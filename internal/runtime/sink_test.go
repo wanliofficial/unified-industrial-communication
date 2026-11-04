@@ -232,33 +232,6 @@ func TestJournalSinkFlushesOnStop(t *testing.T) {
 	}
 }
 
-// 只配了 MQTT（未实现）时必须显式告警，而不是让队列无声增长。
-func TestMQTTEnabledWarnsButDoesNotCreateSink(t *testing.T) {
-	h := newHarness(t, func(cfg map[string]any) {
-		cfg["storage"] = map[string]any{
-			"dir": cfg["storage"].(map[string]any)["dir"], "journal": false,
-		}
-		cfg["northbound"] = map[string]any{
-			"mqtt": map[string]any{"enabled": true, "broker": "tcp://127.0.0.1:1883"},
-		}
-	})
-	h.waitPointGood("sim01", "reg0")
-
-	if code, body := h.do(http.MethodPost, "/api/v1/commands", `{"action":"outbox.flush"}`); code != 409 {
-		t.Fatalf("flush should be 409 with no sink: %d %s", code, body)
-	}
-	logs := h.rt.Logs("", "warn", 50)
-	found := false
-	for _, e := range logs {
-		if e.Message == "mqtt_sink_not_implemented" {
-			found = true
-		}
-	}
-	if !found {
-		t.Fatalf("expected explicit warning, logs = %+v", logs)
-	}
-}
-
 // webhook 启用但没给 URL：不能静默成功。
 func TestWebhookEnabledWithoutURL(t *testing.T) {
 	h := newHarness(t, func(cfg map[string]any) {

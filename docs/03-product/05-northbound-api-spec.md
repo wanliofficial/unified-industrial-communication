@@ -2,7 +2,7 @@
 
 > **版本**：API v1（`/api/v1`）
 > **上游**：`01-prd.md` FR-NOR-*、`02-architecture.md` §4.3
-> **代码对应**：`internal/northbound/httpapi`（REST + SSE）；MQTT 与 OPC UA 在 Wave 1 后半实现
+> **代码对应**：`internal/northbound/httpapi`（REST + SSE）、`internal/mqtt` + `internal/runtime/mqtt_sink.go`（MQTT）；OPC UA 在 Wave 1 后半实现
 > **原则**：一个数据契约，四种传输（REST / SSE / MQTT / OPC UA）；语义一致，表达不同。
 
 ---
@@ -401,16 +401,35 @@ data: {"ts":"..."}
 
 ## 6. MQTT 契约
 
+> **状态**：已实现（`internal/mqtt` + `internal/runtime/mqtt_sink.go`）。客户端为自写的
+> MQTT 3.1.1 发布侧实现，零第三方依赖，保证单二进制交叉编译不被打破。
+
 ### 6.1 主题结构
 
 ```
-uic/{site}/{device}/{point}/value     数据
-uic/{site}/{device}/$state            设备状态（retained）
-uic/{site}/$birth                     网关上线（retained，LWT 为 $death）
-uic/{site}/$death                     网关下线（LWT）
+uic/{site}/{device}/{point}/value     数据（QoS1，非 retained）
+uic/{site}/{device}/$state            设备状态（QoS1，retained）
+uic/{site}/$birth                     网关上线（QoS1，retained）
+uic/{site}/$death                     网关下线（QoS1，retained，LWT）
 ```
 
 **为什么默认不用通配符前缀**：通配符（`uic/+/+/+`）会增加 Broker 的匹配成本，且不利于 ACL 按设备授权。默认规则固定且稳定，不随版本变化。
+
+**主题渲染规则**：
+
+| 占位符 | 取值 | 清洗 |
+|---|---|---|
+| `{site}` | `site` 字段 | `/`、`+`、`#`、NUL → `_` |
+| `{device}` | `Sample.DeviceID` | 同上 |
+| `{point}` | `Sample.PointID` | 同上 |
+
+清洗是最后一道闸门。设备 ID 理论上受 `^[a-z][a-z0-9-]{1,31}$` 约束，但一旦有
+ID 里混进 `/`，消息会静默跑到别人的主题上（甚至被别人的 ACL 放行），发送方
+完全看不出问题——这类故障的排查成本远高于多写四行 `strings.Map`。
+
+默认模板 `uic/{site}/{device}/{point}/value`，可通过 `northbound.mqtt.topic`
+覆盖；模板必须同时包含 `{device}` 与 `{point}`，否则配置校验直接拒绝（所有
+点位挤到一个主题上等于没有主题路由）。
 
 ### 6.2 消息体
 
@@ -420,32 +439,122 @@ uic/{site}/$death                     网关下线（LWT）
 { "schemaVersion": 1 }
 ```
 
+`$state` 的载荷：
+
+```json
+{
+  "schemaVersion": 1,
+  "state": "faulted",
+  "previous": "degraded",
+  "at": "2026-11-04T10:15:23.605Z",
+  "error": "read timeout: ..."
+}
+```
+
+`$birth` / `$death`：
+
+```json
+{ "schemaVersion": 1, "online": true,  "startedAt": "2026-11-04T10:15:20Z" }
+{ "schemaVersion": 1, "online": false }
+```
+
 ### 6.3 QoS 与保留
 
 | 消息 | QoS | Retained | 说明 |
 |---|---|---|---|
-| `value` | 1 | false | 变化上报 |
-| `$state` | 1 | true | 设备状态（在线/离线/降级） |
-| `$birth` | 1 | true | 上线 |
-| `$death` | 1 | true | LWT |
+| `value` | 1（默认） | false | 变化上报；可配 `qos: 0` 换取吞吐 |
+| `$state` | 同 `value` | **true** | 设备状态（在线/离线/降级） |
+| `$birth` | 同 `value` | **true** | 上线 |
+| `$death` | 同 `value` | **true** | 异常掉线时由 Broker 代发 LWT；正常停机时由网关自己补发 |
+
+**停机为什么也要发 `$death`**：正常停机时我们发了 DISCONNECT，Broker 不会触发
+LWT；而 `$birth` 是 retained 的，不补一条 `online=false` 就会让消费方一直以为
+网关在线。运维视角下「网关已经停了但监控说在线」比没有状态更糟。
+
+**为什么状态必须 retained**：状态是「当前事实」而不是事件流。消费方（刚打开的
+看板、刚扩容的消费者）连上就要能读到每台设备是否在线，而不是等下一次状态变化
+——后者可能几小时都不发生。`$birth`/`$death` 同理：网关是否在线必须一问即知。
+
+**QoS 三态**：`northbound.mqtt.qos` 缺省视为 1，显式写 `0` 表示 QoS0。
+配置结构用 `*int` 而不是 `int`，就是为了区分「没写」与「写了 0」——两者
+的投递语义（at-least-once / at-most-once）差别很大，不能靠零值猜。
+
+**不支持 QoS2**：客户端只实现 QoS0/1。配置 `qos: 2` 直接报错而不是静默降级
+成 1：降级会让运维以为买到了「恰好一次」，而实际语义是「至少一次」。
+
+### 6.3.1 配置字段
+
+```json
+{
+  "northbound": {
+    "mqtt": {
+      "enabled": true,
+      "broker": "tcp://192.168.1.10:1883",
+      "clientId": "uic-plant-a",
+      "topic": "uic/{site}/{device}/{point}/value",
+      "qos": 1,
+      "retain": false,
+      "username": "uic",
+      "password": "******"
+    }
+  }
+}
+```
+
+| 字段 | 必填 | 默认 | 说明 |
+|---|---|---|---|
+| `enabled` | 是 | `false` | 关闭时不创建 sink，也不写入 Outbox |
+| `broker` | 启用时必填 | — | `tcp://host:port` 或 `host:port`；`ssl://`/`tls://`/`ws://`/`wss://` 显式拒绝 |
+| `clientId` | 否 | `uic-{site}` | 同一 Broker 上多实例必须显式区分，否则会话互相顶掉 |
+| `topic` | 否 | `uic/{site}/{device}/{point}/value` | 必须含 `{device}` 与 `{point}` |
+| `qos` | 否 | `1` | 仅 0/1；写 2 直接报错 |
+| `retain` | 否 | `false` | 只作用于 `value`；`$state`/`$birth`/`$death` 恒为 retained |
+| `username` / `password` | 否 | — | 只配 `password` 不配 `username` 会被拒绝（3.1.1 规定） |
+
+`uic -check` 会在启动前做静态校验：缺 `broker`、QoS 越界、模板缺占位符都会
+让进程以非零码退出，而不是等到运行时才发现数据发不出去。
 
 ### 6.4 断线补发
 
 由 Outbox 保证：
 
 ```
-采集 → 死区过滤 → Outbox（持久）→ MQTT publish → 收到 PUBACK → 删除
+采集 → 死区过滤 → Outbox（持久）→ MQTT publish → 收到 PUBACK → 推进位点
 ```
 
 | 规则 | 说明 |
 |---|---|
+| 成功判定 | **必须收到 PUBACK**。QoS1 只发不等等于 QoS0，Outbox 会误以为投递成功而丢数据 |
 | 顺序 | 单设备内有序；跨设备不保证 |
 | 去重键 | `device + point + seq` |
 | TTL | 默认 24h，过期丢弃并计数 |
-| 恢复限速 | 默认 500 msg/s，可配 |
-| 背压 | 队列 > 80% 时只保留变化点（降采样） |
+| 恢复限速 | 默认 500 msg/s，可配（Wave 2） |
+| 背压 | 队列 > 80% 时只保留变化点（降采样）（Wave 2） |
 
-### 6.5 Sparkplug B（Wave 2）
+**断线快速失败**：连接断开时，所有在飞的 QoS1 发布立即收到错误，而不是等满
+`AckTimeout`。否则一次网络闪断会让投递协程空转数秒，队列在恢复前持续堆积。
+`AckTimeout` 取 3s，必须小于 Outbox 单轮 drain 的 5s 预算——否则日志里只会剩下
+`context deadline exceeded`，看不出到底是网络慢还是 Broker 没回 PUBACK。
+
+**重连自愈**：Broker 重启会清空 retained 消息，消费方会永远停在掉线前的状态。
+因此客户端每次 CONNECT 成功后都会补发 `$birth` 与全部已知 `$state`（缓存最后
+一次状态），而不是只在启动时发一次。
+
+### 6.5 边界（明确不支持）
+
+| 能力 | 状态 | 原因 |
+|---|---|---|
+| QoS2 | 不支持，配置即报错 | 两段握手（PUBREC/PUBREL/PUBCOMP）对北向上报没有实际收益，且实现复杂度高 |
+| TLS（`ssl://`、`tls://`） | 不支持，配置即报错 | 证书加载/轮换/校验是独立的一件事，不能靠「静默当 tcp」蒙混——那会变成「连上了但没加密」 |
+| WebSocket（`ws://`、`wss://`） | 不支持，配置即报错 | 同上；边缘部署直连 Broker 更常见 |
+| 订阅 | 不支持 | 北向是「网关往外发」，订阅语义属于南向 |
+| 会话持久化（`CleanSession=false`） | 不支持 | 补发由本地 Outbox 负责，Broker 侧会话只会掩盖真实积压 |
+| Sparkplug B | Wave 2 | 见 §6.6 |
+
+显式失败优于静默降级：一个配了 `ssl://` 的现场，宁可启动时报错，也不要让它
+以为自己在加密传输。
+
+### 6.6 Sparkplug B（Wave 2）
 
 | 项 | 映射 |
 |---|---|
@@ -457,7 +566,7 @@ uic/{site}/$death                     网关下线（LWT）
 | `DBIRTH`/`DDEATH` | 设备生命周期 |
 | `DDATA` | 采样值 |
 
-### 6.6 本地 journal 兜底（`storage.journal`）
+### 6.7 本地 journal 兜底（`storage.journal`）
 
 在与 MQTT/Webhook 并列的位置，还有一个**不需要网络**的 sink：
 
@@ -576,7 +685,8 @@ Objects
 | `GET /api/v1/metrics` | 已实现 | 文本格式 |
 | `POST /api/v1/commands` | 已实现 | 白名单子集 |
 | 配置版本/回滚 | 已实现 | 文件快照 |
-| MQTT / OPC UA | 规范已定义 | Wave 1 后半实现 |
+| MQTT | 已实现 | 见 §6（QoS0/1、retained 状态、断线补投） |
+| OPC UA | 规范已定义 | Wave 1 后半实现 |
 | RBAC / 审计 / 诊断包 | 规范已定义 | Wave 1 后半实现 |
 
 ---

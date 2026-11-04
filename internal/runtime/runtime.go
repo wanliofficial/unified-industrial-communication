@@ -70,6 +70,7 @@ type Runtime struct {
 	logFile     io.Closer
 	journal     *os.File
 	journalSink *journalSink
+	mqttSink    *mqttSink
 
 	mu         sync.Mutex
 	collectors map[string]*collector
@@ -165,7 +166,15 @@ func New(opt Options) (*Runtime, error) {
 		startedAt:  time.Now(),
 	}
 	r.declareMetrics()
-	r.sched = scheduler.New(scheduler.Options{}, logger, met)
+	r.sched = scheduler.New(scheduler.Options{
+		// 设备运行态变化同时投递到 MQTT（retained）。scheduler 用独立
+		// goroutine 串行回调，所以即使 Broker 慢也不会拖住采集。
+		OnState: func(ev scheduler.StateEvent) {
+			if s := r.mqttSink; s != nil {
+				s.onState(ev)
+			}
+		},
+	}, logger, met)
 
 	if err := r.build(mgr.Current()); err != nil {
 		if logFile != nil {
@@ -210,6 +219,7 @@ func (r *Runtime) declareMetrics() {
 	d("uic_http_request_duration_seconds", "histogram", "HTTP 请求耗时")
 	d("uic_stale_total", "counter", "点位被判定为 stale 的次数")
 	d("uic_config_apply_total", "counter", "配置应用次数与结果")
+	d("uic_mqtt_publish_total", "counter", "MQTT 发布次数与结果")
 }
 
 // build 按配置创建采集器并注册到调度器。
@@ -303,6 +313,13 @@ func (r *Runtime) Stop(timeout time.Duration) error {
 			first = err
 		}
 		if err := r.box.Close(); err != nil && first == nil {
+			first = err
+		}
+	}
+	if r.mqttSink != nil {
+		// 先关 MQTT：它会发 DISCONNECT，让 Broker 不触发遗嘱消息。
+		// 放在 Outbox 关闭之后，避免还在投递时就断链。
+		if err := r.mqttSink.close(); err != nil && first == nil {
 			first = err
 		}
 	}

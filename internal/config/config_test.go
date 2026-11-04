@@ -504,3 +504,61 @@ func TestAtomicWriteReplacesExisting(t *testing.T) {
 		}
 	}
 }
+
+// 北向 MQTT 的静态错误必须在装配期暴露：配了 enabled 却没有 broker、
+// 用了本实现不支持的 scheme、或者模板缺占位符，都不可能通过重试变好。
+func TestValidateMQTTNorthbound(t *testing.T) {
+	registerDrivers(t)
+	cases := []struct {
+		name string
+		mod  func(*File)
+		want string
+	}{
+		{"no broker", func(f *File) { f.Northbound.MQTT.Enabled = true }, "broker"},
+		{"qos2", func(f *File) {
+			q := 2
+			f.Northbound.MQTT = MQTT{Enabled: true, Broker: "127.0.0.1:1883", QoS: &q}
+		}, "qos 2"},
+		{"tls", func(f *File) {
+			f.Northbound.MQTT = MQTT{Enabled: true, Broker: "ssl://broker:8883"}
+		}, "not supported"},
+		{"topic", func(f *File) {
+			f.Northbound.MQTT = MQTT{Enabled: true, Broker: "broker:1883", Topic: "static/topic"}
+		}, "{device}"},
+	}
+	for _, c := range cases {
+		f := baseFile()
+		c.mod(f)
+		err := f.Validate()
+		if err == nil {
+			t.Fatalf("%s: expected error", c.name)
+		}
+		if !strings.Contains(err.Error(), c.want) {
+			t.Fatalf("%s: err = %v, want mention of %q", c.name, err, c.want)
+		}
+	}
+}
+
+// QoS 用指针是为了区分「没写」与「写了 0」：两者的投递语义不同。
+func TestMQTTQoSTriState(t *testing.T) {
+	registerDrivers(t)
+
+	f := baseFile()
+	f.Northbound.MQTT = MQTT{Enabled: true, Broker: "broker:1883"}
+	if err := f.Validate(); err != nil {
+		t.Fatalf("validate: %v", err)
+	}
+	if q := f.Northbound.MQTT.EffectiveQoS(); q != 1 {
+		t.Fatalf("default qos = %d, want 1", q)
+	}
+
+	zero := 0
+	f = baseFile()
+	f.Northbound.MQTT = MQTT{Enabled: true, Broker: "broker:1883", QoS: &zero}
+	if err := f.Validate(); err != nil {
+		t.Fatalf("explicit qos0 must be accepted: %v", err)
+	}
+	if q := f.Northbound.MQTT.EffectiveQoS(); q != 0 {
+		t.Fatalf("explicit qos0 became %d", q)
+	}
+}

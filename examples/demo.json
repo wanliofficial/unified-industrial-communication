@@ -198,7 +198,7 @@
     "mqtt": {
       "enabled": false,
       "broker": "tcp://127.0.0.1:1883",
-      "topic": "uic/{site}/{device}/{point}",
+      "topic": "uic/{site}/{device}/{point}/value",
       "qos": 1
     },
     "opcua": {

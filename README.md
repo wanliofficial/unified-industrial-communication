@@ -28,6 +28,20 @@ curl -s localhost:8081/api/v1/points
 ./uic -config examples/modbus-rtu.json
 ```
 
+MQTT 北向（需要一个 Broker；`mosquitto` 或任意 MQTT 3.1.1 服务端均可）：
+
+```bash
+mosquitto -p 1883 &
+./uic -config examples/mqtt.json &
+mosquitto_sub -h 127.0.0.1 -t 'uic/mqtt-lab/#' -v
+#   uic/mqtt-lab/$birth                       {"schemaVersion":1,"online":true,...}
+#   uic/mqtt-lab/line-a/temperature/value     {"schemaVersion":1,"device":"line-a",...}
+#   uic/mqtt-lab/line-a/$state                {"schemaVersion":1,"state":"collecting",...}
+```
+
+Broker 断开时数据进本地 Outbox（不丢），恢复后自动补投；`$state`/`$birth` 是
+retained 的，消费方连上即可读到当前状态。
+
 ## 文档
 
 - **[docs/00-README.md](docs/00-README.md)** — 总索引：阅读路径、38 个参考方案总览、结论速查、代码地图、接口速查、实现边界
@@ -53,7 +67,7 @@ go test -race -count=1 ./...
 | `internal/model` | 通道 / 设备 / 点位 / 地址 / 采样 / 质量码 |
 | `internal/driver` | 驱动契约（Codec / Transport / Driver）、错误分类、注册表 |
 | `internal/codec/modbus` | Modbus 纯函数编解码（主站与从站共用） |
-| `internal/driver/modbus` | Modbus TCP 主站 |
+| `internal/driver/modbus` | Modbus TCP + RTU 主站 |
 | `internal/driver/virtual` | 虚拟设备（波形 + 故障注入） |
 | `internal/sim/modbus` | 内置 Modbus TCP 从站 |
 | `internal/planner` | 点位 → 批量读请求 |
@@ -64,7 +78,8 @@ go test -race -count=1 ./...
 | `internal/config` | 配置校验 / 内容哈希版本 / 快照 / 回滚 |
 | `internal/obs` | 指标 / 结构化日志 / 日志环形缓冲 |
 | `internal/northbound/httpapi` | REST + SSE + 认证 + 错误码 |
-| `internal/runtime` | 唯一编排层 + 看门狗 + 后端实现 |
+| `internal/mqtt` | 自写 MQTT 3.1.1 发布侧客户端（QoS0/1、retained、LWT） |
+| `internal/runtime` | 唯一编排层 + 看门狗 + 后端实现（含各 sink 装配） |
 
 ## 许可
 

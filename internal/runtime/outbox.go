@@ -49,10 +49,13 @@ func (r *Runtime) openSinks(f *config.File) error {
 		}
 	}
 	if f.Northbound.MQTT.Enabled {
-		// Wave 1 后半实现。这里显式告警，而不是让队列无声增长。
-		r.log.Warn("mqtt_sink_not_implemented",
-			"detail", "MQTT 北向在 Wave 1 后半实现；当前不会发布消息",
-			"broker", f.Northbound.MQTT.Broker)
+		sink, err := newMQTTSink(f.Northbound.MQTT, f.Site, "uic-"+f.Site)
+		if err != nil {
+			return fmt.Errorf("runtime: mqtt: %w", err)
+		}
+		sink.met = r.metrics
+		r.mqttSink = sink
+		sinks["mqtt"] = sink.deliver
 	}
 	if f.Storage.Journal {
 		path := filepath.Join(r.dataDir, "journal.ndjson")

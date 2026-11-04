@@ -106,6 +106,16 @@ type DeviceStatus struct {
 	Stats           Stats     `json:"stats"`
 }
 
+// StateEvent 是一次设备运行态迁移。
+type StateEvent struct {
+	DeviceID string    `json:"device"`
+	From     State     `json:"previous"`
+	To       State     `json:"state"`
+	At       time.Time `json:"at"`
+	// Error 是触发迁移的错误摘要（进入好状态时为空）。
+	Error string `json:"error,omitempty"`
+}
+
 // Options 是调度参数。零值可用。
 type Options struct {
 	Tick             time.Duration // 默认 50ms
@@ -114,6 +124,13 @@ type Options struct {
 	MaxBackoff       time.Duration // 退避上限，默认 1m
 	Jitter           float64       // 抖动比例 0..1，默认 0.2
 	Now              func() time.Time
+
+	// OnState 在设备运行态迁移时被调用。
+	//
+	// 它由调度器内部的独立 goroutine 串行调用，绝不占用采集协程：北向投递
+	// 可能因 Broker 慢而阻塞数秒，若在采集路径上同步调用，一台设备的网络
+	// 抖动会拖慢所有设备。回调本身也不得阻塞太久（会积压事件）。
+	OnState func(StateEvent)
 }
 
 func (o Options) withDefaults() Options {
@@ -162,11 +179,13 @@ type Scheduler struct {
 	order   []*device
 	gates   map[string]*gate
 
+	events chan StateEvent // 状态迁移事件队列（有界，满则丢弃并计数）
+
 	started atomic.Bool
 	stopped atomic.Bool
 	ctx     context.Context
 	cancel  context.CancelFunc
-	wg      sync.WaitGroup // tick 协程
+	wg      sync.WaitGroup // tick 协程 + 状态派发协程
 	work    sync.WaitGroup // 在飞采集
 }
 
@@ -208,6 +227,7 @@ func New(opt Options, log *slog.Logger, met Metrics) *Scheduler {
 		met:     met,
 		devices: map[string]*device{},
 		gates:   map[string]*gate{},
+		events:  make(chan StateEvent, 256),
 	}
 }
 
@@ -219,6 +239,10 @@ func (s *Scheduler) Start(ctx context.Context) {
 	s.ctx, s.cancel = context.WithCancel(ctx)
 	s.wg.Add(1)
 	go s.loop()
+	if s.opt.OnState != nil {
+		s.wg.Add(1)
+		go s.dispatchStates(s.ctx)
+	}
 }
 
 func (s *Scheduler) loop() {
@@ -437,6 +461,30 @@ func (s *Scheduler) stateChanged(d *device, old State) {
 	d.since = s.now()
 	s.log.Info("device_state", "device", d.id, "state", string(d.state),
 		"previous", string(old), "generation", d.gen.Load())
+
+	if s.opt.OnState != nil {
+		ev := StateEvent{DeviceID: d.id, From: old, To: d.state, At: d.since, Error: d.lastErr}
+		select {
+		case s.events <- ev:
+		default:
+			// 队列满说明下游长期阻塞。丢弃事件比阻塞采集安全：当前态仍然
+			// 可以通过 REST /api/v1/devices 读到，而采集停摆是不可接受的。
+			s.inc("uic_state_event_dropped_total", obs.Labels{"device": d.id})
+		}
+	}
+}
+
+// dispatchStates 串行调用 OnState 回调。
+func (s *Scheduler) dispatchStates(ctx context.Context) {
+	defer s.wg.Done()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case ev := <-s.events:
+			s.opt.OnState(ev)
+		}
+	}
 }
 
 func (s *Scheduler) inc(name string, l obs.Labels) {

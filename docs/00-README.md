@@ -77,6 +77,19 @@ socat -d -d pty,raw,echo=0,link=/tmp/ttyV0 pty,raw,echo=0
 #   然后在 /tmp/ttyV0 上挂从站模拟器，或把配置里的 port 指向它
 ```
 
+MQTT 北向（需要一个 Broker，任意 MQTT 3.1.1 服务端均可）：
+
+```bash
+mosquitto -p 1883 &                          # 或用现场已有的 Broker
+./uic -config examples/mqtt.json
+mosquitto_sub -h 127.0.0.1 -t 'uic/mqtt-lab/#' -v
+```
+
+观察三个主题族：`.../{device}/{point}/value`（变化上报，QoS1）、
+`.../{device}/$state`（设备状态，retained）、`.../$birth`（网关上线，retained）。
+把 Broker 停掉再起来，可以看到数据先进 Outbox、恢复后按序补投，以及
+`$birth`/`$state` 被重新发布。
+
 写入与回滚（这是最能体现「可治理」的两条命令）：
 
 ```bash
@@ -288,7 +301,7 @@ docs/
 |---|---|---|
 | REST | 配置、查询、写入、命令 | ✅ 完整 |
 | SSE | 实时观察（浏览器/curl 友好） | ✅ 完整 |
-| MQTT | 变化上报 | ⏳ 接口与契约已定义，投递未实现（启用时显式告警） |
+| MQTT | 变化上报 + 设备状态 | ✅ 完整（QoS0/1、retained `$state`/`$birth`、LWT `$death`、断线补投；不支持 QoS2/TLS/WebSocket） |
 | OPC UA | 被 SCADA 集成 | ⏳ 映射规范已定义，服务端未实现 |
 
 ### 7.4 明确不做
@@ -317,7 +330,7 @@ docs/
    └───────────────┘   └───────────────────────┘   │ Codec/Transport/Driver │
                                                    └──────────────┘
                     ┌───────────────────────────────┐
-                    │ outbox（持久队列 + 分区确认）   │──▶ webhook / journal
+                    │ outbox（持久队列 + 分区确认）   │──▶ mqtt / webhook / journal
                     └───────────────────────────────┘
 ```
 
@@ -359,14 +372,16 @@ obs  ← 所有包（不依赖任何内部包）
 | `internal/driver/virtual` | 虚拟设备（波形 + 故障注入） | 故障按「第 n 次请求」精确注入一次 | 98.6% |
 | `internal/sim/modbus` | 内置 Modbus TCP 从站 | 复用同一份 codec，避免主从语义漂移 | 87.2% |
 | `internal/planner` | 点位 → 批量读请求（ReadSpan） | 协议无关；按连续性/上限合并 | 93.9% |
-| `internal/scheduler` | tick、actor、信号量、退避、熔断、代次 | 同设备不并发；写优先；旧代次丢弃 | 87.7% |
+| `internal/scheduler` | tick、actor、信号量、退避、熔断、代次 | 同设备不并发；写优先；旧代次丢弃；状态回调不占采集路径 | 85.4% |
 | `internal/pipeline` | 缩放、质量判定、死区过滤 | 质量不可用时不参与死区比较 | 92.7% |
 | `internal/cache` | 当前值唯一事实源 + 变更订阅 | 读写都要过这里，不允许模块自留副本 | 96.7% |
 | `internal/outbox` | 持久队列：分区、WAL、确认位点、三重上限 | at-least-once；整批或前缀成功才推进位点 | 77.4% |
-| `internal/config` | 加载、校验、规范化、版本化、回滚 | 幂等 Normalize；原子写；失败自动恢复 | 82.3% |
+| `internal/config` | 加载、校验、规范化、版本化、回滚 | 幂等 Normalize；原子写；失败自动恢复；北向参数静态校验 | 80.6% |
 | `internal/obs` | 指标、结构化日志、日志环形缓冲 | 指标标签必须归一化（不能含原始 URL） | 88.2% |
 | `internal/northbound/httpapi` | REST + SSE + 认证 + 错误码 | 错误码稳定；响应不泄露凭据 | 80.0% |
-| `internal/runtime` | 唯一编排层 + 后端实现 + 看门狗 | 启动/关闭顺序；`configuredState` 与 `runtimeState` 分离；协议/传输匹配在装配期校验 | 79.7% |
+| `internal/mqtt` | MQTT 3.1.1 发布侧客户端（纯 Go，零依赖） | 单 goroutine 读 socket；QoS1 必须等到 PUBACK；断线立即失败而非超时 | 84.9% |
+| `internal/mqtt/mqtttest` | 可复用的最小 Broker（测试夹具） | 只实现发布侧所需报文；配置必须在 accept 之前注入 | — |
+| `internal/runtime` | 唯一编排层 + 后端实现 + 看门狗 | 启动/关闭顺序；`configuredState` 与 `runtimeState` 分离；协议/传输匹配在装配期校验 | 80.8% |
 | `cmd/uic` | 单入口：run / sim / check / version | 关闭预算 10 秒 | — |
 
 ### 9.2 测试与验证命令
@@ -379,7 +394,7 @@ go test -race -count=1 ./...                    # 竞态 + 全量测试
 go test -coverprofile=c.out ./... && go tool cover -func=c.out | tail -1
 ```
 
-当前状态：`go build` / `go vet` / `gofmt` 全部干净，`go test -race ./...` 16 个包全部通过。
+当前状态：`go build` / `go vet` / `gofmt` 全部干净，`go test -race ./...` 17 个包全部通过。
 
 ### 9.3 源码阅读建议顺序
 
@@ -391,6 +406,7 @@ go test -coverprofile=c.out ./... && go tool cover -func=c.out | tail -1
 5. internal/runtime/runtime.go        装配与生命周期（40 分钟）
 6. internal/outbox/outbox.go          持久队列的分区与确认（40 分钟）
 7. internal/runtime/backends.go       命令白名单与配置端点（30 分钟）
+8. internal/mqtt/codec.go + client.go 报文字节与 QoS1 确认（30 分钟）
 ```
 
 ---
@@ -442,7 +458,7 @@ go test -coverprofile=c.out ./... && go tool cover -func=c.out | tail -1
 | Outbox | ✅ | 文件 WAL + 分区确认位点 + 三重上限 + 定期压缩；默认批量 flush |
 | Webhook 上报 | ✅ | 批量 POST、自定义头、失败不推进位点、恢复后自动补投 |
 | journal 本地归档 | ✅ | `storage.journal=true` → `<dir>/journal.ndjson` |
-| MQTT 上报 | ⏳ | 契约已定；启用时只告警 `mqtt_sink_not_implemented`，不建 sink（不给假成功） |
+| MQTT 上报 | ✅ | 自写 MQTT 3.1.1 客户端（零依赖）：QoS1 等 PUBACK 才推进位点、keepalive、重连后补发 `$birth` 与 retained `$state`、LWT `$death`；显式拒绝 QoS2 与 TLS/WS |
 | OPC UA 服务端 | ⏳ | 地址空间映射已定；未实现 |
 | 配置版本/回滚/diff | ✅ | 内容哈希版本、快照、原子写、失败自动恢复、回滚缺版本返回 404 |
 | 认证 | ✅ | Bearer Token，常量时间比较；未实现 RBAC |

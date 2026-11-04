@@ -25,6 +25,7 @@ import (
 
 	"uic/internal/driver"
 	"uic/internal/model"
+	"uic/internal/mqtt"
 )
 
 // SchemaVersion 是当前支持的配置格式版本。
@@ -63,10 +64,23 @@ type MQTT struct {
 	Broker   string `json:"broker,omitempty"`
 	ClientID string `json:"clientId,omitempty"`
 	Topic    string `json:"topic,omitempty"`
-	QoS      int    `json:"qos,omitempty"`
+
+	// QoS 用指针表达三态：缺省（nil）取默认 1，显式 0 表示 QoS0。
+	// 用 int 无法区分「没写」和「写了 0」，而两者的投递语义差别很大：
+	// QoS0 是 at-most-once，QoS1 是 at-least-once。
+	QoS *int `json:"qos,omitempty"`
+
 	Retain   bool   `json:"retain,omitempty"`
 	Username string `json:"username,omitempty"`
 	Password string `json:"password,omitempty"`
+}
+
+// EffectiveQoS 返回生效的 QoS（默认 1）。
+func (m MQTT) EffectiveQoS() int {
+	if m.QoS == nil {
+		return 1
+	}
+	return *m.QoS
 }
 
 // OPCUA 是 OPC UA 服务端参数。
@@ -146,10 +160,7 @@ func (f *File) Normalize() {
 		f.Logging.Format = "json"
 	}
 	if f.Northbound.MQTT.Topic == "" {
-		f.Northbound.MQTT.Topic = "uic/{site}/{device}/{point}"
-	}
-	if f.Northbound.MQTT.QoS < 0 || f.Northbound.MQTT.QoS > 2 {
-		f.Northbound.MQTT.QoS = 1
+		f.Northbound.MQTT.Topic = "uic/{site}/{device}/{point}/value"
 	}
 	if f.Northbound.Webhook.Timeout <= 0 {
 		f.Northbound.Webhook.Timeout = model.Duration(5 * time.Second)
@@ -242,6 +253,32 @@ func (f *File) Validate() error {
 				return fmt.Errorf("device %q point %q: protocol %q does not accept %q addressing",
 					d.ID, p.ID, ch.Protocol, p.Address.Kind)
 			}
+		}
+	}
+	return f.validateNorthbound()
+}
+
+// validateNorthbound 校验北向通道参数。
+//
+// 这些是静态错误：配了 mqtt.enabled 却没有 broker，永远不可能投递成功。
+// 让它在启动前失败，比让设备采集正常、数据默默发不出去要好得多。
+func (f *File) validateNorthbound() error {
+	m := f.Northbound.MQTT
+	if m.Enabled {
+		if m.Broker == "" {
+			return errors.New("northbound.mqtt.broker required when mqtt.enabled")
+		}
+		// 只支持 0/1：客户端不实现 QoS2 的两段握手。静默降级会让运维
+		// 以为买到了「恰好一次」，因此显式报错。
+		if q := m.EffectiveQoS(); q < 0 || q > 1 {
+			return fmt.Errorf("northbound.mqtt.qos %d: only 0 and 1 are supported by the publisher", q)
+		}
+		if !strings.Contains(m.Topic, "{device}") || !strings.Contains(m.Topic, "{point}") {
+			return fmt.Errorf("northbound.mqtt.topic %q must contain {device} and {point}", m.Topic)
+		}
+		// 与运行时共用同一份地址规则：ssl:// 之类的 scheme 必须在这里就失败。
+		if _, err := mqtt.NormalizeAddr(m.Broker); err != nil {
+			return fmt.Errorf("northbound.mqtt.broker: %w", err)
 		}
 	}
 	return nil

@@ -419,7 +419,7 @@ raw（字节/数值）
     }
   ],
   "northbound": {
-    "mqtt": { "enabled": false, "broker": "tcp://127.0.0.1:1883", "topic": "uic/{site}/{device}/{point}" },
+    "mqtt": { "enabled": false, "broker": "tcp://127.0.0.1:1883", "topic": "uic/{site}/{device}/{point}/value", "qos": 1 },
     "opcua": { "enabled": false, "listen": ":4840" }
   },
   "storage": {

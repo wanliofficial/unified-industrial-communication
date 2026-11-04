@@ -427,3 +427,56 @@ func TestConcurrentDeviceGathers(t *testing.T) {
 		}
 	}
 }
+
+// 状态迁移必须通过独立 goroutine 回调，且回调变慢时不能拖住采集。
+func TestStateEventsDoNotBlockCollection(t *testing.T) {
+	release := make(chan struct{})
+	got := make(chan StateEvent, 8)
+
+	tgt := &fakeTarget{}
+	s, _ := startSched(t, Options{
+		Tick: 2 * time.Millisecond,
+		OnState: func(ev StateEvent) {
+			// 模拟慢消费者（比如 Broker 卡住）：第一个事件就把回调钉住，
+			// 后续事件应入队等待，而不是阻塞采集协程。
+			select {
+			case <-release:
+			case <-time.After(2 * time.Second):
+			}
+			got <- ev
+		},
+	})
+	if err := s.Add(dev("d1", 10*time.Millisecond, true), chan1(2), tgt); err != nil {
+		t.Fatalf("add: %v", err)
+	}
+
+	// 回调被钉住期间，采集仍必须继续推进。
+	waitFor(t, "collecting", func() bool { return tgt.collects.Load() >= 3 })
+
+	// 制造一次失败 → degraded，验证事件内容。
+	tgt.setCollectErr(errors.New("boom"))
+	waitFor(t, "collect attempts during stall", func() bool { return tgt.collects.Load() >= 6 })
+
+	close(release)
+	select {
+	case ev := <-got:
+		if ev.DeviceID != "d1" || ev.To == "" {
+			t.Fatalf("event = %+v", ev)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("state event never delivered")
+	}
+}
+
+// 没有 OnState 时不得启动派发协程，也不得因 nil 回调 panic。
+func TestStateEventsWithoutHook(t *testing.T) {
+	tgt := &fakeTarget{}
+	s, _ := startSched(t, Options{Tick: 2 * time.Millisecond})
+	if err := s.Add(dev("d1", 10*time.Millisecond, true), chan1(1), tgt); err != nil {
+		t.Fatalf("add: %v", err)
+	}
+	waitFor(t, "collecting", func() bool { return tgt.collects.Load() >= 2 })
+	if n := len(s.events); n != 0 {
+		t.Fatalf("events queued without hook: %d", n)
+	}
+}

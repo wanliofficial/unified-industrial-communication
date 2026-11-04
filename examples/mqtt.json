@@ -1,0 +1,76 @@
+{
+  "schemaVersion": 1,
+  "site": "mqtt-lab",
+  "server": {
+    "listen": "127.0.0.1:8083",
+    "token": "dev-token"
+  },
+  "storage": {
+    "dir": "./data-mqtt",
+    "journal": true,
+    "outboxMaxRecords": 20000,
+    "outboxTtl": "1h"
+  },
+  "logging": {
+    "level": "info"
+  },
+  "northbound": {
+    "mqtt": {
+      "enabled": true,
+      "broker": "tcp://127.0.0.1:1883",
+      "clientId": "uic-mqtt-lab",
+      "topic": "uic/{site}/{device}/{point}/value",
+      "qos": 1,
+      "retain": false
+    },
+    "webhook": {
+      "enabled": false,
+      "url": "http://127.0.0.1:9999/ingest",
+      "timeout": "3s"
+    }
+  },
+  "channels": [
+    {
+      "id": "ch-virtual",
+      "protocol": "virtual",
+      "transport": {
+        "kind": "memory"
+      },
+      "concurrency": 4,
+      "timeout": "2s"
+    }
+  ],
+  "devices": [
+    {
+      "id": "line-a",
+      "name": "产线 A（正弦波形，1s 一个变化点）",
+      "channel": "ch-virtual",
+      "interval": "1s",
+      "timeout": "2s",
+      "enabled": true,
+      "points": [
+        {
+          "id": "temperature",
+          "name": "温度",
+          "address": { "kind": "register", "area": "holding", "offset": 0, "length": 2, "bit": -1 },
+          "dataType": "float32",
+          "unit": "℃",
+          "deadband": 0.1,
+          "enabled": true
+        },
+        {
+          "id": "pressure",
+          "name": "压力",
+          "address": { "kind": "register", "area": "holding", "offset": 2, "length": 4, "bit": -1 },
+          "dataType": "float64",
+          "unit": "kPa",
+          "deadband": 0.1,
+          "enabled": true
+        }
+      ],
+      "labels": {
+        "mode": "sine"
+      }
+    }
+  ]
+}
