@@ -295,6 +295,141 @@ ASCII 与 RTU 共用 connect / codec，只在分帧层不同。但有四条硬�
 DCB 结构走另一套 API，在没有真实硬件可验证之前，写一个测不了的实现比不写更
 危险。需要 Windows 串口的部署走 C# 辅助进程桥接（ADR 0001）。
 
+### 3.7 S7（S7comm over ISO-on-TCP）
+
+S7 与 Modbus 的差别不在「寄存器怎么摆」，而在**一次事务可以带多项**。这直接
+改写了驱动的切块逻辑：Modbus 的规划层负责「把连续地址合并成一次请求」，S7 的
+规划层只负责分组，真正的合并单位是「一个 PDU 里能塞下几个变量说明」。
+
+#### 3.7.1 三层封装
+
+```
+┌───────────── TPKT（RFC1006） ─────────────┐  4 字节头：version=3, length(大端)
+│ ┌────────── COTP（ISO 8073） ───────────┐ │  1 字节长度 + 1 字节类型 + 参数
+│ │ ┌──────── S7 PDU ───────────────────┐ │ │  10 字节头 + 参数区 + 数据区
+│ │ └───────────────────────────────────┘ │ │
+│ └───────────────────────────────────────┘ │
+└───────────────────────────────────────────┘
+```
+
+| 层 | 本实现的范围 | 不做的事 |
+|---|---|---|
+| TPKT | 4 字节头、长度上下界校验（4..8192） | 分片重组；S7 不会发超过协商值的帧 |
+| COTP | CR（连接请求）/ CC（连接确认）/ DT（数据传输） | 断开请求、错误 TPDU、TSAP 路由 |
+| S7 | Setup Communication、Read Var、Write Var | 块上传/下载、报警订阅、符号表浏览、时间同步 |
+
+**TPKT 长度必须校验**：长度字段由对端给出，坏帧可能声称 65535 字节。不做上界
+检查，一次坏帧就会吃掉 64KB 缓冲并一直等到设备超时——而现场只会看到「设备卡了
+3 秒」，不会看到「对端发了坏帧」。
+
+#### 3.7.2 连接序列不能省
+
+```
+主站 → COTP CR（dst TSAP = 0x0100 + rack×32 + slot）
+从站 → COTP CC
+主站 → S7 Setup Communication（请求 PDU 长度 480）
+从站 → Setup Ack（返回协商值，如 240 / 480 / 960）
+主站 → Read Var / Write Var
+```
+
+| 约束 | 原因 |
+|---|---|
+| 必须先 COTP 再 S7 | 跳过 COTP 的连接在部分 CPU 上会被直接 RST，且没有任何错误码 |
+| 目的 TSAP 按 rack/slot 计算 | 这是 S7 把「CPU 物理位置」编码进 TSAP 的方式；S7-1200/1500 常在槽 1，S7-300/400 常在槽 2，写死会让一半设备连不上 |
+| 必须完成 Setup 协商 | 未协商时按 480 发送超过 240 的请求，部分 CPU 静默丢弃；现场表现为「读几个点正常，读多了就没反应」 |
+| 切块必须使用协商值 | 用请求值而不是返回值，在只支持 240 的 CPU 上等于每块都超限 |
+
+源 TSAP 固定 `0x0100`（PG/编程器），TPDU 长度固定 256。这两个值不暴露给用户：
+它们不是「现场可调参数」，而是协议惯例；开放出来只会增加配错的可能。
+
+#### 3.7.3 地址与长度单位
+
+点位地址映射到 S7 变量说明（S7ANY，`0x12 0x0A 0x10`）：
+
+| 模型字段 | S7 字段 | 说明 |
+|---|---|---|
+| `address.area` | 区域码 | `input`→0x81、`output`→0x82、`merker`→0x83、`db`→0x84、`counter`→0x1C、`timer`→0x1D |
+| `address.db` | DB 号 | 仅 `area=db` 时有效且必填（≥1）；其他区带 DB 号在配置校验期报错 |
+| `address.offset` | 字节地址 | **不是位地址**；位访问时协议里的地址是 `offset×8 + bit` |
+| `address.bit` | 位号 | 仅 `bool` 点位使用（0..7）；非 bool 点位带 `bit>0` 报错 |
+| `dataType` + `address.length` | 传输尺寸 + 长度 | 见下表 |
+
+**长度单位不统一是 S7 最容易写错的地方**（请求项与响应项还不一样）：
+
+| 场景 | transport size | 长度语义 |
+|---|---|---|
+| 请求（按字节读） | 0x02 BYTE | 字节数 |
+| 请求（按位读） | 0x01 BIT | 恒为 1 |
+| 响应（BIT / BYTE / WORD / DWORD） | 0x03 / 0x04 / 0x05 / 0x06 | **位数** |
+| 响应（INT / DINT / REAL 等） | 0x07 / 0x08 / 0x09 | **字节数** |
+| 写请求数据区（字节） | 0x04 BYTE/WORD | **位数**，且数据偶数对齐 |
+| 写请求数据区（位） | 0x03 BIT | 位数 |
+
+把响应的「位数」当字节数，就会把 4 字节 REAL 截成 1 字节；把写数据的「位数」
+当字节数，就会写出 8 倍长度的脏数据。本实现把换算收敛到
+`codec/s7.payloadBytes()` 一处，主站与从站共用，避免两边各写一套。
+
+#### 3.7.4 每项返回码与错误分类
+
+Read Var / Write Var 的响应是**逐项**的：一个 PDU 里 20 项，可能 18 项成功、
+2 项地址不存在。因此错误必须挂在样本上，而不是让整个事务失败。
+
+| 返回码 | 含义 | 映射 | 质量码 |
+|---|---|---|---|
+| 0x00 | 成功 | — | good |
+| 0x03 | 访问被拒（如写输入区） | `ErrPermission` | bad |
+| 0x05 | 地址越界 | `ErrAddress` | address_error |
+| 0x0A | 对象不存在（DB 未定义） | `ErrAddress` | address_error |
+| 0x06 / 0x07 | 类型/长度不匹配 | `ErrUnsupported` | bad |
+| 其他 | 硬件/协议错误 | `ErrProtocol` | bad |
+
+为了让「逐项错误」自带分类，`driver` 包引入 `Kinded` 接口：
+
+```go
+type Kinded interface{ Kind() ErrorKind }
+```
+
+`codec/s7.ItemError` 实现它，于是 `driver.KindOf` 能直接取到分类，不需要在
+驱动里逐处包 `*OpError`。少包一层就少一处漏包，错误分类是不会在正常路径上
+被发现的缺陷，只能靠「只写一次」来保证。
+
+**部分失败的策略与 Modbus 一致**：只要有任意一项成功，`Read` 就不向上返回错误
+（好样本必须保留）；**全部点位失败**才返回第一个错误，让设备进入故障/退避。
+链路级错误（超时、断连）例外：立即返回，并把剩余未发送的点位显式标坏——
+让它们「消失」会诱导上层报「point missing」，把真正的断链原因盖掉。
+
+#### 3.7.5 切块策略
+
+两个约束同时生效，取更严的一个：
+
+1. **项数 ≤ 20**：S7 协议参数区的项数上限。
+2. **请求与响应都不超过协商 PDU**：按最坏情况估算（每项请求 12 字节规格、
+   响应 4 字节头 + 数据），写入时还要加上数据区的「4 字节头 + 偶数对齐负载」。
+
+预算按最坏情况算而不是「发出去看错误」：S7 超限通常表现为对端不响应，而不是
+返回一个明确的「太长」错误码；从超时反推原因的成本远高于多发一帧。
+
+#### 3.7.6 探活
+
+`Probe` 读 `M0.0` 一个字节。**单项返回「地址不存在」也算链路可达**：探活要回答的
+是「CPU 还应答吗」，不是「探活点配得对吗」。把地址错误当断链，会让一个配错的
+探活地址把整台设备永久判死——而现场往往先怀疑网络，最后才发现是自己写错了地址。
+
+#### 3.7.7 边界
+
+| 项 | 状态 | 说明 |
+|---|---|---|
+| 订阅 / 报警 | ❌ | S7 的报警需要建立独立的 PDU 通道；不实现 |
+| 符号表 / 块上传 | ❌ | 需要 S7 的浏览服务；点位必须手写地址 |
+| 设备发现 | ❌ | S7 无标准发现协议 |
+| 时间同步 | ❌ | 不在采集链路的关键路径上 |
+| TLS | 不适用 | S7 本身无 TLS；需要加密走 VPN/隧道 |
+| 多连接 | ⚠️ | 多数 CPU 允许的连接数很少；`concurrency` 默认 1 |
+
+内置从站（`internal/sim/s7`）只实现连接、Setup、Read Var、Write Var 四种 PDU，
+用于自测与演示。它与主站共用 `codec/s7`，所以「长度单位」这类语义不会在主从
+之间分叉——这是本项目对「自测有效性」的最低要求：测试夹具不能是另一套实现。
+
 ---
 
 ## 4. 错误模型
@@ -359,7 +494,7 @@ type OpError struct {
 | `modbus-tcp` | supported | supported | unsupported | unsupported | unsupported | supported | supported |
 | `modbus-rtu` | supported | supported | unsupported | unsupported | unsupported | supported | supported |
 | `modbus-ascii` | supported | supported | unsupported | unsupported | unsupported | supported | supported |
-| `s7` | supported | supported | unsupported | runtime_dependent | unsupported | supported | supported |
+| `s7` | supported | supported | unsupported | unsupported | unsupported | supported | supported |
 | `opcua` | supported | supported | supported | supported | supported | supported | unsupported |
 | `mqtt` | supported | unsupported | supported | unsupported | unsupported | unsupported | unsupported |
 | `virtual` | supported | supported | supported | supported | unsupported | supported | supported |

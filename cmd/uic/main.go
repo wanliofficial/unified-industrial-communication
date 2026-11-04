@@ -17,6 +17,7 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
+	"math"
 	"net/http"
 	"os"
 	"os/signal"
@@ -29,6 +30,7 @@ import (
 	"uic/internal/driver"
 	uicruntime "uic/internal/runtime"
 	sim "uic/internal/sim/modbus"
+	sims7 "uic/internal/sim/s7"
 )
 
 // 构建期注入：-ldflags "-X main.version=... -X main.commit=..."
@@ -270,12 +272,23 @@ func driverIDs() string {
 	return out
 }
 
-// simCmd 启动内置 Modbus TCP 从站，配合 examples/modbus-loopback.json 使用。
+// simCmd 启动内置从站。-protocol 选择 Modbus TCP 或 S7。
 func simCmd(args []string) {
 	fs := flag.NewFlagSet("sim", flag.ExitOnError)
 	addr := fs.String("listen", "127.0.0.1:15020", "监听地址")
 	size := fs.Int("size", 1024, "寄存器数量")
+	proto := fs.String("protocol", "modbus", "从站协议：modbus | s7")
+	pdu := fs.Int("pdu", 480, "S7 协商 PDU 长度（240/480/960）")
 	fs.Parse(args)
+
+	if *proto == "s7" {
+		simS7(*addr, *pdu)
+		return
+	}
+	if *proto != "modbus" {
+		fmt.Fprintf(os.Stderr, "未知协议 %q（支持 modbus | s7）\n", *proto)
+		os.Exit(2)
+	}
 
 	srv, err := sim.NewServer(*addr, *size)
 	if err != nil {
@@ -314,4 +327,54 @@ func simCmd(args []string) {
 	<-ctx.Done()
 	_ = srv.Close()
 	slog.Info("sim_stopped")
+}
+
+// simS7 启动内置 S7 从站。初始值刻意覆盖常见类型：REAL/INT/DINT/
+// STRING/位/字，这样 examples/s7.json 一跑起来就能看到每一类都对。
+func simS7(addr string, pduLen int) {
+	srv, err := sims7.NewServer(addr, pduLen)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "启动 S7 模拟从站失败: %v\n", err)
+		os.Exit(1)
+	}
+	srv.SetBytes(0x84, 1, 0, float32Bytes(12.5))
+	srv.SetBytes(0x84, 1, 4, []byte{0xFF, 0xFD})             // INT16 -3
+	srv.SetBytes(0x84, 1, 6, []byte{0x00, 0x01, 0x86, 0xA0}) // DINT 100000
+	srv.SetBytes(0x84, 1, 10, []byte("PUMP-01\x00"))
+	srv.SetBytes(0x84, 2, 0, []byte{0xBE, 0xEF})
+	srv.SetBytes(0x81, 0, 0, []byte{0x00, 0x2A})
+	srv.SetBit(0x83, 0, 0, 3, true)
+
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	fmt.Printf("s7 slave listening on %s (pdu=%d)\n", srv.Addr(), srv.PDULen())
+	fmt.Println("  DB1.DBD0=12.5  DB1.DBW4=-3  DB1.DBD6=100000  DB1.DBB10=\"PUMP-01\"")
+	fmt.Println("  DB2.DBW0=0xBEEF  IW0=42  M0.3=true")
+	fmt.Println("  DB1.DBD0 每秒变化，可用于观察 SSE")
+	fmt.Println("  Ctrl+C 停止")
+
+	go func() {
+		t := time.NewTicker(time.Second)
+		defer t.Stop()
+		i := 0
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				i++
+				srv.SetBytes(0x84, 1, 0, float32Bytes(float32(12.5+float64(i%10)/10)))
+			}
+		}
+	}()
+
+	<-ctx.Done()
+	_ = srv.Close()
+	slog.Info("sim_stopped")
+}
+
+func float32Bytes(v float32) []byte {
+	bits := math.Float32bits(v)
+	return []byte{byte(bits >> 24), byte(bits >> 16), byte(bits >> 8), byte(bits)}
 }

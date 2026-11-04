@@ -80,6 +80,18 @@ socat -d -d pty,raw,echo=0,link=/tmp/ttyV0 pty,raw,echo=0
 #   然后在 /tmp/ttyV0 上挂从站模拟器，或把配置里的 port 指向它
 ```
 
+S7（S7comm / ISO-on-TCP）链路：
+
+```bash
+./uic sim -protocol s7 -listen 127.0.0.1:15102 &   # 内置 S7 从站
+./uic -config examples/s7.json
+curl -s localhost:8085/api/v1/points | jq '.items[] | {point, value, quality}'
+```
+
+示例配置覆盖 7 个点位：DB1 的 REAL/INT16/DINT32/STRING、DB2 的 WORD、
+输入区 IW0、位地址 M0.3。模拟从站每秒改 DB1.DBD0，可用来观察 SSE。
+`-pdu 240|480|960` 可改协商值，用来验证切块（240 时 40 个 float 会被拆成多帧）。
+
 MQTT 北向（需要一个 Broker，任意 MQTT 3.1.1 服务端均可）：
 
 ```bash
@@ -367,22 +379,26 @@ obs  ← 所有包（不依赖任何内部包）
 
 | 包 | 职责 | 关键不变量 | 覆盖率 |
 |---|---|---|---|
-| `internal/model` | 通道/设备/点位/地址/采样/质量码 | 不依赖任何内部包；不变量集中在 `Validate` | 75.8% |
-| `internal/driver` | 驱动契约（Codec/Transport/Driver）、错误分类、注册表 | 能力四态；`Conn` 不保证并发安全，由调用方串行 | 90.6% |
-| `internal/codec/modbus` | Modbus 纯函数编解码（TCP/RTU/ASCII，主站与从站共用） | 无 I/O、无时钟、无可变状态 | 89.4% |
-| `internal/transport` | 字节流抽象 + TCP + 串口（termios） | 写满、读满或超时、关闭幂等；串口 deadline 不得静默失效 | 79.7% |
+| `internal/model` | 通道/设备/点位/地址/采样/质量码 | 不依赖任何内部包；不变量集中在 `Validate`；DB 号与 area 联动校验 | 79.1% |
+| `internal/driver` | 驱动契约（Codec/Transport/Driver）、错误分类、注册表 | 能力四态；`Conn` 不保证并发安全，由调用方串行；协议错误可用 `Kinded` 自带分类 | 89.3% |
+| `internal/codec/modbus` | Modbus 纯函数编解码（TCP/RTU/ASCII，主站与从站共用） | 无 I/O、无时钟、无可变状态 | 88.1% |
+| `internal/codec/value` | 协议无关值编解码（重排、数值/字符串/BCD） | 与协议无关；`Encode` 对 string/bytes 不猜宽度 | 95.0% |
+| `internal/codec/s7` | S7 纯函数编解码（TPKT/COTP/S7 PDU、长度单位换算） | 请求按字节、响应按位/字节的差异收敛在一处 | 80.3% |
+| `internal/transport` | 字节流抽象 + TCP + 串口（termios） | 写满、读满或超时、关闭幂等；协议层 deadline 不得被兜底值覆盖 | 80.2% |
 | `internal/driver/modbus` | Modbus TCP + RTU + ASCII 主站 | 事务号递增；异常码分类；部分失败不吞好样本；同串口事务串行；分帧类型参与端口冲突判定 | 83.9% |
+| `internal/driver/s7` | S7（S7comm）主站 | COTP/Setup 握手不可省；按协商 PDU 与 20 项上限切块；逐项返回码映射质量码 | 79.9% |
 | `internal/driver/virtual` | 虚拟设备（波形 + 故障注入） | 故障按「第 n 次请求」精确注入一次 | 98.6% |
 | `internal/sim/modbus` | 内置 Modbus TCP 从站 | 复用同一份 codec，避免主从语义漂移 | 87.2% |
-| `internal/planner` | 点位 → 批量读请求（ReadSpan） | 协议无关；按连续性/上限合并 | 93.9% |
-| `internal/scheduler` | tick、actor、信号量、退避、熔断、代次 | 同设备不并发；写优先；旧代次丢弃；状态回调不占采集路径 | 85.4% |
+| `internal/sim/s7` | 内置 S7 从站（内存 DB/M/I/Q 区） | 与主站共用 codec/s7；输入区只读；位写保邻位 | 71.9% |
+| `internal/planner` | 点位 → 批量读请求（ReadSpan） | 协议无关；按连续性/上限合并；按 `area:db` 分组 | 94.0% |
+| `internal/scheduler` | tick、actor、信号量、退避、熔断、代次 | 同设备不并发；写优先；旧代次丢弃；状态回调不占采集路径 | 87.8% |
 | `internal/pipeline` | 缩放、质量判定、死区过滤 | 质量不可用时不参与死区比较 | 92.7% |
 | `internal/cache` | 当前值唯一事实源 + 变更订阅 | 读写都要过这里，不允许模块自留副本 | 96.7% |
 | `internal/outbox` | 持久队列：分区、WAL、确认位点、三重上限 | at-least-once；整批或前缀成功才推进位点 | 77.4% |
-| `internal/config` | 加载、校验、规范化、版本化、回滚 | 幂等 Normalize；原子写；失败自动恢复；北向参数静态校验 | 80.6% |
+| `internal/config` | 加载、校验、规范化、版本化、回滚 | 幂等 Normalize；原子写；失败自动恢复；北向参数静态校验 | 83.1% |
 | `internal/obs` | 指标、结构化日志、日志环形缓冲 | 指标标签必须归一化（不能含原始 URL） | 88.2% |
 | `internal/northbound/httpapi` | REST + SSE + 认证 + 错误码 | 错误码稳定；响应不泄露凭据 | 80.0% |
-| `internal/mqtt` | MQTT 3.1.1 发布侧客户端（纯 Go，零依赖） | 单 goroutine 读 socket；QoS1 必须等到 PUBACK；断线立即失败而非超时 | 84.9% |
+| `internal/mqtt` | MQTT 3.1.1 发布侧客户端（纯 Go，零依赖） | 单 goroutine 读 socket；QoS1 必须等到 PUBACK；断线立即失败而非超时 | 84.3% |
 | `internal/mqtt/mqtttest` | 可复用的最小 Broker（测试夹具） | 只实现发布侧所需报文；配置必须在 accept 之前注入 | — |
 | `internal/runtime` | 唯一编排层 + 后端实现 + 看门狗 | 启动/关闭顺序；`configuredState` 与 `runtimeState` 分离；协议/传输匹配在装配期校验 | 80.8% |
 | `cmd/uic` | 单入口：run / sim / check / version | 关闭预算 10 秒 | — |
@@ -397,7 +413,7 @@ go test -race -count=1 ./...                    # 竞态 + 全量测试
 go test -coverprofile=c.out ./... && go tool cover -func=c.out | tail -1
 ```
 
-当前状态：`go build` / `go vet` / `gofmt` 全部干净，`go test -race ./...` 17 个包全部通过。
+当前状态：`go build` / `go vet` / `gofmt` 全部干净，`go test -race ./...` 21 个包全部通过。
 
 ### 9.3 源码阅读建议顺序
 
@@ -410,6 +426,7 @@ go test -coverprofile=c.out ./... && go tool cover -func=c.out | tail -1
 6. internal/outbox/outbox.go          持久队列的分区与确认（40 分钟）
 7. internal/runtime/backends.go       命令白名单与配置端点（30 分钟）
 8. internal/mqtt/codec.go + client.go 报文字节与 QoS1 确认（30 分钟）
+9. internal/driver/s7/driver.go       「一次事务多项」与 PDU 预算（40 分钟）
 ```
 
 ---
@@ -456,6 +473,8 @@ go test -coverprofile=c.out ./... && go tool cover -func=c.out | tail -1
 | Modbus TCP 主站 | ✅ | 批量读、单/多寄存器写、线圈写、位访问、异常码分类、字节序（ABCD/CDAB/BADC/DCBA） |
 | Modbus 寄存器位写 | ❌ | 只支持线圈写；寄存器读-改-写未实现（需要「读回-置位-写回」的原子性保证） |
 | Modbus RTU | ✅ | 串口 transport（termios raw、非阻塞 + deadline、tcdrain/tcflush）、3.5 字符帧间静默、按请求推导帧长、半包/CRC 错/unit 错/异常帧分类、同串口多从站共享 fd 并串行化事务 |
+| S7 主站 | ✅ | TPKT/COTP/S7comm 分层；COTP 目的 TSAP 按 rack/slot 计算；Setup 协商 PDU 后按「20 项 / PDU 预算」切块；DB/I/Q/M/C/T 区读写与位访问；逐项返回码分类（越界/缺 DB→地址错、写输入区→权限错）；部分失败保留好样本 |
+| S7 符号表 / 块上传 / 报警 | ❌ | 需要 S7 浏览与报警服务；点位必须手写地址 |
 | Modbus ASCII | ✅ | `:` + 十六进制 + LRC + CRLF 分帧；逐字符读到终止符并跳过 `:` 前杂散字节；与 RTU 共用 conn/codec；同一串口不允许混跑两种分帧（配置期报错） |
 | 虚拟驱动 | ✅ | 正弦/斜坡/随机/常量波形；丢包/超时/坏帧/地址错/断连五种故障注入 |
 | 调度与熔断 | ✅ | tick、actor、写优先、指数退避、熔断后转探活、代次隔离 |

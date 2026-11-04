@@ -34,6 +34,16 @@ Modbus ASCII（`:` + 十六进制 + LRC + CRLF，老式仪表常见）：
 ./uic -check -config examples/modbus-ascii.json
 ```
 
+S7（S7comm / ISO-on-TCP，TCP 102）：
+
+```bash
+./uic sim -protocol s7 -listen 127.0.0.1:15102 &   # 内置 S7 从站
+./uic -config examples/s7.json
+curl -s localhost:8085/api/v1/points
+#   7 点：DB1 的 REAL/INT16/DINT32/STRING、DB2 WORD、IW0、M0.3
+#   -pdu 240 可验证按协商 PDU 切块
+```
+
 MQTT 北向（需要一个 Broker；`mosquitto` 或任意 MQTT 3.1.1 服务端均可）：
 
 ```bash
@@ -69,13 +79,17 @@ go test -race -count=1 ./...
 
 | 路径 | 内容 |
 |---|---|
-| `cmd/uic/` | 单入口：`run` / `sim` / `-check` / `version` |
+| `cmd/uic/` | 单入口：`run` / `sim`（Modbus / S7）/ `-check` / `version` |
 | `internal/model` | 通道 / 设备 / 点位 / 地址 / 采样 / 质量码 |
 | `internal/driver` | 驱动契约（Codec / Transport / Driver）、错误分类、注册表 |
 | `internal/codec/modbus` | Modbus 纯函数编解码（主站与从站共用） |
+| `internal/codec/value` | 协议无关值编解码（重排 / 数值 / 字符串 / BCD） |
+| `internal/codec/s7` | S7 纯函数编解码（TPKT / COTP / S7 PDU） |
 | `internal/driver/modbus` | Modbus TCP + RTU + ASCII 主站 |
+| `internal/driver/s7` | S7（S7comm）主站 |
 | `internal/driver/virtual` | 虚拟设备（波形 + 故障注入） |
 | `internal/sim/modbus` | 内置 Modbus TCP 从站 |
+| `internal/sim/s7` | 内置 S7 从站（内存 DB/M/I/Q 区） |
 | `internal/planner` | 点位 → 批量读请求 |
 | `internal/scheduler` | tick / actor / 信号量 / 退避 / 熔断 / 代次隔离 |
 | `internal/pipeline` | 缩放 / 质量 / 死区 |

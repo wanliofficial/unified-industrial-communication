@@ -224,11 +224,23 @@ func E(kind ErrorKind, op, device, msg string, temporary bool, err error) *OpErr
 	return &OpError{Kind: kind, Op: op, Device: device, Msg: msg, Temporary: temporary, Err: err}
 }
 
+// Kinded 允许协议层错误自带分类。
+//
+// S7 的单项返回码（地址不存在、无权限）不是网络错误，也不该在驱动里
+// 逐处包装成 OpError：让错误对象自己回答「我属于哪一类」最不容易漏。
+type Kinded interface {
+	Kind() ErrorKind
+}
+
 // KindOf 提取错误分类；非 OpError 视为 internal。
 func KindOf(err error) ErrorKind {
 	var oe *OpError
 	if errors.As(err, &oe) {
 		return oe.Kind
+	}
+	var k Kinded
+	if errors.As(err, &k) {
+		return k.Kind()
 	}
 	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
 		return ErrTimeout

@@ -233,3 +233,44 @@ func TestConcurrentWritesAreSerialized(t *testing.T) {
 	}
 	wg.Wait()
 }
+
+// 协议层设置的 deadline 必须真的生效。曾经的实现每次 ReadFull 都重设
+// 5s 兜底，把设备级超时覆盖掉——表现是「熔断迟迟不触发」。
+func TestSetDeadlineShorterThanDefaultIsHonoured(t *testing.T) {
+	ln, addr := listen(t)
+	go func() {
+		c, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer c.Close()
+		// 一直不回数据。
+		<-time.After(2 * time.Second)
+	}()
+
+	s, err := DialTCP(context.Background(), addr, time.Second)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer s.Close()
+
+	ds, ok := s.(DeadlineSetter)
+	if !ok {
+		t.Fatal("tcp stream must implement DeadlineSetter")
+	}
+	if err := ds.SetDeadline(time.Now().Add(120 * time.Millisecond)); err != nil {
+		t.Fatalf("set deadline: %v", err)
+	}
+	start := time.Now()
+	_, err = s.ReadFull(1)
+	if err == nil {
+		t.Fatal("read must time out")
+	}
+	var ne interface{ Timeout() bool }
+	if !errors.As(err, &ne) || !ne.Timeout() {
+		t.Fatalf("err = %v, want timeout", err)
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("deadline not honoured: %v", elapsed)
+	}
+}

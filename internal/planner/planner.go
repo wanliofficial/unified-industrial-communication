@@ -46,7 +46,12 @@ func Build(dev model.Device, opt Options) ([]driver.ReadSpan, Stats) {
 	regs := map[string][]driver.PointRef{}
 	for _, r := range refs {
 		if r.Address.Kind == model.AddressRegister {
+			// DB 是地址命名空间的一部分：DB1.DBW0 与 DB2.DBW0 必须分到不
+			// 同的组，否则一次读取会把两个数据块的内容混在一起。
 			key := strings.ToLower(r.Address.Area)
+			if r.Address.DB > 0 {
+				key = fmt.Sprintf("%s:%d", key, r.Address.DB)
+			}
 			regs[key] = append(regs[key], r)
 			continue
 		}

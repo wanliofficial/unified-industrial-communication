@@ -8,9 +8,9 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
-	"math"
 	"strings"
 
+	"uic/internal/codec/value"
 	"uic/internal/driver"
 	"uic/internal/model"
 )
@@ -280,125 +280,16 @@ func (c *Codec) DecodeWrite(req driver.WriteRequest, resp []byte) (driver.WriteR
 // ---------------------------------------------------------------------------
 
 // Reorder 按字序策略重排 16 位字与字节。该变换是对称的（编码与解码共用）。
-func Reorder(b []byte, order model.ByteOrder) []byte {
-	if len(b) < 2 {
-		return b
-	}
-	out := make([]byte, len(b))
-	copy(out, b)
-	switch order {
-	case model.OrderCDAB:
-		// 字（16 位）顺序反转，字内字节保持大端。
-		words := len(out) / 2
-		for i := 0; i < words/2; i++ {
-			j := words - 1 - i
-			out[i*2], out[j*2] = out[j*2], out[i*2]
-			out[i*2+1], out[j*2+1] = out[j*2+1], out[i*2+1]
-		}
-	case model.OrderDCBA:
-		// 整值小端：全部字节反转（低字在前 + 字内小端）。
-		for i, j := 0, len(out)-1; i < j; i, j = i+1, j-1 {
-			out[i], out[j] = out[j], out[i]
-		}
-	case model.OrderBADC:
-		// 字内字节交换，字顺序不变。
-		for i := 0; i+1 < len(out); i += 2 {
-			out[i], out[i+1] = out[i+1], out[i]
-		}
-	}
-	return out
-}
+// Reorder 委托给 codec/value：值语义必须在所有协议间唯一。
+func Reorder(b []byte, order model.ByteOrder) []byte { return value.Reorder(b, order) }
 
+// decodeValue 委托给 codec/value（见该包文档：为什么不做协议内私有实现）。
 func decodeValue(b []byte, t model.DataType, order model.ByteOrder) (model.Value, error) {
-	switch t {
-	case model.TypeString:
-		return model.TextValue(t, strings.TrimRight(string(b), "\x00")), nil
-	case model.TypeBytes:
-		return model.BytesValue(b), nil
-	}
-	if len(b) < t.Bytes() {
-		return model.Value{}, fmt.Errorf("modbus: need %d bytes for %s, got %d", t.Bytes(), t, len(b))
-	}
-	raw := Reorder(b[:t.Bytes()], order)
-	switch t {
-	case model.TypeInt16:
-		return model.NumValue(t, float64(int16(binary.BigEndian.Uint16(raw)))), nil
-	case model.TypeUint16:
-		return model.NumValue(t, float64(binary.BigEndian.Uint16(raw))), nil
-	case model.TypeInt32:
-		return model.NumValue(t, float64(int32(binary.BigEndian.Uint32(raw)))), nil
-	case model.TypeUint32:
-		return model.NumValue(t, float64(binary.BigEndian.Uint32(raw))), nil
-	case model.TypeInt64:
-		return model.NumValue(t, float64(int64(binary.BigEndian.Uint64(raw)))), nil
-	case model.TypeUint64:
-		return model.NumValue(t, float64(binary.BigEndian.Uint64(raw))), nil
-	case model.TypeFloat32:
-		return model.NumValue(t, float64(math.Float32frombits(binary.BigEndian.Uint32(raw)))), nil
-	case model.TypeFloat64:
-		return model.NumValue(t, math.Float64frombits(binary.BigEndian.Uint64(raw))), nil
-	case model.TypeBCD16:
-		v, err := decodeBCD(raw)
-		return model.NumValue(t, v), err
-	case model.TypeBCD32:
-		v, err := decodeBCD(raw)
-		return model.NumValue(t, v), err
-	}
-	return model.Value{}, fmt.Errorf("modbus: unsupported dataType %q", t)
+	return value.Decode(b, t, order)
 }
 
 func encodeValue(v model.Value, t model.DataType, order model.ByteOrder) ([]byte, error) {
-	n := t.Bytes()
-	if n <= 0 {
-		return nil, fmt.Errorf("modbus: unsupported write type %q", t)
-	}
-	raw := make([]byte, n)
-	switch t {
-	case model.TypeInt16:
-		binary.BigEndian.PutUint16(raw, uint16(int16(v.Num)))
-	case model.TypeUint16:
-		binary.BigEndian.PutUint16(raw, uint16(v.Num))
-	case model.TypeInt32:
-		binary.BigEndian.PutUint32(raw, uint32(int32(v.Num)))
-	case model.TypeUint32:
-		binary.BigEndian.PutUint32(raw, uint32(v.Num))
-	case model.TypeInt64:
-		binary.BigEndian.PutUint64(raw, uint64(int64(v.Num)))
-	case model.TypeUint64:
-		binary.BigEndian.PutUint64(raw, uint64(v.Num))
-	case model.TypeFloat32:
-		binary.BigEndian.PutUint32(raw, math.Float32bits(float32(v.Num)))
-	case model.TypeFloat64:
-		binary.BigEndian.PutUint64(raw, math.Float64bits(v.Num))
-	case model.TypeBCD16, model.TypeBCD32:
-		encodeBCD(raw, v.Num)
-	default:
-		return nil, fmt.Errorf("modbus: unsupported write type %q", t)
-	}
-	return Reorder(raw, order), nil
-}
-
-func decodeBCD(b []byte) (float64, error) {
-	var out float64
-	for _, x := range b {
-		hi, lo := x>>4, x&0x0F
-		if hi > 9 || lo > 9 {
-			return 0, errors.New("modbus: invalid BCD digit")
-		}
-		out = out*100 + float64(hi)*10 + float64(lo)
-	}
-	return out, nil
-}
-
-func encodeBCD(b []byte, v float64) {
-	n := int64(math.Round(v))
-	for i := len(b) - 1; i >= 0; i-- {
-		lo := byte(n % 10)
-		n /= 10
-		hi := byte(n % 10)
-		n /= 10
-		b[i] = hi<<4 | lo
-	}
+	return value.Encode(v, t, order)
 }
 
 // ---------------------------------------------------------------------------

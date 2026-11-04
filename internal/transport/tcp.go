@@ -24,6 +24,12 @@ type Stream interface {
 type tcpStream struct {
 	mu   sync.Mutex
 	conn net.Conn
+	// deadline 是协议层按设备超时设置的截止时间；零值表示用内置兜底。
+	//
+	// 必须自己记住它而不是只调一次 conn.SetDeadline：ReadFull/Write 每次
+	// 都会重设 deadline，如果这里不保存，协议层设的值会被兜底值覆盖，
+	// 「设备超时 300ms」就变成了「永远 5s」——现场表现为熔断迟迟不触发。
+	deadline time.Time
 }
 
 // DialTCP 建立 TCP 连接。ctx 的截止时间同时作为连接与首次读写的超时。
@@ -45,7 +51,7 @@ func (s *tcpStream) Write(p []byte) error {
 	if s.conn == nil {
 		return errors.New("transport: closed")
 	}
-	_ = s.conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+	_ = s.conn.SetWriteDeadline(s.effectiveDeadline())
 	_, err := s.conn.Write(p)
 	return err
 }
@@ -56,7 +62,7 @@ func (s *tcpStream) ReadFull(n int) ([]byte, error) {
 	if s.conn == nil {
 		return nil, errors.New("transport: closed")
 	}
-	_ = s.conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	_ = s.conn.SetReadDeadline(s.effectiveDeadline())
 	buf := make([]byte, n)
 	if _, err := io.ReadFull(s.conn, buf); err != nil {
 		return nil, err
@@ -86,5 +92,18 @@ func (s *tcpStream) SetDeadline(t time.Time) error {
 	if s.conn == nil {
 		return errors.New("transport: closed")
 	}
+	s.deadline = t
 	return s.conn.SetDeadline(t)
+}
+
+// effectiveDeadline 取「协议层设置值」与「5s 兜底」中更早的一个。
+// 调用方必须持有 mu。
+func (s *tcpStream) effectiveDeadline() time.Time {
+	fallback := time.Now().Add(5 * time.Second)
+	if s.deadline.IsZero() || s.deadline.After(fallback) {
+		return fallback
+	}
+	// 已过期的 deadline 原样返回：调用方明确要求「现在就超时」，
+	// 静默延长会掩盖上层已经取消的事实。
+	return s.deadline
 }

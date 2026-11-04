@@ -32,6 +32,7 @@ import (
 	"uic/internal/config"
 	"uic/internal/driver"
 	"uic/internal/driver/modbus"
+	"uic/internal/driver/s7"
 	"uic/internal/driver/virtual"
 	"uic/internal/model"
 	"uic/internal/northbound/httpapi"
@@ -107,7 +108,7 @@ var (
 // 不启动 runtime 的场景下使用。
 func RegisterBuiltins() error {
 	registerOnce.Do(func() {
-		for _, d := range []driver.Driver{modbus.New(), modbus.NewRTU(), modbus.NewASCII(), virtual.New()} {
+		for _, d := range []driver.Driver{modbus.New(), modbus.NewRTU(), modbus.NewASCII(), s7.New(), virtual.New()} {
 			if err := driver.Register(d); err != nil {
 				registerErr = err
 				return

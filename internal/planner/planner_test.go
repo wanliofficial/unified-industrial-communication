@@ -167,3 +167,36 @@ func idFor(i int) string {
 	}
 	return "p" + string(b)
 }
+
+// 同一个区、同一个偏移但不同 DB 必须分开：否则 DB1.DBW0 与 DB2.DBW0
+// 会被合并成一次读取，读回来的值张冠李戴，而且很难从日志看出来。
+func TestBuildSeparatesDataBlocks(t *testing.T) {
+	mk := func(id string, db, offset int) model.Point {
+		p := pt(id, model.AddressRegister, "db", offset, 2, model.TypeUint16)
+		p.Address.DB = db
+		return p
+	}
+	dev := model.Device{ID: "d", ChannelID: "c", Enabled: true, Points: []model.Point{
+		mk("a", 1, 0), mk("b", 1, 2), mk("c", 2, 0), mk("d", 2, 2),
+	}}
+	spans, st := Build(dev, Options{})
+	if st.Points != 4 {
+		t.Fatalf("points = %d", st.Points)
+	}
+	if len(spans) != 2 {
+		t.Fatalf("spans = %d, want 2 (one per DB): %+v", len(spans), spans)
+	}
+	seen := map[int]bool{}
+	for _, s := range spans {
+		db := s.Points[0].Address.DB
+		if seen[db] {
+			t.Fatalf("db %d appears in more than one span", db)
+		}
+		seen[db] = true
+		for _, p := range s.Points {
+			if p.Address.DB != db {
+				t.Fatalf("span mixes db %d and %d", db, p.Address.DB)
+			}
+		}
+	}
+}

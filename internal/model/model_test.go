@@ -295,3 +295,52 @@ func TestPointLengthAndEffectiveValues(t *testing.T) {
 		t.Fatal("float value corrupted")
 	}
 }
+
+// DB 号是 S7 地址命名空间的一部分：它必须与 area 联动校验，否则
+// DB1.DBW0 会被当成 DB0（不存在的块）或与 DB2 混为一谈。
+func TestAddressDBValidateAndCanonical(t *testing.T) {
+	ok := Address{Kind: AddressRegister, Area: "db", DB: 3, Offset: 0, Length: 2, Bit: -1}
+	if err := ok.Validate(); err != nil {
+		t.Fatalf("valid db address: %v", err)
+	}
+	if got := ok.Canonical(); got != "db3:0:2" {
+		t.Fatalf("canonical = %q", got)
+	}
+	// 不同 DB、相同偏移必须产生不同的规范地址，否则缓存键会撞。
+	other := ok
+	other.DB = 4
+	if other.Canonical() == ok.Canonical() {
+		t.Fatal("canonical must include db number")
+	}
+
+	bad := map[string]Address{
+		"db area without db": {Kind: AddressRegister, Area: "db", Offset: 0, Bit: -1},
+		"db on non-db area":  {Kind: AddressRegister, Area: "merker", DB: 2, Offset: 0, Bit: -1},
+		"negative db":        {Kind: AddressRegister, Area: "db", DB: -1, Offset: 0, Bit: -1},
+	}
+	for name, a := range bad {
+		if err := a.Validate(); err == nil {
+			t.Fatalf("%s must be rejected", name)
+		}
+	}
+}
+
+// S7 的机架/槽必须能配置：S7-1200/1500 在槽 1，S7-300/400 在槽 2。
+func TestChannelRackSlotDefaults(t *testing.T) {
+	var c Channel
+	if c.EffectiveRack() != 0 || c.EffectiveSlot() != 2 {
+		t.Fatalf("defaults = rack %d slot %d, want 0/2", c.EffectiveRack(), c.EffectiveSlot())
+	}
+	c = Channel{Rack: 1, Slot: 4}
+	if c.EffectiveRack() != 1 || c.EffectiveSlot() != 4 {
+		t.Fatalf("explicit = rack %d slot %d", c.EffectiveRack(), c.EffectiveSlot())
+	}
+	for _, bad := range []Channel{
+		{ID: "c", Protocol: "s7", Transport: Transport{Kind: "tcp", Address: "h:102"}, Rack: 8},
+		{ID: "c", Protocol: "s7", Transport: Transport{Kind: "tcp", Address: "h:102"}, Slot: 32},
+	} {
+		if err := bad.Validate(); err == nil {
+			t.Fatalf("rack/slot out of range must be rejected: %+v", bad)
+		}
+	}
+}

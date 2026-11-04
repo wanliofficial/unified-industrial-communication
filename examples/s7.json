@@ -1,0 +1,100 @@
+{
+  "schemaVersion": 1,
+  "site": "s7-lab",
+  "server": {
+    "listen": "127.0.0.1:8085",
+    "token": "dev-token"
+  },
+  "storage": {
+    "dir": "./data-s7",
+    "journal": true,
+    "outboxMaxRecords": 5000,
+    "outboxTtl": "10m"
+  },
+  "logging": {
+    "level": "info"
+  },
+  "northbound": {
+    "webhook": {
+      "enabled": false,
+      "url": "http://127.0.0.1:9999/ingest",
+      "timeout": "3s"
+    }
+  },
+  "channels": [
+    {
+      "id": "ch-s7",
+      "protocol": "s7",
+      "transport": {
+        "kind": "tcp",
+        "address": "127.0.0.1:15102"
+      },
+      "rack": 0,
+      "slot": 2,
+      "concurrency": 1,
+      "timeout": "2s"
+    }
+  ],
+  "devices": [
+    {
+      "id": "plc01",
+      "name": "一号 PLC（S7-300，机架 0 / 槽 2）",
+      "channel": "ch-s7",
+      "interval": "1s",
+      "timeout": "2s",
+      "enabled": true,
+      "points": [
+        {
+          "id": "temperature",
+          "name": "温度",
+          "address": { "kind": "register", "area": "db", "db": 1, "offset": 0, "length": 4, "bit": -1 },
+          "dataType": "float32",
+          "unit": "degC",
+          "enabled": true
+        },
+        {
+          "id": "count",
+          "name": "计数",
+          "address": { "kind": "register", "area": "db", "db": 1, "offset": 4, "length": 2, "bit": -1 },
+          "dataType": "int16",
+          "enabled": true
+        },
+        {
+          "id": "total",
+          "name": "累计量",
+          "address": { "kind": "register", "area": "db", "db": 1, "offset": 6, "length": 4, "bit": -1 },
+          "dataType": "int32",
+          "enabled": true
+        },
+        {
+          "id": "label",
+          "name": "设备标识",
+          "address": { "kind": "register", "area": "db", "db": 1, "offset": 10, "length": 7, "bit": -1 },
+          "dataType": "string",
+          "enabled": true
+        },
+        {
+          "id": "db2word",
+          "name": "DB2 字",
+          "address": { "kind": "register", "area": "db", "db": 2, "offset": 0, "length": 2, "bit": -1 },
+          "dataType": "uint16",
+          "enabled": true
+        },
+        {
+          "id": "input_word",
+          "name": "输入字 IW0",
+          "address": { "kind": "register", "area": "input", "offset": 0, "length": 2, "bit": -1 },
+          "dataType": "uint16",
+          "enabled": true
+        },
+        {
+          "id": "run",
+          "name": "运行标志 M0.3",
+          "address": { "kind": "register", "area": "merker", "offset": 0, "length": 1, "bit": 3 },
+          "dataType": "bool",
+          "enabled": true
+        }
+      ]
+    }
+  ]
+}

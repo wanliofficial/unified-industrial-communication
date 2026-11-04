@@ -321,17 +321,22 @@ func TestMQTTRepublishesAfterReconnect(t *testing.T) {
 	})
 	b.WaitMessages(t, 1)
 
-	// 等客户端真的察觉断线再重发。DropAll 后立刻 Publish 会落在
-	// 「对端已关、本端未察觉」的窗口里：本地写仍可能成功，于是不会触发
-	// 重连，测试就变成了在赌时序。
+	// 等客户端真的察觉断线。注意不能假设「察觉后一定停留在断开状态」：
+	// 保活或并发的补发都可能已经触发重连。因此判定条件是「断线被观察到」
+	// （Connected 变 false 或 Connects 增加），而不是「Connected == false」。
+	// 后者在重连快到毫秒级时必然超时，是个纯粹的时序赌局。
 	b.DropAll()
+	connectsBefore := b.Connects()
 	deadline := time.Now().Add(3 * time.Second)
-	for s.client.Stats().Connected && time.Now().Before(deadline) {
+	for time.Now().Before(deadline) {
+		if !s.client.Stats().Connected || b.Connects() > connectsBefore {
+			break
+		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	if s.client.Stats().Connected {
+	if st := s.client.Stats(); st.Connected && b.Connects() == connectsBefore {
 		t.Fatalf("client did not notice dropped connection (connects=%d, stats=%+v)",
-			b.Connects(), s.client.Stats())
+			b.Connects(), st)
 	}
 
 	// QoS1 才会在真正成功前等到 PUBACK；QoS0 在已半关闭的 socket 上

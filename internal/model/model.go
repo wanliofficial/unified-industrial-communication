@@ -12,6 +12,7 @@ import (
 	"math"
 	"regexp"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -160,6 +161,11 @@ type Address struct {
 	Offset int    `json:"offset,omitempty"`
 	Length int    `json:"length,omitempty"`
 	Bit    int    `json:"bit,omitempty"`
+	// DB 是 S7 数据块号（area=db 时必填）。其他协议留空。
+	// 放进通用地址而不是塞进 Area 字符串，是为了让「同一个 area、不同 DB」
+	// 在规划阶段就是两个不同的组——否则 DB1.DBW0 与 DB2.DBW0 会被合并成
+	// 一次读取，读回来的值张冠李戴。
+	DB int `json:"db,omitempty"`
 
 	// symbol
 	Path  string `json:"path,omitempty"`
@@ -200,6 +206,16 @@ func (a Address) Validate() error {
 		if a.Path != "" || a.ObjectType != "" || a.FileID != 0 {
 			return errors.New("address: mixed fields for register kind")
 		}
+		if a.DB < 0 {
+			return errors.New("address.db: must be >= 0")
+		}
+		lower := strings.ToLower(a.Area)
+		if lower == "db" && a.DB < 1 {
+			return errors.New("address.db: required (>= 1) when area is db")
+		}
+		if lower != "db" && a.DB != 0 {
+			return fmt.Errorf("address.db: only valid with area db, got area %q", a.Area)
+		}
 	case AddressSymbol:
 		if a.Path == "" || !pathRe.MatchString(a.Path) {
 			return errors.New("address.path: required and must not contain spaces/control chars")
@@ -239,6 +255,9 @@ func (a Address) Canonical() string {
 		bit := ""
 		if a.Bit >= 0 {
 			bit = "." + strconv.Itoa(a.Bit)
+		}
+		if a.DB > 0 {
+			return fmt.Sprintf("%s%d:%d%s:%d", a.Area, a.DB, a.Offset, bit, a.Length)
 		}
 		return fmt.Sprintf("%s:%d%s:%d", a.Area, a.Offset, bit, a.Length)
 	case AddressSymbol:
@@ -494,6 +513,28 @@ type Channel struct {
 	Transport   Transport `json:"transport"`
 	Concurrency int       `json:"concurrency,omitempty"`
 	Timeout     Duration  `json:"timeout,omitempty"`
+
+	// Rack/Slot 是 S7 的 CPU 寻址参数，其他协议忽略。
+	// Slot 用 0 表示「未配置」，按 2 处理：槽 0 是电源模块，不可能是
+	// 通信目标，因此这个零值不会与合法配置冲突。
+	Rack int `json:"rack,omitempty"`
+	Slot int `json:"slot,omitempty"`
+}
+
+// EffectiveRack 返回机架号（默认 0）。
+func (c Channel) EffectiveRack() int {
+	if c.Rack < 0 {
+		return 0
+	}
+	return c.Rack
+}
+
+// EffectiveSlot 返回槽号（默认 2，S7-300/400 的常见值）。
+func (c Channel) EffectiveSlot() int {
+	if c.Slot <= 0 {
+		return 2
+	}
+	return c.Slot
 }
 
 // EffectiveConcurrency 返回通道并发上限（默认 4，范围 1..64）。
@@ -548,6 +589,12 @@ func (c Channel) Validate() error {
 	case "memory":
 	default:
 		return fmt.Errorf("channel %q: unknown transport kind %q", c.ID, c.Transport.Kind)
+	}
+	if c.Rack < 0 || c.Rack > 7 {
+		return fmt.Errorf("channel %q: rack %d out of range 0..7", c.ID, c.Rack)
+	}
+	if c.Slot < 0 || c.Slot > 31 {
+		return fmt.Errorf("channel %q: slot %d out of range 0..31", c.ID, c.Slot)
 	}
 	return nil
 }
