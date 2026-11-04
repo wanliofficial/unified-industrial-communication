@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"math"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -629,6 +630,186 @@ func (s Sample) Validate() error {
 	}
 	if s.Quality == QualityGood && s.Value.Type == "" {
 		return errors.New("sample: good quality requires a typed value")
+	}
+	return nil
+}
+
+// ---------------------------------------------------------------------------
+// 从站映射（把点位暴露给外部主站）
+// ---------------------------------------------------------------------------
+
+// MappingArea 是映射使用的寄存器区，与 Modbus 的四个功能区一一对应。
+type MappingArea string
+
+const (
+	MappingHolding  MappingArea = "holding"  // FC3 / FC6 / FC16
+	MappingInput    MappingArea = "input"    // FC4
+	MappingCoil     MappingArea = "coil"     // FC1 / FC5 / FC15
+	MappingDiscrete MappingArea = "discrete" // FC2
+)
+
+func (a MappingArea) Valid() bool {
+	switch a {
+	case MappingHolding, MappingInput, MappingCoil, MappingDiscrete:
+		return true
+	}
+	return false
+}
+
+// IsBits 表示该区按位寻址（每个映射占 1 位）。
+func (a MappingArea) IsBits() bool { return a == MappingCoil || a == MappingDiscrete }
+
+// AllowsWrite 表示该区允许外部主站写入。输入区与离散输入区是只读的，
+// 这一点由协议决定，不是实现取舍。
+func (a MappingArea) AllowsWrite() bool { return a == MappingHolding || a == MappingCoil }
+
+// SlaveMapping 把「设备上的一个点位」映射到「从站的一个地址」。
+//
+// 没有单独的编码配置：字节序取所属单元，宽度取点位类型与地址长度。
+// 允许逐点覆盖这些参数听起来更灵活，实际只会制造「同一台设备在上面读
+// 出来是 12.5、在下面读出来是 0.0」的调试噩梦。
+type SlaveMapping struct {
+	Point    string      `json:"point"` // device/point
+	Area     MappingArea `json:"area"`
+	Offset   int         `json:"offset"`
+	Writable bool        `json:"writable,omitempty"`
+}
+
+// SlaveUnit 是一个从站单元（Unit ID）的映射表。
+type SlaveUnit struct {
+	UnitID    int            `json:"unitId"`
+	ByteOrder ByteOrder      `json:"byteOrder,omitempty"`
+	Mappings  []SlaveMapping `json:"mappings"`
+}
+
+// Slave 是一个从站监听端点。
+//
+// 存在即启用：停用一个从站的方式是从配置里删掉它。额外的 enabled 字段
+// 只会制造「配置了但没生效」的状态，而这正是本项目要避免的那一类问题。
+type Slave struct {
+	ID             string      `json:"id"`
+	Listen         string      `json:"listen"`
+	MaxConnections int         `json:"maxConnections,omitempty"`
+	Units          []SlaveUnit `json:"units"`
+}
+
+// EffectiveMaxConnections 返回并发连接上限（默认 8，范围 1..64）。
+func (s Slave) EffectiveMaxConnections() int {
+	if s.MaxConnections <= 0 {
+		return 8
+	}
+	if s.MaxConnections > 64 {
+		return 64
+	}
+	return s.MaxConnections
+}
+
+// RegisterWidth 返回点位映射到 16 位寄存器区时占用的寄存器个数。
+//
+// 与 Length() 的差别：Length() 是驱动侧的读请求参数，缺省时由类型推导；
+// 映射必须给出确定宽度，否则同一个地址可能被两个点位同时声明，而这种
+// 冲突在运行期表现为「谁后写谁生效」，几乎不可能靠日志发现。
+func (p Point) RegisterWidth() int {
+	if p.DataType == TypeBool {
+		return 1
+	}
+	if n := p.Length(); n > 0 {
+		return n
+	}
+	return 1
+}
+
+// Validate 校验从站配置。points 的键是 "device/point"，由配置层构造：
+// 只有拿到点位元数据，才能判断宽度、可写性与地址重叠。
+func (s Slave) Validate(points map[string]Point) error {
+	if !idRe.MatchString(s.ID) {
+		return fmt.Errorf("slave.id %q: must match %s", s.ID, idRe.String())
+	}
+	if s.Listen == "" {
+		return fmt.Errorf("slave %q: listen required", s.ID)
+	}
+	if s.MaxConnections < 0 || s.MaxConnections > 64 {
+		return fmt.Errorf("slave %q: maxConnections %d out of range 0..64", s.ID, s.MaxConnections)
+	}
+	if len(s.Units) == 0 {
+		return fmt.Errorf("slave %q: at least one unit required", s.ID)
+	}
+	seen := make(map[int]bool, len(s.Units))
+	for _, u := range s.Units {
+		if err := u.Validate(points); err != nil {
+			return fmt.Errorf("slave %q: %w", s.ID, err)
+		}
+		if seen[u.UnitID] {
+			return fmt.Errorf("slave %q: duplicate unitId %d", s.ID, u.UnitID)
+		}
+		seen[u.UnitID] = true
+	}
+	return nil
+}
+
+// Validate 校验单元映射：地址范围不能重叠，可写映射必须指向可写点位。
+func (u SlaveUnit) Validate(points map[string]Point) error {
+	// 0 是广播地址，不能作为单播目标；248..255 是保留值。
+	if u.UnitID < 0 || u.UnitID > 247 {
+		return fmt.Errorf("unitId %d out of range 0..247", u.UnitID)
+	}
+	if !u.ByteOrder.Valid() {
+		return fmt.Errorf("unit %d: byteOrder %q invalid", u.UnitID, u.ByteOrder)
+	}
+	if len(u.Mappings) == 0 {
+		return fmt.Errorf("unit %d: at least one mapping required", u.UnitID)
+	}
+
+	type span struct {
+		start int
+		end   int
+		point string
+	}
+	spans := map[MappingArea][]span{}
+	for i, m := range u.Mappings {
+		dev, pt, ok := strings.Cut(m.Point, "/")
+		if !ok || dev == "" || pt == "" {
+			return fmt.Errorf("unit %d mapping[%d]: point %q must be device/point", u.UnitID, i, m.Point)
+		}
+		p, ok := points[m.Point]
+		if !ok {
+			return fmt.Errorf("unit %d mapping[%d]: point %q not found", u.UnitID, i, m.Point)
+		}
+		if !m.Area.Valid() {
+			return fmt.Errorf("unit %d mapping[%d]: area %q must be holding|input|coil|discrete",
+				u.UnitID, i, m.Area)
+		}
+		if m.Offset < 0 || m.Offset > 65535 {
+			return fmt.Errorf("unit %d mapping[%d]: offset %d out of range 0..65535", u.UnitID, i, m.Offset)
+		}
+		if m.Writable {
+			if !m.Area.AllowsWrite() {
+				return fmt.Errorf("unit %d mapping[%d]: area %q is read-only", u.UnitID, i, m.Area)
+			}
+			if !p.Writable {
+				return fmt.Errorf("unit %d mapping[%d]: point %q is not writable", u.UnitID, i, m.Point)
+			}
+		}
+		width := 1
+		if !m.Area.IsBits() {
+			width = p.RegisterWidth()
+		}
+		if m.Offset+width > 65536 {
+			return fmt.Errorf("unit %d mapping[%d]: %s@%d width %d overflows address space",
+				u.UnitID, i, m.Area, m.Offset, width)
+		}
+		spans[m.Area] = append(spans[m.Area], span{m.Offset, m.Offset + width, m.Point})
+	}
+
+	for area, list := range spans {
+		sort.Slice(list, func(i, j int) bool { return list[i].start < list[j].start })
+		for i := 1; i < len(list); i++ {
+			if list[i].start < list[i-1].end {
+				return fmt.Errorf("unit %d: %s@%d (%s) overlaps %s@%d (%s)",
+					u.UnitID, area, list[i].start, list[i].point,
+					area, list[i-1].start, list[i-1].point)
+			}
+		}
 	}
 	return nil
 }

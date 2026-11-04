@@ -344,3 +344,119 @@ func TestChannelRackSlotDefaults(t *testing.T) {
 		}
 	}
 }
+
+// 映射宽度必须由点位类型确定，不能靠调用方猜。
+// string/bytes 的 length 是「寄存器个数」，这是 Modbus 从站映射最容易配错
+// 的地方：把 10 写成 10 个字符，会占掉 10 个寄存器而不是 5 个。
+func TestPointRegisterWidth(t *testing.T) {
+	cases := []struct {
+		name string
+		pt   Point
+		want int
+	}{
+		{"bool", Point{DataType: TypeBool}, 1},
+		{"uint16", Point{DataType: TypeUint16}, 1},
+		{"int16 no length", Point{DataType: TypeInt16}, 1},
+		{"float32", Point{DataType: TypeFloat32}, 2},
+		{"float64", Point{DataType: TypeFloat64}, 4},
+		{"uint32 explicit", Point{DataType: TypeUint32, Address: Address{Kind: AddressRegister, Length: 3}}, 3},
+		{"string 10 regs", Point{DataType: TypeString, Address: Address{Kind: AddressRegister, Length: 10}}, 10},
+		{"bytes 4 regs", Point{DataType: TypeBytes, Address: Address{Kind: AddressRegister, Length: 4}}, 4},
+		{"string no length", Point{DataType: TypeString}, 1},
+	}
+	for _, c := range cases {
+		if got := c.pt.RegisterWidth(); got != c.want {
+			t.Fatalf("%s: width = %d, want %d", c.name, got, c.want)
+		}
+	}
+}
+
+// 从站校验要挡住三类错误：地址重叠、越界、可写性与点位不一致。
+// 这些错误如果放到运行期，表现是「谁后写谁生效」或「写下去没反应」，
+// 几乎不可能靠日志定位。
+func TestSlaveValidateBoundaries(t *testing.T) {
+	points := map[string]Point{
+		"plc/u16": {ID: "u16", DataType: TypeUint16},
+		"plc/f32": {ID: "f32", DataType: TypeFloat32},
+		"plc/ro":  {ID: "ro", DataType: TypeUint16},
+		"plc/rw":  {ID: "rw", DataType: TypeUint16, Writable: true},
+	}
+	base := func() Slave {
+		return Slave{
+			ID: "scada", Listen: "127.0.0.1:1502",
+			Units: []SlaveUnit{{
+				UnitID: 1,
+				Mappings: []SlaveMapping{
+					{Point: "plc/u16", Area: MappingHolding, Offset: 0},
+				},
+			}},
+		}
+	}
+	if err := base().Validate(points); err != nil {
+		t.Fatalf("valid: %v", err)
+	}
+
+	// 边界：65535 处放 1 个寄存器刚好占满地址空间，合法。
+	edge := base()
+	edge.Units[0].Mappings[0].Offset = 65535
+	if err := edge.Validate(points); err != nil {
+		t.Fatalf("last register must be addressable: %v", err)
+	}
+	edge.Units[0].Mappings[0].Offset = 65536
+	if err := edge.Validate(points); err == nil {
+		t.Fatal("offset 65536 must be rejected")
+	}
+
+	// 65535 处放 float32（2 寄存器）会越界。
+	over := base()
+	over.Units[0].Mappings[0] = SlaveMapping{Point: "plc/f32", Area: MappingHolding, Offset: 65535}
+	if err := over.Validate(points); err == nil {
+		t.Fatal("float32 at 65535 overflows address space")
+	}
+
+	// 同一区不允许重叠；不同区允许同偏移。
+	same := base()
+	same.Units[0].Mappings = append(same.Units[0].Mappings,
+		SlaveMapping{Point: "plc/f32", Area: MappingHolding, Offset: 0})
+	if err := same.Validate(points); err == nil {
+		t.Fatal("overlap within an area must be rejected")
+	}
+	other := base()
+	other.Units[0].Mappings = append(other.Units[0].Mappings,
+		SlaveMapping{Point: "plc/f32", Area: MappingInput, Offset: 0})
+	if err := other.Validate(points); err != nil {
+		t.Fatalf("same offset in a different area is legal: %v", err)
+	}
+
+	// 可写映射必须两端都允许写。
+	roArea := base()
+	roArea.Units[0].Mappings[0] = SlaveMapping{Point: "plc/rw", Area: MappingInput, Offset: 0, Writable: true}
+	if err := roArea.Validate(points); err == nil {
+		t.Fatal("writable mapping in input area must be rejected")
+	}
+	roPoint := base()
+	roPoint.Units[0].Mappings[0] = SlaveMapping{Point: "plc/ro", Area: MappingHolding, Offset: 0, Writable: true}
+	if err := roPoint.Validate(points); err == nil {
+		t.Fatal("writable mapping of a read-only point must be rejected")
+	}
+
+	// 单元与从站层面的重复。
+	dupUnit := base()
+	dupUnit.Units = append(dupUnit.Units, dupUnit.Units[0])
+	if err := dupUnit.Validate(points); err == nil {
+		t.Fatal("duplicate unitId must be rejected")
+	}
+	var noUnits Slave
+	noUnits.ID, noUnits.Listen = "x", ":1502"
+	if err := noUnits.Validate(points); err == nil {
+		t.Fatal("slave without units must be rejected")
+	}
+
+	// 默认连接数：0 → 8，超上限截到 64。
+	if got := (Slave{}).EffectiveMaxConnections(); got != 8 {
+		t.Fatalf("default max connections = %d", got)
+	}
+	if got := (Slave{MaxConnections: 1000}).EffectiveMaxConnections(); got != 64 {
+		t.Fatalf("max connections cap = %d", got)
+	}
+}

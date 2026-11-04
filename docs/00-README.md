@@ -92,6 +92,26 @@ curl -s localhost:8085/api/v1/points | jq '.items[] | {point, value, quality}'
 输入区 IW0、位地址 M0.3。模拟从站每秒改 DB1.DBD0，可用来观察 SSE。
 `-pdu 240|480|960` 可改协商值，用来验证切块（240 时 40 个 float 会被拆成多帧）。
 
+从站（把采集到的点位反向暴露给 SCADA / 第三方主站）：
+
+```bash
+./uic sim -listen 127.0.0.1:15020 &           # 上游设备
+./uic -config examples/modbus-slave.json &    # REST :8086，Modbus 从站 :1502
+
+./uic mbread -addr 127.0.0.1:1502 -unit 1 -area holding -offset 0 -qty 4
+./uic mbread -addr 127.0.0.1:1502 -area holding -offset 3 -write 777
+./uic mbread -addr 127.0.0.1:1502 -area coil -offset 0 -qty 1
+```
+
+`uic mbread` 是内置的极简主站，用来在不装任何第三方工具的情况下验证从站：
+寄存器区打印 uint16 / int16 / 十六进制并按 ABCD 拼 float32，位区打印逐位状态。
+读一个跨越未映射地址的区间会返回异常码 `0x02`——这是有意的，补零会让主站
+把「没配映射」当成真实值 0。
+
+从站映射的宽度来自点位类型（`Point.RegisterWidth()`），可写性必须同时满足
+「区可写（holding/coil）」与「点位 `writable: true`」。写入会穿透到
+`Runtime.Write`，与 REST 写入共用设备 actor 与校验，不存在第二条绕过治理的写路径。
+
 MQTT 北向（需要一个 Broker，任意 MQTT 3.1.1 服务端均可）：
 
 ```bash
@@ -379,7 +399,7 @@ obs  ← 所有包（不依赖任何内部包）
 
 | 包 | 职责 | 关键不变量 | 覆盖率 |
 |---|---|---|---|
-| `internal/model` | 通道/设备/点位/地址/采样/质量码 | 不依赖任何内部包；不变量集中在 `Validate`；DB 号与 area 联动校验 | 79.1% |
+| `internal/model` | 通道/设备/点位/地址/采样/质量码 | 不依赖任何内部包；不变量集中在 `Validate`；DB 号与 area 联动校验 | 80.3% |
 | `internal/driver` | 驱动契约（Codec/Transport/Driver）、错误分类、注册表 | 能力四态；`Conn` 不保证并发安全，由调用方串行；协议错误可用 `Kinded` 自带分类 | 89.3% |
 | `internal/codec/modbus` | Modbus 纯函数编解码（TCP/RTU/ASCII，主站与从站共用） | 无 I/O、无时钟、无可变状态 | 88.1% |
 | `internal/codec/value` | 协议无关值编解码（重排、数值/字符串/BCD） | 与协议无关；`Encode` 对 string/bytes 不猜宽度 | 95.0% |
@@ -390,12 +410,13 @@ obs  ← 所有包（不依赖任何内部包）
 | `internal/driver/virtual` | 虚拟设备（波形 + 故障注入） | 故障按「第 n 次请求」精确注入一次 | 98.6% |
 | `internal/sim/modbus` | 内置 Modbus TCP 从站 | 复用同一份 codec，避免主从语义漂移 | 87.2% |
 | `internal/sim/s7` | 内置 S7 从站（内存 DB/M/I/Q 区） | 与主站共用 codec/s7；输入区只读；位写保邻位 | 71.9% |
+| `internal/slave/modbus` | Modbus TCP 从站（把点位暴露给外部主站） | 读走 cache、写走 Runtime.Write；未映射地址报错不补零；坏质量保留最后值并计数 | 73.8% |
 | `internal/planner` | 点位 → 批量读请求（ReadSpan） | 协议无关；按连续性/上限合并；按 `area:db` 分组 | 94.0% |
 | `internal/scheduler` | tick、actor、信号量、退避、熔断、代次 | 同设备不并发；写优先；旧代次丢弃；状态回调不占采集路径 | 87.8% |
 | `internal/pipeline` | 缩放、质量判定、死区过滤 | 质量不可用时不参与死区比较 | 92.7% |
 | `internal/cache` | 当前值唯一事实源 + 变更订阅 | 读写都要过这里，不允许模块自留副本 | 96.7% |
 | `internal/outbox` | 持久队列：分区、WAL、确认位点、三重上限 | at-least-once；整批或前缀成功才推进位点 | 77.4% |
-| `internal/config` | 加载、校验、规范化、版本化、回滚 | 幂等 Normalize；原子写；失败自动恢复；北向参数静态校验 | 83.1% |
+| `internal/config` | 加载、校验、规范化、版本化、回滚 | 幂等 Normalize；原子写；失败自动恢复；北向参数与从站映射静态校验 | 84.1% |
 | `internal/obs` | 指标、结构化日志、日志环形缓冲 | 指标标签必须归一化（不能含原始 URL） | 88.2% |
 | `internal/northbound/httpapi` | REST + SSE + 认证 + 错误码 | 错误码稳定；响应不泄露凭据 | 80.0% |
 | `internal/mqtt` | MQTT 3.1.1 发布侧客户端（纯 Go，零依赖） | 单 goroutine 读 socket；QoS1 必须等到 PUBACK；断线立即失败而非超时 | 84.3% |
@@ -413,7 +434,7 @@ go test -race -count=1 ./...                    # 竞态 + 全量测试
 go test -coverprofile=c.out ./... && go tool cover -func=c.out | tail -1
 ```
 
-当前状态：`go build` / `go vet` / `gofmt` 全部干净，`go test -race ./...` 21 个包全部通过。
+当前状态：`go build` / `go vet` / `gofmt` 全部干净，`go test -race ./...` 22 个包全部通过。
 
 ### 9.3 源码阅读建议顺序
 
@@ -427,6 +448,7 @@ go test -coverprofile=c.out ./... && go tool cover -func=c.out | tail -1
 7. internal/runtime/backends.go       命令白名单与配置端点（30 分钟）
 8. internal/mqtt/codec.go + client.go 报文字节与 QoS1 确认（30 分钟）
 9. internal/driver/s7/driver.go       「一次事务多项」与 PDU 预算（40 分钟）
+10. internal/slave/modbus/server.go    从站：映射、跨映射读、写穿透（40 分钟）
 ```
 
 ---
@@ -475,6 +497,9 @@ go test -coverprofile=c.out ./... && go tool cover -func=c.out | tail -1
 | Modbus RTU | ✅ | 串口 transport（termios raw、非阻塞 + deadline、tcdrain/tcflush）、3.5 字符帧间静默、按请求推导帧长、半包/CRC 错/unit 错/异常帧分类、同串口多从站共享 fd 并串行化事务 |
 | S7 主站 | ✅ | TPKT/COTP/S7comm 分层；COTP 目的 TSAP 按 rack/slot 计算；Setup 协商 PDU 后按「20 项 / PDU 预算」切块；DB/I/Q/M/C/T 区读写与位访问；逐项返回码分类（越界/缺 DB→地址错、写输入区→权限错）；部分失败保留好样本 |
 | S7 符号表 / 块上传 / 报警 | ❌ | 需要 S7 浏览与报警服务；点位必须手写地址 |
+| Modbus TCP 从站 | ✅ | `slaves[]` 存在即启用；四区（holding/input/coil/discrete）映射；跨映射与半值读；写穿透到 `Runtime.Write`；坏质量保留最后值并计入 `uic_slave_degraded_reads_total`；映射变化按指纹重建监听；`uic mbread` 可自检 |
+| Modbus RTU/ASCII 从站 | ❌ | 只做 TCP；串口从站需要与主站角色互斥，语义与治理规则都不同 |
+| Modbus 诊断功能码（FC8/FC11/FC17/FC43） | ❌ | 只实现读写类功能码（FC1/2/3/4/5/6/15/16） |
 | Modbus ASCII | ✅ | `:` + 十六进制 + LRC + CRLF 分帧；逐字符读到终止符并跳过 `:` 前杂散字节；与 RTU 共用 conn/codec；同一串口不允许混跑两种分帧（配置期报错） |
 | 虚拟驱动 | ✅ | 正弦/斜坡/随机/常量波形；丢包/超时/坏帧/地址错/断连五种故障注入 |
 | 调度与熔断 | ✅ | tick、actor、写优先、指数退避、熔断后转探活、代次隔离 |

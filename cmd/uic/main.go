@@ -1,9 +1,10 @@
-// Command uic 是单一可执行入口：run（默认）/ sim / version。
+// Command uic 是单一可执行入口：run（默认）/ sim / mbread / version。
 //
 //	uic -config config.json            # 前台运行
 //	uic run -config config.json        # 同上
 //	uic -check -config config.json     # 只校验配置
 //	uic sim -listen 127.0.0.1:15020    # 内置 Modbus TCP 从站
+//	uic mbread -addr 127.0.0.1:1502    # 不依赖第三方工具的从站读写自检
 //
 // 关闭顺序遵循 docs/03-product/02-architecture.md §11.2：
 // 停止接收流量 → 停调度 → 排空 Outbox → 关连接，总预算 10 秒。
@@ -51,6 +52,8 @@ func main() {
 		runCmd(args)
 	case "sim":
 		simCmd(args)
+	case "mbread":
+		mbreadCmd(args)
 	case "version", "-v", "--version":
 		printVersion()
 	case "help", "-h", "--help":
@@ -69,6 +72,8 @@ func usage() {
   uic [run] -config config.json [-listen :8080] [-token TOKEN]
   uic -check -config config.json
   uic sim [-listen 127.0.0.1:15020]
+  uic mbread -addr 127.0.0.1:1502 -unit 1 -area holding -offset 0 -qty 2
+  uic mbread -addr 127.0.0.1:1502 -area holding -offset 5 -write 777
   uic version
 
 参数:

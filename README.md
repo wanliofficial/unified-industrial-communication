@@ -44,6 +44,18 @@ curl -s localhost:8085/api/v1/points
 #   -pdu 240 可验证按协商 PDU 切块
 ```
 
+从站（把网关采集到的点位反向暴露给 SCADA / 第三方主站）：
+
+```bash
+./uic sim -listen 127.0.0.1:15020 &           # 上游设备
+./uic -config examples/modbus-slave.json &    # REST :8086，Modbus 从站 :1502
+./uic mbread -addr 127.0.0.1:1502 -unit 1 -area holding -offset 0 -qty 4
+./uic mbread -addr 127.0.0.1:1502 -area holding -offset 3 -write 777
+```
+
+`uic mbread` 是内置的极简主站：寄存器打印 uint16 / int16 / 十六进制并拼 float32，
+位区逐位打印。写入会穿透到真实设备，不是改缓存。
+
 MQTT 北向（需要一个 Broker；`mosquitto` 或任意 MQTT 3.1.1 服务端均可）：
 
 ```bash
@@ -79,7 +91,7 @@ go test -race -count=1 ./...
 
 | 路径 | 内容 |
 |---|---|
-| `cmd/uic/` | 单入口：`run` / `sim`（Modbus / S7）/ `-check` / `version` |
+| `cmd/uic/` | 单入口：`run` / `sim`（Modbus / S7）/ `mbread` / `-check` / `version` |
 | `internal/model` | 通道 / 设备 / 点位 / 地址 / 采样 / 质量码 |
 | `internal/driver` | 驱动契约（Codec / Transport / Driver）、错误分类、注册表 |
 | `internal/codec/modbus` | Modbus 纯函数编解码（主站与从站共用） |
@@ -90,6 +102,7 @@ go test -race -count=1 ./...
 | `internal/driver/virtual` | 虚拟设备（波形 + 故障注入） |
 | `internal/sim/modbus` | 内置 Modbus TCP 从站 |
 | `internal/sim/s7` | 内置 S7 从站（内存 DB/M/I/Q 区） |
+| `internal/slave/modbus` | Modbus TCP 从站（把点位映射给外部主站，写穿透到南向） |
 | `internal/planner` | 点位 → 批量读请求 |
 | `internal/scheduler` | tick / actor / 信号量 / 退避 / 熔断 / 代次隔离 |
 | `internal/pipeline` | 缩放 / 质量 / 死区 |

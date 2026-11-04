@@ -1,0 +1,93 @@
+{
+  "schemaVersion": 1,
+  "site": "slave-demo",
+  "server": {
+    "listen": "127.0.0.1:8086",
+    "token": "dev-token"
+  },
+  "storage": {
+    "dir": "./data-slave",
+    "journal": true,
+    "outboxMaxRecords": 5000,
+    "outboxTtl": "10m"
+  },
+  "logging": {
+    "level": "info"
+  },
+  "channels": [
+    {
+      "id": "ch-modbus",
+      "protocol": "modbus-tcp",
+      "transport": {
+        "kind": "tcp",
+        "address": "127.0.0.1:15020"
+      },
+      "concurrency": 2,
+      "timeout": "1s"
+    }
+  ],
+  "devices": [
+    {
+      "id": "sim01",
+      "name": "内置 Modbus 从站",
+      "channel": "ch-modbus",
+      "unitId": 1,
+      "interval": "500ms",
+      "timeout": "1s",
+      "enabled": true,
+      "points": [
+        {
+          "id": "reg0",
+          "address": { "kind": "register", "area": "holding", "offset": 0, "length": 1, "bit": -1 },
+          "dataType": "uint16",
+          "enabled": true
+        },
+        {
+          "id": "reg1",
+          "address": { "kind": "register", "area": "holding", "offset": 1, "length": 1, "bit": -1 },
+          "dataType": "uint16",
+          "enabled": true
+        },
+        {
+          "id": "counter",
+          "address": { "kind": "register", "area": "holding", "offset": 10, "length": 1, "bit": -1 },
+          "dataType": "uint16",
+          "enabled": true
+        },
+        {
+          "id": "write_me",
+          "address": { "kind": "register", "area": "holding", "offset": 5, "length": 1, "bit": -1 },
+          "dataType": "uint16",
+          "writable": true,
+          "enabled": true
+        },
+        {
+          "id": "coil0",
+          "address": { "kind": "register", "area": "coil", "offset": 0, "length": 1, "bit": -1 },
+          "dataType": "bool",
+          "enabled": true
+        }
+      ]
+    }
+  ],
+  "slaves": [
+    {
+      "id": "scada",
+      "listen": "127.0.0.1:1502",
+      "maxConnections": 8,
+      "units": [
+        {
+          "unitId": 1,
+          "byteOrder": "ABCD",
+          "mappings": [
+            { "point": "sim01/reg0", "area": "holding", "offset": 0 },
+            { "point": "sim01/reg1", "area": "holding", "offset": 1 },
+            { "point": "sim01/counter", "area": "holding", "offset": 2 },
+            { "point": "sim01/write_me", "area": "holding", "offset": 3, "writable": true },
+            { "point": "sim01/coil0", "area": "coil", "offset": 0 }
+          ]
+        }
+      ]
+    }
+  ]
+}

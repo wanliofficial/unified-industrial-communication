@@ -39,6 +39,7 @@ import (
 	"uic/internal/obs"
 	"uic/internal/outbox"
 	"uic/internal/scheduler"
+	slavemb "uic/internal/slave/modbus"
 )
 
 // Options 是 runtime 的启动参数。
@@ -73,10 +74,12 @@ type Runtime struct {
 	journalSink *journalSink
 	mqttSink    *mqttSink
 
-	mu         sync.Mutex
-	collectors map[string]*collector
-	sinks      map[string]deliverFunc
-	sinkNames  []string
+	mu          sync.Mutex
+	collectors  map[string]*collector
+	slaves      map[string]*slavemb.Server
+	slavePrints map[string]string
+	sinks       map[string]deliverFunc
+	sinkNames   []string
 
 	dropSeen map[string]map[string]int64
 	idem     map[string]idemEntry
@@ -183,6 +186,12 @@ func New(opt Options) (*Runtime, error) {
 		}
 		return nil, err
 	}
+	if err := r.openSlaves(mgr.Current()); err != nil {
+		if logFile != nil {
+			_ = logFile.Close()
+		}
+		return nil, err
+	}
 	if err := r.openSinks(mgr.Current()); err != nil {
 		if logFile != nil {
 			_ = logFile.Close()
@@ -221,6 +230,9 @@ func (r *Runtime) declareMetrics() {
 	d("uic_stale_total", "counter", "点位被判定为 stale 的次数")
 	d("uic_config_apply_total", "counter", "配置应用次数与结果")
 	d("uic_mqtt_publish_total", "counter", "MQTT 发布次数与结果")
+	d("uic_slave_requests_total", "counter", "从站请求数（按单元/功能码/结果）")
+	d("uic_slave_degraded_reads_total", "counter", "从站用非好质量数据应答的次数")
+	d("uic_slave_write_total", "counter", "从站写入转发次数与结果")
 }
 
 // build 按配置创建采集器并注册到调度器。
@@ -307,6 +319,8 @@ func (r *Runtime) Stop(timeout time.Duration) error {
 	case <-time.After(timeout / 2):
 		r.log.Warn("runtime_stop_timeout", "stage", "workers")
 	}
+
+	r.closeSlaves()
 
 	var first error
 	if r.box != nil {
@@ -526,6 +540,7 @@ func (r *Runtime) reload(before *config.File) []string {
 		r.markDisabled(nd)
 		restarted = append(restarted, id)
 	}
+	restarted = append(restarted, r.syncSlaves(after)...)
 	sort.Strings(restarted)
 	if len(restarted) > 0 {
 		r.log.Info("config_applied", "version", r.cfg.Version(), "restarted", restarted)

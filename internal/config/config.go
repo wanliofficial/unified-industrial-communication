@@ -15,6 +15,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"net"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -126,9 +127,12 @@ type File struct {
 	Server        Server          `json:"server"`
 	Channels      []model.Channel `json:"channels"`
 	Devices       []model.Device  `json:"devices"`
-	Northbound    Northbound      `json:"northbound,omitempty"`
-	Storage       Storage         `json:"storage,omitempty"`
-	Logging       Logging         `json:"logging,omitempty"`
+	// Slaves 把采集到的点位以 Modbus 从站形式暴露给外部主站。它不参与
+	// 采集调度，因此与 channels/devices 并列而不是挂在设备下。
+	Slaves     []model.Slave `json:"slaves,omitempty"`
+	Northbound Northbound    `json:"northbound,omitempty"`
+	Storage    Storage       `json:"storage,omitempty"`
+	Logging    Logging       `json:"logging,omitempty"`
 }
 
 var siteRe = regexp.MustCompile(`^[a-z][a-z0-9-]{1,31}$`)
@@ -255,7 +259,42 @@ func (f *File) Validate() error {
 			}
 		}
 	}
+	if err := f.validateSlaves(); err != nil {
+		return err
+	}
 	return f.validateNorthbound()
+}
+
+// validateSlaves 校验从站映射。
+//
+// 需要先有 devices 的索引：映射宽度的唯一来源是点位类型，可写性也来自
+// 点位本身。把这两件事分开定义，迟早会出现「从站说可写、点位说只读」
+// 的矛盾配置。
+func (f *File) validateSlaves() error {
+	if len(f.Slaves) == 0 {
+		return nil
+	}
+	points := make(map[string]model.Point)
+	for _, d := range f.Devices {
+		for _, p := range d.Points {
+			points[d.ID+"/"+p.ID] = p
+		}
+	}
+	seen := make(map[string]bool, len(f.Slaves))
+	for _, s := range f.Slaves {
+		if err := s.Validate(points); err != nil {
+			return err
+		}
+		if seen[s.ID] {
+			return fmt.Errorf("slave %q: duplicate id", s.ID)
+		}
+		seen[s.ID] = true
+		// 与北向 HTTP 监听撞端口是最常见的配置错误，值得单独拦一次。
+		if listenConflicts(s.Listen, f.Server.Listen) {
+			return fmt.Errorf("slave %q: listen %q conflicts with server.listen", s.ID, s.Listen)
+		}
+	}
+	return nil
 }
 
 // validateNorthbound 校验北向通道参数。
@@ -282,6 +321,24 @@ func (f *File) validateNorthbound() error {
 		}
 	}
 	return nil
+}
+
+// listenConflicts 判断两个监听地址是否必然冲突。
+//
+// 只做保守判断：端口为 0（随机分配）永远不算冲突；端口相同且主机相同
+// 或任一是通配地址时才算。宁可漏报也不要误报——把合法配置拦下来，
+// 运维只能去改端口，问题反而被掩盖。
+func listenConflicts(a, b string) bool {
+	ha, pa, errA := net.SplitHostPort(a)
+	hb, pb, errB := net.SplitHostPort(b)
+	if errA != nil || errB != nil {
+		return a == b
+	}
+	if pa != pb || pa == "0" || pa == "" {
+		return false
+	}
+	wild := func(h string) bool { return h == "" || h == "0.0.0.0" || h == "::" || h == "[::]" }
+	return ha == hb || wild(ha) || wild(hb)
 }
 
 // Canonical 输出确定性 JSON，作为版本哈希的输入。

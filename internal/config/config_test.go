@@ -562,3 +562,80 @@ func TestMQTTQoSTriState(t *testing.T) {
 		t.Fatalf("explicit qos0 became %d", q)
 	}
 }
+
+// 从站映射的校验必须落到点位元数据上：宽度来自类型，可写性来自点位，
+// 这两件事分开定义迟早会出现「从站说可写、点位说只读」的矛盾配置。
+func TestValidateSlaveMappings(t *testing.T) {
+	registerDrivers(t)
+	good := func() *File {
+		f := baseFile()
+		f.Slaves = []model.Slave{{
+			ID: "scada", Listen: "127.0.0.1:1502",
+			Units: []model.SlaveUnit{{
+				UnitID: 1,
+				Mappings: []model.SlaveMapping{
+					{Point: "dev1/p1", Area: model.MappingHolding, Offset: 0},
+				},
+			}},
+		}}
+		return f
+	}
+	if err := good().Validate(); err != nil {
+		t.Fatalf("valid slave: %v", err)
+	}
+
+	cases := map[string]func(*File){
+		"unknown point": func(f *File) {
+			f.Slaves[0].Units[0].Mappings[0].Point = "dev1/ghost"
+		},
+		"bad area": func(f *File) {
+			f.Slaves[0].Units[0].Mappings[0].Area = "registers"
+		},
+		"overlap": func(f *File) {
+			// p1 是 float32，占 2 个寄存器；offset 1 与它重叠。
+			f.Slaves[0].Units[0].Mappings = append(f.Slaves[0].Units[0].Mappings,
+				model.SlaveMapping{Point: "dev1/p1", Area: model.MappingHolding, Offset: 1})
+		},
+		"write to read-only area": func(f *File) {
+			f.Slaves[0].Units[0].Mappings[0].Area = model.MappingInput
+			f.Slaves[0].Units[0].Mappings[0].Writable = true
+		},
+		"write to read-only point": func(f *File) {
+			f.Slaves[0].Units[0].Mappings[0].Writable = true
+		},
+		"unit out of range": func(f *File) { f.Slaves[0].Units[0].UnitID = 248 },
+		"duplicate unit": func(f *File) {
+			f.Slaves[0].Units = append(f.Slaves[0].Units, f.Slaves[0].Units[0])
+		},
+		"duplicate slave": func(f *File) { f.Slaves = append(f.Slaves, f.Slaves[0]) },
+		"port conflict":   func(f *File) { f.Slaves[0].Listen = ":8080" },
+		"empty units":     func(f *File) { f.Slaves[0].Units = nil },
+	}
+	for name, mut := range cases {
+		f := good()
+		mut(f)
+		if err := f.Validate(); err == nil {
+			t.Fatalf("%s: expected validation error", name)
+		}
+	}
+}
+
+// 端口 0 是「随机分配」，永远不该被判成冲突：测试与容器部署都靠它。
+func TestListenConflicts(t *testing.T) {
+	cases := []struct {
+		a, b string
+		want bool
+	}{
+		{"127.0.0.1:0", "127.0.0.1:0", false},
+		{":0", ":8080", false},
+		{"127.0.0.1:8080", "127.0.0.1:8080", true},
+		{"0.0.0.0:8080", "127.0.0.1:8080", true},
+		{"127.0.0.1:8080", "127.0.0.1:8081", false},
+		{"[::]:8080", "127.0.0.1:8080", true},
+	}
+	for _, c := range cases {
+		if got := listenConflicts(c.a, c.b); got != c.want {
+			t.Fatalf("listenConflicts(%q, %q) = %v, want %v", c.a, c.b, got, c.want)
+		}
+	}
+}
