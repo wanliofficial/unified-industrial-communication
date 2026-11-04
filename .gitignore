@@ -1,9 +1,15 @@
+# ---- 构建产物 ----
+/uic
+uic.exe
+dist/
 target/
 *.class
 *.jar
 *.war
 *.ear
 *.iml
+
+# ---- 临时/编辑 ----
 *.log
 *.tmp
 *.swp
@@ -17,4 +23,18 @@ target/
 *.metadata/
 *.gradle/
 *.mvn/
+
+# ---- 运行时数据 ----
+# 默认数据目录：快照、Outbox、状态文件、日志
+/data/
+/data-*/
+# 配置版本与状态（写在配置文件同目录时产生）
+/examples/config.state.json
+/examples/snapshots/
+# Outbox 队列文件
+*.wal
+*.cursor
+journal.ndjson
+
+# ---- 本地参考清单（不入库）----
 readme.txt

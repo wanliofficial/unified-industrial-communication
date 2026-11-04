@@ -1,0 +1,227 @@
+{
+  "schemaVersion": 1,
+  "site": "demo-site",
+  "server": {
+    "listen": "127.0.0.1:8080",
+    "tls": {
+      "enabled": false
+    }
+  },
+  "channels": [
+    {
+      "id": "ch-virtual",
+      "protocol": "virtual",
+      "transport": {
+        "kind": "memory"
+      },
+      "concurrency": 8,
+      "timeout": "2s"
+    }
+  ],
+  "devices": [
+    {
+      "id": "line-a",
+      "name": "产线 A（正弦波形）",
+      "channel": "ch-virtual",
+      "interval": "1s",
+      "timeout": "2s",
+      "enabled": true,
+      "points": [
+        {
+          "id": "temperature",
+          "name": "温度",
+          "address": {
+            "kind": "register",
+            "area": "holding",
+            "length": 2,
+            "bit": -1
+          },
+          "dataType": "float32",
+          "unit": "℃",
+          "deadband": 0.2,
+          "enabled": true
+        },
+        {
+          "id": "pressure",
+          "name": "压力",
+          "address": {
+            "kind": "register",
+            "area": "holding",
+            "offset": 2,
+            "length": 4,
+            "bit": -1
+          },
+          "dataType": "float64",
+          "unit": "kPa",
+          "deadband": 0.5,
+          "enabled": true
+        },
+        {
+          "id": "running",
+          "name": "运行",
+          "address": {
+            "kind": "register",
+            "area": "coil",
+            "length": 1,
+            "bit": -1
+          },
+          "dataType": "bool",
+          "enabled": true
+        },
+        {
+          "id": "counter",
+          "name": "产量计数",
+          "address": {
+            "kind": "register",
+            "area": "holding",
+            "offset": 10,
+            "length": 2,
+            "bit": -1
+          },
+          "dataType": "uint32",
+          "enabled": true
+        },
+        {
+          "id": "setpoint",
+          "name": "温度设定",
+          "address": {
+            "kind": "register",
+            "area": "holding",
+            "offset": 20,
+            "length": 2,
+            "bit": -1
+          },
+          "dataType": "float32",
+          "unit": "℃",
+          "writable": true,
+          "enabled": true
+        },
+        {
+          "id": "alarm",
+          "name": "报警字",
+          "address": {
+            "kind": "symbol",
+            "path": "Status.Alarm"
+          },
+          "dataType": "bool",
+          "enabled": true
+        },
+        {
+          "id": "mode",
+          "name": "运行模式",
+          "address": {
+            "kind": "symbol",
+            "path": "Status.Mode"
+          },
+          "dataType": "string",
+          "enabled": true
+        }
+      ],
+      "labels": {
+        "mode": "sine"
+      }
+    },
+    {
+      "id": "line-b",
+      "name": "产线 B（第 5 次读取注入超时）",
+      "channel": "ch-virtual",
+      "interval": "1s",
+      "timeout": "2s",
+      "enabled": true,
+      "points": [
+        {
+          "id": "speed",
+          "name": "转速",
+          "address": {
+            "kind": "register",
+            "area": "holding",
+            "offset": 100,
+            "length": 2,
+            "bit": -1
+          },
+          "dataType": "float32",
+          "unit": "rpm",
+          "deadband": 1,
+          "enabled": true
+        },
+        {
+          "id": "load",
+          "name": "负载",
+          "address": {
+            "kind": "register",
+            "area": "holding",
+            "offset": 102,
+            "length": 2,
+            "bit": -1
+          },
+          "dataType": "float32",
+          "unit": "%",
+          "deadband": 1,
+          "enabled": true
+        }
+      ],
+      "labels": {
+        "fault": "timeout",
+        "faultAt": "5",
+        "mode": "ramp"
+      }
+    },
+    {
+      "id": "line-c",
+      "name": "产线 C（已停用）",
+      "channel": "ch-virtual",
+      "interval": "2s",
+      "timeout": "2s",
+      "enabled": false,
+      "points": [
+        {
+          "id": "level",
+          "name": "液位",
+          "address": {
+            "kind": "register",
+            "area": "holding",
+            "offset": 200,
+            "length": 2,
+            "bit": -1
+          },
+          "dataType": "float32",
+          "unit": "m",
+          "enabled": true
+        }
+      ],
+      "labels": {
+        "mode": "const"
+      }
+    }
+  ],
+  "northbound": {
+    "mqtt": {
+      "enabled": false,
+      "broker": "tcp://127.0.0.1:1883",
+      "topic": "uic/{site}/{device}/{point}",
+      "qos": 1
+    },
+    "opcua": {
+      "enabled": false,
+      "listen": ":4840",
+      "policy": "Basic256Sha256"
+    },
+    "webhook": {
+      "enabled": false,
+      "url": "http://127.0.0.1:9999/ingest",
+      "timeout": "3s",
+      "batch": 50
+    }
+  },
+  "storage": {
+    "dir": "./data-demo",
+    "outboxMaxBytes": 8388608,
+    "outboxMaxRecords": 20000,
+    "outboxTtl": "1h0m0s",
+    "journal": true
+  },
+  "logging": {
+    "level": "info",
+    "format": "json"
+  }
+}

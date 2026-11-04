@@ -1,0 +1,85 @@
+{
+  "schemaVersion": 1,
+  "site": "loopback",
+  "server": {
+    "listen": "127.0.0.1:8081",
+    "token": "dev-token"
+  },
+  "storage": {
+    "dir": "./data-loopback",
+    "journal": true,
+    "outboxMaxRecords": 5000,
+    "outboxTtl": "10m"
+  },
+  "logging": {
+    "level": "info"
+  },
+  "northbound": {
+    "webhook": {
+      "enabled": false,
+      "url": "http://127.0.0.1:9999/ingest",
+      "timeout": "3s"
+    }
+  },
+  "channels": [
+    {
+      "id": "ch-modbus",
+      "protocol": "modbus-tcp",
+      "transport": {
+        "kind": "tcp",
+        "address": "127.0.0.1:15020"
+      },
+      "concurrency": 2,
+      "timeout": "1s"
+    }
+  ],
+  "devices": [
+    {
+      "id": "sim01",
+      "name": "内置 Modbus 从站",
+      "channel": "ch-modbus",
+      "unitId": 1,
+      "interval": "500ms",
+      "timeout": "1s",
+      "enabled": true,
+      "points": [
+        {
+          "id": "reg0",
+          "name": "保持寄存器 0",
+          "address": { "kind": "register", "area": "holding", "offset": 0, "length": 1, "bit": -1 },
+          "dataType": "uint16",
+          "enabled": true
+        },
+        {
+          "id": "reg1",
+          "name": "保持寄存器 1",
+          "address": { "kind": "register", "area": "holding", "offset": 1, "length": 1, "bit": -1 },
+          "dataType": "uint16",
+          "enabled": true
+        },
+        {
+          "id": "counter",
+          "name": "每秒自增",
+          "address": { "kind": "register", "area": "holding", "offset": 10, "length": 1, "bit": -1 },
+          "dataType": "uint16",
+          "enabled": true
+        },
+        {
+          "id": "write_me",
+          "name": "可写寄存器",
+          "address": { "kind": "register", "area": "holding", "offset": 5, "length": 1, "bit": -1 },
+          "dataType": "uint16",
+          "writable": true,
+          "enabled": true
+        },
+        {
+          "id": "coil0",
+          "name": "线圈 0",
+          "address": { "kind": "register", "area": "coil", "offset": 0, "length": 1, "bit": -1 },
+          "dataType": "bool",
+          "enabled": true
+        }
+      ]
+    }
+  ]
+}
