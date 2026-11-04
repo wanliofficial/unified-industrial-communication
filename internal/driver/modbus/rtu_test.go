@@ -424,13 +424,13 @@ func TestAcquirePortRejectsParamConflict(t *testing.T) {
 	f := &fakeSerial{}
 	opener := func(transport.SerialConfig) (transport.Stream, error) { return f, nil }
 
-	ref, err := acquirePort(transport.SerialConfig{Port: "/dev/fake2", Baud: 9600}, opener)
+	ref, err := acquirePort("rtu", transport.SerialConfig{Port: "/dev/fake2", Baud: 9600}, opener)
 	if err != nil {
 		t.Fatalf("first acquire: %v", err)
 	}
 	defer func() { _ = ref.Close() }()
 
-	_, err = acquirePort(transport.SerialConfig{Port: "/dev/fake2", Baud: 19200}, opener)
+	_, err = acquirePort("rtu", transport.SerialConfig{Port: "/dev/fake2", Baud: 19200}, opener)
 	if err == nil {
 		t.Fatal("conflicting baud must be rejected")
 	}
@@ -444,11 +444,11 @@ func TestAcquirePortReusesSameConfig(t *testing.T) {
 		return f, nil
 	}
 	cfg := transport.SerialConfig{Port: "/dev/fake3", Baud: 9600}
-	r1, err := acquirePort(cfg, opener)
+	r1, err := acquirePort("rtu", cfg, opener)
 	if err != nil {
 		t.Fatal(err)
 	}
-	r2, err := acquirePort(cfg, opener)
+	r2, err := acquirePort("rtu", cfg, opener)
 	if err != nil {
 		t.Fatal(err)
 	}

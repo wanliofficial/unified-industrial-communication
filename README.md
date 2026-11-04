@@ -28,6 +28,12 @@ curl -s localhost:8081/api/v1/points
 ./uic -config examples/modbus-rtu.json
 ```
 
+Modbus ASCII（`:` + 十六进制 + LRC + CRLF，老式仪表常见）：
+
+```bash
+./uic -check -config examples/modbus-ascii.json
+```
+
 MQTT 北向（需要一个 Broker；`mosquitto` 或任意 MQTT 3.1.1 服务端均可）：
 
 ```bash
@@ -67,7 +73,7 @@ go test -race -count=1 ./...
 | `internal/model` | 通道 / 设备 / 点位 / 地址 / 采样 / 质量码 |
 | `internal/driver` | 驱动契约（Codec / Transport / Driver）、错误分类、注册表 |
 | `internal/codec/modbus` | Modbus 纯函数编解码（主站与从站共用） |
-| `internal/driver/modbus` | Modbus TCP + RTU 主站 |
+| `internal/driver/modbus` | Modbus TCP + RTU + ASCII 主站 |
 | `internal/driver/virtual` | 虚拟设备（波形 + 故障注入） |
 | `internal/sim/modbus` | 内置 Modbus TCP 从站 |
 | `internal/planner` | 点位 → 批量读请求 |

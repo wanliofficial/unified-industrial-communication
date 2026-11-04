@@ -23,10 +23,14 @@ var (
 
 // sharedSerial 是一个已经打开的物理串口，被同一路径上的所有设备共享。
 type sharedSerial struct {
-	cfg  transport.SerialConfig
-	st   transport.Stream
-	id   string
-	refs int
+	cfg transport.SerialConfig
+	st  transport.Stream
+	id  string
+	// proto 记录这根线上跑的是哪种分帧（rtu / ascii）。同一根物理线
+	// 不可能同时跑两种分帧：静默复用会让两种帧交错，症状是随机的
+	// CRC/LRC 错，几乎无法从日志判断。
+	proto string
+	refs  int
 
 	// mu 是总线事务锁：从「清空接收缓冲」到「读完整帧」必须独占。
 	// 半双工链路上一旦交错，收到的字节会来自另一台设备的响应。
@@ -85,7 +89,7 @@ func (r *portRef) Close() error {
 //
 // 同一路径已用不同参数打开时直接报错，而不是静默再开一个 fd：现场把
 // 两个通道的波特率配错是常见事故，静默复用只会让故障挪到更难查的地方。
-func acquirePort(cfg transport.SerialConfig, opener SerialOpener) (*portRef, error) {
+func acquirePort(proto string, cfg transport.SerialConfig, opener SerialOpener) (*portRef, error) {
 	cfg = cfg.Normalized()
 	if err := cfg.Validate(); err != nil {
 		return nil, err
@@ -102,6 +106,10 @@ func acquirePort(cfg transport.SerialConfig, opener SerialOpener) (*portRef, err
 			return nil, fmt.Errorf("serial %s already open as %s, refusing to reopen as %s",
 				cfg.Port, p.cfg, cfg)
 		}
+		if p.proto != proto {
+			return nil, fmt.Errorf("serial %s already open for %s framing, refusing to open for %s",
+				cfg.Port, p.proto, proto)
+		}
 		p.refs++
 		return &portRef{port: p}, nil
 	}
@@ -110,7 +118,7 @@ func acquirePort(cfg transport.SerialConfig, opener SerialOpener) (*portRef, err
 	if err != nil {
 		return nil, err
 	}
-	p := &sharedSerial{cfg: cfg, st: st, id: cfg.Port, refs: 1}
+	p := &sharedSerial{cfg: cfg, st: st, id: cfg.Port, proto: proto, refs: 1}
 	portTable[cfg.Port] = p
 	return &portRef{port: p}, nil
 }

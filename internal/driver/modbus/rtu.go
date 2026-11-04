@@ -75,7 +75,7 @@ func (d *RTU) Open(ctx context.Context, cfg driver.OpenConfig) (driver.Conn, err
 	if opener == nil {
 		opener = transport.OpenSerial
 	}
-	ref, err := acquirePort(sc, opener)
+	ref, err := acquirePort("rtu", sc, opener)
 	if err != nil {
 		// 打开串口失败通常是「设备被拔了/权限不对/参数被占用」，属可重试。
 		return nil, driver.E(driver.ErrDisconnected, "open", cfg.Device.ID,

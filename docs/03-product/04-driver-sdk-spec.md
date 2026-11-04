@@ -271,6 +271,25 @@ type Transport interface {
 从 O(帧长) 降到 2~3 次；更重要的是，从站写坏字节计数时会立刻被 CRC 拒绝，
 而不是让主站挂到设备超时才失败——后者在现场表现为「偶发 3 秒延迟」，极难定位。
 
+### 3.6.2 Modbus ASCII 的额外约束
+
+ASCII 与 RTU 共用 connect / codec，只在分帧层不同。但有四条硬约束不能照搬：
+
+| # | 约束 | 不做会怎样 | 代码落点 |
+|---|---|---|---|
+| A1 | 帧以 `:` 开头、CRLF 结尾；LRC 为「地址+PDU」按字节求和取补码 | 用 CRC 当 LRC 校验，永远不通过；现场表现为「从站明明有回包但主站报协议错」 | `codec/modbus/ascii.go` `LRC` |
+| A2 | 逐字符读到 CRLF（没有长度字段），读前跳过 `:` 之前的杂散字节 | 上一次事务残留的字符被当成帧头，重启后第一帧必失败 | `asciiFraming.readFrame` |
+| A3 | 端口注册表把**分帧类型**纳入冲突判定：同一路径不能既跑 RTU 又跑 ASCII | 两种帧交错，症状是随机 LRC/CRC 错，日志里看不出根因 | `acquirePort(proto, …)` |
+| A4 | 十六进制解析严格：必须偶数长度、必须是十六进制字符、LRC 必须吻合 | 「尽力解析」会把半条帧解析成合法值，比读失败危险得多 | `ParseASCII` |
+
+**默认串口参数**：ASCII 规范推荐 7 位数据位 + 偶校验，但现代设备普遍是 8N1。
+`Meta().ConfigFields` 里把 7E1 作为默认值填入**字段说明**，而不是替用户改写配置：
+驱动不替用户猜硬件参数，只把「手册里的推荐值」告诉他。
+
+**与 RTU 的能力差异**：没有。ASCII 同样支持 FC1/2/3/4/5/6/15/16，同样支持
+位访问与批量读。字符膨胀约 2 倍，因此在 9600 波特下吞吐约为 RTU 的一半——
+这是帧格式的固有代价，不是实现取舍。
+
 **平台边界**：串口实现只提供 Linux 版本（`serial_linux.go`）。非 Linux 平台
 返回 `ErrSerialUnsupported` 的**显式失败**，不做静默降级：Windows 串口需要
 DCB 结构走另一套 API，在没有真实硬件可验证之前，写一个测不了的实现比不写更
@@ -339,6 +358,7 @@ type OpError struct {
 |---|---|---|---|---|---|---|---|
 | `modbus-tcp` | supported | supported | unsupported | unsupported | unsupported | supported | supported |
 | `modbus-rtu` | supported | supported | unsupported | unsupported | unsupported | supported | supported |
+| `modbus-ascii` | supported | supported | unsupported | unsupported | unsupported | supported | supported |
 | `s7` | supported | supported | unsupported | runtime_dependent | unsupported | supported | supported |
 | `opcua` | supported | supported | supported | supported | supported | supported | unsupported |
 | `mqtt` | supported | unsupported | supported | unsupported | unsupported | unsupported | unsupported |

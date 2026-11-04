@@ -69,7 +69,8 @@ func TestCheckDriverBindings(t *testing.T) {
 	good := []model.Channel{
 		{ID: "a", Protocol: "modbus-tcp", Transport: model.Transport{Kind: "tcp", Address: "h:502"}},
 		{ID: "b", Protocol: "modbus-rtu", Transport: model.Transport{Kind: "serial", Port: "/dev/ttyUSB0", Baud: 9600}},
-		{ID: "c", Protocol: "virtual", Transport: model.Transport{Kind: "memory"}},
+		{ID: "c", Protocol: "modbus-ascii", Transport: model.Transport{Kind: "serial", Port: "/dev/ttyUSB0", Baud: 9600}},
+		{ID: "d", Protocol: "virtual", Transport: model.Transport{Kind: "memory"}},
 	}
 	if err := CheckDriverBindings(good); err != nil {
 		t.Fatalf("valid channels rejected: %v", err)
@@ -77,6 +78,8 @@ func TestCheckDriverBindings(t *testing.T) {
 
 	bad := []model.Channel{
 		{ID: "x", Protocol: "modbus-tcp", Transport: model.Transport{Kind: "serial", Port: "/dev/ttyS0"}},
+		// ASCII 也只能走串口；配成 tcp 同样是静态错误。
+		{ID: "z", Protocol: "modbus-ascii", Transport: model.Transport{Kind: "tcp", Address: "h:502"}},
 	}
 	if err := CheckDriverBindings(bad); err == nil {
 		t.Fatal("protocol/transport mismatch must be rejected")
