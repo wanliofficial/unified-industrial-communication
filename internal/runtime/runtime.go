@@ -106,7 +106,7 @@ var (
 // 不启动 runtime 的场景下使用。
 func RegisterBuiltins() error {
 	registerOnce.Do(func() {
-		for _, d := range []driver.Driver{modbus.New(), virtual.New()} {
+		for _, d := range []driver.Driver{modbus.New(), modbus.NewRTU(), virtual.New()} {
 			if err := driver.Register(d); err != nil {
 				registerErr = err
 				return

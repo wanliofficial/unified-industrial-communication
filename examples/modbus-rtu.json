@@ -1,0 +1,116 @@
+{
+  "schemaVersion": 1,
+  "site": "rtu-lab",
+  "server": {
+    "listen": "127.0.0.1:8082",
+    "token": "dev-token"
+  },
+  "storage": {
+    "dir": "./data-rtu",
+    "journal": true,
+    "outboxMaxRecords": 5000,
+    "outboxTtl": "10m"
+  },
+  "logging": {
+    "level": "debug"
+  },
+  "northbound": {
+    "webhook": {
+      "enabled": false,
+      "url": "http://127.0.0.1:9999/ingest",
+      "timeout": "3s"
+    }
+  },
+  "channels": [
+    {
+      "id": "ch-rtu",
+      "protocol": "modbus-rtu",
+      "transport": {
+        "kind": "serial",
+        "port": "/dev/ttyUSB0",
+        "baud": 9600,
+        "dataBits": 8,
+        "parity": "none",
+        "stopBits": 1
+      },
+      "concurrency": 1,
+      "timeout": "1s"
+    }
+  ],
+  "devices": [
+    {
+      "id": "meter01",
+      "name": "一号电表（从站地址 1）",
+      "channel": "ch-rtu",
+      "unitId": 1,
+      "interval": "1s",
+      "timeout": "1s",
+      "enabled": true,
+      "points": [
+        {
+          "id": "voltage",
+          "name": "A 相电压",
+          "address": { "kind": "register", "area": "holding", "offset": 0, "length": 1, "bit": -1 },
+          "dataType": "uint16",
+          "scale": 0.1,
+          "unit": "V",
+          "enabled": true
+        },
+        {
+          "id": "current",
+          "name": "A 相电流",
+          "address": { "kind": "register", "area": "holding", "offset": 1, "length": 1, "bit": -1 },
+          "dataType": "uint16",
+          "scale": 0.01,
+          "unit": "A",
+          "enabled": true
+        },
+        {
+          "id": "energy",
+          "name": "累计电量",
+          "address": { "kind": "register", "area": "input", "offset": 10, "length": 2, "bit": -1 },
+          "dataType": "uint32",
+          "scale": 0.01,
+          "unit": "kWh",
+          "enabled": true
+        },
+        {
+          "id": "run",
+          "name": "运行状态",
+          "address": { "kind": "register", "area": "coil", "offset": 0, "length": 1, "bit": -1 },
+          "dataType": "bool",
+          "enabled": true
+        }
+      ]
+    },
+    {
+      "id": "meter02",
+      "name": "二号电表（从站地址 2，同一总线）",
+      "channel": "ch-rtu",
+      "unitId": 2,
+      "interval": "1s",
+      "timeout": "1s",
+      "enabled": true,
+      "points": [
+        {
+          "id": "voltage",
+          "name": "A 相电压",
+          "address": { "kind": "register", "area": "holding", "offset": 0, "length": 1, "bit": -1 },
+          "dataType": "uint16",
+          "scale": 0.1,
+          "unit": "V",
+          "enabled": true
+        },
+        {
+          "id": "current",
+          "name": "A 相电流",
+          "address": { "kind": "register", "area": "holding", "offset": 1, "length": 1, "bit": -1 },
+          "dataType": "uint16",
+          "scale": 0.01,
+          "unit": "A",
+          "enabled": true
+        }
+      ]
+    }
+  ]
+}

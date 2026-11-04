@@ -531,12 +531,23 @@ func (c Channel) Validate() error {
 		if c.Transport.Port == "" {
 			return fmt.Errorf("channel %q: transport.port required for serial", c.ID)
 		}
+		if c.Transport.Baud < 0 {
+			return fmt.Errorf("channel %q: transport.baud must be positive", c.ID)
+		}
+		if c.Transport.DataBits != 0 && (c.Transport.DataBits < 5 || c.Transport.DataBits > 8) {
+			return fmt.Errorf("channel %q: transport.dataBits %d out of range 5..8", c.ID, c.Transport.DataBits)
+		}
+		switch c.Transport.Parity {
+		case "", "none", "even", "odd":
+		default:
+			return fmt.Errorf("channel %q: transport.parity %q must be none|even|odd", c.ID, c.Transport.Parity)
+		}
+		if c.Transport.StopBits != 0 && c.Transport.StopBits != 1 && c.Transport.StopBits != 2 {
+			return fmt.Errorf("channel %q: transport.stopBits %d must be 1 or 2", c.ID, c.Transport.StopBits)
+		}
 	case "memory":
 	default:
 		return fmt.Errorf("channel %q: unknown transport kind %q", c.ID, c.Transport.Kind)
-	}
-	if c.Transport.Baud < 0 {
-		return fmt.Errorf("channel %q: binary baud", c.ID)
 	}
 	return nil
 }

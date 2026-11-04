@@ -1,16 +1,17 @@
-// Package modbus 实现 Modbus TCP 主站驱动。
+// Package modbus 实现 Modbus 主站驱动，覆盖 TCP 与 RTU 两种链路。
 //
 // 分层：driver.Meta（能力声明）→ Conn（事务/错误分类）→
-// codec/modbus（纯函数编解码）→ transport（字节流与 MBAP 分帧）。
+// codec/modbus（纯函数编解码）→ transport（字节流）。
+//
+// TCP 与 RTU 只在「分帧」这一层不同，其余（批读、写入、异常码分类、
+// 部分失败保留好样本）完全共用同一份代码。这是刻意的：两份实现迟早
+// 会在异常路径上分叉。
 package modbus
 
 import (
 	"context"
-	"encoding/binary"
 	"errors"
 	"fmt"
-	"io"
-	"net"
 	"sync"
 	"time"
 
@@ -23,27 +24,45 @@ import (
 // Dialer 允许测试注入内存链路。
 type Dialer func(ctx context.Context, addr string, timeout time.Duration) (transport.Stream, error)
 
-// Driver 是 Modbus TCP 驱动。
+// SerialOpener 允许测试注入内存串口。
+type SerialOpener func(cfg transport.SerialConfig) (transport.Stream, error)
+
+// Driver 是 Modbus 主站驱动。
 type Driver struct {
-	dial Dialer
+	dial   Dialer
+	serial SerialOpener
 }
 
-// New 返回使用真实 TCP 的驱动。
+// New 返回使用真实 TCP 与真实串口的驱动。
 func New() *Driver {
-	return &Driver{dial: func(ctx context.Context, addr string, timeout time.Duration) (transport.Stream, error) {
-		return transport.DialTCP(ctx, addr, timeout)
-	}}
+	return &Driver{
+		dial: func(ctx context.Context, addr string, timeout time.Duration) (transport.Stream, error) {
+			return transport.DialTCP(ctx, addr, timeout)
+		},
+		serial: transport.OpenSerial,
+	}
 }
 
-// NewWithDialer 返回使用自定义链路的驱动（测试用）。
-func NewWithDialer(d Dialer) *Driver { return &Driver{dial: d} }
+// NewWithDialer 返回使用自定义 TCP 链路的驱动（测试用）。
+func NewWithDialer(d Dialer) *Driver {
+	drv := New()
+	drv.dial = d
+	return drv
+}
+
+// NewWithSerial 返回使用自定义串口链路的驱动（测试用）。
+func NewWithSerial(o SerialOpener) *Driver {
+	drv := New()
+	drv.serial = o
+	return drv
+}
 
 // Meta 声明驱动能力。Modbus 不支持订阅、浏览与设备发现。
 func (d *Driver) Meta() driver.Meta {
 	return driver.Meta{
 		ID:           "modbus-tcp",
 		Name:         "Modbus TCP",
-		Version:      "0.1.0",
+		Version:      "0.2.0",
 		SDKVersion:   driver.SDKVersion,
 		Roles:        []driver.Role{driver.RoleMaster},
 		Transports:   []string{"tcp"},
@@ -74,41 +93,59 @@ func (d *Driver) Meta() driver.Meta {
 	}
 }
 
-// Open 建立连接。
+// Open 建立链路并按传输类型选择分帧方式。
 func (d *Driver) Open(ctx context.Context, cfg driver.OpenConfig) (driver.Conn, error) {
-	if cfg.Channel.Transport.Kind != "tcp" {
-		return nil, driver.E(driver.ErrUnsupported, "open", cfg.Device.ID,
-			"modbus-tcp requires tcp transport", false, nil)
-	}
-	stream, err := d.dial(ctx, cfg.Channel.Transport.Address, cfg.Channel.EffectiveTimeout())
+	tr, err := d.openTransport(ctx, cfg)
 	if err != nil {
-		return nil, driver.E(driver.ErrDisconnected, "dial", cfg.Device.ID, "connect failed", true, err)
+		return nil, err
 	}
 	return &conn{
-		cfg:    cfg,
-		stream: stream,
-		codec:  mbcodec.NewCodec(cfg.Device.ID),
-		tr:     &mbTransport{stream: stream, unit: uint8(cfg.Device.UnitID)},
+		cfg:   cfg,
+		codec: mbcodec.NewCodec(cfg.Device.ID),
+		tr:    tr,
 	}, nil
 }
 
+func (d *Driver) openTransport(ctx context.Context, cfg driver.OpenConfig) (framed, error) {
+	t := cfg.Channel.Transport
+	switch t.Kind {
+	case "tcp":
+		stream, err := d.dial(ctx, t.Address, cfg.Channel.EffectiveTimeout())
+		if err != nil {
+			return nil, driver.E(driver.ErrDisconnected, "dial", cfg.Device.ID, "connect failed", true, err)
+		}
+		return &tcpFraming{stream: stream, unit: uint8(cfg.Device.UnitID)}, nil
+	case "serial":
+		// 串口走独立的 modbus-rtu 驱动（rtu.go）：它需要端口复用与总线
+		// 串行化，这两件事在只处理 TCP 的驱动里没有位置。
+		return nil, driver.E(driver.ErrUnsupported, "open", cfg.Device.ID,
+			"serial transport requires driver modbus-rtu", false, nil)
+	case "":
+		return nil, driver.E(driver.ErrUnsupported, "open", cfg.Device.ID,
+			"transport.kind required (tcp|serial)", false, nil)
+	}
+	return nil, driver.E(driver.ErrUnsupported, "open", cfg.Device.ID,
+		fmt.Sprintf("modbus does not support transport %q", t.Kind), false, nil)
+}
+
+// framed 是一次 PDU 往返。TCP 与 RTU 各自实现，上层 conn 不感知差异。
+type framed interface {
+	RoundTrip(ctx context.Context, pdu []byte) ([]byte, error)
+	Close() error
+}
+
 type conn struct {
-	mu     sync.Mutex
-	cfg    driver.OpenConfig
-	stream transport.Stream
-	tr     *mbTransport
-	codec  *mbcodec.Codec
-	tx     uint16
+	mu    sync.Mutex
+	cfg   driver.OpenConfig
+	tr    framed
+	codec *mbcodec.Codec
 }
 
 func (c *conn) Probe(ctx context.Context) error {
 	// 读 1 个保持寄存器；即使返回异常码，也说明链路可达。
 	pdu := []byte{mbcodec.FCReadHoldingRegs, 0, 0, 0, 1}
 	_, err := c.tr.RoundTrip(ctx, pdu)
-	if err != nil {
-		return err
-	}
-	return nil
+	return err
 }
 
 func (c *conn) Read(ctx context.Context, spans []driver.ReadSpan) ([]driver.RawSample, error) {
@@ -185,7 +222,14 @@ func (c *conn) Write(ctx context.Context, reqs []driver.WriteRequest) ([]driver.
 }
 
 func (c *conn) Close() error {
-	return c.stream.Close()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.tr == nil {
+		return nil
+	}
+	err := c.tr.Close()
+	c.tr = nil
+	return err
 }
 
 func failedSamples(span driver.ReadSpan, err error) []driver.RawSample {
@@ -211,64 +255,21 @@ func qualityOf(err error) model.Quality {
 	return model.QualityBad
 }
 
-// ---------------------------------------------------------------------------
-// MBAP 分帧
-// ---------------------------------------------------------------------------
-
-type mbTransport struct {
-	stream transport.Stream
-	unit   uint8
-}
-
-// RoundTrip 写一个 PDU（自动加 MBAP），再按长度字段读满整帧并返回 PDU。
-func (t *mbTransport) RoundTrip(ctx context.Context, pdu []byte) ([]byte, error) {
-	if dl, ok := ctx.Deadline(); ok {
-		if s, ok := t.stream.(interface{ SetDeadline(time.Time) error }); ok {
-			_ = s.SetDeadline(dl)
-		}
-	}
-	tx := nextTx()
-	adu := mbcodec.BuildTCP(mbcodec.Frame{Transaction: tx, Unit: t.unit, PDU: pdu})
-	if err := t.stream.Write(adu); err != nil {
-		return nil, classifyNetErr("write", err)
-	}
-	head, err := t.stream.ReadFull(7)
-	if err != nil {
-		return nil, classifyNetErr("read-header", err)
-	}
-	length := int(binary.BigEndian.Uint16(head[4:6]))
-	if length < 2 || length > 260 {
-		return nil, driver.E(driver.ErrProtocol, "read", "", fmt.Sprintf("invalid MBAP length %d", length), false, nil)
-	}
-	body, err := t.stream.ReadFull(length - 1)
-	if err != nil {
-		return nil, classifyNetErr("read-body", err)
-	}
-	return body, nil
-}
-
-func (t *mbTransport) Close() error { return t.stream.Close() }
-
-var txCounter uint32
-
-func nextTx() uint16 {
-	txCounter++
-	return uint16(txCounter)
-}
-
 func classifyNetErr(op string, err error) error {
 	if err == nil {
 		return nil
 	}
-	var ne net.Error
+	var ne interface{ Timeout() bool }
 	if errors.As(err, &ne) && ne.Timeout() {
 		return driver.E(driver.ErrTimeout, op, "", "network timeout", true, err)
-	}
-	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
-		return driver.E(driver.ErrDisconnected, op, "", "connection closed", true, err)
 	}
 	if errors.Is(err, context.DeadlineExceeded) {
 		return driver.E(driver.ErrTimeout, op, "", "deadline exceeded", true, err)
 	}
+	if errors.Is(err, errClosedStream) {
+		return driver.E(driver.ErrDisconnected, op, "", "connection closed", true, err)
+	}
 	return driver.E(driver.ErrDisconnected, op, "", "network error", true, err)
 }
+
+var errClosedStream = errors.New("transport: closed")

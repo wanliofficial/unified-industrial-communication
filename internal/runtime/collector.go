@@ -40,6 +40,9 @@ func newCollector(rt *Runtime, dev model.Device, ch model.Channel) (*collector, 
 	if !ok {
 		return nil, httpapi.Errf(422, "config.invalid_protocol", "protocol %q not registered", ch.Protocol)
 	}
+	if err := checkTransportSupport(drv.Meta(), ch); err != nil {
+		return nil, err
+	}
 	plan, _ := planner.Build(dev, planner.Options{})
 	points := make(map[string]model.Point, len(dev.Points))
 	for _, p := range dev.Points {
@@ -49,6 +52,41 @@ func newCollector(rt *Runtime, dev model.Device, ch model.Channel) (*collector, 
 		rt: rt, dev: dev, ch: ch, drv: drv, plan: plan,
 		points: points, pipe: pipeline.NewProcessor(),
 	}, nil
+}
+
+// CheckDriverBindings 校验每条通道声明的协议与传输方式是否匹配。
+//
+// 供 `uic -check` 与 runtime 装配共用，避免两处规则漂移：CI 里 `-check` 通过
+// 而运行时启动失败，是最令人困惑的一类不一致。
+func CheckDriverBindings(channels []model.Channel) error {
+	for _, ch := range channels {
+		drv, ok := driver.Get(ch.Protocol)
+		if !ok {
+			return httpapi.Errf(422, "config.invalid_protocol",
+				"channel %q: protocol %q not registered", ch.ID, ch.Protocol)
+		}
+		if err := checkTransportSupport(drv.Meta(), ch); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// checkTransportSupport 校验通道的传输方式是否在该驱动的声明范围内。
+//
+// 这项校验放在装配期而不是 Open 期，是因为它是**静态配置错误**：把
+// modbus-tcp 配到串口上永远不会成功，重试一万次也没用。若留到 Open，
+// 现场看到的是设备一直「连接失败」，而不是「配置写错了」。
+func checkTransportSupport(m driver.Meta, ch model.Channel) error {
+	kind := ch.Transport.Kind
+	for _, t := range m.Transports {
+		if t == kind {
+			return nil
+		}
+	}
+	return httpapi.Errf(422, "config.unsupported_transport",
+		"channel %q: protocol %q supports transports %v, got %q",
+		ch.ID, ch.Protocol, m.Transports, kind)
 }
 
 // fingerprint 决定热更新时该设备是否需要重建。通道参数变化也会导致重建，

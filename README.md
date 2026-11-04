@@ -21,6 +21,13 @@ curl -s localhost:8080/api/v1/health
 curl -s localhost:8081/api/v1/points
 ```
 
+串口 / Modbus RTU（有硬件改端口即可，无硬件可用 `socat` 造一对 pty）：
+
+```bash
+./uic -check -config examples/modbus-rtu.json
+./uic -config examples/modbus-rtu.json
+```
+
 ## 文档
 
 - **[docs/00-README.md](docs/00-README.md)** — 总索引：阅读路径、38 个参考方案总览、结论速查、代码地图、接口速查、实现边界

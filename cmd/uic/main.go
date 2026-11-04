@@ -203,6 +203,13 @@ func checkConfig(path string) int {
 		fmt.Fprintf(os.Stderr, "配置校验失败: %v\n", err)
 		return 1
 	}
+	// 协议与传输的匹配是静态配置错误，必须和字段校验一样在 CI 里就被拦下。
+	// 只做 f.Validate() 会漏掉「modbus-tcp 配到串口上」这类问题，等到
+	// 部署后才发现。
+	if err := uicruntime.CheckDriverBindings(f.Channels); err != nil {
+		fmt.Fprintf(os.Stderr, "配置校验失败: %v\n", err)
+		return 1
+	}
 	canonical, err := f.Canonical()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "配置序列化失败: %v\n", err)

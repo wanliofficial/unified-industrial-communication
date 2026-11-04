@@ -525,6 +525,44 @@ func BuildRTU(unit byte, pdu []byte) []byte {
 	return append(out, byte(crc), byte(crc>>8))
 }
 
+// RTUExpectedResponseLen 由请求 PDU 推导**正常**响应的帧总长（地址 + PDU + CRC）。
+//
+// 相比「逐字节读到长度可判定」，这条路径快一个数量级：一次 2 字节探测
+// 之后就能整段读满，不必每字节一次系统调用。更重要的是它把「字节计数
+// 被写坏」变成了立即可判的错误——否则主站会一直等到设备超时才失败，
+// 现场看到的是「偶发 3 秒延迟」而不是「从站返回了非法字节数」。
+//
+// 异常响应（FC|0x80）恒为 5 字节，不在本函数职责内。
+func RTUExpectedResponseLen(reqPDU []byte) (int, error) {
+	if len(reqPDU) < 1 {
+		return 0, errors.New("modbus: empty request pdu")
+	}
+	switch fc := reqPDU[0]; fc {
+	case FCReadCoils, FCReadDiscreteInputs:
+		if len(reqPDU) < 5 {
+			return 0, fmt.Errorf("modbus: short FC%#x request pdu (%d bytes)", fc, len(reqPDU))
+		}
+		qty := int(binary.BigEndian.Uint16(reqPDU[3:5]))
+		if qty <= 0 || qty > MaxReadBits {
+			return 0, fmt.Errorf("modbus: FC%#x quantity %d out of range", fc, qty)
+		}
+		return 5 + (qty+7)/8, nil
+	case FCReadHoldingRegs, FCReadInputRegs:
+		if len(reqPDU) < 5 {
+			return 0, fmt.Errorf("modbus: short FC%#x request pdu (%d bytes)", fc, len(reqPDU))
+		}
+		qty := int(binary.BigEndian.Uint16(reqPDU[3:5]))
+		if qty <= 0 || qty > MaxReadRegisters {
+			return 0, fmt.Errorf("modbus: FC%#x quantity %d out of range", fc, qty)
+		}
+		return 5 + qty*2, nil
+	case FCWriteSingleCoil, FCWriteSingleRegister, FCWriteMultipleCoils, FCWriteMultipleRegs:
+		// 写响应是回显：地址 + FC + 2 字节地址 + 2 字节值/数量 + CRC。
+		return 8, nil
+	}
+	return 0, fmt.Errorf("modbus: cannot predict RTU response length for fc %#x", reqPDU[0])
+}
+
 // ParseRTU 校验并剥离 RTU 帧的地址与 CRC。
 func ParseRTU(b []byte) (unit byte, pdu []byte, err error) {
 	if len(b) < 4 {

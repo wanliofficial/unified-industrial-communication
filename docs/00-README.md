@@ -65,6 +65,18 @@ curl -sN localhost:8080/api/v1/stream | head -20        # SSE 实时流
 curl -s localhost:8081/api/v1/points | jq '.items[0]'
 ```
 
+串口（Modbus RTU）链路：
+
+```bash
+# 有真实硬件时直接改 examples/modbus-rtu.json 里的 port / baud / 从站地址
+./uic -check -config examples/modbus-rtu.json
+./uic -config examples/modbus-rtu.json
+
+# 没有硬件时可用伪终端模拟一条总线（Linux）
+socat -d -d pty,raw,echo=0,link=/tmp/ttyV0 pty,raw,echo=0
+#   然后在 /tmp/ttyV0 上挂从站模拟器，或把配置里的 port 指向它
+```
+
 写入与回滚（这是最能体现「可治理」的两条命令）：
 
 ```bash
@@ -339,11 +351,11 @@ obs  ← 所有包（不依赖任何内部包）
 
 | 包 | 职责 | 关键不变量 | 覆盖率 |
 |---|---|---|---|
-| `internal/model` | 通道/设备/点位/地址/采样/质量码 | 不依赖任何内部包；不变量集中在 `Validate` | 78.4% |
+| `internal/model` | 通道/设备/点位/地址/采样/质量码 | 不依赖任何内部包；不变量集中在 `Validate` | 75.8% |
 | `internal/driver` | 驱动契约（Codec/Transport/Driver）、错误分类、注册表 | 能力四态；`Conn` 不保证并发安全，由调用方串行 | 90.6% |
 | `internal/codec/modbus` | Modbus 纯函数编解码（主站与从站共用） | 无 I/O、无时钟、无可变状态 | 89.0% |
-| `internal/transport` | 字节流抽象 + TCP | 写满、读满或超时、关闭幂等 | 100% |
-| `internal/driver/modbus` | Modbus TCP 主站 | 事务号递增；异常码分类；部分失败不吞好样本 | 80.2% |
+| `internal/transport` | 字节流抽象 + TCP + 串口（termios） | 写满、读满或超时、关闭幂等；串口 deadline 不得静默失效 | 79.7% |
+| `internal/driver/modbus` | Modbus TCP + RTU 主站 | 事务号递增；异常码分类；部分失败不吞好样本；同串口事务串行 | 84.6% |
 | `internal/driver/virtual` | 虚拟设备（波形 + 故障注入） | 故障按「第 n 次请求」精确注入一次 | 98.6% |
 | `internal/sim/modbus` | 内置 Modbus TCP 从站 | 复用同一份 codec，避免主从语义漂移 | 87.2% |
 | `internal/planner` | 点位 → 批量读请求（ReadSpan） | 协议无关；按连续性/上限合并 | 93.9% |
@@ -354,7 +366,7 @@ obs  ← 所有包（不依赖任何内部包）
 | `internal/config` | 加载、校验、规范化、版本化、回滚 | 幂等 Normalize；原子写；失败自动恢复 | 82.3% |
 | `internal/obs` | 指标、结构化日志、日志环形缓冲 | 指标标签必须归一化（不能含原始 URL） | 88.2% |
 | `internal/northbound/httpapi` | REST + SSE + 认证 + 错误码 | 错误码稳定；响应不泄露凭据 | 80.0% |
-| `internal/runtime` | 唯一编排层 + 后端实现 + 看门狗 | 启动/关闭顺序；`configuredState` 与 `runtimeState` 分离 | 77.6% |
+| `internal/runtime` | 唯一编排层 + 后端实现 + 看门狗 | 启动/关闭顺序；`configuredState` 与 `runtimeState` 分离；协议/传输匹配在装配期校验 | 79.7% |
 | `cmd/uic` | 单入口：run / sim / check / version | 关闭预算 10 秒 | — |
 
 ### 9.2 测试与验证命令
@@ -424,7 +436,7 @@ go test -coverprofile=c.out ./... && go tool cover -func=c.out | tail -1
 |---|---|---|
 | Modbus TCP 主站 | ✅ | 批量读、单/多寄存器写、线圈写、位访问、异常码分类、字节序（ABCD/CDAB/BADC/DCBA） |
 | Modbus 寄存器位写 | ❌ | 只支持线圈写；寄存器读-改-写未实现（需要「读回-置位-写回」的原子性保证） |
-| Modbus RTU | ⏳ | 帧层（CRC、分帧）已实现并有金向量测试；串口 transport 与主站驱动未接 |
+| Modbus RTU | ✅ | 串口 transport（termios raw、非阻塞 + deadline、tcdrain/tcflush）、3.5 字符帧间静默、按请求推导帧长、半包/CRC 错/unit 错/异常帧分类、同串口多从站共享 fd 并串行化事务 |
 | 虚拟驱动 | ✅ | 正弦/斜坡/随机/常量波形；丢包/超时/坏帧/地址错/断连五种故障注入 |
 | 调度与熔断 | ✅ | tick、actor、写优先、指数退避、熔断后转探活、代次隔离 |
 | Outbox | ✅ | 文件 WAL + 分区确认位点 + 三重上限 + 定期压缩；默认批量 flush |
