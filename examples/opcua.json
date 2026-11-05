@@ -1,0 +1,92 @@
+{
+  "schemaVersion": 1,
+  "site": "opcua-lab",
+  "server": {
+    "listen": "127.0.0.1:8086",
+    "token": "dev-token"
+  },
+  "storage": {
+    "dir": "./data-opcua",
+    "journal": true,
+    "outboxMaxRecords": 5000,
+    "outboxTtl": "10m"
+  },
+  "logging": {
+    "level": "info"
+  },
+  "northbound": {
+    "webhook": {
+      "enabled": false,
+      "url": "http://127.0.0.1:9999/ingest",
+      "timeout": "3s"
+    }
+  },
+  "channels": [
+    {
+      "id": "ch-opcua",
+      "protocol": "opcua",
+      "transport": {
+        "kind": "tcp",
+        "address": "opc.tcp://127.0.0.1:14840"
+      },
+      "concurrency": 1,
+      "timeout": "3s"
+    }
+  ],
+  "devices": [
+    {
+      "id": "ua1",
+      "name": "OPC UA 服务端（Policy=None / 匿名）",
+      "channel": "ch-opcua",
+      "interval": "1s",
+      "timeout": "3s",
+      "enabled": true,
+      "points": [
+        {
+          "id": "temperature",
+          "name": "温度",
+          "address": { "kind": "symbol", "path": "ns=2;s=Plant.Temperature" },
+          "dataType": "float64",
+          "unit": "degC",
+          "enabled": true
+        },
+        {
+          "id": "counter",
+          "name": "计数",
+          "address": { "kind": "symbol", "path": "ns=2;s=Plant.Counter" },
+          "dataType": "int32",
+          "enabled": true
+        },
+        {
+          "id": "running",
+          "name": "运行标志",
+          "address": { "kind": "symbol", "path": "ns=2;s=Plant.Running" },
+          "dataType": "bool",
+          "enabled": true
+        },
+        {
+          "id": "label",
+          "name": "设备标识",
+          "address": { "kind": "symbol", "path": "ns=2;s=Plant.Label" },
+          "dataType": "string",
+          "enabled": true
+        },
+        {
+          "id": "setpoint",
+          "name": "设定值（可写）",
+          "address": { "kind": "symbol", "path": "ns=2;s=Plant.Setpoint" },
+          "dataType": "float64",
+          "writable": true,
+          "enabled": true
+        },
+        {
+          "id": "server_time",
+          "name": "服务端时间（标准节点 ns=0;i=2258）",
+          "address": { "kind": "symbol", "path": "ns=0;i=2258" },
+          "dataType": "string",
+          "enabled": true
+        }
+      ]
+    }
+  ]
+}

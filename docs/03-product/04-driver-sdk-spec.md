@@ -576,6 +576,146 @@ Modbus 写请求 → decodeCellValue（按单元字节序还原） → Writer.Wr
 前者模拟 PLC，后者把网关变成 PLC。测试里两者可以同时在一条链路上跑，正好覆盖
 「采集 → 缓存 → 反向暴露」的完整闭环。
 
+### 3.9 OPC UA（二进制，SecurityPolicy=None）
+
+OPC UA 与前面所有协议的**结构性差异**只有一条：它有**三层可独立失效的状态**。
+把「TCP 连着」当成「能用」，是这个协议最常见的接入错误。
+
+#### 3.9.1 三层状态必须分开判断
+
+| 层 | 建立动作 | 失效表现 | 恢复动作 |
+|---|---|---|---|
+| TCP 连接 | dial | 读写直接 IO 错误 | 重新 dial |
+| 安全通道（SecureChannel） | `OPN` | `BadSecureChannelIdInvalid` | 重新 `OPN`（不必重连 TCP） |
+| 会话（Session） | `CreateSession` + `ActivateSession` | `BadSessionIdInvalid` / `BadSessionClosed` | 重新建会话（通道可留） |
+
+**为什么不能只看一个 `connected bool`**：通道在 TokenLifetime 到期后失效，但 TCP
+还好；会话在空闲超时后被服务端回收，但通道还好。三种失效的恢复代价差一个数量级，
+合并判断会让驱动「每次都全量重连」——在一条 20 台设备的产线上，这等于每秒重连。
+
+`Close` 的顺序同样是**反过来的**：`CloseSession` → `CLO`（关通道）→ 关 TCP。
+反过来会让服务端留下悬挂会话，直到它的 SessionTimeout 到期（常见 10 分钟）。
+
+#### 3.9.2 连接序列
+
+```
+主站 → HEL（receiveBufferSize / sendBufferSize / maxMessageSize / maxChunkCount / endpointUrl）
+从站 → ACK
+主站 → OPN（SecurityPolicy=None, SecurityMode=None, RequestType=Issue, RequestedLifetime=3600000）
+从站 → OPN 响应（ChannelId + TokenId + RevisedLifetime）
+主站 → CreateSession
+主站 → ActivateSession（匿名：AnonymousIdentityToken，PolicyId="anonymous"）
+从站 → ActivateSessionResponse
+主站 → Read / Write / Browse / GetEndpoints
+```
+
+| 约束 | 原因 |
+|---|---|
+| 必须先 HEL/ACK | 跳过 HEL 直接发 OPN，多数服务端直接断链，且不给错误码 |
+| TokenId 必须在每条 MSG 里带上 | 通道续订（Renew）后 TokenId 会变，继续用旧值会被 `BadSecureChannelTokenUnknown` 拒绝 |
+| TokenId 寿命到 3/4 时续订 | 等到过期再续，请求会在「已发出、未响应」的窗口里失败；提前续订是规范推荐做法 |
+| `ActivateSession` 不可省 | 部分服务端允许未激活会话读、拒绝写。表现是「能看不能控」，最难排查 |
+| 响应必须按 `RequestId` 匹配 | 迟到的响应（前一次超时的）会串到当前请求上，把 A 点的值写成 B 点的 |
+
+#### 3.9.3 地址：NodeId 而不是「区 + 偏移」
+
+OPC UA 的寻址单位是**节点标识**，不是地址。因此：
+
+```json
+{ "address": { "kind": "symbol", "path": "ns=2;s=Line1.Temperature" } }
+```
+
+| 写法 | 解析结果 | 说明 |
+|---|---|---|
+| `ns=2;s=Line1.Temperature` | 字符串 NodeId | 现场最常见（大多数 PLC/网关按名称暴露） |
+| `ns=2;i=1001` | 数值 NodeId | 紧凑，但人不可读 |
+| `i=2258` | `ns=0;i=2258` | 命名空间 0 可省 |
+| `Temperature` | `ns=0;s=Temperature` | 裸字符串等价于 ns=0 |
+| `ns=2` / `ns=2;x=1` | **配置期报错** | 前者漏标识符、后者标识符类型未知 |
+
+最后一行是刻意加的：这两种写法按「裸字符串」解释也能构造出一个 NodeId，但它
+永远查不到任何节点，服务端只会回「节点不存在」——错误信息指不回配置。这类
+笔误在批量导入点位时非常常见，必须在 `-check` 阶段就拦住。
+
+**为什么不用 register 寻址**：OPC UA 没有「寄存器」概念。硬塞进 register 会丢掉
+命名空间与字符串标识，等于只支持那一小撮用数值 NodeId 的服务端。
+
+#### 3.9.4 类型映射与越界
+
+| 平台类型 | OPC UA 内置类型 | 备注 |
+|---|---|---|
+| `bool` | Boolean | 数值写入非零即真 |
+| `int16` / `uint16` / `int32` / `uint32` / `int64` / `uint64` | 对应整型 | 越界**判坏**，不截断 |
+| `float32` / `float64` | Float / Double | float32 真降精度（不是先转 double 再回来） |
+| `string` | String | DateTime 读成 string 时按 RFC3339Nano 格式化 |
+| `bytes` | ByteString | — |
+| `bcd16` / `bcd32` | **报错** | BCD 是编码方式不是数据类型，只能在协议层解码后上报 |
+
+越界必须判坏而不是截断：一个把 70000 截成 4464 的温度点，会让操作员按错误的
+数字做决策，而且不会有任何告警。判坏至少会亮出来。
+
+#### 3.9.5 部分失败语义
+
+OPC UA 的 `Read` 是**逐项**返回 `DataValue.Status` 的：一个节点不存在，不影响
+其他节点返回值。这与 Modbus 的「异常码 = 整帧失败」完全不同。
+
+| 情况 | 驱动行为 |
+|---|---|
+| 部分节点坏 | 好样本照常返回；坏节点带 `Err` 与对应质量码；整体 `err == nil` |
+| 全部节点坏 | 返回样本 + 一个整体错误（熔断器需要看到「这台设备全坏了」） |
+| 地址非法（配置笔误） | 在发请求前就判定，计入 `ErrAddress`；不发无效请求 |
+| 服务级错误（`ServiceFault`） | 整条请求失败，按状态码分类 |
+
+「全部失败必须返回 error」这一条容易被漏掉：如果只在 `DataValue.Status` 上标坏，
+上层的熔断器与告警都看不到异常，设备会一直「在采但全坏」。
+
+#### 3.9.6 状态码 → 错误分类
+
+| 状态码 | 分类 | 理由 |
+|---|---|---|
+| `BadNodeIdUnknown` / `BadNodeIdInvalid` / `BadAttributeIdInvalid` | `ErrAddress` | 点位配错了，不是设备坏了；不该熔断整台设备 |
+| `BadUserAccessDenied` / `BadSecurityChecks` / `BadNotWritable` | `ErrPermission` | 权限问题，重试无用，需要改配置 |
+| `BadServiceUnsupported` | `ErrUnsupported` | 对端不支持该服务 |
+| `BadTimeout` / `BadWaitingForInitialData` | `ErrTimeout` | 可重试 |
+| `BadSessionIdInvalid` / `BadSessionClosed` / `BadSecureChannelIdInvalid` / `BadNoCommunication` / `BadNotConnected` / `BadCommunicationError` | `ErrDisconnected` | 需要重建会话或通道 |
+
+其余未列出的 `Bad*` 归 `ErrProtocol`。
+
+#### 3.9.7 明确的能力边界
+
+| 项 | 状态 | 说明 |
+|---|---|---|
+| SecurityPolicy None / SecurityMode None | ✅ | 明确的产品边界，不是「暂时没做」 |
+| 匿名认证 | ✅ | 用户名/证书认证未实现 |
+| 批量读（≤100 节点/请求） | ✅ | 按服务端的 OperationLimits 保守取值 |
+| 写（单点/批量） | ✅ | 逐项状态码回传 |
+| Browse / GetEndpoints | ✅ | 驱动层提供，供后续「点位浏览」界面用 |
+| 订阅（CreateSubscription / MonitoredItems / Publish） | ❌ | 需要三条额外状态机 + 一个常驻发布队列；`Capabilities.Subscribe` 声明 `unsupported` |
+| 历史读取（HistoryRead） | ❌ | 属 Wave 2 历史库范畴 |
+| 方法调用 / 事件 / 别名 | ❌ | — |
+| 证书 / 信任列表 / 签名校验 | ❌ | 属于另一套运维体系，混进来会让「连不上」的原因不可判定 |
+| 分块响应（Chunked） | ❌ | 见到分块直接报错，比拼错更强 |
+
+> 声明 `unsupported` 而不是「静默降级」：如果驱动说支持订阅而实际收不到数据，
+> 上层会配出永远不更新的点位，而现场只会看到「数据不动了」。显式失败至少
+> 在配置期就能拦住。
+
+#### 3.9.8 内置服务端（`internal/sim/opcua`）
+
+`uic sim -protocol opcua` 起一个最小服务端，用途与 Modbus/S7 的内置从站一致：
+
+| 项 | 实现 |
+|---|---|
+| 服务 | HEL/ACK、OPN、CreateSession、ActivateSession、CloseSession、Read、Write、Browse、GetEndpoints、CloseSecureChannel |
+| 地址空间 | `Root/Objects/{Server/ServerStatus/CurrentTime, Plant/{Counter,Temperature,Running,Label,Setpoint}}` |
+| 安全 | 仅 Policy=None + 匿名；非匿名令牌回 `BadUserAccessDenied` |
+| 会话 | 未激活会话的读写回 `BadSessionIdInvalid`（不是断链） |
+| 写校验 | Variant 类型必须与节点 DataType 一致，否则 `BadTypeMismatch` |
+| 不支持的服务 | 回 `ServiceFault` + `BadServiceUnsupported`，不断链 |
+
+它**与主站共用同一份 `codec/opcua`**：主从分开实现编解码，会让「编码错」与
+「解码错」互相抵消，自测永远全绿。共用同一份实现才能保证测的是协议而不是笔误。
+
 ---
 
 ## 4. 错误模型
@@ -641,7 +781,7 @@ type OpError struct {
 | `modbus-rtu` | supported | supported | unsupported | unsupported | unsupported | supported | supported |
 | `modbus-ascii` | supported | supported | unsupported | unsupported | unsupported | supported | supported |
 | `s7` | supported | supported | unsupported | unsupported | unsupported | supported | supported |
-| `opcua` | supported | supported | supported | supported | supported | supported | unsupported |
+| `opcua` | supported | supported | unsupported | unsupported | experimental | supported | unsupported |
 | `mqtt` | supported | unsupported | supported | unsupported | unsupported | unsupported | unsupported |
 | `virtual` | supported | supported | supported | supported | unsupported | supported | supported |
 

@@ -34,7 +34,8 @@ cmd/ + internal/            可运行的最小骨架（不是伪代码，能采�
 
 ### 1.2 它不是什么
 
-- 不是协议库大杂烩。当前只实现了 2 个驱动（Modbus TCP 主站、virtual），其余协议在 `04-protocol-catalog.md` 里按工作量排了三波，没有假装已经支持。
+- 不是协议库大杂烩。当前实现了 6 个驱动（Modbus TCP / RTU / ASCII 主站、S7 主站、OPC UA 主站、virtual），
+  外加 Modbus TCP 从站与三个内置模拟从站；其余协议在 `04-protocol-catalog.md` 里按工作量排了三波，没有假装已经支持。
 - 不是组态软件。不做画面、不做报表、不做自研时序库——理由见 `02-synthesis/01-capability-matrix.md` §6.4。
 - 不是「参考项目的改写版」。全部产物经过脱敏，只以 PA 编号 + 技术画像指代，不含任何被分析对象的名称、地址、作者、商标或包名前缀。
 
@@ -91,6 +92,23 @@ curl -s localhost:8085/api/v1/points | jq '.items[] | {point, value, quality}'
 示例配置覆盖 7 个点位：DB1 的 REAL/INT16/DINT32/STRING、DB2 的 WORD、
 输入区 IW0、位地址 M0.3。模拟从站每秒改 DB1.DBD0，可用来观察 SSE。
 `-pdu 240|480|960` 可改协商值，用来验证切块（240 时 40 个 float 会被拆成多帧）。
+
+OPC UA（二进制，SecurityPolicy None / 匿名）：
+
+```bash
+./uic sim -protocol opcua -listen 127.0.0.1:14840 &   # 内置 OPC UA 服务端
+./uic -config examples/opcua.json
+curl -s localhost:8086/api/v1/points | jq '.items[] | {point, value, quality}'
+# 写穿透（服务端回读确认）：
+curl -s -X POST -H 'Authorization: Bearer dev-token' -H 'Content-Type: application/json' \
+     -d '{"value":{"type":"float64","num":42.5},"confirm":true}' \
+     localhost:8086/api/v1/points/ua1/setpoint/write
+```
+
+示例配置覆盖 6 个点位：`ns=2;s=Plant.Temperature`（double）、`Counter`（int32）、
+`Running`（bool）、`Label`（string）、`Setpoint`（double，可写）、
+以及标准节点 `ns=0;i=2258`（ServerStatus.CurrentTime）。
+服务端每秒改 Counter 与 CurrentTime，可用来观察 SSE。
 
 从站（把采集到的点位反向暴露给 SCADA / 第三方主站）：
 
@@ -337,7 +355,7 @@ docs/
 | REST | 配置、查询、写入、命令 | ✅ 完整 |
 | SSE | 实时观察（浏览器/curl 友好） | ✅ 完整 |
 | MQTT | 变化上报 + 设备状态 | ✅ 完整（QoS0/1、retained `$state`/`$birth`、LWT `$death`、断线补投；不支持 QoS2/TLS/WebSocket） |
-| OPC UA | 被 SCADA 集成 | ⏳ 映射规范已定义，服务端未实现 |
+| OPC UA | 被 SCADA 集成 | ⏳ 南向主站已完成（None/None + 匿名）；北向服务端未实现 |
 
 ### 7.4 明确不做
 
@@ -404,12 +422,15 @@ obs  ← 所有包（不依赖任何内部包）
 | `internal/codec/modbus` | Modbus 纯函数编解码（TCP/RTU/ASCII，主站与从站共用） | 无 I/O、无时钟、无可变状态 | 88.1% |
 | `internal/codec/value` | 协议无关值编解码（重排、数值/字符串/BCD） | 与协议无关；`Encode` 对 string/bytes 不猜宽度 | 95.0% |
 | `internal/codec/s7` | S7 纯函数编解码（TPKT/COTP/S7 PDU、长度单位换算） | 请求按字节、响应按位/字节的差异收敛在一处 | 80.3% |
+| `internal/codec/opcua` | OPC UA 纯函数编解码（UACP HEL/ACK、安全报文、NodeId、Variant、九类服务） | 分块响应显式报错；数组长度上界必查；BCD 等无对应类型显式报错 | 83.6%（含 driver/sim 交叉覆盖） |
 | `internal/transport` | 字节流抽象 + TCP + 串口（termios） | 写满、读满或超时、关闭幂等；协议层 deadline 不得被兜底值覆盖 | 80.2% |
 | `internal/driver/modbus` | Modbus TCP + RTU + ASCII 主站 | 事务号递增；异常码分类；部分失败不吞好样本；同串口事务串行；分帧类型参与端口冲突判定 | 83.9% |
 | `internal/driver/s7` | S7（S7comm）主站 | COTP/Setup 握手不可省；按协商 PDU 与 20 项上限切块；逐项返回码映射质量码 | 79.9% |
+| `internal/driver/opcua` | OPC UA 二进制主站（None/None + 匿名） | 三层状态（TCP/通道/会话）分开判断；按 RequestId 过滤迟到响应；节点越界判坏不截断 | 72.3% |
 | `internal/driver/virtual` | 虚拟设备（波形 + 故障注入） | 故障按「第 n 次请求」精确注入一次 | 98.6% |
 | `internal/sim/modbus` | 内置 Modbus TCP 从站 | 复用同一份 codec，避免主从语义漂移 | 87.2% |
 | `internal/sim/s7` | 内置 S7 从站（内存 DB/M/I/Q 区） | 与主站共用 codec/s7；输入区只读；位写保邻位 | 71.9% |
+| `internal/sim/opcua` | 内置 OPC UA 服务端（内存地址空间） | 与主站共用 codec/opcua；未激活会话拒绝读写；Variant 类型必须与节点 DataType 一致 | 80.9% |
 | `internal/slave/modbus` | Modbus TCP 从站（把点位暴露给外部主站） | 读走 cache、写走 Runtime.Write；未映射地址报错不补零；坏质量保留最后值并计数 | 73.8% |
 | `internal/planner` | 点位 → 批量读请求（ReadSpan） | 协议无关；按连续性/上限合并；按 `area:db` 分组 | 94.0% |
 | `internal/scheduler` | tick、actor、信号量、退避、熔断、代次 | 同设备不并发；写优先；旧代次丢弃；状态回调不占采集路径 | 87.8% |
@@ -434,7 +455,7 @@ go test -race -count=1 ./...                    # 竞态 + 全量测试
 go test -coverprofile=c.out ./... && go tool cover -func=c.out | tail -1
 ```
 
-当前状态：`go build` / `go vet` / `gofmt` 全部干净，`go test -race ./...` 22 个包全部通过。
+当前状态：`go build` / `go vet` / `gofmt` 全部干净，`go test -race ./...` 25 个测试包全部通过。
 
 ### 9.3 源码阅读建议顺序
 
@@ -449,6 +470,7 @@ go test -coverprofile=c.out ./... && go tool cover -func=c.out | tail -1
 8. internal/mqtt/codec.go + client.go 报文字节与 QoS1 确认（30 分钟）
 9. internal/driver/s7/driver.go       「一次事务多项」与 PDU 预算（40 分钟）
 10. internal/slave/modbus/server.go    从站：映射、跨映射读、写穿透（40 分钟）
+11. internal/driver/opcua/driver.go    三层握手与状态机（50 分钟）
 ```
 
 ---
@@ -507,7 +529,10 @@ go test -coverprofile=c.out ./... && go tool cover -func=c.out | tail -1
 | Webhook 上报 | ✅ | 批量 POST、自定义头、失败不推进位点、恢复后自动补投 |
 | journal 本地归档 | ✅ | `storage.journal=true` → `<dir>/journal.ndjson` |
 | MQTT 上报 | ✅ | 自写 MQTT 3.1.1 客户端（零依赖）：QoS1 等 PUBACK 才推进位点、keepalive、重连后补发 `$birth` 与 retained `$state`、LWT `$death`；显式拒绝 QoS2 与 TLS/WS |
-| OPC UA 服务端 | ⏳ | 地址空间映射已定；未实现 |
+| OPC UA 主站 | ✅ | UACP HEL/ACK + OPN 安全通道 + CreateSession/ActivateSession 会话三层；批量读（≤100 节点/请求）、写、Browse、GetEndpoints；SecurityPolicy=None / SecurityMode=None / 匿名；NodeId 支持 `ns=2;s=` / `ns=2;i=` / `i=` / 裸字符串；TokenId 寿命 3/4 时自动 OPN 续订；数值越界判坏不截断 |
+| OPC UA 订阅 / 历史 / 方法 / 事件 / 证书 | ❌ | 订阅需 CreateSubscription + MonitoredItems + Publish 三条状态机与存活的发布队列；证书体系是另一套运维域。`Capabilities.Subscribe` 显式声明 `unsupported`，避免上层配出永远收不到数据的点位 |
+| OPC UA 服务端（内置演示） | ✅ | `uic sim -protocol opcua`：Root/Objects/Server/ServerStatus/CurrentTime + ns=2 Plant.{Counter,Temperature,Running,Label,Setpoint}；只读节点写入回 `BadNotWritable`；未知节点回 `BadNodeIdUnknown`；不支持的订阅类服务回 `BadServiceUnsupported` |
+| OPC UA 北向（对外暴露为服务端） | ⏳ | 只完成南向主站与演示服务端；把 cache 映射成对外的地址空间属于 Wave 2 |
 | 配置版本/回滚/diff | ✅ | 内容哈希版本、快照、原子写、失败自动恢复、回滚缺版本返回 404 |
 | 认证 | ✅ | Bearer Token，常量时间比较；未实现 RBAC |
 | TLS | ⏳ | 配置项已定义；未接证书加载 |

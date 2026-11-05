@@ -4,6 +4,8 @@
 //	uic run -config config.json        # 同上
 //	uic -check -config config.json     # 只校验配置
 //	uic sim -listen 127.0.0.1:15020    # 内置 Modbus TCP 从站
+//	uic sim -protocol s7 -listen 127.0.0.1:15102   # 内置 S7 从站
+//	uic sim -protocol opcua -listen 127.0.0.1:14840 # 内置 OPC UA 服务端
 //	uic mbread -addr 127.0.0.1:1502    # 不依赖第三方工具的从站读写自检
 //
 // 关闭顺序遵循 docs/03-product/02-architecture.md §11.2：
@@ -27,10 +29,12 @@ import (
 	"syscall"
 	"time"
 
+	ua "uic/internal/codec/opcua"
 	"uic/internal/config"
 	"uic/internal/driver"
 	uicruntime "uic/internal/runtime"
 	sim "uic/internal/sim/modbus"
+	simopcua "uic/internal/sim/opcua"
 	sims7 "uic/internal/sim/s7"
 )
 
@@ -71,7 +75,7 @@ func usage() {
 用法:
   uic [run] -config config.json [-listen :8080] [-token TOKEN]
   uic -check -config config.json
-  uic sim [-listen 127.0.0.1:15020]
+  uic sim [-listen 127.0.0.1:15020] [-protocol modbus|s7|opcua]
   uic mbread -addr 127.0.0.1:1502 -unit 1 -area holding -offset 0 -qty 2
   uic mbread -addr 127.0.0.1:1502 -area holding -offset 5 -write 777
   uic version
@@ -277,21 +281,25 @@ func driverIDs() string {
 	return out
 }
 
-// simCmd 启动内置从站。-protocol 选择 Modbus TCP 或 S7。
+// simCmd 启动内置从站。-protocol 选择 Modbus TCP / S7 / OPC UA。
 func simCmd(args []string) {
 	fs := flag.NewFlagSet("sim", flag.ExitOnError)
 	addr := fs.String("listen", "127.0.0.1:15020", "监听地址")
 	size := fs.Int("size", 1024, "寄存器数量")
-	proto := fs.String("protocol", "modbus", "从站协议：modbus | s7")
+	proto := fs.String("protocol", "modbus", "从站协议：modbus | s7 | opcua")
 	pdu := fs.Int("pdu", 480, "S7 协商 PDU 长度（240/480/960）")
 	fs.Parse(args)
 
-	if *proto == "s7" {
+	switch *proto {
+	case "s7":
 		simS7(*addr, *pdu)
 		return
-	}
-	if *proto != "modbus" {
-		fmt.Fprintf(os.Stderr, "未知协议 %q（支持 modbus | s7）\n", *proto)
+	case "opcua":
+		simOPCUA(*addr)
+		return
+	case "modbus":
+	default:
+		fmt.Fprintf(os.Stderr, "未知协议 %q（支持 modbus | s7 | opcua）\n", *proto)
 		os.Exit(2)
 	}
 
@@ -382,4 +390,50 @@ func simS7(addr string, pduLen int) {
 func float32Bytes(v float32) []byte {
 	bits := math.Float32bits(v)
 	return []byte{byte(bits >> 24), byte(bits >> 16), byte(bits >> 8), byte(bits)}
+}
+
+// simOPCUA 启动内置 OPC UA 服务端。它实现的是「无安全策略 + 匿名」这一
+// 最小可用面，正好覆盖现场最常见的一类服务端（老 PLC 网关、测试桩、
+// 演示服务器），也是驱动侧当前支持的范围。
+//
+// 初始值刻意做成混合类型（double / int32 / bool / string），
+// 这样 examples/opcua.json 一跑起来就能逐类核对类型映射是否正确。
+func simOPCUA(addr string) {
+	srv, err := simopcua.NewServer(addr)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "启动 OPC UA 模拟服务端失败: %v\n", err)
+		os.Exit(1)
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	fmt.Printf("opc ua server listening on %s\n", srv.Addr())
+	fmt.Println("  ns=2;s=Plant.Temperature=21.5 (double, 只读)")
+	fmt.Println("  ns=2;s=Plant.Counter=0        (int32, 每秒自增)")
+	fmt.Println("  ns=2;s=Plant.Running=true     (bool, 只读)")
+	fmt.Println("  ns=2;s=Plant.Label=\"SIM-01\"   (string, 可写)")
+	fmt.Println("  ns=2;s=Plant.Setpoint=60      (double, 可写)")
+	fmt.Println("  ns=0;i=2258 CurrentTime 每秒刷新，可用于观察 SSE")
+	fmt.Println("  Ctrl+C 停止")
+
+	go func() {
+		t := time.NewTicker(time.Second)
+		defer t.Stop()
+		var n int32
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				n++
+				srv.Set("ns=2;s=Plant.Counter", ua.Variant{Type: ua.TypeInt32, Int: int64(n)})
+				srv.Set("ns=0;i=2258", ua.Variant{Type: ua.TypeDateTime, Time: time.Now()})
+			}
+		}
+	}()
+
+	<-ctx.Done()
+	_ = srv.Close()
+	slog.Info("sim_stopped")
 }

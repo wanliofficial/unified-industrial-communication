@@ -44,6 +44,16 @@ curl -s localhost:8085/api/v1/points
 #   -pdu 240 可验证按协商 PDU 切块
 ```
 
+OPC UA（二进制，SecurityPolicy None / 匿名）：
+
+```bash
+./uic sim -protocol opcua -listen 127.0.0.1:14840 &   # 内置 OPC UA 服务端
+./uic -config examples/opcua.json
+curl -s localhost:8086/api/v1/points
+#   6 点：double / int32 / bool / string / 可写 double / 标准节点 ns=0;i=2258
+#   写穿透：curl -X POST .../points/ua1/setpoint/write
+```
+
 从站（把网关采集到的点位反向暴露给 SCADA / 第三方主站）：
 
 ```bash
@@ -91,17 +101,20 @@ go test -race -count=1 ./...
 
 | 路径 | 内容 |
 |---|---|
-| `cmd/uic/` | 单入口：`run` / `sim`（Modbus / S7）/ `mbread` / `-check` / `version` |
+| `cmd/uic/` | 单入口：`run` / `sim`（Modbus / S7 / OPC UA）/ `mbread` / `-check` / `version` |
 | `internal/model` | 通道 / 设备 / 点位 / 地址 / 采样 / 质量码 |
 | `internal/driver` | 驱动契约（Codec / Transport / Driver）、错误分类、注册表 |
 | `internal/codec/modbus` | Modbus 纯函数编解码（主站与从站共用） |
 | `internal/codec/value` | 协议无关值编解码（重排 / 数值 / 字符串 / BCD） |
 | `internal/codec/s7` | S7 纯函数编解码（TPKT / COTP / S7 PDU） |
+| `internal/codec/opcua` | OPC UA 纯函数编解码（UACP、安全报文、NodeId、Variant、九类服务） |
 | `internal/driver/modbus` | Modbus TCP + RTU + ASCII 主站 |
 | `internal/driver/s7` | S7（S7comm）主站 |
+| `internal/driver/opcua` | OPC UA 主站（None/None + 匿名，三层状态机） |
 | `internal/driver/virtual` | 虚拟设备（波形 + 故障注入） |
 | `internal/sim/modbus` | 内置 Modbus TCP 从站 |
 | `internal/sim/s7` | 内置 S7 从站（内存 DB/M/I/Q 区） |
+| `internal/sim/opcua` | 内置 OPC UA 服务端（内存地址空间） |
 | `internal/slave/modbus` | Modbus TCP 从站（把点位映射给外部主站，写穿透到南向） |
 | `internal/planner` | 点位 → 批量读请求 |
 | `internal/scheduler` | tick / actor / 信号量 / 退避 / 熔断 / 代次隔离 |
