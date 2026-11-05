@@ -9,6 +9,17 @@ internal sealed class CheckFailedException : Exception
 }
 
 /// <summary>
+/// 环境不具备执行条件（例如非 Linux 上没有伪终端）。
+///
+/// 与「失败」严格区分：跳过意味着这条用例在本机根本没有验证过，
+/// 输出里必须能看见它，而不是悄悄算进通过数。
+/// </summary>
+internal sealed class SkipException : Exception
+{
+    public SkipException(string reason) : base(reason) { }
+}
+
+/// <summary>
 /// 单个用例的上下文：断言 + 临时目录 + 取消信号。
 ///
 /// 断言直接抛异常而不是返回 bool：失败点就是异常点，不需要每行都写 if。
@@ -192,6 +203,11 @@ internal static class TestRunner
                 failed.Add((test.Name, "timed out after 180s"));
                 Console.WriteLine($"  FAIL  {test.Name}  (timeout)");
                 if (stopOnFail) break;
+            }
+            catch (SkipException ex)
+            {
+                skipped++;
+                Console.WriteLine($"  skip  {test.Name}  ({ex.Message})");
             }
             catch (CheckFailedException ex)
             {

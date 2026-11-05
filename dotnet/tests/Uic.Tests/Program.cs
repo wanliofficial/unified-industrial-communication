@@ -31,6 +31,7 @@ OutboxTests.Register(tests);
 ConfigStoreTests.Register(tests);
 JsonTests.Register(tests);
 LoopbackTests.Register(tests);
+SerialTests.Register(tests);
 ContractTests.Register(tests);
 OpcUaTests.Register(tests);
 

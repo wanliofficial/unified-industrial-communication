@@ -16,10 +16,11 @@ dotnet run --project tests/Uic.Tests -- --stop-on-fail      # 首个失败即停
 正常输出：
 
 ```
-94 passed, 0 failed, 1 skipped · 18.7s
+100 passed, 0 failed, 1 skipped · 22.5s
 ```
 
 跳过的一条是 OPC UA 验收（要绑端口、生成证书，默认不跑）。
+串口用例会自己开伪终端，Linux 上默认执行；其它平台报 `skip`，不算通过也不算失败。
 
 运行器的行为：
 
@@ -28,6 +29,7 @@ dotnet run --project tests/Uic.Tests -- --stop-on-fail      # 首个失败即停
 | 单个用例硬超时 180 s | 挂死的用例不会拖住整轮，失败信息里会写 `timed out after 180s` |
 | 每个用例独立临时目录 | `TestContext.TempDir`，跑完不清理，失败时可以进去看现场 |
 | `UIC_TESTDATA` | 覆盖黄金帧目录；不设时从输出目录向上找 `testdata/golden` |
+| 环境不具备时跳过 | 用例抛 `SkipException`（例如非 Linux 没有 pty），输出 `skip` 与原因，不计入通过 |
 | 退出码 | 0 = 全过，1 = 有失败，2 = 语料加载失败 |
 
 ## 用例分布
@@ -44,6 +46,7 @@ dotnet run --project tests/Uic.Tests -- --stop-on-fail      # 首个失败即停
 | `json/*` | 9 | 时长、枚举、值形状、UTC、往返稳定、前向兼容 |
 | `engine/*` | 2 | 同连接永不并发、状态机与代次 |
 | `loopback/*` | 12 | 主站 ↔ 内置从站的真实链路 |
+| `serial/*` | 6 | 真实伪终端上的 RTU / ASCII、半双工、deadline、关闭打断读 |
 | `contract/*` | 7 | 进程内真实 Kestrel 的 REST 契约 |
 | `opcua/*` | 1 | 标准 OPC UA 客户端：浏览、读、写、订阅 |
 
@@ -65,23 +68,31 @@ dotnet run --project tests/Uic.Tests -- --stop-on-fail      # 首个失败即停
 | T12 | 半包响应 | `loopback/fragmented_response_is_reassembled`、`codec/framing_rejects_corruption` | 响应分三片、带间隔到达 |
 | T13 | 异常码映射 | `codec/exception_codes_map_to_kinds` | 01/02/03/04/06/11 全覆盖 |
 | T14 | 金报文 | `golden/*`（16 份） | TCP / RTU / ASCII 三种封装 |
-| T15 | 半双工并发 | — | **留白**，见下 |
-| T16 | 沉默从站 | `loopback/silent_slave_times_out` | 300 ms 超时，不挂死 |
-| T17 | 串口 deadline | — | **留白**，见下 |
-| T18 | 关闭打断读 | — | **留白**，见下 |
+| T15 | 半双工并发 | `serial/half_duplex_does_not_cross_responses` | 两台从站共用一条 pty：值不许串，响应未发出前总线上不许出现新请求 |
+| T16 | 沉默从站 | `loopback/silent_slave_times_out`、`serial/silent_slave_times_out` | TCP 与串口各一条，都是 300 ms 超时且不挂死 |
+| T17 | 串口 deadline | `serial/read_returns_near_deadline` | 返回时间落在 deadline 附近，既不是瞬间返回也不是 N 倍 |
+| T18 | 关闭打断读 | `serial/close_interrupts_blocked_read` | 阻塞中的读在关闭后 2 s 内返回 |
 
-### 为什么 T15–T18 留白
+### 串口用例怎么跑
 
-这四条是串口链路专属：伪终端（pty）上的 termios 行为、内核 tty 的 deadline、
-半双工链路上两个设备的响应交错。它们无法用内存流复现 —— 内存流没有内核 tty 层，
-也没有真实的 poller 行为，用内存流伪造出来的「通过」只会掩盖真实缺陷。
+T15–T18 是串口链路专属：termios、内核 tty 的 deadline、半双工总线上的响应交错。
+这些行为不在内存流里 —— 内存流没有 tty 层，也没有真实的 poller，用内存流伪造出来的
+「通过」只会掩盖缺陷。所以 `serial/*` 跑在**真实伪终端**上：
 
-在自包含运行器里做这件事需要先建 pty 对（`posix_openpt` / `grantpt` / `unlockpt`），
-这已经超出「一个控制台程序 + 框架自带库」的范围。所以这里明确留白，并且**不写占位用例**：
-一条永远通过的假用例比没有用例更糟。
+```
+posix_openpt → grantpt → unlockpt → ptsname
+主站：System.IO.Ports 打开 pts 从设备路径
+测试端：用同一个 master fd 扮演总线上的一台或多台从站
+```
 
-要在 CI 上补上，需要：Linux + `socat`/pty 辅助进程，或者一个独立的串口验收脚本。
-`src/Uic.Transport` 的串口实现本身只依赖 `System.IO.Ports`，没有额外假设。
+只用 libc 的四个函数，不引第三方包，也不依赖 `socat` 之类的外部进程；
+非 Linux 上 `posix_openpt` 不存在，用例报 `skip` 并打印原因。
+
+从站这一端不是「照着期望字节回包」：它跑的是仓库里的 `ModbusSlaveHandler`
+（与内置 TCP 从站同一份 PDU 逻辑），所以主站发出的帧必须真的能被解析、CRC 必须对。
+`serial/rtu_golden_frame_over_pty` 与 `serial/ascii_golden_frame_over_pty` 还会把
+总线上抓到的请求字节与 `testdata/golden/` 里的黄金帧逐字节比对 —— 这样「黄金帧」
+和「真实 tty」之间不再是两套互不相干的验证。
 
 ## 黄金帧格式
 
@@ -169,9 +180,12 @@ WebApplication.CreateBuilder → UseUrls("http://127.0.0.1:0")
 
 | 缺口 | 影响 | 建议 |
 |---|---|---|
-| 串口用例 T15–T18 | 半双工交错、tty deadline、关闭打断读未在本仓库验证 | 上线前用 `socat` 造 pty 对跑一次手工验收 |
 | MQTT 未连真实 broker | 协议实现（3.1.1 发布侧）只经代码评审，未经互操作验证 | 用 mosquitto 手工验收一次：联通、断线重连、`$birth`/`$death`/`$state` |
 | WASM 控制台 | 自动化验收放在独立脚本里（Playwright 驱动），不在本运行器内 | 见仓库外部的浏览器冒烟脚本 |
-| 真实硬件 | 全部用例都跑在内置从站/虚拟设备上 | 现场接入时先用 `uic check` 与 `/api/v1/commands` 的 `device.selftest` |
+| 真实硬件 | 全部用例都跑在内置从站 / 虚拟设备 / 伪终端上 | 现场接入时先用 `uic check` 与 `/api/v1/commands` 的 `device.selftest` |
+
+串口用例虽然跑在伪终端上，走的是与真串口完全相同的内核 tty 路径（termios、
+行规程、poller），所以 T15–T18 在 pty 上通过是有意义的；但它仍然不是
+「某型号 USB 转 485 适配器」的验收——那一步只能在现场做。
 
 这些缺口是**明确留白**而不是遗漏：每一条都写清了「为什么现在不做」与「上线前怎么补」。

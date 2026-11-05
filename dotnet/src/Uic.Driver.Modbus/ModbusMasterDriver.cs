@@ -470,7 +470,11 @@ internal static class SerialPortTable
             if (shared.Refs > 0) return;
 
             Ports.Remove(lease.Port);
-            shared.Mutex.Dispose();
+
+            // 先关端口：关闭会让阻塞中的读立刻失败返回，而那个读的 finally
+            // 还要再 Release 一次，所以信号量不能在这里 Dispose。
+            // SemaphoreSlim 除 AvailableWaitHandle 外不持有非托管资源，
+            // 交给 GC 即可。
             await shared.Stream.DisposeAsync().ConfigureAwait(false);
         }
         finally
