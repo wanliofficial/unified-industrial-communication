@@ -38,6 +38,7 @@ import (
 	opcuadriver "uic/internal/driver/opcua"
 	"uic/internal/driver/s7"
 	"uic/internal/driver/virtual"
+	"uic/internal/history"
 	"uic/internal/model"
 	"uic/internal/northbound/httpapi"
 	"uic/internal/obs"
@@ -78,6 +79,8 @@ type Runtime struct {
 	journalSink *journalSink
 	mqttSink    *mqttSink
 	alarms      *alarm.Engine
+	hist        *history.Store
+	histWriter  *historyWriter
 
 	mu          sync.Mutex
 	collectors  map[string]*collector
@@ -200,6 +203,12 @@ func New(opt Options) (*Runtime, error) {
 		}
 		return nil, err
 	}
+	if err := r.openHistory(mgr.Current()); err != nil {
+		if logFile != nil {
+			_ = logFile.Close()
+		}
+		return nil, err
+	}
 	if err := r.openSlaves(mgr.Current()); err != nil {
 		if logFile != nil {
 			_ = logFile.Close()
@@ -253,6 +262,12 @@ func (r *Runtime) declareMetrics() {
 	d("uic_alarm_cleared", "gauge", "已恢复但未确认的报警数")
 	d("uic_alarm_unknown", "gauge", "最近一次评估时输入不可信的报警数")
 	d("uic_alarm_rules", "gauge", "已加载的报警规则数")
+	d("uic_history_bytes", "gauge", "历史库占用字节数")
+	d("uic_history_segments", "gauge", "历史库段文件数")
+	d("uic_history_records_total", "gauge", "历史库累计写入记录数")
+	d("uic_history_evicted_total", "gauge", "因保留策略淘汰的段数")
+	d("uic_history_write_errors_total", "gauge", "历史写入失败次数")
+	d("uic_history_query_total", "counter", "历史查询次数与结果")
 }
 
 // build 按配置创建采集器并注册到调度器。
@@ -315,6 +330,11 @@ func (r *Runtime) Start(ctx context.Context) {
 		// 不会在 sink 还没拿到初始快照时把它覆盖掉。
 		r.seedAlarmSink()
 	}
+	if r.hist != nil {
+		r.wg.Add(1)
+		go r.historyLoop(r.ctx)
+		r.refreshHistoryMetrics()
+	}
 	for name, fn := range r.sinks {
 		sink, deliver := name, fn
 		r.wg.Add(1)
@@ -368,6 +388,13 @@ func (r *Runtime) Stop(timeout time.Duration) error {
 		// 先关 MQTT：它会发 DISCONNECT，让 Broker 不触发遗嘱消息。
 		// 放在 Outbox 关闭之后，避免还在投递时就断链。
 		if err := r.mqttSink.close(); err != nil && first == nil {
+			first = err
+		}
+	}
+	if r.hist != nil {
+		// 采样循环已经随 ctx 退出；这里再刷一次并关闭，保证缓冲区里的
+		// 最后几条记录落盘、所有段文件句柄释放。
+		if err := r.hist.Close(); err != nil && first == nil {
 			first = err
 		}
 	}
@@ -497,6 +524,13 @@ func (r *Runtime) ApplyConfig(raw json.RawMessage, source string) (config.ApplyR
 	}{after.Northbound, after.Storage})
 	if string(beforeNB) != string(afterNB) {
 		r.log.Warn("northbound_config_changed", "detail", "MQTT/OPC UA/Webhook 参数变更需重启进程生效")
+	}
+	// 历史库的目录与保留策略在 Open 时就固定了。采样参数可以热改，
+	// 但这四项不能——必须明确告诉运维「改了但没生效」，否则他会盯着
+	// 一个没变的水位以为配置没生效。
+	if historyFingerprint(before.Storage.History) != historyFingerprint(after.Storage.History) {
+		r.log.Warn("history_config_changed",
+			"detail", "storage.history 的 dir/maxBytes/segmentBytes/maxAge 变更需重启进程生效；minInterval/heartbeat/deadband 已即时生效")
 	}
 	return res, nil
 }
@@ -648,6 +682,20 @@ func (r *Runtime) Health() httpapi.Health {
 		}
 	}
 	h.Points = r.pointCounts("")
+	if st, ok := r.HistoryStats(); ok {
+		h.History = httpapi.HistoryHealth{
+			Enabled: true, Records: st.Appended, Bytes: st.Bytes, MaxBytes: st.MaxBytes,
+			Segments: st.Segments, Evicted: st.Evicted, Errors: st.WriteErrors,
+		}
+		if !st.Oldest.IsZero() {
+			oldest := st.Oldest
+			h.History.Oldest = &oldest
+		}
+		if !st.Newest.IsZero() {
+			newest := st.Newest
+			h.History.Newest = &newest
+		}
+	}
 	if r.box != nil {
 		for _, st := range r.box.Stats() {
 			h.Outbox.Pending += st.Pending

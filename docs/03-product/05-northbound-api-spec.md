@@ -366,6 +366,7 @@ logs/uic.log         最近 5000 行
 health.json          健康快照（含报警计数）
 devices.json         设备状态与统计
 alarms.json          报警规则 + 当前状态 + 计数
+history.json         历史库水位 + 采样策略 + 目录（启用历史时）
 outbox.json          待投递队列水位（启用北向时）
 ```
 
@@ -608,6 +609,173 @@ uic_alarm_unknown                       输入不可信的规则数
 uic_alarm_rules                         已加载规则数
 uic_mqtt_publish_total{result="alarm"}  报警 retained 发布
 ```
+
+---
+
+### 4.8 历史查询
+
+> **状态**：已实现（`internal/history` + `internal/runtime/history.go`）。
+
+历史库是**有界的采样日志**，不是时序数据库：没有索引、没有压缩、没有跨点位
+join、没有 SQL。它解决的是「昨天下午三点那台泵的功率是多少」这一类一线问题，
+而不是「对 10 亿点做多维度下钻」。这个边界必须写在接口上，否则它一定会被当成
+TSDB 用，然后在数据量上来之后变成一次事故。
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| GET | `/api/v1/history?device=&point=&from=&to=&step=&agg=&limit=` | 查询单个点位的原始采样或聚合结果 |
+
+#### 4.8.1 参数
+
+| 参数 | 必填 | 默认 | 说明 |
+|---|---|---|---|
+| `device` | 是 | — | 设备 ID |
+| `point` | 是 | — | 点位 ID |
+| `from` | 否 | `to - 1h` | 起始时刻（含） |
+| `to` | 否 | 服务器当前时间 | 结束时刻（含） |
+| `step` | 否 | 0（原始点） | 聚合步长，如 `10s` / `1m` / `1h`；必须 > 0 |
+| `agg` | 否 | `last` | 仅在有 `step` 时有效：`last` / `first` / `avg` / `min` / `max` / `count` |
+| `limit` | 否 | 1000 | 返回条数上限，最大 10000 |
+
+`from` / `to` 接受三种写法：
+
+```
+now               服务器当前时间
+-1h  /  +30m      相对服务器当前时间（运维最常用的写法）
+2026-03-01T12:00:00Z   RFC3339 绝对时刻
+```
+
+**区间是左闭右闭的**：`from` 与 `to` 正好命中记录时必须包含。这一点与很多
+时序库的「左闭右开」相反，因为这里的查询是「给我看这两分钟内发生了什么」，
+两端都是人指定的边界，丢掉边界上的点会让人怀疑数据丢了。
+
+#### 4.8.2 原始查询
+
+```bash
+curl -s 'localhost:8092/api/v1/history?device=press&point=power&from=-5m&limit=2'
+```
+
+```json
+{
+  "device": "press",
+  "point": "power",
+  "from": "2026-03-01T11:55:00Z",
+  "to": "2026-03-01T12:00:00Z",
+  "step": "0s",
+  "agg": "last",
+  "points": [
+    { "time": "2026-03-01T11:59:58.203Z",
+      "value": { "type": "float64", "num": 73.4 }, "quality": "good" },
+    { "time": "2026-03-01T11:59:59.204Z",
+      "value": { "type": "float64", "num": 73.9 }, "quality": "good" }
+  ],
+  "count": 2,
+  "scanned": 812,
+  "skipped": 0
+}
+```
+
+- `points` 按时间**升序**。写入端可能乱序（时钟回拨、补写历史），查询端负责
+  排序，消费方不必再排一次。
+- `scanned` / `skipped` 是诊断量：扫了多少行、跳过了多少损坏行。把它们放进
+  响应而不是只写日志，是因为现场很难区分「查询变慢」与「文件损坏」。
+- 没有数据时返回 `200` + `count: 0`，**不返回 404**。「这段时间没有数据」是
+  一个正常答案；404 会让人以为点位不存在。
+- 超过 `limit` 时返回前 `limit` 条并置 `truncated: true`。
+
+#### 4.8.3 聚合查询
+
+```bash
+curl -s 'localhost:8092/api/v1/history?device=press&point=power&from=-1h&step=1m&agg=avg'
+```
+
+```json
+{
+  "device": "press", "point": "power",
+  "from": "2026-03-01T11:00:00Z", "to": "2026-03-01T12:00:00Z",
+  "step": "1m0s", "agg": "avg",
+  "buckets": [
+    { "time": "2026-03-01T11:00:00Z", "count": 12,
+      "first": { "type": "float64", "num": 71.2 },
+      "last":  { "type": "float64", "num": 74.8 },
+      "min": 70.9, "max": 75.1, "avg": 73.05, "quality": "good" }
+  ],
+  "count": 1, "scanned": 812, "skipped": 0
+}
+```
+
+- 桶的 `time` 是**桶起点**（对齐到 `from + k*step`），不是桶内第一条记录的时间。
+  这样同一份查询在不同时间重跑，桶边界保持不变。
+- `min` / `max` / `avg` 只对**数值类型**计算；文本、`bytes` 与 `bool` 点位这三项
+  是 `null`。把开关量平均成 `0.37`、把文本平均成 `0` 都是编造出来的数字。
+- 桶的 `quality` 取桶内**最差**的质量码，而不是最后一条。一个桶里只要有一条
+  `comm_error`，它的均值就不可信；标成 `good` 等于让前端把坏数据画成好数据。
+- 一次查询的桶数上限是 5000（`MaxBuckets`）。超限返回 `400` 并提示「加大 step
+  或缩小范围」，而不是先扫完再说——那会在低配盒子上直接 OOM。
+- `count` 是返回的桶数；`limit` 同样约束桶数，超出时置 `truncated`。
+
+#### 4.8.4 错误码
+
+| HTTP | code | 触发条件 |
+|---|---|---|
+| 400 | `history.invalid_range` | `from` 不早于 `to`，或时间格式无法解析 |
+| 400 | `history.invalid_query` | `step` / `agg` 非法、桶数超限、只有 `agg` 没有 `step` |
+| 400 | `request.invalid` | 缺 `device` / `point`，或 `limit` 不是正整数 |
+| 409 | `history.disabled` | 配置里 `storage.history.enabled=false` |
+| 503 | `history.unavailable` | 历史库已关闭（进程正在停止） |
+
+`history.disabled` 必须是 `409` 而不是「返回空结果」。空结果会被读成「这段时间
+没有数据」，而真实原因是「这台网关根本没开历史」——两者的处置方式完全不同。
+
+#### 4.8.5 存储语义（对使用方的承诺）
+
+| 项 | 行为 |
+|---|---|
+| 采样 | 事件驱动 + 心跳：值变化超过 `deadband` 就记，没变化也至少每 `heartbeat` 记一条 |
+| 最小间隔 | 同一测点两次落盘至少间隔 `minInterval`（默认 1s）；被挡下的变化会以「最新值」在到期后补写 |
+| 质量 | 质量码变化也会落一条（坏数据的起点是最需要查的信息）；`disabled` 点位不记录 |
+| 保留 | 按总字节数（`maxBytes`）与保留期（`maxAge`）**整段淘汰**最旧的数据，永远保留至少一个段 |
+| 落盘 | 每 200ms 刷一次用户态缓冲；进程崩溃最多丢 200ms；不做每条 fsync（SD 卡寿命） |
+| 重启 | 重开目录后继续追加；末尾半行会被识别并另起一段，不会把新记录拼进坏行 |
+| 时区 | 所有对外时间戳都是 UTC（RFC3339），与 `Sample` 侧保持一致 |
+
+**明确不支持**：
+
+- 跨点位聚合 / join（一条查询只服务一个 `device+point`）；
+- 任意时间跨度的全量导出（用 `limit` + 分段查询，或直接拷段文件）；
+- 删除单条记录（保留策略只按段淘汰）；
+- 采样策略按点位覆盖（全局一套；需要区别对待时用 `deadband` 与停用点位表达）。
+
+#### 4.8.6 配置
+
+```json
+{
+  "storage": {
+    "dir": "./data",
+    "history": {
+      "enabled": true,
+      "dir": "./data/history",
+      "maxBytes": 268435456,
+      "maxAge": "168h0m0s",
+      "segmentBytes": 16777216,
+      "minInterval": "1s",
+      "heartbeat": "5m0s",
+      "deadband": 0
+    }
+  }
+}
+```
+
+- `heartbeat` 未配置时默认 `5m`；显式写 `"0s"` 表示**不补点**（长时间稳定的
+  点位在图上会是一段空白，这是有意的取舍）。
+- `dir` 默认是 `<storage.dir>/history`。
+- 改 `dir` / `maxBytes` / `segmentBytes` / `maxAge` **需要重启**（存储打开时
+  就固定了），热更新只对 `minInterval` / `heartbeat` / `deadband` 生效；配置
+  重载时会打一条 `history_config_changed` 警告说明这一点。
+- `health.history` 暴露 `records` / `bytes` / `segments` / `oldest` / `newest` /
+  `evicted` / `writeErrors`；指标为 `uic_history_bytes`、`uic_history_segments`、
+  `uic_history_records_total`、`uic_history_evicted_total`、
+  `uic_history_write_errors_total`、`uic_history_query_total{result}`。
 
 ---
 
@@ -898,7 +1066,7 @@ LWT；而 `$birth` 是 retained 的，不补一条 `online=false` 就会让消�
 
 **它不是北向协议**。定位是：断网留痕、开发联调时无需架 Broker 即可验证整条链路、CI 里可直接断言落盘内容。默认关闭，因为它是磁盘写入路径，不该在为「只是想采个数」的部署里默默产生 I/O。
 
-详见 `03-domain-model.md` §11.0.1 与 `02-architecture.md` §7。
+详见 `03-domain-model.md` §12.0.1 与 `02-architecture.md` §7。
 
 ---
 
@@ -1039,6 +1207,7 @@ Objects
 | 配置版本/回滚 | 已实现 | 文件快照 |
 | 报警 REST + SSE | 已实现 | 见 §4.7 / §5.4（五态机、确认、质量门控） |
 | 报警 MQTT retained | 已实现 | 见 §6.8（重连补发、删除清理） |
+| `GET /api/v1/history` | 已实现 | 见 §4.8（原始点 + 定步长聚合、有界保留） |
 | `alarm.ack` 命令 | 已实现 | 同 §4.7.3 语义 |
 | MQTT | 已实现 | 见 §6（QoS0/1、retained 状态、断线补投） |
 | OPC UA | 规范已定义 | Wave 1 后半实现 |

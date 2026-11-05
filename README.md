@@ -129,13 +129,28 @@ curl -sN 'localhost:8091/api/v1/alarms/stream?heartbeat=5s'   # 事件流
 **`active` 与 `cleared` 都需要人确认**，前者转 `acked`，后者转 `normal`，另外
 `pending` 不可确认（否则等于允许提前消音）。
 
+历史（有界采样日志，不引入数据库）：
+
+```bash
+./uic -config examples/history.json           # REST :8092
+curl -s 'localhost:8092/api/v1/history?device=press&point=power&from=-5m&limit=5' | jq
+curl -s 'localhost:8092/api/v1/history?device=press&point=power&from=-1h&step=1m&agg=avg' | jq '.buckets[0]'
+curl -s localhost:8092/api/v1/health | jq '.history'
+```
+
+示例把采样策略配成「1 秒最小间隔 + 30 秒心跳 + 0.5 死区」。三条语义必须记住：
+**它是旁路**——写失败只计数，绝不反压采集；**整段淘汰**——按字节上限与保留期
+淘汰最旧的段，永远保留一段；**心跳不撒谎**——只有样本本身仍新鲜才补点，设备停
+了就不再写「此刻仍然是 42」。查询左闭右闭、结果按时间升序、桶质量取桶内最差，
+非数值点位的 `min/max/avg` 是 `null` 而不是 0。
+
 ## 文档
 
 - **[docs/00-README.md](docs/00-README.md)** — 总索引：阅读路径、38 个参考方案总览、结论速查、代码地图、接口速查、实现边界
 - `docs/01-project-analysis/` — 38 份逐方案六章分析（PA-01 … PA-38）
 - `docs/02-synthesis/` — 能力矩阵 / 架构原型 / 缺口分析 / 协议目录
 - `docs/03-product/` — PRD / 架构 / 领域模型 / 驱动 SDK / 北向 API / NFR / 路线图
-- `docs/04-decisions/` — ADR（语言选型）
+- `docs/04-decisions/` — ADR（语言选型、历史库选型）
 
 ## 开发
 
@@ -155,6 +170,7 @@ go test -race -count=1 ./...
 | `internal/driver` | 驱动契约（Codec / Transport / Driver）、错误分类、注册表、只读 `Lookup` 注入 |
 | `internal/calc` | 零依赖表达式引擎（编译期类型检查、短路求值、引用 `device:point`） |
 | `internal/alarm` | 报警引擎：五态机 / 滞回 / 延时 / 表达式规则 / 确认 / 订阅 |
+| `internal/history` | 有界采样日志：NDJSON 分段 / 整段淘汰 / 原始查询与定步长聚合 |
 | `internal/codec/modbus` | Modbus 纯函数编解码（主站与从站共用） |
 | `internal/codec/value` | 协议无关值编解码（重排 / 数值 / 字符串 / BCD） |
 | `internal/codec/s7` | S7 纯函数编解码（TPKT / COTP / S7 PDU） |

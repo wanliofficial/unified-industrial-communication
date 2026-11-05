@@ -369,6 +369,17 @@ func (r *Runtime) DiagnosticsBundle(_ context.Context) ([]byte, error) {
 			return nil, err
 		}
 	}
+	if r.hist != nil {
+		// 水位 + 策略一起导出：只看字节数无法判断「为什么只存了 3 天」。
+		hist, _ := json.MarshalIndent(map[string]any{
+			"stats":  r.hist.Stats(),
+			"policy": r.cfg.Current().Storage.History,
+			"dir":    r.hist.Dir(),
+		}, "", "  ")
+		if err := add("history.json", hist); err != nil {
+			return nil, err
+		}
+	}
 	if r.alarms != nil {
 		// 规则与状态一起导出：只有状态看不出「为什么没报警」。
 		alarms, _ := json.MarshalIndent(map[string]any{

@@ -254,6 +254,14 @@ func checkConfig(path string) int {
 		}
 		fmt.Printf("  alarms      %d（启用 %d）\n", len(f.Alarms), enabled)
 	}
+	if h := f.Storage.History; h.Enabled {
+		beat := "关闭"
+		if h.Heartbeat != nil && h.Heartbeat.Duration() > 0 {
+			beat = h.Heartbeat.String()
+		}
+		fmt.Printf("  history     %s（上限 %s，保留 %s，心跳 %s）\n",
+			h.Dir, humanBytes(h.MaxBytes), h.MaxAge.String(), beat)
+	}
 	fmt.Printf("  drivers     %d（%s）\n", len(driver.List()), driverIDs())
 	sinks := []string{}
 	if f.Northbound.Webhook.Enabled {
@@ -267,9 +275,22 @@ func checkConfig(path string) int {
 	}
 	fmt.Printf("  outbox      %v\n", sinks)
 	if f.Northbound.MQTT.Enabled {
-		fmt.Printf("  mqtt        已配置（本骨架未实现投递）\n")
+		fmt.Printf("  mqtt        %s（qos %d）\n", f.Northbound.MQTT.Broker, f.Northbound.MQTT.QoS)
 	}
 	return 0
+}
+
+// humanBytes 用二进制单位打印容量。配置里是字节数（精确），但人读的是 MB。
+func humanBytes(n int64) string {
+	switch {
+	case n >= 1<<30:
+		return fmt.Sprintf("%.1f GiB", float64(n)/(1<<30))
+	case n >= 1<<20:
+		return fmt.Sprintf("%.1f MiB", float64(n)/(1<<20))
+	case n >= 1<<10:
+		return fmt.Sprintf("%.1f KiB", float64(n)/(1<<10))
+	}
+	return fmt.Sprintf("%d B", n)
 }
 
 func decodeStrict(raw []byte, v any) error {

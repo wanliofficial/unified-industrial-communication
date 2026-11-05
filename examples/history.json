@@ -1,0 +1,97 @@
+{
+  "schemaVersion": 1,
+  "site": "history-site",
+  "server": {
+    "listen": "127.0.0.1:8092",
+    "tls": {
+      "enabled": false
+    }
+  },
+  "channels": [
+    {
+      "id": "ch-virtual",
+      "protocol": "virtual",
+      "transport": {
+        "kind": "memory"
+      },
+      "concurrency": 4,
+      "timeout": "2s"
+    }
+  ],
+  "devices": [
+    {
+      "id": "press",
+      "name": "压机（正弦功率 + 斜坡速率）",
+      "channel": "ch-virtual",
+      "interval": "500ms",
+      "timeout": "2s",
+      "enabled": true,
+      "points": [
+        {
+          "id": "power",
+          "name": "功率",
+          "address": {
+            "kind": "register",
+            "area": "holding",
+            "offset": 0,
+            "length": 2,
+            "bit": -1
+          },
+          "dataType": "float64",
+          "unit": "kW",
+          "enabled": true
+        },
+        {
+          "id": "rate",
+          "name": "速率",
+          "address": {
+            "kind": "register",
+            "area": "holding",
+            "offset": 2,
+            "length": 2,
+            "bit": -1
+          },
+          "dataType": "float64",
+          "unit": "次/min",
+          "enabled": true
+        },
+        {
+          "id": "running",
+          "name": "运行中",
+          "address": {
+            "kind": "register",
+            "area": "coil",
+            "offset": 0,
+            "length": 1,
+            "bit": -1
+          },
+          "dataType": "bool",
+          "enabled": true
+        }
+      ],
+      "labels": {
+        "mode": "sine"
+      }
+    }
+  ],
+  "storage": {
+    "dir": "./data-history",
+    "outboxMaxBytes": 8388608,
+    "outboxMaxRecords": 20000,
+    "outboxTtl": "1h0m0s",
+    "journal": false,
+    "history": {
+      "enabled": true,
+      "maxBytes": 33554432,
+      "maxAge": "24h0m0s",
+      "segmentBytes": 4194304,
+      "minInterval": "1s",
+      "heartbeat": "30s",
+      "deadband": 0.5
+    }
+  },
+  "logging": {
+    "level": "info",
+    "format": "json"
+  }
+}

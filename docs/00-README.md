@@ -35,7 +35,7 @@ cmd/ + internal/            可运行的最小骨架（不是伪代码，能采�
 ### 1.2 它不是什么
 
 - 不是协议库大杂烩。当前实现了 8 个驱动（Modbus TCP / RTU / ASCII 主站、S7 主站、OPC UA 主站、
-  MQTT 南向订阅、计算点、virtual），外加 Modbus TCP 从站、四个内置模拟从站/Broker 与一个零依赖报警引擎；其余协议在
+  MQTT 南向订阅、计算点、virtual），外加 Modbus TCP 从站、四个内置模拟从站/Broker、一个零依赖报警引擎与一个有界历史采样日志；其余协议在
   `04-protocol-catalog.md` 里按工作量排了三波，没有假装已经支持。
   注意 MQTT 出现了两次且**互不相干**：北向是「网关把数据发出去」（sink），南向是「网关订阅别人发来的数据」（driver）。
 - 不是组态软件。不做画面、不做报表、不做自研时序库——理由见 `02-synthesis/01-capability-matrix.md` §6.4。
@@ -202,6 +202,23 @@ curl -sN 'localhost:8091/api/v1/alarms/stream?heartbeat=5s'    # 事件流
 （功率过高）、低阈值（空转）、布尔表达式（功率与速率不匹配）、`autoAck`（尖峰）、
 以及 `disabled`（维护窗口）。确认语义刻意区分「正在报警」和「已恢复但没看过」：
 两者都需要人处理，确认后分别是 `acked` 与 `normal`。
+
+历史（有界采样日志，不引入数据库与第三方依赖）：
+
+```bash
+./uic -config examples/history.json           # REST :8092
+curl -s 'localhost:8092/api/v1/history?device=press&point=power&from=-5m&limit=5' | jq
+curl -s 'localhost:8092/api/v1/history?device=press&point=power&from=-1h&step=1m&agg=avg' | jq '.buckets[0]'
+curl -s localhost:8092/api/v1/health | jq '.history'
+```
+
+采样是「事件驱动 + 心跳补点」：值变化超过死区就记，没变化也至少每 `heartbeat`
+记一条；被 `minInterval` 挡下的变化进 pending，到期补写成**最终值**（否则「快速
+变化后立刻稳定」的末值会永久丢失）。三条边界必须记住：**它是旁路**（写失败只
+计数，不反压采集）；**整段淘汰**（按字节上限与保留期淘汰最旧的段，永远保留一
+段）；**心跳不撒谎**（只有样本本身仍新鲜才补点，设备停了就不再写「此刻仍然是
+42」）。查询左闭右闭、结果按时间升序、桶质量取桶内最差，非数值点位的
+`min/max/avg` 是 `null` 而不是 0。
 
 写入与回滚（这是最能体现「可治理」的两条命令）：
 
@@ -501,18 +518,19 @@ obs  ← 所有包（不依赖任何内部包）
 | `internal/sim/mqtt` | 内置 MQTT 3.1.1 Broker，兼 `uic sim -protocol mqtt` 运行时 | 全项目唯一一份 Broker 实现；不做 QoS2/持久会话/TLS；QoS2 授予时降级为 1 | 79.3% |
 | `internal/slave/modbus` | Modbus TCP 从站（把点位暴露给外部主站） | 读走 cache、写走 Runtime.Write；未映射地址报错不补零；坏质量保留最后值并计数 | 73.8% |
 | `internal/alarm` | 报警引擎：五态机、阈值/滞回/延时、表达式规则、确认、订阅 | 输入不可信时绝不改状态机；延时是「连续满足」；`cleared` 与 `active` 都要确认；状态只在内存 | 94.4% |
+| `internal/history` | 有界采样日志：NDJSON 分段、整段淘汰、原始查询与定步长聚合 | 一条记录不跨段；永远保留至少一段；末尾半行触发新段；查询升序、桶对齐、桶质量取最差；非数值点位不产出 `min/max/avg` | 83.5% |
 | `internal/calc` | 零依赖表达式引擎（编译期类型检查、短路求值） | 无 `eval`；引用是 `device:point`；除零/NaN/Inf/溢出都报错而不是降级 | 91.2% |
 | `internal/planner` | 点位 → 批量读请求（ReadSpan） | 协议无关；按连续性/上限合并；按 `area:db` 分组；计算点合成单个 `expr` span（漏组会表现为全坏且无日志） | 92.6% |
 | `internal/scheduler` | tick、actor、信号量、退避、熔断、代次 | 同设备不并发；写优先；旧代次丢弃；状态回调不占采集路径 | 87.8% |
 | `internal/pipeline` | 缩放、质量判定、死区过滤 | 质量不可用时不参与死区比较 | 92.7% |
 | `internal/cache` | 当前值唯一事实源 + 变更订阅 | 读写都要过这里，不允许模块自留副本 | 96.7% |
 | `internal/outbox` | 持久队列：分区、WAL、确认位点、三重上限 | at-least-once；整批或前缀成功才推进位点 | 77.4% |
-| `internal/config` | 加载、校验、规范化、版本化、回滚 | 幂等 Normalize；原子写；失败自动恢复；北向参数、从站映射、计算点（编译/引用/类型/环）与报警（条件/引用/类型）静态校验 | 86.3% |
+| `internal/config` | 加载、校验、规范化、版本化、回滚 | 幂等 Normalize；原子写；失败自动恢复；北向参数、从站映射、计算点（编译/引用/类型/环）、报警（条件/引用/类型）与历史保留策略静态校验 | 86.8% |
 | `internal/obs` | 指标、结构化日志、日志环形缓冲 | 指标标签必须归一化（不能含原始 URL） | 88.2% |
-| `internal/northbound/httpapi` | REST + SSE + 认证 + 错误码 | 错误码稳定；响应不泄露凭据；报警未知过滤值必须报错而不是静默忽略 | 82.2% |
+| `internal/northbound/httpapi` | REST + SSE + 认证 + 错误码 | 错误码稳定；响应不泄露凭据；报警/历史查询的未知参数取值必须报错而不是静默忽略 | 83.5% |
 | `internal/mqtt` | MQTT 3.1.1 客户端（北向发布 + 南向订阅共用，纯 Go 零依赖） | 单 goroutine 读 socket；QoS1 必须等到 PUBACK；`Ping` 必须等到 PINGRESP（写成功不算活着）；断线立即失败而非超时 | 70.3% |
 | `internal/mqtt/mqtttest` | 测试封装：`internal/sim/mqtt` 的 `*testing.T` 生命周期 + 等待断言 | 不另写 Broker（两份实现必然长歪）；开关一律走 setup 函数而非直接赋字段 | — |
-| `internal/runtime` | 唯一编排层 + 后端实现 + 看门狗 | 启动/关闭顺序；`configuredState` 与 `runtimeState` 分离；协议/传输匹配在装配期校验；只向驱动与报警引擎注入只读 `cache.Get` | 79.1% |
+| `internal/runtime` | 唯一编排层 + 后端实现 + 看门狗 | 启动/关闭顺序；`configuredState` 与 `runtimeState` 分离；协议/传输匹配在装配期校验；只向驱动与报警引擎注入只读 `cache.Get` | 79.5% |
 | `cmd/uic` | 单入口：run / sim / check / version | 关闭预算 10 秒 | — |
 
 ### 9.2 测试与验证命令
@@ -525,7 +543,7 @@ go test -race -count=1 ./...                    # 竞态 + 全量测试
 go test -coverprofile=c.out ./... && go tool cover -func=c.out | tail -1
 ```
 
-当前状态：`go build` / `go vet` / `gofmt` 全部干净，`go test -race ./...` 30 个测试包全部通过
+当前状态：`go build` / `go vet` / `gofmt` 全部干净，`go test -race ./...` 31 个测试包全部通过
 （另有 `cmd/uic` 与 `internal/mqtt/mqtttest` 两个无测试文件的包）。
 
 ### 9.3 源码阅读建议顺序
@@ -546,6 +564,7 @@ go test -coverprofile=c.out ./... && go tool cover -func=c.out | tail -1
 13. internal/calc/parse.go            表达式词法/语法：引用与减号的消歧（30 分钟）
 14. internal/driver/computed/driver.go 拓扑求值、质量传播、无 IO 的驱动形态（30 分钟）
 15. internal/alarm/engine.go           五态机、滞回/延时、质量门控、按依赖索引（50 分钟）
+16. internal/history/store.go + query.go 分段追加、整段淘汰、扫描聚合（50 分钟）
 ```
 
 ---
@@ -575,6 +594,7 @@ go test -coverprofile=c.out ./... && go tool cover -func=c.out | tail -1
 | POST | `/api/v1/commands` | 白名单命令 |
 | GET | `/api/v1/logs` | 结构化日志（按设备/级别/条数） |
 | GET | `/api/v1/stream` | SSE 实时流 |
+| GET | `/api/v1/history?device=&point=&from=&to=&step=&agg=&limit=` | 历史查询（原始点 / 定步长聚合） |
 | GET | `/api/v1/diagnostics/bundle` | 诊断 zip（配置脱敏） |
 
 **命令白名单**：`driver.restart`、`device.selftest`、`outbox.flush`、`outbox.drop`（需 confirm）、`config.rollback`（需 confirm）、`log.level`、`diag.bundle`。未知动作一律 400，不做猜测。
@@ -618,11 +638,13 @@ go test -coverprofile=c.out ./... && go tool cover -func=c.out | tail -1
 | 报警引擎 | ✅ | 五态机（normal/pending/active/acked/cleared）；阈值（单侧/双侧 + 滞回）或布尔表达式（复用 `calc`）；`onDelay`/`offDelay` 是「连续满足」；输入不可信时不动状态机；确认幂等、批量原子；规则热更新按判定条件哈希决定保留或重置 |
 | 报警的出口 | ✅ | REST（列表/单条/确认）、SSE `/alarms/stream`、MQTT retained `uic/{site}/$alarm/{id}`（重连整体补发、删除规则发空载荷清理）、`health.alarms`、5 个指标 |
 | 报警的边界 | ⚠️ | 状态只在内存（重启后仍成立的条件经 `onDelay` 重新报警，不恢复 `ackBy`）；不做报警抑制/依赖（父报警压子报警）、不做排班与升级通知；`autoAck` 只适合纯提示类规则 |
-| 历史窗口聚合（`avg(近 5 分钟)`） | ❌ | 需要历史库，属 Wave 2；当前只能对「此刻的值」求值 |
+| 历史采样日志 | ✅ | `storage.history.enabled=true`：事件驱动 + 心跳补点（死区 / 最小间隔 / 质量变化 / `disabled` 不记）；NDJSON 分段、按字节上限与保留期整段淘汰且永远保留一段；掉电半行触发新段；查询左闭右闭、结果升序、桶起点对齐、桶质量取最差、桶数上限 5000 |
+| 历史查询 API | ✅ | `GET /api/v1/history`：原始点 + 定步长聚合（last/first/avg/min/max/count）；`from`/`to` 支持 RFC3339、`now` 与相对写法（`-1h`）；关掉时返回 `409 history.disabled` 而不是空结果 |
+| 历史的边界 | ⚠️ | 单点位查询（不做跨点 join / 多点多列）；不做样本级删除（只按段淘汰）；采样策略全局一套（需要区别对待时用死区与停用点位）；`dir`/`maxBytes`/`segmentBytes`/`maxAge` 改动需重启，`minInterval`/`heartbeat`/`deadband` 可热改 |
+| 历史窗口聚合（`avg(近 5 分钟)`） | ⏳ | 历史库已可查；「在报警/计算表达式里引用历史窗口」尚未接入（属 Wave 2 的表达式扩展） |
 | 配置版本/回滚/diff | ✅ | 内容哈希版本、快照、原子写、失败自动恢复、回滚缺版本返回 404 |
 | 认证 | ✅ | Bearer Token，常量时间比较；未实现 RBAC |
 | TLS | ⏳ | 配置项已定义；未接证书加载 |
-| 历史数据 | ⏳ | Wave 2（SQLite） |
 | `uic -check` | ✅ | 纯校验，不写快照/状态文件（可在 CI 里安全运行） |
 
 > 判断标准：**没实现的能力必须显式失败或显式告警，不允许静默降级。** 这是从 38 份分析里提炼出的第一条工程纪律（见 `02-synthesis/03-gap-analysis.md` §6「反风险」）。

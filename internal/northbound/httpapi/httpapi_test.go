@@ -15,6 +15,7 @@ import (
 	"uic/internal/alarm"
 	"uic/internal/cache"
 	"uic/internal/config"
+	"uic/internal/history"
 	"uic/internal/model"
 	"uic/internal/obs"
 )
@@ -48,6 +49,10 @@ type fakeBackend struct {
 	alarmCounts alarm.Counts
 	ackFn       func(ctx context.Context, ids []string, all bool, by string) ([]alarm.Status, error)
 	alarmCh     chan alarm.Event
+
+	historyFn    func(q history.Query) (history.Result, error)
+	historyStats history.Stats
+	historyOn    bool
 
 	mu       sync.Mutex
 	recorded []string
@@ -220,6 +225,18 @@ func (f *fakeBackend) AlarmStream(buffer int) (<-chan alarm.Event, func()) {
 		f.alarmCh = make(chan alarm.Event, buffer)
 	}
 	return f.alarmCh, func() {}
+}
+
+func (f *fakeBackend) History(q history.Query) (history.Result, error) {
+	if f.historyFn != nil {
+		return f.historyFn(q)
+	}
+	return history.Result{Device: q.Device, Point: q.Point, From: q.From, To: q.To,
+		Step: model.Duration(q.Step), Agg: q.Agg}, nil
+}
+
+func (f *fakeBackend) HistoryStats() (history.Stats, bool) {
+	return f.historyStats, f.historyOn
 }
 
 func (f *fakeBackend) DiagnosticsBundle(ctx context.Context) ([]byte, error) {
@@ -1062,5 +1079,131 @@ func TestHealthIncludesAlarmCounts(t *testing.T) {
 	}
 	if h.Alarms.Total != 3 || h.Alarms.Active != 1 || h.Alarms.Cleared != 1 {
 		t.Fatalf("alarms = %+v", h.Alarms)
+	}
+}
+
+func TestHistoryQueryParsing(t *testing.T) {
+	s, be := newServer(t, Options{Now: func() time.Time {
+		return time.Date(2026, 3, 1, 12, 0, 0, 0, time.UTC)
+	}})
+	var got history.Query
+	be.historyFn = func(q history.Query) (history.Result, error) {
+		got = q
+		return history.Result{Device: q.Device, Point: q.Point, From: q.From, To: q.To,
+			Step: model.Duration(q.Step), Agg: q.Agg, Count: 1,
+			Points: []history.Point{{Time: q.From, Value: model.NumValue(model.TypeFloat64, 1.5),
+				Quality: model.QualityGood}}}, nil
+	}
+
+	rec := httptest.NewRecorder()
+	s.ServeHTTP(rec, httptest.NewRequest(http.MethodGet,
+		"/api/v1/history?device=press&point=power&from=-2h&step=5m&agg=avg&limit=100", nil))
+	if rec.Code != 200 {
+		t.Fatalf("code = %d body = %s", rec.Code, rec.Body.String())
+	}
+	if got.Device != "press" || got.Point != "power" {
+		t.Fatalf("query = %+v", got)
+	}
+	now := time.Date(2026, 3, 1, 12, 0, 0, 0, time.UTC)
+	if !got.From.Equal(now.Add(-2 * time.Hour)) {
+		t.Fatalf("from = %s", got.From)
+	}
+	// to 缺省时必须由 runtime/store 补成「现在」，而不是零值。
+	if !got.To.IsZero() {
+		t.Fatalf("to = %s, want zero so the store applies its default", got.To)
+	}
+	if got.Step != 5*time.Minute || got.Agg != history.AggAvg || got.Limit != 100 {
+		t.Fatalf("step/agg/limit = %s/%s/%d", got.Step, got.Agg, got.Limit)
+	}
+	if !strings.Contains(rec.Body.String(), `"count":1`) {
+		t.Fatalf("body = %s", rec.Body.String())
+	}
+
+	// 绝对时刻也要接受。
+	rec = httptest.NewRecorder()
+	s.ServeHTTP(rec, httptest.NewRequest(http.MethodGet,
+		"/api/v1/history?device=press&point=power&to=2026-03-01T12:00:00Z", nil))
+	if rec.Code != 200 {
+		t.Fatalf("code = %d body = %s", rec.Code, rec.Body.String())
+	}
+	if !got.To.Equal(now) {
+		t.Fatalf("to = %s", got.To)
+	}
+}
+
+func TestHistoryQueryErrors(t *testing.T) {
+	s, _ := newServer(t, Options{})
+	cases := []struct {
+		name string
+		url  string
+		code int
+		want string
+	}{
+		{"no device", "/api/v1/history?point=power", 400, "device and point are required"},
+		{"no point", "/api/v1/history?device=press", 400, "device and point are required"},
+		{"bad from", "/api/v1/history?device=d&point=p&from=yesterday", 400, "history.invalid_range"},
+		{"bad to", "/api/v1/history?device=d&point=p&to=12:00", 400, "history.invalid_range"},
+		{"bad step", "/api/v1/history?device=d&point=p&step=five", 400, "history.invalid_query"},
+		{"zero step", "/api/v1/history?device=d&point=p&step=0s", 400, "step must be"},
+		{"bad agg", "/api/v1/history?device=d&point=p&step=1m&agg=p95", 400, "history.invalid_query"},
+		{"bad limit", "/api/v1/history?device=d&point=p&limit=abc", 400, "limit"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			rec := httptest.NewRecorder()
+			s.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, c.url, nil))
+			if rec.Code != c.code {
+				t.Fatalf("code = %d, want %d (body %s)", rec.Code, c.code, rec.Body.String())
+			}
+			if !strings.Contains(rec.Body.String(), c.want) {
+				t.Fatalf("body = %s, want mention of %q", rec.Body.String(), c.want)
+			}
+		})
+	}
+}
+
+func TestHistoryDisabled(t *testing.T) {
+	s, be := newServer(t, Options{})
+	be.historyFn = func(q history.Query) (history.Result, error) {
+		return history.Result{}, Errf(http.StatusConflict, "history.disabled",
+			"history storage is not enabled in this configuration")
+	}
+	rec := httptest.NewRecorder()
+	s.ServeHTTP(rec, httptest.NewRequest(http.MethodGet,
+		"/api/v1/history?device=d&point=p", nil))
+	if rec.Code != 409 {
+		t.Fatalf("code = %d body = %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "history.disabled") {
+		t.Fatalf("body = %s", rec.Body.String())
+	}
+}
+
+func TestHealthSerializesHistory(t *testing.T) {
+	s, be := newServer(t, Options{})
+	be.health = Health{Status: "ok", History: HistoryHealth{
+		Enabled: true, Records: 42, Bytes: 4096, MaxBytes: 1 << 20, Segments: 2,
+		Evicted: 3, Errors: 1,
+	}}
+	rec := httptest.NewRecorder()
+	s.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/v1/health", nil))
+	if rec.Code != 200 {
+		t.Fatalf("code = %d", rec.Code)
+	}
+	var body struct {
+		History HistoryHealth `json:"history"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if !body.History.Enabled || body.History.Records != 42 || body.History.Segments != 2 {
+		t.Fatalf("history = %+v", body.History)
+	}
+	// 未启用时也要有 history 字段（enabled=false），否则客户端要写两套分支。
+	be.health = Health{Status: "ok"}
+	rec = httptest.NewRecorder()
+	s.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/v1/health", nil))
+	if !strings.Contains(rec.Body.String(), `"history":{"enabled":false}`) {
+		t.Fatalf("body = %s", rec.Body.String())
 	}
 }

@@ -2,6 +2,7 @@ package config
 
 import (
 	"encoding/json"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -874,6 +875,129 @@ func TestValidateAlarms(t *testing.T) {
 		c2, _ := f2.Canonical()
 		if VersionOf(c1) == VersionOf(c2) {
 			t.Fatal("changing a threshold must change the config version")
+		}
+	})
+}
+
+func TestValidateHistory(t *testing.T) {
+	registerDrivers(t)
+
+	t.Run("disabled by default", func(t *testing.T) {
+		f := baseFile()
+		if err := f.Validate(); err != nil {
+			t.Fatal(err)
+		}
+		if f.Storage.History.Enabled {
+			t.Fatal("history must be opt-in")
+		}
+		if f.Storage.History.Dir != "" || f.Storage.History.MaxBytes != 0 {
+			t.Fatalf("disabled history must not be normalized: %+v", f.Storage.History)
+		}
+	})
+
+	t.Run("defaults", func(t *testing.T) {
+		f := baseFile()
+		f.Storage.Dir = "/var/lib/uic"
+		f.Storage.History.Enabled = true
+		if err := f.Validate(); err != nil {
+			t.Fatal(err)
+		}
+		h := f.Storage.History
+		// 目录默认挂在 storage.dir 下：历史是这台网关的本地数据，
+		// 不应该默认写到进程的当前工作目录。
+		if h.Dir != "/var/lib/uic/history" {
+			t.Fatalf("dir = %q", h.Dir)
+		}
+		if h.MaxBytes != 256<<20 || h.SegmentBytes != 16<<20 {
+			t.Fatalf("defaults = %+v", h)
+		}
+		if h.MaxAge.Duration() != 7*24*time.Hour {
+			t.Fatalf("maxAge = %s", h.MaxAge)
+		}
+		if h.MinInterval.Duration() != time.Second {
+			t.Fatalf("minInterval = %s", h.MinInterval)
+		}
+		if h.Heartbeat == nil || h.Heartbeat.Duration() != 5*time.Minute {
+			t.Fatalf("heartbeat = %v (a stable value must still get a point every 5m)", h.Heartbeat)
+		}
+	})
+
+	// 负值走「回到默认」而不是报错：与 outboxTtl 等字段保持一致，
+	// 配置文件里一个漏写的减号不应该让整台网关起不来。
+	t.Run("negatives fall back to defaults", func(t *testing.T) {
+		f := baseFile()
+		f.Storage.History.Enabled = true
+		f.Storage.History.MaxBytes = -1
+		f.Storage.History.MaxAge = -1
+		if err := f.Validate(); err != nil {
+			t.Fatal(err)
+		}
+		if f.Storage.History.MaxBytes != 256<<20 || f.Storage.History.MaxAge.Duration() != 7*24*time.Hour {
+			t.Fatalf("negatives were not normalized: %+v", f.Storage.History)
+		}
+		if f.Storage.History.SegmentBytes > f.Storage.History.MaxBytes {
+			t.Fatalf("segment must be clamped to maxBytes: %+v", f.Storage.History)
+		}
+	})
+
+	t.Run("segment clamped to maxBytes", func(t *testing.T) {
+		f := baseFile()
+		f.Storage.History.Enabled = true
+		f.Storage.History.MaxBytes = 1 << 20
+		if err := f.Validate(); err != nil {
+			t.Fatal(err)
+		}
+		// 只调小总量不应该要求同时改段大小。
+		if f.Storage.History.SegmentBytes != 1<<20 {
+			t.Fatalf("segmentBytes = %d, want clamp to maxBytes", f.Storage.History.SegmentBytes)
+		}
+	})
+
+	bad := []struct {
+		name  string
+		apply func(*History)
+		want  string
+	}{
+		{"empty dir", func(h *History) { h.Dir = " " }, "must not be empty"},
+		{"tiny maxBytes", func(h *History) { h.MaxBytes = 512 }, "too small"},
+		{"tiny segment", func(h *History) { h.MaxBytes = 4096; h.SegmentBytes = 100 }, "too small"},
+		{"maxAge over a year", func(h *History) { h.MaxAge = model.Duration(400 * 24 * time.Hour) }, "365-day"},
+		{"minInterval too long", func(h *History) { h.MinInterval = model.Duration(2 * time.Hour) }, "minInterval"},
+		{"negative heartbeat", func(h *History) { d := model.Duration(-1); h.Heartbeat = &d }, "heartbeat"},
+		{"heartbeat too long", func(h *History) { d := model.Duration(48 * time.Hour); h.Heartbeat = &d }, "24h"},
+		{"non-finite deadband", func(h *History) { h.Deadband = math.Inf(1) }, "deadband"},
+	}
+	for _, c := range bad {
+		t.Run(c.name, func(t *testing.T) {
+			f := baseFile()
+			f.Storage.History.Enabled = true
+			f.Normalize() // 先拿到默认值，再破坏其中一项
+			c.apply(&f.Storage.History)
+			err := f.Validate()
+			if err == nil {
+				t.Fatal("expected an error")
+			}
+			if !strings.Contains(err.Error(), c.want) {
+				t.Fatalf("err = %v, want mention of %q", err, c.want)
+			}
+		})
+	}
+
+	t.Run("history affects config version", func(t *testing.T) {
+		mk := func(maxBytes int64) *File {
+			f := baseFile()
+			f.Storage.History.Enabled = true
+			f.Storage.History.MaxBytes = maxBytes
+			if err := f.Validate(); err != nil {
+				t.Fatal(err)
+			}
+			return f
+		}
+		_ = mk
+		c1, _ := mk(1 << 20).Canonical()
+		c2, _ := mk(2 << 20).Canonical()
+		if VersionOf(c1) == VersionOf(c2) {
+			t.Fatal("changing the retention policy must change the config version")
 		}
 	})
 }

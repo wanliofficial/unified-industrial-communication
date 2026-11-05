@@ -15,6 +15,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"math"
 	"net"
 	"os"
 	"path/filepath"
@@ -113,6 +114,40 @@ type Storage struct {
 	// <dir>/journal.ndjson。它既是断网期间的兜底留痕，也让 Outbox 在
 	// 没有 MQTT/Webhook 的开发环境里可被观察与验证。
 	Journal bool `json:"journal,omitempty"`
+	// History 是本地历史采样日志（有界、按段淘汰）。它独立于 Journal：
+	// Journal 记的是「每一次变化事件」，用于排障；History 记的是「按采样
+	// 策略抽取的时间序列」，用于查历史曲线。两者写同一个目录会让保留
+	// 策略互相干扰，所以 History 有自己的一套字节上限与保留期。
+	History History `json:"history,omitempty"`
+}
+
+// History 是历史采样日志的策略。
+//
+// 采样是「事件驱动 + 心跳补点」：值变了（超过死区）就记一条，没变也至少
+// 每 heartbeat 记一条。只靠事件会让一条稳定运行的产线在图上变成一条稀疏的
+// 虚线；只靠定时轮询又会把「值没变」写成海量重复点。
+type History struct {
+	Enabled bool `json:"enabled,omitempty"`
+	// Dir 默认 <storage.dir>/history。
+	Dir string `json:"dir,omitempty"`
+	// MaxBytes 是整个历史目录的字节上限（默认 256MB）。超过后按段淘汰
+	// 最旧的数据：历史是有界缓存，不是无限账本。
+	MaxBytes int64 `json:"maxBytes,omitempty"`
+	// MaxAge 是保留期（默认 7 天）。
+	MaxAge model.Duration `json:"maxAge,omitempty"`
+	// SegmentBytes 是单段大小（默认 16MB）。查询按段并行/顺序扫描，
+	// 段太大则淘汰粒度粗，段太小则查询要打开很多文件。
+	SegmentBytes int64 `json:"segmentBytes,omitempty"`
+	// MinInterval 是同一测点两次落盘的最小间隔（默认 1s）。它是对
+	// 「高频抖动」的最后一道闸门：即使设备每 50ms 采一次，也不会写爆磁盘。
+	MinInterval model.Duration `json:"minInterval,omitempty"`
+	// Heartbeat 是「值没变也补一个点」的周期。未设置时默认 5m；显式写
+	// "0s" 表示不补点（趋势图只显示真实变化，长时间稳定时是一段空白）。
+	// 用指针是为了把「没配」与「配成 0」区分开——两者语义相反。
+	Heartbeat *model.Duration `json:"heartbeat,omitempty"`
+	// Deadband 是数值死区（默认 0）：变化小于它不落盘。0 表示任何变化
+	// 都记录（因为缓存事件本身就只在变化时触发，重复值不会到这里）。
+	Deadband float64 `json:"deadband,omitempty"`
 }
 
 // Logging 是日志配置。
@@ -161,6 +196,37 @@ func (f *File) Normalize() {
 	}
 	if f.Storage.OutboxTTL <= 0 {
 		f.Storage.OutboxTTL = model.Duration(24 * time.Hour)
+	}
+	if f.Storage.History.Enabled {
+		h := &f.Storage.History
+		if h.Dir == "" {
+			h.Dir = filepath.Join(f.Storage.Dir, "history")
+		}
+		if h.MaxBytes <= 0 {
+			h.MaxBytes = 256 << 20
+		}
+		if h.MaxAge <= 0 {
+			h.MaxAge = model.Duration(7 * 24 * time.Hour)
+		}
+		if h.SegmentBytes <= 0 {
+			h.SegmentBytes = 16 << 20
+		}
+		if h.MinInterval <= 0 {
+			h.MinInterval = model.Duration(time.Second)
+		}
+		if h.Heartbeat == nil {
+			d := model.Duration(5 * time.Minute)
+			h.Heartbeat = &d
+		}
+		// 段不能大于总上限：否则第一条记录就触发「淘汰又立刻超限」，
+		// 表现为历史目录里永远只有一个段。夹住而不是报错，是因为
+		// 「只调小了 maxBytes」是完全合理的配置动作。
+		if h.SegmentBytes > h.MaxBytes {
+			h.SegmentBytes = h.MaxBytes
+		}
+		if h.Deadband < 0 {
+			h.Deadband = 0
+		}
 	}
 	if f.Logging.Level == "" {
 		f.Logging.Level = "info"
@@ -276,7 +342,58 @@ func (f *File) Validate() error {
 	if err := f.validateSlaves(); err != nil {
 		return err
 	}
+	if err := f.validateHistory(); err != nil {
+		return err
+	}
 	return f.validateNorthbound()
+}
+
+// validateHistory 校验历史库策略。
+//
+// 这里只拦「逻辑上不可能成立」的组合：段比总量还大、心跳比最小间隔还短。
+// 绝对大小（比如最少 1MB）不拦——测试和边缘小盒子需要小段，而真正的保护
+// 是「段 ≤ 总量」这条不变量。
+func (f *File) validateHistory() error {
+	h := f.Storage.History
+	if !h.Enabled {
+		return nil
+	}
+	if strings.TrimSpace(h.Dir) == "" {
+		return errors.New("storage.history.dir: must not be empty")
+	}
+	if h.MaxBytes < 1024 {
+		return fmt.Errorf("storage.history.maxBytes: %d is too small (min 1024)", h.MaxBytes)
+	}
+	if h.SegmentBytes < 1024 {
+		return fmt.Errorf("storage.history.segmentBytes: %d is too small (min 1024)", h.SegmentBytes)
+	}
+	if h.SegmentBytes > h.MaxBytes {
+		return fmt.Errorf("storage.history.segmentBytes: %d exceeds maxBytes %d", h.SegmentBytes, h.MaxBytes)
+	}
+	if h.MaxAge.Duration() <= 0 {
+		return fmt.Errorf("storage.history.maxAge: must be > 0, got %s", h.MaxAge)
+	}
+	if h.MaxAge.Duration() > 365*24*time.Hour {
+		return fmt.Errorf("storage.history.maxAge: %s exceeds the 365-day limit", h.MaxAge)
+	}
+	if h.MinInterval.Duration() < 0 {
+		return errors.New("storage.history.minInterval: must be >= 0")
+	}
+	if h.MinInterval.Duration() > time.Hour {
+		return fmt.Errorf("storage.history.minInterval: %s exceeds 1h", h.MinInterval)
+	}
+	if h.Heartbeat != nil {
+		if h.Heartbeat.Duration() < 0 {
+			return errors.New("storage.history.heartbeat: must be >= 0 (use \"0s\" to disable)")
+		}
+		if h.Heartbeat.Duration() > 24*time.Hour {
+			return fmt.Errorf("storage.history.heartbeat: %s exceeds 24h", h.Heartbeat)
+		}
+	}
+	if math.IsNaN(h.Deadband) || math.IsInf(h.Deadband, 0) {
+		return errors.New("storage.history.deadband: must be a finite number")
+	}
+	return nil
 }
 
 // validateAlarms 校验报警规则：规则自身自洽、ID 唯一、引用的点位存在且可比较。

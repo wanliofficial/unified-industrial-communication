@@ -22,6 +22,7 @@ import (
 	"uic/internal/alarm"
 	"uic/internal/cache"
 	"uic/internal/config"
+	"uic/internal/history"
 	"uic/internal/model"
 	"uic/internal/obs"
 )
@@ -120,6 +121,21 @@ type OutboxHealth struct {
 	Delivered uint64           `json:"delivered"`
 }
 
+// HistoryHealth 是历史库水位。历史不可用时 enabled=false，其余字段留空。
+type HistoryHealth struct {
+	Enabled  bool   `json:"enabled"`
+	Records  uint64 `json:"records,omitempty"`
+	Bytes    int64  `json:"bytes,omitempty"`
+	MaxBytes int64  `json:"maxBytes,omitempty"`
+	Segments int    `json:"segments,omitempty"`
+	// 指针 + omitempty：time.Time 是结构体，零值不会被 omitempty 省掉，
+	// 结果就是每个响应里都挂着一个 "0001-01-01T00:00:00Z"。
+	Oldest  *time.Time `json:"oldest,omitempty"`
+	Newest  *time.Time `json:"newest,omitempty"`
+	Evicted uint64     `json:"evicted,omitempty"`
+	Errors  uint64     `json:"writeErrors,omitempty"`
+}
+
 // Health 是业务健康聚合。
 type Health struct {
 	Status        string       `json:"status"`
@@ -129,10 +145,11 @@ type Health struct {
 	Outbox        OutboxHealth `json:"outbox"`
 	// Alarms 是报警状态汇总。放在 health 里而不是要求调用方额外拉一次
 	// /alarms：看板判断「这台网关是否健康」时，未确认报警必须算进去。
-	Alarms        alarm.Counts `json:"alarms"`
-	Problems      []Problem    `json:"problems,omitempty"`
-	Version       string       `json:"version,omitempty"`
-	ConfigVersion string       `json:"configVersion,omitempty"`
+	Alarms        alarm.Counts  `json:"alarms"`
+	History       HistoryHealth `json:"history"`
+	Problems      []Problem     `json:"problems,omitempty"`
+	Version       string        `json:"version,omitempty"`
+	ConfigVersion string        `json:"configVersion,omitempty"`
 }
 
 // Check 是就绪检查的一项。
@@ -230,6 +247,9 @@ type Backend interface {
 	AckAlarms(ctx context.Context, ids []string, all bool, by string) ([]alarm.Status, error)
 	AlarmStream(buffer int) (<-chan alarm.Event, func())
 
+	History(q history.Query) (history.Result, error)
+	HistoryStats() (history.Stats, bool)
+
 	DiagnosticsBundle(ctx context.Context) ([]byte, error)
 
 	RecordHTTP(path string, code int, d time.Duration)
@@ -297,6 +317,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /api/v1/alarms/stream", h(s.alarmsStream))
 	s.mux.HandleFunc("GET /api/v1/alarms/{id}", h(s.alarmGet))
 	s.mux.HandleFunc("POST /api/v1/alarms/{id}/ack", h(s.alarmAck))
+	s.mux.HandleFunc("GET /api/v1/history", h(s.history))
 	s.mux.HandleFunc("GET /api/v1/diagnostics/bundle", h(s.bundle))
 }
 
@@ -1026,6 +1047,99 @@ func (s *Server) logs(w http.ResponseWriter, r *http.Request) error {
 	}
 	writeOK(w, map[string]any{"items": items, "total": len(items)})
 	return nil
+}
+
+// ---------------------------------------------------------------------------
+// 历史查询
+// ---------------------------------------------------------------------------
+
+// history 查询一段时间内的采样。
+//
+// 参数全部走 query string（幂等、可缓存、可直接贴进浏览器），因此这里对
+// 每个参数的解析都必须严格：静默忽略一个拼错的 `stpe=1m` 会让调用方拿到
+// 一堆原始点，然后以为是聚合坏了。
+func (s *Server) history(w http.ResponseWriter, r *http.Request) error {
+	q, err := parseHistoryQuery(r, s.opt.Now())
+	if err != nil {
+		return err
+	}
+	res, err := s.be.History(q)
+	if err != nil {
+		return err
+	}
+	writeOK(w, res)
+	return nil
+}
+
+func parseHistoryQuery(r *http.Request, now time.Time) (history.Query, error) {
+	v := r.URL.Query()
+	var q history.Query
+	q.Device = strings.TrimSpace(v.Get("device"))
+	q.Point = strings.TrimSpace(v.Get("point"))
+	if q.Device == "" || q.Point == "" {
+		return q, Errf(http.StatusBadRequest, "request.invalid",
+			"device and point are required (e.g. ?device=press-01&point=power)")
+	}
+
+	from, err := parseTimeParam(v.Get("from"), now)
+	if err != nil {
+		return q, Errf(http.StatusBadRequest, "history.invalid_range", "from: %v", err)
+	}
+	to, err := parseTimeParam(v.Get("to"), now)
+	if err != nil {
+		return q, Errf(http.StatusBadRequest, "history.invalid_range", "to: %v", err)
+	}
+	q.From, q.To = from, to
+
+	if raw := strings.TrimSpace(v.Get("step")); raw != "" {
+		d, derr := time.ParseDuration(raw)
+		if derr != nil {
+			return q, Errf(http.StatusBadRequest, "history.invalid_query",
+				"step: %q is not a duration (try 10s, 1m, 1h)", raw)
+		}
+		if d <= 0 {
+			return q, Errf(http.StatusBadRequest, "history.invalid_query", "step must be > 0")
+		}
+		q.Step = d
+	}
+	if raw := strings.TrimSpace(v.Get("agg")); raw != "" {
+		q.Agg = history.Aggregation(raw)
+		if !q.Agg.Valid() {
+			return q, Errf(http.StatusBadRequest, "history.invalid_query",
+				"agg: %q is not one of last|first|avg|min|max|count", raw)
+		}
+	}
+	if raw := strings.TrimSpace(v.Get("limit")); raw != "" {
+		n, cerr := strconv.Atoi(raw)
+		if cerr != nil || n <= 0 {
+			return q, Errf(http.StatusBadRequest, "request.invalid", "limit must be a positive integer")
+		}
+		q.Limit = n
+	}
+	return q, nil
+}
+
+// parseTimeParam 接受三种写法：
+//
+//	""             → 交给 store 用默认窗口
+//	"now"          → 服务器当前时间
+//	"-1h" / "+30m" → 相对服务器当前时间（运维最常用的写法）
+//	RFC3339        → 绝对时刻
+func parseTimeParam(raw string, now time.Time) (time.Time, error) {
+	raw = strings.TrimSpace(raw)
+	switch raw {
+	case "":
+		return time.Time{}, nil
+	case "now":
+		return now, nil
+	}
+	if d, err := time.ParseDuration(raw); err == nil {
+		return now.Add(d), nil
+	}
+	if t, err := time.Parse(time.RFC3339Nano, raw); err == nil {
+		return t, nil
+	}
+	return time.Time{}, fmt.Errorf("%q is not a duration (-1h) or an RFC3339 timestamp", raw)
 }
 
 func (s *Server) bundle(w http.ResponseWriter, r *http.Request) error {
