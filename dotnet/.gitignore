@@ -1,0 +1,33 @@
+# ---- 构建产物 ----
+bin/
+obj/
+*.user
+*.suo
+*.binlog
+
+# ---- 发布产物 ----
+publish/
+artifacts/
+
+# ---- 运行时数据 ----
+# 默认数据目录（配置版本、上报队列、PKI）
+/data/
+/data-*/
+
+# 上报队列：逐分区追加文件与已确认位点
+outbox/
+*.ndjson
+*.cursor
+
+# ---- 前端构建输出 ----
+# Uno 生成的静态站点：由 `dotnet publish -f net10.0-browserwasm` 产出，不入库
+src/Uic.Ui/wwwroot/*.js
+src/Uic.Ui/wwwroot/*.wasm
+src/Uic.Ui/wwwroot/framework/
+src/Uic.Ui/wwwroot/_framework/
+src/Uic.Ui/bin/
+src/Uic.Ui/obj/
+
+# ---- 测试与临时目录 ----
+testdata/_tmp/
+*.received.*

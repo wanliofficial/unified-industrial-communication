@@ -1,0 +1,9 @@
+{
+  "name": "read_holding_2_regs",
+  "request": "0001 0000 0006 01 03 0064 0002",
+  "response": "0001 0000 0007 01 03 04 000A 000B",
+  "expect": [
+    { "point": "p1", "type": "uint16", "num": 10 },
+    { "point": "p2", "type": "uint16", "num": 11 }
+  ]
+}

@@ -1,0 +1,10 @@
+{
+  "name": "ascii_read_holding_2_regs",
+  "frame": "ascii",
+  "request": ":01030064000296\r\n",
+  "response": ":010304000A000BE3\r\n",
+  "expect": [
+    { "point": "p1", "type": "uint16", "num": 10 },
+    { "point": "p2", "type": "uint16", "num": 11 }
+  ]
+}

@@ -1,0 +1,8 @@
+{
+  "name": "read_holding_uint32",
+  "request": "000C 0000 0006 01 03 0000 0002",
+  "response": "000C 0000 0007 01 03 04 1234 5678",
+  "expect": [
+    { "point": "counter", "type": "uint32", "num": 305419896 }
+  ]
+}

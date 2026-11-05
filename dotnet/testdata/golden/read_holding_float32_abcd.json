@@ -1,0 +1,8 @@
+{
+  "name": "read_holding_float32_abcd",
+  "request": "0002 0000 0006 01 03 0010 0002",
+  "response": "0002 0000 0007 01 03 04 3FC0 0000",
+  "expect": [
+    { "point": "level", "type": "float32", "num": 1.5 }
+  ]
+}

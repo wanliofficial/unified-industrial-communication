@@ -1,0 +1,10 @@
+{
+  "name": "write_single_register",
+  "kind": "write",
+  "area": "holding",
+  "request": "0007 0000 0006 01 06 0020 0007",
+  "response": "0007 0000 0006 01 06 0020 0007",
+  "expect": [
+    { "point": "setpoint", "type": "uint16", "num": 7 }
+  ]
+}

@@ -1,0 +1,9 @@
+{
+  "name": "read_holding_with_gap",
+  "request": "000E 0000 0006 01 03 0064 0003",
+  "response": "000E 0000 0009 01 03 06 000A 0000 000B",
+  "expect": [
+    { "point": "first", "type": "uint16", "num": 10, "offset": 100 },
+    { "point": "third", "type": "uint16", "num": 11, "offset": 102 }
+  ]
+}

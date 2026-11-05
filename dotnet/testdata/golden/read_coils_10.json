@@ -1,0 +1,17 @@
+{
+  "name": "read_coils_10",
+  "request": "0005 0000 0006 01 01 0000 000A",
+  "response": "0005 0000 0005 01 01 02 05 02",
+  "expect": [
+    { "point": "c0", "type": "bool", "bool": true,  "offset": 0 },
+    { "point": "c1", "type": "bool", "bool": false, "offset": 1 },
+    { "point": "c2", "type": "bool", "bool": true,  "offset": 2 },
+    { "point": "c3", "type": "bool", "bool": false, "offset": 3 },
+    { "point": "c4", "type": "bool", "bool": false, "offset": 4 },
+    { "point": "c5", "type": "bool", "bool": false, "offset": 5 },
+    { "point": "c6", "type": "bool", "bool": false, "offset": 6 },
+    { "point": "c7", "type": "bool", "bool": false, "offset": 7 },
+    { "point": "c8", "type": "bool", "bool": false, "offset": 8 },
+    { "point": "c9", "type": "bool", "bool": true,  "offset": 9 }
+  ]
+}

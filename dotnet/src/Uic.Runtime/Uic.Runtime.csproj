@@ -1,0 +1,16 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <RootNamespace>Uic.Runtime</RootNamespace>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" Version="10.0.14" />
+    <ProjectReference Include="..\Uic.Domain\Uic.Domain.csproj" />
+    <ProjectReference Include="..\Uic.Driver\Uic.Driver.csproj" />
+    <ProjectReference Include="..\Uic.Engine\Uic.Engine.csproj" />
+    <ProjectReference Include="..\Uic.Config\Uic.Config.csproj" />
+    <ProjectReference Include="..\Uic.Outbox\Uic.Outbox.csproj" />
+    <ProjectReference Include="..\Uic.Obs\Uic.Obs.csproj" />
+    <ProjectReference Include="..\Uic.Northbound\Uic.Northbound.csproj" />
+    <ProjectReference Include="..\Uic.OpcUa\Uic.OpcUa.csproj" />
+  </ItemGroup>
+</Project>

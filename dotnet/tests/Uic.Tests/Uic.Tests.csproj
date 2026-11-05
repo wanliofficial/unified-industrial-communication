@@ -1,0 +1,49 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <RootNamespace>Uic.Tests</RootNamespace>
+    <AssemblyName>Uic.Tests</AssemblyName>
+
+    <!--
+      不引第三方测试框架：本仓库的依赖清单是刻意收窄的，
+      而这里要断言的又都是纯函数与本地回环，一个百来行的运行器足够。
+      这样也能在离网构建机上直接 dotnet run，不需要还原 xunit。
+    -->
+    <IsPackable>false</IsPackable>
+
+    <!-- OPC UA 需要 en-US；与本目录其它库的默认设置不同，必须显式打开。 -->
+    <InvariantGlobalization>false</InvariantGlobalization>
+
+    <!-- OPC UA 的 TraceConfiguration 在这个版本上已标记过时，但必须赋值。 -->
+    <NoWarn>$(NoWarn);CS0618</NoWarn>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- 契约冒烟测试在进程内起一个最小 Kestrel。 -->
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- 仅测试用：断言北向 OPC UA 端点确实能被标准客户端读写。 -->
+    <PackageReference Include="OPCFoundation.NetStandard.Opc.Ua.Client" Version="1.5.378.182" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\Uic.Domain\Uic.Domain.csproj" />
+    <ProjectReference Include="..\..\src\Uic.Driver\Uic.Driver.csproj" />
+    <ProjectReference Include="..\..\src\Uic.Transport\Uic.Transport.csproj" />
+    <ProjectReference Include="..\..\src\Uic.Codec.Modbus\Uic.Codec.Modbus.csproj" />
+    <ProjectReference Include="..\..\src\Uic.Driver.Modbus\Uic.Driver.Modbus.csproj" />
+    <ProjectReference Include="..\..\src\Uic.Driver.Virtual\Uic.Driver.Virtual.csproj" />
+    <ProjectReference Include="..\..\src\Uic.Sim.Modbus\Uic.Sim.Modbus.csproj" />
+    <ProjectReference Include="..\..\src\Uic.Engine\Uic.Engine.csproj" />
+    <ProjectReference Include="..\..\src\Uic.Outbox\Uic.Outbox.csproj" />
+    <ProjectReference Include="..\..\src\Uic.Config\Uic.Config.csproj" />
+    <ProjectReference Include="..\..\src\Uic.Obs\Uic.Obs.csproj" />
+    <ProjectReference Include="..\..\src\Uic.Northbound\Uic.Northbound.csproj" />
+    <ProjectReference Include="..\..\src\Uic.Runtime\Uic.Runtime.csproj" />
+    <ProjectReference Include="..\..\src\Uic.OpcUa\Uic.OpcUa.csproj" />
+  </ItemGroup>
+
+</Project>

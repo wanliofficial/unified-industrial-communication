@@ -1,0 +1,8 @@
+{
+  "name": "read_input_int16_negative",
+  "request": "0004 0000 0006 01 04 0000 0001",
+  "response": "0004 0000 0005 01 04 02 FFFE",
+  "expect": [
+    { "point": "offset", "type": "int16", "num": -2 }
+  ]
+}

@@ -1,0 +1,5 @@
+<Project>
+  <ItemGroup>
+    <InternalsVisibleTo Include="Uic.Tests" />
+  </ItemGroup>
+</Project>

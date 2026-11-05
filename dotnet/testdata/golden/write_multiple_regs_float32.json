@@ -1,0 +1,10 @@
+{
+  "name": "write_multiple_regs_float32",
+  "kind": "write",
+  "area": "holding",
+  "request": "0009 0000 000B 01 10 0010 0002 04 3FC0 0000",
+  "response": "0009 0000 0006 01 10 0010 0002",
+  "expect": [
+    { "point": "flow", "type": "float32", "num": 1.5 }
+  ]
+}

@@ -1,0 +1,11 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <RootNamespace>Uic.OpcUa</RootNamespace>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="OPCFoundation.NetStandard.Opc.Ua.Server" Version="1.5.378.182" />
+    <PackageReference Include="OPCFoundation.NetStandard.Opc.Ua.Configuration" Version="1.5.378.182" />
+    <ProjectReference Include="..\Uic.Domain\Uic.Domain.csproj" />
+    <ProjectReference Include="..\Uic.Engine\Uic.Engine.csproj" />
+  </ItemGroup>
+</Project>

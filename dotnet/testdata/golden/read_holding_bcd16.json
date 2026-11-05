@@ -1,0 +1,8 @@
+{
+  "name": "read_holding_bcd16",
+  "request": "000D 0000 0006 01 03 0000 0001",
+  "response": "000D 0000 0005 01 03 02 1234",
+  "expect": [
+    { "point": "meter", "type": "bcd16", "num": 1234 }
+  ]
+}

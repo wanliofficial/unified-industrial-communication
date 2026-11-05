@@ -1,0 +1,23 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <AssemblyName>uic</AssemblyName>
+    <RootNamespace>Uic.Host</RootNamespace>
+
+    <!-- OPC UA 协议栈在启动时会构造 en-US 等具体文化（日期解析、证书主题），
+         invariant 模式会直接抛 CultureNotFoundException。 -->
+    <InvariantGlobalization>false</InvariantGlobalization>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\Uic.Domain\Uic.Domain.csproj" />
+    <ProjectReference Include="..\Uic.Driver\Uic.Driver.csproj" />
+    <ProjectReference Include="..\Uic.Driver.Modbus\Uic.Driver.Modbus.csproj" />
+    <ProjectReference Include="..\Uic.Driver.Virtual\Uic.Driver.Virtual.csproj" />
+    <ProjectReference Include="..\Uic.Engine\Uic.Engine.csproj" />
+    <ProjectReference Include="..\Uic.Config\Uic.Config.csproj" />
+    <ProjectReference Include="..\Uic.Obs\Uic.Obs.csproj" />
+    <ProjectReference Include="..\Uic.Northbound\Uic.Northbound.csproj" />
+    <ProjectReference Include="..\Uic.Runtime\Uic.Runtime.csproj" />
+    <ProjectReference Include="..\Uic.Sim.Modbus\Uic.Sim.Modbus.csproj" />
+  </ItemGroup>
+</Project>

@@ -1,0 +1,51 @@
+<Project Sdk="Uno.Sdk">
+  <PropertyGroup>
+    <!--
+      Directory.Build.props 给类库统一设了 net10.0；UI 项目只跑浏览器 WebAssembly，
+      必须把单目标 Framework 清空，否则 MSBuild 会把 net10.0 也当成一个目标去还原。
+    -->
+    <TargetFramework></TargetFramework>
+    <TargetFrameworks>net10.0-browserwasm</TargetFrameworks>
+
+    <OutputType>Exe</OutputType>
+    <UnoSingleProject>true</UnoSingleProject>
+    <RootNamespace>Uic.Ui</RootNamespace>
+    <AssemblyName>Uic.Ui</AssemblyName>
+    <ApplicationTitle>UIC 工业连接底座</ApplicationTitle>
+    <ApplicationId>com.uic.gateway</ApplicationId>
+    <ApplicationDisplayVersion>0.1.0</ApplicationDisplayVersion>
+    <ApplicationVersion>1</ApplicationVersion>
+
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+
+    <!-- OPC UA / 时间格式化依赖 ICU；WASM 下保留完整全球化数据。 -->
+    <InvariantGlobalization>false</InvariantGlobalization>
+
+    <!-- 解释器模式：启动稍慢但不生成本地 .wasm，CI 上不用装 emscripten。 -->
+    <WasmShellMonoRuntimeExecutionMode>Interpreter</WasmShellMonoRuntimeExecutionMode>
+    <UnoEnableSplashScreen>false</UnoEnableSplashScreen>
+
+    <!--
+      发布包必须裁剪：不裁剪时整个 BCL（含 System.Data.SqlClient / System.ServiceModel
+      这类控制台根本用不到的程序集）会作为独立 .wasm 一起下发，首屏要拉三百多个文件。
+      只保留中英文资源，避免再带上十几套卫星程序集。
+    -->
+    <PublishTrimmed>true</PublishTrimmed>
+    <SatelliteResourceLanguages>zh-Hans;en</SatelliteResourceLanguages>
+
+    <!-- 加载页由 wwwroot/index.html 自己提供，别让 bootstrap 再插一层遮罩。 -->
+    <WasmShellIndexHtmlPath>$(MSBuildProjectDirectory)/wwwroot/index.html</WasmShellIndexHtmlPath>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- 复用网关的线上 DTO 约定序列化选项（DurationConverter 等），避免两端契约漂移。
+         Uic.Domain 是纯模型库，不带任何框架依赖，拉进 WASM 无副作用。 -->
+    <ProjectReference Include="../Uic.Domain/Uic.Domain.csproj" />
+
+    <PackageReference Include="Uno.WinUI" Version="6.7.135" />
+    <PackageReference Include="Uno.WinUI.WebAssembly" Version="6.7.135" />
+    <PackageReference Include="Uno.Wasm.Bootstrap" Version="10.0.98" />
+    <PackageReference Include="Uno.Wasm.Bootstrap.DevServer" Version="10.0.98" />
+  </ItemGroup>
+</Project>

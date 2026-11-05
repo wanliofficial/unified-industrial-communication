@@ -1,0 +1,10 @@
+{
+  "name": "read_discrete_inputs_3",
+  "request": "0006 0000 0006 01 02 0008 0003",
+  "response": "0006 0000 0004 01 02 01 05",
+  "expect": [
+    { "point": "d0", "type": "bool", "bool": true,  "offset": 8 },
+    { "point": "d1", "type": "bool", "bool": false, "offset": 9 },
+    { "point": "d2", "type": "bool", "bool": true,  "offset": 10 }
+  ]
+}

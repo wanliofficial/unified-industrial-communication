@@ -1,0 +1,16 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <RootNamespace>Uic.Northbound</RootNamespace>
+  </PropertyGroup>
+  <ItemGroup>
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\Uic.Domain\Uic.Domain.csproj" />
+    <ProjectReference Include="..\Uic.Driver\Uic.Driver.csproj" />
+    <ProjectReference Include="..\Uic.Engine\Uic.Engine.csproj" />
+    <ProjectReference Include="..\Uic.Outbox\Uic.Outbox.csproj" />
+    <ProjectReference Include="..\Uic.Obs\Uic.Obs.csproj" />
+    <ProjectReference Include="..\Uic.Config\Uic.Config.csproj" />
+  </ItemGroup>
+</Project>

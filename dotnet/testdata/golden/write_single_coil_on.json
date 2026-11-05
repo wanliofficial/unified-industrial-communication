@@ -1,0 +1,10 @@
+{
+  "name": "write_single_coil_on",
+  "kind": "write",
+  "area": "coil",
+  "request": "0008 0000 0006 01 05 0003 FF00",
+  "response": "0008 0000 0006 01 05 0003 FF00",
+  "expect": [
+    { "point": "alarm", "type": "bool", "bool": true }
+  ]
+}

@@ -1,0 +1,10 @@
+{
+  "name": "rtu_read_holding_2_regs",
+  "frame": "rtu",
+  "request": "01 03 0064 0002 85D4",
+  "response": "01 03 04 000A 000B 9BF6",
+  "expect": [
+    { "point": "p1", "type": "uint16", "num": 10 },
+    { "point": "p2", "type": "uint16", "num": 11 }
+  ]
+}
