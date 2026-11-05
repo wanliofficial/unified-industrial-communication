@@ -52,6 +52,7 @@ public sealed class GatewayRuntime : IGatewayControl, IAsyncDisposable
     private readonly SemaphoreSlim _applyGate = new(1, 1);
 
     private MqttSink? _mqtt;
+    private MqttCommandSink? _mqttCommands;
     private JournalSink? _journal;
     private UicOpcUaServer? _opcUa;
     private ConfigDocument _config;
@@ -317,8 +318,16 @@ public sealed class GatewayRuntime : IGatewayControl, IAsyncDisposable
         if (mqttChanged)
         {
             var old = _mqtt;
+            var oldCommands = _mqttCommands;
             _mqtt = null;
+            _mqttCommands = null;
             _outbox.RemoveSink("mqtt");
+
+            if (oldCommands is not null)
+            {
+                // 先摘掉命令回调，再关连接：避免旧回调在旧连接的最后几条消息上执行命令。
+                _ = oldCommands.DisposeAsync().AsTask();
+            }
 
             if (old is not null)
             {
@@ -329,10 +338,28 @@ public sealed class GatewayRuntime : IGatewayControl, IAsyncDisposable
             if (mqtt.Enabled)
             {
                 var sink = new MqttSink(mqtt, config.Site, _logs.CreateLogger("uic.mqtt"));
+
+                MqttCommandSink? commands = null;
+                if (mqtt.Commands)
+                {
+                    // 构造时登记订阅，因此必须在 sink.Start() 之前创建。
+                    commands = new MqttCommandSink(
+                        sink.Client, mqtt, config.Site, this,
+                        _logs.CreateLogger("uic.mqtt.commands"));
+                }
+
                 _outbox.RegisterSink(sink);
                 sink.Start();
                 _mqtt = sink;
+                _mqttCommands = commands;
+
                 _log.LogInformation("mqtt sink started: {Host}:{Port}", mqtt.Host, mqtt.Port);
+
+                if (commands is not null)
+                {
+                    _log.LogInformation("mqtt command channel on {Topic} -> {Result} (restart/selftest/flush/log-level)",
+                        commands.Topic, commands.ResultTopic);
+                }
             }
         }
 
@@ -413,6 +440,12 @@ public sealed class GatewayRuntime : IGatewayControl, IAsyncDisposable
             catch
             {
                 // $death 发不出去只能留痕，退出码不受影响。
+            }
+
+            if (_mqttCommands is not null)
+            {
+                await _mqttCommands.DisposeAsync().ConfigureAwait(false);
+                _mqttCommands = null;
             }
 
             await _mqtt.DisposeAsync().ConfigureAwait(false);

@@ -120,16 +120,29 @@ public sealed class MqttSink : IOutboxSink, IAsyncDisposable
     }
 
     public string RenderTopic(string device, string point)
-    {
-        var template = string.IsNullOrWhiteSpace(_options.Topic)
-            ? "uic/{site}/{device}/{point}/value"
-            : _options.Topic;
+        => Render(_options.Topic, _options, _site, device, point);
 
-        return template
-            .Replace("{prefix}", _options.TopicPrefix, StringComparison.Ordinal)
-            .Replace("{site}", MqttClient.Segment(_site), StringComparison.Ordinal)
-            .Replace("{device}", MqttClient.Segment(device), StringComparison.Ordinal)
-            .Replace("{point}", MqttClient.Segment(point), StringComparison.Ordinal);
+    /// <summary>
+    /// 渲染主题模板。命令通道只用到 {prefix}/{site}，值主题额外用到 {device}/{point}。
+    /// 占位符不在模板里时替换是空操作，所以统一走同一个方法。
+    /// </summary>
+    internal static string Render(string template, MqttOptions options, string site, string? device = null, string? point = null)
+    {
+        var value = string.IsNullOrWhiteSpace(template)
+            ? "uic/{site}/{device}/{point}/value"
+            : template;
+
+        value = value
+            .Replace("{prefix}", options.TopicPrefix, StringComparison.Ordinal)
+            .Replace("{site}", MqttClient.Segment(site), StringComparison.Ordinal);
+
+        if (device is not null)
+            value = value.Replace("{device}", MqttClient.Segment(device), StringComparison.Ordinal);
+
+        if (point is not null)
+            value = value.Replace("{point}", MqttClient.Segment(point), StringComparison.Ordinal);
+
+        return value;
     }
 
     /// <summary>

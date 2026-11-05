@@ -10,8 +10,9 @@ namespace Uic.Tests;
 /// 它刻意不复用客户端任何代码：拆包、拼包、字段顺序全部按协议规范独立实现，
 /// 这样才能把「客户端编码错了」和「测试也照着错」区分开。
 ///
-/// 覆盖 CONNECT / PUBLISH(QoS0/1) / PUBACK / PINGREQ / PINGRESP / DISCONNECT，
-/// 不支持订阅、TLS 与持久会话 —— 客户端本来也不做这些。
+/// 覆盖 CONNECT / SUBSCRIBE / SUBACK / PUBLISH(QoS0/1) / PUBACK /
+/// PINGREQ / PINGRESP / DISCONNECT，不支持 TLS 与持久会话 ——
+/// 客户端本来也不做这些。
 /// </summary>
 internal sealed class FakeMqttBroker : IAsyncDisposable
 {
@@ -28,16 +29,30 @@ internal sealed class FakeMqttBroker : IAsyncDisposable
 
     public sealed record PublishInfo(string Topic, string Payload, int Qos, bool Retain, ushort PacketId);
 
+    public sealed record SubscriptionInfo(string Topic, int Qos, ushort PacketId);
+
+    private sealed class Connection
+    {
+        public Connection(NetworkStream stream) => Stream = stream;
+
+        public NetworkStream Stream { get; }
+        public SemaphoreSlim WriteLock { get; } = new(1, 1);
+    }
+
     private readonly TcpListener _listener;
     private readonly CancellationTokenSource _cts = new();
     private readonly Task _accept;
     private readonly List<ConnectInfo> _connects = new();
     private readonly List<PublishInfo> _published = new();
+    private readonly List<SubscriptionInfo> _subscriptions = new();
+    private readonly List<ushort> _pubacks = new();
     private readonly object _lock = new();
     private readonly List<TcpClient> _clients = new();
 
+    private Connection? _connection;
     private int _droppedOnce;
     private int _pings;
+    private int _nextPacketId;
 
     public FakeMqttBroker()
     {
@@ -58,8 +73,11 @@ internal sealed class FakeMqttBroker : IAsyncDisposable
     /// <summary>收到第一条 PUBLISH 后断开连接，模拟 Broker 重启。</summary>
     public bool DropAfterFirstPublish { get; init; }
 
-    /// <summary>连接后是否发消息（客户端从不订阅，这里只为验证它不会把入站 PUBLISH 当成确认）。</summary>
+    /// <summary>连接后是否发一条无关主题的消息。</summary>
     public bool StrayPublishOnConnect { get; init; }
+
+    /// <summary>SUBACK 里对所有主题回 0x80，模拟 Broker 的 ACL 拒绝订阅。</summary>
+    public bool RefuseSubscription { get; init; }
 
     public IReadOnlyList<ConnectInfo> Connects
     {
@@ -69,6 +87,17 @@ internal sealed class FakeMqttBroker : IAsyncDisposable
     public IReadOnlyList<PublishInfo> Published
     {
         get { lock (_lock) return _published.ToArray(); }
+    }
+
+    public IReadOnlyList<SubscriptionInfo> Subscriptions
+    {
+        get { lock (_lock) return _subscriptions.ToArray(); }
+    }
+
+    /// <summary>客户端回给 broker 的 PUBACK（入站 QoS1 消息的确认）。</summary>
+    public IReadOnlyList<ushort> Pubacks
+    {
+        get { lock (_lock) return _pubacks.ToArray(); }
     }
 
     public bool ClientSentDisconnect { get; private set; }
@@ -99,9 +128,12 @@ internal sealed class FakeMqttBroker : IAsyncDisposable
 
     private async Task HandleAsync(TcpClient client, CancellationToken ct)
     {
+        Connection? conn = null;
+
         try
         {
             await using var stream = client.GetStream();
+            conn = new Connection(stream);
 
             var (header, payload) = await ReadPacketAsync(stream, ct).ConfigureAwait(false);
             if ((header & 0xF0) != 0x10) return;
@@ -109,13 +141,17 @@ internal sealed class FakeMqttBroker : IAsyncDisposable
             var connect = ParseConnect(payload);
             lock (_lock) _connects.Add(connect);
 
-            await WritePacketAsync(stream, 0x20, new byte[] { 0x00, ConnackCode }, ct).ConfigureAwait(false);
+            await SendAsync(conn, 0x20, new byte[] { 0x00, ConnackCode }, ct).ConfigureAwait(false);
+
             if (ConnackCode != 0) return;
+
+            // 新连接成为「当前连接」，测试通过它向客户端下发命令。
+            lock (_lock) _connection = conn;
 
             if (StrayPublishOnConnect)
             {
-                // 一条 QoS1 的下行消息：客户端不支持订阅，必须忽略而不是当成 PUBACK。
-                await WritePacketAsync(stream, 0x32,
+                // 一条 QoS1 的下行消息：没有登记订阅时客户端必须忽略而不是当成 PUBACK。
+                await SendAsync(conn, 0x32,
                     Concat(StringBytes("uic/other/x/value"), new byte[] { 0x00, 0x07 }, Encoding.UTF8.GetBytes("{}")),
                     ct).ConfigureAwait(false);
             }
@@ -126,6 +162,44 @@ internal sealed class FakeMqttBroker : IAsyncDisposable
 
                 switch (h & 0xF0)
                 {
+                    case 0x80: // SUBSCRIBE
+                    {
+                        if (body.Length < 2) return;
+                        var packetId = (ushort)((body[0] << 8) | body[1]);
+                        var offset = 2;
+
+                        var granted = new List<byte>();
+                        var requested = new List<SubscriptionInfo>();
+
+                        while (offset < body.Length)
+                        {
+                            var topic = ReadString(body, ref offset);
+                            if (offset >= body.Length) return;
+                            var qos = body[offset++];
+
+                            // 客户端只发 QoS0/1；收到 2 说明编码有误。
+                            if (qos > 1) return;
+
+                            requested.Add(new SubscriptionInfo(topic, qos, packetId));
+                            granted.Add(RefuseSubscription ? (byte)0x80 : (byte)qos);
+                        }
+
+                        lock (_lock) _subscriptions.AddRange(requested);
+
+                        await SendAsync(conn, 0x90,
+                            Concat(new[] { (byte)(packetId >> 8), (byte)packetId }, granted.ToArray()),
+                            ct).ConfigureAwait(false);
+                        break;
+                    }
+
+                    case 0x40: // 客户端对入站 QoS1 的 PUBACK
+                    {
+                        if (body.Length < 2) return;
+                        var packetId = (ushort)((body[0] << 8) | body[1]);
+                        lock (_lock) _pubacks.Add(packetId);
+                        break;
+                    }
+
                     case 0x30:
                     {
                         var info = ParsePublish(h, body);
@@ -136,7 +210,7 @@ internal sealed class FakeMqttBroker : IAsyncDisposable
                             if (PubackDelay > TimeSpan.Zero)
                                 await Task.Delay(PubackDelay, ct).ConfigureAwait(false);
 
-                            await WritePacketAsync(stream, 0x40,
+                            await SendAsync(conn, 0x40,
                                 new[] { (byte)(info.PacketId >> 8), (byte)(info.PacketId & 0xFF) }, ct)
                                 .ConfigureAwait(false);
                         }
@@ -149,7 +223,7 @@ internal sealed class FakeMqttBroker : IAsyncDisposable
 
                     case 0xC0:
                         Interlocked.Increment(ref _pings);
-                        await WritePacketAsync(stream, 0xD0, Array.Empty<byte>(), ct).ConfigureAwait(false);
+                        await SendAsync(conn, 0xD0, Array.Empty<byte>(), ct).ConfigureAwait(false);
                         break;
 
                     case 0xE0:
@@ -165,6 +239,35 @@ internal sealed class FakeMqttBroker : IAsyncDisposable
         {
             // 连接被测试或被客户端关掉，属于正常收尾。
         }
+        finally
+        {
+            lock (_lock)
+            {
+                if (ReferenceEquals(_connection, conn)) _connection = null;
+            }
+        }
+    }
+
+    /// <summary>
+    /// 向客户端下发一条消息（模拟操作员发布命令）。
+    /// 返回 QoS1 使用的 packet id，测试据此断言客户端回了 PUBACK。
+    /// </summary>
+    public async Task<ushort> PublishToClientAsync(
+        string topic, string payload, int qos = 1, CancellationToken ct = default)
+    {
+        Connection conn;
+        lock (_lock) conn = _connection ?? throw new InvalidOperationException("no client is connected");
+
+        var packetId = qos > 0 ? (ushort)((Interlocked.Increment(ref _nextPacketId) % 65535) + 1) : (ushort)0;
+
+        var body = qos > 0
+            ? Concat(StringBytes(topic),
+                new[] { (byte)(packetId >> 8), (byte)packetId },
+                Encoding.UTF8.GetBytes(payload))
+            : Concat(StringBytes(topic), Encoding.UTF8.GetBytes(payload));
+
+        await SendAsync(conn, (byte)(0x30 | (qos << 1)), body, ct).ConfigureAwait(false);
+        return packetId;
     }
 
     private static ConnectInfo ParseConnect(byte[] payload)
@@ -289,6 +392,20 @@ internal sealed class FakeMqttBroker : IAsyncDisposable
         await stream.FlushAsync(ct).ConfigureAwait(false);
     }
 
+    /// <summary>所有写都串行化：下行命令与 ACK 可能同时发生，字节交错会直接毁掉报文。</summary>
+    private static async Task SendAsync(Connection conn, byte header, byte[] body, CancellationToken ct)
+    {
+        await conn.WriteLock.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            await WritePacketAsync(conn.Stream, header, body, ct).ConfigureAwait(false);
+        }
+        finally
+        {
+            conn.WriteLock.Release();
+        }
+    }
+
     /// <summary>主动断开所有连接，用来模拟「Broker 把客户端踢下线」。</summary>
     public void DropConnections()
     {
@@ -300,6 +417,7 @@ internal sealed class FakeMqttBroker : IAsyncDisposable
             }
 
             _clients.Clear();
+            _connection = null;
         }
     }
 

@@ -30,6 +30,7 @@ internal static class MqttTests
         tests.Add(new TestCase("mqtt/reconnect_republishes_birth_and_state", ReconnectRepublishesBirthAndState));
         tests.Add(new TestCase("mqtt/refused_connack_keeps_retrying_without_connecting", RefusedConnackKeepsRetrying));
         tests.Add(new TestCase("mqtt/idle_connection_sends_pingreq", IdleConnectionSendsPingreq));
+        tests.Add(new TestCase("mqtt/subscribe_receives_inbound_and_sends_puback", SubscribeReceivesInboundAndSendsPuback));
     }
 
     private static MqttOptions Options(int port, int qos = 1, string? username = null, string? password = null, int keepAliveSeconds = 30) => new()
@@ -273,6 +274,44 @@ internal static class MqttTests
         await WaitUntil(t, () => broker.PingCount >= 1, "an idle connection is kept alive", timeoutMs: 6000);
 
         t.Ok(client.IsConnected, "PINGRESP is consumed and the client stays connected");
+    }
+
+    /// <summary>
+    /// 订阅的协议细节：SUBSCRIBE 必须带 packet id 与 QoS，SUBACK 要被消费掉；
+    /// 入站 QoS1 消息必须回 PUBACK——漏了这条，broker 会一直重投同一条命令。
+    /// </summary>
+    private static async Task SubscribeReceivesInboundAndSendsPuback(TestContext t)
+    {
+        await using var broker = new FakeMqttBroker();
+        await using var client = new MqttClient(Options(broker.Port), "site-a", NullLogger.Instance);
+
+        var received = new TaskCompletionSource<MqttMessage>(TaskCreationOptions.RunContinuationsAsynchronously);
+        client.OnMessage = (_, message, _) =>
+        {
+            received.TrySetResult(message);
+            return Task.CompletedTask;
+        };
+
+        client.Subscribe("uic/site-a/$command", qos: 1);
+        client.Start();
+
+        await WaitUntil(t, () => broker.Subscriptions.Count > 0, "the SUBSCRIBE reaches the broker");
+        t.Equal("uic/site-a/$command", broker.Subscriptions[0].Topic, "the topic filter is sent verbatim");
+        t.Equal(1, broker.Subscriptions[0].Qos, "the requested QoS is forwarded");
+        t.Ok(broker.Subscriptions[0].PacketId != 0, "SUBSCRIBE carries a non-zero packet id");
+
+        var packetId = await broker.PublishToClientAsync(
+            "uic/site-a/$command", "{\"id\":\"x\"}", qos: 1);
+
+        await WaitUntil(t, () => received.Task.IsCompleted, "the inbound PUBLISH is delivered");
+        var message = await received.Task;
+
+        t.Equal("uic/site-a/$command", message.Topic, "the topic is decoded");
+        t.Equal((byte)1, message.Qos, "the QoS is decoded from the fixed header");
+        t.Equal("{\"id\":\"x\"}", Encoding.UTF8.GetString(message.Payload), "the payload is passed through");
+
+        await WaitUntil(t, () => broker.Pubacks.Contains(packetId),
+            "the inbound QoS1 message is acknowledged");
     }
 
     private static int Count(FakeMqttBroker broker, string topic) =>

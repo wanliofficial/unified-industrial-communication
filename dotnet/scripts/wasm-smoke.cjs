@@ -32,45 +32,67 @@ async function main() {
     args: ['--no-sandbox'],
   });
 
-  const page = await browser.newPage();
+  // 一次完整尝试：打开页面、等 WASM 把 REST 数据渲染出来、收集全程的异常与失败请求。
+  // 单独成函数是为了在「网络接口变化」这种环境噪声上做一次重试，见下面的 transient。
+  const attempt = async () => {
+    const page = await browser.newPage();
 
-  const pageErrors = [];
-  const consoleErrors = [];
-  const failedRequests = [];
-  const badResponses = [];
+    const pageErrors = [];
+    const consoleErrors = [];
+    const failedRequests = [];
+    const badResponses = [];
 
-  page.on('pageerror', (err) => pageErrors.push(err.message));
-  page.on('console', (msg) => {
-    if (msg.type() === 'error') consoleErrors.push(msg.text());
-  });
-  page.on('requestfailed', (req) => {
-    // favicon 不存在不影响控制台，浏览器会自动放弃。
-    if (!req.url().includes('favicon')) failedRequests.push(`${req.url()} ${req.failure()?.errorText ?? ''}`);
-  });
-  page.on('response', (res) => {
-    if (res.status() >= 400 && !res.url().includes('favicon')) {
-      badResponses.push(`${res.status()} ${res.url()}`);
-    }
-  });
+    page.on('pageerror', (err) => pageErrors.push(err.message));
+    page.on('console', (msg) => {
+      if (msg.type() === 'error') consoleErrors.push(msg.text());
+    });
+    page.on('requestfailed', (req) => {
+      // favicon 不存在不影响控制台，浏览器会自动放弃。
+      if (!req.url().includes('favicon')) failedRequests.push(`${req.url()} ${req.failure()?.errorText ?? ''}`);
+    });
+    page.on('response', (res) => {
+      if (res.status() >= 400 && !res.url().includes('favicon')) {
+        badResponses.push(`${res.status()} ${res.url()}`);
+      }
+    });
 
-  const started = Date.now();
-  await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
+    const started = Date.now();
+    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
 
-  // 判据不是「页面有 HTML」，而是「REST 数据已经渲染出来」：
-  // 它同时要求 WASM 启动、裁剪后的序列化可用、同源地址解析正确。
-  await page.waitForFunction(
-    () => document.body && document.body.innerText.includes('虚拟设备 1'),
-    null,
-    { timeout: 120000 },
-  );
+    // 判据不是「页面有 HTML」，而是「REST 数据已经渲染出来」：
+    // 它同时要求 WASM 启动、裁剪后的序列化可用、同源地址解析正确。
+    await page.waitForFunction(
+      () => document.body && document.body.innerText.includes('虚拟设备 1'),
+      null,
+      { timeout: 120000 },
+    );
 
-  const bootMs = Date.now() - started;
+    const bootMs = Date.now() - started;
 
-  const state = await page.evaluate(() => ({
-    loader: document.querySelector('.uno-loader') !== null,
-    text: document.body.innerText,
-    canvases: document.querySelectorAll('canvas').length,
-  }));
+    const state = await page.evaluate(() => ({
+      loader: document.querySelector('.uno-loader') !== null,
+      text: document.body.innerText,
+      canvases: document.querySelectorAll('canvas').length,
+    }));
+
+    return { page, pageErrors, consoleErrors, failedRequests, badResponses, bootMs, state };
+  };
+
+  // 本机同时挂着 tailscale / docker / VPN 时，Chromium 会收到网络接口变化事件，
+  // 正在下载的框架 .wasm 会被中止成 net::ERR_NETWORK_CHANGED。应用本身已经起来了，
+  // 这是环境噪声：只对这一种错误重试一次，其它失败照常判负。
+  const transient = (r) =>
+    r.failedRequests.some((line) => line.includes('ERR_NETWORK_CHANGED')) ||
+    r.pageErrors.some((line) => /Failed to fetch/i.test(line));
+
+  let run = await attempt();
+  if (transient(run)) {
+    console.log('  ! 浏览器报告网络接口变化，框架资源被中断；重试一次');
+    await run.page.close();
+    run = await attempt();
+  }
+
+  const { page, pageErrors, consoleErrors, failedRequests, badResponses, bootMs, state } = run;
 
   const checks = [];
   const ok = (cond, what) => checks.push({ cond: !!cond, what });

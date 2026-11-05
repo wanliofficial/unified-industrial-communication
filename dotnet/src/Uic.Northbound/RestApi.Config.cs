@@ -130,69 +130,11 @@ public static partial class RestApi
             var request = ReadJson<CommandRequestDto>(body)
                           ?? throw ApiException.BadRequest("request.invalid", "body is required");
 
-            var parameters = request.Params ?? new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            var response = await CommandExecutor
+                .ExecuteAsync(ctx.Control, request, CommandScope.All, ct)
+                .ConfigureAwait(false);
 
-            string Param(string name) =>
-                parameters.TryGetValue(name, out var v) && !string.IsNullOrWhiteSpace(v)
-                    ? v
-                    : throw ApiException.BadRequest("request.missing_parameter",
-                        $"command '{request.Action}' requires param '{name}'");
-
-            switch (request.Action)
-            {
-                case "driver.restart":
-                {
-                    var device = Param("device");
-                    await ctx.Control.RestartDeviceAsync(device, ct).ConfigureAwait(false);
-                    return Results.Json(new CommandResponseDto(request.Action, true, $"device '{device}' restarted"),
-                        ApiJson.Options);
-                }
-
-                case "device.selftest":
-                {
-                    var device = Param("device");
-                    var ok = await ctx.Control.SelfTestAsync(device, ct).ConfigureAwait(false);
-                    return Results.Json(new CommandResponseDto(request.Action, ok,
-                        ok ? "self test passed" : "self test failed"), ApiJson.Options);
-                }
-
-                case "outbox.flush":
-                    await ctx.Control.FlushOutboxAsync(ct).ConfigureAwait(false);
-                    return Results.Json(new CommandResponseDto(request.Action, true, "outbox flushed"),
-                        ApiJson.Options);
-
-                case "outbox.drop":
-                    if (!request.Confirm)
-                        throw ApiException.BadRequest("request.confirm_required",
-                            "outbox.drop requires \"confirm\": true");
-                    return Results.Json(new CommandResponseDto(request.Action, false,
-                        "outbox.drop is not implemented: dropping pending records needs a retention policy"),
-                        ApiJson.Options);
-
-                case "config.rollback":
-                {
-                    if (!request.Confirm)
-                        throw ApiException.BadRequest("request.confirm_required",
-                            "config.rollback requires \"confirm\": true");
-
-                    var version = Param("version");
-                    var outcome = await ctx.Control.RollbackAsync(version, ct).ConfigureAwait(false);
-                    return Results.Json(new CommandResponseDto(request.Action, true,
-                        $"rolled back to {version} as {outcome.Version}"), ApiJson.Options);
-                }
-
-                case "log.level":
-                {
-                    var level = Param("level");
-                    ctx.Control.SetLogLevel(level);
-                    return Results.Json(new CommandResponseDto(request.Action, true, $"log level set to {level}"),
-                        ApiJson.Options);
-                }
-
-                default:
-                    throw ApiException.BadRequest("request.unknown_action",
-                        $"unknown action '{request.Action}'");
-            }
+            return Results.Json(response, ApiJson.Options);
         });
     }
 

@@ -16,7 +16,7 @@ dotnet run --project tests/Uic.Tests -- --stop-on-fail      # 首个失败即停
 正常输出：
 
 ```
-108 passed, 0 failed, 1 skipped · 29.7s
+115 passed, 0 failed, 1 skipped · 33.1s
 ```
 
 跳过的一条是 OPC UA 验收（要绑端口、生成证书，默认不跑）。
@@ -47,7 +47,7 @@ dotnet run --project tests/Uic.Tests -- --stop-on-fail      # 首个失败即停
 | `engine/*` | 2 | 同连接永不并发、状态机与代次 |
 | `loopback/*` | 12 | 主站 ↔ 内置从站的真实链路 |
 | `serial/*` | 6 | 真实伪终端上的 RTU / ASCII、半双工、deadline、关闭打断读 |
-| `mqtt/*` | 8 | 测试内 broker：CONNECT 字段、QoS0/1、主题渲染、断线重连补发 |
+| `mqtt/*` | 15 | 测试内 broker：CONNECT/SUBSCRIBE 字段、QoS0/1、主题渲染、重连补发、命令去重与权限 |
 | `contract/*` | 7 | 进程内真实 Kestrel 的 REST 契约 |
 | `opcua/*` | 1 | 标准 OPC UA 客户端：浏览、读、写、订阅 |
 
@@ -177,7 +177,21 @@ WebApplication.CreateBuilder → UseUrls("http://127.0.0.1:0")
   载荷原样透传；
 - 重连：broker 主动断链后客户端自行重连，并补发 `$birth` 与全部已知 `$state`；
 - 心跳：空闲连接在 keepalive 的一半内发 PINGREQ（不发就会被 broker 按 1.5×keepalive 踢掉）；
+- 订阅：SUBSCRIBE 带 packet id 与 QoS，SUBACK 被消费；入站 QoS1 要回 PUBACK
+  （漏了这条 broker 会一直重投同一条命令）；
 - 反例：CONNACK 非 0 时不报「已连接」但继续重试；入站 PUBLISH 不会被当成 PUBACK。
+
+命令通道（`MqttCommandSink`）另有 6 条端到端用例，用 stub `IGatewayControl` 计数
+来证明「执行了/没执行」而不是只看结果 JSON：
+
+| 用例 | 断言 |
+|---|---|
+| `command_executes_and_publishes_result` | 请求参数透传、结果回到约定主题、`schemaVersion`/`replayed` 正确 |
+| `command_unknown_action_returns_error` | `request.unknown_action`，错误信息包含被拒动作 |
+| `command_duplicate_id_executes_once` | 同一 id 两次只调用一次控制面，第二次 `replayed:true` |
+| `command_privileged_action_is_forbidden` | `config.rollback` 返回 `command.forbidden`，控制面零调用 |
+| `command_missing_id_is_rejected` | 无 id 返回 `request.invalid`，一次也不执行 |
+| `command_resubscribes_after_reconnect` | broker 断链后重新订阅，命令在新会话上仍可执行 |
 
 这套用例抓到过三个真实缺陷，都属于「代码评审看不出来、上线才出问题」的类型：
 `ReadPacketAsync` 把剩余长度字节当成报文头（所有应答都被丢弃）、
@@ -188,13 +202,16 @@ WebApplication.CreateBuilder → UseUrls("http://127.0.0.1:0")
 ### 与真实 broker 的互操作
 
 测试内 broker 证明「客户端拼的字节自洽」，但证明不了「别的实现也认」。`scripts/mqtt-interop.sh`
-起一个官方 mosquitto 容器跑真链路，覆盖三件事：
+起一个官方 mosquitto 容器跑真链路，覆盖四件事：
 
 1. 上线：`$birth` 与设备 `$state` 被 retained，点位值按 QoS1 持续发布；
    新起的订阅者一条命令就能拿到 retained 状态；
 2. 重连：`docker rm -f` broker 再用同一端口起回来（retained 随进程消失），
    客户端在 `reconnectDelayMs` 后自己回去并补发 `$birth`/`$state`，数据继续流动；
-3. 遗嘱：`kill -9` 网关，broker 检测到没有 DISCONNECT，代发 retained 的 `$death`。
+3. 命令：用 `mosquitto_pub` 往 `$command` 发 `driver.restart`，结果回到
+   `$command/result`；同一个 id 重投只重放结果（`replayed:true`）；
+   `config.rollback` 被拒绝（`command.forbidden`）；
+4. 遗嘱：`kill -9` 网关，broker 检测到没有 DISCONNECT，代发 retained 的 `$death`。
 
 脚本需要 docker（镜像不存在时自动拉取 `eclipse-mosquitto:2`），不在 `tests/Uic.Tests`
 里跑是因为它依赖外部容器，而那个运行器要保证离网可跑。`--keep` 保留配置、日志与抓包。
@@ -232,7 +249,8 @@ WebApplication.CreateBuilder → UseUrls("http://127.0.0.1:0")
 
 | 缺口 | 影响 | 建议 |
 |---|---|---|
-| MQTT 只与 mosquitto 互操作过 | 认证、ACL、TLS、其它 broker 的差异未覆盖（客户端本身只做匿名明文） | 接入现场时用目标 broker 重跑 `scripts/mqtt-interop.sh`，并单独验 TLS 终结方案 |
+| MQTT 只与 mosquitto 互操作过 | 认证、ACL、TLS、其它 broker 的差异未覆盖（客户端本身只做匿名明文）；命令通道同样依赖 Broker 侧隔离 | 接入现场时用目标 broker 重跑 `scripts/mqtt-interop.sh`，并单独验 TLS 终结方案与命令主题的 ACL |
+| MQTT 命令去重只在进程内 | 幂等窗口 5 分钟、重启即清空；没有持久审计台账 | 需要跨重启幂等时用 REST 的 `X-Idempotency-Key`，或把命令记录落到外部存储 |
 | WASM 控制台只在 Chromium 上验过 | 未覆盖 Firefox / Safari、移动端与真实触屏 | 上线前在目标浏览器各跑一次同一套检查（换 Playwright 的 browser 参数） |
 | 真实硬件 | 全部用例都跑在内置从站 / 虚拟设备 / 伪终端上 | 现场接入时先用 `uic check` 与 `/api/v1/commands` 的 `device.selftest` |
 

@@ -43,14 +43,15 @@
 
 - **南向**：Modbus TCP / RTU / ASCII 主站；Modbus TCP 从站（仅用于仿真与测试）；
   虚拟设备（正弦/斜坡/随机/常量 + 五类故障注入）。
-- **北向**：REST（设备/点位/写入/配置/命令/诊断）、SSE、MQTT 发布侧、OPC UA 服务端。
+- **北向**：REST（设备/点位/写入/配置/命令/诊断）、SSE、MQTT 发布 + 可选下行命令、OPC UA 服务端。
 - **治理**：内容寻址配置 + diff + 回滚 + 热更新；持久化上报队列（分区分位点、三重上限）；
   设备状态机 + 熔断 + 探活恢复；指标 + 环形日志 + 诊断包。
 - **控制台**：Uno WASM 五个页面（设备 / 点位 / 监控 / 日志 / 配置）。
 - **验收**：黄金帧 16 份；T1–T18 全部有对应用例，其中 T15–T18 跑在 libc 开出来的
-  真实伪终端上；MQTT 发布侧先在测试内按规范独立实现的最小 broker 上做协议级验收，
-  再用官方 mosquitto 容器跑一次互操作（`scripts/mqtt-interop.sh`：上线、重启重连、
-  kill -9 后由 broker 代发遗嘱）；WASM 控制台用 `scripts/wasm-smoke.sh` 发布后
+  真实伪终端上；MQTT 先在测试内按规范独立实现的最小 broker 上做协议级验收（发布、
+  订阅、入站 PUBACK、下行命令去重与权限），再用官方 mosquitto 容器跑一次互操作
+  （`scripts/mqtt-interop.sh`：上线、重启重连、命令请求/结果、kill -9 后由 broker
+  代发遗嘱）；WASM 控制台用 `scripts/wasm-smoke.sh` 发布后
   在 Playwright 里真跑一遍（`index.html` / 引导脚本 / SPA 回退 / REST 首屏）。
   见 [testing.md](testing.md)。
 
@@ -63,7 +64,7 @@
 | OPC UA 用户认证 | 没有用户后端，匿名读 + 可选匿名写足够覆盖调试场景 | 接 `IUserIdentityValidator` |
 | MQTT QoS2 | 现场 QoS1 + 持久化队列已经够用，QoS2 的握手复杂度不划算 | 在 `MqttClient` 里加 PUBREL 状态机 |
 | MQTT TLS / WebSocket | 证书轮换与代理终结是部署问题，客户端只做明文发布 | 用 stunnel / 反向代理终结 TLS；确需内置时在 `MqttClient` 上接 `SslStream` |
-| MQTT 订阅（下行命令） | 下行命令走 REST 更可控（有幂等键与审计） | 新增一个 `MqttCommandSink`，复用 `IGatewayControl` |
+| MQTT 命令的持久审计与 ACL | 这一版只有匿名明文；幂等窗口在进程内，重启即清空 | 在 Broker 侧做主题 ACL 与 TLS；需要跨重启幂等时把命令记录落到外部存储 |
 | 多协议（S7 / OPC DA / IEC 104 …） | 首版把一条链路的每一层都做透，比铺开十个半成品有用 | 见下「扩展点」 |
 
 ## 与文档的偏差

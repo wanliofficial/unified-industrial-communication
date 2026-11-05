@@ -33,6 +33,7 @@ JsonTests.Register(tests);
 LoopbackTests.Register(tests);
 SerialTests.Register(tests);
 MqttTests.Register(tests);
+MqttCommandTests.Register(tests);
 ContractTests.Register(tests);
 OpcUaTests.Register(tests);
 

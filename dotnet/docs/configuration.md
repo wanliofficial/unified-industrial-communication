@@ -218,9 +218,17 @@
 | `keepAliveSeconds` | `30` | 5..600 |
 | `reconnectDelayMs` | `2000` | 重连退避 |
 | `publishedSnapshotOnStart` | `true` | 启动时补发一次当前快照 |
+| `commands` | `false` | 打开下行命令通道（订阅 `commandTopic`） |
+| `commandTopic` | `{prefix}/{site}/$command` | 不能含 `{device}` / `{point}` |
+| `commandResultTopic` | `{prefix}/{site}/$command/result` | 必须与 `commandTopic` 不同 |
 
 主题模板必须含 `{device}` 与 `{point}`，且以 `topicPrefix` 开头或含 `{site}` ——
 否则同一套主题可能把两个站点的数据混在一起。
+
+命令主题与结果主题同样以 `topicPrefix` 开头或含 `{site}`。`commands` 默认关闭：
+这一版 MQTT 只有匿名明文，开启前请确认 Broker 侧已经做了网络隔离或 ACL。
+即便打开，`config.rollback` 与 `outbox.drop` 也会被拒绝，只能走 REST。
+契约见 [northbound-api.md](northbound-api.md#下行命令可选)。
 
 ### `opcUa`
 

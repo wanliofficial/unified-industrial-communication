@@ -7,7 +7,9 @@
 #
 #   1. 连接后 $birth 上线，点位值按 QoS1 持续发布，$state 有 retained 状态；
 #   2. broker 重启后客户端自己回去，并补发 $birth / $state（retained 已随重启清空）；
-#   3. kill -9 网关，broker 代发遗嘱 $death —— 订阅端看到的「进程被杀」与「正常退出」一致。
+#   3. 通过 broker 下发命令：执行结果回到 $command/result，重复 id 只执行一次，
+#      特权动作被拒；
+#   4. kill -9 网关，broker 代发遗嘱 $death —— 订阅端看到的「进程被杀」与「正常退出」一致。
 #
 # 用法：
 #   scripts/mqtt-interop.sh          # 跑一遍，结束后清理
@@ -55,6 +57,15 @@ wait_line() { # file pattern timeout-seconds
   local file=$1 pattern=$2 timeout=${3:-20} i
   for ((i = 0; i < timeout * 10; i++)); do
     grep -qF -- "$pattern" "$file" 2>/dev/null && return 0
+    sleep 0.1
+  done
+  return 1
+}
+
+wait_count() { # file pattern count timeout-seconds
+  local file=$1 pattern=$2 count=$3 timeout=${4:-20} i
+  for ((i = 0; i < timeout * 10; i++)); do
+    [[ "$(grep -cF -- "$pattern" "$file" 2>/dev/null || true)" -ge "$count" ]] && return 0
     sleep 0.1
   done
   return 1
@@ -128,7 +139,8 @@ cat > "$TMP/config.json" <<JSON
       "topic": "uic/{site}/{device}/{point}/value",
       "qos": 1,
       "keepAliveSeconds": 10,
-      "reconnectDelayMs": 500
+      "reconnectDelayMs": 500,
+      "commands": true
     },
     "opcUa": { "enabled": false }
   },
@@ -220,6 +232,37 @@ wait_line "$TMP/capture2.txt" 'uic/interop-site/virtual-1/$state' 25 ||
 wait_line "$TMP/capture2.txt" 'uic/interop-site/virtual-1/temperature/value' 25 ||
   die "重连后数据没有恢复"
 ok "重连后补发了 \$birth 与 \$state，数据继续流动"
+
+log "下发命令：执行结果回到 \$command/result"
+
+publish_command() { # json
+  docker exec "$BROKER" mosquitto_pub -h 127.0.0.1 -p 1883 -q 1 \
+    -t 'uic/interop-site/$command' -m "$1"
+}
+
+publish_command '{"id":"interop-1","action":"driver.restart","params":{"device":"virtual-1"}}'
+wait_line "$TMP/capture2.txt" 'uic/interop-site/$command/result' 20 ||
+  die "没有收到命令结果（见 $TMP/gateway.log）"
+grep -q '"id":"interop-1"' "$TMP/capture2.txt" || die "结果里没有回显请求 id"
+grep -q '"ok":true' "$TMP/capture2.txt" || die "命令没有执行成功"
+grep -q '"replayed":false' "$TMP/capture2.txt" || die "首次结果被误标成 replay"
+
+FIRST_RESULTS="$(grep -cF 'uic/interop-site/$command/result' "$TMP/capture2.txt" || true)"
+ok "命令被执行，结果已回到 \$command/result"
+
+# 同一个 id 重投：必须重放首次结果，而不是再重启一次设备。
+publish_command '{"id":"interop-1","action":"driver.restart","params":{"device":"virtual-1"}}'
+wait_count "$TMP/capture2.txt" 'uic/interop-site/$command/result' "$((FIRST_RESULTS + 1))" 20 ||
+  die "重复 id 没有返回结果"
+grep -q '"replayed":true' "$TMP/capture2.txt" || die "重复 id 没有被标记为 replay"
+ok "重复 id 只执行一次，第二次结果是 replay"
+
+# 匿名明文通道不允许回滚配置：即使带 confirm 也必须拒绝。
+publish_command '{"id":"interop-2","action":"config.rollback","params":{"version":"v1"},"confirm":true}'
+wait_count "$TMP/capture2.txt" 'uic/interop-site/$command/result' "$((FIRST_RESULTS + 2))" 20 ||
+  die "特权命令没有返回结果"
+grep -q '"code":"command.forbidden"' "$TMP/capture2.txt" || die "特权命令没有被拒绝"
+ok "config.rollback 在 MQTT 通道上被拒绝（command.forbidden）"
 
 log "kill -9 网关，验证 broker 代发遗嘱"
 kill -9 "$GW_PID"

@@ -53,6 +53,18 @@ public sealed class MqttOptions
     public int KeepAliveSeconds { get; init; } = 30;
     public int ReconnectDelayMs { get; init; } = 2000;
     public bool PublishedSnapshotOnStart { get; init; } = true;
+
+    /// <summary>
+    /// 是否开放下行命令（订阅 CommandTopic）。默认关闭：明文匿名通道上的
+    /// 写操作必须由部署方显式打开。
+    /// </summary>
+    public bool Commands { get; init; }
+
+    /// <summary>命令主题模板。默认 {prefix}/{site}/$command。</summary>
+    public string CommandTopic { get; init; } = "{prefix}/{site}/$command";
+
+    /// <summary>命令结果主题模板。默认 {prefix}/{site}/$command/result。</summary>
+    public string CommandResultTopic { get; init; } = "{prefix}/{site}/$command/result";
 }
 
 public sealed class OpcUaOptions

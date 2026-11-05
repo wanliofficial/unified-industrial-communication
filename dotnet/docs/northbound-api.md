@@ -258,7 +258,7 @@
 
 ## MQTT
 
-只实现 3.1.1 的发布侧（QoS 0/1，无 QoS2）。
+实现 3.1.1 的发布与订阅（QoS 0/1，无 QoS2）。
 
 | 主题 | 载荷 | 保留 |
 |---|---|---|
@@ -279,6 +279,51 @@
   broker 会在 1.5×keepalive 后单方面断开，表现为「没有数据时定时重连」；
 - 不走 TLS 与 WebSocket：需要加密时在链路上用 stunnel / 反向代理终结 TLS，
   再连本机明文端口。配置校验阶段会拒绝 `qos=2`，避免「以为支持其实没有」。
+
+### 下行命令（可选）
+
+`northbound.mqtt.commands` 打开后，客户端订阅 `commandTopic`
+（默认 `{prefix}/{site}/$command`）。订阅在建立连接时登记，**每次重连都会重新订阅**：
+Broker 重启或 ACL 变更后不需要人工重启网关。订阅被 Broker 拒绝时只记录错误，
+数据通道继续工作——命令通道失效不应该把整条链路拖进重连循环。
+
+请求：
+
+```json
+{"id": "9f1c", "action": "driver.restart", "params": {"device": "d1"}, "confirm": false}
+```
+
+| 字段 | 必填 | 说明 |
+|---|---|---|
+| `id` | 是 | 幂等键；也接受 `idempotencyKey` |
+| `action` | 是 | 见下方允许列表 |
+| `params` | 否 | 字符串键值对，与 REST 的 `params` 同义 |
+| `confirm` | 否 | 与 REST 相同的确认语义（本通道上不会用到需要确认的动作） |
+
+结果发到 `commandResultTopic`（默认 `{prefix}/{site}/$command/result`），
+**成功和失败都发**——只回成功的通道会让操作员分不清「没执行」和「结果丢了」：
+
+```json
+{"schemaVersion":1,"id":"9f1c","action":"driver.restart","ok":true,
+ "detail":"device 'd1' restarted","replayed":false,"at":"2026-11-05T...","site":"plant-a"}
+```
+
+失败时多一个 `error` 对象，`code` 与 REST 错误信封同源：
+
+```json
+{"schemaVersion":1,"id":"9f1c","action":"config.rollback","ok":false,
+ "replayed":false,"at":"...","site":"plant-a",
+ "error":{"code":"command.forbidden","message":"command 'config.rollback' is not allowed on this channel"}}
+```
+
+- 允许的动作：`driver.restart`、`device.selftest`、`outbox.flush`、`log.level`；
+- `config.rollback` 与 `outbox.drop` 固定返回 `command.forbidden`：这一版 MQTT
+  只有匿名明文，切换整份配置与丢弃队列必须留在可挂 Bearer Token 的 REST 上；
+- 同一 `id` 在 **5 分钟窗口**内重复到达时不再执行，直接重放首次结果并标
+  `replayed:true`。重连与人工重投都可能造成重复；
+- 入站 QoS1 在入队后立即回 PUBACK，执行在独立 worker 上串行进行，不会堵住
+  读循环与心跳。进程在「已确认、未执行完」之间崩溃仍会丢命令——这一版没有持久会话，
+  需要严格语义时请用 REST 的幂等键 + 结果查询。
 
 ## OPC UA
 

@@ -126,6 +126,42 @@ public static partial class ModelValidator
                 Add("northbound.mqtt.username", "username is required when password is set");
             if (mqtt.KeepAliveSeconds is < 5 or > 600)
                 Add("northbound.mqtt.keepAliveSeconds", "must be 5..600");
+
+            if (mqtt.Commands)
+            {
+                if (string.IsNullOrWhiteSpace(mqtt.CommandTopic))
+                    Add("northbound.mqtt.commandTopic", "required when commands are enabled");
+                if (string.IsNullOrWhiteSpace(mqtt.CommandResultTopic))
+                    Add("northbound.mqtt.commandResultTopic", "required when commands are enabled");
+
+                if (!string.IsNullOrWhiteSpace(mqtt.CommandTopic) &&
+                    !string.IsNullOrWhiteSpace(mqtt.CommandResultTopic) &&
+                    string.Equals(mqtt.CommandTopic, mqtt.CommandResultTopic, StringComparison.Ordinal))
+                {
+                    Add("northbound.mqtt.commandResultTopic", "must differ from commandTopic");
+                }
+
+                foreach (var (path, topic) in new[]
+                         {
+                             ("northbound.mqtt.commandTopic", mqtt.CommandTopic),
+                             ("northbound.mqtt.commandResultTopic", mqtt.CommandResultTopic),
+                         })
+                {
+                    if (string.IsNullOrWhiteSpace(topic)) continue;
+
+                    if (topic.Contains("{device}", StringComparison.Ordinal) ||
+                        topic.Contains("{point}", StringComparison.Ordinal))
+                    {
+                        Add(path, "must not contain {device} or {point}; the command channel is per site");
+                    }
+
+                    if (!topic.Contains("{site}", StringComparison.Ordinal) &&
+                        !topic.StartsWith(mqtt.TopicPrefix, StringComparison.Ordinal))
+                    {
+                        Add(path, $"must start with '{mqtt.TopicPrefix}' or contain {{site}}");
+                    }
+                }
+            }
         }
 
         var opc = doc.Northbound.OpcUa;
