@@ -36,6 +36,7 @@ import (
 	ua "uic/internal/codec/opcua"
 	"uic/internal/config"
 	"uic/internal/driver"
+	"uic/internal/model"
 	uicruntime "uic/internal/runtime"
 	sim "uic/internal/sim/modbus"
 	simmqtt "uic/internal/sim/mqtt"
@@ -263,6 +264,9 @@ func checkConfig(path string) int {
 			h.Dir, humanBytes(h.MaxBytes), h.MaxAge.String(), beat)
 	}
 	fmt.Printf("  drivers     %d（%s）\n", len(driver.List()), driverIDs())
+	if subs := subscribedChannels(f.Channels); len(subs) > 0 {
+		fmt.Printf("  subscribe   %v\n", subs)
+	}
 	sinks := []string{}
 	if f.Northbound.Webhook.Enabled {
 		sinks = append(sinks, "webhook")
@@ -297,6 +301,25 @@ func decodeStrict(raw []byte, v any) error {
 	dec := json.NewDecoder(bytes.NewReader(raw))
 	dec.DisallowUnknownFields()
 	return dec.Decode(v)
+}
+
+// subscribedChannels 列出开启了服务端订阅的通道。订阅改变了取数路径
+// （推送 vs 轮询），必须在校验阶段就让人看到——它不会体现在点位数、
+// 采集周期这些更显眼的字段上。
+func subscribedChannels(chs []model.Channel) []string {
+	var out []string
+	for _, ch := range chs {
+		if !ch.Subscribe {
+			continue
+		}
+		desc := ch.ID
+		if d := ch.PublishingInterval.Duration(); d > 0 {
+			desc += "@" + d.String()
+		}
+		out = append(out, desc)
+	}
+	sort.Strings(out)
+	return out
 }
 
 func driverIDs() string {

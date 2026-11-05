@@ -590,6 +590,22 @@ type Channel struct {
 	Rack int `json:"rack,omitempty"`
 	Slot int `json:"slot,omitempty"`
 
+	// Subscribe 是 OPC UA 的取数方式开关（其他协议忽略）：true 表示
+	// 让服务端建立订阅、主动推送变化；false（默认）表示每轮用 Read 轮询。
+	//
+	// 为什么是一个显式开关而不是「自动挑最好的」：两者的失败模式、
+	// 带宽特征与服务端负载完全不同。自动切换会让同一份配置在两种
+	// 行为之间漂移，现场无法判断「数据变慢了」是网络问题还是驱动
+	// 悄悄换成了轮询。
+	Subscribe bool `json:"subscribe,omitempty"`
+	// PublishingInterval 是订阅的发布周期；0 表示跟随设备采集周期。
+	// 只有 Subscribe=true 时有意义。
+	PublishingInterval Duration `json:"publishingInterval,omitempty"`
+	// SamplingInterval 是服务端的采样周期；0 表示跟随设备采集周期。
+	// 它通常应当 ≤ PublishingInterval：采样比发布慢会让一个发布周期里
+	// 丢掉中间的变化。
+	SamplingInterval Duration `json:"samplingInterval,omitempty"`
+
 	// Username/Password 是链路级凭据（MQTT 的 CONNECT、以及未来的
 	// OPC UA 用户名认证）。放在通道而不是设备上：凭据属于 Broker/服务端，
 	// 同一通道下的多台设备共用一份。
@@ -675,6 +691,18 @@ func (c Channel) Validate() error {
 	}
 	if c.Slot < 0 || c.Slot > 31 {
 		return fmt.Errorf("channel %q: slot %d out of range 0..31", c.ID, c.Slot)
+	}
+	if c.PublishingInterval < 0 {
+		return fmt.Errorf("channel %q: publishingInterval must be >= 0", c.ID)
+	}
+	if c.SamplingInterval < 0 {
+		return fmt.Errorf("channel %q: samplingInterval must be >= 0", c.ID)
+	}
+	// 发布/采样周期只有订阅模式下才有意义。配了但没开订阅时静默忽略，
+	// 会让「我把周期从 1s 改成 100ms，为什么还是 1s」变成一个没有线索
+	// 的问题——所以这里显式拒绝。允许等于 0（跟随设备采集周期）。
+	if !c.Subscribe && (c.PublishingInterval > 0 || c.SamplingInterval > 0) {
+		return fmt.Errorf("channel %q: publishingInterval/samplingInterval require subscribe=true", c.ID)
 	}
 	return nil
 }

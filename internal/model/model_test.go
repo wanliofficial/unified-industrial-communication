@@ -559,3 +559,41 @@ func TestCanonicalCoversEveryKind(t *testing.T) {
 		t.Errorf("unknown kind canonical = %q, want empty", got)
 	}
 }
+
+// 订阅的两个周期字段只在 subscribe=true 时有意义。配了却没开订阅是
+// 一个没有线索的静默错误（「我改了周期为什么没生效」），必须在配置
+// 校验阶段挡住；而 0 表示「跟随设备采集周期」，是合法的。
+func TestChannelSubscriptionFields(t *testing.T) {
+	base := Channel{ID: "c", Protocol: "opcua", Transport: Transport{Kind: "tcp", Address: "h:4840"}}
+
+	off := base
+	off.Subscribe = false
+	if err := off.Validate(); err != nil {
+		t.Fatalf("polling channel: %v", err)
+	}
+	on := base
+	on.Subscribe = true
+	on.PublishingInterval = Duration(200 * time.Millisecond)
+	on.SamplingInterval = Duration(100 * time.Millisecond)
+	if err := on.Validate(); err != nil {
+		t.Fatalf("subscribed channel: %v", err)
+	}
+	// 0 是「跟随设备采集周期」的合法写法。
+	zero := base
+	zero.Subscribe = true
+	if err := zero.Validate(); err != nil {
+		t.Fatalf("zero intervals: %v", err)
+	}
+
+	bad := []Channel{
+		{ID: "c", Protocol: "opcua", Transport: Transport{Kind: "tcp", Address: "h:4840"}, PublishingInterval: Duration(time.Second)},
+		{ID: "c", Protocol: "opcua", Transport: Transport{Kind: "tcp", Address: "h:4840"}, SamplingInterval: Duration(time.Second)},
+		{ID: "c", Protocol: "opcua", Transport: Transport{Kind: "tcp", Address: "h:4840"}, Subscribe: true, PublishingInterval: Duration(-time.Second)},
+		{ID: "c", Protocol: "opcua", Transport: Transport{Kind: "tcp", Address: "h:4840"}, Subscribe: true, SamplingInterval: Duration(-time.Second)},
+	}
+	for _, c := range bad {
+		if err := c.Validate(); err == nil {
+			t.Fatalf("must be rejected: %+v", c)
+		}
+	}
+}

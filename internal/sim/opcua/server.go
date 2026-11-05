@@ -3,9 +3,11 @@
 // 怎么解释」这两件事不会在主从之间分叉。
 //
 // 边界：只实现 HEL/ACK、OPN、CreateSession/ActivateSession/CloseSession、
-// Read、Write、Browse、GetEndpoints。不含订阅、历史、方法调用、事件、
-// 别名、证书。它存在的意义是让主站在没有真实服务端的机器上跑通完整
-// 三层握手，而不是模拟一套完整地址空间。
+// Read、Write、Browse、GetEndpoints 与订阅（CreateSubscription /
+// CreateMonitoredItems / Publish / DeleteSubscriptions）。不含历史、方法
+// 调用、事件、别名、证书。订阅只按「值变化」推送，没有采样定时器——
+// 这恰好是网关关心的那部分语义。它存在的意义是让主站在没有真实服务端的
+// 机器上跑通完整三层握手与推送链路，而不是模拟一套完整地址空间。
 package opcua
 
 import (
@@ -27,6 +29,11 @@ type Server struct {
 	conns    map[net.Conn]struct{}
 	sessions map[uint32]bool
 	nextSess uint32
+
+	// subs 是全部订阅。Publish 可能阻塞数秒，所以订阅有自己的锁，
+	// 不能靠 s.mu 串行化——否则一个空闲订阅会把 Read/Write 一起堵住。
+	subs    map[uint32]*subscription
+	nextSub uint32
 
 	wg     sync.WaitGroup
 	closed bool
@@ -54,6 +61,7 @@ func NewServer(addr string) (*Server, error) {
 		nodes:    map[string]*node{},
 		conns:    map[net.Conn]struct{}{},
 		sessions: map[uint32]bool{},
+		subs:     map[uint32]*subscription{},
 	}
 	s.buildAddressSpace()
 	s.wg.Add(1)
@@ -159,10 +167,17 @@ func (s *Server) Set(id string, v ua.Variant) {
 		return
 	}
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	if n, ok := s.nodes[nid.String()]; ok {
+	n, ok := s.nodes[nid.String()]
+	if ok {
 		n.value = v
 	}
+	s.mu.Unlock()
+	if !ok {
+		return
+	}
+	// 先解锁再分发：notifyChange 要拿订阅锁，而 Publish 路径持有订阅锁
+	// 时会读节点表（判存在/类型），两把锁反序就是互等。
+	s.notifyChange(nid, v, ua.StatusGood, time.Now())
 }
 
 // Value 读取一个变量的当前值。
@@ -221,10 +236,37 @@ type session struct {
 	seq       uint32
 	sessionID uint32
 	activated bool
+
+	// writeMu 让「响应写回」串行化：Publish 在独立 goroutine 里等通知，
+	// 它与 Read/Write 的响应会并发写同一条连接。OPC UA 允许乱序响应
+	// （按 RequestId 匹配），但不允许两个 goroutine 同时往一个 socket
+	// 写半条报文。
+	writeMu sync.Mutex
+	// done 在本连接结束时关闭，用来唤醒阻塞中的 Publish。
+	done chan struct{}
+}
+
+func (sess *session) respond(requestID, serviceID uint32, body []byte) bool {
+	sess.writeMu.Lock()
+	defer sess.writeMu.Unlock()
+	sess.seq++
+	_, err := sess.conn.Write(ua.EncodeSecureMessage(ua.MsgMessage,
+		sess.channelID, sess.tokenID,
+		ua.SequenceHeader{Number: sess.seq, RequestID: requestID},
+		serviceID, body))
+	return err == nil
 }
 
 func (s *Server) handleConn(conn net.Conn) {
-	sess := &session{conn: conn}
+	sess := &session{conn: conn, done: make(chan struct{})}
+	defer func() {
+		// 先唤醒 Publish 再清订阅：反过来的话，阻塞中的 Publish 会先把
+		// 「订阅不存在」的错误写回一条已经关掉的连接。
+		close(sess.done)
+		if sess.sessionID != 0 {
+			s.dropSessionSubscriptions(sess.sessionID)
+		}
+	}()
 	buf := make([]byte, 8)
 	for {
 		if _, err := readFull(conn, buf); err != nil {
@@ -296,11 +338,12 @@ func (s *Server) sendError(c net.Conn, code ua.StatusCode, reason string) {
 
 // dispatch 处理一条安全报文；返回 false 表示连接应当关闭。
 func (s *Server) dispatch(sess *session, m ua.SecureMessage) bool {
-	sess.seq++
-
 	switch m.Type {
 	case ua.MsgOpen:
 		resp := s.handleOpenSecureChannel(sess, m.Body)
+		sess.writeMu.Lock()
+		defer sess.writeMu.Unlock()
+		sess.seq++
 		_, err := sess.conn.Write(ua.EncodeOpenMessage(sess.channelID,
 			ua.AsymmetricSecurityHeader{PolicyURI: ua.PolicyNone},
 			ua.SequenceHeader{Number: sess.seq, RequestID: m.Seq.RequestID},
@@ -309,12 +352,20 @@ func (s *Server) dispatch(sess *session, m ua.SecureMessage) bool {
 	case ua.MsgClose:
 		return false
 	case ua.MsgMessage:
+		// Publish 会一直等到有通知或保活周期到。同步处理它会让这条连接
+		// 上的 DeleteSubscriptions 永远排不到，关闭时只能靠超时——所以
+		// 它单独开一个 goroutine，响应按 RequestId 乱序返回是规范允许的。
+		if m.ServiceID == ua.SvcPublishRequest {
+			body := m.Body
+			reqID := m.Seq.RequestID
+			go func() {
+				serviceID, out := s.handleMessage(sess, ua.SvcPublishRequest, body)
+				sess.respond(reqID, serviceID, out)
+			}()
+			return true
+		}
 		serviceID, body := s.handleMessage(sess, m.ServiceID, m.Body)
-		_, err := sess.conn.Write(ua.EncodeSecureMessage(ua.MsgMessage,
-			sess.channelID, sess.tokenID,
-			ua.SequenceHeader{Number: sess.seq, RequestID: m.Seq.RequestID},
-			serviceID, body))
-		return err == nil
+		return sess.respond(m.Seq.RequestID, serviceID, body)
 	}
 	return false
 }
@@ -364,6 +415,12 @@ func (s *Server) handleMessage(sess *session, serviceID uint32, body []byte) (ui
 			return ua.SvcServiceFaultResponse, s.fault(nil, 0, ua.StatusBadUnexpectedError, err.Error())
 		}
 		sess.activated = false
+		if sess.sessionID != 0 {
+			s.dropSessionSubscriptions(sess.sessionID)
+			s.mu.Lock()
+			delete(s.sessions, sess.sessionID)
+			s.mu.Unlock()
+		}
 		sess.sessionID = 0
 		resp := ua.CloseSessionResponse{Header: ua.ResponseHeader{
 			Timestamp: time.Now(), RequestHandle: req.Header.RequestHandle,
@@ -375,6 +432,18 @@ func (s *Server) handleMessage(sess *session, serviceID uint32, body []byte) (ui
 		return s.handleWrite(sess, body)
 	case ua.SvcBrowseRequest:
 		return s.handleBrowse(sess, body)
+	case ua.SvcCreateSubscriptionRequest:
+		return s.handleCreateSubscription(sess, body)
+	case ua.SvcCreateMonitoredItemsRequest:
+		return s.handleCreateMonitoredItems(sess, body)
+	case ua.SvcDeleteMonitoredItemsRequest:
+		return s.handleDeleteMonitoredItems(sess, body)
+	case ua.SvcDeleteSubscriptionsRequest:
+		return s.handleDeleteSubscriptions(sess, body)
+	case ua.SvcSetPublishingModeRequest:
+		return s.handleSetPublishingMode(sess, body)
+	case ua.SvcPublishRequest:
+		return s.handlePublish(sess, body)
 	}
 	return ua.SvcServiceFaultResponse, s.fault(nil, 0, ua.StatusBadServiceUnsupported,
 		fmt.Sprintf("service %d is not implemented", serviceID))
@@ -547,8 +616,12 @@ func (s *Server) handleWrite(sess *session, body []byte) (uint32, []byte) {
 	}
 
 	results := make([]ua.StatusCode, len(req.Nodes))
+	type change struct {
+		node ua.NodeID
+		val  ua.Variant
+	}
+	var changes []change
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	for i, wv := range req.Nodes {
 		n, ok := s.nodes[wv.NodeID.String()]
 		switch {
@@ -583,10 +656,19 @@ func (s *Server) handleWrite(sess *session, body []byte) (uint32, []byte) {
 			}
 			n.value = nv
 			results[i] = ua.StatusGood
+			changes = append(changes, change{node: wv.NodeID, val: nv})
 		}
 	}
+	s.mu.Unlock()
+
+	// 写入也要触发订阅。少这一步，订阅客户端会看到「自己写进去的值
+	// 迟迟不回流」——现场表现为「控制生效了但状态栏不变」。
+	now := time.Now()
+	for _, ch := range changes {
+		s.notifyChange(ch.node, ch.val, ua.StatusGood, now)
+	}
 	resp := ua.WriteResponse{Header: ua.ResponseHeader{
-		Timestamp: time.Now(), RequestHandle: req.Header.RequestHandle,
+		Timestamp: now, RequestHandle: req.Header.RequestHandle,
 	}, Results: results}
 	return ua.SvcWriteResponse, resp.Encode()
 }

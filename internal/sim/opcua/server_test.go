@@ -608,17 +608,17 @@ func TestGetEndpoints(t *testing.T) {
 }
 
 // 不支持的服务必须回 ServiceFault + BadServiceUnsupported，而不是断链：
-// 订阅类请求在驱动侧是「已知不支持」，上层要能区分这个和「连不上」。
+// 上层要能区分「服务端不会做这件事」和「连不上」。
 func TestUnsupportedServiceIsFault(t *testing.T) {
 	srv := newSim(t)
 	c := dial(t, srv)
 	c.hello(srv)
 	c.open()
 
-	// 787 = CreateSubscriptionRequest。本实现不提供订阅，故意用一个
+	// 712 = CallRequest（方法调用）。本实现不提供方法调用，故意用一个
 	// 「规范里存在但这里没实现」的服务 ID 来测服务不支持的分支。
-	const svcCreateSubscriptionRequest uint32 = 787
-	id, body := c.call(svcCreateSubscriptionRequest, []byte{})
+	const svcCallRequest uint32 = 712
+	id, body := c.call(svcCallRequest, []byte{})
 	if id != ua.SvcServiceFaultResponse {
 		t.Fatalf("service id %d", id)
 	}

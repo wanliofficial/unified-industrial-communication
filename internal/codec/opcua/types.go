@@ -130,6 +130,14 @@ func (s StatusCode) Text() string {
 		return "BadNotConnected"
 	case StatusBadNoData:
 		return "BadNoData"
+	case StatusBadNoSubscription:
+		return "BadNoSubscription"
+	case StatusBadSequenceNumberUnknown:
+		return "BadSequenceNumberUnknown"
+	case StatusBadSubscriptionIDInvalid:
+		return "BadSubscriptionIdInvalid"
+	case StatusBadMonitoredItemIDInvalid:
+		return "BadMonitoredItemIdInvalid"
 	}
 	return fmt.Sprintf("StatusCode(0x%08X)", uint32(s))
 }

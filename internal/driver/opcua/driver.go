@@ -19,6 +19,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	ua "uic/internal/codec/opcua"
@@ -70,7 +71,7 @@ func (d *Driver) Meta() driver.Meta {
 		Capabilities: driver.Capabilities{
 			Read:        driver.CapSupported,
 			Write:       driver.CapSupported,
-			Subscribe:   driver.CapUnsupported,
+			Subscribe:   driver.CapSupported,
 			Browse:      driver.CapUnsupported,
 			Discovery:   driver.CapExperimental,
 			MultiRead:   driver.CapSupported,
@@ -83,6 +84,10 @@ func (d *Driver) Meta() driver.Meta {
 				Help: "host:port，也可写 opc.tcp://host:port"},
 			{Name: "concurrency", Label: "并发上限", Type: "int", Default: 1, Scope: "channel",
 				Help: "本驱动单连接串行事务，保持 1"},
+			{Name: "subscribe", Label: "使用服务端订阅", Type: "bool", Default: false, Scope: "channel",
+				Help: "开启后由服务端推送变化（第二条连接上的 Publish 长轮询），Read 从本地最新值表取数；关闭则每轮 Read 轮询"},
+			{Name: "publishingInterval", Label: "发布周期", Type: "duration", Scope: "channel",
+				Help: "订阅的发布周期，留空跟随设备采集周期；采样周期相同"},
 		},
 		PointFields: []driver.ConfigField{
 			{Name: "address.kind", Label: "寻址方式", Type: "enum", Required: true,
@@ -95,17 +100,76 @@ func (d *Driver) Meta() driver.Meta {
 					"float32", "float64", "string", "bytes"}, Scope: "point",
 				Help: "写入时按此类型编码；读取时超出范围会判坏而不是截断"},
 		},
-		Description: "OPC UA 二进制客户端（SecurityPolicy None，匿名），支持批量读、写与端点发现",
+		Description: "OPC UA 二进制客户端（SecurityPolicy None，匿名），支持批量读、写、订阅推送与端点发现",
 	}
 }
 
-// Open 建立连接、安全通道与会话。
+// Open 建立连接、安全通道与会话；通道要求订阅时再建第二条连接。
 //
 // 顺序不可省：HEL/ACK → OPN → CreateSession → ActivateSession。少一步
 // 的表现各不相同：缺 OPN 时服务端直接断开；缺 CreateSession 时 Read
 // 返回 BadSessionIdInvalid；缺 ActivateSession 时部分服务端允许读但拒绝
 // 写，现场会变成「能看不能控」——最难排查的一种。
 func (d *Driver) Open(ctx context.Context, cfg driver.OpenConfig) (driver.Conn, error) {
+	c, err := d.openConn(ctx, cfg, "")
+	if err != nil {
+		return nil, err
+	}
+	if !cfg.Channel.Subscribe {
+		return c, nil
+	}
+
+	points, perr := subscriptionPoints(cfg)
+	if perr != nil {
+		_ = c.Close()
+		return nil, driver.E(driver.ErrAddress, "open", cfg.Device.ID, perr.Error(), false, perr)
+	}
+	if len(points) == 0 {
+		// 没有启用的点位就没有可监视的东西。退回轮询而不是报错：
+		// 一台全停用的设备仍然要能启动、能被健康检查看到。
+		return c, nil
+	}
+
+	every := cfg.Device.Interval.Duration()
+	if cfg.Channel.PublishingInterval.Duration() > 0 {
+		every = cfg.Channel.PublishingInterval.Duration()
+	}
+	if every <= 0 {
+		every = time.Second
+	}
+	// 采样周期默认跟随发布周期。真实服务端允许采样比发布快（一个发布
+	// 周期里只送最新值），慢于发布则毫无意义——那等于主动丢变化。
+	sampling := every
+	if cfg.Channel.SamplingInterval.Duration() > 0 {
+		sampling = cfg.Channel.SamplingInterval.Duration()
+	}
+
+	logf := func(msg string, args ...any) {}
+	if cfg.Log != nil {
+		logf = func(msg string, args ...any) { cfg.Log.Info(msg, args...) }
+	}
+	sub := newSubState(cfg.Device.ID, points, every, sampling,
+		func(ctx context.Context) (*conn, error) {
+			return d.openConn(ctx, cfg, "-sub")
+		}, cfg.Metrics, logf)
+
+	// 同步建立一次：订阅建不起来时就让 Open 失败。静默退化成轮询会让
+	// 「配置写着订阅、实际在轮询」永远没人发现。
+	if err := sub.establish(ctx); err != nil {
+		_ = c.Close()
+		return nil, err
+	}
+	subCtx, cancel := context.WithCancel(context.Background())
+	c.sub = sub
+	c.subCancel = cancel
+	sub.start(subCtx)
+	return c, nil
+}
+
+// openConn 完成一层连接的建链。sessionSuffix 区分主连接与订阅连接：
+// 同一个客户端对同一服务端开两个会话是合法的，但会话名重复会让服务端
+// 日志与诊断包难以对应。
+func (d *Driver) openConn(ctx context.Context, cfg driver.OpenConfig, sessionSuffix string) (*conn, error) {
 	t := cfg.Channel.Transport
 	if t.Kind != "tcp" {
 		return nil, driver.E(driver.ErrUnsupported, "open", cfg.Device.ID,
@@ -128,13 +192,45 @@ func (d *Driver) Open(ctx context.Context, cfg driver.OpenConfig) (driver.Conn, 
 		deviceID: cfg.Device.ID,
 		endpoint: endpoint,
 		timeout:  timeout,
-		session:  "uic-" + cfg.Device.ID,
+		session:  "uic-" + cfg.Device.ID + sessionSuffix,
 	}
+	c.streamBox.Store(&stream)
 	if err := c.handshake(ctx); err != nil {
 		_ = stream.Close()
 		return nil, err
 	}
 	return c, nil
+}
+
+// abort 直接关掉底层 socket，用于打断阻塞中的 Publish。
+// 它不是优雅关闭：不删订阅、不关会话，那些由 closeCurrent 负责。
+func (c *conn) abort() {
+	if p := c.streamBox.Load(); p != nil {
+		_ = (*p).Close()
+	}
+}
+
+// subscriptionPoints 把设备点位翻成监视项。
+//
+// 停用点位不监视：服务端为它推送的每一条通知都是白花的带宽，而 Read
+// 也不会去读它。
+func subscriptionPoints(cfg driver.OpenConfig) ([]subPoint, error) {
+	out := make([]subPoint, 0, len(cfg.Device.Points))
+	for _, p := range cfg.Device.Points {
+		if !p.Enabled {
+			continue
+		}
+		node, err := ua.ParseNodeID(p.Address.Path)
+		if err != nil || node.IsNull() {
+			msg := fmt.Sprintf("point %q: invalid node id %q", p.ID, p.Address.Path)
+			if err != nil {
+				msg = fmt.Sprintf("point %q: %v", p.ID, err)
+			}
+			return nil, errors.New(msg)
+		}
+		out = append(out, subPoint{id: p.ID, node: node, dt: p.DataType})
+	}
+	return out, nil
 }
 
 // conn 是一条 OPC UA 连接。契约规定同一 Conn 不会被并发调用，这里仍然
@@ -148,9 +244,20 @@ type conn struct {
 	session  string
 	timeout  time.Duration
 
-	seq    uint32
-	reqID  uint32
+	seq   uint32
+	reqID uint32
+
+	// hmu 单独保护 handle：订阅连接上 Publish 与 DeleteSubscriptions
+	// 会从两个 goroutine 同时取请求头。用 c.mu 不行——Publish 在等响应
+	// 期间持有 c.mu，而发 Delete 之前就要先构造请求头。
+	hmu    sync.Mutex
 	handle uint32
+
+	// streamBox 让「从另一个 goroutine 打断阻塞读」成为可能：Publish 是
+	// 15 秒起步的长轮询，Close 不能等它自然超时。关闭 net.Conn 是唯一
+	// 能让阻塞中的 Read 立刻返回的手段，而读 stream 字段本身要先拿
+	// c.mu——那个锁正被 Publish 持有。用原子槽绕开这个循环。
+	streamBox atomic.Pointer[transport.Stream]
 
 	channelID uint32
 	tokenID   uint32
@@ -161,6 +268,11 @@ type conn struct {
 
 	tokenIssued   time.Time
 	tokenLifetime time.Duration
+
+	// sub 为 nil 表示走轮询（默认）。它只被 Open 写一次，发布循环自己
+	// 持有内部状态，所以读路径不需要额外加锁。
+	sub       *subState
+	subCancel context.CancelFunc
 
 	closed bool
 }
@@ -488,11 +600,14 @@ func (c *conn) activateSession(ctx context.Context) error {
 }
 
 func (c *conn) newHeader() ua.RequestHeader {
+	c.hmu.Lock()
 	c.handle++
+	handle := c.handle
+	c.hmu.Unlock()
 	return ua.RequestHeader{
 		AuthenticationToken: c.authToken,
 		Timestamp:           time.Now(),
-		RequestHandle:       c.handle,
+		RequestHandle:       handle,
 		TimeoutHint:         uint32(c.timeout / time.Millisecond),
 	}
 }
@@ -505,6 +620,33 @@ func (c *conn) faultErr(op string, body []byte) error {
 	}
 	s := f.Header.ServiceResult
 	return driver.E(statusKind(s), op, c.deviceID, s.Text(), false, s)
+}
+
+// call 发送一次服务请求并把响应体交给 decode。
+//
+// 它存在的意义是把「ServiceFault / 服务号不匹配 / 解码失败」这三件必须
+// 一致处理的事收在一处。三处各写一遍的结果是：某一条路径忘了检查
+// ServiceFault，于是把一条错误响应当成成功数据解析。
+func (c *conn) call(ctx context.Context, op string, serviceID uint32, body []byte, want uint32,
+	decode func(ua.SecureMessage) error) error {
+	m, err := c.exchange(ctx, serviceID, body)
+	if err != nil {
+		return err
+	}
+	if m.ServiceID == ua.SvcServiceFaultResponse {
+		return c.faultErr(op, m.Body)
+	}
+	if m.ServiceID != want {
+		return driver.E(driver.ErrProtocol, op, c.deviceID,
+			fmt.Sprintf("unexpected service response %d (want %d)", m.ServiceID, want), true, nil)
+	}
+	if err := decode(m); err != nil {
+		if s, ok := err.(ua.StatusCode); ok {
+			return s
+		}
+		return driver.E(driver.ErrProtocol, op, c.deviceID, err.Error(), true, err)
+	}
+	return nil
 }
 
 // ---------------------------------------------------------------------------
@@ -569,9 +711,16 @@ func (c *conn) readNodes(ctx context.Context, nodes []NodeID) ([]ua.DataValue, e
 type readItem struct {
 	point driver.PointRef
 	node  ua.NodeID
+	idx   int // 在输出切片里的位置：结果必须与输入点位一一对应
 }
 
-// Read 批量读取。每个点位一个 NodeId，按 maxNodesPerRead 切块。
+// Read 批量读取。订阅开启时，已经被服务端推过值的点位直接从本地表取；
+// 其余点位合并成真实 Read 请求（按 maxNodesPerRead 切块）。
+//
+// 「订阅优先、必要时回退」而不是「二选一」，是因为三条现实约束：
+//  1. 订阅刚建立时还没有任何通知，第一轮必须有真实读兜底；
+//  2. 服务端可能拒掉某个节点（不存在/无权限），这一个点仍要能看到错误；
+//  3. 订阅连接断了以后，设备不该跟着判故障——退回轮询比停摆好。
 func (c *conn) Read(ctx context.Context, spans []driver.ReadSpan) ([]driver.RawSample, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -583,11 +732,23 @@ func (c *conn) Read(ctx context.Context, spans []driver.ReadSpan) ([]driver.RawS
 		return nil, err
 	}
 
+	total := 0
+	for _, span := range spans {
+		total += len(span.Points)
+	}
+	out := make([]driver.RawSample, 0, total)
 	var (
-		items  []readItem
-		out    []driver.RawSample
-		badPre []driver.RawSample
+		items    []readItem
+		firstErr error
+		good     int
 	)
+	fail := func(s driver.RawSample) {
+		if s.Err != nil && firstErr == nil {
+			firstErr = s.Err
+		}
+		out = append(out, s)
+	}
+
 	for _, span := range spans {
 		for _, p := range span.Points {
 			node, err := ua.ParseNodeID(p.Address.Path)
@@ -597,24 +758,28 @@ func (c *conn) Read(ctx context.Context, spans []driver.ReadSpan) ([]driver.RawS
 					msg = err.Error()
 				}
 				e := driver.E(driver.ErrAddress, "encode", c.deviceID, msg, false, err)
-				badPre = append(badPre, driver.RawSample{
-					PointID: p.ID, Quality: model.QualityAddressError, Err: e,
-				})
+				fail(driver.RawSample{PointID: p.ID, Quality: model.QualityAddressError, Err: e})
 				continue
 			}
-			items = append(items, readItem{point: p, node: node})
+			if c.sub != nil {
+				if sv, ok := c.sub.lookup(p.ID, p.DataType); ok {
+					if sv.Err == nil && sv.Quality == model.QualityGood {
+						good++
+					}
+					fail(sv)
+					continue
+				}
+			}
+			out = append(out, driver.RawSample{PointID: p.ID})
+			items = append(items, readItem{point: p, node: node, idx: len(out) - 1})
 		}
 	}
-	out = append(out, badPre...)
-	var firstErr error
-	if len(badPre) > 0 {
-		firstErr = badPre[0].Err
-	}
 	if len(items) == 0 {
-		return out, firstErr
+		if good == 0 && firstErr != nil {
+			return out, firstErr
+		}
+		return out, nil
 	}
-
-	good := 0
 
 	for start := 0; start < len(items); start += maxNodesPerRead {
 		end := start + maxNodesPerRead
@@ -629,13 +794,13 @@ func (c *conn) Read(ctx context.Context, spans []driver.ReadSpan) ([]driver.RawS
 
 		if err := ctx.Err(); err != nil {
 			e := driver.E(driver.ErrTimeout, "read", c.deviceID, "context done", true, err)
+			for _, it := range items[start:] {
+				out[it.idx] = errSample(it.point.ID, e)
+			}
 			if firstErr == nil {
 				firstErr = e
 			}
-			for _, it := range chunk {
-				out = append(out, errSample(it.point.ID, e))
-			}
-			continue
+			return out, firstErr
 		}
 
 		values, err := c.readNodes(ctx, nodes)
@@ -647,49 +812,48 @@ func (c *conn) Read(ctx context.Context, spans []driver.ReadSpan) ([]driver.RawS
 				firstErr = err
 			}
 			for _, rest := range items[start:] {
-				out = append(out, errSample(rest.point.ID, err))
+				out[rest.idx] = errSample(rest.point.ID, err)
 			}
 			return out, firstErr
 		}
 
 		for i, it := range chunk {
 			dv := values[i]
-			if dv.Status.IsBad() {
+			switch {
+			case dv.Status.IsBad():
 				e := driver.E(statusKind(dv.Status), "read", c.deviceID,
 					dv.Status.Text(), false, dv.Status)
-				out = append(out, driver.RawSample{
+				out[it.idx] = driver.RawSample{
 					PointID: it.point.ID, Quality: ua.QualityOf(dv.Status), Err: e,
-				})
+				}
 				if firstErr == nil {
 					firstErr = e
 				}
-				continue
-			}
-			if dv.Value == nil {
+			case dv.Value == nil:
 				e := driver.E(driver.ErrProtocol, "read", c.deviceID,
 					"server returned no value for "+it.point.ID, false, nil)
-				out = append(out, driver.RawSample{PointID: it.point.ID, Quality: model.QualityBad, Err: e})
+				out[it.idx] = driver.RawSample{PointID: it.point.ID, Quality: model.QualityBad, Err: e}
 				if firstErr == nil {
 					firstErr = e
 				}
-				continue
-			}
-			val, derr := ua.DecodeValue(*dv.Value, it.point.DataType)
-			if derr != nil {
-				e := driver.E(driver.ErrProtocol, "decode", c.deviceID,
-					it.point.ID+": "+derr.Error(), false, derr)
-				out = append(out, driver.RawSample{PointID: it.point.ID, Quality: model.QualityBad, Err: e})
-				if firstErr == nil {
-					firstErr = e
+			default:
+				val, derr := ua.DecodeValue(*dv.Value, it.point.DataType)
+				if derr != nil {
+					e := driver.E(driver.ErrProtocol, "decode", c.deviceID,
+						it.point.ID+": "+derr.Error(), false, derr)
+					out[it.idx] = driver.RawSample{PointID: it.point.ID, Quality: model.QualityBad, Err: e}
+					if firstErr == nil {
+						firstErr = e
+					}
+					continue
 				}
-				continue
+				out[it.idx] = driver.RawSample{
+					PointID: it.point.ID,
+					Value:   val,
+					Quality: ua.QualityOf(dv.Status),
+				}
+				good++
 			}
-			out = append(out, driver.RawSample{
-				PointID: it.point.ID,
-				Value:   val,
-				Quality: ua.QualityOf(dv.Status),
-			})
-			good++
 		}
 	}
 	// 与 Modbus / S7 保持同一约定：有任何一个点位成功就向上返回 nil，
@@ -839,6 +1003,24 @@ func (c *conn) Close() error {
 		return nil
 	}
 	c.closed = true
+
+	// 先停发布循环：它持有独立的第二条连接，如果不取消，它会在本连接
+	// 关闭之后继续重连，表现为「网关已停，服务端还能看到一个会话」。
+	if c.subCancel != nil {
+		c.subCancel()
+		c.subCancel = nil
+	}
+	if c.sub != nil {
+		// 先打断阻塞的 Publish，再等循环退出。只取消 context 不够：
+		// 发布循环正卡在读响应上，它要等到保活超时（15 秒起）才会
+		// 发现 context 已取消。
+		c.sub.abortConn()
+		if !c.sub.waitDone(3 * time.Second) {
+			c.sub.closeCurrent()
+		}
+		c.sub = nil
+	}
+
 	if c.stream == nil {
 		return nil
 	}
@@ -859,7 +1041,10 @@ func (c *conn) Close() error {
 			ua.SvcCloseSecureChannelRequest, req.Encode())
 		_ = c.write(ctx, frame)
 	}
-	err := c.stream.Close()
+	var err error
+	if p := c.streamBox.Swap(nil); p != nil {
+		err = (*p).Close()
+	}
 	c.stream = nil
 	return err
 }

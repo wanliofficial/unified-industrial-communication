@@ -110,6 +110,15 @@ curl -s -X POST -H 'Authorization: Bearer dev-token' -H 'Content-Type: applicati
 示例配置覆盖 6 个点位：`ns=2;s=Plant.Temperature`（double）、`Counter`（int32）、
 `Running`（bool）、`Label`（string）、`Setpoint`（double，可写）、
 以及标准节点 `ns=0;i=2258`（ServerStatus.CurrentTime）。
+
+OPC UA 订阅（服务端推送；`Read` 不再逐点轮询）：
+
+```bash
+./uic sim -protocol opcua -listen 127.0.0.1:14840 &
+./uic -config examples/opcua-subscribe.json
+curl -s -H 'Authorization: Bearer dev-token' localhost:8093/api/v1/points/ua1/counter
+# channels[].subscribe / publishingInterval / samplingInterval
+```
 服务端每秒改 Counter 与 CurrentTime，可用来观察 SSE。
 
 从站（把采集到的点位反向暴露给 SCADA / 第三方主站）：
@@ -499,22 +508,22 @@ obs  ← 所有包（不依赖任何内部包）
 
 | 包 | 职责 | 关键不变量 | 覆盖率 |
 |---|---|---|---|
-| `internal/model` | 通道/设备/点位/地址/采样/质量码 | 不依赖任何内部包；不变量集中在 `Validate`；DB 号与 area 联动校验；计算点强制只读、4 类地址各有规范形式 | 84.7% |
+| `internal/model` | 通道/设备/点位/地址/采样/质量码 | 不依赖任何内部包；不变量集中在 `Validate`；DB 号与 area 联动校验；计算点强制只读、4 类地址各有规范形式；订阅周期只在 `subscribe=true` 时允许出现 | 85.0% |
 | `internal/driver` | 驱动契约（Codec/Transport/Driver）、错误分类、注册表、只读 `Lookup` 注入 | 能力四态；`Conn` 不保证并发安全，由调用方串行；协议错误可用 `Kinded` 自带分类 | 87.0% |
 | `internal/codec/modbus` | Modbus 纯函数编解码（TCP/RTU/ASCII，主站与从站共用） | 无 I/O、无时钟、无可变状态 | 88.1% |
 | `internal/codec/value` | 协议无关值编解码（重排、数值/字符串/BCD） | 与协议无关；`Encode` 对 string/bytes 不猜宽度 | 95.0% |
 | `internal/codec/s7` | S7 纯函数编解码（TPKT/COTP/S7 PDU、长度单位换算） | 请求按字节、响应按位/字节的差异收敛在一处 | 80.3% |
-| `internal/codec/opcua` | OPC UA 纯函数编解码（UACP HEL/ACK、安全报文、NodeId、Variant、九类服务） | 分块响应显式报错；数组长度上界必查；BCD 等无对应类型显式报错 | 83.6%（含 driver/sim 交叉覆盖） |
+| `internal/codec/opcua` | OPC UA 纯函数编解码（UACP HEL/ACK、安全报文、NodeId、Variant、读/写/浏览 + 订阅/发布/确认） | 分块响应显式报错；数组长度上界必查；BCD 等无对应类型显式报错；未知通知类型跳过而不是判故障 | 86.1%（含 driver/sim 交叉覆盖） |
 | `internal/transport` | 字节流抽象 + TCP + 串口（termios） | 写满、读满或超时、关闭幂等；协议层 deadline 不得被兜底值覆盖 | 80.2% |
 | `internal/driver/modbus` | Modbus TCP + RTU + ASCII 主站 | 事务号递增；异常码分类；部分失败不吞好样本；同串口事务串行；分帧类型参与端口冲突判定 | 83.9% |
 | `internal/driver/s7` | S7（S7comm）主站 | COTP/Setup 握手不可省；按协商 PDU 与 20 项上限切块；逐项返回码映射质量码 | 79.9% |
-| `internal/driver/opcua` | OPC UA 二进制主站（None/None + 匿名） | 三层状态（TCP/通道/会话）分开判断；按 RequestId 过滤迟到响应；节点越界判坏不截断 | 72.3% |
+| `internal/driver/opcua` | OPC UA 二进制主站（None/None + 匿名）；可选订阅推送 | 三层状态（TCP/通道/会话）分开判断；按 RequestId 过滤迟到响应；节点越界判坏不截断；订阅走独立第二条连接，Read 优先本地表、失效即回退真读 | 76.2% |
 | `internal/driver/mqtt` | MQTT 南向（订阅取数）：把推送型协议适配成拉取契约 | `Read` 无网络交互，只读本地最新值表；质量码只反映新鲜度（good/stale/bad 三档）；一条消息都没有不算断链，安静到一个窗口且 PING 失败才判链 | 77.4% |
 | `internal/driver/computed` | 计算点：表达式驱动，无物理链路 | 同设备依赖在一次 `Read` 内按拓扑序闭合；输入不可用则不计算、质量取最差并指名输入；整数越界判坏不截断 | 92.4% |
 | `internal/driver/virtual` | 虚拟设备（波形 + 故障注入） | 故障按「第 n 次请求」精确注入一次 | 98.6% |
 | `internal/sim/modbus` | 内置 Modbus TCP 从站 | 复用同一份 codec，避免主从语义漂移 | 87.2% |
 | `internal/sim/s7` | 内置 S7 从站（内存 DB/M/I/Q 区） | 与主站共用 codec/s7；输入区只读；位写保邻位 | 71.9% |
-| `internal/sim/opcua` | 内置 OPC UA 服务端（内存地址空间） | 与主站共用 codec/opcua；未激活会话拒绝读写；Variant 类型必须与节点 DataType 一致 | 80.9% |
+| `internal/sim/opcua` | 内置 OPC UA 服务端（内存地址空间 + 订阅/发布） | 与主站共用 codec/opcua；未激活会话拒绝读写；Variant 类型必须与节点 DataType 一致；Publish 在独立 goroutine，响应按 RequestId 乱序返回 | 83.8% |
 | `internal/sim/mqtt` | 内置 MQTT 3.1.1 Broker，兼 `uic sim -protocol mqtt` 运行时 | 全项目唯一一份 Broker 实现；不做 QoS2/持久会话/TLS；QoS2 授予时降级为 1 | 79.3% |
 | `internal/slave/modbus` | Modbus TCP 从站（把点位暴露给外部主站） | 读走 cache、写走 Runtime.Write；未映射地址报错不补零；坏质量保留最后值并计数 | 73.8% |
 | `internal/alarm` | 报警引擎：五态机、阈值/滞回/延时、表达式规则、确认、订阅 | 输入不可信时绝不改状态机；延时是「连续满足」；`cleared` 与 `active` 都要确认；状态只在内存 | 94.4% |
@@ -629,8 +638,10 @@ go test -coverprofile=c.out ./... && go tool cover -func=c.out | tail -1
 | MQTT 南向不支持项 | ❌ | 点位的 `path` 只能是具体主题（禁止 `+` / `#` 通配符，否则一个点位对应 N 个主题、值无法归属）；不做持久会话 / ACL / TLS / WebSocket / QoS2；不做二进制载荷解码 |
 | MQTT 内置 Broker | ✅ | `uic sim -protocol mqtt`：CONNECT/SUBSCRIBE/PUBLISH/PING 全套、retained 内存表、每秒发布演示点位并回显 setpoint 写入；同时是集成测试的对端（全项目唯一一份 Broker 实现） |
 | OPC UA 主站 | ✅ | UACP HEL/ACK + OPN 安全通道 + CreateSession/ActivateSession 会话三层；批量读（≤100 节点/请求）、写、Browse、GetEndpoints；SecurityPolicy=None / SecurityMode=None / 匿名；NodeId 支持 `ns=2;s=` / `ns=2;i=` / `i=` / 裸字符串；TokenId 寿命 3/4 时自动 OPN 续订；数值越界判坏不截断 |
-| OPC UA 订阅 / 历史 / 方法 / 事件 / 证书 | ❌ | 订阅需 CreateSubscription + MonitoredItems + Publish 三条状态机与存活的发布队列；证书体系是另一套运维域。`Capabilities.Subscribe` 显式声明 `unsupported`，避免上层配出永远收不到数据的点位 |
-| OPC UA 服务端（内置演示） | ✅ | `uic sim -protocol opcua`：Root/Objects/Server/ServerStatus/CurrentTime + ns=2 Plant.{Counter,Temperature,Running,Label,Setpoint}；只读节点写入回 `BadNotWritable`；未知节点回 `BadNodeIdUnknown`；不支持的订阅类服务回 `BadServiceUnsupported` |
+| OPC UA 订阅 | ✅ | 通道级 `subscribe` 开关（默认关闭 = 每轮 Read 轮询）；CreateSubscription + CreateMonitoredItems + Publish 长轮询 + 逐条确认；走**独立第二条连接**（Publish 不阻塞读写）；`QueueSize=1` + `DiscardOldest` 只保留最新值；监视项建立后立刻收到一次初始样本；建订阅失败让 `Open` 失败（不静默退化成轮询）；运行期断开自动重建并暂时回退真读 |
+| OPC UA 订阅的边界 | ⚠️ | 不做同一连接上的多请求复用（那需要一套完整的多路复用器）；不实现 Republish 补取（跳号时靠下一条通知）；采样周期只发配置值，不做服务端采样率协商；`publishingInterval` / `samplingInterval` 必须配合 `subscribe=true` |
+| OPC UA 历史 / 方法 / 事件 / 证书 | ❌ | 证书体系是另一套运维域；方法与事件需要完整地址空间与权限模型；历史由自建有界采样日志承担（ADR-0002） |
+| OPC UA 服务端（内置演示） | ✅ | `uic sim -protocol opcua`：Root/Objects/Server/ServerStatus/CurrentTime + ns=2 Plant.{Counter,Temperature,Running,Label,Setpoint}；只读节点写入回 `BadNotWritable`；未知节点回 `BadNodeIdUnknown`；未实现的服务（方法调用/历史读取）回 `BadServiceUnsupported`；订阅按值变化推送，空闲按 KeepAlive 周期发空通知 |
 | OPC UA 北向（对外暴露为服务端） | ⏳ | 只完成南向主站与演示服务端；把 cache 映射成对外的地址空间属于 Wave 2 |
 | 计算点（纯表达式） | ✅ | `protocol: "computed"` + `address.kind: "computed"` + `address.expr`；零依赖表达式引擎（编译期类型检查、短路求值、除零/NaN/Inf 报错）；同设备依赖在一次 `Read` 内按拓扑序闭合，跨设备最终一致；质量取最差且指名坏输入；整数四舍五入 + 越界判坏 |
 | 计算点的边界 | ⚠️ | 只读（写入返回 `point.not_writable`）；只支持数值与布尔（字符串/Bytes/BCD 拒绝）；引用写作 `device:point`，因 ID 允许 `-`，**减号两边要留空格**（`line-a:power-1` 是引用）；跨设备引用慢一拍 |

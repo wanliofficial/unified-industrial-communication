@@ -56,6 +56,7 @@ Wave 3（6 个月） 规模化：集中管理 + 进程外驱动 + 多站点 + �
 | 21 | 计算点（零依赖表达式引擎 + `computed` 驱动） | 无物理链路、复用驱动契约：`address.kind: computed` + `expr`；同设备依赖在一次 `Read` 内按拓扑序闭合（`cost_with_tax / cost` 恒为税率），跨设备最终一致；环（含跨设备）配置期拒绝；输入不可用则不计算、质量取最差并指名输入；整数四舍五入 + 越界判坏不截断；计算点强制只读；`planner` 把计算点合成单个 `expr` span（漏组会表现为全坏且无日志） |
 | 22 | 报警引擎（五态机 + 确认 + 多出口） | 有生命周期的对象而不是派生布尔：`normal/pending/active/acked/cleared` 五态；阈值（单侧/双侧 + 滞回）或布尔表达式（复用 `calc`）；`onDelay`/`offDelay` 是**连续**满足；输入质量不可信时**只更新可观测字段、不动状态机**（`pending` 取消，`active`/`acked` 保持）；`active` 与 `cleared` 都要人确认，`acked` 幂等，批量确认先整体校验再应用（混入不可确认项整体失败，`all:true` 静默跳过）；规则热更新按判定条件哈希决定保留或重置，改名字不重置，删除规则发 `removed` 清理 retained 幽灵；出口为 REST + SSE `/alarms/stream` + MQTT retained `uic/{site}/$alarm/{id}`（重连整体补发）+ `health.alarms` + 5 个指标 |
 | 23 | 历史采样日志（有界分段 + 查询/聚合 API） | 不引入数据库与第三方依赖：事件驱动 + 心跳补点的采样策略（死区、最小间隔、质量变化、`disabled` 不记）；被 `minInterval` 挡下的变化进 pending，到期补写成最终值；按字节上限与保留期**整段**淘汰且永远保留一段；掉电留下的半行触发新段而不是把新记录拼进坏行；查询左闭右闭、结果按时间升序、桶起点对齐 `from + k*step`、桶质量取最差、非数值点位的 `min/max/avg` 为 `null`、桶数上限 5000；`health.history` + 6 个指标 + 诊断包 `history.json`；关掉时返回 `409 history.disabled` 而不是空结果 |
+| 24 | OPC UA 订阅（服务端推送） | 通道级 `subscribe` 开关（默认关闭 = 轮询）；CreateSubscription + CreateMonitoredItems + Publish 长轮询跑通；走**独立第二条连接**，Publish 不阻塞读写；每个带序列号的通知都在下一次 Publish 中确认（不确认会让服务端重传队列填满，表现为「跑一阵就不动了」）；`QueueSize=1 + DiscardOldest` 只保留最新值；监视项建立后立刻收到一次初始样本；建订阅失败让 `Open` 失败（不静默退化成轮询）；运行期断开自动重建，期间 `Read` 回退真读；`Close` 靠关闭 socket 打断阻塞中的 Publish，不等 15 秒保活超时；内置服务端同步支持订阅/发布，`Set` 与写穿透都触发通知 |
 
 ### 2.3 出口标准
 

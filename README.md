@@ -54,6 +54,15 @@ curl -s localhost:8086/api/v1/points
 #   写穿透：curl -X POST .../points/ua1/setpoint/write
 ```
 
+OPC UA 订阅（服务端推送，而不是每轮 Read 轮询）：
+
+```bash
+./uic sim -protocol opcua -listen 127.0.0.1:14840 &
+./uic -config examples/opcua-subscribe.json
+curl -s localhost:8093/api/v1/points/ua1/counter   # 每秒自增，由服务端推送
+#   channels[].subscribe=true；publishingInterval / samplingInterval 可调
+```
+
 从站（把网关采集到的点位反向暴露给 SCADA / 第三方主站）：
 
 ```bash
@@ -177,13 +186,13 @@ go test -race -count=1 ./...
 | `internal/codec/opcua` | OPC UA 纯函数编解码（UACP、安全报文、NodeId、Variant、九类服务） |
 | `internal/driver/modbus` | Modbus TCP + RTU + ASCII 主站 |
 | `internal/driver/s7` | S7（S7comm）主站 |
-| `internal/driver/opcua` | OPC UA 主站（None/None + 匿名，三层状态机） |
+| `internal/driver/opcua` | OPC UA 主站（None/None + 匿名，三层状态机）；可选订阅推送（独立第二条连接） |
 | `internal/driver/mqtt` | MQTT 南向（订阅取数）：推送适配成拉取，三档新鲜度质量码 |
 | `internal/driver/computed` | 计算点：表达式驱动，同设备依赖在一次 Read 内按拓扑序闭合 |
 | `internal/driver/virtual` | 虚拟设备（波形 + 故障注入） |
 | `internal/sim/modbus` | 内置 Modbus TCP 从站 |
 | `internal/sim/s7` | 内置 S7 从站（内存 DB/M/I/Q 区） |
-| `internal/sim/opcua` | 内置 OPC UA 服务端（内存地址空间） |
+| `internal/sim/opcua` | 内置 OPC UA 服务端（内存地址空间 + 订阅/发布） |
 | `internal/sim/mqtt` | 内置 MQTT 3.1.1 Broker（兼 `uic sim -protocol mqtt` 运行时） |
 | `internal/slave/modbus` | Modbus TCP 从站（把点位映射给外部主站，写穿透到南向） |
 | `internal/planner` | 点位 → 批量读请求 |

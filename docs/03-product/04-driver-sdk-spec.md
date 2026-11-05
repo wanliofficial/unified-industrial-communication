@@ -691,15 +691,20 @@ OPC UA 的 `Read` 是**逐项**返回 `DataValue.Status` 的：一个节点不�
 | 批量读（≤100 节点/请求） | ✅ | 按服务端的 OperationLimits 保守取值 |
 | 写（单点/批量） | ✅ | 逐项状态码回传 |
 | Browse / GetEndpoints | ✅ | 驱动层提供，供后续「点位浏览」界面用 |
-| 订阅（CreateSubscription / MonitoredItems / Publish） | ❌ | 需要三条额外状态机 + 一个常驻发布队列；`Capabilities.Subscribe` 声明 `unsupported` |
+| 订阅（CreateSubscription / MonitoredItems / Publish） | ✅ | 通道级 `subscribe` 开关（默认 false = 轮询）；订阅走独立第二条连接，Publish 长轮询不阻塞 Read/Write；每个带序列号的通知都在下一次 Publish 中确认；`QueueSize=1 + DiscardOldest` 只保留最新值；断开自动重建，期间 Read 回退真读 |
 | 历史读取（HistoryRead） | ❌ | 属 Wave 2 历史库范畴 |
 | 方法调用 / 事件 / 别名 | ❌ | — |
 | 证书 / 信任列表 / 签名校验 | ❌ | 属于另一套运维体系，混进来会让「连不上」的原因不可判定 |
 | 分块响应（Chunked） | ❌ | 见到分块直接报错，比拼错更强 |
 
-> 声明 `unsupported` 而不是「静默降级」：如果驱动说支持订阅而实际收不到数据，
-> 上层会配出永远不更新的点位，而现场只会看到「数据不动了」。显式失败至少
-> 在配置期就能拦住。
+> 订阅的两条硬规则：
+>
+> 1. **建订阅失败就让 `Open` 失败**，绝不静默退化成轮询。配置里写了
+>    `subscribe=true`、实际却在轮询，是那种「跑起来一切正常、三个月后有人
+>    问为什么数据延迟变了」的问题。要轮询就显式关掉开关。
+> 2. **推送值只在「订阅健康 + 未超保鲜期 + 类型一致」时才替代真实读**。
+>    其余情况一律回退 `Read`——拿最后一次成功的读数冒充当前值，是这类
+>    实现最危险的失效模式。
 
 #### 3.9.8 内置服务端（`internal/sim/opcua`）
 
@@ -707,11 +712,12 @@ OPC UA 的 `Read` 是**逐项**返回 `DataValue.Status` 的：一个节点不�
 
 | 项 | 实现 |
 |---|---|
-| 服务 | HEL/ACK、OPN、CreateSession、ActivateSession、CloseSession、Read、Write、Browse、GetEndpoints、CloseSecureChannel |
+| 服务 | HEL/ACK、OPN、CreateSession、ActivateSession、CloseSession、Read、Write、Browse、GetEndpoints、CloseSecureChannel；订阅：CreateSubscription、CreateMonitoredItems、DeleteMonitoredItems、DeleteSubscriptions、SetPublishingMode、Publish |
 | 地址空间 | `Root/Objects/{Server/ServerStatus/CurrentTime, Plant/{Counter,Temperature,Running,Label,Setpoint}}` |
 | 安全 | 仅 Policy=None + 匿名；非匿名令牌回 `BadUserAccessDenied` |
 | 会话 | 未激活会话的读写回 `BadSessionIdInvalid`（不是断链） |
 | 写校验 | Variant 类型必须与节点 DataType 一致，否则 `BadTypeMismatch` |
+| 订阅 | 监视项建立后立刻回一次当前值；`Set` 与写穿透都触发通知；队列语义 `QueueSize=1 + DiscardOldest`；空闲按 `MaxKeepAliveCount` 个发布周期发空通知；Publish 在独立 goroutine 中等待，响应按 RequestId 乱序返回（规范允许） |
 | 不支持的服务 | 回 `ServiceFault` + `BadServiceUnsupported`，不断链 |
 
 它**与主站共用同一份 `codec/opcua`**：主从分开实现编解码，会让「编码错」与
@@ -1075,7 +1081,7 @@ type OpError struct {
 | `modbus-rtu` | supported | supported | unsupported | unsupported | unsupported | supported | supported |
 | `modbus-ascii` | supported | supported | unsupported | unsupported | unsupported | supported | supported |
 | `s7` | supported | supported | unsupported | unsupported | unsupported | supported | supported |
-| `opcua` | supported | supported | unsupported | unsupported | experimental | supported | unsupported |
+| `opcua` | supported | supported | supported ⁴ | unsupported | experimental | supported | unsupported |
 | `mqtt`（南向订阅） | supported | supported | supported ¹ | unsupported | unsupported | supported ² | unsupported |
 | `computed`（计算点） | supported | unsupported ³ | unsupported | unsupported | unsupported | supported | unsupported |
 | `virtual` | supported | supported | supported | supported | unsupported | supported | supported |
@@ -1090,6 +1096,11 @@ type OpError struct {
 >
 > ³ 计算点的 `Write` 声明 `unsupported` 而不是 `runtime_dependent`：这不是
 > 「取决于型号」，而是**语义上不存在**——没有可写回的地址（见 §3.11.9）。
+>
+> ⁴ OPC UA 的 `Subscribe` 同样是指「服务端推送、驱动内部消化、上层仍是
+> `Read` 拉取契约」，并且需要通道上显式打开 `subscribe`。之所以不做成
+> 自动切换：轮询与订阅的失败模式、带宽特征、服务端负载完全不同，自动切换
+> 会让同一份配置在两种行为之间漂移，现场无法判断「数据变慢了」的原因。
 
 ---
 

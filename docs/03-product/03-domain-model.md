@@ -261,6 +261,23 @@ type Channel struct {
     // 共用一份。配置文件权限要求 0600，REST 回显时只回答「是否配置」。
     Username    string    `json:"username,omitempty"`
     Password    string    `json:"password,omitempty"`
+
+    // Rack/Slot 是 S7 的 CPU 寻址参数；Slot=0 表示未配置（按 2 处理）。
+    Rack int `json:"rack,omitempty"`
+    Slot int `json:"slot,omitempty"`
+
+    // Subscribe 是 OPC UA 的取数方式开关（其他协议忽略）。
+    // true = 服务端推送变化；false（默认）= 每轮 Read 轮询。
+    //
+    // 为什么是显式开关而不是「自动挑最好的」：两者的失败模式、带宽特征与
+    // 服务端负载完全不同。自动切换会让同一份配置在两种行为之间漂移，
+    // 现场无法判断「数据变慢了」是网络问题还是驱动悄悄换成了轮询。
+    Subscribe bool `json:"subscribe,omitempty"`
+    // PublishingInterval 是订阅发布周期；0 表示跟随设备采集周期。
+    PublishingInterval Duration `json:"publishingInterval,omitempty"`
+    // SamplingInterval 是服务端采样周期；0 表示等于发布周期。
+    // 通常应 ≤ PublishingInterval：采样比发布慢等于主动丢变化。
+    SamplingInterval Duration `json:"samplingInterval,omitempty"`
 }
 
 type Transport struct {
@@ -596,6 +613,16 @@ type Record struct {
       "transport": { "kind": "tcp", "address": "192.168.1.10:502" },
       "concurrency": 4,
       "timeout": "3s"
+    },
+    {
+      "id": "ch-opcua",
+      "protocol": "opcua",
+      "transport": { "kind": "tcp", "address": "opc.tcp://192.168.1.20:4840" },
+      "concurrency": 1,
+      "timeout": "3s",
+      "subscribe": true,
+      "publishingInterval": "200ms",
+      "samplingInterval": "200ms"
     }
   ],
   "devices": [
@@ -739,6 +766,8 @@ type Record struct {
 | 20 | 每段不超过 `segmentBytes`（单条超长除外） | 运行期 | 写前判定后换段 |
 | 21 | 历史查询区间左闭右闭、返回升序 | API 层 | `history.invalid_range` |
 | 22 | 聚合桶数 ≤ 5000 | API 层 | `history.invalid_query` |
+| 23 | `publishingInterval`/`samplingInterval` 只允许出现在 `subscribe=true` 的通道上 | 配置加载 | `config.invalid_channel` |
+| 24 | 订阅推送值只在「健康 + 未超保鲜期 + 类型一致」时可替代真实读 | 运行期 | 命中失败即回退 `Read` |
 
 ---
 

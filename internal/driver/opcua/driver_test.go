@@ -76,9 +76,10 @@ func TestMetaDeclaresSymbolAddressOnly(t *testing.T) {
 	if m.Capabilities.Read != driver.CapSupported || m.Capabilities.Write != driver.CapSupported {
 		t.Fatalf("caps %+v", m.Capabilities)
 	}
-	// 订阅尚未实现；声明 supported 会让上层配出永远收不到数据的点位。
-	if m.Capabilities.Subscribe != driver.CapUnsupported {
-		t.Fatalf("subscribe must be unsupported, got %s", m.Capabilities.Subscribe)
+	// 订阅已实现（通道级 subscribe 开关）。声明 supported 意味着上层
+	// 可以为这台设备打开推送；关掉开关仍然走轮询。
+	if m.Capabilities.Subscribe != driver.CapSupported {
+		t.Fatalf("subscribe must be supported, got %s", m.Capabilities.Subscribe)
 	}
 	if len(m.Transports) != 1 || m.Transports[0] != "tcp" {
 		t.Fatalf("transports %v", m.Transports)
