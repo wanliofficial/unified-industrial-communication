@@ -112,6 +112,9 @@ func (c *collector) ensure(ctx context.Context, gen uint64) error {
 		Device:  c.dev,
 		Log:     c.rt.log.With("device", c.dev.ID, "channel", c.ch.ID, "protocol", c.ch.Protocol),
 		Metrics: obs.DriverAdapter{M: c.rt.metrics},
+		// 只注入只读的 Get：计算点驱动能读到别的点位，但拿不到写入与订阅
+		// 能力，因此不可能绕过采集层的治理。
+		Lookup: c.rt.cache.Get,
 	})
 	if err != nil {
 		return err

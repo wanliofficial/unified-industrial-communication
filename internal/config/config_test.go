@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"uic/internal/driver"
+	"uic/internal/driver/computed"
 	"uic/internal/driver/modbus"
 	"uic/internal/driver/virtual"
 	"uic/internal/model"
@@ -19,7 +20,7 @@ func registerDrivers(t *testing.T) {
 	if _, ok := driver.Get("virtual"); ok {
 		return
 	}
-	for _, d := range []driver.Driver{virtual.New(), modbus.New()} {
+	for _, d := range []driver.Driver{virtual.New(), modbus.New(), computed.New()} {
 		if err := driver.Register(d); err != nil {
 			t.Fatalf("register: %v", err)
 		}
@@ -637,5 +638,136 @@ func TestListenConflicts(t *testing.T) {
 		if got := listenConflicts(c.a, c.b); got != c.want {
 			t.Fatalf("listenConflicts(%q, %q) = %v, want %v", c.a, c.b, got, c.want)
 		}
+	}
+}
+
+// 计算点的配置校验：能编译、引用存在、类型自洽、没有环。
+// 这四条都是静态错误，必须在配置期拒绝。
+func TestValidateComputed(t *testing.T) {
+	registerDrivers(t)
+
+	// baseComputed 构造「一台虚拟源设备 + 一台计算设备」的最小配置。
+	baseComputed := func() *File {
+		f := baseFile()
+		f.Channels = []model.Channel{
+			{ID: "ch-src", Protocol: "virtual", Transport: model.Transport{Kind: "memory"}},
+			{ID: "ch-calc", Protocol: "computed", Transport: model.Transport{Kind: "memory"}},
+		}
+		f.Devices = []model.Device{
+			{
+				ID: "src", ChannelID: "ch-src", Interval: model.Duration(1e9), Enabled: true,
+				Points: []model.Point{
+					{ID: "a", DataType: model.TypeFloat64, Enabled: true,
+						Address: model.Address{Kind: model.AddressRegister, Area: "holding", Offset: 0, Length: 2, Bit: -1}},
+					{ID: "flag", DataType: model.TypeBool, Enabled: true,
+						Address: model.Address{Kind: model.AddressRegister, Area: "coil", Offset: 0, Length: 1, Bit: -1}},
+				},
+			},
+			{
+				ID: "kpi", ChannelID: "ch-calc", Interval: model.Duration(1e9), Enabled: true,
+				Points: []model.Point{
+					{ID: "sum", DataType: model.TypeFloat64, Enabled: true,
+						Address: model.Address{Kind: model.AddressComputed, Expr: "src:a + src:a"}},
+					{ID: "chained", DataType: model.TypeFloat64, Enabled: true,
+						Address: model.Address{Kind: model.AddressComputed, Expr: "kpi:sum * 2"}},
+					{ID: "high", DataType: model.TypeBool, Enabled: true,
+						Address: model.Address{Kind: model.AddressComputed, Expr: "src:a > 100"}},
+				},
+			},
+		}
+		return f
+	}
+
+	t.Run("accepts valid", func(t *testing.T) {
+		if err := baseComputed().Validate(); err != nil {
+			t.Fatalf("validate: %v", err)
+		}
+	})
+
+	// 引用可以指向停用点位：那是运行态问题，不是配置错误。
+	t.Run("reference to disabled point is allowed", func(t *testing.T) {
+		f := baseComputed()
+		f.Devices[0].Points[0].Enabled = false
+		if err := f.Validate(); err != nil {
+			t.Fatalf("validate: %v", err)
+		}
+	})
+
+	cases := []struct {
+		name string
+		mod  func(*File)
+		want string
+	}{
+		{"missing reference", func(f *File) {
+			f.Devices[1].Points[0].Address.Expr = "nobody:x + 1"
+		}, "does not exist"},
+		{"self cycle", func(f *File) {
+			f.Devices[1].Points[0].Address.Expr = "kpi:sum + 1"
+		}, "cycle"},
+		{"two point cycle", func(f *File) {
+			f.Devices[1].Points[0].Address.Expr = "kpi:chained + 1"
+		}, "cycle"},
+		{"bool point with number expression", func(f *File) {
+			f.Devices[1].Points[2].Address.Expr = "src:a + 1"
+		}, "expression is number"},
+		{"number point with bool expression", func(f *File) {
+			f.Devices[1].Points[0].Address.Expr = "src:a > 1"
+		}, "expression is bool"},
+		{"writable computed", func(f *File) {
+			f.Devices[1].Points[0].Writable = true
+		}, "read-only"},
+		{"physical field on computed", func(f *File) {
+			f.Devices[1].Points[0].Address.Offset = 4
+		}, "mixed fields"},
+		{"missing expr", func(f *File) {
+			f.Devices[1].Points[0].Address.Expr = ""
+		}, "required for computed"},
+		{"syntax error", func(f *File) {
+			f.Devices[1].Points[0].Address.Expr = "src:a +"
+		}, "unexpected"},
+		{"dot instead of colon", func(f *File) {
+			f.Devices[1].Points[0].Address.Expr = "src.a + 1"
+		}, "冒号"},
+		{"string data type", func(f *File) {
+			f.Devices[1].Points[0].DataType = model.TypeString
+		}, "numeric or bool"},
+		{"too long expression", func(f *File) {
+			f.Devices[1].Points[0].Address.Expr = strings.Repeat("1", 1025)
+		}, "1024"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			f := baseComputed()
+			c.mod(f)
+			err := f.Validate()
+			if err == nil {
+				t.Fatalf("expected error containing %q", c.want)
+			}
+			if !strings.Contains(err.Error(), c.want) {
+				t.Fatalf("err = %v, want mention of %q", err, c.want)
+			}
+		})
+	}
+}
+
+// 跨设备的环同样要拒绝：两边各拿对方上一轮的值，表现为「值永远慢一拍」，
+// 而每台设备看起来都完全正常——最不该留给现场去发现的一类配置。
+func TestValidateComputedCrossDeviceCycle(t *testing.T) {
+	registerDrivers(t)
+	f := baseFile()
+	f.Channels = []model.Channel{
+		{ID: "ch-calc", Protocol: "computed", Transport: model.Transport{Kind: "memory"}},
+	}
+	f.Devices = []model.Device{
+		{ID: "d1", ChannelID: "ch-calc", Interval: model.Duration(1e9), Enabled: true,
+			Points: []model.Point{{ID: "p", DataType: model.TypeFloat64, Enabled: true,
+				Address: model.Address{Kind: model.AddressComputed, Expr: "d2:p + 1"}}}},
+		{ID: "d2", ChannelID: "ch-calc", Interval: model.Duration(1e9), Enabled: true,
+			Points: []model.Point{{ID: "p", DataType: model.TypeFloat64, Enabled: true,
+				Address: model.Address{Kind: model.AddressComputed, Expr: "d1:p + 1"}}}},
+	}
+	err := f.Validate()
+	if err == nil || !strings.Contains(err.Error(), "cycle") {
+		t.Fatalf("cross-device cycle must be rejected, got %v", err)
 	}
 }

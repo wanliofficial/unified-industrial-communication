@@ -31,7 +31,7 @@ Template（设备模板）──实例化──→ Device
 
 ---
 
-## 2. 地址模型（四类寻址）
+## 2. 地址模型（五类寻址）
 
 ### 2.1 类型定义
 
@@ -43,6 +43,12 @@ const (
     AddressSymbol   AddressKind = "symbol"   // 路径 + 下标
     AddressObject   AddressKind = "object"   // 对象类型 + 实例 + 属性 + 索引
     AddressFile     AddressKind = "file"     // 文件 + 记录 + 偏移
+    // AddressComputed 没有物理地址：值由表达式算出（计算点）。
+    // 表达式放在 Address 而不是 Point 上，是因为 driver.Read 只拿到
+    // PointRef（ID + Address + DataType + Length）；放 Point 会迫使所有
+    // 驱动都接收一个带表达式的结构，或给 PointRef 加一个只有一种驱动
+    // 使用的字段。
+    AddressComputed AddressKind = "computed"
 )
 
 type Address struct {
@@ -74,6 +80,13 @@ type Address struct {
     // file
     FileID   int `json:"fileId,omitempty"`
     RecordID int `json:"recordId,omitempty"`
+
+    // computed
+    // Expr 是计算点表达式，引用写作 `device:point`。用冒号而不是点号：
+    // 设备 ID 与点位 ID 都允许包含点号（`line.a` 合法），用点号分隔会
+    // 产生「a.b.c 指谁」的歧义。ID 也允许 `-`，因此**减号两边要留空格**
+    // （`line-a:power-1` 是引用，`line-a:power - 1` 才是减法）。
+    Expr string `json:"expr,omitempty"`
 }
 ```
 
@@ -87,6 +100,7 @@ type Address struct {
 | symbol | `{path}[{index}]`（带二级选择器时追加 `#{selector}`） | `DB1.DBW0`、`Program:Main.Tags[3]`、`plant/line1/state#running` |
 | object | `{type}:{instance}.{property}[{index}]` | `analogInput:1.presentValue` |
 | file | `file:{fileId}/{recordId}:{offset}` | `file:1/2:0` |
+| computed | `expr:{表达式原文}` | `expr:line-a:power * line-a:rate` |
 
 **不变量**：
 
@@ -94,7 +108,10 @@ type Address struct {
 2. `register.Bit` 取 `-1`（整字）或 `0..15`；
 3. `symbol.Path` 非空，不含控制字符与空格；`symbol.Selector`（可空）同样不含控制字符与空格；
 4. `object.Instance >= 0`，`ObjectType` 与 `Property` 非空；
-5. 四类字段不得混填（校验时按 `Kind` 只检查对应字段，其余必须为零值）。
+5. 各类字段不得混填（校验时按 `Kind` 只检查对应字段，其余必须为零值）；
+6. `computed.Expr` 非空、≤1024 字节、不含控制字符；对应点位必须**只读**且
+   类型为数值或布尔——允许可写会产生一条永远失败的写入路径，允许字符串
+   则得到一个没有任何运算符可消费的值。
 
 ### 2.3 为什么不用 `string` 地址
 

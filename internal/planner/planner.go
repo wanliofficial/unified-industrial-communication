@@ -65,6 +65,7 @@ func Build(dev model.Device, opt Options) ([]driver.ReadSpan, Stats) {
 		spans = append(spans, planRegisters(area, regs[area], opt)...)
 	}
 	spans = append(spans, planSymbols(refs)...)
+	spans = append(spans, planComputed(refs)...)
 
 	useful, covered := 0, 0
 	for _, s := range spans {
@@ -151,6 +152,29 @@ func planRegisters(area string, refs []driver.PointRef, opt Options) []driver.Re
 	}
 	flush()
 	return out
+}
+
+// planComputed 把所有计算点放进同一个 span。
+//
+// 为什么不是「一个计算点一个 span」：计算点之间有依赖（A 引用 B），
+// 驱动必须按拓扑序在同一次 Read 内先算 B 再算 A。拆成多个 span 后，
+// 驱动仍然能靠 Open 期编译好的依赖图自行排序，但 span 的划分会变成
+// 一个毫无意义的中间层；而合成一个 span 让「一次 Read = 一组自洽求值」
+// 这件事在计划里就直接可见。
+//
+// 也不能把它们丢进 planSymbols 的 default 分支——那会让它们静默消失，
+// 表现为「配置里有 3 个计算点，API 里显示 3 个坏点，日志里什么都没有」。
+func planComputed(refs []driver.PointRef) []driver.ReadSpan {
+	var pts []driver.PointRef
+	for _, r := range refs {
+		if r.Address.Kind == model.AddressComputed {
+			pts = append(pts, r)
+		}
+	}
+	if len(pts) == 0 {
+		return nil
+	}
+	return []driver.ReadSpan{{ID: "expr", Points: pts}}
 }
 
 func planSymbols(refs []driver.PointRef) []driver.ReadSpan {

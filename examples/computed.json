@@ -1,0 +1,188 @@
+{
+  "schemaVersion": 1,
+  "site": "computed-site",
+  "server": {
+    "listen": "127.0.0.1:8089",
+    "tls": {
+      "enabled": false
+    }
+  },
+  "channels": [
+    {
+      "id": "ch-virtual",
+      "protocol": "virtual",
+      "transport": {
+        "kind": "memory"
+      },
+      "concurrency": 4,
+      "timeout": "2s"
+    },
+    {
+      "id": "ch-calc",
+      "protocol": "computed",
+      "transport": {
+        "kind": "memory"
+      },
+      "concurrency": 1,
+      "timeout": "1s"
+    }
+  ],
+  "devices": [
+    {
+      "id": "line-a",
+      "name": "产线 A（斜坡波形，两个通道相位不同）",
+      "channel": "ch-virtual",
+      "interval": "500ms",
+      "timeout": "2s",
+      "enabled": true,
+      "points": [
+        {
+          "id": "power",
+          "name": "功率",
+          "address": {
+            "kind": "register",
+            "area": "holding",
+            "offset": 0,
+            "length": 2,
+            "bit": -1
+          },
+          "dataType": "float64",
+          "unit": "kW",
+          "enabled": true
+        },
+        {
+          "id": "rate",
+          "name": "费率",
+          "address": {
+            "kind": "register",
+            "area": "holding",
+            "offset": 2,
+            "length": 2,
+            "bit": -1
+          },
+          "dataType": "float64",
+          "unit": "元/kWh",
+          "enabled": true
+        },
+        {
+          "id": "count",
+          "name": "产量",
+          "address": {
+            "kind": "register",
+            "area": "holding",
+            "offset": 4,
+            "length": 1,
+            "bit": -1
+          },
+          "dataType": "uint16",
+          "enabled": true
+        }
+      ],
+      "labels": {
+        "mode": "ramp"
+      }
+    },
+    {
+      "id": "line-a-kpi",
+      "name": "产线 A 派生指标（纯表达式，无物理链路）",
+      "channel": "ch-calc",
+      "interval": "500ms",
+      "timeout": "1s",
+      "enabled": true,
+      "points": [
+        {
+          "id": "cost",
+          "name": "成本",
+          "address": {
+            "kind": "computed",
+            "expr": "line-a:power * line-a:rate"
+          },
+          "dataType": "float64",
+          "unit": "元",
+          "enabled": true
+        },
+        {
+          "id": "cost_with_tax",
+          "name": "含税成本（依赖同设备的 cost）",
+          "address": {
+            "kind": "computed",
+            "expr": "line-a-kpi:cost * 1.13"
+          },
+          "dataType": "float64",
+          "unit": "元",
+          "enabled": true
+        },
+        {
+          "id": "avg_power",
+          "name": "两路均值",
+          "address": {
+            "kind": "computed",
+            "expr": "avg(line-a:power, line-a:rate)"
+          },
+          "dataType": "float64",
+          "enabled": true
+        },
+        {
+          "id": "power_rounded",
+          "name": "功率取整（uint16，越界判坏不截断）",
+          "address": {
+            "kind": "computed",
+            "expr": "round(line-a:power)"
+          },
+          "dataType": "uint16",
+          "enabled": true
+        },
+        {
+          "id": "high_load",
+          "name": "高负载（布尔表达式）",
+          "address": {
+            "kind": "computed",
+            "expr": "line-a:power > 80"
+          },
+          "dataType": "bool",
+          "enabled": true
+        },
+        {
+          "id": "safe_ratio",
+          "name": "带除零保护的比值",
+          "address": {
+            "kind": "computed",
+            "expr": "if(line-a:rate != 0, line-a:power / line-a:rate, 0)"
+          },
+          "dataType": "float64",
+          "enabled": true
+        }
+      ]
+    }
+  ],
+  "northbound": {
+    "mqtt": {
+      "enabled": false,
+      "broker": "tcp://127.0.0.1:1883",
+      "topic": "uic/{site}/{device}/{point}/value",
+      "qos": 1
+    },
+    "opcua": {
+      "enabled": false,
+      "listen": ":4840",
+      "policy": "Basic256Sha256"
+    },
+    "webhook": {
+      "enabled": false,
+      "url": "http://127.0.0.1:9999/ingest",
+      "timeout": "3s",
+      "batch": 50
+    }
+  },
+  "storage": {
+    "dir": "./data-computed",
+    "outboxMaxBytes": 8388608,
+    "outboxMaxRecords": 20000,
+    "outboxTtl": "1h0m0s",
+    "journal": false
+  },
+  "logging": {
+    "level": "info",
+    "format": "json"
+  }
+}

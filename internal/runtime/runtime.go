@@ -31,6 +31,7 @@ import (
 	"uic/internal/cache"
 	"uic/internal/config"
 	"uic/internal/driver"
+	"uic/internal/driver/computed"
 	"uic/internal/driver/modbus"
 	mqttdriver "uic/internal/driver/mqtt"
 	opcuadriver "uic/internal/driver/opcua"
@@ -115,7 +116,7 @@ func RegisterBuiltins() error {
 	registerOnce.Do(func() {
 		for _, d := range []driver.Driver{
 			modbus.New(), modbus.NewRTU(), modbus.NewASCII(),
-			s7.New(), opcuadriver.New(), mqttdriver.New(), virtual.New(),
+			s7.New(), opcuadriver.New(), mqttdriver.New(), computed.New(), virtual.New(),
 		} {
 			if err := driver.Register(d); err != nil {
 				registerErr = err

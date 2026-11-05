@@ -96,6 +96,22 @@ MQTT 是推送型协议，而驱动契约是拉取型，所以驱动在连接时
 一个新鲜度窗口且 PING 往返失败才判断链）。写入成功也只代表「已发出」，
 结果质量码是 `uncertain`，回读一致才转 good。
 
+计算点（纯表达式，没有任何物理链路）：
+
+```bash
+./uic -config examples/computed.json          # REST :8089
+curl -s localhost:8089/api/v1/points | jq '.items[] | {point, value, quality}'
+#   9 点：line-a 三个源点 + line-a-kpi 六个计算点
+#   cost = power × rate；cost_with_tax = cost × 1.13（同一轮内按拓扑序求值）
+#   写入计算点返回 point.not_writable —— 它没有可写回的地址
+```
+
+`protocol: "computed"` + `address.kind: "computed"` + `address.expr`。表达式引擎
+零依赖、编译期做类型检查、短路求值，除零 / NaN / Inf / 整数越界都判坏而不是
+算出一个错数字。引用写作 `device:point`；因为 ID 允许 `-`，**减号两边要留空格**
+（`line-a:power-1` 是引用，`line-a:power - 1` 才是减法）。质量沿依赖传播：
+任一输入不可用则不计算，输出取最差质量并指明是哪个输入。
+
 ## 文档
 
 - **[docs/00-README.md](docs/00-README.md)** — 总索引：阅读路径、38 个参考方案总览、结论速查、代码地图、接口速查、实现边界
@@ -119,7 +135,8 @@ go test -race -count=1 ./...
 |---|---|
 | `cmd/uic/` | 单入口：`run` / `sim`（Modbus / S7 / OPC UA / MQTT）/ `mbread` / `-check` / `version` |
 | `internal/model` | 通道 / 设备 / 点位 / 地址 / 采样 / 质量码 |
-| `internal/driver` | 驱动契约（Codec / Transport / Driver）、错误分类、注册表 |
+| `internal/driver` | 驱动契约（Codec / Transport / Driver）、错误分类、注册表、只读 `Lookup` 注入 |
+| `internal/calc` | 零依赖表达式引擎（编译期类型检查、短路求值、引用 `device:point`） |
 | `internal/codec/modbus` | Modbus 纯函数编解码（主站与从站共用） |
 | `internal/codec/value` | 协议无关值编解码（重排 / 数值 / 字符串 / BCD） |
 | `internal/codec/s7` | S7 纯函数编解码（TPKT / COTP / S7 PDU） |
@@ -128,6 +145,7 @@ go test -race -count=1 ./...
 | `internal/driver/s7` | S7（S7comm）主站 |
 | `internal/driver/opcua` | OPC UA 主站（None/None + 匿名，三层状态机） |
 | `internal/driver/mqtt` | MQTT 南向（订阅取数）：推送适配成拉取，三档新鲜度质量码 |
+| `internal/driver/computed` | 计算点：表达式驱动，同设备依赖在一次 Read 内按拓扑序闭合 |
 | `internal/driver/virtual` | 虚拟设备（波形 + 故障注入） |
 | `internal/sim/modbus` | 内置 Modbus TCP 从站 |
 | `internal/sim/s7` | 内置 S7 从站（内存 DB/M/I/Q 区） |

@@ -34,8 +34,8 @@ cmd/ + internal/            可运行的最小骨架（不是伪代码，能采�
 
 ### 1.2 它不是什么
 
-- 不是协议库大杂烩。当前实现了 7 个驱动（Modbus TCP / RTU / ASCII 主站、S7 主站、OPC UA 主站、
-  MQTT 南向订阅、virtual），外加 Modbus TCP 从站与四个内置模拟从站/Broker；其余协议在
+- 不是协议库大杂烩。当前实现了 8 个驱动（Modbus TCP / RTU / ASCII 主站、S7 主站、OPC UA 主站、
+  MQTT 南向订阅、计算点、virtual），外加 Modbus TCP 从站与四个内置模拟从站/Broker；其余协议在
   `04-protocol-catalog.md` 里按工作量排了三波，没有假装已经支持。
   注意 MQTT 出现了两次且**互不相干**：北向是「网关把数据发出去」（sink），南向是「网关订阅别人发来的数据」（driver）。
 - 不是组态软件。不做画面、不做报表、不做自研时序库——理由见 `02-synthesis/01-capability-matrix.md` §6.4。
@@ -165,6 +165,28 @@ curl -s -H 'Authorization: Bearer dev-token' \
 超时 → stale 但保留最后值；从未收到 → bad），以及 **一条消息都没来不等于断链**
 （不会因此重连；只有「安静超过一个新鲜度窗口且 PING 往返失败」才判断链——
 拔网线、对端断电这类故障 TCP 自己不会报错）。
+
+计算点（纯表达式，没有任何物理链路）：
+
+```bash
+./uic -config examples/computed.json          # REST :8089
+curl -s localhost:8089/api/v1/points | jq '.items[] | {point, value, quality}'
+curl -s -X POST localhost:8089/api/v1/points/line-a-kpi/write \
+  -H 'Content-Type: application/json' \
+  -d '{"writes":[{"point":"cost","value":{"type":"float64","num":1}}]}' | jq
+# → {"ok":false,"code":"point.not_writable", ...}
+```
+
+示例里 `line-a` 是虚拟源（斜坡波形，3 个点位），`line-a-kpi` 是 6 个计算点：
+`cost = power × rate`、`cost_with_tax = cost × 1.13`（**同设备依赖**，同一次 Read
+内按拓扑序求值，因此 `cost_with_tax / cost` 恒为 1.13）、`avg` / `round` / `if` 的
+用法、`high_load = power > 80`（布尔点位必须接布尔表达式）。写入被拒是设计：
+计算点没有可写回的地址。
+
+表达式直接复用驱动契约（`planner` 把计算点合成一个 `expr` span，驱动按编译期
+依赖图求值），不引入第二套采集路径。引用写作 `device:point`；因为 ID 允许 `-`，
+**减号两边要留空格**（`line-a:power-1` 是引用，`line-a:power - 1` 才是减法）。
+质量沿依赖传播：任一输入不可用则不计算，输出取最差质量并指明是哪个输入。
 
 写入与回滚（这是最能体现「可治理」的两条命令）：
 
@@ -445,8 +467,8 @@ obs  ← 所有包（不依赖任何内部包）
 
 | 包 | 职责 | 关键不变量 | 覆盖率 |
 |---|---|---|---|
-| `internal/model` | 通道/设备/点位/地址/采样/质量码 | 不依赖任何内部包；不变量集中在 `Validate`；DB 号与 area 联动校验；凭据在通道级 | 79.2% |
-| `internal/driver` | 驱动契约（Codec/Transport/Driver）、错误分类、注册表 | 能力四态；`Conn` 不保证并发安全，由调用方串行；协议错误可用 `Kinded` 自带分类 | 89.3% |
+| `internal/model` | 通道/设备/点位/地址/采样/质量码 | 不依赖任何内部包；不变量集中在 `Validate`；DB 号与 area 联动校验；计算点强制只读、4 类地址各有规范形式 | 84.7% |
+| `internal/driver` | 驱动契约（Codec/Transport/Driver）、错误分类、注册表、只读 `Lookup` 注入 | 能力四态；`Conn` 不保证并发安全，由调用方串行；协议错误可用 `Kinded` 自带分类 | 87.0% |
 | `internal/codec/modbus` | Modbus 纯函数编解码（TCP/RTU/ASCII，主站与从站共用） | 无 I/O、无时钟、无可变状态 | 88.1% |
 | `internal/codec/value` | 协议无关值编解码（重排、数值/字符串/BCD） | 与协议无关；`Encode` 对 string/bytes 不猜宽度 | 95.0% |
 | `internal/codec/s7` | S7 纯函数编解码（TPKT/COTP/S7 PDU、长度单位换算） | 请求按字节、响应按位/字节的差异收敛在一处 | 80.3% |
@@ -456,23 +478,25 @@ obs  ← 所有包（不依赖任何内部包）
 | `internal/driver/s7` | S7（S7comm）主站 | COTP/Setup 握手不可省；按协商 PDU 与 20 项上限切块；逐项返回码映射质量码 | 79.9% |
 | `internal/driver/opcua` | OPC UA 二进制主站（None/None + 匿名） | 三层状态（TCP/通道/会话）分开判断；按 RequestId 过滤迟到响应；节点越界判坏不截断 | 72.3% |
 | `internal/driver/mqtt` | MQTT 南向（订阅取数）：把推送型协议适配成拉取契约 | `Read` 无网络交互，只读本地最新值表；质量码只反映新鲜度（good/stale/bad 三档）；一条消息都没有不算断链，安静到一个窗口且 PING 失败才判链 | 77.4% |
+| `internal/driver/computed` | 计算点：表达式驱动，无物理链路 | 同设备依赖在一次 `Read` 内按拓扑序闭合；输入不可用则不计算、质量取最差并指名输入；整数越界判坏不截断 | 92.4% |
 | `internal/driver/virtual` | 虚拟设备（波形 + 故障注入） | 故障按「第 n 次请求」精确注入一次 | 98.6% |
 | `internal/sim/modbus` | 内置 Modbus TCP 从站 | 复用同一份 codec，避免主从语义漂移 | 87.2% |
 | `internal/sim/s7` | 内置 S7 从站（内存 DB/M/I/Q 区） | 与主站共用 codec/s7；输入区只读；位写保邻位 | 71.9% |
 | `internal/sim/opcua` | 内置 OPC UA 服务端（内存地址空间） | 与主站共用 codec/opcua；未激活会话拒绝读写；Variant 类型必须与节点 DataType 一致 | 80.9% |
 | `internal/sim/mqtt` | 内置 MQTT 3.1.1 Broker，兼 `uic sim -protocol mqtt` 运行时 | 全项目唯一一份 Broker 实现；不做 QoS2/持久会话/TLS；QoS2 授予时降级为 1 | 79.3% |
 | `internal/slave/modbus` | Modbus TCP 从站（把点位暴露给外部主站） | 读走 cache、写走 Runtime.Write；未映射地址报错不补零；坏质量保留最后值并计数 | 73.8% |
-| `internal/planner` | 点位 → 批量读请求（ReadSpan） | 协议无关；按连续性/上限合并；按 `area:db` 分组 | 94.0% |
+| `internal/calc` | 零依赖表达式引擎（编译期类型检查、短路求值） | 无 `eval`；引用是 `device:point`；除零/NaN/Inf/溢出都报错而不是降级 | 91.2% |
+| `internal/planner` | 点位 → 批量读请求（ReadSpan） | 协议无关；按连续性/上限合并；按 `area:db` 分组；计算点合成单个 `expr` span（漏组会表现为全坏且无日志） | 92.6% |
 | `internal/scheduler` | tick、actor、信号量、退避、熔断、代次 | 同设备不并发；写优先；旧代次丢弃；状态回调不占采集路径 | 87.8% |
 | `internal/pipeline` | 缩放、质量判定、死区过滤 | 质量不可用时不参与死区比较 | 92.7% |
 | `internal/cache` | 当前值唯一事实源 + 变更订阅 | 读写都要过这里，不允许模块自留副本 | 96.7% |
 | `internal/outbox` | 持久队列：分区、WAL、确认位点、三重上限 | at-least-once；整批或前缀成功才推进位点 | 77.4% |
-| `internal/config` | 加载、校验、规范化、版本化、回滚 | 幂等 Normalize；原子写；失败自动恢复；北向参数与从站映射静态校验 | 84.1% |
+| `internal/config` | 加载、校验、规范化、版本化、回滚 | 幂等 Normalize；原子写；失败自动恢复；北向参数、从站映射与计算点（编译/引用/类型/环）静态校验 | 85.8% |
 | `internal/obs` | 指标、结构化日志、日志环形缓冲 | 指标标签必须归一化（不能含原始 URL） | 88.2% |
 | `internal/northbound/httpapi` | REST + SSE + 认证 + 错误码 | 错误码稳定；响应不泄露凭据 | 80.0% |
 | `internal/mqtt` | MQTT 3.1.1 客户端（北向发布 + 南向订阅共用，纯 Go 零依赖） | 单 goroutine 读 socket；QoS1 必须等到 PUBACK；`Ping` 必须等到 PINGRESP（写成功不算活着）；断线立即失败而非超时 | 70.3% |
 | `internal/mqtt/mqtttest` | 测试封装：`internal/sim/mqtt` 的 `*testing.T` 生命周期 + 等待断言 | 不另写 Broker（两份实现必然长歪）；开关一律走 setup 函数而非直接赋字段 | — |
-| `internal/runtime` | 唯一编排层 + 后端实现 + 看门狗 | 启动/关闭顺序；`configuredState` 与 `runtimeState` 分离；协议/传输匹配在装配期校验 | 80.8% |
+| `internal/runtime` | 唯一编排层 + 后端实现 + 看门狗 | 启动/关闭顺序；`configuredState` 与 `runtimeState` 分离；协议/传输匹配在装配期校验；只向驱动注入只读 `cache.Get` | 81.3% |
 | `cmd/uic` | 单入口：run / sim / check / version | 关闭预算 10 秒 | — |
 
 ### 9.2 测试与验证命令
@@ -485,7 +509,7 @@ go test -race -count=1 ./...                    # 竞态 + 全量测试
 go test -coverprofile=c.out ./... && go tool cover -func=c.out | tail -1
 ```
 
-当前状态：`go build` / `go vet` / `gofmt` 全部干净，`go test -race ./...` 27 个测试包全部通过
+当前状态：`go build` / `go vet` / `gofmt` 全部干净，`go test -race ./...` 29 个测试包全部通过
 （另有 `cmd/uic` 与 `internal/mqtt/mqtttest` 两个无测试文件的包）。
 
 ### 9.3 源码阅读建议顺序
@@ -503,6 +527,8 @@ go test -coverprofile=c.out ./... && go tool cover -func=c.out | tail -1
 10. internal/slave/modbus/server.go    从站：映射、跨映射读、写穿透（40 分钟）
 11. internal/driver/opcua/driver.go    三层握手与状态机（50 分钟）
 12. internal/driver/mqtt/driver.go    推送→拉取适配与新鲜度语义（40 分钟）
+13. internal/calc/parse.go            表达式词法/语法：引用与减号的消歧（30 分钟）
+14. internal/driver/computed/driver.go 拓扑求值、质量传播、无 IO 的驱动形态（30 分钟）
 ```
 
 ---
@@ -569,6 +595,10 @@ go test -coverprofile=c.out ./... && go tool cover -func=c.out | tail -1
 | OPC UA 订阅 / 历史 / 方法 / 事件 / 证书 | ❌ | 订阅需 CreateSubscription + MonitoredItems + Publish 三条状态机与存活的发布队列；证书体系是另一套运维域。`Capabilities.Subscribe` 显式声明 `unsupported`，避免上层配出永远收不到数据的点位 |
 | OPC UA 服务端（内置演示） | ✅ | `uic sim -protocol opcua`：Root/Objects/Server/ServerStatus/CurrentTime + ns=2 Plant.{Counter,Temperature,Running,Label,Setpoint}；只读节点写入回 `BadNotWritable`；未知节点回 `BadNodeIdUnknown`；不支持的订阅类服务回 `BadServiceUnsupported` |
 | OPC UA 北向（对外暴露为服务端） | ⏳ | 只完成南向主站与演示服务端；把 cache 映射成对外的地址空间属于 Wave 2 |
+| 计算点（纯表达式） | ✅ | `protocol: "computed"` + `address.kind: "computed"` + `address.expr`；零依赖表达式引擎（编译期类型检查、短路求值、除零/NaN/Inf 报错）；同设备依赖在一次 `Read` 内按拓扑序闭合，跨设备最终一致；质量取最差且指名坏输入；整数四舍五入 + 越界判坏 |
+| 计算点的边界 | ⚠️ | 只读（写入返回 `point.not_writable`）；只支持数值与布尔（字符串/Bytes/BCD 拒绝）；引用写作 `device:point`，因 ID 允许 `-`，**减号两边要留空格**（`line-a:power-1` 是引用）；跨设备引用慢一拍 |
+| 计算点的环检测 | ✅ | 自引用、两点互引、**跨设备互引**都在配置期拒绝，报错打印完整路径（`a -> b -> a`） |
+| 历史窗口聚合（`avg(近 5 分钟)`） | ❌ | 需要历史库，属 Wave 2；当前只能对「此刻的值」求值 |
 | 配置版本/回滚/diff | ✅ | 内容哈希版本、快照、原子写、失败自动恢复、回滚缺版本返回 404 |
 | 认证 | ✅ | Bearer Token，常量时间比较；未实现 RBAC |
 | TLS | ⏳ | 配置项已定义；未接证书加载 |

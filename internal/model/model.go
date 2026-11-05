@@ -65,10 +65,16 @@ const (
 	AddressSymbol   AddressKind = "symbol"   // 路径 + 下标
 	AddressObject   AddressKind = "object"   // 对象类型 + 实例 + 属性 + 索引
 	AddressFile     AddressKind = "file"     // 文件 + 记录 + 偏移
+	// AddressComputed 表示「值由表达式算出」，没有物理地址。表达式放在
+	// Address.Expr 而不是 Point 上，是因为 driver.Read 只拿到 PointRef
+	// （ID + Address + DataType）；放 Point 会迫使所有驱动都接收一个带
+	// 表达式的结构，或给 PointRef 加一个只有一种驱动使用的字段。
+	AddressComputed AddressKind = "computed"
 )
 
 var validAddressKinds = map[AddressKind]bool{
 	AddressRegister: true, AddressSymbol: true, AddressObject: true, AddressFile: true,
+	AddressComputed: true,
 }
 
 // DataType 是平台统一的数据类型；协议类型在驱动内映射到该集合。
@@ -189,6 +195,12 @@ type Address struct {
 	// file
 	FileID   int `json:"fileId,omitempty"`
 	RecordID int `json:"recordId,omitempty"`
+
+	// computed
+	// Expr 是计算点的表达式（`line-a:power / line-a:rate`）。引用写法用
+	// 冒号而不是点号：设备 ID 与点位 ID 都允许包含点号，用点号分隔会产生
+	// 「a.b.c 到底指谁」的歧义。
+	Expr string `json:"expr,omitempty"`
 }
 
 var pathRe = regexp.MustCompile(`^[^\x00-\x1f\s]+$`)
@@ -216,7 +228,7 @@ func (a Address) Validate() error {
 		if a.Bit < -1 || a.Bit > 15 {
 			return fmt.Errorf("address.bit: must be -1..15, got %d", a.Bit)
 		}
-		if a.Path != "" || a.ObjectType != "" || a.FileID != 0 || a.Selector != "" {
+		if a.Path != "" || a.ObjectType != "" || a.FileID != 0 || a.Selector != "" || a.Expr != "" {
 			return errors.New("address: mixed fields for register kind")
 		}
 		if a.DB < 0 {
@@ -239,7 +251,7 @@ func (a Address) Validate() error {
 		if a.Selector != "" && !selectorRe.MatchString(a.Selector) {
 			return errors.New("address.selector: must not contain spaces/control chars")
 		}
-		if a.Area != "" || a.ObjectType != "" || a.FileID != 0 {
+		if a.Area != "" || a.ObjectType != "" || a.FileID != 0 || a.Expr != "" {
 			return errors.New("address: mixed fields for symbol kind")
 		}
 	case AddressObject:
@@ -249,15 +261,32 @@ func (a Address) Validate() error {
 		if a.Instance < 0 {
 			return errors.New("address.instance: must be >= 0")
 		}
-		if a.Area != "" || a.Path != "" || a.FileID != 0 || a.Selector != "" {
+		if a.Area != "" || a.Path != "" || a.FileID != 0 || a.Selector != "" || a.Expr != "" {
 			return errors.New("address: mixed fields for object kind")
 		}
 	case AddressFile:
 		if a.FileID < 0 || a.RecordID < 0 || a.Offset < 0 {
 			return errors.New("address.file: fileId/recordId/offset must be >= 0")
 		}
-		if a.Area != "" || a.Path != "" || a.ObjectType != "" || a.Selector != "" {
+		if a.Area != "" || a.Path != "" || a.ObjectType != "" || a.Selector != "" || a.Expr != "" {
 			return errors.New("address: mixed fields for file kind")
+		}
+	case AddressComputed:
+		if strings.TrimSpace(a.Expr) == "" {
+			return errors.New("address.expr: required for computed")
+		}
+		// 上限不是为了省内存，而是为了防止一份配置把表达式引擎拖进
+		// 指数级求值（深层嵌套的调用）。1024 字节足够写出任何现场公式。
+		if len(a.Expr) > 1024 {
+			return fmt.Errorf("address.expr: %d bytes exceeds the 1024-byte limit", len(a.Expr))
+		}
+		if !selectorRe.MatchString(a.Expr) {
+			return errors.New("address.expr: must not contain control chars")
+		}
+		if a.Area != "" || a.Path != "" || a.ObjectType != "" || a.FileID != 0 ||
+			a.Selector != "" || a.Offset != 0 || a.Length != 0 || a.Bit != 0 || a.DB != 0 ||
+			a.Index != 0 || a.Instance != 0 || a.PropIndex != 0 || a.RecordID != 0 {
+			return errors.New("address: mixed fields for computed kind")
 		}
 	}
 	return nil
@@ -294,6 +323,8 @@ func (a Address) Canonical() string {
 		return fmt.Sprintf("%s:%d.%s", a.ObjectType, a.Instance, a.Property)
 	case AddressFile:
 		return fmt.Sprintf("file:%d/%d:%d", a.FileID, a.RecordID, a.Offset)
+	case AddressComputed:
+		return "expr:" + a.Expr
 	}
 	return ""
 }
@@ -461,6 +492,23 @@ func (p Point) Validate() error {
 	}
 	if p.Address.Kind == AddressRegister && p.Address.Bit > 0 && p.DataType != TypeBool {
 		return fmt.Errorf("point %q: address.bit > 0 requires bool dataType", p.ID)
+	}
+	if p.Address.Kind == AddressComputed {
+		// 计算点是纯函数的结果，没有可以写回去的地址。允许它 writable 会
+		// 产生一条永远失败的写入路径——运维点了「下发」，只得到一个权限错，
+		// 却不知道为什么。在配置期拒绝，错误信息才能说清原因。
+		if p.Writable {
+			return fmt.Errorf("point %q: computed points are read-only", p.ID)
+		}
+		// 表达式的结果只能是数值或布尔：字符串/Bytes 没有对应的运算符，
+		// BCD 不是「值」而是一种寄存器编码，算出来也没有意义。
+		switch p.DataType {
+		case TypeBool, TypeInt16, TypeUint16, TypeInt32, TypeUint32,
+			TypeInt64, TypeUint64, TypeFloat32, TypeFloat64:
+		default:
+			return fmt.Errorf("point %q: computed points require a numeric or bool dataType, got %q",
+				p.ID, p.DataType)
+		}
 	}
 	return nil
 }

@@ -24,6 +24,7 @@ import (
 	"sync"
 	"time"
 
+	"uic/internal/calc"
 	"uic/internal/driver"
 	"uic/internal/model"
 	"uic/internal/mqtt"
@@ -259,10 +260,139 @@ func (f *File) Validate() error {
 			}
 		}
 	}
+	if err := f.validateComputed(); err != nil {
+		return err
+	}
 	if err := f.validateSlaves(); err != nil {
 		return err
 	}
 	return f.validateNorthbound()
+}
+
+// validateComputed 校验计算点：表达式能编译、引用存在、类型自洽、没有环。
+//
+// 这四项全部放在配置期，理由是同一条：**它们都是静态错误**。等到运行时
+// 才暴露，代价是一次设备启动失败 + 一条「expression ...: division by zero」
+// 的日志，而真正的原因（写错了一个点位名）已经很难回溯。
+func (f *File) validateComputed() error {
+	index := make(map[pointKey]model.Point)
+	for _, d := range f.Devices {
+		for _, p := range d.Points {
+			index[pointKey{d.ID, p.ID}] = p
+		}
+	}
+	// programs 缓存编译结果，避免同一表达式被编译两次（校验 + 依赖分析）。
+	programs := make(map[pointKey]*calc.Program)
+	for _, d := range f.Devices {
+		for _, p := range d.Points {
+			if p.Address.Kind != model.AddressComputed {
+				continue
+			}
+			prog, err := calc.Compile(p.Address.Expr)
+			if err != nil {
+				return fmt.Errorf("device %q point %q: %w", d.ID, p.ID, err)
+			}
+			programs[pointKey{d.ID, p.ID}] = prog
+			// 顶层类型必须与点位声明一致。布尔点只能接布尔表达式：
+			// 允许数值隐式转布尔，就等于允许 `alarm = temperature`，
+			// 而它永远为真（非零即真）——一个不会报错也不会工作的报警。
+			wantBool := p.DataType == model.TypeBool
+			switch {
+			case wantBool && prog.Kind() != calc.KindBool:
+				return fmt.Errorf("device %q point %q: dataType is bool but the expression is %s "+
+					"(compare explicitly, e.g. `x > 0`)", d.ID, p.ID, prog.Kind())
+			case !wantBool && prog.Kind() != calc.KindNumber:
+				return fmt.Errorf("device %q point %q: dataType is %s but the expression is %s",
+					d.ID, p.ID, p.DataType, prog.Kind())
+			}
+			for _, ref := range prog.Refs() {
+				dev, pt, ok := splitRef(ref)
+				if !ok {
+					return fmt.Errorf("device %q point %q: malformed reference %q", d.ID, p.ID, ref)
+				}
+				if _, exists := index[pointKey{dev, pt}]; !exists {
+					return fmt.Errorf("device %q point %q: reference %q does not exist", d.ID, p.ID, ref)
+				}
+			}
+		}
+	}
+	return detectComputedCycles(programs)
+}
+
+// detectComputedCycles 在计算点之间找环。跨设备也要查：A 依赖 B、B 依赖 A
+// 时两边都只能拿到对方上一轮的值，表现为「值永远慢一拍」，而每台设备看起来
+// 都完全正常。这种问题在生产现场极难定位，必须在配置期拦掉。
+func detectComputedCycles(programs map[pointKey]*calc.Program) error {
+	const (
+		white = 0
+		grey  = 1
+		black = 2
+	)
+	color := make(map[pointKey]int, len(programs))
+	ids := make([]pointKey, 0, len(programs))
+	for k := range programs {
+		ids = append(ids, k)
+	}
+	sort.Slice(ids, func(i, j int) bool {
+		if ids[i].device != ids[j].device {
+			return ids[i].device < ids[j].device
+		}
+		return ids[i].point < ids[j].point
+	})
+	var stack []pointKey
+	var visit func(k pointKey) error
+	visit = func(k pointKey) error {
+		switch color[k] {
+		case black:
+			return nil
+		case grey:
+			path := make([]string, 0, len(stack)+1)
+			for _, s := range append(stack, k) {
+				path = append(path, s.device+":"+s.point)
+			}
+			return fmt.Errorf("computed points form a dependency cycle: %s", strings.Join(path, " -> "))
+		}
+		color[k] = grey
+		stack = append(stack, k)
+		prog := programs[k]
+		// 排序保证报错路径稳定（每次启动都指向同一条环）。
+		refs := prog.Refs()
+		sort.Strings(refs)
+		for _, ref := range refs {
+			dev, pt, ok := splitRef(ref)
+			if !ok {
+				continue
+			}
+			dep := pointKey{dev, pt}
+			if _, isComputed := programs[dep]; !isComputed {
+				continue
+			}
+			if err := visit(dep); err != nil {
+				return err
+			}
+		}
+		stack = stack[:len(stack)-1]
+		color[k] = black
+		return nil
+	}
+	for _, k := range ids {
+		if err := visit(k); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// pointKey 是「设备/点位」的复合键。
+type pointKey struct{ device, point string }
+
+// splitRef 拆分 `device:point`。与 calc 的引用语法保持一致。
+func splitRef(ref string) (string, string, bool) {
+	i := strings.IndexByte(ref, ':')
+	if i <= 0 || i == len(ref)-1 {
+		return "", "", false
+	}
+	return ref[:i], ref[i+1:], true
 }
 
 // validateSlaves 校验从站映射。

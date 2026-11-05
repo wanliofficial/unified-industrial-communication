@@ -3,6 +3,7 @@ package model
 import (
 	"encoding/json"
 	"math"
+	"strings"
 	"testing"
 	"time"
 )
@@ -458,5 +459,103 @@ func TestSlaveValidateBoundaries(t *testing.T) {
 	}
 	if got := (Slave{MaxConnections: 1000}).EffectiveMaxConnections(); got != 64 {
 		t.Fatalf("max connections cap = %d", got)
+	}
+}
+
+// 计算点地址：必须带表达式、不接受任何物理字段，且要有稳定的规范形式。
+// 规范形式进入缓存键与配置版本计算，因此表达式本身必须是它的一部分：
+// 改一个常数就意味着「这个点位换了算法」，不能被当成同一个版本。
+func TestComputedAddress(t *testing.T) {
+	a := Address{Kind: AddressComputed, Expr: "line-a:power * 2"}
+	if err := a.Validate(); err != nil {
+		t.Fatalf("valid computed address: %v", err)
+	}
+	if got := a.Canonical(); got != "expr:line-a:power * 2" {
+		t.Fatalf("canonical = %q", got)
+	}
+	other := a
+	other.Expr = "line-a:power * 3"
+	if other.Canonical() == a.Canonical() {
+		t.Fatal("canonical must include the expression")
+	}
+
+	bad := map[string]Address{
+		"no expr":      {Kind: AddressComputed},
+		"blank expr":   {Kind: AddressComputed, Expr: "   "},
+		"too long":     {Kind: AddressComputed, Expr: strings.Repeat("1", 1025)},
+		"control char": {Kind: AddressComputed, Expr: "1 +\n2"},
+		// 物理字段混填是最容易犯的错：把计算点当寄存器写，或者把
+		// 寄存器改成计算点时忘了删掉 offset。
+		"offset":  {Kind: AddressComputed, Expr: "1 + 1", Offset: 4},
+		"area":    {Kind: AddressComputed, Expr: "1 + 1", Area: "holding"},
+		"path":    {Kind: AddressComputed, Expr: "1 + 1", Path: "DB1"},
+		"length":  {Kind: AddressComputed, Expr: "1 + 1", Length: 2},
+		"bit":     {Kind: AddressComputed, Expr: "1 + 1", Bit: 3},
+		"db":      {Kind: AddressComputed, Expr: "1 + 1", DB: 1},
+		"file id": {Kind: AddressComputed, Expr: "1 + 1", FileID: 2},
+	}
+	for name, addr := range bad {
+		if err := addr.Validate(); err == nil {
+			t.Fatalf("%s must be rejected", name)
+		}
+	}
+}
+
+// 计算点只能是只读的数值/布尔点。允许可写或 string/BCD 会在运行时
+// 产生一条永远失败的写入路径，或一个没有任何运算符可以消费的值。
+func TestComputedPointRules(t *testing.T) {
+	mk := func(dt DataType, writable bool) Point {
+		return Point{ID: "p", DataType: dt, Writable: writable, Enabled: true,
+			Address: Address{Kind: AddressComputed, Expr: "1 + 1"}}
+	}
+	for _, dt := range []DataType{TypeBool, TypeInt16, TypeUint16, TypeInt32, TypeUint32,
+		TypeInt64, TypeUint64, TypeFloat32, TypeFloat64} {
+		if err := mk(dt, false).Validate(); err != nil {
+			t.Fatalf("%s: %v", dt, err)
+		}
+	}
+	if err := mk(TypeFloat64, true).Validate(); err == nil ||
+		!strings.Contains(err.Error(), "read-only") {
+		t.Fatalf("writable computed point must be rejected, got %v", err)
+	}
+	for _, dt := range []DataType{TypeString, TypeBytes, TypeBCD16, TypeBCD32} {
+		if err := mk(dt, false).Validate(); err == nil {
+			t.Fatalf("%s computed point must be rejected", dt)
+		}
+	}
+}
+
+// Canonical 是缓存键与北向节点名的唯一来源，驱动不得自行实现。每种寻址
+// 都必须产出不同且稳定的字符串：两个不同的地址得到同一个键，会导致
+// 读回来的值张冠李戴——这类错误在运行时完全看不出来。
+func TestCanonicalCoversEveryKind(t *testing.T) {
+	cases := []struct {
+		a    Address
+		want string
+	}{
+		{Address{Kind: AddressRegister, Area: "holding", Offset: 3, Length: 2, Bit: -1}, "holding:3:2"},
+		{Address{Kind: AddressRegister, Area: "coil", Offset: 3, Length: 1, Bit: 3}, "coil:3.3:1"},
+		{Address{Kind: AddressRegister, Area: "db", DB: 2, Offset: 3, Length: 2, Bit: -1}, "db2:3:2"},
+		{Address{Kind: AddressSymbol, Path: "DB1.DBW0", Index: -1}, "DB1.DBW0"},
+		{Address{Kind: AddressSymbol, Path: "array", Index: 4}, "array[4]"},
+		{Address{Kind: AddressSymbol, Path: "device0", Index: -1, Selector: "temp"}, "device0#temp"},
+		{Address{Kind: AddressObject, ObjectType: "binary_input", Instance: 2, Property: "present_value", PropIndex: -1}, "binary_input:2.present_value"},
+		{Address{Kind: AddressObject, ObjectType: "analog_input", Instance: 2, Property: "priority_array", PropIndex: 3}, "analog_input:2.priority_array[3]"},
+		{Address{Kind: AddressFile, FileID: 3, RecordID: 5, Offset: 7}, "file:3/5:7"},
+		{Address{Kind: AddressComputed, Expr: "1 + 2"}, "expr:1 + 2"},
+	}
+	seen := map[string]bool{}
+	for _, c := range cases {
+		got := c.a.Canonical()
+		if got != c.want {
+			t.Errorf("%s canonical = %q, want %q", c.a.Kind, got, c.want)
+		}
+		if seen[got] {
+			t.Errorf("duplicate canonical key %q", got)
+		}
+		seen[got] = true
+	}
+	if got := (Address{Kind: AddressKind("nope")}).Canonical(); got != "" {
+		t.Errorf("unknown kind canonical = %q, want empty", got)
 	}
 }

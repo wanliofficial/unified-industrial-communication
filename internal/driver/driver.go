@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"log/slog"
 	"sort"
+	"strings"
 	"sync"
 
 	"uic/internal/model"
@@ -98,6 +99,13 @@ type OpenConfig struct {
 	Device  model.Device
 	Log     *slog.Logger
 	Metrics Metrics
+	// Lookup 返回某点位的最新采样，供「需要引用其他点位」的驱动使用
+	// （目前只有 computed）。它在装配期由 runtime 注入 cache.Get。
+	//
+	// 为什么给驱动一个读取入口而不是让它直接持有 cache：这个函数是**只读**
+	// 的，拿不到写入与订阅能力；驱动因此不可能绕过采集层的去重、死区、
+	// 序号与代次治理。为 nil 时驱动必须按「没有值」处理，而不是 panic。
+	Lookup func(device, point string) (model.Sample, bool)
 }
 
 // Metrics 是驱动可用的最小埋点接口；可为 nil。
@@ -214,11 +222,31 @@ type OpError struct {
 	Err       error     `json:"-"`
 }
 
+// Error 输出 `设备 操作 类别: 说明`。
+//
+// Protocol 字段是可选的（目前没有驱动填写）：早期实现把它当成前缀硬编码，
+// 于是所有驱动错误都显示成「/read timeout: ...」——一个以斜杠开头、既没有
+// 设备也没有协议的字符串。错误信息是要被人读的，前缀必须真的存在才打印。
 func (e *OpError) Error() string {
-	if e.Err != nil {
-		return fmt.Sprintf("%s/%s %s: %s: %v", e.Protocol, e.Op, e.Kind, e.Msg, e.Err)
+	var b strings.Builder
+	if e.Protocol != "" {
+		b.WriteString(e.Protocol)
+		b.WriteByte(' ')
 	}
-	return fmt.Sprintf("%s/%s %s: %s", e.Protocol, e.Op, e.Kind, e.Msg)
+	if e.Device != "" {
+		b.WriteString(e.Device)
+		b.WriteByte(' ')
+	}
+	b.WriteString(e.Op)
+	b.WriteByte(' ')
+	b.WriteString(string(e.Kind))
+	b.WriteString(": ")
+	b.WriteString(e.Msg)
+	if e.Err != nil {
+		b.WriteString(": ")
+		b.WriteString(e.Err.Error())
+	}
+	return b.String()
 }
 
 func (e *OpError) Unwrap() error { return e.Err }
