@@ -171,6 +171,14 @@ type Address struct {
 	// symbol
 	Path  string `json:"path,omitempty"`
 	Index int    `json:"index,omitempty"`
+	// Selector 是符号地址内部的二级选择器。MQTT 南向用它指定 JSON 载荷
+	// 里的字段路径（"data.temperature" / "values[0].temp"）；其他符号型
+	// 协议（如 OPC UA）留空。
+	//
+	// 为什么单开一个字段而不是塞进 Path：主题里允许出现 `#` 与 `+`，
+	// 用分隔符拼接会与 MQTT 通配符撞车；而且「订阅哪个主题」与「取
+	// 载荷里哪一段」是两件独立的事，混在一个字符串里无法分别校验。
+	Selector string `json:"selector,omitempty"`
 
 	// object
 	ObjectType string `json:"objectType,omitempty"`
@@ -184,6 +192,10 @@ type Address struct {
 }
 
 var pathRe = regexp.MustCompile(`^[^\x00-\x1f\s]+$`)
+
+// selectorRe 比 pathRe 更宽松一点：允许空格（JSON 字段名里出现空格虽少见
+// 但合法），只禁止控制字符。空选择器由调用方视为「整个载荷」。
+var selectorRe = regexp.MustCompile(`^[^\x00-\x1f]+$`)
 
 // Validate 校验地址自身的一致性与范围。
 func (a Address) Validate() error {
@@ -204,7 +216,7 @@ func (a Address) Validate() error {
 		if a.Bit < -1 || a.Bit > 15 {
 			return fmt.Errorf("address.bit: must be -1..15, got %d", a.Bit)
 		}
-		if a.Path != "" || a.ObjectType != "" || a.FileID != 0 {
+		if a.Path != "" || a.ObjectType != "" || a.FileID != 0 || a.Selector != "" {
 			return errors.New("address: mixed fields for register kind")
 		}
 		if a.DB < 0 {
@@ -224,6 +236,9 @@ func (a Address) Validate() error {
 		if a.Index < -1 {
 			return errors.New("address.index: must be >= -1")
 		}
+		if a.Selector != "" && !selectorRe.MatchString(a.Selector) {
+			return errors.New("address.selector: must not contain spaces/control chars")
+		}
 		if a.Area != "" || a.ObjectType != "" || a.FileID != 0 {
 			return errors.New("address: mixed fields for symbol kind")
 		}
@@ -234,14 +249,14 @@ func (a Address) Validate() error {
 		if a.Instance < 0 {
 			return errors.New("address.instance: must be >= 0")
 		}
-		if a.Area != "" || a.Path != "" || a.FileID != 0 {
+		if a.Area != "" || a.Path != "" || a.FileID != 0 || a.Selector != "" {
 			return errors.New("address: mixed fields for object kind")
 		}
 	case AddressFile:
 		if a.FileID < 0 || a.RecordID < 0 || a.Offset < 0 {
 			return errors.New("address.file: fileId/recordId/offset must be >= 0")
 		}
-		if a.Area != "" || a.Path != "" || a.ObjectType != "" {
+		if a.Area != "" || a.Path != "" || a.ObjectType != "" || a.Selector != "" {
 			return errors.New("address: mixed fields for file kind")
 		}
 	}
@@ -262,10 +277,16 @@ func (a Address) Canonical() string {
 		}
 		return fmt.Sprintf("%s:%d%s:%d", a.Area, a.Offset, bit, a.Length)
 	case AddressSymbol:
+		base := a.Path
 		if a.Index >= 0 {
-			return fmt.Sprintf("%s[%d]", a.Path, a.Index)
+			base = fmt.Sprintf("%s[%d]", a.Path, a.Index)
 		}
-		return a.Path
+		if a.Selector != "" {
+			// 用 `#` 分隔：主题里不会出现 `#`（MQTT 通配符在点位的
+			// path 侧被禁止），因此不会与合法主题产生歧义。
+			return base + "#" + a.Selector
+		}
+		return base
 	case AddressObject:
 		if a.PropIndex > 0 {
 			return fmt.Sprintf("%s:%d.%s[%d]", a.ObjectType, a.Instance, a.Property, a.PropIndex)
@@ -520,6 +541,16 @@ type Channel struct {
 	// 通信目标，因此这个零值不会与合法配置冲突。
 	Rack int `json:"rack,omitempty"`
 	Slot int `json:"slot,omitempty"`
+
+	// Username/Password 是链路级凭据（MQTT 的 CONNECT、以及未来的
+	// OPC UA 用户名认证）。放在通道而不是设备上：凭据属于 Broker/服务端，
+	// 同一通道下的多台设备共用一份。
+	//
+	// 明文存在配置文件里是当前版本的真实状态：加密存储需要密钥管理，
+	// 属于另一件事。文档里明确要求配置文件权限 0600，并在启动日志里
+	// 只打印「是否配置了凭据」，不打印值。
+	Username string `json:"username,omitempty"`
+	Password string `json:"password,omitempty"`
 }
 
 // EffectiveRack 返回机架号（默认 0）。

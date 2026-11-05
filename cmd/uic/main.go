@@ -6,6 +6,7 @@
 //	uic sim -listen 127.0.0.1:15020    # 内置 Modbus TCP 从站
 //	uic sim -protocol s7 -listen 127.0.0.1:15102   # 内置 S7 从站
 //	uic sim -protocol opcua -listen 127.0.0.1:14840 # 内置 OPC UA 服务端
+//	uic sim -protocol mqtt -listen 127.0.0.1:18830  # 内置 MQTT Broker（南向演示）
 //	uic mbread -addr 127.0.0.1:1502    # 不依赖第三方工具的从站读写自检
 //
 // 关闭顺序遵循 docs/03-product/02-architecture.md §11.2：
@@ -26,6 +27,9 @@ import (
 	"os/signal"
 	goruntime "runtime"
 	"sort"
+	"strconv"
+	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -34,6 +38,7 @@ import (
 	"uic/internal/driver"
 	uicruntime "uic/internal/runtime"
 	sim "uic/internal/sim/modbus"
+	simmqtt "uic/internal/sim/mqtt"
 	simopcua "uic/internal/sim/opcua"
 	sims7 "uic/internal/sim/s7"
 )
@@ -75,7 +80,7 @@ func usage() {
 用法:
   uic [run] -config config.json [-listen :8080] [-token TOKEN]
   uic -check -config config.json
-  uic sim [-listen 127.0.0.1:15020] [-protocol modbus|s7|opcua]
+  uic sim [-listen 127.0.0.1:15020] [-protocol modbus|s7|opcua|mqtt]
   uic mbread -addr 127.0.0.1:1502 -unit 1 -area holding -offset 0 -qty 2
   uic mbread -addr 127.0.0.1:1502 -area holding -offset 5 -write 777
   uic version
@@ -286,7 +291,7 @@ func simCmd(args []string) {
 	fs := flag.NewFlagSet("sim", flag.ExitOnError)
 	addr := fs.String("listen", "127.0.0.1:15020", "监听地址")
 	size := fs.Int("size", 1024, "寄存器数量")
-	proto := fs.String("protocol", "modbus", "从站协议：modbus | s7 | opcua")
+	proto := fs.String("protocol", "modbus", "从站协议：modbus | s7 | opcua | mqtt")
 	pdu := fs.Int("pdu", 480, "S7 协商 PDU 长度（240/480/960）")
 	fs.Parse(args)
 
@@ -297,9 +302,12 @@ func simCmd(args []string) {
 	case "opcua":
 		simOPCUA(*addr)
 		return
+	case "mqtt":
+		simMQTT(*addr)
+		return
 	case "modbus":
 	default:
-		fmt.Fprintf(os.Stderr, "未知协议 %q（支持 modbus | s7 | opcua）\n", *proto)
+		fmt.Fprintf(os.Stderr, "未知协议 %q（支持 modbus | s7 | opcua | mqtt）\n", *proto)
 		os.Exit(2)
 	}
 
@@ -429,6 +437,96 @@ func simOPCUA(addr string) {
 				n++
 				srv.Set("ns=2;s=Plant.Counter", ua.Variant{Type: ua.TypeInt32, Int: int64(n)})
 				srv.Set("ns=0;i=2258", ua.Variant{Type: ua.TypeDateTime, Time: time.Now()})
+			}
+		}
+	}()
+
+	<-ctx.Done()
+	_ = srv.Close()
+	slog.Info("sim_stopped")
+}
+
+// simMQTT 启动内置 MQTT Broker 并周期性发布一组演示点位。
+//
+// 与 Modbus/S7/OPC UA 的内置从站同一个用途：让 examples/mqtt-southbound.json
+// 不用先装 mosquitto 就能跑通「订阅 → 采集 → REST/SSE」整条链。
+//
+// 演示载荷刻意分两种形态，因为南向驱动必须同时支持：
+//   - 纯文本标量（大量存量设备就是这么发的）；
+//   - JSON 对象（新一点的边缘网关会一次发多个字段）。
+//
+// setpoint 模拟「可写点位」：Broker 收到网关发来的 PUBLISH 就更新本地状态，
+// 下一次周期上报时把新值报回去。真实设备的闭环也是这样——写入只是发命令，
+// 值是否生效要看设备下一次上报。没有这一步回显，示例里的写穿透永远只能停在
+// uncertain，看的人会误以为写入坏了。
+func simMQTT(addr string) {
+	var (
+		mu       sync.Mutex
+		setpoint = 60.0
+	)
+
+	// echo 是「设备采纳写入后立刻上报」的回调。真实设备两种做法都有：
+	// 等下一个上报周期（确认会晚一拍）、或变化即报（确认立刻成功）。这里
+	// 用后者，好让示例里的写穿透能当场闭环。
+	var echo func(string, float64)
+
+	srv, err := simmqtt.New(addr, simmqtt.Options{
+		OnMessage: func(m simmqtt.Message) {
+			if m.Topic != "plant/line1/setpoint" {
+				return
+			}
+			v, perr := strconv.ParseFloat(strings.TrimSpace(string(m.Payload)), 64)
+			if perr != nil {
+				return
+			}
+			mu.Lock()
+			setpoint = v
+			mu.Unlock()
+			if echo != nil {
+				echo(m.Topic, v)
+			}
+		},
+	})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "启动 MQTT 模拟 Broker 失败: %v\n", err)
+		os.Exit(1)
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	echo = func(topic string, v float64) {
+		srv.Publish(topic, []byte(strconv.FormatFloat(v, 'g', -1, 64)), 1, false)
+	}
+
+	fmt.Printf("mqtt broker listening on %s (tcp://%s)\n", srv.Addr(), srv.Addr())
+	fmt.Println("  周期发布（每秒一次）：")
+	fmt.Println("    plant/line1/temp     \"21.0\"~\"21.9\"  纯文本标量")
+	fmt.Println("    plant/line1/counter  \"N\"               每秒自增")
+	fmt.Println("    plant/line1/state    {\"running\":true,\"mode\":\"auto\",\"cycle\":N}  JSON 对象")
+	fmt.Println("    plant/line1/setpoint \"60\"              可写：向该主题发布即被采纳")
+	fmt.Println("  Ctrl+C 停止")
+
+	go func() {
+		t := time.NewTicker(time.Second)
+		defer t.Stop()
+		var n int
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				n++
+				mu.Lock()
+				sp := setpoint
+				mu.Unlock()
+				srv.Publish("plant/line1/temp",
+					[]byte(fmt.Sprintf("%.1f", 21.0+float64(n%10)*0.1)), 1, false)
+				srv.Publish("plant/line1/counter", []byte(strconv.Itoa(n)), 1, false)
+				srv.Publish("plant/line1/state",
+					[]byte(fmt.Sprintf(`{"running":true,"mode":"auto","cycle":%d}`, n)), 1, false)
+				srv.Publish("plant/line1/setpoint",
+					[]byte(strconv.FormatFloat(sp, 'g', -1, 64)), 1, false)
 			}
 		}
 	}()

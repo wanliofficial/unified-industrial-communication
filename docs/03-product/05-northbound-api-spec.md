@@ -200,6 +200,20 @@ Authorization: Bearer <token>
 }
 ```
 
+**不变量：`status != "ok"` ⟹ `problems` 非空。**
+
+设备从 `collecting` 掉到 `faulted` 需要连续 3 次失败（防抖），而点位的坏质量在
+第一次失败时就已产生。因此存在一个真实窗口：`status: degraded`、`points.bad: 7`、
+但没有任何设备态问题项。只靠设备态填 `problems` 会漏掉它。此时补一条聚合项
+（`device` 为空）：
+
+```json
+{ "state": "degraded", "reason": "point quality degraded: bad=7 stale=0 uncertain=0 (of 7)" }
+```
+
+理由很直接：健康检查的消费者是告警系统与人。一条「说自己有病但说不出哪里疼」的
+响应，最终一定会变成没人看的一行绿字。
+
 ### 4.2 设备与点位
 
 | 方法 | 路径 | 说明 |

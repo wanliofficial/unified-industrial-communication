@@ -69,7 +69,7 @@ func TestClientPublishQoS1WaitsForPuback(t *testing.T) {
 }
 
 func TestClientPublishQoS1TimesOutWithoutPuback(t *testing.T) {
-	b := mqtttest.New(t, func(b *mqtttest.Broker) { b.AckPublish = false })
+	b := mqtttest.New(t, mqtttest.NoAck)
 	c := newClient(b, func(o *mqtt.Options) { o.AckTimeout = 200 * time.Millisecond })
 	defer c.Close()
 
@@ -110,7 +110,7 @@ func TestClientConnackRefusal(t *testing.T) {
 	}
 	for _, tc := range cases {
 		code := tc.code
-		b := mqtttest.New(t, func(b *mqtttest.Broker) { b.ConnackCode = code })
+		b := mqtttest.New(t, mqtttest.ConnackCode(code))
 		c := newClient(b, nil)
 		err := c.Connect(context.Background())
 		if err == nil {
@@ -162,7 +162,7 @@ func TestClientReconnectsAfterDrop(t *testing.T) {
 // 连接在等 PUBACK 期间断开：必须立刻失败，不能等到 AckTimeout 才失败，
 // 更不能被误判为成功。
 func TestClientFailsFastWhenConnectionDropsMidPublish(t *testing.T) {
-	b := mqtttest.New(t, func(b *mqtttest.Broker) { b.AckPublish = false })
+	b := mqtttest.New(t, mqtttest.NoAck)
 	c := newClient(b, func(o *mqtt.Options) { o.AckTimeout = 10 * time.Second })
 	defer c.Close()
 
@@ -269,7 +269,7 @@ func TestClientCloseIsIdempotent(t *testing.T) {
 }
 
 func TestClientPublishAfterBrokerDies(t *testing.T) {
-	b := mqtttest.New(t, func(b *mqtttest.Broker) { b.DropOnConnect = true })
+	b := mqtttest.New(t, mqtttest.DropOnConnect)
 	c := newClient(b, func(o *mqtt.Options) { o.ConnectTimeout = 500 * time.Millisecond })
 	defer c.Close()
 	if err := c.Publish(context.Background(), mqtt.Message{Topic: "t", Payload: []byte("x")}); err == nil {

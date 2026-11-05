@@ -85,7 +85,7 @@ func TestMQTTSinkDelivers(t *testing.T) {
 
 // Broker 不回 PUBACK 时，Outbox 位点绝不能推进——否则那条数据永久丢失。
 func TestMQTTSinkKeepsDataWhenBrokerSilent(t *testing.T) {
-	b := mqtttest.New(t, func(b *mqtttest.Broker) { b.AckPublish = false })
+	b := mqtttest.New(t, mqtttest.NoAck)
 	h := newHarness(t, withMQTT(b.URL(), nil))
 	h.waitPointGood("sim01", "reg0")
 
@@ -110,7 +110,7 @@ func TestMQTTSinkKeepsDataWhenBrokerSilent(t *testing.T) {
 
 // Broker 恢复后，积压记录必须自动补投（断网不丢数据）。
 func TestMQTTSinkResumesAfterBrokerComesBack(t *testing.T) {
-	b := mqtttest.New(t, func(b *mqtttest.Broker) { b.AckPublish = false })
+	b := mqtttest.New(t, mqtttest.NoAck)
 	h := newHarness(t, withMQTT(b.URL(), nil))
 	h.waitPointGood("sim01", "reg0")
 

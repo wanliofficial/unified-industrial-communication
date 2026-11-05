@@ -55,8 +55,15 @@ type Address struct {
     Bit    int    `json:"bit,omitempty"`    // -1 表示整字访问
 
     // symbol
-    Path  string `json:"path,omitempty"`  // DB1.DBW0 / Program:Main.Tag / NS=2;s=...
+    Path  string `json:"path,omitempty"`  // DB1.DBW0 / Program:Main.Tag / NS=2;s=... / plant/line1/temp
     Index int    `json:"index,omitempty"` // 数组下标，-1 表示非数组
+    // Selector 是符号地址**内部**的二级选择器：MQTT 南向用它指向 JSON 载荷
+    // 里的字段（"data.temperature" / "values[0].temp"）；其他符号型协议留空。
+    //
+    // 为什么不塞进 Path：主题里允许出现 `#` 与 `+`，用分隔符拼接会与 MQTT
+    // 通配符撞车；而且「订阅哪个主题」与「取载荷里哪一段」是两件事，
+    // 混成一个字符串后无法分别校验。
+    Selector string `json:"selector,omitempty"`
 
     // object
     ObjectType string `json:"objectType,omitempty"` // analogInput / ...
@@ -77,7 +84,7 @@ type Address struct {
 | 类型 | 格式 | 示例 |
 |---|---|---|
 | register | `{area}:{offset}[.{bit}]:{len}` | `holding:100:2`、`coil:20.3:1` |
-| symbol | `{path}[{index}]` | `DB1.DBW0`、`Program:Main.Tags[3]` |
+| symbol | `{path}[{index}]`（带二级选择器时追加 `#{selector}`） | `DB1.DBW0`、`Program:Main.Tags[3]`、`plant/line1/state#running` |
 | object | `{type}:{instance}.{property}[{index}]` | `analogInput:1.presentValue` |
 | file | `file:{fileId}/{recordId}:{offset}` | `file:1/2:0` |
 
@@ -85,7 +92,7 @@ type Address struct {
 
 1. `register.Offset >= 0`，`Length >= 1`（推导后）；
 2. `register.Bit` 取 `-1`（整字）或 `0..15`；
-3. `symbol.Path` 非空，不含控制字符与空格；
+3. `symbol.Path` 非空，不含控制字符与空格；`symbol.Selector`（可空）同样不含控制字符与空格；
 4. `object.Instance >= 0`，`ObjectType` 与 `Property` 非空；
 5. 四类字段不得混填（校验时按 `Kind` 只检查对应字段，其余必须为零值）。
 
@@ -229,6 +236,11 @@ type Channel struct {
     Transport   Transport `json:"transport"`
     Concurrency int       `json:"concurrency,omitempty"` // 默认 4，范围 1..64
     Timeout     Duration  `json:"timeout,omitempty"`     // 默认 3s
+    // Username/Password 是**链路级**凭据（MQTT CONNECT、未来的用户名认证）。
+    // 放在通道而不是设备上：凭据属于 Broker / 服务端，同一通道下的多台设备
+    // 共用一份。配置文件权限要求 0600，REST 回显时只回答「是否配置」。
+    Username    string    `json:"username,omitempty"`
+    Password    string    `json:"password,omitempty"`
 }
 
 type Transport struct {

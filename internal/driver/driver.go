@@ -61,6 +61,10 @@ type ConfigField struct {
 	Placeholder string   `json:"placeholder,omitempty"`
 	Help        string   `json:"help,omitempty"`
 	Scope       string   `json:"scope"` // channel | device | point
+	// Secret 标记「这个字段是凭据」。渲染配置界面时必须做成密码框，
+	// 且回显时用固定掩码而不是真实值——把密码原样吐回前端是最常见
+	// 的一类凭据泄漏。
+	Secret bool `json:"secret,omitempty"`
 }
 
 // Meta 是驱动的不可变元数据。

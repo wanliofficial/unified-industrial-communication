@@ -242,3 +242,126 @@ func TestNormalizeAddr(t *testing.T) {
 		}
 	}
 }
+
+// ---------------------------------------------------------------------------
+// 订阅侧编解码
+// ---------------------------------------------------------------------------
+
+func TestSubscribePacketGolden(t *testing.T) {
+	pkt, err := SubscribePacket([]TopicFilter{
+		{Filter: "a/b", QoS: 1},
+		{Filter: "c/#", QoS: 0},
+	}, 0x1234)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 固定头低 4 位必须是 0b0010（§3.8.1）。写错不会被本地发现，只会被
+	// Broker 以「协议错误」断链，抓包里极难看出来。
+	if pkt[0] != TypeSubscribe<<4|0x02 {
+		t.Fatalf("fixed header = %#x, want %#x", pkt[0], TypeSubscribe<<4|0x02)
+	}
+	want := []byte{
+		0x82, 0x0e, // 固定头 + 剩余长度 14
+		0x12, 0x34, // packet id
+		0x00, 0x03, 'a', '/', 'b', 0x01, // 过滤器 1 + 期望 QoS
+		0x00, 0x03, 'c', '/', '#', 0x00, // 过滤器 2
+	}
+	if !bytes.Equal(pkt, want) {
+		t.Fatalf("pkt = % x\n want % x", pkt, want)
+	}
+}
+
+func TestSubscribePacketValidation(t *testing.T) {
+	if _, err := SubscribePacket(nil, 1); err == nil {
+		t.Fatal("empty filter list must fail")
+	}
+	if _, err := SubscribePacket([]TopicFilter{{Filter: ""}}, 1); err == nil {
+		t.Fatal("empty filter must fail")
+	}
+	// packet id 0 是「无 id」，Broker 无法把 SUBACK 对回来。
+	if _, err := SubscribePacket([]TopicFilter{{Filter: "a"}}, 0); err == nil {
+		t.Fatal("packet id 0 must fail")
+	}
+	if _, err := SubscribePacket([]TopicFilter{{Filter: "a", QoS: 3}}, 1); err == nil {
+		t.Fatal("qos 3 must fail")
+	}
+}
+
+func TestParseSuback(t *testing.T) {
+	pid, granted, err := ParseSuback([]byte{0x00, 0x07, 0x01, 0x80})
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if pid != 7 {
+		t.Fatalf("pid = %d", pid)
+	}
+	if len(granted) != 2 || granted[0] != 1 || granted[1] != SubackFailure {
+		t.Fatalf("granted = %v", granted)
+	}
+	if _, _, err := ParseSuback([]byte{0x00}); err == nil {
+		t.Fatal("short suback must fail")
+	}
+}
+
+func TestParsePublishFlags(t *testing.T) {
+	// QoS1 + retain：固定头 0b0011_0011。
+	pkt, err := PublishPacket(Message{Topic: "a/b", Payload: []byte("hi"), QoS: 1, Retain: true}, 9)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := ReadPacket(bytes.NewReader(pkt), 1<<20)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	p, err := ParsePublish(got)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if p.Topic != "a/b" || string(p.Payload) != "hi" {
+		t.Fatalf("p = %+v", p)
+	}
+	if p.QoS != 1 || !p.Retain || p.Duplicate {
+		t.Fatalf("flags = qos%d retain=%v dup=%v", p.QoS, p.Retain, p.Duplicate)
+	}
+	if p.PID != 9 {
+		t.Fatalf("pid = %d", p.PID)
+	}
+}
+
+func TestParsePublishDuplicateFlag(t *testing.T) {
+	// DUP 位由 Broker 在重投时置位。驱动不需要特殊处理（QoS1 幂等靠上层的
+	// 时间戳），但必须能读出来，否则排障时无法区分「新消息」与「重投」。
+	body := append([]byte{0x00, 0x01, 't'}, []byte("x")...)
+	pkt := Packet{Type: TypePublish, Flags: 0x08, Body: body}
+	p, err := ParsePublish(pkt)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if !p.Duplicate {
+		t.Fatal("dup flag lost")
+	}
+}
+
+func TestParsePublishRejectsNonPublish(t *testing.T) {
+	if _, err := ParsePublish(Packet{Type: TypePuback, Body: []byte{0, 1}}); err == nil {
+		t.Fatal("puback must not parse as publish")
+	}
+	// 主题长度超过报文长度：必须报错，不能越界读。
+	bad := Packet{Type: TypePublish, Body: []byte{0x00, 0x20, 'a'}}
+	if _, err := ParsePublish(bad); err == nil {
+		t.Fatal("truncated topic must fail")
+	}
+	// QoS1 但缺少 packet id。
+	bad = Packet{Type: TypePublish, Flags: 0x02, Body: []byte{0x00, 0x01, 't'}}
+	if _, err := ParsePublish(bad); err == nil {
+		t.Fatal("qos1 without packet id must fail")
+	}
+}
+
+func TestPublishQoS2IsRejectedLocally(t *testing.T) {
+	// QoS2 需要 PUBREC/PUBREL/PUBCOMP 三条报文与两套状态，本项目不做。
+	// 本地直接拒绝，好过发出去之后被 Broker 断链。
+	if _, err := PublishPacket(Message{Topic: "t", QoS: 2}, 1); err == nil {
+		t.Fatal("qos2 must be rejected at the codec layer")
+	}
+}

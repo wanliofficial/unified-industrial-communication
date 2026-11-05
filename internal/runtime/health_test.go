@@ -2,12 +2,15 @@ package runtime
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"net/http"
 	"testing"
 	"time"
 
 	"uic/internal/driver"
 	"uic/internal/model"
+	"uic/internal/northbound/httpapi"
 	"uic/internal/scheduler"
 )
 
@@ -95,4 +98,43 @@ func TestQualityOf(t *testing.T) {
 	if got := qualityOf(context.DeadlineExceeded); got != model.QualityTimeout {
 		t.Fatalf("deadline -> %s", got)
 	}
+}
+
+// 健康检查不能「说自己有病但说不出哪里疼」：只要 status 不是 ok，
+// problems 就必须有内容，否则接进告警系统后就是一行没人看的绿字。
+func TestHealthStatusAlwaysExplainsItself(t *testing.T) {
+	h := newHarness(t, func(cfg map[string]any) {
+		// 指向几乎不可能有人监听的端口：点位会很快变坏，但设备要连续 3 次
+		// 失败才转 faulted，中间存在一段「点位全坏、设备仍 collecting、
+		// problems 为空」的真实窗口。
+		cfg["channels"] = []any{map[string]any{
+			"id": "ch-modbus", "protocol": "modbus-tcp",
+			"transport":   map[string]any{"kind": "tcp", "address": "127.0.0.1:1"},
+			"concurrency": 1, "timeout": "200ms",
+		}}
+		cfg["devices"].([]any)[0].(map[string]any)["interval"] = "100ms"
+	})
+
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		code, body := h.do(http.MethodGet, "/api/v1/health", "")
+		if code != 200 {
+			t.Fatalf("health = %d %s", code, body)
+		}
+		var health httpapi.Health
+		if err := json.Unmarshal(body, &health); err != nil {
+			t.Fatalf("decode: %v (%s)", err, body)
+		}
+		if health.Points.Bad > 0 {
+			if health.Status == "ok" {
+				t.Fatalf("bad points must not report ok: %+v", health)
+			}
+			if len(health.Problems) == 0 {
+				t.Fatalf("status %q without any problem entry: %+v", health.Status, health)
+			}
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("points never went bad")
 }

@@ -32,6 +32,11 @@ type Client struct {
 	// 因为通道被关闭而把零值误判成「已确认」。
 	pending map[uint16]chan error
 
+	// pingWait 是「等 PINGRESP」的等待者。PINGRESP 报文里没有 packet id，
+	// 所以不能复用 pending：同时只能有一个在飞的 PINGREQ。
+	pingMu   sync.Mutex
+	pingWait chan struct{}
+
 	done     chan struct{}
 	doneOnce sync.Once
 
@@ -41,6 +46,7 @@ type Client struct {
 	// 统计：让运维能回答「到底发出去了没有」。
 	sent      atomic.Uint64
 	acked     atomic.Uint64
+	recv      atomic.Uint64
 	reconnect atomic.Uint64
 }
 
@@ -71,6 +77,16 @@ type Options struct {
 	// 用途：Broker 重启会清掉 retained 状态，消费方看到的设备状态就永远
 	// 停在掉线前。重连后主动重发 birth/state 才能让这条链路自愈。
 	OnConnect func()
+
+	// OnMessage 在收到 PUBLISH 时调用。它在读循环里同步执行，必须快速
+	// 返回——不要在这里做网络调用或磁盘写。南向订阅取数用它把消息塞进
+	// 本地缓存，慢消费者应自己开队列。
+	OnMessage func(Publish)
+
+	// Subscriptions 是「连接建立后要恢复的订阅」。CleanSession=true 时
+	// Broker 不保留订阅，断线重连后必须重新 SUBSCRIBE——忘了这一步的
+	// 典型现象是「重连成功但再也收不到数据」。
+	Subscriptions []TopicFilter
 }
 
 func (o Options) withDefaults() Options {
@@ -175,12 +191,107 @@ func (c *Client) Connect(ctx context.Context) error {
 	_ = conn.SetDeadline(time.Time{})
 	c.conn = conn
 	c.state.Store(2)
+
+	// 订阅必须在启动读循环之前完成，且由**当前 goroutine 自己读 socket**：
+	// 两个 goroutine 同时读同一条 TCP 流会把报文切碎，是这类客户端最难
+	// 排查的串扰。期间到达的 retained PUBLISH 在这里顺手分发（它们往往
+	// 就是设备的初始值，丢掉会让点位在重启后一直空着）。
+	if len(c.opt.Subscriptions) > 0 {
+		if err := c.subscribeLocked(conn, c.opt.Subscriptions); err != nil {
+			c.conn = nil
+			c.state.Store(0)
+			_ = conn.Close()
+			return err
+		}
+	}
+
 	go c.readLoop(conn)
 	go c.keepaliveLoop(conn)
 	if c.opt.OnConnect != nil {
 		go c.opt.OnConnect()
 	}
 	return nil
+}
+
+// subscribeLocked 在已持有 c.mu 的情况下发 SUBSCRIBE 并等 SUBACK。
+//
+// 单独抽出来是因为重连路径也要用它：CleanSession=true 时 Broker 不保留
+// 订阅，重连后不重新订阅就会出现「连上了但永远收不到数据」——这是
+// 订阅型接入最常见的一个坑，而且从外部看与「设备没发数据」无法区分。
+func (c *Client) subscribeLocked(conn net.Conn, filters []TopicFilter) error {
+	if len(filters) == 0 {
+		return nil
+	}
+	pid := c.allocPID()
+	pkt, err := SubscribePacket(filters, pid)
+	if err != nil {
+		return err
+	}
+	if _, err := conn.Write(pkt); err != nil {
+		return fmt.Errorf("mqtt: send subscribe: %w", err)
+	}
+
+	// 等 SUBACK。期间可能夹着 retained 的 PUBLISH，必须边收边分发，
+	// 不能丢弃——它们往往就是设备的初始值。
+	deadline := time.Now().Add(c.opt.AckTimeout)
+	_ = conn.SetReadDeadline(deadline)
+	defer func() { _ = conn.SetReadDeadline(time.Time{}) }()
+
+	for {
+		resp, err := ReadPacket(conn, c.opt.MaxPacket)
+		if err != nil {
+			return fmt.Errorf("mqtt: wait suback: %w", err)
+		}
+		switch resp.Type {
+		case TypeSuback:
+			rpid, granted, perr := ParseSuback(resp.Body)
+			if perr != nil {
+				return perr
+			}
+			if rpid != pid {
+				// 迟到的 SUBACK（上一次重连的）。继续等当前这个。
+				continue
+			}
+			for i, g := range granted {
+				if g == SubackFailure {
+					name := ""
+					if i < len(filters) {
+						name = filters[i].Filter
+					}
+					// 被拒绝必须报错：静默继续会得到一个「显示在线但
+					// 永远没数据」的设备，是最难排查的一类现场问题。
+					return fmt.Errorf("mqtt: subscription %q rejected by broker (check ACL)", name)
+				}
+			}
+			return nil
+		case TypePublish:
+			c.dispatchPublish(resp)
+		default:
+			// 其它报文忽略：这里不是读循环，不该处理 PUBACK 等语义。
+		}
+	}
+}
+
+// dispatchPublish 把一条 PUBLISH 交给 OnMessage，并按 QoS 回 PUBACK。
+func (c *Client) dispatchPublish(pkt Packet) {
+	p, err := ParsePublish(pkt)
+	if err != nil {
+		return
+	}
+	if p.QoS == 1 {
+		c.mu.Lock()
+		conn := c.conn
+		c.mu.Unlock()
+		if conn != nil {
+			c.writeMu.Lock()
+			_ = writeAll(conn, PubackPacket(p.PID))
+			c.writeMu.Unlock()
+		}
+	}
+	c.recv.Add(1)
+	if c.opt.OnMessage != nil {
+		c.opt.OnMessage(p)
+	}
 }
 
 // Publish 发布一条消息。QoS0 发完即返回；QoS1 等到 PUBACK 才返回成功。
@@ -261,11 +372,42 @@ func (c *Client) Publish(ctx context.Context, m Message) error {
 	}
 }
 
-// Ping 发送 PINGREQ，用于健康检查。
+// Ping 做一次真正的往返探测：发 PINGREQ 并等 PINGRESP。
+//
+// 只「写成功」不算活着——写进内核缓冲就返回成功，对端早就没了也看不出来。
+// 订阅型驱动没有请求-响应可探，PINGRESP 是唯一能证明对端还在说话的信号。
+// 超时即判定链路已死并主动断开，让下一次 Connect 重建。
 func (c *Client) Ping(ctx context.Context) error {
 	if err := c.Connect(ctx); err != nil {
 		return err
 	}
+	wait := make(chan struct{})
+	c.pingMu.Lock()
+	if c.pingWait != nil {
+		// 已有一次在飞的 PINGREQ：等它就行，不必叠加。
+		prev := c.pingWait
+		c.pingMu.Unlock()
+		select {
+		case <-prev:
+			return nil
+		case <-time.After(c.opt.AckTimeout):
+			return fmt.Errorf("mqtt: no PINGRESP within %s", c.opt.AckTimeout)
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-c.done:
+			return errors.New("mqtt: client closed")
+		}
+	}
+	c.pingWait = wait
+	c.pingMu.Unlock()
+	defer func() {
+		c.pingMu.Lock()
+		if c.pingWait == wait {
+			c.pingWait = nil
+		}
+		c.pingMu.Unlock()
+	}()
+
 	c.mu.Lock()
 	conn := c.conn
 	c.mu.Unlock()
@@ -275,7 +417,24 @@ func (c *Client) Ping(ctx context.Context) error {
 	c.writeMu.Lock()
 	err := writeAll(conn, PingreqPacket())
 	c.writeMu.Unlock()
-	return err
+	if err != nil {
+		c.dropConn(conn)
+		return fmt.Errorf("mqtt: ping: %w", err)
+	}
+
+	timer := time.NewTimer(c.opt.AckTimeout)
+	defer timer.Stop()
+	select {
+	case <-wait:
+		return nil
+	case <-timer.C:
+		c.dropConn(conn)
+		return fmt.Errorf("mqtt: no PINGRESP within %s", c.opt.AckTimeout)
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-c.done:
+		return errors.New("mqtt: client closed")
+	}
 }
 
 // Close 发送 DISCONNECT 并关闭连接。幂等。
@@ -302,6 +461,7 @@ func (c *Client) Close() error {
 type Stats struct {
 	Sent      uint64
 	Acked     uint64
+	Recv      uint64
 	Reconnect uint64
 	Connected bool
 	LastError string
@@ -311,6 +471,7 @@ func (c *Client) Stats() Stats {
 	s := Stats{
 		Sent:      c.sent.Load(),
 		Acked:     c.acked.Load(),
+		Recv:      c.recv.Load(),
 		Reconnect: c.reconnect.Load(),
 		Connected: c.state.Load() == 2,
 	}
@@ -352,6 +513,13 @@ func (c *Client) dropConn(conn net.Conn) {
 	// 唤醒所有等待 PUBACK 的发布者：连接已经没了，继续等只是白白拖长
 	// Outbox 的失败判定。
 	c.failPending(errors.New("mqtt: connection lost before PUBACK"))
+	// 唤醒等 PINGRESP 的等待者，避免保活循环白等满 AckTimeout。
+	c.pingMu.Lock()
+	if c.pingWait != nil {
+		close(c.pingWait)
+		c.pingWait = nil
+	}
+	c.pingMu.Unlock()
 }
 
 // failPending 让所有在飞的 QoS1 发布立即失败。
@@ -385,6 +553,10 @@ func (c *Client) readLoop(conn net.Conn) {
 			return
 		}
 		switch pkt.Type {
+		case TypePublish:
+			// 订阅侧的入站消息。QoS1 必须回 PUBACK，否则 Broker 会一直
+			// 重投，最终把连接判定为无响应。
+			c.dispatchPublish(pkt)
 		case TypePuback:
 			pid, perr := ParsePuback(pkt.Body)
 			if perr != nil {
@@ -401,7 +573,13 @@ func (c *Client) readLoop(conn net.Conn) {
 				}
 			}
 		case TypePingresp:
-			// 保活得到回应，说明链路仍然活着。
+			// 保活得到回应，说明链路仍然活着（不只是「写成功」）。
+			c.pingMu.Lock()
+			if c.pingWait != nil {
+				close(c.pingWait)
+				c.pingWait = nil
+			}
+			c.pingMu.Unlock()
 		default:
 			// 订阅类报文本客户端不使用；忽略而不报错，避免 Broker 推送
 			// 非预期报文时把连接打掉。
@@ -409,7 +587,11 @@ func (c *Client) readLoop(conn net.Conn) {
 	}
 }
 
-// keepaliveLoop 在 keepalive/2 无流量时发 PINGREQ。
+// keepaliveLoop 定期发 PINGREQ 并等 PINGRESP。
+//
+// 必须等回应：只发不等的话，对端断电、网线被拔、NAT 表项过期这几种情况
+// 都不会让本地 socket 报错——写进内核缓冲就返回成功。表现为「连接标志一直
+// 是已连接，但一条数据都收不到」，这是订阅型接入最典型的静默故障。
 func (c *Client) keepaliveLoop(conn net.Conn) {
 	interval := c.opt.KeepAlive / 2
 	if interval < time.Second {
@@ -428,12 +610,37 @@ func (c *Client) keepaliveLoop(conn net.Conn) {
 			if !alive {
 				return
 			}
+
+			wait := make(chan struct{})
+			c.pingMu.Lock()
+			if c.pingWait != nil {
+				// 已经有一次 PINGREQ 在飞（比如 Probe 刚发过）。不要在飞
+				// 两条：PINGRESP 里没有 packet id，无法区分是回哪一条的。
+				c.pingMu.Unlock()
+				continue
+			}
+			c.pingWait = wait
+			c.pingMu.Unlock()
+
 			c.writeMu.Lock()
 			err := writeAll(conn, PingreqPacket())
 			c.writeMu.Unlock()
 			if err != nil {
 				c.setErr(err)
 				c.dropConn(conn)
+				return
+			}
+
+			timer := time.NewTimer(c.opt.AckTimeout)
+			select {
+			case <-wait:
+				timer.Stop()
+			case <-timer.C:
+				c.setErr(errors.New("mqtt: keepalive timeout (no PINGRESP)"))
+				c.dropConn(conn)
+				return
+			case <-c.done:
+				timer.Stop()
 				return
 			}
 		}

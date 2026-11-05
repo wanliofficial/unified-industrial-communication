@@ -1,0 +1,97 @@
+{
+  "schemaVersion": 1,
+  "site": "mqtt-lab",
+  "server": {
+    "listen": "127.0.0.1:8087",
+    "token": "dev-token"
+  },
+  "storage": {
+    "dir": "./data-mqtt-source",
+    "journal": true,
+    "outboxMaxRecords": 5000,
+    "outboxTtl": "10m"
+  },
+  "logging": {
+    "level": "info"
+  },
+  "channels": [
+    {
+      "id": "ch-mqtt",
+      "protocol": "mqtt",
+      "transport": {
+        "kind": "tcp",
+        "address": "tcp://127.0.0.1:18830"
+      },
+      "concurrency": 2,
+      "timeout": "3s"
+    }
+  ],
+  "devices": [
+    {
+      "id": "edge01",
+      "name": "MQTT 边缘网关（订阅取数）",
+      "channel": "ch-mqtt",
+      "interval": "1s",
+      "timeout": "3s",
+      "enabled": true,
+      "points": [
+        {
+          "id": "temperature",
+          "name": "温度（纯文本载荷）",
+          "address": { "kind": "symbol", "path": "plant/line1/temp" },
+          "dataType": "float64",
+          "unit": "degC",
+          "enabled": true
+        },
+        {
+          "id": "counter",
+          "name": "计数（纯文本载荷）",
+          "address": { "kind": "symbol", "path": "plant/line1/counter" },
+          "dataType": "int32",
+          "enabled": true
+        },
+        {
+          "id": "running",
+          "name": "运行标志（JSON 字段）",
+          "address": {
+            "kind": "symbol",
+            "path": "plant/line1/state",
+            "selector": "running"
+          },
+          "dataType": "bool",
+          "enabled": true
+        },
+        {
+          "id": "mode",
+          "name": "运行模式（JSON 字段）",
+          "address": {
+            "kind": "symbol",
+            "path": "plant/line1/state",
+            "selector": "mode"
+          },
+          "dataType": "string",
+          "enabled": true
+        },
+        {
+          "id": "cycle",
+          "name": "循环计数（JSON 字段，同一主题上的第三个点位）",
+          "address": {
+            "kind": "symbol",
+            "path": "plant/line1/state",
+            "selector": "cycle"
+          },
+          "dataType": "int32",
+          "enabled": true
+        },
+        {
+          "id": "setpoint",
+          "name": "设定值（可写：向同一主题发布）",
+          "address": { "kind": "symbol", "path": "plant/line1/setpoint" },
+          "dataType": "float64",
+          "writable": true,
+          "enabled": true
+        }
+      ]
+    }
+  ]
+}

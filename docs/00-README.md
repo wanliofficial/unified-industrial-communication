@@ -34,8 +34,10 @@ cmd/ + internal/            可运行的最小骨架（不是伪代码，能采�
 
 ### 1.2 它不是什么
 
-- 不是协议库大杂烩。当前实现了 6 个驱动（Modbus TCP / RTU / ASCII 主站、S7 主站、OPC UA 主站、virtual），
-  外加 Modbus TCP 从站与三个内置模拟从站；其余协议在 `04-protocol-catalog.md` 里按工作量排了三波，没有假装已经支持。
+- 不是协议库大杂烩。当前实现了 7 个驱动（Modbus TCP / RTU / ASCII 主站、S7 主站、OPC UA 主站、
+  MQTT 南向订阅、virtual），外加 Modbus TCP 从站与四个内置模拟从站/Broker；其余协议在
+  `04-protocol-catalog.md` 里按工作量排了三波，没有假装已经支持。
+  注意 MQTT 出现了两次且**互不相干**：北向是「网关把数据发出去」（sink），南向是「网关订阅别人发来的数据」（driver）。
 - 不是组态软件。不做画面、不做报表、不做自研时序库——理由见 `02-synthesis/01-capability-matrix.md` §6.4。
 - 不是「参考项目的改写版」。全部产物经过脱敏，只以 PA 编号 + 技术画像指代，不含任何被分析对象的名称、地址、作者、商标或包名前缀。
 
@@ -142,6 +144,27 @@ mosquitto_sub -h 127.0.0.1 -t 'uic/mqtt-lab/#' -v
 `.../{device}/$state`（设备状态，retained）、`.../$birth`（网关上线，retained）。
 把 Broker 停掉再起来，可以看到数据先进 Outbox、恢复后按序补投，以及
 `$birth`/`$state` 被重新发布。
+
+MQTT 南向（订阅别人的数据，方向与上一节相反）：这是全项目**唯一一个推送型**
+协议，驱动必须把「设备主动发」适配成「采集器来拉」。内置 Broker 让这条链路
+同样零外部依赖：
+
+```bash
+./uic sim -protocol mqtt -listen 127.0.0.1:18830 &   # 内置 Broker，每秒发布演示点位
+./uic -config examples/mqtt-southbound.json          # REST :8087
+curl -s -H 'Authorization: Bearer dev-token' \
+     localhost:8087/api/v1/points | jq '.items[] | {point, value, quality}'
+```
+
+示例配置覆盖 6 个点位、两种载荷形态：纯文本标量（`plant/line1/temp` → `21.3`）
+与 JSON 对象（`plant/line1/state` → 用 `address.selector` 取出 `running` / `mode` /
+`cycle` 三个字段，且三者只订阅**一次**）。`setpoint` 可写，写入就是向同一主题
+发一条 PUBLISH，Broker 采纳后立刻回显，于是回读确认能闭环。
+
+两条语义必须记住：**质量码只反映新鲜度**（收到过且在 `staleAfter` 内 → good；
+超时 → stale 但保留最后值；从未收到 → bad），以及 **一条消息都没来不等于断链**
+（不会因此重连；只有「安静超过一个新鲜度窗口且 PING 往返失败」才判断链——
+拔网线、对端断电这类故障 TCP 自己不会报错）。
 
 写入与回滚（这是最能体现「可治理」的两条命令）：
 
@@ -357,6 +380,11 @@ docs/
 | MQTT | 变化上报 + 设备状态 | ✅ 完整（QoS0/1、retained `$state`/`$birth`、LWT `$death`、断线补投；不支持 QoS2/TLS/WebSocket） |
 | OPC UA | 被 SCADA 集成 | ⏳ 南向主站已完成（None/None + 匿名）；北向服务端未实现 |
 
+> 注意方向的对称性：MQTT 与 OPC UA 都**同时出现在南向和北向**，但这是两条独立的链路。
+> 北向 MQTT 是「把采集到的值发出去」，南向 MQTT 是「订阅设备发来的值」；两者共用
+> 报文编解码与连接管理（`internal/mqtt`），但驱动契约、配置项、质量语义完全不同——
+> 混为一谈会得到「以为在订阅、其实在发布」这种最难查的错配。
+
 ### 7.4 明确不做
 
 组态画面 / 通用 BI 报表 / 自研时序数据库 / 云端 SaaS / 桌面 GUI 主形态 / 全协议一次性覆盖。每条都有对应的失败案例，见 `01-capability-matrix.md` §6.4。
@@ -417,7 +445,7 @@ obs  ← 所有包（不依赖任何内部包）
 
 | 包 | 职责 | 关键不变量 | 覆盖率 |
 |---|---|---|---|
-| `internal/model` | 通道/设备/点位/地址/采样/质量码 | 不依赖任何内部包；不变量集中在 `Validate`；DB 号与 area 联动校验 | 80.3% |
+| `internal/model` | 通道/设备/点位/地址/采样/质量码 | 不依赖任何内部包；不变量集中在 `Validate`；DB 号与 area 联动校验；凭据在通道级 | 79.2% |
 | `internal/driver` | 驱动契约（Codec/Transport/Driver）、错误分类、注册表 | 能力四态；`Conn` 不保证并发安全，由调用方串行；协议错误可用 `Kinded` 自带分类 | 89.3% |
 | `internal/codec/modbus` | Modbus 纯函数编解码（TCP/RTU/ASCII，主站与从站共用） | 无 I/O、无时钟、无可变状态 | 88.1% |
 | `internal/codec/value` | 协议无关值编解码（重排、数值/字符串/BCD） | 与协议无关；`Encode` 对 string/bytes 不猜宽度 | 95.0% |
@@ -427,10 +455,12 @@ obs  ← 所有包（不依赖任何内部包）
 | `internal/driver/modbus` | Modbus TCP + RTU + ASCII 主站 | 事务号递增；异常码分类；部分失败不吞好样本；同串口事务串行；分帧类型参与端口冲突判定 | 83.9% |
 | `internal/driver/s7` | S7（S7comm）主站 | COTP/Setup 握手不可省；按协商 PDU 与 20 项上限切块；逐项返回码映射质量码 | 79.9% |
 | `internal/driver/opcua` | OPC UA 二进制主站（None/None + 匿名） | 三层状态（TCP/通道/会话）分开判断；按 RequestId 过滤迟到响应；节点越界判坏不截断 | 72.3% |
+| `internal/driver/mqtt` | MQTT 南向（订阅取数）：把推送型协议适配成拉取契约 | `Read` 无网络交互，只读本地最新值表；质量码只反映新鲜度（good/stale/bad 三档）；一条消息都没有不算断链，安静到一个窗口且 PING 失败才判链 | 77.4% |
 | `internal/driver/virtual` | 虚拟设备（波形 + 故障注入） | 故障按「第 n 次请求」精确注入一次 | 98.6% |
 | `internal/sim/modbus` | 内置 Modbus TCP 从站 | 复用同一份 codec，避免主从语义漂移 | 87.2% |
 | `internal/sim/s7` | 内置 S7 从站（内存 DB/M/I/Q 区） | 与主站共用 codec/s7；输入区只读；位写保邻位 | 71.9% |
 | `internal/sim/opcua` | 内置 OPC UA 服务端（内存地址空间） | 与主站共用 codec/opcua；未激活会话拒绝读写；Variant 类型必须与节点 DataType 一致 | 80.9% |
+| `internal/sim/mqtt` | 内置 MQTT 3.1.1 Broker，兼 `uic sim -protocol mqtt` 运行时 | 全项目唯一一份 Broker 实现；不做 QoS2/持久会话/TLS；QoS2 授予时降级为 1 | 79.3% |
 | `internal/slave/modbus` | Modbus TCP 从站（把点位暴露给外部主站） | 读走 cache、写走 Runtime.Write；未映射地址报错不补零；坏质量保留最后值并计数 | 73.8% |
 | `internal/planner` | 点位 → 批量读请求（ReadSpan） | 协议无关；按连续性/上限合并；按 `area:db` 分组 | 94.0% |
 | `internal/scheduler` | tick、actor、信号量、退避、熔断、代次 | 同设备不并发；写优先；旧代次丢弃；状态回调不占采集路径 | 87.8% |
@@ -440,8 +470,8 @@ obs  ← 所有包（不依赖任何内部包）
 | `internal/config` | 加载、校验、规范化、版本化、回滚 | 幂等 Normalize；原子写；失败自动恢复；北向参数与从站映射静态校验 | 84.1% |
 | `internal/obs` | 指标、结构化日志、日志环形缓冲 | 指标标签必须归一化（不能含原始 URL） | 88.2% |
 | `internal/northbound/httpapi` | REST + SSE + 认证 + 错误码 | 错误码稳定；响应不泄露凭据 | 80.0% |
-| `internal/mqtt` | MQTT 3.1.1 发布侧客户端（纯 Go，零依赖） | 单 goroutine 读 socket；QoS1 必须等到 PUBACK；断线立即失败而非超时 | 84.3% |
-| `internal/mqtt/mqtttest` | 可复用的最小 Broker（测试夹具） | 只实现发布侧所需报文；配置必须在 accept 之前注入 | — |
+| `internal/mqtt` | MQTT 3.1.1 客户端（北向发布 + 南向订阅共用，纯 Go 零依赖） | 单 goroutine 读 socket；QoS1 必须等到 PUBACK；`Ping` 必须等到 PINGRESP（写成功不算活着）；断线立即失败而非超时 | 70.3% |
+| `internal/mqtt/mqtttest` | 测试封装：`internal/sim/mqtt` 的 `*testing.T` 生命周期 + 等待断言 | 不另写 Broker（两份实现必然长歪）；开关一律走 setup 函数而非直接赋字段 | — |
 | `internal/runtime` | 唯一编排层 + 后端实现 + 看门狗 | 启动/关闭顺序；`configuredState` 与 `runtimeState` 分离；协议/传输匹配在装配期校验 | 80.8% |
 | `cmd/uic` | 单入口：run / sim / check / version | 关闭预算 10 秒 | — |
 
@@ -455,7 +485,8 @@ go test -race -count=1 ./...                    # 竞态 + 全量测试
 go test -coverprofile=c.out ./... && go tool cover -func=c.out | tail -1
 ```
 
-当前状态：`go build` / `go vet` / `gofmt` 全部干净，`go test -race ./...` 25 个测试包全部通过。
+当前状态：`go build` / `go vet` / `gofmt` 全部干净，`go test -race ./...` 27 个测试包全部通过
+（另有 `cmd/uic` 与 `internal/mqtt/mqtttest` 两个无测试文件的包）。
 
 ### 9.3 源码阅读建议顺序
 
@@ -471,6 +502,7 @@ go test -coverprofile=c.out ./... && go tool cover -func=c.out | tail -1
 9. internal/driver/s7/driver.go       「一次事务多项」与 PDU 预算（40 分钟）
 10. internal/slave/modbus/server.go    从站：映射、跨映射读、写穿透（40 分钟）
 11. internal/driver/opcua/driver.go    三层握手与状态机（50 分钟）
+12. internal/driver/mqtt/driver.go    推送→拉取适配与新鲜度语义（40 分钟）
 ```
 
 ---
@@ -529,6 +561,10 @@ go test -coverprofile=c.out ./... && go tool cover -func=c.out | tail -1
 | Webhook 上报 | ✅ | 批量 POST、自定义头、失败不推进位点、恢复后自动补投 |
 | journal 本地归档 | ✅ | `storage.journal=true` → `<dir>/journal.ndjson` |
 | MQTT 上报 | ✅ | 自写 MQTT 3.1.1 客户端（零依赖）：QoS1 等 PUBACK 才推进位点、keepalive、重连后补发 `$birth` 与 retained `$state`、LWT `$death`；显式拒绝 QoS2 与 TLS/WS |
+| MQTT 南向（订阅取数） | ✅ | 连接时按点位主题批量 SUBSCRIBE（同主题只订一次），消息进本地最新值表，`Read` 只读表不发网络请求；载荷支持纯文本标量与 JSON（`address.selector`，`a.b` / `a[0].b`）；写入 = 向同一主题 PUBLISH（QoS1）；SUBACK 0x80 视为配置错误直接失败而非「在线但没数据」；静默且 PING 往返失败才判断链 |
+| MQTT 南向的语义边界 | ⚠️ | 质量码只反映「消息新鲜度」（`staleAfter = max(3×周期, 5s)`，兜底 30s）：收到过且未超时 → good；超时 → stale 且保留最后值；从未收到 → bad。写入成功只代表「已发出」不代表「设备已执行」，因此回读不一致时结果留在 uncertain |
+| MQTT 南向不支持项 | ❌ | 点位的 `path` 只能是具体主题（禁止 `+` / `#` 通配符，否则一个点位对应 N 个主题、值无法归属）；不做持久会话 / ACL / TLS / WebSocket / QoS2；不做二进制载荷解码 |
+| MQTT 内置 Broker | ✅ | `uic sim -protocol mqtt`：CONNECT/SUBSCRIBE/PUBLISH/PING 全套、retained 内存表、每秒发布演示点位并回显 setpoint 写入；同时是集成测试的对端（全项目唯一一份 Broker 实现） |
 | OPC UA 主站 | ✅ | UACP HEL/ACK + OPN 安全通道 + CreateSession/ActivateSession 会话三层；批量读（≤100 节点/请求）、写、Browse、GetEndpoints；SecurityPolicy=None / SecurityMode=None / 匿名；NodeId 支持 `ns=2;s=` / `ns=2;i=` / `i=` / 裸字符串；TokenId 寿命 3/4 时自动 OPN 续订；数值越界判坏不截断 |
 | OPC UA 订阅 / 历史 / 方法 / 事件 / 证书 | ❌ | 订阅需 CreateSubscription + MonitoredItems + Publish 三条状态机与存活的发布队列；证书体系是另一套运维域。`Capabilities.Subscribe` 显式声明 `unsupported`，避免上层配出永远收不到数据的点位 |
 | OPC UA 服务端（内置演示） | ✅ | `uic sim -protocol opcua`：Root/Objects/Server/ServerStatus/CurrentTime + ns=2 Plant.{Counter,Temperature,Running,Label,Setpoint}；只读节点写入回 `BadNotWritable`；未知节点回 `BadNodeIdUnknown`；不支持的订阅类服务回 `BadServiceUnsupported` |

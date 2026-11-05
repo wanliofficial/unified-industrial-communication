@@ -107,6 +107,7 @@ type ConfigField struct {
     Placeholder string   `json:"placeholder,omitempty"`
     Help        string   `json:"help,omitempty"`
     Scope       string   `json:"scope"`       // channel | device | point
+    Secret      bool     `json:"secret,omitempty"` // 凭据字段：渲染成密码框，回显用固定掩码
 }
 ```
 
@@ -718,6 +719,120 @@ OPC UA 的 `Read` 是**逐项**返回 `DataValue.Status` 的：一个节点不�
 
 ---
 
+### 3.10 MQTT 南向（订阅取数）
+
+这是全项目**唯一的推送型协议**：设备不会因为「你问了一次」而回答。而 `driver.Conn`
+是拉取契约（`Read` 立即返回一批样本）。两种范式之间的转换只有一种做法是对的，
+其余做法都能编译通过、也能在实验室里跑出值，但在现场一定会出问题。
+
+#### 3.10.1 唯一正确的适配：订阅 + 本地最新值表
+
+| 做法 | 结果 |
+|---|---|
+| **连接时订阅，消息进本地最新值表，`Read` 只读表**（本实现） | ✅ `Read` 耗时与网络无关；设备安静时也不超时；retained 的历史消息与实时消息可以按到达时间区分 |
+| 在 `Read` 里发一条请求等回应 | ❌ 没有「请求」这个东西。只能等到超时（采一个点 = 一个超时时间）；retained 消息会被当成「刚刚发生的变化」 |
+| `Read` 直接返回上一次的消息，不记时间 | ❌ 无法表达「这条消息是 3 小时前的」，质量码永远是 good |
+| 起后台协程不停重连、把值推给 cache | ❌ 驱动不该绕过采集器直接写 cache（会跳过去重、死区、序号、代次四道治理） |
+
+因此有一条硬性约束：**MQTT 点位的质量码只能反映「消息新鲜度」**，不能反映
+「设备现在是否正常」。这是协议决定的，不是实现偷懒——同一个主题上可能既有
+数据消息也有状态消息，驱动没有办法验证「这个值是此刻的真实值」。
+
+#### 3.10.2 订阅建立
+
+| 规则 | 原因 |
+|---|---|
+| 按点位的 `address.path` 收集主题，**去重后一次 SUBSCRIBE 批量发出** | 同一主题上常配多个点位（JSON 里的不同字段）。不去重会让 Broker 收到 N 条相同过滤器，QoS1 下还会收到 N 份相同消息 |
+| `path` 必须是精确主题，**禁止 `+` / `#`** | 一个点位若对应 N 个主题，「这个值属于哪台设备」就无法回答；映射关系从 1:1 变成 1:N，写入也会失去目标 |
+| SUBACK 返回 `0x80` 视为**打开失败**，不做静默容忍 | ACL 拒绝时若按成功处理，会得到一台「在线但永远没数据」的设备——它和「设备没发数据」在现场完全无法区分 |
+| 重连后**必须重新 SUBSCRIBE** | 本实现使用 CleanSession=true（不做持久会话），Broker 不保留订阅。只重连不重订会得到一个安静的空连接 |
+| QoS 取 1 | QoS0 在网络抖动时静默丢消息，而订阅驱动没有「补读」这回事：丢一条就在等下一轮上报，低频设备上表现为「数据长时间不动」 |
+
+`ClientID` 由 `通道 ID + 设备 ID` 稳定派生（截断到 100 字节）。**不能带时间戳或随机数**：
+每次重连都换 ClientID 会让 Broker 认为是新客户端，触发上一条连接的遗嘱，消费方看到设备反复上下线。
+
+#### 3.10.3 三档质量码
+
+`staleAfter = max(3 × device.Interval, 5s)`，设备未配周期时兜底 30s。取 3 倍周期是因为
+单次丢包不该立刻判 stale；下限 5s 是因为半秒周期的设备本来就不该走 MQTT。
+
+| 状态 | 条件 | 返回的值 | 说明 |
+|---|---|---|---|
+| `good` | 收到过，且距最后一条 < `staleAfter` | 最新值 | — |
+| `stale` | 收到过，但已超过 `staleAfter` | **保留最后值** | 清空会让趋势图断点，运维也看不出「最后是多少」 |
+| `bad` | 从未收到过任何消息 | 零值 | 携带 `ErrProtocol` 便于排障 |
+
+载荷解析失败**不覆盖**已有的好值：同一主题上很可能还有状态/日志类消息，
+把「解不出」当成「设备坏了」是误判。失败只累加 `badPayloads` 计数，让旧值按
+`staleAfter` 自然降级。
+
+#### 3.10.4 载荷解码
+
+| 形态 | 判定 | 例 |
+|---|---|---|
+| 纯文本标量 | `address.selector` 为空 | `21.5` / `ON` / `LINE-1`（首尾空白会 trim，设备常带 `\r\n`） |
+| JSON 字段 | `selector` 非空 | `{"data":{"temperature":23.75}}` + `data.temperature` |
+
+selector 支持 `a.b.c` 与 `values[0].v` 两种段：**先按键名下钻，再按下标取元素**。
+只做下标会把文档本身当成数组，报出一个与真实原因无关的类型错。
+
+数值转换的三条规则，都是从「上层按这个数字做决策」倒推的：
+
+1. **越界判坏，不截断**：`uint16` 收到 `70000` 必须报错。截断成 `4464` 会让操作员
+   按错的数字决策，比没有数据更糟。
+2. **布尔接受常见写法**：`true/false`、`1/0`、`ON/OFF`、`on/off`。
+3. **写入整数不带小数点**：`uint16` 写 `7` 发 `"7"` 而不是 `"7.0"`——大量设备
+   用 `strconv` 严格解析，`7.0` 会被拒。
+
+#### 3.10.5 写入 = 向同一主题发布
+
+写入没有独立的确认通道，所以结果质量码是 **`uncertain`**：`Publish` 返回成功只说明
+消息进了 Broker，不代表设备已经执行。只有回读到一致的值，采集到的样本才会变 good。
+这让「写入成功」与「设备已生效」在 API 上保持可区分。
+
+QoS 取 1：控制命令不能是 fire-and-forget。
+
+#### 3.10.6 链路自检：一条消息都没有 ≠ 断链
+
+这是订阅型接入最容易写错的地方，两个方向都会错：
+
+| 写法 | 后果 |
+|---|---|
+| 一轮 `Read` 没有好消息就返回整体错误 | ❌ 采集器按「断链」处理 → 拆连接重建 → 每轮重连、重新订阅，而设备根本没故障 |
+| 只看「TCP 连接标志」判断在线 | ❌ 拔网线 / 对端断电 / NAT 表项过期时，本地 socket 不会报错，写进内核缓冲还返回成功 → 「永远在线、永远没数据」 |
+
+本实现的规则是：
+
+1. `Read` 在链路正常时**永不返回整体错误**，逐点返回质量码（`bad` / `stale` 见 3.10.3）。
+2. 只有当「一条好消息都没有」**且**「已经安静超过一个 `staleAfter`」时，才做一次
+   `PINGREQ → PINGRESP` 往返；往返失败才返回 `ErrDisconnected`，让上层重建连接。
+3. `Ping` **必须等 PINGRESP**。写成功不算活着——这是上面第二行的直接推论。
+   PINGRESP 报文里没有 packet id，因此同一时刻只能有一次在飞的 PINGREQ（单飞）。
+
+`Probe`（手工探活 / 熔断后的探测）走同一条路径。keepalive 循环也等 PINGRESP，
+所以半死链路在后台就会被打断，不必等到某个点位彻底 stale 才暴露。
+
+#### 3.10.7 能力边界与内置 Broker
+
+| 项 | 状态 | 说明 |
+|---|---|---|
+| MQTT 3.1.1 明文 TCP | ✅ | 不支持 TLS / WebSocket（配置期显式报错，不静默降级） |
+| QoS0 / QoS1 | ✅ | QoS2 在编解码层直接拒绝：客户端等的是 PUBACK，等 QoS2 会等成超时 |
+| 订阅取数 | ✅ | 批量 SUBSCRIBE、去重、重连重订、三档质量码 |
+| 纯文本 / JSON 载荷 | ✅ | selector 二级寻址，`a.b` 与 `a[0].b` |
+| 写入（发布） | ✅ | 结果质量码 `uncertain`，回读一致才转 good |
+| 持久会话 / ACL / 共享订阅 | ❌ | CleanSession=true；订阅权限交给 Broker |
+| 二进制协议绑定（CBOR / Protobuf / Sparkplug B） | ❌ | 需要 schema 协商，属另一层产品功能 |
+| 通配符点位（`plant/+/temp`） | ❌ | 见 3.10.2：值无法归属到具体点位 |
+
+内置 Broker（`internal/sim/mqtt`）同时是三样东西：`uic sim -protocol mqtt` 的运行时、
+集成测试的对端、以及 `examples/mqtt-southbound.json` 的零依赖依赖项。它**只有一份
+实现**——测试封装（`internal/mqtt/mqtttest`）只负责绑定 `*testing.T` 的生命周期与
+等待断言。两份 Broker 会慢慢长成不同行为，最终制造出「客户端测试通过、换真 Broker 失败」
+这类最难查的分歧。
+
+---
+
 ## 4. 错误模型
 
 ```go
@@ -782,8 +897,16 @@ type OpError struct {
 | `modbus-ascii` | supported | supported | unsupported | unsupported | unsupported | supported | supported |
 | `s7` | supported | supported | unsupported | unsupported | unsupported | supported | supported |
 | `opcua` | supported | supported | unsupported | unsupported | experimental | supported | unsupported |
-| `mqtt` | supported | unsupported | supported | unsupported | unsupported | unsupported | unsupported |
+| `mqtt`（南向订阅） | supported | supported | supported ¹ | unsupported | unsupported | supported ² | unsupported |
 | `virtual` | supported | supported | supported | supported | unsupported | supported | supported |
+
+> ¹ `mqtt` 的 `Subscribe` 指「协议是推送型、由驱动内部订阅」，**不是**驱动对外提供推送回调：
+> 上层拿到的仍然是 `Read` 拉取契约，推送在同包内被消化成最新值表（见 §3.10.1）。
+> 声明 `unsupported` 会让配置界面建议用户换协议，方向就错了。
+>
+> ² MQTT 的批量读没有协议交互——一次 `Read` 取任意多点位都是查内存表，
+> 成本与点位数量无关。因此 `MultiRead` 声明 `supported`，但语义与 Modbus 的
+> 「一个请求读多地址」不同。
 
 ---
 

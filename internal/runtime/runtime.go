@@ -32,6 +32,7 @@ import (
 	"uic/internal/config"
 	"uic/internal/driver"
 	"uic/internal/driver/modbus"
+	mqttdriver "uic/internal/driver/mqtt"
 	opcuadriver "uic/internal/driver/opcua"
 	"uic/internal/driver/s7"
 	"uic/internal/driver/virtual"
@@ -112,7 +113,10 @@ var (
 // 不启动 runtime 的场景下使用。
 func RegisterBuiltins() error {
 	registerOnce.Do(func() {
-		for _, d := range []driver.Driver{modbus.New(), modbus.NewRTU(), modbus.NewASCII(), s7.New(), opcuadriver.New(), virtual.New()} {
+		for _, d := range []driver.Driver{
+			modbus.New(), modbus.NewRTU(), modbus.NewASCII(),
+			s7.New(), opcuadriver.New(), mqttdriver.New(), virtual.New(),
+		} {
 			if err := driver.Register(d); err != nil {
 				registerErr = err
 				return
@@ -626,6 +630,20 @@ func (r *Runtime) Health() httpapi.Health {
 		h.Status = "degraded"
 	case h.Points.Bad > 0 || h.Points.Stale > 0:
 		h.Status = "degraded"
+	}
+	// 状态与原因必须同时出现。
+	//
+	// 设备从 collecting 掉到 faulted 需要连续 3 次失败（防抖），而点位的坏
+	// 质量在第一次失败时就有了。如果只把「设备态」写进 problems，就会出现
+	// 一段真实存在的窗口：status=degraded、points.bad=7、problems=[]。
+	// 运维看到的是一个「说自己有病但说不出哪里疼」的健康检查——这类响应
+	// 最后一定会被接进告警系统，然后变成没人看的一行绿字。
+	if h.Status == "degraded" && len(h.Problems) == 0 {
+		h.Problems = append(h.Problems, httpapi.Problem{
+			State: "degraded",
+			Reason: fmt.Sprintf("point quality degraded: bad=%d stale=%d uncertain=%d (of %d)",
+				h.Points.Bad, h.Points.Stale, h.Points.Uncertain, h.Points.Total),
+		})
 	}
 	return h
 }

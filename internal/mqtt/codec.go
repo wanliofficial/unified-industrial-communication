@@ -11,6 +11,7 @@
 package mqtt
 
 import (
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -175,8 +176,11 @@ func PublishPacket(m Message, pid uint16) ([]byte, error) {
 	if m.Topic == "" {
 		return nil, errors.New("mqtt: topic required")
 	}
-	if m.QoS > 2 {
-		return nil, fmt.Errorf("mqtt: qos %d out of range", m.QoS)
+	if m.QoS > 1 {
+		// QoS2 需要 PUBREC/PUBREL/PUBCOMP 三条报文与两套中间状态，
+		// 本实现不做。在这里拒绝，比发出去之后被 Broker 以协议错误断链
+		// 更容易定位：调用方拿到的是一个明确的配置错误，而不是偶发断线。
+		return nil, fmt.Errorf("mqtt: qos %d unsupported (only 0 and 1)", m.QoS)
 	}
 	if m.QoS > 0 && pid == 0 {
 		return nil, errors.New("mqtt: packet id must be non-zero for qos>0")
@@ -206,6 +210,100 @@ func PublishPacket(m Message, pid uint16) ([]byte, error) {
 // PubackPacket 生成 PUBACK 报文。
 func PubackPacket(pid uint16) []byte {
 	return []byte{TypePuback << 4, 2, byte(pid >> 8), byte(pid)}
+}
+
+// TopicFilter 是一条订阅项：主题过滤器 + 期望 QoS。
+type TopicFilter struct {
+	Filter string // 可含 + / # 通配符
+	QoS    byte
+}
+
+// SubscribePacket 生成 SUBSCRIBE 报文。
+//
+// 固定头低 4 位必须是 0b0010（§3.8.1）；写错不会被本地发现，只会被
+// Broker 以「协议错误」断链——这类错误在抓包里极难看出来，所以在这里
+// 直接硬编码并用测试锁住。
+func SubscribePacket(filters []TopicFilter, pid uint16) ([]byte, error) {
+	if len(filters) == 0 {
+		return nil, errors.New("mqtt: subscribe needs at least one topic filter")
+	}
+	if pid == 0 {
+		return nil, errors.New("mqtt: subscribe packet id must be non-zero")
+	}
+	body := []byte{byte(pid >> 8), byte(pid)}
+	for _, f := range filters {
+		if f.Filter == "" {
+			return nil, errors.New("mqtt: empty topic filter")
+		}
+		if f.QoS > 2 {
+			return nil, fmt.Errorf("mqtt: qos %d out of range", f.QoS)
+		}
+		var err error
+		if body, err = appendString(body, f.Filter); err != nil {
+			return nil, err
+		}
+		body = append(body, f.QoS)
+	}
+	out := []byte{TypeSubscribe<<4 | 0x02}
+	out = appendLength(out, len(body))
+	return append(out, body...), nil
+}
+
+// SubackFailure 是 SUBACK 里表示「该过滤器被拒绝」的返回码。
+const SubackFailure byte = 0x80
+
+// ParseSuback 解析 SUBACK 报文体，返回 packet id 与逐条授予的 QoS。
+//
+// 授予值可以是 0/1/2，也可以是 0x80（拒绝）。**不能只看报文是否收到**：
+// 通配符被 ACL 拒绝时 Broker 回的是 SUBACK+0x80，不是断链。把它当成
+// 订阅成功，会得到一个永远收不到数据却显示「在线」的设备。
+func ParseSuback(body []byte) (uint16, []byte, error) {
+	if len(body) < 3 {
+		return 0, nil, fmt.Errorf("mqtt: suback body too short (%d)", len(body))
+	}
+	pid := uint16(body[0])<<8 | uint16(body[1])
+	return pid, body[2:], nil
+}
+
+// Publish 是一条收到的 PUBLISH。
+type Publish struct {
+	Topic     string
+	Payload   []byte
+	QoS       byte
+	Retain    bool
+	Duplicate bool
+	PID       uint16 // 仅 QoS>0
+}
+
+// ParsePublish 解析一条 PUBLISH 报文。
+func ParsePublish(pkt Packet) (Publish, error) {
+	if pkt.Type != TypePublish {
+		return Publish{}, fmt.Errorf("mqtt: not a publish (type %d)", pkt.Type)
+	}
+	body := pkt.Body
+	if len(body) < 2 {
+		return Publish{}, errors.New("mqtt: short publish")
+	}
+	tl := int(binary.BigEndian.Uint16(body[:2]))
+	if len(body) < 2+tl {
+		return Publish{}, errors.New("mqtt: short topic")
+	}
+	p := Publish{
+		Topic:     string(body[2 : 2+tl]),
+		QoS:       (pkt.Flags >> 1) & 0x03,
+		Retain:    pkt.Flags&0x01 != 0,
+		Duplicate: pkt.Flags&0x08 != 0,
+	}
+	rest := body[2+tl:]
+	if p.QoS > 0 {
+		if len(rest) < 2 {
+			return Publish{}, errors.New("mqtt: short packet id")
+		}
+		p.PID = binary.BigEndian.Uint16(rest[:2])
+		rest = rest[2:]
+	}
+	p.Payload = append([]byte(nil), rest...)
+	return p, nil
 }
 
 // PingreqPacket 生成 PINGREQ 报文。

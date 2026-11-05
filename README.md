@@ -80,6 +80,22 @@ mosquitto_sub -h 127.0.0.1 -t 'uic/mqtt-lab/#' -v
 Broker 断开时数据进本地 Outbox（不丢），恢复后自动补投；`$state`/`$birth` 是
 retained 的，消费方连上即可读到当前状态。
 
+MQTT 南向（订阅别人发来的数据，方向相反）：
+
+```bash
+./uic sim -protocol mqtt -listen 127.0.0.1:18830 &   # 内置 Broker，每秒发布演示点位
+./uic -config examples/mqtt-southbound.json          # REST :8087
+curl -s -H 'Authorization: Bearer dev-token' localhost:8087/api/v1/points
+#   6 点：纯文本标量 temp / counter，JSON 字段 running / mode / cycle，可写 setpoint
+#   写穿透：POST .../points/edge01/write  → 发布到 plant/line1/setpoint
+```
+
+MQTT 是推送型协议，而驱动契约是拉取型，所以驱动在连接时订阅、把消息存进本地
+最新值表，`Read` 只查表。由此两条语义必须记住：**质量码只反映消息新鲜度**
+（超时 → stale 但保留最后值），以及**一条消息都没来不等于断链**（只有安静超过
+一个新鲜度窗口且 PING 往返失败才判断链）。写入成功也只代表「已发出」，
+结果质量码是 `uncertain`，回读一致才转 good。
+
 ## 文档
 
 - **[docs/00-README.md](docs/00-README.md)** — 总索引：阅读路径、38 个参考方案总览、结论速查、代码地图、接口速查、实现边界
@@ -101,7 +117,7 @@ go test -race -count=1 ./...
 
 | 路径 | 内容 |
 |---|---|
-| `cmd/uic/` | 单入口：`run` / `sim`（Modbus / S7 / OPC UA）/ `mbread` / `-check` / `version` |
+| `cmd/uic/` | 单入口：`run` / `sim`（Modbus / S7 / OPC UA / MQTT）/ `mbread` / `-check` / `version` |
 | `internal/model` | 通道 / 设备 / 点位 / 地址 / 采样 / 质量码 |
 | `internal/driver` | 驱动契约（Codec / Transport / Driver）、错误分类、注册表 |
 | `internal/codec/modbus` | Modbus 纯函数编解码（主站与从站共用） |
@@ -111,10 +127,12 @@ go test -race -count=1 ./...
 | `internal/driver/modbus` | Modbus TCP + RTU + ASCII 主站 |
 | `internal/driver/s7` | S7（S7comm）主站 |
 | `internal/driver/opcua` | OPC UA 主站（None/None + 匿名，三层状态机） |
+| `internal/driver/mqtt` | MQTT 南向（订阅取数）：推送适配成拉取，三档新鲜度质量码 |
 | `internal/driver/virtual` | 虚拟设备（波形 + 故障注入） |
 | `internal/sim/modbus` | 内置 Modbus TCP 从站 |
 | `internal/sim/s7` | 内置 S7 从站（内存 DB/M/I/Q 区） |
 | `internal/sim/opcua` | 内置 OPC UA 服务端（内存地址空间） |
+| `internal/sim/mqtt` | 内置 MQTT 3.1.1 Broker（兼 `uic sim -protocol mqtt` 运行时） |
 | `internal/slave/modbus` | Modbus TCP 从站（把点位映射给外部主站，写穿透到南向） |
 | `internal/planner` | 点位 → 批量读请求 |
 | `internal/scheduler` | tick / actor / 信号量 / 退避 / 熔断 / 代次隔离 |
@@ -124,7 +142,8 @@ go test -race -count=1 ./...
 | `internal/config` | 配置校验 / 内容哈希版本 / 快照 / 回滚 |
 | `internal/obs` | 指标 / 结构化日志 / 日志环形缓冲 |
 | `internal/northbound/httpapi` | REST + SSE + 认证 + 错误码 |
-| `internal/mqtt` | 自写 MQTT 3.1.1 发布侧客户端（QoS0/1、retained、LWT） |
+| `internal/mqtt` | 自写 MQTT 3.1.1 客户端（北向发布 + 南向订阅共用；QoS0/1、retained、LWT、PING 往返探测） |
+| `internal/mqtt/mqtttest` | 测试封装：`internal/sim/mqtt` 的 `*testing.T` 生命周期 + 等待断言 |
 | `internal/runtime` | 唯一编排层 + 看门狗 + 后端实现（含各 sink 装配） |
 
 ## 许可

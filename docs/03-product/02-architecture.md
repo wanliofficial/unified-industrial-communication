@@ -82,8 +82,14 @@ cmd/uic
 
 internal/driver/modbus  ──→ internal/codec/modbus（纯函数）
                         ──→ internal/transport
+internal/driver/s7      ──→ internal/codec/s7（纯函数）
+internal/driver/opcua   ──→ internal/codec/opcua（纯函数）
+internal/driver/mqtt    ──→ internal/mqtt（报文编解码 + 连接管理）
+                        ──→ internal/model
 internal/driver/virtual ──→ internal/model
 internal/sim/modbus     ──→ internal/codec/modbus（复用同一编解码）
+internal/sim/mqtt       ──→ internal/mqtt（两侧共用同一份报文实现）
+internal/slave/modbus   ──→ internal/codec/modbus + internal/cache
 ```
 
 **硬性规则**：
@@ -402,7 +408,7 @@ uic_<subsystem>_<name>{<labels>}
 | 日志 | `log/slog` | 结构化、标准库 |
 | 配置 | JSON + 手写校验 | 不引入 YAML 依赖；JSON 可被机器生成 |
 | 存储 | 文件（配置/Outbox）+ SQLite（历史，Wave 2） | 单文件、可备份 |
-| MQTT | 自研 MQTT 3.1.1 发布侧客户端（已实现，零依赖） | 发布侧只需 6 种报文，规范正文不足 80 页；引入依赖的供应链与交叉编译成本更高。QoS2/TLS/WS 未实现且配置即报错 |
+| MQTT | 自研 MQTT 3.1.1 客户端（已实现，零依赖；北向发布 + 南向订阅共用） | 需要的报文不到 10 种，规范正文不足 80 页；引入依赖的供应链与交叉编译成本更高。QoS2/TLS/WS 未实现且配置即报错；QoS2 在编解码层直接拒绝，因为客户端等的是 PUBACK |
 | OPC UA | 自研封装（生产用 gopcua） | 见 ADR-0001 |
 | 前端 | 单文件 HTML + 原生 JS（骨架）/ 轻量 SPA（生产） | `go:embed` 进二进制 |
 | 测试 | 标准 `testing` + 自研 drivertest | 不引入断言库 |

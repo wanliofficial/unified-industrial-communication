@@ -198,13 +198,24 @@ func TestRuntimeEndToEnd(t *testing.T) {
 	}
 
 	// 设备视图：配置态与运行态分别返回。
-	code, body = h.do(http.MethodGet, "/api/v1/devices/sim01", "")
-	if code != 200 {
-		t.Fatalf("device = %d %s", code, body)
-	}
+	//
+	// 注意这里有两次「先值后账」的时序：点位进 cache 发生在本轮采集内，
+	// 而 readsTotal 在收尾记账时才 +1。所以缓存已经是 good 之后的一瞬间，
+	// 读计数仍然是 0。断言必须等到记账完成，否则就是在测调度器的调度时机。
 	var dv httpapi.DeviceView
-	if err := json.Unmarshal(body, &dv); err != nil {
-		t.Fatal(err)
+	statsDeadline := time.Now().Add(10 * time.Second)
+	for {
+		code, body = h.do(http.MethodGet, "/api/v1/devices/sim01", "")
+		if code != 200 {
+			t.Fatalf("device = %d %s", code, body)
+		}
+		if err := json.Unmarshal(body, &dv); err != nil {
+			t.Fatal(err)
+		}
+		if dv.Stats.ReadsTotal > 0 || time.Now().After(statsDeadline) {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 	if dv.ConfiguredState != "enabled" || dv.RuntimeState != "collecting" {
 		t.Fatalf("device view = %+v", dv)
