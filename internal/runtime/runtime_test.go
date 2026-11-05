@@ -202,6 +202,11 @@ func TestRuntimeEndToEnd(t *testing.T) {
 	// 注意这里有两次「先值后账」的时序：点位进 cache 发生在本轮采集内，
 	// 而 readsTotal 在收尾记账时才 +1。所以缓存已经是 good 之后的一瞬间，
 	// 读计数仍然是 0。断言必须等到记账完成，否则就是在测调度器的调度时机。
+	//
+	// 同理，`runtimeState` 是瞬时值：-race 下并发跑多个包时，某一次读可能
+	// 因为 CPU 抢占而超时，让设备短暂落到 degraded。这里等的是「收敛到
+	// collecting」而不是「任意时刻都是 collecting」——后者会把调度抖动
+	// 当成产品缺陷。
 	var dv httpapi.DeviceView
 	statsDeadline := time.Now().Add(10 * time.Second)
 	for {
@@ -212,16 +217,15 @@ func TestRuntimeEndToEnd(t *testing.T) {
 		if err := json.Unmarshal(body, &dv); err != nil {
 			t.Fatal(err)
 		}
-		if dv.Stats.ReadsTotal > 0 || time.Now().After(statsDeadline) {
+		ok := dv.Stats.ReadsTotal > 0 && dv.Points.Good > 0 &&
+			dv.ConfiguredState == "enabled" && dv.RuntimeState == "collecting"
+		if ok {
 			break
 		}
+		if time.Now().After(statsDeadline) {
+			t.Fatalf("device view never converged: %+v", dv)
+		}
 		time.Sleep(10 * time.Millisecond)
-	}
-	if dv.ConfiguredState != "enabled" || dv.RuntimeState != "collecting" {
-		t.Fatalf("device view = %+v", dv)
-	}
-	if dv.Points.Good == 0 || dv.Stats.ReadsTotal == 0 {
-		t.Fatalf("device stats = %+v", dv)
 	}
 
 	// 写入 + 回读确认。

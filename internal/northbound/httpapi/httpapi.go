@@ -19,6 +19,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"uic/internal/alarm"
 	"uic/internal/cache"
 	"uic/internal/config"
 	"uic/internal/model"
@@ -126,6 +127,9 @@ type Health struct {
 	Devices       DeviceCounts `json:"devices"`
 	Points        PointCounts  `json:"points"`
 	Outbox        OutboxHealth `json:"outbox"`
+	// Alarms 是报警状态汇总。放在 health 里而不是要求调用方额外拉一次
+	// /alarms：看板判断「这台网关是否健康」时，未确认报警必须算进去。
+	Alarms        alarm.Counts `json:"alarms"`
 	Problems      []Problem    `json:"problems,omitempty"`
 	Version       string       `json:"version,omitempty"`
 	ConfigVersion string       `json:"configVersion,omitempty"`
@@ -220,6 +224,12 @@ type Backend interface {
 
 	Stream(filter func(model.Sample) bool, buffer int) (<-chan cache.Event, func())
 
+	Alarms(f alarm.Filter) []alarm.Status
+	Alarm(id string) (alarm.Status, bool)
+	AlarmCounts() alarm.Counts
+	AckAlarms(ctx context.Context, ids []string, all bool, by string) ([]alarm.Status, error)
+	AlarmStream(buffer int) (<-chan alarm.Event, func())
+
 	DiagnosticsBundle(ctx context.Context) ([]byte, error)
 
 	RecordHTTP(path string, code int, d time.Duration)
@@ -281,6 +291,12 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST /api/v1/commands", h(s.command))
 	s.mux.HandleFunc("GET /api/v1/logs", h(s.logs))
 	s.mux.HandleFunc("GET /api/v1/stream", h(s.stream))
+
+	s.mux.HandleFunc("GET /api/v1/alarms", h(s.alarmsList))
+	s.mux.HandleFunc("POST /api/v1/alarms/ack", h(s.alarmsAck))
+	s.mux.HandleFunc("GET /api/v1/alarms/stream", h(s.alarmsStream))
+	s.mux.HandleFunc("GET /api/v1/alarms/{id}", h(s.alarmGet))
+	s.mux.HandleFunc("POST /api/v1/alarms/{id}/ack", h(s.alarmAck))
 	s.mux.HandleFunc("GET /api/v1/diagnostics/bundle", h(s.bundle))
 }
 
@@ -678,6 +694,192 @@ func intQuery(r *http.Request, key string, def int) int {
 		return def
 	}
 	return n
+}
+
+// ---------------------------------------------------------------------------
+// 报警
+// ---------------------------------------------------------------------------
+
+// alarmStates / alarmSeverities 是查询过滤的合法取值。
+func parseAlarmFilter(r *http.Request) (alarm.Filter, error) {
+	q := r.URL.Query()
+	f := alarm.Filter{Q: strings.TrimSpace(q.Get("q")), Limit: intQuery(r, "limit", 0)}
+
+	collect := func(key string) []string {
+		var out []string
+		for _, v := range q[key] {
+			for _, part := range strings.Split(v, ",") {
+				if part = strings.TrimSpace(part); part != "" {
+					out = append(out, part)
+				}
+			}
+		}
+		return out
+	}
+	for _, v := range collect("state") {
+		st := alarm.State(v)
+		if !st.Valid() {
+			return f, Errf(http.StatusBadRequest, "request.invalid",
+				"unknown state %q (want normal|pending|active|acked|cleared)", v)
+		}
+		f.States = append(f.States, st)
+	}
+	for _, v := range collect("severity") {
+		sv := alarm.Severity(v)
+		if !sv.Valid() {
+			return f, Errf(http.StatusBadRequest, "request.invalid",
+				"unknown severity %q (want info|warning|critical)", v)
+		}
+		f.Severities = append(f.Severities, sv)
+	}
+	return f, nil
+}
+
+func (s *Server) alarmsList(w http.ResponseWriter, r *http.Request) error {
+	f, err := parseAlarmFilter(r)
+	if err != nil {
+		return err
+	}
+	items := s.be.Alarms(f)
+	if items == nil {
+		items = []alarm.Status{}
+	}
+	writeOK(w, map[string]any{
+		"items":  items,
+		"total":  len(items),
+		"counts": s.be.AlarmCounts(),
+	})
+	return nil
+}
+
+func (s *Server) alarmGet(w http.ResponseWriter, r *http.Request) error {
+	id := r.PathValue("id")
+	st, ok := s.be.Alarm(id)
+	if !ok {
+		return Errf(http.StatusNotFound, "alarm.not_found", "alarm %q not found", id)
+	}
+	writeOK(w, st)
+	return nil
+}
+
+type alarmAckBody struct {
+	IDs []string `json:"ids"`
+	All bool     `json:"all"`
+	// By 是操作人标识。由调用方提供而不是从 Token 推导：Token 是共享的
+	// 接入凭据，不等同于「谁按下了确认」。
+	By string `json:"by,omitempty"`
+}
+
+func (s *Server) alarmsAck(w http.ResponseWriter, r *http.Request) error {
+	var body alarmAckBody
+	if err := s.body(w, r, &body); err != nil {
+		return err
+	}
+	if body.All && len(body.IDs) > 0 {
+		return Errf(http.StatusBadRequest, "request.invalid", "all and ids are mutually exclusive")
+	}
+	if !body.All && len(body.IDs) == 0 {
+		return Errf(http.StatusBadRequest, "request.invalid", "ids must not be empty unless all is true")
+	}
+	return s.doAck(w, r, body.IDs, body.All, body.By)
+}
+
+func (s *Server) alarmAck(w http.ResponseWriter, r *http.Request) error {
+	id := r.PathValue("id")
+	var body alarmAckBody
+	// 单条确认允许空 body，但配了 body 时仍要严格解析。
+	if r.ContentLength != 0 {
+		if err := s.body(w, r, &body); err != nil {
+			return err
+		}
+	}
+	if body.All || len(body.IDs) > 0 {
+		return Errf(http.StatusBadRequest, "request.invalid", "body ids/all are not allowed on a single-alarm ack")
+	}
+	return s.doAck(w, r, []string{id}, false, body.By)
+}
+
+func (s *Server) doAck(w http.ResponseWriter, r *http.Request, ids []string, all bool, by string) error {
+	by = strings.TrimSpace(by)
+	if len(by) > 64 {
+		return Errf(http.StatusBadRequest, "request.invalid", "by must be <= 64 bytes")
+	}
+	out, err := s.be.AckAlarms(r.Context(), ids, all, by)
+	if err != nil {
+		return err
+	}
+	if out == nil {
+		out = []alarm.Status{}
+	}
+	writeOK(w, map[string]any{"acknowledged": out, "total": len(out)})
+	return nil
+}
+
+// alarmsStream 把报警状态迁移推给浏览器。
+//
+// 与 /api/v1/stream（点位的值）分开：消费方完全不同——点位流是趋势图和
+// 实时值，报警流是弹窗与声音。合成一路会让前端在一堆采样里筛选报警。
+func (s *Server) alarmsStream(w http.ResponseWriter, r *http.Request) error {
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		return Errf(http.StatusInternalServerError, "internal.sse_unsupported", "streaming not supported")
+	}
+	hb := s.heartbeat(r)
+	ch, cancel := s.be.AlarmStream(256)
+	defer cancel()
+
+	h := w.Header()
+	h.Set("Content-Type", "text/event-stream; charset=utf-8")
+	h.Set("Cache-Control", "no-cache, no-transform")
+	h.Set("Connection", "keep-alive")
+	h.Set("X-Accel-Buffering", "no")
+	w.WriteHeader(http.StatusOK)
+
+	s.sseLive.Add(1)
+	defer s.sseLive.Add(-1)
+
+	hello := map[string]any{
+		"server": "uic", "apiVersion": 1,
+		"heartbeatSeconds": int(hb / time.Second),
+		"counts":           s.be.AlarmCounts(),
+	}
+	if err := writeSSE(w, "hello", "", hello); err != nil {
+		return nil
+	}
+	flusher.Flush()
+
+	tick := time.NewTicker(hb)
+	defer tick.Stop()
+	for {
+		select {
+		case <-r.Context().Done():
+			return nil
+		case <-tick.C:
+			if err := writeSSE(w, "heartbeat", "", map[string]any{"ts": s.opt.Now().UTC()}); err != nil {
+				return nil
+			}
+			flusher.Flush()
+		case ev, ok := <-ch:
+			if !ok {
+				return nil
+			}
+			if err := writeSSE(w, string(ev.Type), ev.Status.ID, ev); err != nil {
+				return nil
+			}
+			flusher.Flush()
+		}
+	}
+}
+
+// heartbeat 从查询串解析 SSE 心跳周期（1s ~ 5min，非法值回落默认）。
+func (s *Server) heartbeat(r *http.Request) time.Duration {
+	hb := s.opt.Heartbeat
+	if v := r.URL.Query().Get("heartbeat"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil && d >= time.Second && d <= 5*time.Minute {
+			hb = d
+		}
+	}
+	return hb
 }
 
 // ---------------------------------------------------------------------------

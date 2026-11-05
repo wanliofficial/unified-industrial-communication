@@ -10,6 +10,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"uic/internal/alarm"
 	"uic/internal/config"
 	"uic/internal/mqtt"
 	"uic/internal/obs"
@@ -34,6 +35,15 @@ type mqttSink struct {
 	// 靠这份缓存把当前状态补发回去，否则消费方会一直看到旧状态。
 	stateMu sync.Mutex
 	states  map[string]sinkState
+
+	// 报警是「当前状态」而不是数据流：发布时不进 Outbox，走 retained，
+	// 并在（重）连后整体重发。积压一条过期报警毫无价值，而漏掉「当前正在
+	// 报警」是致命的。
+	alarmMu     sync.Mutex
+	alarmStates map[string]alarm.Status
+	// alarmCleared 记录「规则已删除但清空消息还没发出去」的 ID。断线时
+	// 删除规则会留下一个 retained 幽灵，必须在重连后补发空载荷清掉。
+	alarmCleared map[string]bool
 
 	met *obs.Metrics
 
@@ -72,6 +82,8 @@ func newMQTTSink(cfg config.MQTT, site, gatewayID string) (*mqttSink, error) {
 		qos:           byte(cfg.EffectiveQoS()),
 		retain:        cfg.Retain,
 		states:        map[string]sinkState{},
+		alarmStates:   map[string]alarm.Status{},
+		alarmCleared:  map[string]bool{},
 	}
 	s.client = mqtt.New(mqtt.Options{
 		Addr:      cfg.Broker,
@@ -221,6 +233,9 @@ func (m *mqttSink) republish(ctx context.Context) {
 			return
 		}
 	}
+	// 报警状态同样要补：Broker 重启会丢掉 retained，而「网关重连后看板上
+	// 的报警全部消失」比没有报警更危险。
+	m.resendAlarms(ctx)
 }
 
 func (m *mqttSink) count(result string) {
@@ -256,4 +271,107 @@ func splitKey(key string) (device, point string) {
 // String 便于日志展示。注意不要打印用户名/密码。
 func (m *mqttSink) String() string {
 	return "mqtt(" + m.topicTemplate + ",qos=" + strconv.Itoa(int(m.qos)) + ")"
+}
+
+// ---------------------------------------------------------------------------
+// 报警出口
+// ---------------------------------------------------------------------------
+
+// alarmTopic 是单条报警的状态主题。用 `$alarm` 前缀把控制面（`$state`/
+// `$birth`）与数据面（`uic/{site}/{device}/{point}/value`）分开：消费方
+// 订阅 `uic/{site}/#` 取数据时不会把报警混进去。
+func (m *mqttSink) alarmTopic(id string) string {
+	return fmt.Sprintf("uic/%s/$alarm/%s", sanitizeTopicLevel(m.site), sanitizeTopicLevel(id))
+}
+
+// onAlarmEvent 把一次状态迁移发布为 retained 消息。
+func (m *mqttSink) onAlarmEvent(ev alarm.Event) {
+	id := ev.Status.ID
+	m.alarmMu.Lock()
+	if ev.Type == alarm.EventRemoved {
+		delete(m.alarmStates, id)
+		m.alarmCleared[id] = true
+	} else {
+		m.alarmStates[id] = ev.Status
+	}
+	m.alarmMu.Unlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if err := m.publishAlarm(ctx, ev.Status, ev.Type == alarm.EventRemoved); err != nil {
+		// 与设备状态一致：报警发布失败只影响可观测性，不能影响采集。
+		// 重连时会整体重发，所以这里不回滚内存中的状态。
+		m.failed.Add(1)
+		m.count("alarm_error")
+	}
+}
+
+// seedAlarms 用引擎的当前快照初始化本地缓存（启动时调用一次）。
+func (m *mqttSink) seedAlarms(statuses []alarm.Status) {
+	m.alarmMu.Lock()
+	defer m.alarmMu.Unlock()
+	if m.alarmStates == nil {
+		m.alarmStates = map[string]alarm.Status{}
+	}
+	for _, st := range statuses {
+		m.alarmStates[st.ID] = st
+	}
+}
+
+// resendAlarms 在连接建立后重发全部报警状态与待清理的幽灵记录。
+func (m *mqttSink) resendAlarms(ctx context.Context) {
+	m.alarmMu.Lock()
+	snapshot := make([]alarm.Status, 0, len(m.alarmStates))
+	for _, st := range m.alarmStates {
+		snapshot = append(snapshot, st)
+	}
+	cleared := make([]string, 0, len(m.alarmCleared))
+	for id := range m.alarmCleared {
+		cleared = append(cleared, id)
+	}
+	m.alarmMu.Unlock()
+
+	for _, id := range cleared {
+		if err := m.publishAlarmID(ctx, id, nil); err != nil {
+			return
+		}
+		m.alarmMu.Lock()
+		delete(m.alarmCleared, id)
+		m.alarmMu.Unlock()
+	}
+	for _, st := range snapshot {
+		if err := m.publishAlarm(ctx, st, false); err != nil {
+			return
+		}
+	}
+}
+
+func (m *mqttSink) publishAlarm(ctx context.Context, st alarm.Status, remove bool) error {
+	var payload []byte
+	if !remove {
+		b, err := json.Marshal(struct {
+			SchemaVersion int `json:"schemaVersion"`
+			alarm.Status
+		}{1, st})
+		if err != nil {
+			return err
+		}
+		payload = b
+	}
+	return m.publishAlarmID(ctx, st.ID, payload)
+}
+
+// publishAlarmID 发布一条报警消息；payload 为 nil 表示清空 retained。
+//
+// MQTT 规范里「零长度 retained 载荷」就是删除该主题的 retained 消息。
+// 这是唯一能让已删规则从消费方视野里彻底消失的方式。
+func (m *mqttSink) publishAlarmID(ctx context.Context, id string, payload []byte) error {
+	if err := m.client.Publish(ctx, mqtt.Message{
+		Topic: m.alarmTopic(id), Payload: payload, QoS: m.qos, Retain: true,
+	}); err != nil {
+		return err
+	}
+	m.published.Add(1)
+	m.count("alarm")
+	return nil
 }

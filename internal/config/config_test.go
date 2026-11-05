@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"uic/internal/alarm"
 	"uic/internal/driver"
 	"uic/internal/driver/computed"
 	"uic/internal/driver/modbus"
@@ -770,4 +771,109 @@ func TestValidateComputedCrossDeviceCycle(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "cycle") {
 		t.Fatalf("cross-device cycle must be rejected, got %v", err)
 	}
+}
+
+func TestValidateAlarms(t *testing.T) {
+	registerDrivers(t)
+
+	withAlarm := func(r alarm.Rule) *File {
+		f := baseFile()
+		f.Alarms = []alarm.Rule{r}
+		return f
+	}
+	high := func(v float64) *float64 { return &v }
+
+	t.Run("accepts threshold rule", func(t *testing.T) {
+		f := withAlarm(alarm.Rule{ID: "over-heat", Point: "dev1:p1", High: high(80)})
+		if err := f.Validate(); err != nil {
+			t.Fatalf("validate: %v", err)
+		}
+		// Normalize 补默认级别。
+		if f.Alarms[0].Severity != alarm.SeverityWarning {
+			t.Fatalf("severity = %q", f.Alarms[0].Severity)
+		}
+	})
+
+	t.Run("accepts expression rule", func(t *testing.T) {
+		f := withAlarm(alarm.Rule{ID: "ratio", Expr: "dev1:p1 / 2 > 10", Severity: alarm.SeverityInfo})
+		if err := f.Validate(); err != nil {
+			t.Fatalf("validate: %v", err)
+		}
+	})
+
+	t.Run("accepts rule with delays", func(t *testing.T) {
+		f := withAlarm(alarm.Rule{
+			ID: "delayed", Point: "dev1:p1", High: high(10), Hysteresis: 1,
+			OnDelay: model.Duration(3 * time.Second), OffDelay: model.Duration(5 * time.Second),
+		})
+		if err := f.Validate(); err != nil {
+			t.Fatalf("validate: %v", err)
+		}
+	})
+
+	// 停用的规则也要校验：它随时可能被重新启用，而没人会重新检查一遍。
+	t.Run("disabled rule is still validated", func(t *testing.T) {
+		f := withAlarm(alarm.Rule{ID: "off", Point: "nobody:x", High: high(1), Disabled: true})
+		if err := f.Validate(); err == nil || !strings.Contains(err.Error(), "does not exist") {
+			t.Fatalf("err = %v", err)
+		}
+	})
+
+	cases := []struct {
+		name  string
+		rules []alarm.Rule
+		want  string
+	}{
+		{"missing point", []alarm.Rule{{ID: "a", Point: "dev1:missing", High: high(1)}}, "does not exist"},
+		{"missing device", []alarm.Rule{{ID: "a", Point: "ghost:p1", High: high(1)}}, "does not exist"},
+		{"malformed point", []alarm.Rule{{ID: "a", Point: "p1", High: high(1)}}, "device:point"},
+		{"threshold on text point", []alarm.Rule{{ID: "a", Point: "dev1:label", High: high(1)}}, "cannot be compared"},
+		{"threshold on bool point", []alarm.Rule{{ID: "a", Point: "dev1:flag", High: high(1)}}, "cannot be compared"},
+		{"expr references bool point", []alarm.Rule{{ID: "a", Expr: "dev1:flag > 0"}}, "cannot be compared"},
+		{"expr references missing point", []alarm.Rule{{ID: "a", Expr: "dev1:p1 > nobody:x"}}, "does not exist"},
+		{"duplicate id", []alarm.Rule{
+			{ID: "dup", Point: "dev1:p1", High: high(1)},
+			{ID: "dup", Point: "dev1:p1", Low: high(1)},
+		}, "duplicate id"},
+		{"rule level error", []alarm.Rule{{ID: "a"}}, "one of"},
+		{"bad severity", []alarm.Rule{{ID: "a", Point: "dev1:p1", High: high(1), Severity: "fatal"}}, "severity"},
+		{"high equals low", []alarm.Rule{{ID: "a", Point: "dev1:p1", High: high(5), Low: high(5)}}, "greater than low"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			f := baseFile()
+			// 文本 / 布尔点位是「不可比较」的对照组。
+			f.Devices[0].Points = append(f.Devices[0].Points,
+				model.Point{ID: "label", DataType: model.TypeString, Enabled: true,
+					Address: model.Address{Kind: model.AddressRegister, Area: "holding", Offset: 4, Length: 1, Bit: -1}},
+				model.Point{ID: "flag", DataType: model.TypeBool, Enabled: true,
+					Address: model.Address{Kind: model.AddressRegister, Area: "coil", Offset: 0, Length: 1, Bit: -1}},
+			)
+			f.Alarms = c.rules
+			err := f.Validate()
+			if err == nil {
+				t.Fatalf("expected error containing %q", c.want)
+			}
+			if !strings.Contains(err.Error(), c.want) {
+				t.Fatalf("err = %v, want mention of %q", err, c.want)
+			}
+		})
+	}
+
+	// 报警规则参与版本哈希：只改一条规则的阈值也必须产生新版本。
+	t.Run("alarms affect config version", func(t *testing.T) {
+		f1 := withAlarm(alarm.Rule{ID: "a", Point: "dev1:p1", High: high(1)})
+		f2 := withAlarm(alarm.Rule{ID: "a", Point: "dev1:p1", High: high(2)})
+		if err := f1.Validate(); err != nil {
+			t.Fatal(err)
+		}
+		if err := f2.Validate(); err != nil {
+			t.Fatal(err)
+		}
+		c1, _ := f1.Canonical()
+		c2, _ := f2.Canonical()
+		if VersionOf(c1) == VersionOf(c2) {
+			t.Fatal("changing a threshold must change the config version")
+		}
+	})
 }

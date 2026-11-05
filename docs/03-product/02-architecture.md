@@ -262,7 +262,7 @@ type Gate struct {
 | journal | 高 | 可丢 | 追加写 + 批量 flush，不逐条 fsync |
 | 历史 | 高 | 可丢 | 有界 + 降采样 |
 
-`journal.ndjson` 与 `outbox/` 的区别在于**职责**：Outbox 是「还没送出去的东西」，会被确认、删除、压缩；journal 是「已经发生的事实」，只追加、不删除，由外部轮转或运维清理。因此 journal 不参与 Outbox 的三重上限判定，它的增长由磁盘容量与日志轮转策略兜底。开启方式见 `03-domain-model.md` §10.0.1。
+`journal.ndjson` 与 `outbox/` 的区别在于**职责**：Outbox 是「还没送出去的东西」，会被确认、删除、压缩；journal 是「已经发生的事实」，只追加、不删除，由外部轮转或运维清理。因此 journal 不参与 Outbox 的三重上限判定，它的增长由磁盘容量与日志轮转策略兜底。开启方式见 `03-domain-model.md` §11.0.1。
 
 ---
 

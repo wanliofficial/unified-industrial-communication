@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"uic/internal/alarm"
 	"uic/internal/config"
 	"uic/internal/northbound/httpapi"
 )
@@ -230,6 +231,25 @@ func (r *Runtime) Command(ctx context.Context, action string, params map[string]
 		r.level.Set(level)
 		return map[string]any{"level": r.level.Level().String()}, nil
 
+	case "alarm.ack":
+		by := ""
+		if v, ok := params["by"].(string); ok {
+			by = v
+		}
+		all := false
+		if v, ok := params["all"].(bool); ok {
+			all = v
+		}
+		ids, err := stringList(params["ids"])
+		if err != nil {
+			return nil, err
+		}
+		out, err := r.AckAlarms(ctx, ids, all, by)
+		if err != nil {
+			return nil, err
+		}
+		return map[string]any{"acknowledged": out, "total": len(out)}, nil
+
 	case "diag.bundle":
 		return map[string]any{
 			"endpoint": "/api/v1/diagnostics/bundle",
@@ -249,6 +269,31 @@ func strParam(p map[string]any, key string) (string, error) {
 		return "", httpapi.Errf(http.StatusBadRequest, "request.invalid", "param %q must be a non-empty string", key)
 	}
 	return s, nil
+}
+
+// stringList 接受 JSON 数组（[]any）或单个字符串。
+func stringList(v any) ([]string, error) {
+	switch t := v.(type) {
+	case nil:
+		return nil, nil
+	case string:
+		if strings.TrimSpace(t) == "" {
+			return nil, nil
+		}
+		return []string{t}, nil
+	case []any:
+		out := make([]string, 0, len(t))
+		for _, item := range t {
+			s, ok := item.(string)
+			if !ok || strings.TrimSpace(s) == "" {
+				return nil, httpapi.Errf(http.StatusBadRequest, "request.invalid",
+					"ids must be a list of non-empty strings")
+			}
+			out = append(out, s)
+		}
+		return out, nil
+	}
+	return nil, httpapi.Errf(http.StatusBadRequest, "request.invalid", "ids must be a string or a list of strings")
 }
 
 func confirmed(p map[string]any) bool {
@@ -321,6 +366,17 @@ func (r *Runtime) DiagnosticsBundle(_ context.Context) ([]byte, error) {
 	if r.box != nil {
 		stats, _ := json.MarshalIndent(r.box.Stats(), "", "  ")
 		if err := add("outbox.json", stats); err != nil {
+			return nil, err
+		}
+	}
+	if r.alarms != nil {
+		// 规则与状态一起导出：只有状态看不出「为什么没报警」。
+		alarms, _ := json.MarshalIndent(map[string]any{
+			"rules":  r.alarms.Rules(),
+			"status": r.alarms.List(alarm.Filter{}),
+			"counts": r.alarms.Counts(),
+		}, "", "  ")
+		if err := add("alarms.json", alarms); err != nil {
 			return nil, err
 		}
 	}

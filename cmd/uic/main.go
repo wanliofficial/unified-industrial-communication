@@ -245,6 +245,15 @@ func checkConfig(path string) int {
 		points += len(d.Points)
 	}
 	fmt.Printf("  points      %d\n", points)
+	if len(f.Alarms) > 0 {
+		enabled := 0
+		for _, a := range f.Alarms {
+			if !a.Disabled {
+				enabled++
+			}
+		}
+		fmt.Printf("  alarms      %d（启用 %d）\n", len(f.Alarms), enabled)
+	}
 	fmt.Printf("  drivers     %d（%s）\n", len(driver.List()), driverIDs())
 	sinks := []string{}
 	if f.Northbound.Webhook.Enabled {

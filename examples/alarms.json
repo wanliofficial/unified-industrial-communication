@@ -1,0 +1,145 @@
+{
+  "schemaVersion": 1,
+  "site": "alarm-site",
+  "server": {
+    "listen": "127.0.0.1:8091",
+    "tls": {
+      "enabled": false
+    }
+  },
+  "channels": [
+    {
+      "id": "ch-virtual",
+      "protocol": "virtual",
+      "transport": {
+        "kind": "memory"
+      },
+      "concurrency": 4,
+      "timeout": "2s"
+    }
+  ],
+  "devices": [
+    {
+      "id": "press",
+      "name": "压机（正弦功率 + 斜坡速率）",
+      "channel": "ch-virtual",
+      "interval": "500ms",
+      "timeout": "2s",
+      "enabled": true,
+      "points": [
+        {
+          "id": "power",
+          "name": "功率",
+          "address": {
+            "kind": "register",
+            "area": "holding",
+            "offset": 0,
+            "length": 2,
+            "bit": -1
+          },
+          "dataType": "float64",
+          "unit": "kW",
+          "enabled": true
+        },
+        {
+          "id": "rate",
+          "name": "速率",
+          "address": {
+            "kind": "register",
+            "area": "holding",
+            "offset": 2,
+            "length": 2,
+            "bit": -1
+          },
+          "dataType": "float64",
+          "unit": "次/min",
+          "enabled": true
+        }
+      ],
+      "labels": {
+        "mode": "sine"
+      }
+    }
+  ],
+  "alarms": [
+    {
+      "id": "high-power",
+      "name": "功率过高",
+      "severity": "warning",
+      "message": "压机功率超过 70kW 持续 2 秒，检查液压系统",
+      "point": "press:power",
+      "high": 70,
+      "hysteresis": 5,
+      "onDelay": "2s",
+      "offDelay": "3s"
+    },
+    {
+      "id": "low-power",
+      "name": "功率过低（空转）",
+      "severity": "info",
+      "message": "功率低于 25kW 持续 1 秒，可能处于空转状态",
+      "point": "press:power",
+      "low": 25,
+      "hysteresis": 3,
+      "onDelay": "1s"
+    },
+    {
+      "id": "power-rate-mismatch",
+      "name": "功率与速率不匹配",
+      "severity": "critical",
+      "message": "高功率同时高转速，检查工艺参数",
+      "expr": "press:power > 50 && press:rate > 50",
+      "onDelay": "500ms"
+    },
+    {
+      "id": "peak-spike",
+      "name": "功率尖峰（自动确认）",
+      "severity": "warning",
+      "message": "功率超过 84kW；纯提示类报警，恢复即归位",
+      "point": "press:power",
+      "high": 84,
+      "hysteresis": 2,
+      "autoAck": true
+    },
+    {
+      "id": "maintenance-window",
+      "name": "维护窗口（默认停用）",
+      "severity": "info",
+      "message": "维护期间不报警；停用规则同样参与配置校验",
+      "point": "press:power",
+      "high": 60,
+      "hysteresis": 2,
+      "disabled": true
+    }
+  ],
+  "northbound": {
+    "mqtt": {
+      "enabled": false,
+      "broker": "tcp://127.0.0.1:1883",
+      "topic": "uic/{site}/{device}/{point}/value",
+      "qos": 1
+    },
+    "opcua": {
+      "enabled": false,
+      "listen": ":4840",
+      "policy": "Basic256Sha256"
+    },
+    "webhook": {
+      "enabled": false,
+      "url": "http://127.0.0.1:9999/ingest",
+      "timeout": "3s",
+      "batch": 50
+    }
+  },
+  "storage": {
+    "dir": "./data-alarms",
+    "outboxMaxBytes": 8388608,
+    "outboxMaxRecords": 20000,
+    "outboxTtl": "1h0m0s",
+    "journal": false
+  },
+  "logging": {
+    "level": "info",
+    "format": "json"
+  }
+}

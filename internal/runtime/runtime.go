@@ -28,6 +28,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"uic/internal/alarm"
 	"uic/internal/cache"
 	"uic/internal/config"
 	"uic/internal/driver"
@@ -76,6 +77,7 @@ type Runtime struct {
 	journal     *os.File
 	journalSink *journalSink
 	mqttSink    *mqttSink
+	alarms      *alarm.Engine
 
 	mu          sync.Mutex
 	collectors  map[string]*collector
@@ -192,6 +194,12 @@ func New(opt Options) (*Runtime, error) {
 		}
 		return nil, err
 	}
+	if err := r.openAlarms(mgr.Current()); err != nil {
+		if logFile != nil {
+			_ = logFile.Close()
+		}
+		return nil, err
+	}
 	if err := r.openSlaves(mgr.Current()); err != nil {
 		if logFile != nil {
 			_ = logFile.Close()
@@ -239,6 +247,12 @@ func (r *Runtime) declareMetrics() {
 	d("uic_slave_requests_total", "counter", "从站请求数（按单元/功能码/结果）")
 	d("uic_slave_degraded_reads_total", "counter", "从站用非好质量数据应答的次数")
 	d("uic_slave_write_total", "counter", "从站写入转发次数与结果")
+	d("uic_alarm_events_total", "counter", "报警状态迁移次数（按类型/级别）")
+	d("uic_alarm_active", "gauge", "当前未恢复的报警数（按级别，含已确认）")
+	d("uic_alarm_pending", "gauge", "处于 onDelay 等待期的报警数")
+	d("uic_alarm_cleared", "gauge", "已恢复但未确认的报警数")
+	d("uic_alarm_unknown", "gauge", "最近一次评估时输入不可信的报警数")
+	d("uic_alarm_rules", "gauge", "已加载的报警规则数")
 }
 
 // build 按配置创建采集器并注册到调度器。
@@ -291,6 +305,16 @@ func (r *Runtime) Start(ctx context.Context) {
 	}
 	r.ctx, r.cancel = context.WithCancel(ctx)
 	r.sched.Start(r.ctx)
+	if r.alarms != nil {
+		r.alarms.Start(r.ctx)
+		r.wg.Add(1)
+		go r.alarmSampleLoop(r.ctx)
+		r.wg.Add(1)
+		go r.alarmEventLoop(r.ctx)
+		// 先播种再开采集：这样第一条状态迁移（可能在 200ms 内就发生）
+		// 不会在 sink 还没拿到初始快照时把它覆盖掉。
+		r.seedAlarmSink()
+	}
 	for name, fn := range r.sinks {
 		sink, deliver := name, fn
 		r.wg.Add(1)
@@ -317,6 +341,9 @@ func (r *Runtime) Stop(timeout time.Duration) error {
 		r.cancel()
 	}
 	_ = r.sched.Close(timeout / 2)
+	if r.alarms != nil {
+		r.alarms.Stop()
+	}
 
 	done := make(chan struct{})
 	go func() { r.wg.Wait(); close(done) }()
@@ -546,6 +573,16 @@ func (r *Runtime) reload(before *config.File) []string {
 		r.markDisabled(nd)
 		restarted = append(restarted, id)
 	}
+	if r.alarms != nil {
+		if err := r.alarms.Reload(after.Alarms); err != nil {
+			// 配置层已校验过，走到这里说明有校验没覆盖到的路径。保留旧规则
+			// 比让引擎处于未知状态安全，但必须留下显式日志。
+			r.log.Error("alarm_reload_failed", "error", errText(err))
+		}
+		// 规则集变化会改变「规则总数」这类 gauge；纯元数据变更（改名）不发
+		// 事件，等下一次迁移再刷新就会长期显示旧值。
+		r.refreshAlarmMetrics()
+	}
 	restarted = append(restarted, r.syncSlaves(after)...)
 	sort.Strings(restarted)
 	if len(restarted) > 0 {
@@ -589,6 +626,7 @@ func (r *Runtime) Health() httpapi.Health {
 		UptimeSeconds: int64(time.Since(r.startedAt).Seconds()),
 		Version:       r.version.Version,
 		ConfigVersion: r.cfg.Version(),
+		Alarms:        r.AlarmCounts(),
 	}
 	for _, st := range sts {
 		h.Devices.Total++

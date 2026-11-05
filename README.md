@@ -112,6 +112,23 @@ curl -s localhost:8089/api/v1/points | jq '.items[] | {point, value, quality}'
 （`line-a:power-1` 是引用，`line-a:power - 1` 才是减法）。质量沿依赖传播：
 任一输入不可用则不计算，输出取最差质量并指明是哪个输入。
 
+报警（阈值 / 滞回 / 延时 / 确认）：
+
+```bash
+./uic -config examples/alarms.json            # REST :8091
+curl -s localhost:8091/api/v1/alarms | jq '.counts'
+curl -s 'localhost:8091/api/v1/alarms?state=active' | jq '.items[] | {id,state,value}'
+curl -s -X POST localhost:8091/api/v1/alarms/high-power/ack -d '{"by":"operator-1"}' | jq
+curl -sN 'localhost:8091/api/v1/alarms/stream?heartbeat=5s'   # 事件流
+```
+
+示例里压机功率是一条 10~90kW 的正弦波，5 条规则演示了阈值 + 滞回 + `onDelay`
+（功率过高）、低阈值（空转）、布尔表达式（功率与速率不匹配）、`autoAck`（尖峰）
+与 `disabled`（维护窗口）。三条语义必须记住：**延时是「连续满足」**，中途抖动
+清零；**输入质量不可信时不动状态机**——数据断了既不当成「正常」也不当成「报警」；
+**`active` 与 `cleared` 都需要人确认**，前者转 `acked`，后者转 `normal`，另外
+`pending` 不可确认（否则等于允许提前消音）。
+
 ## 文档
 
 - **[docs/00-README.md](docs/00-README.md)** — 总索引：阅读路径、38 个参考方案总览、结论速查、代码地图、接口速查、实现边界
@@ -137,6 +154,7 @@ go test -race -count=1 ./...
 | `internal/model` | 通道 / 设备 / 点位 / 地址 / 采样 / 质量码 |
 | `internal/driver` | 驱动契约（Codec / Transport / Driver）、错误分类、注册表、只读 `Lookup` 注入 |
 | `internal/calc` | 零依赖表达式引擎（编译期类型检查、短路求值、引用 `device:point`） |
+| `internal/alarm` | 报警引擎：五态机 / 滞回 / 延时 / 表达式规则 / 确认 / 订阅 |
 | `internal/codec/modbus` | Modbus 纯函数编解码（主站与从站共用） |
 | `internal/codec/value` | 协议无关值编解码（重排 / 数值 / 字符串 / BCD） |
 | `internal/codec/s7` | S7 纯函数编解码（TPKT / COTP / S7 PDU） |

@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"uic/internal/alarm"
 	"uic/internal/cache"
 	"uic/internal/config"
 	"uic/internal/model"
@@ -42,6 +43,11 @@ type fakeBackend struct {
 	streamFn func(filter func(model.Sample) bool, buffer int) (<-chan cache.Event, func())
 
 	bundle []byte
+
+	alarms      []alarm.Status
+	alarmCounts alarm.Counts
+	ackFn       func(ctx context.Context, ids []string, all bool, by string) ([]alarm.Status, error)
+	alarmCh     chan alarm.Event
 
 	mu       sync.Mutex
 	recorded []string
@@ -140,6 +146,80 @@ func (f *fakeBackend) Stream(filter func(model.Sample) bool, buffer int) (<-chan
 	}
 	ch := make(chan cache.Event, buffer)
 	return ch, func() { close(ch) }
+}
+
+func (f *fakeBackend) Alarms(fl alarm.Filter) []alarm.Status {
+	out := make([]alarm.Status, 0, len(f.alarms))
+	for _, st := range f.alarms {
+		if len(fl.States) > 0 && !slicesContainsState(fl.States, st.State) {
+			continue
+		}
+		if len(fl.Severities) > 0 {
+			ok := false
+			for _, want := range fl.Severities {
+				if st.Severity == want {
+					ok = true
+				}
+			}
+			if !ok {
+				continue
+			}
+		}
+		out = append(out, st)
+	}
+	return out
+}
+
+func (f *fakeBackend) Alarm(id string) (alarm.Status, bool) {
+	for _, st := range f.alarms {
+		if st.ID == id {
+			return st, true
+		}
+	}
+	return alarm.Status{}, false
+}
+
+func (f *fakeBackend) AlarmCounts() alarm.Counts { return f.alarmCounts }
+
+func (f *fakeBackend) AckAlarms(ctx context.Context, ids []string, all bool, by string) ([]alarm.Status, error) {
+	if f.ackFn != nil {
+		return f.ackFn(ctx, ids, all, by)
+	}
+	var out []alarm.Status
+	for _, st := range f.alarms {
+		if all || slicesContains(ids, st.ID) {
+			st.State = alarm.StateAcked
+			st.Acknowledged = true
+			st.AckBy = by
+			out = append(out, st)
+		}
+	}
+	return out, nil
+}
+
+func slicesContainsState(hay []alarm.State, needle alarm.State) bool {
+	for _, s := range hay {
+		if s == needle {
+			return true
+		}
+	}
+	return false
+}
+
+func slicesContains(hay []string, needle string) bool {
+	for _, s := range hay {
+		if s == needle {
+			return true
+		}
+	}
+	return false
+}
+
+func (f *fakeBackend) AlarmStream(buffer int) (<-chan alarm.Event, func()) {
+	if f.alarmCh == nil {
+		f.alarmCh = make(chan alarm.Event, buffer)
+	}
+	return f.alarmCh, func() {}
 }
 
 func (f *fakeBackend) DiagnosticsBundle(ctx context.Context) ([]byte, error) {
@@ -730,5 +810,257 @@ func TestWriteResultsShape(t *testing.T) {
 	json.Unmarshal(rec.Body.Bytes(), &got)
 	if len(got.Results) != 1 || got.Results[0].Code != "point.not_found" {
 		t.Fatalf("results = %+v", got.Results)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 报警
+// ---------------------------------------------------------------------------
+
+func alarmServer(t *testing.T) (*Server, *fakeBackend) {
+	t.Helper()
+	s, be := newServer(t, Options{})
+	be.health = Health{Status: "ok", Alarms: alarm.Counts{Total: 3, Active: 1, Cleared: 1, Unknown: 1}}
+	be.alarmCounts = be.health.Alarms
+	be.alarms = []alarm.Status{
+		{ID: "high-temp", Name: "高温", Severity: alarm.SeverityCritical, State: alarm.StateActive,
+			Active: true, Count: 2, Message: "temperature above limit",
+			UpdatedAt: time.Unix(1000, 0).UTC()},
+		{ID: "low-level", Name: "低液位", Severity: alarm.SeverityWarning, State: alarm.StateCleared,
+			Count: 1, UpdatedAt: time.Unix(1001, 0).UTC()},
+		{ID: "ratio", Severity: alarm.SeverityInfo, State: alarm.StateNormal,
+			UpdatedAt: time.Unix(1002, 0).UTC()},
+	}
+	return s, be
+}
+
+func TestAlarmsList(t *testing.T) {
+	s, be := alarmServer(t)
+
+	rec := httptest.NewRecorder()
+	s.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/v1/alarms", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code = %d body = %s", rec.Code, rec.Body)
+	}
+	var env struct {
+		Items  []alarm.Status `json:"items"`
+		Total  int            `json:"total"`
+		Counts alarm.Counts   `json:"counts"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &env); err != nil {
+		t.Fatal(err)
+	}
+	if env.Total != 3 || len(env.Items) != 3 {
+		t.Fatalf("total = %d items = %d", env.Total, len(env.Items))
+	}
+	if env.Counts.Active != 1 || env.Counts.Total != 3 {
+		t.Fatalf("counts = %+v", env.Counts)
+	}
+	if env.Items[0].ID != "high-temp" || env.Items[0].State != alarm.StateActive {
+		t.Fatalf("first item = %+v", env.Items[0])
+	}
+
+	// 过滤条件透传给 backend。
+	rec = httptest.NewRecorder()
+	s.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/v1/alarms?state=active,cleared&severity=warning", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code = %d body = %s", rec.Code, rec.Body)
+	}
+	if !strings.Contains(rec.Body.String(), `"total":1`) {
+		t.Fatalf("filtered body = %s", rec.Body)
+	}
+
+	// 未知取值必须报错：静默忽略会返回「全部规则」，看起来像过滤生效了。
+	for _, q := range []string{"state=bogus", "severity=fatal"} {
+		rec = httptest.NewRecorder()
+		s.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/v1/alarms?"+q, nil))
+		if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "request.invalid") {
+			t.Fatalf("%s: code = %d body = %s", q, rec.Code, rec.Body)
+		}
+	}
+	_ = be
+}
+
+func TestAlarmGet(t *testing.T) {
+	s, _ := alarmServer(t)
+
+	rec := httptest.NewRecorder()
+	s.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/v1/alarms/low-level", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code = %d body = %s", rec.Code, rec.Body)
+	}
+	var st alarm.Status
+	if err := json.Unmarshal(rec.Body.Bytes(), &st); err != nil {
+		t.Fatal(err)
+	}
+	if st.ID != "low-level" || st.State != alarm.StateCleared {
+		t.Fatalf("status = %+v", st)
+	}
+
+	rec = httptest.NewRecorder()
+	s.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/v1/alarms/nope", nil))
+	if rec.Code != http.StatusNotFound || !strings.Contains(rec.Body.String(), "alarm.not_found") {
+		t.Fatalf("code = %d body = %s", rec.Code, rec.Body)
+	}
+}
+
+func TestAlarmAckSingle(t *testing.T) {
+	s, be := alarmServer(t)
+	var gotBy string
+	be.ackFn = func(_ context.Context, ids []string, all bool, by string) ([]alarm.Status, error) {
+		gotBy = by
+		if all || len(ids) != 1 || ids[0] != "high-temp" {
+			t.Fatalf("ids = %v all = %v", ids, all)
+		}
+		return []alarm.Status{{ID: "high-temp", State: alarm.StateAcked, Acknowledged: true, AckBy: by}}, nil
+	}
+
+	// 空 body：允许（只靠路径 ID）。
+	rec := httptest.NewRecorder()
+	s.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/api/v1/alarms/high-temp/ack", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code = %d body = %s", rec.Code, rec.Body)
+	}
+	if gotBy != "" {
+		t.Fatalf("by = %q", gotBy)
+	}
+	if !strings.Contains(rec.Body.String(), `"acknowledged"`) || !strings.Contains(rec.Body.String(), `"total":1`) {
+		t.Fatalf("body = %s", rec.Body)
+	}
+
+	// 带操作人。
+	rec = httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/alarms/high-temp/ack", strings.NewReader(`{"by":"alice"}`))
+	s.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK || gotBy != "alice" {
+		t.Fatalf("code = %d by = %q body = %s", rec.Code, gotBy, rec.Body)
+	}
+
+	// 单条确认不允许再用 body 指定 ids/all。
+	rec = httptest.NewRecorder()
+	s.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/api/v1/alarms/high-temp/ack", strings.NewReader(`{"all":true}`)))
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("code = %d body = %s", rec.Code, rec.Body)
+	}
+
+	// by 过长。
+	rec = httptest.NewRecorder()
+	s.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/api/v1/alarms/high-temp/ack",
+		strings.NewReader(`{"by":"`+strings.Repeat("x", 65)+`"}`)))
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("code = %d body = %s", rec.Code, rec.Body)
+	}
+}
+
+func TestAlarmAckErrorsPassThrough(t *testing.T) {
+	s, be := alarmServer(t)
+	be.ackFn = func(context.Context, []string, bool, string) ([]alarm.Status, error) {
+		return nil, Errf(http.StatusConflict, "alarm.not_active", "alarm %q is normal", "high-temp")
+	}
+	rec := httptest.NewRecorder()
+	s.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/api/v1/alarms/high-temp/ack", nil))
+	if rec.Code != http.StatusConflict || !strings.Contains(rec.Body.String(), "alarm.not_active") {
+		t.Fatalf("code = %d body = %s", rec.Code, rec.Body)
+	}
+}
+
+func TestAlarmsAckBatch(t *testing.T) {
+	s, be := alarmServer(t)
+	var gotIDs []string
+	var gotAll bool
+	var gotBy string
+	be.ackFn = func(_ context.Context, ids []string, all bool, by string) ([]alarm.Status, error) {
+		gotIDs, gotAll, gotBy = ids, all, by
+		return []alarm.Status{{ID: "high-temp", State: alarm.StateAcked, Acknowledged: true}}, nil
+	}
+
+	post := func(body string) *httptest.ResponseRecorder {
+		rec := httptest.NewRecorder()
+		s.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/api/v1/alarms/ack", strings.NewReader(body)))
+		return rec
+	}
+
+	if rec := post(`{"ids":["high-temp","low-level"],"by":"bob"}`); rec.Code != http.StatusOK {
+		t.Fatalf("code = %d body = %s", rec.Code, rec.Body)
+	}
+	if len(gotIDs) != 2 || gotAll || gotBy != "bob" {
+		t.Fatalf("ids = %v all = %v by = %q", gotIDs, gotAll, gotBy)
+	}
+
+	if rec := post(`{"all":true}`); rec.Code != http.StatusOK || !gotAll {
+		t.Fatalf("all: code = %d body = %s", rec.Code, rec.Body)
+	}
+
+	// 参数互斥与缺省。
+	for _, body := range []string{`{}`, `{"all":true,"ids":["x"]}`, `{"ids":[]}`} {
+		if rec := post(body); rec.Code != http.StatusBadRequest {
+			t.Fatalf("%s: code = %d body = %s", body, rec.Code, rec.Body)
+		}
+	}
+}
+
+func TestAlarmStream(t *testing.T) {
+	s, be := alarmServer(t)
+	srv := httptest.NewServer(s)
+	defer srv.Close()
+
+	req, _ := http.NewRequest(http.MethodGet, srv.URL+"/api/v1/alarms/stream?heartbeat=1s", nil)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if ct := resp.Header.Get("Content-Type"); !strings.HasPrefix(ct, "text/event-stream") {
+		t.Fatalf("content-type = %q", ct)
+	}
+
+	be.alarmCh <- alarm.Event{
+		Type: alarm.EventRaised, At: time.Unix(2000, 0).UTC(), From: alarm.StateNormal,
+		Status: alarm.Status{ID: "high-temp", Severity: alarm.SeverityCritical, State: alarm.StateActive, Active: true},
+	}
+
+	br := bufio.NewReader(resp.Body)
+	readEvent := func() string {
+		var lines []string
+		for {
+			line, err := br.ReadString('\n')
+			if err != nil {
+				t.Fatalf("read: %v (got %v)", err, lines)
+			}
+			trimmed := strings.TrimRight(line, "\n")
+			if trimmed == "" {
+				return strings.Join(lines, "\n")
+			}
+			lines = append(lines, trimmed)
+		}
+	}
+	hello := readEvent()
+	if !strings.Contains(hello, "event: hello") || !strings.Contains(hello, `"active":1`) {
+		t.Fatalf("hello = %s", hello)
+	}
+	joined := readEvent()
+	if !strings.Contains(joined, "event: raised") {
+		t.Fatalf("missing event name:\n%s", joined)
+	}
+	if !strings.Contains(joined, `"id":"high-temp"`) {
+		t.Fatalf("missing status payload:\n%s", joined)
+	}
+}
+
+func TestHealthIncludesAlarmCounts(t *testing.T) {
+	s, _ := alarmServer(t)
+	rec := httptest.NewRecorder()
+	s.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/v1/health", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code = %d", rec.Code)
+	}
+	var h struct {
+		Alarms alarm.Counts `json:"alarms"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &h); err != nil {
+		t.Fatal(err)
+	}
+	if h.Alarms.Total != 3 || h.Alarms.Active != 1 || h.Alarms.Cleared != 1 {
+		t.Fatalf("alarms = %+v", h.Alarms)
 	}
 }

@@ -2,7 +2,7 @@
 
 > **版本**：API v1（`/api/v1`）
 > **上游**：`01-prd.md` FR-NOR-*、`02-architecture.md` §4.3
-> **代码对应**：`internal/northbound/httpapi`（REST + SSE）、`internal/mqtt` + `internal/runtime/mqtt_sink.go`（MQTT）；OPC UA 在 Wave 1 后半实现
+> **代码对应**：`internal/northbound/httpapi`（REST + SSE）、`internal/mqtt` + `internal/runtime/mqtt_sink.go`（MQTT）、`internal/alarm`（报警引擎）；OPC UA 在 Wave 1 后半实现
 > **原则**：一个数据契约，四种传输（REST / SSE / MQTT / OPC UA）；语义一致，表达不同。
 
 ---
@@ -342,6 +342,7 @@ POST /api/v1/commands
 | `outbox.flush` | `sink?` | `system.control` | 手动触发补发 |
 | `outbox.drop` | `sink`, `before` | `system.control` | 丢弃指定时间前消息 |
 | `config.rollback` | `version` | `config.rollback` | 同 4.4 |
+| `alarm.ack` | `ids` 或 `all`, `by` | `alarm.ack` | 同 4.7 的确认语义 |
 | `log.level` | `level` | `system.control` | 动态调整日志级别 |
 | `diag.bundle` | — | `system.read` | 生成诊断包 |
 
@@ -362,8 +363,250 @@ manifest.json        版本/时间/站点/配置哈希
 config.redacted.json 脱敏配置（口令→***）
 metrics.txt          指标快照
 logs/uic.log         最近 5000 行
-health.json          健康快照
+health.json          健康快照（含报警计数）
 devices.json         设备状态与统计
+alarms.json          报警规则 + 当前状态 + 计数
+outbox.json          待投递队列水位（启用北向时）
+```
+
+### 4.7 报警
+
+> **状态**：已实现（`internal/alarm` + `internal/runtime/alarm.go`）。
+
+报警不是「点位值超过阈值」的同义词，而是**有生命周期、需要人确认**的对象。
+把它做成一串无状态的事件，会让「谁在什么时候处理了哪一条」永久丢失；做成
+一个布尔值，则无法区分「正在报警」与「已经恢复但没人看过」。
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| GET | `/api/v1/alarms` | 列表（`state`/`severity`/`q`/`limit` 过滤） |
+| GET | `/api/v1/alarms/{id}` | 单条当前状态 |
+| POST | `/api/v1/alarms/{id}/ack` | 确认单条 |
+| POST | `/api/v1/alarms/ack` | 批量确认 / 全部确认 |
+| GET | `/api/v1/alarms/stream` | SSE 状态迁移流（见 5.4） |
+
+**列表响应**：
+
+```json
+{
+  "items": [
+    {
+      "id": "high-power",
+      "name": "功率过高",
+      "severity": "warning",
+      "message": "压机功率超过 70kW 持续 2 秒，检查液压系统",
+      "state": "active",
+      "active": true,
+      "pending": false,
+      "acknowledged": false,
+      "count": 3,
+      "value": 73.4,
+      "valueKnown": true,
+      "quality": "good",
+      "since": "2026-11-05T10:40:48.534Z",
+      "updatedAt": "2026-11-05T10:41:06.736Z",
+      "ackAt": null,
+      "ackBy": "",
+      "clearedAt": null,
+      "reason": ""
+    }
+  ],
+  "total": 1,
+  "counts": { "total": 5, "normal": 3, "pending": 0, "active": 1, "acked": 1, "cleared": 0, "unknown": 0 }
+}
+```
+
+| 过滤参数 | 取值 | 说明 |
+|---|---|---|
+| `state` | `normal,pending,active,acked,cleared` | 逗号分隔；未知值返回 400，**不静默忽略** |
+| `severity` | `info,warning,critical` | 同上 |
+| `q` | 子串 | 匹配 ID / 名称 / 消息，不区分大小写 |
+| `limit` | 正整数 | 0 表示不限制 |
+
+无条件返回**全部规则**（含 `normal`），不是只返回正在报警的：否则「没有报警」
+与「规则没加载」在响应里长得一模一样。
+
+**排序**：严重度降序 → 激活时间升序 → ID。这就是运维的处理顺序。
+
+**`reason`**：只有输入不可信时才非空（如 `input src:power: input quality is timeout`）。
+它不是错误码，是给人看的一句话——「为什么这条规则现在判不出来」。
+
+`count` 是累计触发次数（不清零）；`since` 是**最近一次进入 active** 的时刻，
+不是进入当前状态的时刻：运维关心的是「这个故障从什么时候开始的」。
+
+#### 4.7.1 状态机
+
+```
+                 条件成立且满足 onDelay
+      normal ───────────────────────────► active ◄──┐
+        ▲                                  │        │ 条件再次成立
+        │ 已确认过 / autoAck                │ ack    │
+        │                                  ▼        │
+        │                               acked ──────┘
+        │                                  │
+        │ 无条件 / 未经 onDelay             │ 条件恢复且满足 offDelay
+        ▼                                  ▼
+     pending ──条件消失──► normal        cleared
+        ▲                                  │
+        └──────── 条件再次成立 ◄────────────┘  ack
+```
+
+| 状态 | 需要人处理 | 可确认 | 含义 |
+|---|---|---|---|
+| `normal` | 否 | 否（409） | 条件不成立 |
+| `pending` | 否 | 否（409） | 条件成立，但还在 `onDelay` 等待期内 |
+| `active` | **是** | 是 | 正在报警，未确认 |
+| `acked` | 否 | 是（幂等） | 已确认，条件可能仍然成立 |
+| `cleared` | **是** | 是 | 条件已恢复，但这次报警还没人看过 |
+
+三条容易被忽略、但必须写进契约的规则：
+
+1. **`cleared` 与 `active` 都需要确认。** 只对「正在报警」要求确认，会在交接班
+   时丢掉刚刚恢复的故障——而那往往是最需要复盘的。
+2. **`pending` 不可确认。** 还没成为报警就确认，等于允许调用方「提前消音」，
+   随后真正的报警会被误认为已处理。
+3. **`acked` 的确认是幂等的。** 客户端重试返回 200，不覆盖首次的 `ackBy`/`ackAt`。
+
+#### 4.7.2 判定语义
+
+规则二选一（同时配置在配置期被拒绝）：
+
+```json
+{ "id": "high-power", "point": "press:power", "high": 70, "hysteresis": 5,
+  "onDelay": "2s", "offDelay": "3s", "severity": "warning" }
+```
+
+```json
+{ "id": "mismatch", "expr": "press:power > 50 && press:rate > 50",
+  "onDelay": "500ms", "severity": "critical" }
+```
+
+| 概念 | 语义 | 为什么这样定义 |
+|---|---|---|
+| `high` / `low` | 严格不等号触发（`v > high`、`v < low`） | 等于阈值不是越限，否则「刚好到达上限」会一直报警 |
+| `hysteresis` | 恢复阈值 = 触发阈值 ∓ 滞回量 | 值在阈值附近抖动时不会产生 raised/cleared 风暴 |
+| `onDelay` | **连续**满足多久才报警 | 断续抖动不该攒够时间就报警 |
+| `offDelay` | **连续**不满足多久才清除 | 同上；给「瞬时恢复又复发」一个观察窗口 |
+| 双侧阈值 | 任一侧越限触发，**仍在任一侧滞回带内**就维持 | 高侧的滞回带与低侧的滞回带分别判定，二者不重叠（配置期要求 `high - low > 2 × hysteresis`） |
+| 表达式 | 复用计算点的 `calc` 引擎，必须是布尔表达式 | 同一套词法/类型检查，避免第二套「迷你语言」 |
+
+**质量门控**（这是报警最容易被做错的地方）：
+
+| 输入质量 | 行为 |
+|---|---|
+| `good` / `uncertain` | 正常判定（`uncertain` 表示值可信但可能不新鲜） |
+| `stale` / `timeout` / `not_connected` / `comm_error` / `address_error` | **不改变状态机**，只更新 `valueKnown=false`、`quality`、`reason`；`pending` 被取消 |
+
+数据断了既不能当成「正常」（会掩盖真实故障），也不能当成「报警」（一次断线
+就是满屏假报警）。已经 `active`/`acked` 的报警保持原状：**看不见不等于好了**。
+
+布尔表达式做短路求值，未被求值的引用不参与质量判定：`false && dead:x > 0` 的
+结果确实是 `false`，不属于「未知」。
+
+#### 4.7.3 确认
+
+```http
+POST /api/v1/alarms/high-power/ack
+{ "by": "operator-1" }
+```
+
+```http
+POST /api/v1/alarms/ack
+{ "ids": ["high-power", "low-flow"], "by": "operator-1" }
+```
+
+```json
+{ "acknowledged": [ { "id": "high-power", "state": "acked", "ackBy": "operator-1" } ], "total": 1 }
+```
+
+| 场景 | 结果 |
+|---|---|
+| `active` / `cleared` | 200，转 `acked` / `normal`，发 `acknowledged` 事件 |
+| `acked` | 200（幂等），不发事件，不覆盖首次确认人 |
+| `normal` / `pending` | 409 `alarm.not_active` |
+| ID 不存在 | 404 `alarm.not_found` |
+| 批量里混入不可确认项 | 409，**整批不生效**（先整体校验再应用） |
+| `all: true` 与 `ids` 同时出现 | 400 `request.invalid` |
+
+批量操作必须原子：半完成的结果会让调用方无法判断该重试哪一条。`all: true`
+则相反——静默跳过不可确认项，因为「全部确认」的语义就是「能确认的都确认」。
+
+`by` 由调用方提供，不从 Token 推导：Token 是共享的接入凭据，不等同于
+「谁按下了确认」。为空表示匿名；上限 64 字节；会进审计日志与 `ackBy`。
+
+#### 4.7.4 配置与规则变更
+
+```json
+{
+  "alarms": [
+    {
+      "id": "high-power",
+      "name": "功率过高",
+      "severity": "warning",
+      "message": "压机功率超过 70kW 持续 2 秒",
+      "point": "press:power",
+      "high": 70,
+      "hysteresis": 5,
+      "onDelay": "2s",
+      "offDelay": "3s"
+    },
+    {
+      "id": "spike",
+      "point": "press:power",
+      "high": 84,
+      "hysteresis": 2,
+      "autoAck": true
+    },
+    {
+      "id": "maintenance",
+      "point": "press:power",
+      "high": 60,
+      "disabled": true
+    }
+  ]
+}
+```
+
+| 字段 | 默认 | 说明 |
+|---|---|---|
+| `severity` | `warning` | `info` / `warning` / `critical` |
+| `disabled` | `false` | **默认启用**——与设备相反：漏写 `enabled: true` 的设备会表现为「没数据」，而漏写的报警会表现为「一切正常」 |
+| `autoAck` | `false` | 恢复即归位，只适用于纯提示类报警 |
+| `onDelay` / `offDelay` | `0` | 上限 24h（48h 的延时几乎一定是把秒写成了小时） |
+| `hysteresis` | `0` | 双侧阈值要求 `high - low > 2 × hysteresis` |
+
+配置期静态校验：规则自洽、ID 唯一、引用的 `device:point` 存在、点位类型可比较
+（`bool` / `string` / `bytes` 一律拒绝）。这些错误等到运行时才发现，代价是
+一条永远 `unknown` 的报警——而没人会去看一条永远不响的报警。
+
+**规则变更的热更新语义**：只有「影响判定结果」的字段变化才重置状态（严重度、
+点位、阈值、滞回、延时、`autoAck`、`disabled`）；改 `name` / `message` 不会把
+一条正在报警的记录打成 `normal`。把一条正在报警的规则停用同样会重置并发
+`reset`——否则 retained 主题上会永远挂着一个既不能确认也不会恢复的 `active`
+报警。重置时发 `reset` 事件，删除规则时发 `removed` 事件——
+消费方必须能区分「故障恢复」与「规则被改掉」。
+
+#### 4.7.5 报警相关的健康与指标
+
+`GET /api/v1/health` 增加：
+
+```json
+{ "alarms": { "total": 5, "normal": 3, "pending": 0, "active": 1, "acked": 1, "cleared": 0, "unknown": 0 } }
+```
+
+`unknown` 统计最近一次评估时输入不可信的规则数。它不进 `status`（网关本身是
+健康的），但必须可见：一片 `unknown` 说明数据链路出了问题，而不是设备都正常。
+
+指标：
+
+```
+uic_alarm_events_total{type,severity}   状态迁移次数
+uic_alarm_active{severity}              当前未恢复的报警数（active + acked）
+uic_alarm_pending                       等待 onDelay 的规则数
+uic_alarm_cleared                       已恢复未确认的规则数
+uic_alarm_unknown                       输入不可信的规则数
+uic_alarm_rules                         已加载规则数
+uic_mqtt_publish_total{result="alarm"}  报警 retained 发布
 ```
 
 ---
@@ -411,6 +654,56 @@ data: {"ts":"..."}
 
 **`id:` 字段**：使用 `device:point:seq`，用于 `Last-Event-ID`。
 
+### 5.4 报警事件流
+
+```http
+GET /api/v1/alarms/stream?heartbeat=15s
+Accept: text/event-stream
+```
+
+与 `/api/v1/stream`（点位的值）**分开**：消费方完全不同——点位流是趋势图和
+实时值，报警流是弹窗、声音与确认面板。合成一路会让前端在一堆采样里筛选报警，
+也会让报警被高频数据挤掉。
+
+```
+event: hello
+data: {"server":"uic","apiVersion":1,"heartbeatSeconds":15,"counts":{"total":5,"active":1,"cleared":0}}
+
+event: raised
+id: high-power
+data: {"type":"raised","at":"...","from":"normal","status":{ ...完整 Status... }}
+
+event: acknowledged
+id: high-power
+data: {"type":"acknowledged","at":"...","from":"active","status":{ ... }}
+
+event: cleared
+id: high-power
+data: {"type":"cleared","at":"...","from":"acked","status":{ ... }}
+
+event: reset
+id: high-power
+data: {"type":"reset","at":"...","from":"active","status":{ ...状态已按新规则重置... }}
+
+event: removed
+id: high-power
+data: {"type":"removed","at":"...","from":"active","status":{"id":"high-power","state":"normal","disabled":true,...}}
+```
+
+| 约定 | 说明 |
+|---|---|
+| 事件名 = 迁移类型 | `raised` / `acknowledged` / `cleared` / `reset` / `removed` |
+| `id:` | 报警 ID（不是序号）：重连后按 ID 对齐本地状态 |
+| 载荷 | `{type, at, from, status}`；`status` 与 REST 单条查询完全一致 |
+| `reset` / `removed` | **不是**故障恢复：一个表示规则变了，一个表示规则没了 |
+| 慢客户端 | 有界缓冲（256），满则丢最旧并保持最新状态可见 |
+| 心跳 | 默认同 `heartbeat` 参数（1s~5min），无事件时只发 `heartbeat` |
+| 无报警配置 | 建流成功但只发心跳（不返回错误，便于前端统一处理） |
+
+**为什么没有「事件回放」**：报警是当前状态 + 迁移通知，不是消息队列。客户端
+重连时应调用 `GET /api/v1/alarms` 做一次全量对齐，而不是要求服务端补齐断线
+期间的每一条事件——那需要持久化，而报警的正确恢复源是「现在的状态」。
+
 ---
 
 ## 6. MQTT 契约
@@ -425,6 +718,7 @@ uic/{site}/{device}/{point}/value     数据（QoS1，非 retained）
 uic/{site}/{device}/$state            设备状态（QoS1，retained）
 uic/{site}/$birth                     网关上线（QoS1，retained）
 uic/{site}/$death                     网关下线（QoS1，retained，LWT）
+uic/{site}/$alarm/{alarmId}           报警状态（QoS1，retained）
 ```
 
 **为什么默认不用通配符前缀**：通配符（`uic/+/+/+`）会增加 Broker 的匹配成本，且不利于 ACL 按设备授权。默认规则固定且稳定，不随版本变化。
@@ -604,7 +898,51 @@ LWT；而 `$birth` 是 retained 的，不补一条 `online=false` 就会让消�
 
 **它不是北向协议**。定位是：断网留痕、开发联调时无需架 Broker 即可验证整条链路、CI 里可直接断言落盘内容。默认关闭，因为它是磁盘写入路径，不该在为「只是想采个数」的部署里默默产生 I/O。
 
-详见 `03-domain-model.md` §10.0.1 与 `02-architecture.md` §7。
+详见 `03-domain-model.md` §11.0.1 与 `02-architecture.md` §7。
+
+---
+
+### 6.8 报警状态主题
+
+> **状态**：已实现（`internal/runtime/mqtt_sink.go` 的 `$alarm` 出口）。
+
+```
+uic/{site}/$alarm/{alarmId}     QoS1, retained
+```
+
+```json
+{
+  "schemaVersion": 1,
+  "id": "high-power",
+  "name": "功率过高",
+  "severity": "warning",
+  "message": "压机功率超过 70kW 持续 2 秒",
+  "state": "active",
+  "active": true,
+  "acknowledged": false,
+  "count": 3,
+  "value": 73.4,
+  "valueKnown": true,
+  "quality": "good",
+  "since": "2026-11-05T10:40:48.534Z",
+  "updatedAt": "2026-11-05T10:41:06.736Z"
+}
+```
+
+| 约定 | 说明 |
+|---|---|
+| retained | **是**。报警是「当前事实」，新接入的看板连上就该看到 |
+| 主题 | 每条规则一个主题，`{alarmId}` 经过 `/`、`+`、`#`、NUL 清洗 |
+| 不进 Outbox | 报警不需要 at-least-once 的事件流：积压一条过期报警毫无价值，而漏掉「当前正在报警」是致命的。重连后整体重发即可 |
+| 重连补发 | `$birth` 之后重发**全部**规则状态（含 `normal`），保证消费方看到完整集合 |
+| 规则删除 | 发布**零长度 retained 载荷**清掉主题；断线时记入待清理表，重连补发 |
+| 规则重置 | 发 `reset` 事件并覆盖 retained，不把「规则被改掉」伪装成「恢复正常」 |
+| 发布失败 | 只计数（`result="alarm_error"`），不影响采集；下次迁移或重连补发 |
+
+**为什么用 `$alarm` 而不是 `uic/{site}/{device}/alarm/{id}`**：报警规则可以跨设备
+引用点位（`press:power > 50 && pump:flow < 10`），挂在某台设备下会暗示「它只属于
+那台设备」。`$` 前缀同时把控制面（`$state`/`$birth`/`$death`/`$alarm`）与数据面
+（`.../value`）分开，消费方订阅 `uic/{site}/#` 取数据时不会把报警混进来。
 
 ---
 
@@ -699,6 +1037,9 @@ Objects
 | `GET /api/v1/metrics` | 已实现 | 文本格式 |
 | `POST /api/v1/commands` | 已实现 | 白名单子集 |
 | 配置版本/回滚 | 已实现 | 文件快照 |
+| 报警 REST + SSE | 已实现 | 见 §4.7 / §5.4（五态机、确认、质量门控） |
+| 报警 MQTT retained | 已实现 | 见 §6.8（重连补发、删除清理） |
+| `alarm.ack` 命令 | 已实现 | 同 §4.7.3 语义 |
 | MQTT | 已实现 | 见 §6（QoS0/1、retained 状态、断线补投） |
 | OPC UA | 规范已定义 | Wave 1 后半实现 |
 | RBAC / 审计 / 诊断包 | 规范已定义 | Wave 1 后半实现 |

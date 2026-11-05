@@ -24,6 +24,7 @@ import (
 	"sync"
 	"time"
 
+	"uic/internal/alarm"
 	"uic/internal/calc"
 	"uic/internal/driver"
 	"uic/internal/model"
@@ -130,10 +131,13 @@ type File struct {
 	Devices       []model.Device  `json:"devices"`
 	// Slaves 把采集到的点位以 Modbus 从站形式暴露给外部主站。它不参与
 	// 采集调度，因此与 channels/devices 并列而不是挂在设备下。
-	Slaves     []model.Slave `json:"slaves,omitempty"`
-	Northbound Northbound    `json:"northbound,omitempty"`
-	Storage    Storage       `json:"storage,omitempty"`
-	Logging    Logging       `json:"logging,omitempty"`
+	Slaves []model.Slave `json:"slaves,omitempty"`
+	// Alarms 是报警规则。与设备并列：一条规则可以跨设备引用点位，
+	// 挂在某台设备下会暗示「它只属于那台设备」。
+	Alarms     []alarm.Rule `json:"alarms,omitempty"`
+	Northbound Northbound   `json:"northbound,omitempty"`
+	Storage    Storage      `json:"storage,omitempty"`
+	Logging    Logging      `json:"logging,omitempty"`
 }
 
 var siteRe = regexp.MustCompile(`^[a-z][a-z0-9-]{1,31}$`)
@@ -163,6 +167,9 @@ func (f *File) Normalize() {
 	}
 	if f.Logging.Format == "" {
 		f.Logging.Format = "json"
+	}
+	for i := range f.Alarms {
+		f.Alarms[i].Normalize()
 	}
 	if f.Northbound.MQTT.Topic == "" {
 		f.Northbound.MQTT.Topic = "uic/{site}/{device}/{point}/value"
@@ -263,10 +270,58 @@ func (f *File) Validate() error {
 	if err := f.validateComputed(); err != nil {
 		return err
 	}
+	if err := f.validateAlarms(); err != nil {
+		return err
+	}
 	if err := f.validateSlaves(); err != nil {
 		return err
 	}
 	return f.validateNorthbound()
+}
+
+// validateAlarms 校验报警规则：规则自身自洽、ID 唯一、引用的点位存在且可比较。
+//
+// 引用不存在的点位和「引用了一个文本点位」都属于静态错误：前者运行期表现
+// 为一条永远 unknown 的报警（没人会去看），后者表现相同但更难猜。
+func (f *File) validateAlarms() error {
+	if len(f.Alarms) == 0 {
+		return nil
+	}
+	index := make(map[pointKey]model.Point)
+	for _, d := range f.Devices {
+		for _, p := range d.Points {
+			index[pointKey{d.ID, p.ID}] = p
+		}
+	}
+	seen := make(map[string]bool, len(f.Alarms))
+	for _, r := range f.Alarms {
+		if err := r.Validate(); err != nil {
+			return fmt.Errorf("alarm %q: %w", r.ID, err)
+		}
+		if seen[r.ID] {
+			return fmt.Errorf("alarm %q: duplicate id", r.ID)
+		}
+		seen[r.ID] = true
+		refs, err := r.References()
+		if err != nil {
+			return fmt.Errorf("alarm %q: %w", r.ID, err)
+		}
+		for _, ref := range refs {
+			dev, pt, ok := splitRef(ref)
+			if !ok {
+				return fmt.Errorf("alarm %q: malformed reference %q", r.ID, ref)
+			}
+			p, exists := index[pointKey{dev, pt}]
+			if !exists {
+				return fmt.Errorf("alarm %q: reference %q does not exist", r.ID, ref)
+			}
+			if !p.DataType.IsNumeric() {
+				return fmt.Errorf("alarm %q: reference %q is %s, which cannot be compared with a threshold",
+					r.ID, ref, p.DataType)
+			}
+		}
+	}
+	return nil
 }
 
 // validateComputed 校验计算点：表达式能编译、引用存在、类型自洽、没有环。

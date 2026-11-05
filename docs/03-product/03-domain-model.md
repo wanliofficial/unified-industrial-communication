@@ -17,6 +17,8 @@ Site（站点）
                 └── Sample（采样：值 + 质量 + 时间）
 
 Template（设备模板）──实例化──→ Device
+
+Alarm（报警规则）──引用──→ Point（可跨设备、可多条规则引用同一点位）
 ```
 
 | 实体 | 身份 | 生命周期 | 归属 |
@@ -26,6 +28,7 @@ Template（设备模板）──实例化──→ Device
 | Device | `id`（全局唯一） | 配置变更时可单独重启 | Channel |
 | Point | `id`（设备内唯一） | 可增量增删 | Device |
 | Sample | `(device, point, seq)` | 瞬时（只存在快照与队列中） | Point |
+| Alarm | `id`（站点内唯一） | 配置变更时可单独重置 | Site（可引用任意设备的点位） |
 
 **为什么 Channel 必须是实体而不是「连接字符串」**：因为并发上限、串口互斥、重连退避、熔断都以通道为边界。把通道降级为设备的一个字段，会导致「同一串口被两个设备同时写」这类问题无解（PA-10 正是用「通道 + 全局串口锁」解决的）。
 
@@ -409,7 +412,94 @@ raw（字节/数值）
 
 ---
 
-## 10. 配置文件形态
+## 10. 报警（Alarm）
+
+报警是**有生命周期的领域对象**，不是「点位值超过阈值」的派生布尔。它有自己的
+标识、级别、状态、确认人、计数与时间线，并且可以跨设备引用点位。
+
+```go
+type Rule struct {
+    ID         string        // ^[a-z0-9][a-z0-9._-]{0,63}$
+    Name       string        // 展示名
+    Severity   Severity      // info | warning | critical
+    Message    string        // 给人看的处置提示
+    Disabled   bool          // 默认 false（启用）
+
+    // 条件二选一：阈值 或 布尔表达式
+    Point      string        // "device:point"
+    High, Low  *float64
+    Hysteresis float64
+    Expr       string
+
+    OnDelay    Duration      // 连续满足多久才报警
+    OffDelay   Duration      // 连续不满足多久才清除
+    AutoAck    bool          // 恢复即归位（纯提示类）
+}
+
+type Status struct {
+    ID, Name, Severity, Message string
+    State      State         // normal | pending | active | acked | cleared
+    Active     bool          // active 或 acked
+    Acknowledged bool
+    Count      uint64        // 累计触发次数
+    Value      *float64
+    ValueKnown bool
+    Quality    Quality
+    Since      *time.Time    // 最近一次进入 active
+    AckAt      *time.Time
+    AckBy      string
+    ClearedAt  *time.Time
+    Reason     string        // 仅输入不可信时非空
+}
+```
+
+### 10.1 状态机不变量
+
+| 不变量 | 内容 |
+|---|---|
+| I-AL-1 | 状态只在五态之间迁移；不存在「未知」态——输入不可信时状态**保持不变** |
+| I-AL-2 | `active` 与 `cleared` 都需要人确认；`acked` 的确认幂等 |
+| I-AL-3 | `pending` 不可确认，且输入变坏时立即取消（未知时间不能凑够 `onDelay`） |
+| I-AL-4 | `onDelay` / `offDelay` 是**连续**满足，中途抖动清零 |
+| I-AL-5 | 滞回只在「维持/恢复」判定里生效，触发判定永远用原始阈值 |
+| I-AL-6 | 每次 `normal|cleared → active` 迁移 `count++`，并清空上一次的确认信息 |
+| I-AL-7 | `AutoAck` 只影响恢复路径：`clear → normal` 时自动写 `ackBy="auto"` |
+| I-AL-8 | 状态只存内存；重启后仍成立的条件经 `onDelay` 重新报警（不做状态恢复） |
+| I-AL-9 | 规则变更按「判定条件哈希」决定保留或重置；改名字/说明不重置；停用/启用会重置 |
+| I-AL-10 | 删除规则必须发 `removed` 事件，让消费方清理自己的记录与 retained 主题 |
+
+### 10.2 与点位质量的关系
+
+| 输入 | 阈值规则 | 表达式规则 |
+|---|---|---|
+| `good` | 正常判定 | 正常判定 |
+| `uncertain` | 正常判定（值可信，可能不新鲜） | 正常判定 |
+| `stale` / `timeout` / `comm_error` / `address_error` / `not_connected` | `valueKnown=false`，状态机不动 | 同左；短路未求值的引用不参与 |
+| 点位不存在 / 非数值 | `valueKnown=false` + `reason` | 同左 |
+
+「数据断了」与「数据说正常」是两件事。把前者当后者会掩盖真实故障，把前者
+当「报警」会让一次断线变成满屏假报警——两种都是运维最讨厌的噪声。
+
+### 10.3 排序与可见性
+
+- 列表按「严重度降序 → 激活时间升序 → ID」排序，这就是处置顺序。
+- 无条件查询返回**全部规则**（含 `normal`）：否则「没有报警」与「规则没加载」
+  在响应里无法区分。
+- `health.alarms.unknown` 是链路健康的一等公民；它不进 `status`，但必须可见。
+
+### 10.4 与设备状态机的区别
+
+| 维度 | 设备状态机 | 报警状态机 |
+|---|---|---|
+| 输入 | 采集成功/失败 | 点位值 + 质量 + 延时 |
+| 状态 | configured/connecting/collecting/degraded/faulted/disabled | normal/pending/active/acked/cleared |
+| 需要人处理 | 故障需要，但无「确认」语义 | 显式 ack，记录 `ackBy`/`ackAt` |
+| 持久化 | 运行态，重启重建 | 状态只存内存，计数与确认也不落盘 |
+| 目的 | 「数据在不在流」 | 「这件事有没有人管」 |
+
+---
+
+## 11. 配置文件形态
 
 ```json
 {
@@ -462,7 +552,7 @@ raw（字节/数值）
 }
 ```
 
-### 10.0.1 `storage` 字段
+### 11.0.1 `storage` 字段
 
 | 字段 | 默认 | 含义 |
 |---|---|---|
@@ -484,7 +574,7 @@ raw（字节/数值）
 
 > 注意：`journal` 与 MQTT/Webhook 是**并列**关系，不是替代关系。同时开启时，同一条事件会分别进入各自的 sink 分区，各自独立确认，互不影响。
 
-### 10.1 命名规则
+### 11.1 命名规则
 
 | 对象 | 规则 | 示例 |
 |---|---|---|
@@ -495,7 +585,7 @@ raw（字节/数值）
 
 **保留字**：`_system`、`_internal`、`uic` 不允许作为 ID 前缀外的完整 ID。
 
-### 10.2 迁移
+### 11.2 迁移
 
 配置带 `schemaVersion`。加载时：
 
@@ -505,7 +595,7 @@ raw（字节/数值）
 
 ---
 
-## 11. 模板（Template）
+## 12. 模板（Template）
 
 ```json
 {
@@ -539,7 +629,7 @@ raw（字节/数值）
 
 ---
 
-## 12. 不变量汇总（实现检查单）
+## 13. 不变量汇总（实现检查单）
 
 | # | 不变量 | 检查时机 | 错误码 |
 |---|---|---|---|
@@ -555,10 +645,16 @@ raw（字节/数值）
 | 10 | 写入需 Writable | API 层 | `point.not_writable` |
 | 11 | 值类型与 DataType 一致 | 写入/解码 | `value.type_mismatch` |
 | 12 | 队列不超上限 | 运行期 | 触发降级 |
+| 13 | 报警条件二选一（阈值 XOR 表达式） | 配置加载 | `config.invalid_alarm` |
+| 14 | 报警引用的点位存在且类型可比较 | 配置加载 | `config.invalid_alarm` |
+| 15 | 报警 ID 唯一 | 配置加载 | `config.invalid_alarm` |
+| 16 | `high - low > 2 × hysteresis` | 配置加载 | `config.invalid_alarm` |
+| 17 | 输入不可信时不更改报警状态机 | 运行期 | 仅更新 `reason`/`quality` |
+| 18 | `pending` 不可确认 | API 层 | `alarm.not_active` |
 
 ---
 
-## 13. 与参考方案的模型差异
+## 14. 与参考方案的模型差异
 
 | 维度 | 常见做法 | UIC |
 |---|---|---|
