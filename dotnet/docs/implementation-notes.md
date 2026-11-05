@@ -50,7 +50,9 @@
 - **验收**：黄金帧 16 份；T1–T18 全部有对应用例，其中 T15–T18 跑在 libc 开出来的
   真实伪终端上；MQTT 发布侧先在测试内按规范独立实现的最小 broker 上做协议级验收，
   再用官方 mosquitto 容器跑一次互操作（`scripts/mqtt-interop.sh`：上线、重启重连、
-  kill -9 后由 broker 代发遗嘱）。见 [testing.md](testing.md)。
+  kill -9 后由 broker 代发遗嘱）；WASM 控制台用 `scripts/wasm-smoke.sh` 发布后
+  在 Playwright 里真跑一遍（`index.html` / 引导脚本 / SPA 回退 / REST 首屏）。
+  见 [testing.md](testing.md)。
 
 ### 刻意没做
 

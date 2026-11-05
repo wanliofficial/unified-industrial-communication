@@ -212,12 +212,28 @@ WebApplication.CreateBuilder → UseUrls("http://127.0.0.1:0")
 用第三方栈而不是自己拼二进制，是为了证明「真的兼容 OPC UA」而不是「看起来像」。
 握手（Hello/Ack、OpenSecureChannel、CreateSession、CreateSubscription）一步都不能省。
 
+## WASM 控制台验收
+
+`scripts/wasm-smoke.sh` 分两层：
+
+1. **静态层**（curl）：`/` 返回启动页、引导脚本可下载、`/api/v1/health` 同源可用、
+   深链接回退到 `index.html`、缺失的框架资源返回 404（不能被 SPA 回退吞成 HTML）；
+2. **运行层**（Playwright + Chromium）：真开页面，等 WASM 启动，等设备列表从 REST
+   渲染出来；同时断言没有未捕获异常、失败请求、4xx/5xx，启动遮罩在挂载后移除。
+
+运行层是重点：裁剪后的 WASM 最容易坏在运行时（源生成序列化漏类型、启动脚本与
+`index.html` 的结构约定、同源地址解析写死端口），这些 curl 全看不出来。本机实测
+首次启动约 12 s。
+
+没装 playwright 时运行层报 `skip`，静态层仍会执行并给出结论；`--no-browser` 可以
+显式只跑静态层，`--web <dir>` 复用已有发布目录，`--keep` 保留发布产物、日志与截图。
+
 ## 已知缺口
 
 | 缺口 | 影响 | 建议 |
 |---|---|---|
 | MQTT 只与 mosquitto 互操作过 | 认证、ACL、TLS、其它 broker 的差异未覆盖（客户端本身只做匿名明文） | 接入现场时用目标 broker 重跑 `scripts/mqtt-interop.sh`，并单独验 TLS 终结方案 |
-| WASM 控制台 | 自动化验收放在独立脚本里（Playwright 驱动），不在本运行器内 | 见仓库外部的浏览器冒烟脚本 |
+| WASM 控制台只在 Chromium 上验过 | 未覆盖 Firefox / Safari、移动端与真实触屏 | 上线前在目标浏览器各跑一次同一套检查（换 Playwright 的 browser 参数） |
 | 真实硬件 | 全部用例都跑在内置从站 / 虚拟设备 / 伪终端上 | 现场接入时先用 `uic check` 与 `/api/v1/commands` 的 `device.selftest` |
 
 串口用例虽然跑在伪终端上，走的是与真串口完全相同的内核 tty 路径（termios、

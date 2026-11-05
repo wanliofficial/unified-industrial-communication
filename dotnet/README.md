@@ -53,6 +53,16 @@ dotnet run --project src/Uic.Host -- run --web /tmp/uic-ui/wwwroot
 > 发布必须显式指定 `-f net10.0-browserwasm`：项目是单目标 WASM 工程，
 > 省略框架时 MSBuild 会按 `net10.0` 还原并报 `NETSDK1129`。
 
+发布产物本身可以用一个脚本验收（静态层 + 真浏览器层）：
+
+```bash
+scripts/wasm-smoke.sh              # 发布 + curl 检查 + Playwright 真跑一遍
+scripts/wasm-smoke.sh --no-browser # 只做静态层
+```
+
+浏览器层会等 WASM 启动、等设备列表从 REST 渲染出来，并断言没有未捕获异常、
+失败请求或 4xx/5xx —— 裁剪后的运行时问题只有这样才看得见。
+
 ## 命令行
 
 ```
@@ -127,7 +137,7 @@ src/
   Uic.Host/           宿主进程与命令行
   Uic.Ui/             Uno WASM 控制台
 tests/Uic.Tests/      自包含测试运行器与全部用例
-scripts/              外部依赖的验收脚本（如与真实 mosquitto 的互操作）
+scripts/              外部依赖的验收脚本（mosquitto 互操作、WASM 浏览器冒烟）
 testdata/golden/      黄金帧（请求字节 / 响应字节 / 期望值）
 docs/                 架构、配置、北向契约、测试矩阵、实现说明
 ```
