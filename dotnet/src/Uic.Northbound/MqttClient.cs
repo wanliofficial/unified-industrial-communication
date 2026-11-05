@@ -39,6 +39,7 @@ public sealed class MqttClient : IAsyncDisposable
     private NetworkStream? _stream;
     private Task? _loop;
     private int _packetId;
+    private long _lastWriteMs;
     private volatile bool _connected;
     private int _disposed;
 
@@ -68,21 +69,41 @@ public sealed class MqttClient : IAsyncDisposable
 
         while (!ct.IsCancellationRequested)
         {
+            // 每条连接一份会话令牌：断链时取消它，读循环与心跳循环一起退出。
+            using var session = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            Task? keepAlive = null;
+
             try
             {
-                await ConnectAsync(ct).ConfigureAwait(false);
+                await ConnectAsync(session.Token).ConfigureAwait(false);
 
                 _connected = true;
                 _log.LogInformation("mqtt connected to {Host}:{Port}", _options.Host, _options.Port);
 
+                // 读循环必须先跑起来：OnConnected 里要补发 $birth 与全部 $state，
+                // 这些是 QoS1、要等 PUBACK，而 PUBACK 只有读循环能消费。
+                // 顺序反了的话每次重连都会先卡满 3s 超时，再"补发"。
+                var reader = ReadLoopAsync(session.Token);
+                keepAlive = KeepAliveAsync(session.Token);
+
                 if (OnConnected is not null)
                 {
-                    try { await OnConnected(this, ct).ConfigureAwait(false); }
-                    catch (Exception ex) { _log.LogWarning(ex, "mqtt on-connected hook failed"); }
+                    try
+                    {
+                        await OnConnected(this, session.Token).ConfigureAwait(false);
+                    }
+                    catch (Exception ex)
+                    {
+                        _log.LogWarning(ex, "mqtt on-connected hook failed");
+
+                        // 钩子失败通常意味着连接已经不可用：关掉流让读循环退出，
+                        // 走下面的重连路径，而不是把它挂在这里。
+                        await CloseAsync().ConfigureAwait(false);
+                    }
                 }
 
                 delay = TimeSpan.FromMilliseconds(Math.Max(500, _options.ReconnectDelayMs));
-                await ReadLoopAsync(ct).ConfigureAwait(false);
+                await reader.ConfigureAwait(false);
             }
             catch (OperationCanceledException) when (ct.IsCancellationRequested)
             {
@@ -95,6 +116,14 @@ public sealed class MqttClient : IAsyncDisposable
             finally
             {
                 _connected = false;
+                await session.CancelAsync().ConfigureAwait(false);
+
+                if (keepAlive is not null)
+                {
+                    try { await keepAlive.ConfigureAwait(false); }
+                    catch { /* 会话结束时的取消/写失败，均已记录 */ }
+                }
+
                 FailPending("connection closed");
                 await CloseAsync().ConfigureAwait(false);
             }
@@ -178,6 +207,30 @@ public sealed class MqttClient : IAsyncDisposable
             throw new InvalidOperationException($"broker refused connection: code {payload[1]}");
     }
 
+    /// <summary>
+    /// 心跳：连接空闲时按 keepalive 的一半发 PINGREQ。
+    ///
+    /// 不发的话 broker 会在 1.5×keepalive 后主动断开，表现为「没有数据的时候
+    /// 每隔几十秒重连一次」——有流量时看不出来，现场静默时段才会暴露。
+    /// 因此只要链路上没有写动作就补一次 ping，而不是无条件定时发。
+    /// </summary>
+    private async Task KeepAliveAsync(CancellationToken ct)
+    {
+        var keepAliveSeconds = Math.Max(5, _options.KeepAliveSeconds);
+        var interval = TimeSpan.FromMilliseconds(keepAliveSeconds * 1000L / 2);
+        var intervalMs = (long)interval.TotalMilliseconds;
+
+        while (!ct.IsCancellationRequested)
+        {
+            await Task.Delay(interval, ct).ConfigureAwait(false);
+
+            var idleMs = Environment.TickCount64 - Interlocked.Read(ref _lastWriteMs);
+            if (idleMs < intervalMs) continue;
+
+            await WritePacketAsync(PacketPingreq, Array.Empty<byte>(), ct).ConfigureAwait(false);
+        }
+    }
+
     private async Task ReadLoopAsync(CancellationToken ct)
     {
         while (!ct.IsCancellationRequested)
@@ -229,24 +282,38 @@ public sealed class MqttClient : IAsyncDisposable
         body.AddRange(payload.ToArray());
 
         var header = (byte)(PacketPublish | (qos << 1) | (retain ? 1 : 0));
-        await WritePacketAsync(header, body.ToArray(), ct).ConfigureAwait(false);
 
-        if (qos == 0) return;
+        if (qos == 0)
+        {
+            await WritePacketAsync(header, body.ToArray(), ct).ConfigureAwait(false);
+            return;
+        }
 
+        // 必须先登记再写：PUBACK 可能在 WritePacketAsync 返回之前就到达，
+        // 那时读循环找不到等待者，会把确认丢掉，发布白白等到 3s 超时。
         var tcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
         _pending[packetId] = tcs;
 
-        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
-        timeout.CancelAfter(TimeSpan.FromSeconds(3));
-
         try
         {
-            await tcs.Task.WaitAsync(timeout.Token).ConfigureAwait(false);
+            await WritePacketAsync(header, body.ToArray(), ct).ConfigureAwait(false);
+
+            using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            timeout.CancelAfter(TimeSpan.FromSeconds(3));
+
+            try
+            {
+                await tcs.Task.WaitAsync(timeout.Token).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+            {
+                throw new TimeoutException($"no PUBACK for '{topic}' within 3s");
+            }
         }
-        catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+        finally
         {
+            // 成功时读循环已经摘掉了；失败/取消时由这里兜底，避免等待表泄漏。
             _pending.TryRemove(packetId, out _);
-            throw new TimeoutException($"no PUBACK for '{topic}' within 3s");
         }
     }
 
@@ -282,6 +349,9 @@ public sealed class MqttClient : IAsyncDisposable
             var stream = _stream ?? throw new InvalidOperationException("mqtt is not connected");
             await stream.WriteAsync(buffer.WrittenMemory, ct).ConfigureAwait(false);
             await stream.FlushAsync(ct).ConfigureAwait(false);
+
+            // 心跳据此判断「链路上还有没有动作」，写失败时不要刷新时间戳。
+            Interlocked.Exchange(ref _lastWriteMs, Environment.TickCount64);
         }
         finally
         {
@@ -294,6 +364,10 @@ public sealed class MqttClient : IAsyncDisposable
         var stream = _stream ?? throw new InvalidOperationException("mqtt is not connected");
         var one = new byte[1];
         await stream.ReadExactlyAsync(one, ct).ConfigureAwait(false);
+
+        // 首字节是报文类型与标志位，必须在读「剩余长度」之前留下：
+        // 后面几轮把同一个 one 缓冲覆盖掉了，读循环会因此把所有应答都当成未知报文。
+        var header = one[0];
 
         var multiplier = 1;
         var length = 0;
@@ -313,7 +387,7 @@ public sealed class MqttClient : IAsyncDisposable
         var payload = new byte[length];
         if (length > 0) await stream.ReadExactlyAsync(payload, ct).ConfigureAwait(false);
 
-        return (one[0], payload);
+        return (header, payload);
     }
 
     private void FailPending(string reason)

@@ -90,11 +90,13 @@ dotnet run --project tests/Uic.Tests -- --opcua             # 额外跑 OPC UA �
 dotnet run --project tests/Uic.Tests -- --stop-on-fail
 ```
 
-正常情况下输出 `100 passed, 0 failed, 1 skipped`（跳过的是默认不启用的 OPC UA 用例）。
+正常情况下输出 `108 passed, 0 failed, 1 skipped`（跳过的是默认不启用的 OPC UA 用例）。
 黄金帧测试默认从仓库的 `testdata/golden/` 读取，可用 `UIC_TESTDATA` 指向别的目录。
 
 串口用例（T15–T18）会用 libc 开一对伪终端，在 Linux 上默认执行，其它平台报 `skip`；
 不需要 `socat`，也不需要真实串口设备。
+
+MQTT 用例连的是测试进程内的最小 broker，做协议级验收；与 mosquitto 的互操作仍未做。
 
 覆盖范围与规范用例（T1–T18）的对应关系见 [docs/testing.md](docs/testing.md)。
 

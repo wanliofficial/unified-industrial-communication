@@ -16,7 +16,7 @@ dotnet run --project tests/Uic.Tests -- --stop-on-fail      # 首个失败即停
 正常输出：
 
 ```
-100 passed, 0 failed, 1 skipped · 22.5s
+108 passed, 0 failed, 1 skipped · 29.7s
 ```
 
 跳过的一条是 OPC UA 验收（要绑端口、生成证书，默认不跑）。
@@ -47,6 +47,7 @@ dotnet run --project tests/Uic.Tests -- --stop-on-fail      # 首个失败即停
 | `engine/*` | 2 | 同连接永不并发、状态机与代次 |
 | `loopback/*` | 12 | 主站 ↔ 内置从站的真实链路 |
 | `serial/*` | 6 | 真实伪终端上的 RTU / ASCII、半双工、deadline、关闭打断读 |
+| `mqtt/*` | 8 | 测试内 broker：CONNECT 字段、QoS0/1、主题渲染、断线重连补发 |
 | `contract/*` | 7 | 进程内真实 Kestrel 的 REST 契约 |
 | `opcua/*` | 1 | 标准 OPC UA 客户端：浏览、读、写、订阅 |
 
@@ -163,6 +164,27 @@ WebApplication.CreateBuilder → UseUrls("http://127.0.0.1:0")
 配置里的 `northbound.rest.listen` 填一个合法假值（`127.0.0.1:18080`），
 因为校验器不接受 0 号端口，而真实绑定地址由 `UseUrls` 决定。
 
+## MQTT 用例怎么跑
+
+`mqtt/*` 连的是测试进程内的最小 broker（`tests/Uic.Tests/Mqtt/FakeMqttBroker.cs`），
+它按 3.1.1 规范独立拆包、拼包，**不复用客户端任何代码** —— 否则「客户端拼错了」
+和「测试也照着错」会互相掩护，跑通了也说明不了什么。覆盖：
+
+- CONNECT：协议名与级别 4、clean session、遗嘱（主题/载荷/QoS/retain）、用户名口令；
+- PUBLISH：QoS1 必须等到 PUBACK（broker 故意延迟 150 ms，断言发布确实被阻塞）、
+  QoS0 不带 packet id、retain 跟随配置；
+- 主题与载荷：`{site}/{device}/{point}` 渲染与斜杠清洗、`schemaVersion` 注入、
+  载荷原样透传；
+- 重连：broker 主动断链后客户端自行重连，并补发 `$birth` 与全部已知 `$state`；
+- 心跳：空闲连接在 keepalive 的一半内发 PINGREQ（不发就会被 broker 按 1.5×keepalive 踢掉）；
+- 反例：CONNACK 非 0 时不报「已连接」但继续重试；入站 PUBLISH 不会被当成 PUBACK。
+
+这套用例抓到过三个真实缺陷，都属于「代码评审看不出来、上线才出问题」的类型：
+`ReadPacketAsync` 把剩余长度字节当成报文头（所有应答都被丢弃）、
+`PublishAsync` 在写完才登记等待者（PUBACK 抢跑即丢）、
+读循环在 `OnConnected` 之后才启动（`$birth`/`$state` 每次重连都要等满 3 s 超时）。
+另外补上了原先根本没实现的心跳：CONNECT 声明了 keepalive 却从不发 PINGREQ。
+
 ## OPC UA 验收
 
 `--opcua` 会：
@@ -180,7 +202,7 @@ WebApplication.CreateBuilder → UseUrls("http://127.0.0.1:0")
 
 | 缺口 | 影响 | 建议 |
 |---|---|---|
-| MQTT 未连真实 broker | 协议实现（3.1.1 发布侧）只经代码评审，未经互操作验证 | 用 mosquitto 手工验收一次：联通、断线重连、`$birth`/`$death`/`$state` |
+| MQTT 未连真实 broker | 发布侧已在测试内 broker 上做协议级验收，但没和 mosquitto 等实现互操作过 | 上线前用 mosquitto 手工验收一次：联通、断线重连、`$birth`/`$death`/`$state` |
 | WASM 控制台 | 自动化验收放在独立脚本里（Playwright 驱动），不在本运行器内 | 见仓库外部的浏览器冒烟脚本 |
 | 真实硬件 | 全部用例都跑在内置从站 / 虚拟设备 / 伪终端上 | 现场接入时先用 `uic check` 与 `/api/v1/commands` 的 `device.selftest` |
 

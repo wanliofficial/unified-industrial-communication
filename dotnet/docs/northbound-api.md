@@ -272,7 +272,11 @@
   因为 broker 重启会清空 retained；
 - 停机时发 `$death` 并把遗嘱（LWT）也指向它，这样「进程被 kill」与「正常退出」
   在订阅端看起来一致；
-- 投递失败直接抛给 `Outbox` 保留位点重试 —— 这一层只负责「发出去并拿到 PUBACK」，不负责「不丢」。
+- 投递失败直接抛给 `Outbox` 保留位点重试 —— 这一层只负责「发出去并拿到 PUBACK」，不负责「不丢」；
+- QoS1 的发布只有收到 PUBACK 才返回，3 s 内等不到就抛 `TimeoutException`；
+  QoS0 发完即返回（丢一条不会卡住位点），因此对可靠性有要求的现场必须用 QoS1；
+- 连接空闲时按 keepalive 的一半发 PINGREQ：只声明 keepalive 而不发心跳，
+  broker 会在 1.5×keepalive 后单方面断开，表现为「没有数据时定时重连」。
 
 ## OPC UA
 
