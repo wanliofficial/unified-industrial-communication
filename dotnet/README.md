@@ -96,7 +96,13 @@ dotnet run --project tests/Uic.Tests -- --stop-on-fail
 串口用例（T15–T18）会用 libc 开一对伪终端，在 Linux 上默认执行，其它平台报 `skip`；
 不需要 `socat`，也不需要真实串口设备。
 
-MQTT 用例连的是测试进程内的最小 broker，做协议级验收；与 mosquitto 的互操作仍未做。
+MQTT 用例连的是测试进程内的最小 broker，做协议级验收。与真实 broker 的互操作
+由 `scripts/mqtt-interop.sh` 完成（起官方 mosquitto 镜像，验证上线/重连/遗嘱）：
+
+```bash
+scripts/mqtt-interop.sh          # 需要 docker，结束后自动清理
+scripts/mqtt-interop.sh --keep   # 保留配置、日志与抓包，便于排查
+```
 
 覆盖范围与规范用例（T1–T18）的对应关系见 [docs/testing.md](docs/testing.md)。
 
@@ -121,6 +127,7 @@ src/
   Uic.Host/           宿主进程与命令行
   Uic.Ui/             Uno WASM 控制台
 tests/Uic.Tests/      自包含测试运行器与全部用例
+scripts/              外部依赖的验收脚本（如与真实 mosquitto 的互操作）
 testdata/golden/      黄金帧（请求字节 / 响应字节 / 期望值）
 docs/                 架构、配置、北向契约、测试矩阵、实现说明
 ```

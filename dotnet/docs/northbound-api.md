@@ -276,7 +276,9 @@
 - QoS1 的发布只有收到 PUBACK 才返回，3 s 内等不到就抛 `TimeoutException`；
   QoS0 发完即返回（丢一条不会卡住位点），因此对可靠性有要求的现场必须用 QoS1；
 - 连接空闲时按 keepalive 的一半发 PINGREQ：只声明 keepalive 而不发心跳，
-  broker 会在 1.5×keepalive 后单方面断开，表现为「没有数据时定时重连」。
+  broker 会在 1.5×keepalive 后单方面断开，表现为「没有数据时定时重连」；
+- 不走 TLS 与 WebSocket：需要加密时在链路上用 stunnel / 反向代理终结 TLS，
+  再连本机明文端口。配置校验阶段会拒绝 `qos=2`，避免「以为支持其实没有」。
 
 ## OPC UA
 

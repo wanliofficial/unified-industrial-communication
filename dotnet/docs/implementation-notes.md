@@ -48,8 +48,9 @@
   设备状态机 + 熔断 + 探活恢复；指标 + 环形日志 + 诊断包。
 - **控制台**：Uno WASM 五个页面（设备 / 点位 / 监控 / 日志 / 配置）。
 - **验收**：黄金帧 16 份；T1–T18 全部有对应用例，其中 T15–T18 跑在 libc 开出来的
-  真实伪终端上；MQTT 发布侧跑在测试内按规范独立实现的最小 broker 上
-  （见 [testing.md](testing.md)）。
+  真实伪终端上；MQTT 发布侧先在测试内按规范独立实现的最小 broker 上做协议级验收，
+  再用官方 mosquitto 容器跑一次互操作（`scripts/mqtt-interop.sh`：上线、重启重连、
+  kill -9 后由 broker 代发遗嘱）。见 [testing.md](testing.md)。
 
 ### 刻意没做
 
@@ -59,6 +60,7 @@
 | OPC UA 签名/加密 | 证书生命周期（签发、轮换、吊销、信任列表）是独立的运维负担 | 配置里已显式拒绝非 `None`，加实现时同步放开校验 |
 | OPC UA 用户认证 | 没有用户后端，匿名读 + 可选匿名写足够覆盖调试场景 | 接 `IUserIdentityValidator` |
 | MQTT QoS2 | 现场 QoS1 + 持久化队列已经够用，QoS2 的握手复杂度不划算 | 在 `MqttClient` 里加 PUBREL 状态机 |
+| MQTT TLS / WebSocket | 证书轮换与代理终结是部署问题，客户端只做明文发布 | 用 stunnel / 反向代理终结 TLS；确需内置时在 `MqttClient` 上接 `SslStream` |
 | MQTT 订阅（下行命令） | 下行命令走 REST 更可控（有幂等键与审计） | 新增一个 `MqttCommandSink`，复用 `IGatewayControl` |
 | 多协议（S7 / OPC DA / IEC 104 …） | 首版把一条链路的每一层都做透，比铺开十个半成品有用 | 见下「扩展点」 |
 

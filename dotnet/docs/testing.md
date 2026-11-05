@@ -185,6 +185,20 @@ WebApplication.CreateBuilder → UseUrls("http://127.0.0.1:0")
 读循环在 `OnConnected` 之后才启动（`$birth`/`$state` 每次重连都要等满 3 s 超时）。
 另外补上了原先根本没实现的心跳：CONNECT 声明了 keepalive 却从不发 PINGREQ。
 
+### 与真实 broker 的互操作
+
+测试内 broker 证明「客户端拼的字节自洽」，但证明不了「别的实现也认」。`scripts/mqtt-interop.sh`
+起一个官方 mosquitto 容器跑真链路，覆盖三件事：
+
+1. 上线：`$birth` 与设备 `$state` 被 retained，点位值按 QoS1 持续发布；
+   新起的订阅者一条命令就能拿到 retained 状态；
+2. 重连：`docker rm -f` broker 再用同一端口起回来（retained 随进程消失），
+   客户端在 `reconnectDelayMs` 后自己回去并补发 `$birth`/`$state`，数据继续流动；
+3. 遗嘱：`kill -9` 网关，broker 检测到没有 DISCONNECT，代发 retained 的 `$death`。
+
+脚本需要 docker（镜像不存在时自动拉取 `eclipse-mosquitto:2`），不在 `tests/Uic.Tests`
+里跑是因为它依赖外部容器，而那个运行器要保证离网可跑。`--keep` 保留配置、日志与抓包。
+
 ## OPC UA 验收
 
 `--opcua` 会：
@@ -202,7 +216,7 @@ WebApplication.CreateBuilder → UseUrls("http://127.0.0.1:0")
 
 | 缺口 | 影响 | 建议 |
 |---|---|---|
-| MQTT 未连真实 broker | 发布侧已在测试内 broker 上做协议级验收，但没和 mosquitto 等实现互操作过 | 上线前用 mosquitto 手工验收一次：联通、断线重连、`$birth`/`$death`/`$state` |
+| MQTT 只与 mosquitto 互操作过 | 认证、ACL、TLS、其它 broker 的差异未覆盖（客户端本身只做匿名明文） | 接入现场时用目标 broker 重跑 `scripts/mqtt-interop.sh`，并单独验 TLS 终结方案 |
 | WASM 控制台 | 自动化验收放在独立脚本里（Playwright 驱动），不在本运行器内 | 见仓库外部的浏览器冒烟脚本 |
 | 真实硬件 | 全部用例都跑在内置从站 / 虚拟设备 / 伪终端上 | 现场接入时先用 `uic check` 与 `/api/v1/commands` 的 `device.selftest` |
 
