@@ -13,6 +13,7 @@ public sealed class ConfigDocument
     public List<Device> Devices { get; init; } = new();
     public NorthboundOptions Northbound { get; init; } = new();
     public StorageOptions Storage { get; init; } = new();
+    public LoggingOptions Logging { get; init; } = new();
 
     /// <summary>替换设备列表，其余字段原样保留。模板/导入都靠它构造候选配置。</summary>
     public ConfigDocument WithDevices(IReadOnlyList<Device> devices) => new()
@@ -24,6 +25,7 @@ public sealed class ConfigDocument
         Devices = devices.ToList(),
         Northbound = Northbound,
         Storage = Storage,
+        Logging = Logging,
     };
 }
 
@@ -107,6 +109,37 @@ public sealed class StorageOptions
     public TimeSpan OutboxTtl { get; init; } = TimeSpan.FromHours(24);
     public int OutboxBatchSize { get; init; } = 64;
     public TimeSpan OutboxFlushInterval { get; init; } = TimeSpan.FromSeconds(1);
+}
+
+/// <summary>日志配置。默认不落盘：边缘设备磁盘小，没显式配置就不该悄悄写文件。</summary>
+public sealed class LoggingOptions
+{
+    public FileLogOptions File { get; init; } = new();
+}
+
+/// <summary>
+/// JSON 行文件日志。一行一个对象，方便直接 <c>grep</c> / <c>jq</c>，
+/// 也避免多行异常把日志切碎后无法按行恢复。
+/// </summary>
+public sealed class FileLogOptions
+{
+    /// <summary>默认关闭。内存环形日志仍然可用，文件是给需要留档的现场用的。</summary>
+    public bool Enabled { get; init; }
+
+    /// <summary>相对 <c>storage.dataDir</c> 的目录；绝对路径原样使用。</summary>
+    public string Directory { get; init; } = "logs";
+
+    /// <summary>当前活动文件名。轮转后的归档名由它派生。</summary>
+    public string FileName { get; init; } = "uic.log";
+
+    /// <summary>单个文件大小上限，超过后轮转。下限 4 KiB，避免每行切一个文件。</summary>
+    public long MaxBytes { get; init; } = 10L * 1024 * 1024;
+
+    /// <summary>保留的归档份数（不含当前文件）。</summary>
+    public int Retain { get; init; } = 5;
+
+    /// <summary>文件日志独立的最低级别；为空时沿用全局级别。</summary>
+    public string? MinimumLevel { get; init; }
 }
 
 /// <summary>把 <c>"1s"</c> / <c>"500ms"</c> / <c>"2m"</c> 解析为 TimeSpan；纯数字按毫秒处理。</summary>

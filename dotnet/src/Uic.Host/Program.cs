@@ -108,11 +108,13 @@ internal static class Program
         if (cli.Verbose) level.Level = LogLevel.Debug;
 
         var ring = new RingBufferLogProvider(capacity: 2000);
+        var fileLog = new JsonLineFileLogProvider();
 
         using var loggerFactory = LoggerFactory.Create(builder =>
         {
             builder.SetMinimumLevel(LogLevel.Trace);
             builder.AddProvider(ring);
+            builder.AddProvider(fileLog);
             builder.AddSimpleConsole(options =>
             {
                 options.SingleLine = true;
@@ -144,6 +146,15 @@ internal static class Program
             return 3;
         }
 
+        // 文件日志的开关来自配置，而配置要读出来才知道：先配置、后写文件，
+        // 启动阶段之前的日志只在控制台与环形缓冲里，不会因为「还没配好」而丢一条。
+        fileLog.Configure(bootstrap.Logging.File, dataDir);
+        if (bootstrap.Logging.File.Enabled)
+        {
+            log.LogInformation("structured file logging: {Path} (max {MaxBytes} bytes, retain {Retain})",
+                fileLog.ActivePath, bootstrap.Logging.File.MaxBytes, bootstrap.Logging.File.Retain);
+        }
+
         var listen = cli.Listen ?? bootstrap.Northbound.Rest.Listen;
         var webRoot = cli.WebRoot
                       ?? bootstrap.Northbound.Rest.StaticRoot
@@ -160,6 +171,7 @@ internal static class Program
         builder.Logging.ClearProviders();
         builder.Logging.SetMinimumLevel(LogLevel.Trace);
         builder.Logging.AddProvider(ring);
+        builder.Logging.AddProvider(fileLog);
         builder.Logging.AddSimpleConsole(options =>
         {
             options.SingleLine = true;
@@ -207,6 +219,7 @@ internal static class Program
                     GatewayVersion = GatewayVersion,
                     Level = level,
                     Fallback = Fallback,
+                    FileLog = fileLog,
                 },
                 drivers,
                 loggerFactory,

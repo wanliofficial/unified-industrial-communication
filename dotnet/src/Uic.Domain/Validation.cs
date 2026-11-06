@@ -171,8 +171,42 @@ public static partial class ModelValidator
             }
         }
 
+        var file = doc.Logging.File;
+
+        // 即使当前 disabled 也校验：配置里留一个错值，等现场打开时就变成启动失败，
+        // 而那时往往已经不具备改配置的条件。
+        if (string.IsNullOrWhiteSpace(file.Directory))
+            Add("logging.file.directory", "required");
+        if (string.IsNullOrWhiteSpace(file.FileName) ||
+            file.FileName is "." or ".." ||
+            file.FileName.IndexOfAny(new[] { '/', '\\' }) >= 0 ||
+            file.FileName.IndexOfAny(Path.GetInvalidFileNameChars()) >= 0)
+        {
+            Add("logging.file.fileName", "must be a bare file name without path separators");
+        }
+
+        if (file.MaxBytes < 4096)
+            Add("logging.file.maxBytes", "must be >= 4096; smaller files rotate on every line");
+        if (file.MaxBytes > 1024L * 1024 * 1024)
+            Add("logging.file.maxBytes", "must be <= 1 GiB");
+        if (file.Retain is < 1 or > 100)
+            Add("logging.file.retain", "must be 1..100");
+
+        if (file.MinimumLevel is not null &&
+            !AllowedLogLevels.Contains(file.MinimumLevel))
+        {
+            Add("logging.file.minimumLevel",
+                "must be one of trace/debug/information/warning/error/critical");
+        }
+
         return problems;
     }
+
+    private static readonly HashSet<string> AllowedLogLevels =
+        new(StringComparer.OrdinalIgnoreCase)
+        {
+            "trace", "debug", "information", "info", "warning", "warn", "error", "critical",
+        };
 
     public static void ThrowIfInvalid(ConfigDocument doc)
     {

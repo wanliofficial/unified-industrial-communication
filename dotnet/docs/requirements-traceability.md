@@ -11,7 +11,7 @@
 它们不是 §6.1「不做」清单里的项，属于真实缺口；逐协议现状、原因与补法见
 [protocol-status.md](protocol-status.md)。
 
-当前测试基线：**145 passed / 0 failed / 1 skipped**（跳过的是需要 `--opcua` 的 OPC UA 端到端用例）。
+当前测试基线：**152 passed / 0 failed / 1 skipped**（跳过的是需要 `--opcua` 的 OPC UA 端到端用例）。
 
 ## 1. 采集（FR-COL）
 
@@ -104,7 +104,7 @@
 | FR-OPS-08 | 远程命令白名单 | 已实现 | `contract/*` 与 `mqtt/command_unknown_action_returns_error`、`mqtt/command_privileged_action_is_forbidden`；REST/MQTT 共用 `CommandExecutor` |
 | FR-OPS-09 | 凭据加密存储 | 刻意没做（M） | 配置里的 token/口令是明文。**这是 PRD 安全红线之一**，见文末 |
 | FR-OPS-10 | TLS（API 与北向） | 刻意没做（M） | 由反向代理 / stunnel 终结；本仓库只监听明文端口 |
-| FR-OPS-11 | 日志（结构化、分级、轮转） | 部分实现 | 结构化字段（时间/级别/类别/设备）与动态级别已实现；**输出是内存环形缓冲，不是 JSON 行文件，也没有文件轮转**。补法：接一个 `ILoggerProvider` 写 JSON 行并按大小切分 |
+| FR-OPS-11 | 日志（结构化、分级、轮转） | 已实现 | 控制台 + 内存环形缓冲 + 可选 JSON 行文件日志：字段 `ts/level/category/msg/device/exception`，按 `logging.file.maxBytes` 轮转、保留 `retain` 份；支持热更新开关：`logs/json_line_fields_are_complete`、`logs/file_rotates_without_losing_lines`、`logs/retention_prunes_old_archives`、`logs/reconfigure_stops_writing` |
 
 ## 7. 驱动开发与测试（FR-SDK）
 
@@ -141,7 +141,7 @@
 | 安全：配置文件无明文口令 | 红线 | 不满足 | 见 FR-OPS-09 |
 | 安全：未认证即可写点位 | 红线 | 满足（配置了 token 时） | 写端点走鉴权中间件；不配 token 时等同于开放 |
 | 安全：诊断包含凭据 | 红线 | 满足 | `Redact` 把 `token`/`password`/`secret` 替换为 `***`，`contract/config_is_redacted` 验证 |
-| 可观测：日志字段 | `ts/level/msg/device/...` | 部分实现 | 环形缓冲里有这些字段，但没有 JSON 行文件输出 |
+| 可观测：日志字段 | `ts/level/msg/device/...` | 已实现 | 环形缓冲与 JSON 行文件共用同一套字段：`ts/level/category/msg/device/exception`；`logs/json_line_fields_are_complete` |
 | 兼容：配置向后兼容 ≥2 大版本 | 自动迁移 | 部分实现 | 迁移链已就位，但只有 v0→v1 两条真实规则 |
 | 兼容：浏览器最近 2 个版本 | Chrome/Edge/Firefox | 已验证 Chrome | `scripts/wasm-smoke.sh` 用 Playwright Chromium；其余浏览器未跑 |
 | 可维护：单文件 ≤600 行 | — | 已实现 | 新增端点都拆成 `RestApi.*.cs` partial |

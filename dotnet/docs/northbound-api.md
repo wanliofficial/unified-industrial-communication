@@ -382,8 +382,10 @@
 | GET | `/api/v1/diagnostics/bundle` | 打包配置、日志、指标、环境信息（zip） |
 | GET | `/api/v1/diagnostics/network` | 通道连通性检查 |
 
-日志是内存里的环形缓冲（默认 2000 条），进程重启即清空 —— 边缘设备上「翻日志」
-是最常见的排障动作，但没人愿意为此部署一套日志系统。
+日志默认是内存里的环形缓冲（默认 2000 条），进程重启即清空 —— 边缘设备上「翻日志」
+是最常见的排障动作，但没人愿意为此部署一套日志系统。需要留档时在配置里打开
+`logging.file.enabled`，即可额外得到按大小轮转的 JSON 行文件（见
+[configuration.md](configuration.md#logging)）。
 
 ## SSE
 

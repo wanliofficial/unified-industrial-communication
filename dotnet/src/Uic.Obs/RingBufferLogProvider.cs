@@ -139,16 +139,6 @@ public sealed class RingBufferLogProvider : ILoggerProvider
 
         /// <summary>从分类名或消息里提取设备 id，供 API 按设备过滤。</summary>
         private static string? ExtractDeviceId(string category, string message)
-        {
-            const string prefix = "uic.device.";
-            if (category.StartsWith(prefix, StringComparison.Ordinal))
-            {
-                var rest = category[prefix.Length..];
-                var dot = rest.IndexOf('.');
-                return dot < 0 ? rest : rest[..dot];
-            }
-
-            return null;
-        }
+            => LogFields.DeviceId(category);
     }
 }

@@ -63,6 +63,9 @@
       "qos": 1
     },
     "opcUa": { "enabled": true, "endpoint": "opc.tcp://0.0.0.0:4840" }
+  },
+  "logging": {
+    "file": { "enabled": true, "directory": "logs", "maxBytes": 10485760, "retain": 5 }
   }
 }
 ```
@@ -78,6 +81,7 @@
 | `devices` | array | `[]` | 设备 |
 | `northbound` | object | 见下 | 北向通道 |
 | `storage` | object | 见下 | 数据目录与队列上限 |
+| `logging` | object | 见下 | 日志输出（默认只有内存环形缓冲） |
 
 ## 通道 `channels[]`
 
@@ -297,6 +301,34 @@
 
 超限时丢最旧的并计数，`/api/v1/health` 与指标里都能看到丢弃数。
 
+## `logging`
+
+控制台与 `/api/v1/logs` 的环形缓冲始终开启；这里只决定**要不要额外写文件**。
+
+| 字段 | 默认 | 说明 |
+|---|---|---|
+| `file.enabled` | `false` | 默认关闭：边缘设备磁盘小，未显式配置时不应悄悄落盘 |
+| `file.directory` | `logs` | 相对 `storage.dataDir`；绝对路径原样使用 |
+| `file.fileName` | `uic.log` | 当前活动文件名，必须是纯文件名（不能带路径） |
+| `file.maxBytes` | `10485760` | 单文件上限，4 KiB .. 1 GiB |
+| `file.retain` | `5` | 保留的归档份数（不含当前文件），1..100 |
+| `file.minimumLevel` | — | `trace` / `debug` / `information` / `warning` / `error` / `critical`；为空则沿用全局级别 |
+
+格式是一行一个 JSON 对象，异常堆栈被转义进同一个字段，不会把一条日志拆成多行：
+
+```json
+{"ts":"2026-11-06T02:31:12.482+00:00","level":"Information","category":"uic.device.meter-1","msg":"collection recovered","device":"meter-1"}
+{"ts":"2026-11-06T02:31:13.004+00:00","level":"Error","category":"uic.device.meter-1","msg":"read failed","device":"meter-1","exception":"System.TimeoutException: ..."}
+```
+
+轮转只在新行会超过 `maxBytes` 时发生：当前文件改名为 `uic-20261106-023112-482.log`，
+再按修改时间删掉超出 `retain` 的旧归档；当前文件永不参与裁剪。日志目录里因此
+最多有 `retain + 1` 个文件。逐行 flush，便于 `tail -f`；写失败只在 stderr 提醒一次，
+不会因为磁盘满把采集进程拖垮。
+
+`logging` 支持热更新：应用新配置后立即切换目录/上限/开关，不需要重启进程。
+目录切换只影响之后写入的行，旧目录里的文件原样保留。
+
 ## 时长写法
 
 `"500ms"`、`"2s"`、`"5m"`、`"1h"`、`"1d"`，也接受：
@@ -321,6 +353,9 @@ data/
     modbus-meter.json    # 设备模板，与配置版本分开
   diagnostics/
     uic-diagnostics-20261105-091402.zip
+  logs/
+    uic.log                     # 当前 JSON 行日志（logging.file.enabled=true 时）
+    uic-20261105-091402-118.log # 轮转归档，最多 retain 份
   outbox/
     <sink>/records.ndjson
     <sink>/ack
@@ -359,8 +394,9 @@ data/
 2. 小于当前版本 → 执行迁移，升级项在导入响应里逐条回显（静默改写比拒绝更难排查）；
 3. 大于当前版本 → 拒绝启动：不能「猜」新字段的语义，猜错会静默丢配置。
 
-迁移**不删字段以外的东西**：`logging`、`northbound.webhook` 这类当前版本不支持的段落
+迁移**不删字段以外的东西**：`northbound.webhook` 这类当前版本还不支持的段落
 原样保留、只是被忽略，等它们变成正式功能时再读，避免「升级即丢数据」。
+（`logging` 已是正式段落，不再属于这一类。）
 
 ## 校验
 

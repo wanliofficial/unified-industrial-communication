@@ -24,6 +24,9 @@ public sealed record RuntimeOptions
     public LogLevelSwitch Level { get; init; } = new();
     public SchedulerOptions? SchedulerOptions { get; init; }
 
+    /// <summary>JSON 行文件日志。配置热更新时由运行时重新 Configure，不必重启进程。</summary>
+    public JsonLineFileLogProvider? FileLog { get; init; }
+
     /// <summary>首次启动的兜底配置。CI 与自测会替换成最小配置。</summary>
     public Func<ConfigDocument>? Fallback { get; init; }
 }
@@ -43,6 +46,7 @@ public sealed class GatewayRuntime : IGatewayControl, IAsyncDisposable
     private readonly OutboxQueue _outbox;
     private readonly MetricsRegistry _metrics;
     private readonly RingBufferLogProvider _ring;
+    private readonly JsonLineFileLogProvider? _fileLog;
     private readonly SampleFanout _fanout;
     private readonly DeviceStateWatcher _watcher;
     private readonly string _dataDir;
@@ -63,6 +67,7 @@ public sealed class GatewayRuntime : IGatewayControl, IAsyncDisposable
         string gatewayVersion,
         ILoggerFactory logs,
         RingBufferLogProvider ring,
+        JsonLineFileLogProvider? fileLog,
         ConfigStore store,
         DriverRegistry drivers,
         ConfigDocument config,
@@ -72,6 +77,7 @@ public sealed class GatewayRuntime : IGatewayControl, IAsyncDisposable
         _gatewayVersion = gatewayVersion;
         _logs = logs;
         _ring = ring;
+        _fileLog = fileLog;
         _store = store;
         _config = config;
         _log = logs.CreateLogger("uic.runtime");
@@ -137,6 +143,7 @@ public sealed class GatewayRuntime : IGatewayControl, IAsyncDisposable
             options.GatewayVersion,
             logs,
             ring,
+            options.FileLog,
             store,
             drivers,
             config,
@@ -227,6 +234,14 @@ public sealed class GatewayRuntime : IGatewayControl, IAsyncDisposable
                 _log.LogWarning(
                     "site changed from '{Old}' to '{New}'; northbound topics and API metadata keep the old value until restart",
                     before.Site, doc.Site);
+            }
+
+            // 日志落盘设置可以在线切换；其它北向监听地址仍然要求重启。
+            if (!SameJson(before.Logging, doc.Logging))
+            {
+                _fileLog?.Configure(doc.Logging.File, _dataDir);
+                _log.LogInformation("file logging {State}",
+                    doc.Logging.File.Enabled ? $"-> {_fileLog?.ActivePath}" : "disabled");
             }
 
             ConfigureSinks(doc, before);

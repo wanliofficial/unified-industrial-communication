@@ -54,7 +54,7 @@
 | `Uic.Engine` | 每设备 actor、读规划、加工、死区、缓存 | 序列化、网络出口 |
 | `Uic.Outbox` | 落盘队列、分区确认、三重上限、重放 | 认识 MQTT |
 | `Uic.Config` | 内容寻址版本库、校验、diff、回滚 | 运行态 |
-| `Uic.Obs` | 指标、环形日志 | 输出格式 |
+| `Uic.Obs` | 指标、环形日志、JSON 行文件日志 | 输出格式 |
 | `Uic.Northbound` | HTTP 路由、鉴权、限流、SSE、MQTT 客户端 | 采集 |
 | `Uic.OpcUa` | 地址空间、订阅推送、写回调度器 | 采集 |
 | `Uic.Runtime` | 装配、热更新、优雅停止 | 具体业务逻辑 |

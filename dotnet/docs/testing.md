@@ -16,7 +16,7 @@ dotnet run --project tests/Uic.Tests -- --stop-on-fail      # 首个失败即停
 正常输出：
 
 ```
-145 passed, 0 failed, 1 skipped · 36.5s
+152 passed, 0 failed, 1 skipped · 36.0s
 ```
 
 跳过的一条是 OPC UA 验收（要绑端口、生成证书，默认不跑）。
@@ -47,6 +47,7 @@ dotnet run --project tests/Uic.Tests -- --stop-on-fail      # 首个失败即停
 | `outbox/*` | 8 | 位点推进、重启重放、批次、分区隔离、三重上限、半行容错 |
 | `config/*` | 13 | 内容寻址、回滚、启动优先级、非法文档、diff、旧配置迁移、复合时长、死区/量程规则、仓库示例可校验 |
 | `json/*` | 9 | 时长、枚举、值形状、UTC、往返稳定、前向兼容 |
+| `logs/*` | 7 | JSON 行字段、轮转不丢行、归档裁剪、默认关闭、热更新开关、非法配置拒绝、环形缓冲顺序与过滤 |
 | `engine/*` | 7 | 同连接永不并发、状态机与代次、临时失败重试、坏质量整批重试、deadline 超时重试、确定性错误不重试、重试次数有限 |
 | `schedule/*` | 3 | 启动相位均匀铺开、单调时间换算与到期边界、调度器实际分配相位 |
 | `loopback/*` | 12 | 主站 ↔ 内置从站的真实链路 |

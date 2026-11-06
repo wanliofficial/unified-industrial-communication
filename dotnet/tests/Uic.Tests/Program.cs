@@ -31,6 +31,7 @@ PlannerTests.Register(tests);
 OutboxTests.Register(tests);
 ConfigStoreTests.Register(tests);
 JsonTests.Register(tests);
+ObsTests.Register(tests);
 LoopbackTests.Register(tests);
 SerialTests.Register(tests);
 MqttTests.Register(tests);
