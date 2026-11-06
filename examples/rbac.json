@@ -1,0 +1,114 @@
+{
+  "schemaVersion": 1,
+  "site": "rbac-lab",
+  "server": {
+    "listen": "127.0.0.1:8093",
+    "tls": {
+      "enabled": false
+    },
+    "users": [
+      {
+        "name": "viewer",
+        "role": "viewer",
+        "tokenSha256": "161c0eb860cff8fb62ec2022bb77555a3be036691b43b07c8a78346f629acaa4"
+      },
+      {
+        "name": "ops",
+        "role": "operator",
+        "tokenSha256": "a65fb2096214a3bf9e95decbe790312556136d8712b51899a3111432b7f11db5"
+      },
+      {
+        "name": "root",
+        "role": "admin",
+        "tokenSha256": "5f884d73072e63ecee3aa3de1e3dc0f1781e67e5eaa98609de61787906a549b9"
+      }
+    ]
+  },
+  "channels": [
+    {
+      "id": "ch-v",
+      "protocol": "virtual",
+      "transport": {
+        "kind": "memory"
+      },
+      "concurrency": 2,
+      "timeout": "1s"
+    }
+  ],
+  "devices": [
+    {
+      "id": "press",
+      "name": "压机",
+      "channel": "ch-v",
+      "interval": "500ms",
+      "timeout": "1s",
+      "enabled": true,
+      "points": [
+        {
+          "id": "power",
+          "address": {
+            "kind": "register",
+            "area": "holding",
+            "length": 2,
+            "bit": -1
+          },
+          "dataType": "float32",
+          "unit": "kW",
+          "enabled": true
+        },
+        {
+          "id": "setpoint",
+          "address": {
+            "kind": "register",
+            "area": "holding",
+            "offset": 2,
+            "length": 2,
+            "bit": -1
+          },
+          "dataType": "float32",
+          "unit": "kW",
+          "writable": true,
+          "enabled": true
+        }
+      ],
+      "labels": {
+        "mode": "sine"
+      }
+    }
+  ],
+  "northbound": {
+    "mqtt": {
+      "enabled": false,
+      "topic": "uic/{site}/{device}/{point}/value"
+    },
+    "opcua": {
+      "enabled": false,
+      "listen": ":4840",
+      "policy": "None"
+    },
+    "webhook": {
+      "enabled": false,
+      "timeout": "5s",
+      "batch": 100
+    }
+  },
+  "storage": {
+    "dir": "./data/rbac",
+    "outboxMaxBytes": 67108864,
+    "outboxMaxRecords": 1000,
+    "outboxTtl": "24h0m0s",
+    "journal": true,
+    "history": {},
+    "audit": {
+      "enabled": true,
+      "dir": "data/rbac/audit",
+      "maxBytes": 16777216,
+      "maxAge": "720h0m0s",
+      "segmentBytes": 4194304
+    }
+  },
+  "logging": {
+    "level": "info",
+    "format": "json"
+  }
+}

@@ -332,6 +332,10 @@ uic_<subsystem>_<name>{<labels>}
 | `uic_outbox_dropped_total` | counter | `sink,reason` | 丢弃（ttl/size/count） |
 | `uic_http_requests_total` | counter | `path,code` | API 请求 |
 | `uic_sse_clients` | gauge | — | SSE 连接数 |
+| `uic_audit_records_total` | counter | — | 审计记录写入数 |
+| `uic_audit_write_errors_total` | counter | — | 审计写入失败（不阻断业务，需告警） |
+| `uic_audit_last_seq` | gauge | — | 审计链最后一条记录的序号 |
+| `uic_audit_query_total` | counter | — | 审计查询次数 |
 
 ### 9.2 日志字段（最小集）
 
@@ -361,11 +365,18 @@ uic_<subsystem>_<name>{<labels>}
 | 边界 | 控制 |
 |---|---|
 | 浏览器 → API | TLS + Bearer Token + CORS 白名单 |
+| 身份 | 一个 Token 一个具名用户；Token 先 SHA-256 再定长比较；配置可只存哈希 |
+| 授权 | 三角色九权限按动作划分，`viewer ⊆ operator ⊆ admin`；未知角色/权限一律拒绝；高危命令在 handler 内二次判定 |
+| 凭据热更新 | 凭据表整体替换（`atomic.Pointer`），配置 apply 后下一条请求即生效——删掉的用户立刻失效 |
+| 审计 | 写/命令/配置/确认/越权全部落盘；NDJSON 分段 + SHA-256 哈希链；查询与完整性校验需 `audit.read` |
 | API → 设备 | 只允许配置中的地址（禁止 SSRF 式任意地址） |
 | 驱动 → 主进程 | 第一版同进程（可信）；第二版进程外（隔离） |
 | 配置 → 执行 | 远程动作白名单 + Schema 校验 + 版本单调 |
-| 日志/诊断包 | 凭据脱敏 + 帧截断 |
+| 日志/诊断包 | 凭据脱敏 + 帧截断；`***` 占位符在 apply 时还原为当前值 |
 | 依赖 | 白名单 + SBOM |
+
+**取舍**：审计写入失败只计数、不阻断业务。反过来（因为审计盘满而拒绝写点位）
+会让产线停摆——可用性与可追溯性冲突时，先保可用性，用指标与告警让问题可见。
 
 ---
 
@@ -381,8 +392,13 @@ uic_<subsystem>_<name>{<labels>}
 5. 启动 cache 与 outbox（重放未确认）
 6. 启动驱动注册表（内置驱动）
 7. 启动 scheduler（设备按通道分组）
-8. 启动北向（HTTP → SSE → MQTT → OPC UA）
-9. 标记 ready
+8. 构建凭据表（无凭据则进入 open 模式并打 WARN）→ 打开审计存储
+9. 启动北向（HTTP → SSE → MQTT → OPC UA）
+10. 标记 ready
+
+任何一步失败都按**逆序**释放已获取的资源（`abortStartup`）：逐个 case 手写
+Close 会漏——每加一个子系统就多一条 return 路径，而「进程启动失败但审计段
+还开着」在生产里表现为重启后段文件被锁。
 ```
 
 ### 11.2 关闭（`SIGTERM`）
@@ -410,7 +426,8 @@ uic_<subsystem>_<name>{<labels>}
 | HTTP | 标准库 `net/http`（1.22 路由增强） | 不引入框架，减少依赖 |
 | 日志 | `log/slog` | 结构化、标准库 |
 | 配置 | JSON + 手写校验 | 不引入 YAML 依赖；JSON 可被机器生成 |
-| 存储 | 文件（配置/Outbox）+ 自建有界采样日志（历史，见 ADR-0002） | 单文件、可备份；SQLite 留作需要 join/索引时的替换点 |
+| 存储 | 文件（配置/Outbox）+ 自建有界采样日志（历史）+ 审计日志 | 单文件、可备份；SQLite 留作需要 join/索引时的替换点（见 ADR-0002） |
+| 认证/授权/审计 | 静态 Token + 三角色九权限 + 哈希链审计（见 ADR-0003） | 不引入会话、IdP 与第三方依赖 |
 | MQTT | 自研 MQTT 3.1.1 客户端（已实现，零依赖；北向发布 + 南向订阅共用） | 需要的报文不到 10 种，规范正文不足 80 页；引入依赖的供应链与交叉编译成本更高。QoS2/TLS/WS 未实现且配置即报错；QoS2 在编解码层直接拒绝，因为客户端等的是 PUBACK |
 | OPC UA | 自研封装（生产用 gopcua） | 见 ADR-0001；主站含订阅（独立第二条连接上的 Publish 长轮询） |
 | 前端 | 单文件 HTML + 原生 JS（骨架）/ 轻量 SPA（生产） | `go:embed` 进二进制 |
@@ -434,10 +451,12 @@ uic_<subsystem>_<name>{<labels>}
 
 ## 14. 架构决策记录（索引）
 
-| ADR | 主题 | 状态 |
+| ADR 文件 | 主题 | 状态 |
 |---|---|---|
-| 0001 | 语言选型（Go + C# 辅助） | Accepted |
-| 0002 | 四类寻址统一模型 | 见 `03-domain-model.md` |
-| 0003 | 驱动三层分离 | 见 `04-driver-sdk-spec.md` |
-| 0004 | 北向四通道 | 见 `05-northbound-api-spec.md` |
-| 0005 | Outbox 语义（at-least-once） | 见本文 §4.3 与 `06-nfr.md` |
+| `0001-language-selection.md` | 语言选型（Go + C# 辅助） | Accepted |
+| `0002-history-storage.md` | 历史存储（自建有界采样日志） | Accepted |
+| `0003-auth-rbac-audit.md` | 认证 / 授权 / 审计 | Accepted |
+| —（本文档承担） | 四类寻址统一模型 | 见 `03-domain-model.md` |
+| —（本文档承担） | 驱动三层分离 | 见 `04-driver-sdk-spec.md` |
+| —（本文档承担） | 北向四通道 | 见 `05-northbound-api-spec.md` |
+| —（本文档承担） | Outbox 语义（at-least-once） | 见本文 §4.3 与 `06-nfr.md` |

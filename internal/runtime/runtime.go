@@ -29,6 +29,8 @@ import (
 	"time"
 
 	"uic/internal/alarm"
+	"uic/internal/audit"
+	"uic/internal/auth"
 	"uic/internal/cache"
 	"uic/internal/config"
 	"uic/internal/driver"
@@ -81,6 +83,9 @@ type Runtime struct {
 	alarms      *alarm.Engine
 	hist        *history.Store
 	histWriter  *historyWriter
+	audit       *audit.Store
+	auth        *auth.Reloadable
+	auditErrors atomic.Uint64
 
 	// nbMu 只保护北向 OPC UA 实例的启停。不能复用 mu：reload 已经持着 mu
 	// 调 syncOPCUA，再拿一次就是自锁。
@@ -196,47 +201,32 @@ func New(opt Options) (*Runtime, error) {
 		},
 	}, logger, met)
 
-	if err := r.build(mgr.Current()); err != nil {
-		if logFile != nil {
-			_ = logFile.Close()
-		}
-		return nil, err
+	// 启动失败的每一步都走同一个收口：逐个 case 手写 Close 会漏——每加一个
+	// 子系统就多一条 return 路径，而「进程启动失败但审计段还开着」在测试里
+	// 表现为临时目录删不掉，在生产里表现为重启后段文件被锁。
+	steps := []func(*config.File) error{
+		r.build,
+		r.openAlarms,
+		r.openHistory,
+		r.buildAuth,
+		r.openAudit,
+		r.openSlaves,
+		r.openOPCUA,
+		r.openSinks,
 	}
-	if err := r.openAlarms(mgr.Current()); err != nil {
-		if logFile != nil {
-			_ = logFile.Close()
+	for _, step := range steps {
+		if err := step(mgr.Current()); err != nil {
+			r.abortStartup()
+			return nil, err
 		}
-		return nil, err
-	}
-	if err := r.openHistory(mgr.Current()); err != nil {
-		if logFile != nil {
-			_ = logFile.Close()
-		}
-		return nil, err
-	}
-	if err := r.openSlaves(mgr.Current()); err != nil {
-		if logFile != nil {
-			_ = logFile.Close()
-		}
-		return nil, err
-	}
-	if err := r.openOPCUA(mgr.Current()); err != nil {
-		if logFile != nil {
-			_ = logFile.Close()
-		}
-		return nil, err
-	}
-	if err := r.openSinks(mgr.Current()); err != nil {
-		if logFile != nil {
-			_ = logFile.Close()
-		}
-		return nil, err
 	}
 
 	r.api = httpapi.New(httpapi.Options{
 		Token:         firstNonEmpty(opt.Token, f.Server.Token),
 		BasePath:      f.Server.BasePath,
 		MetricsPublic: opt.MetricsPublic,
+		Auth:          r.auth,
+		Audit:         r,
 	}, r, logger)
 
 	r.version = httpapi.VersionInfo{
@@ -244,6 +234,39 @@ func New(opt Options) (*Runtime, error) {
 		GoVersion: runtime.Version(), Schema: config.SchemaVersion, APIVer: 1,
 	}
 	return r, nil
+}
+
+// abortStartup 按打开的逆序释放已获取的资源。启动失败时调用。
+//
+// 它不追求「和 Stop 一样完整」——进程马上就要退出——但必须把**持有文件
+// 句柄与后台 goroutine** 的东西关掉。否则：测试里临时目录删不掉；生产里
+// 重启后旧进程还没退干净，新进程抢不到段文件锁。
+func (r *Runtime) abortStartup() {
+	r.closeOPCUA()
+	r.closeSlaves()
+	if r.alarms != nil {
+		r.alarms.Stop()
+	}
+	_ = r.closeAudit()
+	if r.hist != nil {
+		_ = r.hist.Close()
+		r.hist = nil
+	}
+	if r.box != nil {
+		_ = r.box.Flush()
+		_ = r.box.Close()
+	}
+	if r.mqttSink != nil {
+		_ = r.mqttSink.close()
+	}
+	if r.journal != nil {
+		_ = r.journal.Sync()
+		_ = r.journal.Close()
+	}
+	if r.logFile != nil {
+		_ = r.logFile.Close()
+		r.logFile = nil
+	}
 }
 
 func (r *Runtime) declareMetrics() {
@@ -281,6 +304,10 @@ func (r *Runtime) declareMetrics() {
 	d("uic_history_query_total", "counter", "历史查询次数与结果")
 	d("uic_opcua_server_up", "gauge", "北向 OPC UA 服务端是否在监听")
 	d("uic_opcua_server_writes_total", "counter", "北向 OPC UA 写入次数与结果")
+	d("uic_audit_records_total", "counter", "写入审计日志的记录数")
+	d("uic_audit_write_errors_total", "counter", "审计写入失败次数（不等于业务失败）")
+	d("uic_audit_last_seq", "gauge", "审计链最后一条记录的序号")
+	d("uic_audit_query_total", "counter", "审计查询次数")
 }
 
 // build 按配置创建采集器并注册到调度器。
@@ -414,6 +441,11 @@ func (r *Runtime) Stop(timeout time.Duration) error {
 			first = err
 		}
 	}
+	if r.audit != nil {
+		if err := r.audit.Close(); err != nil && first == nil {
+			first = err
+		}
+	}
 	if r.journal != nil {
 		_ = r.journal.Sync()
 		_ = r.journal.Close()
@@ -510,9 +542,19 @@ func (r *Runtime) markStale(now time.Time) {
 // ---------------------------------------------------------------------------
 
 // ApplyConfig 校验并应用配置，返回需要重启的设备列表。
-func (r *Runtime) ApplyConfig(raw json.RawMessage, source string) (config.ApplyResult, error) {
+func (r *Runtime) ApplyConfig(ctx context.Context, raw json.RawMessage, source string) (config.ApplyResult, error) {
+	filled, err := r.fillRedacted(raw)
+	if err != nil {
+		apiErr, _ := err.(*httpapi.APIError)
+		code, msg := "config.invalid", err.Error()
+		if apiErr != nil {
+			code, msg = apiErr.Code, apiErr.Message
+		}
+		r.auditConfigChange(ctx, "config.apply", "rejected", source, "error", code, msg)
+		return config.ApplyResult{}, err
+	}
 	var f config.File
-	if err := json.Unmarshal(raw, &f); err != nil {
+	if err := json.Unmarshal(filled, &f); err != nil {
 		return config.ApplyResult{}, httpapi.Errf(http.StatusBadRequest, "config.invalid_json",
 			"cannot parse config: %v", err)
 	}
@@ -525,13 +567,19 @@ func (r *Runtime) ApplyConfig(raw json.RawMessage, source string) (config.ApplyR
 	res, err := r.cfg.Apply(&f, source)
 	if err != nil {
 		r.metrics.Inc("uic_config_apply_total", obs.Labels{"status": "error"})
-		return config.ApplyResult{}, httpapi.Errf(http.StatusUnprocessableEntity, "config.apply_failed", "%v", err)
+		apiErr := httpapi.Errf(http.StatusUnprocessableEntity, "config.apply_failed", "%v", err)
+		r.auditConfigChange(ctx, "config.apply", "rejected", source, "error", apiErr.Code, apiErr.Message)
+		return config.ApplyResult{}, apiErr
 	}
 	if !res.Applied {
+		// 内容哈希相同：没改任何东西。仍记一条——「谁在什么时候试图改配置」
+		// 本身就是审计要回答的问题，即使最终没有生效。
+		r.auditConfigChange(ctx, "config.apply", res.Version, source, "ok", "config.unchanged", "content hash unchanged")
 		return res, nil
 	}
 	res.Restarted = r.reload(before)
 	r.metrics.Inc("uic_config_apply_total", obs.Labels{"status": "ok"})
+	r.auditConfigChange(ctx, "config.apply", res.Version, source, "ok", "", "")
 
 	after := r.cfg.Current()
 	afterNB, _ := json.Marshal(struct {
@@ -552,22 +600,45 @@ func (r *Runtime) ApplyConfig(raw json.RawMessage, source string) (config.ApplyR
 }
 
 // Rollback 回滚到指定版本并热更新。
-func (r *Runtime) Rollback(version string) (config.ApplyResult, error) {
+func (r *Runtime) Rollback(ctx context.Context, version string) (config.ApplyResult, error) {
 	before := r.cfg.Current()
 	res, err := r.cfg.Rollback(version)
 	if err != nil {
+		var apiErr *httpapi.APIError
 		if errors.Is(err, config.ErrVersionNotFound) {
-			return config.ApplyResult{}, httpapi.Errf(http.StatusNotFound, "config.version_not_found", "%v", err)
+			apiErr = httpapi.Errf(http.StatusNotFound, "config.version_not_found", "%v", err)
+		} else {
+			apiErr = httpapi.Errf(http.StatusUnprocessableEntity, "config.rollback_failed", "%v", err)
 		}
-		return config.ApplyResult{}, httpapi.Errf(http.StatusUnprocessableEntity, "config.rollback_failed", "%v", err)
+		r.auditConfigChange(ctx, "config.rollback", version, "rollback", "error", apiErr.Code, apiErr.Message)
+		return config.ApplyResult{}, apiErr
+	}
+	// 回滚同样重建凭据表：回滚最常见的用途就是「刚才那次变更引入了错误」，
+	// 而那次变更可能同时改掉了用户表。
+	if err := r.buildAuth(r.cfg.Current()); err != nil {
+		// 不回滚整次 Apply（配置已落盘，业务面要继续服务），但凭据必须
+		// 换成新表：保留旧表等于「配置说删了、进程还说在」。
+		r.log.Error("auth_reload_failed", "error", errText(err))
 	}
 	res.Restarted = r.reload(before)
+	r.auditConfigChange(ctx, "config.rollback", res.Version, "rollback", "ok", "", "restored "+version)
 	return res, nil
 }
 
 // reload 只重建「指纹变化」的设备，未变化的设备连接与死区状态保持不变。
 func (r *Runtime) reload(before *config.File) []string {
 	after := r.cfg.Current()
+	if err := r.buildAuth(after); err != nil {
+		// 不回滚整次 Apply（配置已落盘，业务面要继续服务），但凭据必须
+		// 换成新表：保留旧表等于「配置说删了、进程还说在」。
+		r.log.Error("auth_reload_failed", "error", errText(err))
+	}
+	if err := r.openAudit(after); err != nil {
+		// 保留旧存储继续写：审计不可用只影响留痕，不该让已经在跑的服务
+		// 丢掉整段历史。错误已经打日志，/api/v1/audit/stats 也会显示 enabled=false。
+		r.log.Error("audit_reload_failed", "error", errText(err))
+	}
+
 	chans := make(map[string]model.Channel, len(after.Channels))
 	for _, ch := range after.Channels {
 		chans[ch.ID] = ch
@@ -1086,6 +1157,24 @@ func (r *Runtime) Write(ctx context.Context, device string, items []httpapi.Writ
 
 	if key := httpapi.IdempotencyKey(ctx); key != "" {
 		r.idemPut(device+"\x00"+key, results)
+	}
+	// 逐项审计：一次批量写可能一半成功一半被拒绝，只记一条「写入了 3 个点」
+	// 无法回答事后最重要的问题——**到底哪个点没写进去**。
+	for i, it := range items {
+		res := results[i]
+		detail := map[string]string{
+			"device": device,
+			"point":  it.Point,
+			"value":  it.Value.String(),
+		}
+		if old, ok := r.Point(device, it.Point); ok && old.Quality == model.QualityGood {
+			detail["oldValue"] = old.Value.String()
+		}
+		result, code, msg := "ok", "", ""
+		if !res.OK {
+			result, code, msg = "error", res.Code, res.Message
+		}
+		r.auditFrom(ctx, "point.write", device+"/"+it.Point, result, code, msg, detail)
 	}
 	return results, nil
 }

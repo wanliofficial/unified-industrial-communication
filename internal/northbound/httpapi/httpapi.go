@@ -14,17 +14,21 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
 
 	"uic/internal/alarm"
+	"uic/internal/audit"
+	"uic/internal/auth"
 	"uic/internal/cache"
 	"uic/internal/config"
 	"uic/internal/history"
 	"uic/internal/model"
 	"uic/internal/obs"
+	"uic/internal/rbac"
 )
 
 // Options 是 HTTP 层参数。
@@ -36,6 +40,43 @@ type Options struct {
 	MaxBodyBytes  int64         // 默认 4MB
 	Heartbeat     time.Duration // SSE 默认心跳
 	Now           func() time.Time
+	// Auth 是多身份凭据表。为 nil 时退化为「Token 为空即开放、非空即全权」的
+	// 单凭据模式（供既有测试与最小部署使用）。
+	//
+	// 类型是接口而不是 *auth.Store：runtime 需要在配置热更新后整体替换凭据表，
+	// 而 HTTP 层在启动时就拿到了它。见 auth.Reloadable 的注释。
+	Auth Credentials
+	// Audit 接收认证/授权/写入记录。为 nil 时不记录（测试环境）。
+	Audit Auditor
+}
+
+// Credentials 是 HTTP 层需要的凭据能力。runtime 传 auth.Reloadable。
+type Credentials interface {
+	Authenticate(token string) (auth.Principal, bool)
+	Open() bool
+	Users() []auth.Principal
+}
+
+// Auditor 是 HTTP 层的审计出口。runtime 实现它；测试可以用假实现。
+//
+// 接口只有一个方法，参数是「已发生的事实」而不是业务对象：HTTP 层不该
+// 知道审计日志怎么存、存在哪、怎么分片。
+type Auditor interface {
+	AuditHTTP(ev AuditEvent)
+}
+
+// AuditEvent 是一条 HTTP 侧审计事实。
+type AuditEvent struct {
+	User      string
+	Role      string
+	Action    string
+	Target    string
+	Result    string
+	Code      string
+	Message   string
+	Remote    string
+	RequestID string
+	Detail    map[string]string
 }
 
 func (o Options) withDefaults() Options {
@@ -231,11 +272,11 @@ type Backend interface {
 
 	Config() (json.RawMessage, error)
 	ValidateConfig(raw json.RawMessage) error
-	ApplyConfig(raw json.RawMessage, source string) (config.ApplyResult, error)
+	ApplyConfig(ctx context.Context, raw json.RawMessage, source string) (config.ApplyResult, error)
 	ConfigVersions() []config.VersionInfo
 	ConfigVersion(id string) (json.RawMessage, error)
 	ConfigDiff(from, to string) (config.Diff, error)
-	Rollback(version string) (config.ApplyResult, error)
+	Rollback(ctx context.Context, version string) (config.ApplyResult, error)
 
 	Command(ctx context.Context, action string, params map[string]any) (any, error)
 
@@ -251,6 +292,10 @@ type Backend interface {
 	HistoryStats() (history.Stats, bool)
 
 	DiagnosticsBundle(ctx context.Context) ([]byte, error)
+
+	AuditQuery(f audit.Filter) (audit.Result, error)
+	AuditVerify() (audit.VerifyResult, error)
+	AuditStats() (audit.Stats, bool)
 
 	RecordHTTP(path string, code int, d time.Duration)
 }
@@ -270,6 +315,198 @@ type Server struct {
 	sseLive atomic.Int64
 }
 
+// ---------------------------------------------------------------------------
+// 身份与授权
+// ---------------------------------------------------------------------------
+
+type actorCtxKey struct{}
+
+// Actor 是已通过认证的调用方。HTTP 层只用它做两件事：判定权限，以及写进
+// 审计记录。角色解析到具体权限判定发生在 rbac 包。
+type Actor struct {
+	User      string
+	Role      rbac.Role
+	Remote    string
+	RequestID string
+}
+
+// ActorFrom 从 context 取出调用方身份。ok=false 表示请求未经过认证流程
+// （例如内部调用方），此时上游应当记 system。
+func ActorFrom(ctx context.Context) (Actor, bool) {
+	a, ok := ctx.Value(actorCtxKey{}).(Actor)
+	return a, ok
+}
+
+// guard 认证 + 授权。它是所有业务路由的唯一入口：权限写在路由注册处，
+// 漏写即编译期不可表达。
+//
+// 两种失败分开记：未认证（401 auth.unauthorized）是有意为之的探测或凭据
+// 问题；越权（403 auth.forbidden）是「有身份但不够」——后者才需要进审计，
+// 因为前者会被扫描器无限产生。
+func (s *Server) guard(perm rbac.Permission, next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		actor, ok := s.authenticate(r)
+		if !ok {
+			s.auditDenied(r, actor, "auth.unauthorized", http.StatusUnauthorized,
+				"missing or invalid bearer token", perm)
+			w.Header().Set("WWW-Authenticate", `Bearer realm="uic"`)
+			s.fail(w, r, Errf(http.StatusUnauthorized, "auth.unauthorized",
+				"missing or invalid bearer token"))
+			return
+		}
+		if !rbac.Can(actor.Role, perm) {
+			s.auditDenied(r, actor, "auth.forbidden", http.StatusForbidden,
+				"role "+string(actor.Role)+" lacks "+string(perm), perm)
+			s.fail(w, r, Errf(http.StatusForbidden, "auth.forbidden",
+				"role %q lacks permission %q", actor.Role, perm))
+			return
+		}
+		actor.Remote = r.RemoteAddr
+		actor.RequestID = requestID(r)
+		next(w, r.WithContext(context.WithValue(r.Context(), actorCtxKey{}, actor)))
+	}
+}
+
+// guardReadPublic 保留旧语义：MetricsPublic 为 true 时 metrics 免认证。
+func (s *Server) guardReadPublic(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if s.opt.MetricsPublic && r.URL.Path == "/api/v1/metrics" {
+			next(w, r)
+			return
+		}
+		s.guard(rbac.PermRead, next)(w, r)
+	}
+}
+
+// authenticate 解析凭据。opt.Auth 为 nil 时退化为「Token 非空即全权」，这是
+// 兼容旧部署的单凭据路径。
+//
+// 关键细节：opt.Auth 为 nil 只发生在调用方没接多身份凭据表时（例如旧测试
+// 直接构造 Server）。此时如果 opt.Token 也是空，历史上是**完全开放**而不是
+// 拒绝，runtime 依赖这个语义启动无认证的最小部署，因此这里保持放行。
+func (s *Server) authenticate(r *http.Request) (Actor, bool) {
+	if s.opt.Auth == nil {
+		if s.opt.Token == "" {
+			return Actor{User: "anonymous", Role: rbac.RoleAdmin}, true
+		}
+		got := strings.TrimSpace(strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer "))
+		if got == "" {
+			return Actor{}, false
+		}
+		if subtle.ConstantTimeCompare([]byte(got), []byte(s.opt.Token)) != 1 {
+			return Actor{}, false
+		}
+		return Actor{User: "api", Role: rbac.RoleAdmin}, true
+	}
+	raw := strings.TrimSpace(r.Header.Get("Authorization"))
+	// 开放模式（未配置任何凭据）下认证被显式关闭：不带 Token 也应通过。
+	// 这正是 opt.Auth 为 nil 时「Token 为空即开放」的等价语义，只是搬到了
+	// 凭据表内部，以便热更新时能在「多身份」与「开放」之间切换。
+	if s.opt.Auth.Open() {
+		return Actor{User: "anonymous", Role: rbac.RoleAdmin}, true
+	}
+	if !strings.HasPrefix(raw, "Bearer ") {
+		return Actor{}, false
+	}
+	p, ok := s.opt.Auth.Authenticate(strings.TrimSpace(raw[len("Bearer "):]))
+	if !ok {
+		return Actor{}, false
+	}
+	return Actor{User: p.User, Role: p.Role}, true
+}
+
+func (s *Server) auditDenied(r *http.Request, a Actor, code string, status int, msg string, perm rbac.Permission) {
+	if s.opt.Audit == nil {
+		return
+	}
+	// Action 记「发生了哪类拒绝」，Target 记「当时要的权限」：
+	// 事后最常问的两个问题是「有没有人一直在试」与「他缺的是哪个权限」。
+	s.opt.Audit.AuditHTTP(AuditEvent{
+		User:      actorName(a),
+		Role:      string(a.Role),
+		Action:    code,
+		Target:    string(perm),
+		Result:    auditDeniedResult(status),
+		Code:      code,
+		Message:   msg,
+		Remote:    r.RemoteAddr,
+		RequestID: requestID(r),
+	})
+}
+
+func actorName(a Actor) string {
+	if a.User == "" {
+		return "anonymous"
+	}
+	return a.User
+}
+
+func auditDeniedResult(status int) string {
+	if status == http.StatusForbidden {
+		return "denied"
+	}
+	return "error"
+}
+
+// whoami 回答「我在这台网关上是谁」。公开端点：客户端要先知道「这里到底
+// 要不要凭据」才能决定弹不弹登录框。
+//
+// 它**不列举用户**。之前那版把整张凭据表的用户名与角色返回给任何匿名
+// 请求，等于把账号清单（以及谁有 admin）免费送给扫描器；枚举是
+// /auth/users 的事，需要 audit.read。
+func (s *Server) whoami(w http.ResponseWriter, r *http.Request) error {
+	body := map[string]any{
+		"user": "", "role": "", "open": false, "authenticated": false,
+		"permissions": []string{},
+	}
+	actor, ok := s.authenticate(r)
+	if !ok {
+		// 认证开着但这次没带（或带错）凭据。200 而不是 401：调用方问的
+		// 是「认证模式」，不是「我能进吗」——后者由真正的业务端点回答。
+		writeOK(w, body)
+		return nil
+	}
+	perms := rbac.Grants(actor.Role)
+	names := make([]string, len(perms))
+	for i, p := range perms {
+		names[i] = string(p)
+	}
+	body["user"] = actor.User
+	body["role"] = string(actor.Role)
+	body["open"] = s.openMode()
+	body["authenticated"] = !body["open"].(bool)
+	body["permissions"] = names
+	writeOK(w, body)
+	return nil
+}
+
+// openMode 报告认证是否处于「无凭据」的开放状态。
+func (s *Server) openMode() bool {
+	if s.opt.Auth == nil {
+		return s.opt.Token == ""
+	}
+	return s.opt.Auth.Open()
+}
+
+// authUsers 列出全部账号，需要 audit.read。
+//
+// 只返回用户名与角色：Token 与哈希一旦出现在响应里，它就同时进了浏览器
+// 历史、代理日志和截图。凭据的轮换不走这个接口。
+func (s *Server) authUsers(w http.ResponseWriter, _ *http.Request) error {
+	items := []map[string]any{}
+	if s.opt.Auth == nil {
+		if s.opt.Token != "" {
+			items = append(items, map[string]any{"user": "api", "role": string(rbac.RoleAdmin)})
+		}
+	} else {
+		for _, p := range s.opt.Auth.Users() {
+			items = append(items, map[string]any{"user": p.User, "role": string(p.Role)})
+		}
+	}
+	writeOK(w, map[string]any{"items": items, "open": s.openMode(), "count": len(items)})
+	return nil
+}
+
 // New 构造 HTTP 层并注册全部路由。
 func New(opt Options, be Backend, log *slog.Logger) *Server {
 	if log == nil {
@@ -285,40 +522,60 @@ func (s *Server) SSEClients() int64 { return s.sseLive.Load() }
 
 func (s *Server) routes() {
 	h := s.handle
-	s.mux.HandleFunc("GET /healthz", h(s.healthz))
-	s.mux.HandleFunc("GET /readyz", h(s.readyz))
-	s.mux.HandleFunc("GET /api/v1/health", h(s.health))
-	s.mux.HandleFunc("GET /api/v1/version", h(s.version))
-	s.mux.HandleFunc("GET /api/v1/metrics", h(s.metrics))
+	// route 把「路径模式 + 所需权限」绑在一起。权限写在路由旁边而不是
+	// 集中在一张表里，是因为新增路由时最容易被忘掉的就是权限——写在这里，
+	// 漏掉就是编译期可见的（route 的第二个参数不能省）。
+	route := func(pattern string, perm rbac.Permission, fn func(http.ResponseWriter, *http.Request) error) {
+		s.mux.HandleFunc(pattern, s.guard(perm, h(fn)))
+	}
+	// public 是无需任何权限的端点：健康探针与版本号必须能被负载均衡与
+	// 监控系统直接访问，否则「服务是否活着」本身也要凭据才能回答。
+	public := func(pattern string, fn func(http.ResponseWriter, *http.Request) error) {
+		s.mux.HandleFunc(pattern, h(fn))
+	}
 
-	s.mux.HandleFunc("GET /api/v1/devices", h(s.devices))
-	s.mux.HandleFunc("GET /api/v1/devices/{device}", h(s.device))
-	s.mux.HandleFunc("GET /api/v1/devices/{device}/points", h(s.devicePoints))
+	public("GET /healthz", s.healthz)
+	public("GET /readyz", s.readyz)
+	public("GET /api/v1/version", s.version)
+	s.mux.HandleFunc("GET /api/v1/health", s.guardReadPublic(h(s.health)))
+	s.mux.HandleFunc("GET /api/v1/metrics", s.guardReadPublic(h(s.metrics)))
+	public("GET /api/v1/auth/me", s.whoami)
 
-	s.mux.HandleFunc("GET /api/v1/points", h(s.points))
-	s.mux.HandleFunc("GET /api/v1/points/{device}/{point}", h(s.point))
-	s.mux.HandleFunc("POST /api/v1/points/{device}/{point}/write", h(s.writeOne))
-	s.mux.HandleFunc("POST /api/v1/points/{device}/write", h(s.writeBatch))
+	route("GET /api/v1/devices", rbac.PermRead, s.devices)
+	route("GET /api/v1/devices/{device}", rbac.PermRead, s.device)
+	route("GET /api/v1/devices/{device}/points", rbac.PermRead, s.devicePoints)
 
-	s.mux.HandleFunc("GET /api/v1/config", h(s.configGet))
-	s.mux.HandleFunc("POST /api/v1/config/validate", h(s.configValidate))
-	s.mux.HandleFunc("POST /api/v1/config/apply", h(s.configApply))
-	s.mux.HandleFunc("GET /api/v1/config/versions", h(s.configVersions))
-	s.mux.HandleFunc("GET /api/v1/config/versions/{id}", h(s.configVersion))
-	s.mux.HandleFunc("GET /api/v1/config/diff", h(s.configDiff))
-	s.mux.HandleFunc("POST /api/v1/config/rollback", h(s.configRollback))
+	route("GET /api/v1/points", rbac.PermRead, s.points)
+	route("GET /api/v1/points/{device}/{point}", rbac.PermRead, s.point)
+	route("POST /api/v1/points/{device}/{point}/write", rbac.PermWrite, s.writeOne)
+	route("POST /api/v1/points/{device}/write", rbac.PermWrite, s.writeBatch)
 
-	s.mux.HandleFunc("POST /api/v1/commands", h(s.command))
-	s.mux.HandleFunc("GET /api/v1/logs", h(s.logs))
-	s.mux.HandleFunc("GET /api/v1/stream", h(s.stream))
+	route("GET /api/v1/config", rbac.PermConfigRead, s.configGet)
+	route("POST /api/v1/config/validate", rbac.PermConfigWrite, s.configValidate)
+	route("POST /api/v1/config/apply", rbac.PermConfigWrite, s.configApply)
+	route("GET /api/v1/config/versions", rbac.PermConfigRead, s.configVersions)
+	route("GET /api/v1/config/versions/{id}", rbac.PermConfigRead, s.configVersion)
+	route("GET /api/v1/config/diff", rbac.PermConfigRead, s.configDiff)
+	route("POST /api/v1/config/rollback", rbac.PermConfigWrite, s.configRollback)
 
-	s.mux.HandleFunc("GET /api/v1/alarms", h(s.alarmsList))
-	s.mux.HandleFunc("POST /api/v1/alarms/ack", h(s.alarmsAck))
-	s.mux.HandleFunc("GET /api/v1/alarms/stream", h(s.alarmsStream))
-	s.mux.HandleFunc("GET /api/v1/alarms/{id}", h(s.alarmGet))
-	s.mux.HandleFunc("POST /api/v1/alarms/{id}/ack", h(s.alarmAck))
-	s.mux.HandleFunc("GET /api/v1/history", h(s.history))
-	s.mux.HandleFunc("GET /api/v1/diagnostics/bundle", h(s.bundle))
+	// 命令的路由级权限只到 PermCommand；具体动作是高危还是普通，要解析
+	// 请求体才知道，因此在 handler 里再判一次（见 command）。
+	route("POST /api/v1/commands", rbac.PermCommand, s.command)
+	route("GET /api/v1/logs", rbac.PermDiagnostics, s.logs)
+	route("GET /api/v1/stream", rbac.PermRead, s.stream)
+
+	route("GET /api/v1/alarms", rbac.PermRead, s.alarmsList)
+	route("POST /api/v1/alarms/ack", rbac.PermAlarmAck, s.alarmsAck)
+	route("GET /api/v1/alarms/stream", rbac.PermRead, s.alarmsStream)
+	route("GET /api/v1/alarms/{id}", rbac.PermRead, s.alarmGet)
+	route("POST /api/v1/alarms/{id}/ack", rbac.PermAlarmAck, s.alarmAck)
+	route("GET /api/v1/history", rbac.PermRead, s.history)
+	route("GET /api/v1/diagnostics/bundle", rbac.PermDiagnostics, s.bundle)
+
+	route("GET /api/v1/audit", rbac.PermAuditRead, s.auditList)
+	route("GET /api/v1/audit/verify", rbac.PermAuditRead, s.auditVerify)
+	route("GET /api/v1/audit/stats", rbac.PermAuditRead, s.auditStats)
+	route("GET /api/v1/auth/users", rbac.PermAuditRead, s.authUsers)
 }
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -443,7 +700,9 @@ func requestID(r *http.Request) string {
 	if v, ok := r.Context().Value(ctxKeyRequestID{}).(string); ok {
 		return v
 	}
-	return ""
+	// 直接调用 guard（测试或未来的非 ServeHTTP 入口）时 ctx 里没有注入的 ID，
+	// 退回客户端提供的那个；都没有就留空，不编一个假的。
+	return r.Header.Get("X-Request-Id")
 }
 
 type statusWriter struct {
@@ -935,7 +1194,7 @@ func (s *Server) configApply(w http.ResponseWriter, r *http.Request) error {
 	if err != nil {
 		return err
 	}
-	res, err := s.be.ApplyConfig(raw, "api")
+	res, err := s.be.ApplyConfig(r.Context(), raw, "api")
 	if err != nil {
 		return err
 	}
@@ -997,7 +1256,7 @@ func (s *Server) configRollback(w http.ResponseWriter, r *http.Request) error {
 	if body.Version == "" {
 		return Errf(http.StatusBadRequest, "request.invalid", "version is required")
 	}
-	res, err := s.be.Rollback(body.Version)
+	res, err := s.be.Rollback(r.Context(), body.Version)
 	if err != nil {
 		return err
 	}
@@ -1023,6 +1282,17 @@ func (s *Server) command(w http.ResponseWriter, r *http.Request) error {
 	}
 	if body.Params == nil {
 		body.Params = map[string]any{}
+	}
+	// 路由级权限只到 PermCommand；高危动作要在这里再判一次。判定表在
+	// rbac.CommandPermission，与命令白名单放在同一个仓库里评审。
+	if need := rbac.CommandPermission(body.Action); need != rbac.PermCommand {
+		actor, _ := ActorFrom(r.Context())
+		if !rbac.Can(actor.Role, need) {
+			s.auditDenied(r, actor, "auth.forbidden", http.StatusForbidden,
+				"action "+body.Action+" requires "+string(need), need)
+			return Errf(http.StatusForbidden, "auth.forbidden",
+				"role %q cannot run %q (requires %q)", actor.Role, body.Action, need)
+		}
 	}
 	if body.Confirm {
 		body.Params["_confirm"] = true
@@ -1341,4 +1611,144 @@ func parseSet(s string) map[string]bool {
 		return nil
 	}
 	return out
+}
+
+// ---------------------------------------------------------------------------
+// 审计查询
+// ---------------------------------------------------------------------------
+
+func (s *Server) auditList(w http.ResponseWriter, r *http.Request) error {
+	q := r.URL.Query()
+	f := audit.Filter{
+		User:   q.Get("user"),
+		Role:   q.Get("role"),
+		Action: q.Get("action"),
+		Result: q.Get("result"),
+		Q:      q.Get("q"),
+	}
+	if v := q.Get("from"); v != "" {
+		t, err := time.Parse(time.RFC3339, v)
+		if err != nil {
+			return Errf(http.StatusBadRequest, "request.invalid", "from must be RFC3339: %v", err)
+		}
+		f.From = t
+	}
+	if v := q.Get("to"); v != "" {
+		t, err := time.Parse(time.RFC3339, v)
+		if err != nil {
+			return Errf(http.StatusBadRequest, "request.invalid", "to must be RFC3339: %v", err)
+		}
+		f.To = t
+	}
+	if v := q.Get("limit"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 0 {
+			return Errf(http.StatusBadRequest, "request.invalid", "limit must be a non-negative integer")
+		}
+		f.Limit = n
+	}
+	f.Cursor = q.Get("cursor")
+	res, err := s.be.AuditQuery(f)
+	var ae *APIError
+	if errors.As(err, &ae) {
+		return err
+	}
+	if err != nil {
+		return Errf(http.StatusInternalServerError, "audit.query_failed", "%v", err)
+	}
+	// 时间统一 UTC 输出（docs/03-product/05-northbound-api-spec.md §2.1）。
+	items := make([]map[string]any, 0, len(res.Items))
+	for _, rec := range res.Items {
+		items = append(items, auditView(rec))
+	}
+	next := res.NextCursor
+	if next == "" {
+		next = ""
+	}
+	writeOK(w, map[string]any{
+		"items": items, "nextCursor": next,
+		"total": res.Total, "scanned": res.Scanned,
+	})
+	return nil
+}
+
+func auditView(rec audit.Record) map[string]any {
+	v := map[string]any{
+		"seq":    rec.Seq,
+		"time":   rec.Time.UTC().Format(time.RFC3339Nano),
+		"user":   rec.User,
+		"role":   rec.Role,
+		"action": rec.Action,
+		"result": rec.Result,
+	}
+	if rec.Target != "" {
+		v["target"] = rec.Target
+	}
+	if rec.Code != "" {
+		v["code"] = rec.Code
+	}
+	if rec.Message != "" {
+		v["message"] = rec.Message
+	}
+	if rec.Remote != "" {
+		v["remote"] = rec.Remote
+	}
+	if rec.RequestID != "" {
+		v["requestId"] = rec.RequestID
+	}
+	if len(rec.Detail) > 0 {
+		keys := make([]string, 0, len(rec.Detail))
+		for k := range rec.Detail {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		detail := make(map[string]string, len(keys))
+		for _, k := range keys {
+			detail[k] = rec.Detail[k]
+		}
+		v["detail"] = detail
+	}
+	return v
+}
+
+func (s *Server) auditVerify(w http.ResponseWriter, _ *http.Request) error {
+	res, err := s.be.AuditVerify()
+	var ae *APIError
+	if errors.As(err, &ae) {
+		return err
+	}
+	if err != nil {
+		return Errf(http.StatusInternalServerError, "audit.verify_failed", "%v", err)
+	}
+	status := "ok"
+	if !res.OK {
+		status = "broken"
+	}
+	writeOK(w, map[string]any{
+		"status": status, "checked": res.Checked,
+		"brokenAt": res.BrokenAt, "reason": res.Reason,
+	})
+	return nil
+}
+
+func (s *Server) auditStats(w http.ResponseWriter, _ *http.Request) error {
+	st, enabled := s.be.AuditStats()
+	if !enabled {
+		writeOK(w, map[string]any{"enabled": false})
+		return nil
+	}
+	writeOK(w, map[string]any{
+		"enabled":     true,
+		"records":     st.Records,
+		"bytes":       st.Bytes,
+		"maxBytes":    st.MaxBytes,
+		"segments":    st.Segments,
+		"oldest":      st.Oldest.UTC().Format(time.RFC3339),
+		"newest":      st.Newest.UTC().Format(time.RFC3339),
+		"appended":    st.Appended,
+		"evicted":     st.Evicted,
+		"writeErrors": st.WriteErrors,
+		"lastSeq":     st.LastSeq,
+	})
+	return nil
 }

@@ -50,7 +50,7 @@ func (w slaveWriter) Write(ctx context.Context, reqs []slavemb.WriteRequest) []s
 		for j, i := range idx {
 			items[j] = httpapi.WriteItem{Point: reqs[i].Point, Value: reqs[i].Value}
 		}
-		res, err := w.rt.Write(ctx, dev, items)
+		res, err := w.rt.Write(withSource(ctx, "modbus-slave"), dev, items)
 		if err != nil {
 			for _, i := range idx {
 				out[i] = slavemb.WriteResult{Err: err}

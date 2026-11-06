@@ -33,19 +33,52 @@
 | 版本 | 路径版本（`/v1`）；破坏性变更升 `/v2`，`/v1` 至少保留 12 个月 |
 | 请求 ID | 响应头 `X-Request-Id`；客户端可传 `X-Request-Id` 透传 |
 
-### 2.2 认证
+### 2.2 认证与身份
 
 ```
 Authorization: Bearer <token>
 ```
 
+凭据是**配置里的静态 Token**，一个 Token 对应一个具名用户与一个角色（Wave 1
+不做登录会话与 Token 过期；理由见 §4.9.1）。
+
 | 规则 | 说明 |
 |---|---|
-| Token 来源 | 登录接口签发；或配置的静态 API Token（运维用） |
-| 有效期 | 会话 Token 12h；API Token 可长期 |
-| 失败 | `401` + `WWW-Authenticate: Bearer` |
-| 权限不足 | `403` + 错误码 `auth.forbidden` |
-| 首次登录 | 必须修改初始口令，否则除改密外全部 `403` |
+| Token 形态 | 不透明字符串，≥16 字符，不含空白；推荐 `uic token` 生成 |
+| 配置位置 | `server.users[]`，每项 `name`/`role` + `token` 或 `tokenSha256` |
+| 比对方式 | 服务端先做 SHA-256，再定长比较；配置文件可只存哈希 |
+| 失败 | `401` + `WWW-Authenticate: Bearer` + `auth.unauthorized` |
+| 权限不足 | `403` + `auth.forbidden`，`message` 指出缺少哪个权限 |
+| 开放模式 | 未配置任何凭据时认证关闭，启动横幅与 `auth_open_mode` WARN 明确提示 |
+| 身份查询 | `GET /api/v1/auth/me`（公开）返回当前用户、角色、是否开放模式 |
+| 凭据热更新 | 改 `server.users` 后 `POST /config/apply`，新请求立即按新表判定 |
+
+#### 2.2.1 角色与权限
+
+权限按**动作**定义，不按资源路径。角色是权限集合，且满足
+`viewer ⊆ operator ⊆ admin`——这条包含关系是刻意的：任何「低角色能做而高
+角色不能做」的设计最终都解释不清。
+
+| 权限 | viewer | operator | admin | 覆盖的动作 |
+|---|:--:|:--:|:--:|---|
+| `read` | ✓ | ✓ | ✓ | 设备/点位/历史/报警/SSE 查询 |
+| `point.write` | — | ✓ | ✓ | 单点与批量写入 |
+| `alarm.ack` | — | ✓ | ✓ | 报警确认 |
+| `command` | — | ✓ | ✓ | 普通白名单命令 |
+| `command.danger` | — | — | ✓ | `outbox.drop` / `config.rollback` / `log.level` |
+| `config.read` | — | ✓ | ✓ | 读配置、版本、diff |
+| `config.write` | — | — | ✓ | 校验/应用/回滚配置 |
+| `audit.read` | — | — | ✓ | 审计查询/校验/统计、用户枚举 |
+| `diagnostics` | — | ✓ | ✓ | 日志、诊断包 |
+
+| 角色 | 定位 |
+|---|---|
+| `viewer` | 只看。给值班大屏、只读看板、跨部门查询 |
+| `operator` | 能作业不能改结构：写点位、确认报警、重启采集、导诊断包 |
+| `admin` | 全部，含配置与审计 |
+
+**未知角色一律拒绝**（不是默认放行）。`role` 字段缺省时按 `admin` 处理，仅
+为兼容没有该字段的历史配置——新配置必须显式写角色。
 
 ### 2.3 错误响应
 
@@ -319,6 +352,14 @@ X-Idempotency-Key: 0b6f...
 }
 ```
 
+**`***` 占位符**：GET 出来的配置里，`token`/`tokenSha256`/`password`/`secret`
+类字段是 `***`。`validate` 与 `apply` 都把它理解为「保持当前值不变」，
+因此「读出配置 → 改一个点位 → 写回去」是安全且可用的路径。占位符出现在当前
+配置里不存在的字段上会返回 `config.invalid`，而不是猜一个值。
+
+数组按 `id`/`name` 匹配而不是按下标还原——删掉或重排 `server.users` 时，
+按下标会把 A 的凭据安到 B 头上，且不会报错。
+
 **回滚语义**：
 
 | 规则 | 说明 |
@@ -335,18 +376,24 @@ POST /api/v1/commands
 { "action": "driver.restart", "params": { "device": "plc-01" } }
 ```
 
-| action | 参数 | 权限 | 说明 |
+| action | 参数 | 所需权限 | 说明 |
 |---|---|---|---|
-| `driver.restart` | `device` | `device.control` | 重启单设备采集 |
-| `device.selftest` | `device` | `device.control` | 读 1 个点验证连通性 |
-| `outbox.flush` | `sink?` | `system.control` | 手动触发补发 |
-| `outbox.drop` | `sink`, `before` | `system.control` | 丢弃指定时间前消息 |
-| `config.rollback` | `version` | `config.rollback` | 同 4.4 |
-| `alarm.ack` | `ids` 或 `all`, `by` | `alarm.ack` | 同 4.7 的确认语义 |
-| `log.level` | `level` | `system.control` | 动态调整日志级别 |
-| `diag.bundle` | — | `system.read` | 生成诊断包 |
+| `driver.restart` | `device` | `command` | 重启单设备采集 |
+| `device.selftest` | `device` | `command` | 读 1 个点验证连通性 |
+| `outbox.flush` | `sink?` | `command` | 手动触发补发 |
+| `outbox.drop` | `sink`, `before` | `command.danger` | 丢弃指定时间前消息（不可逆） |
+| `config.rollback` | `version` | `command.danger` | 同 4.4 |
+| `alarm.ack` | `ids` 或 `all`, `by` | `command` | 同 4.7 的确认语义 |
+| `log.level` | `level` | `command.danger` | 动态调整日志级别（会掩盖问题） |
+| `diag.bundle` | — | `command` | 生成诊断包 |
 
-**规则**：未知 action 返回 `request.unknown_action`；所有命令写审计；高危命令需二次确认参数 `"confirm": true`。
+**规则**：未知 action 返回 `request.unknown_action`；所有命令写审计（成功与
+失败都写）；高危命令需参数 `"confirm": true`。
+
+**两级权限判定**：路由级只要求 `command`（因为动作在请求体里），handler 解析
+出 `action` 后再按上表二次判定。这样新增一个高危命令时，漏改路由也不会
+让 operator 拿到它——判定表 `rbac.CommandPermission` 与命令白名单放在同一个
+仓库里评审。
 
 ### 4.6 诊断
 
@@ -776,6 +823,177 @@ curl -s 'localhost:8092/api/v1/history?device=press&point=power&from=-1h&step=1m
   `evicted` / `writeErrors`；指标为 `uic_history_bytes`、`uic_history_segments`、
   `uic_history_records_total`、`uic_history_evicted_total`、
   `uic_history_write_errors_total`、`uic_history_query_total{result}`。
+
+### 4.9 认证与授权
+
+#### 4.9.1 为什么是静态 Token 而不是登录会话
+
+Wave 1 的目标是「边缘网关 + 少量运维客户端」，不是面向终端用户的门户。登录
+会话会引入口令存储、重置流程、会话存储与过期清理——四块都需要持久化与运维
+投入，却不会让一个只有三类角色的系统更安全。静态 Token 的边界很明确：
+
+- 每个 Token 独立可撤销（改配置即可，**下一条请求立即生效**）；
+- 配置文件可只存 `tokenSha256`，泄露配置不等于泄露凭据；
+- 不需要在网关上存任何口令哈希表之外的东西。
+
+代价是 Token 不会过期、不能自助轮换。因此 `uic token` 负责生成，轮换 = 生成
+新 Token → 双写过渡 → 删除旧项 → apply。
+
+#### 4.9.2 `GET /api/v1/auth/me`
+
+无需凭据（否则无法探测「是否需要凭据」）。它只回答「**我**是谁」，不列举
+其他账号。
+
+```json
+{
+  "user": "ops",
+  "role": "operator",
+  "open": false,
+  "authenticated": true,
+  "permissions": ["alarm.ack", "command", "config.read", "diagnostics", "point.write", "read"]
+}
+```
+
+| 情形 | 响应 |
+|---|---|
+| 携带有效 Token | `authenticated: true` + 该用户的 `user`/`role`/`permissions` |
+| 未带或带错 Token（认证开启） | `200` + `authenticated: false`、`user`/`role` 为空 |
+| 开放模式 | `open: true`、`user: "anonymous"`、`role: "admin"`、`authenticated: false` |
+
+未认证返回 `200` 而不是 `401`：调用方问的是「认证模式」，不是「我能进吗」——
+后者由真正的业务端点回答。客户端据此决定是否显示「写入」按钮，但不能把它当作
+授权依据——服务端每次请求都重新判定。
+
+#### 4.9.3 `GET /api/v1/auth/users`
+
+需要 `audit.read`（admin）。只返回 `user`/`role`，**永不返回 Token 或哈希**。
+
+```json
+{ "items": [ {"user":"ops","role":"operator"}, {"user":"root","role":"admin"} ], "open": false }
+```
+
+#### 4.9.4 权限判定的顺序
+
+1. 解析 `Authorization`；开放模式下直接视为 `anonymous/admin`。
+2. 无 Token 或 Token 不匹配 → `401 auth.unauthorized`（审计 `result=error`）。
+3. 路由级权限不足 → `403 auth.forbidden`（审计 `result=denied`）。
+4. handler 内的细粒度权限（高危命令、写入逐项校验）再判一次。
+
+第 2 步与第 3 步在审计里刻意区分：401 多半是扫描器或配置错误，403 才是「有
+身份的人试图越权」，后者才需要人看。
+
+### 4.10 审计
+
+#### 4.10.1 记录什么
+
+| 类别 | `action` | 触发点 |
+|---|---|---|
+| 认证 | `auth.unauthorized` | Token 缺失/错误 |
+| 授权 | `auth.forbidden` | 角色缺少所需权限 |
+| 写入 | `point.write` | 每次写入的**每个点位**各一条 |
+| 命令 | `command.<action>` | 成功、失败、未知 action |
+| 报警 | `alarm.ack` | 单条/批量/全部确认 |
+| 配置 | `config.apply` / `config.rollback` | 成功、被拒绝、内容未变 |
+
+一条记录的字段：
+
+```json
+{
+  "seq": 1024,
+  "time": "2026-11-06T04:30:00.123Z",
+  "user": "ops",
+  "role": "operator",
+  "action": "point.write",
+  "target": "plc-01/setpoint",
+  "result": "ok",
+  "code": "",
+  "message": "",
+  "remote": "10.0.0.8:51422",
+  "requestId": "req-...",
+  "detail": { "device": "plc-01", "point": "setpoint", "oldValue": "40", "value": "42", "via": "api" },
+  "prev": "…",
+  "hash": "…"
+}
+```
+
+`result` 三态：`ok` / `denied` / `error`。`detail` 只允许字符串键值（可检索、
+可截断）；`via` 自动标注来源：`api` / `modbus-slave` / `opcua-server`。
+
+**写入逐项记录**：一次批量写一半成功一半被拒绝时，只记一条汇总无法回答事后
+最重要的问题——到底哪个点没写进去。
+
+#### 4.10.2 完整性
+
+审计是 NDJSON 分段文件 + **SHA-256 哈希链**：
+
+- `seq` 连续递增，重启后从上一段尾部续号；
+- `hash = SHA-256(规范化字段 + prev)`，字段边界用「长度:内容」编码，避免
+  值里塞分隔符构造碰撞；
+- 整段淘汰（保留策略）后链仍可从新起点校验；
+- 尾部半行（掉电）不参与校验，新记录写入新段。
+
+```
+GET /api/v1/audit/verify
+{ "status": "ok", "checked": 1024, "brokenAt": 0, "reason": "" }
+```
+
+被篡改或整条删除时 `brokenAt` 指向第一条不一致的记录，`reason` 说明是
+`hash mismatch` 还是 `seq gap`。
+
+#### 4.10.3 查询
+
+```http
+GET /api/v1/audit?user=ops&action=point.write&result=error&from=...&to=...&q=setpoint&limit=100&cursor=o1200
+```
+
+| 参数 | 说明 |
+|---|---|
+| `user` `role` `action` `result` | 精确匹配 |
+| `from` `to` | RFC 3339 时间窗 |
+| `q` | 子串匹配 user/action/target/message/code |
+| `limit` | 默认 100，上限 1000 |
+| `cursor` | 不透明游标（`o<offset>`），只保证「翻页不漏」 |
+
+结果按时间**倒序**（最新在前），`scanned` 报告本次实际扫描的记录数——它和
+`total` 的差距是「过滤发生在读出之后」的诚实说明。
+
+#### 4.10.4 存储与保留
+
+| 配置 | 默认 | 说明 |
+|---|---|---|
+| `storage.audit.enabled` | `true` | 显式 `false` 才关闭 |
+| `storage.audit.dir` | `<storage.dir>/audit` | 与历史库分开目录 |
+| `storage.audit.maxBytes` | 64 MiB | 总量上限，整段淘汰 |
+| `storage.audit.segmentBytes` | 8 MiB | 单段上限 |
+| `storage.audit.maxAge` | 90d | 按时间淘汰 |
+
+#### 4.10.5 水位
+
+```http
+GET /api/v1/audit/stats
+{ "enabled": true, "records": 1024, "appended": 12, "evicted": 3, "bytes": 20480,
+  "maxBytes": 67108864, "segments": 1, "lastSeq": 1024,
+  "oldest": "…", "newest": "…", "writeErrors": 0 }
+```
+
+| 字段 | 语义 |
+|---|---|
+| `records` | 磁盘上**当前保留**的条数（含重启前写入的；淘汰整段会同步减少） |
+| `appended` | 本进程启动以来写入的条数 |
+| `evicted` | 本进程淘汰的整段数 |
+| `lastSeq` | 最后一条记录的序号；重启后从磁盘续号 |
+| `writeErrors` | 本进程写入失败次数（对应 `uic_audit_write_errors_total`） |
+
+区分「审计停了」和「刚重启」要看这两个字段的配合：`records` 是磁盘上的
+存量事实（重启后不归零），`appended` 才是本次进程的活动量。判断是否停摆应
+盯 `appended` / `writeErrors` 是否还在变化，而不是 `records` 的绝对值。
+
+**审计写入失败不阻断业务**：写不进去时记 ERROR 日志并累加
+`uic_audit_write_errors_total`，接口照常返回。反过来（因为磁盘满而拒绝写
+点位）会让产线停摆——这是明确的取舍，指标与告警负责让人发现。
+
+审计关闭时 `/api/v1/audit*` 返回 `409 audit.disabled`，而不是空列表：空列表
+会让调用方以为「查过了，没有记录」。
 
 ---
 
@@ -1261,7 +1479,10 @@ SCADA 会显示一个从未生效的设定值。
 | `alarm.ack` 命令 | 已实现 | 同 §4.7.3 语义 |
 | MQTT | 已实现 | 见 §6（QoS0/1、retained 状态、断线补投） |
 | OPC UA 北向 | 已实现 | 见 §7（地址空间、质量映射、写穿透、订阅、热重建） |
-| RBAC / 审计 / 诊断包 | 规范已定义 | Wave 1 后半实现 |
+| RBAC（三角色九权限） | 已实现 | 见 §2.2.1 / §4.9 |
+| 审计（哈希链 + 查询/校验） | 已实现 | 见 §4.10（NDJSON 分段、at-least-once 语义） |
+| `uic token` | 已实现 | 生成 Token + `tokenSha256` + 可粘贴片段 |
+| 诊断包 | 已实现 | 见 §4.6 |
 
 ---
 

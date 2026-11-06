@@ -26,6 +26,8 @@ type harness struct {
 	sim   *sim.Server
 	dir   string
 	token string
+	// actor 覆盖身份。空表示沿用旧行为（带 Token 时以 api/admin 身份调用）。
+	actor string
 }
 
 func newHarness(t *testing.T, mutate func(cfg map[string]any)) *harness {
@@ -130,7 +132,9 @@ func (h *harness) do(method, path, body string) (int, []byte) {
 	if err != nil {
 		h.t.Fatal(err)
 	}
-	if h.token != "" {
+	if h.actor != "" {
+		req.Header.Set("Authorization", "Bearer "+h.actor)
+	} else if h.token != "" {
 		req.Header.Set("Authorization", "Bearer "+h.token)
 	}
 	if body != "" {
@@ -182,6 +186,11 @@ func TestRuntimeEndToEnd(t *testing.T) {
 	}
 
 	// health：设备在采集，点位全部 good。
+	//
+	// Outbox 的投递是异步的：publish 只是入队 + 唤醒 dispatchLoop，真正
+	// drain 取决于调度。拿到第一个 good 样本的瞬间就断言 Delivered>0，测的
+	// 是 goroutine 的调度时机而不是补发语义——GOMAXPROCS=1 或机器繁忙时
+	// 会稳定失败。所以这里等它收敛。
 	code, body := h.do(http.MethodGet, "/api/v1/health", "")
 	if code != 200 {
 		t.Fatalf("health = %d %s", code, body)
@@ -193,8 +202,19 @@ func TestRuntimeEndToEnd(t *testing.T) {
 	if health.Devices.Collecting != 1 || health.Points.Good == 0 {
 		t.Fatalf("health = %+v", health)
 	}
-	if health.Outbox.Delivered == 0 {
-		t.Fatalf("journal sink should have delivered events: %+v", health.Outbox)
+	deliverDeadline := time.Now().Add(10 * time.Second)
+	for health.Outbox.Delivered == 0 {
+		if time.Now().After(deliverDeadline) {
+			t.Fatalf("journal sink should have delivered events: %+v", health.Outbox)
+		}
+		time.Sleep(10 * time.Millisecond)
+		code, body = h.do(http.MethodGet, "/api/v1/health", "")
+		if code != 200 {
+			t.Fatalf("health = %d %s", code, body)
+		}
+		if err := json.Unmarshal(body, &health); err != nil {
+			t.Fatal(err)
+		}
 	}
 
 	// 设备视图：配置态与运行态分别返回。
@@ -349,24 +369,31 @@ func TestRuntimeEndToEnd(t *testing.T) {
 	}
 
 	// journal 真实落盘。
+	//
+	// journalSink 一次 Write 写入整批（多行）；读者可能在写入中途读到半行。
+	// 因此只认「已以 \n 结尾」的行，解析失败就继续等，而不是把半行当成
+	// 写坏了——这同样是读-写并发下的观察时机问题，不是产品缺陷。
 	journal := filepath.Join(h.dir, "journal.ndjson")
 	deadline := time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) {
-		if b, err := os.ReadFile(journal); err == nil && len(b) > 0 {
-			line := strings.SplitN(strings.TrimSpace(string(b)), "\n", 2)[0]
-			var ev map[string]any
-			if err := json.Unmarshal([]byte(line), &ev); err != nil {
-				t.Fatalf("journal line not JSON: %s", line)
+	var lastLine string
+	for {
+		if b, err := os.ReadFile(journal); err == nil {
+			if i := strings.IndexByte(string(b), '\n'); i >= 0 {
+				line := string(b)[:i]
+				lastLine = line
+				var ev map[string]any
+				if err := json.Unmarshal([]byte(line), &ev); err == nil {
+					if ev["schemaVersion"] != float64(1) || ev["device"] != "sim01" {
+						t.Fatalf("journal payload = %v", ev)
+					}
+					break
+				}
 			}
-			if ev["schemaVersion"].(float64) != 1 || ev["device"] != "sim01" {
-				t.Fatalf("journal payload = %v", ev)
-			}
-			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("journal.ndjson never received a complete record (last line %q)", lastLine)
 		}
 		time.Sleep(20 * time.Millisecond)
-		if time.Now().After(deadline) {
-			t.Fatal("journal.ndjson never received data")
-		}
 	}
 
 	// 配置热更新：只重启指纹变化的设备。

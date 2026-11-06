@@ -26,10 +26,12 @@ import (
 	"time"
 
 	"uic/internal/alarm"
+	"uic/internal/auth"
 	"uic/internal/calc"
 	"uic/internal/driver"
 	"uic/internal/model"
 	"uic/internal/mqtt"
+	"uic/internal/rbac"
 )
 
 // SchemaVersion 是当前支持的配置格式版本。
@@ -45,6 +47,25 @@ type Server struct {
 	Token    string `json:"token,omitempty"`
 	BasePath string `json:"basePath,omitempty"`
 	TLS      TLS    `json:"tls,omitempty"`
+	// Users 是多身份凭据表。存在时 server.token 仍被接受（映射为名为
+	// "api" 的 admin 凭据），这样老配置升级后不会突然变成「无凭据」。
+	Users []User `json:"users,omitempty"`
+}
+
+// User 是一条北向凭据。
+//
+// Token 与 TokenSha256 二选一：
+//   - Token 是明文，便于联调时「从配置里读回自己的口令」；
+//   - TokenSha256 是它的 SHA-256 十六进制，生产环境应该用这个——配置文件
+//     会被备份、贴进工单、进 git，明文 Token 一旦这样流转就等于泄露。
+//
+// 两者都支持而不是只留哈希，是因为现场最常见的事故是「Token 只在部署时
+// 出现过一次，然后丢了」。`uic token` 一次生成两者，写哪份由部署方决定。
+type User struct {
+	Name        string `json:"name"`
+	Role        string `json:"role"`
+	Token       string `json:"token,omitempty"`
+	TokenSha256 string `json:"tokenSha256,omitempty"`
 }
 
 // TLS 是 API 的 TLS 配置。默认关闭；生产要求开启。
@@ -119,6 +140,19 @@ type Storage struct {
 	// 策略抽取的时间序列」，用于查历史曲线。两者写同一个目录会让保留
 	// 策略互相干扰，所以 History 有自己的一套字节上限与保留期。
 	History History `json:"history,omitempty"`
+	// Audit 是审计日志（有界、按段淘汰、哈希链）。默认开启：一个「审计
+	// 可以关掉」的部署，在出事那天一定会发现它一直是关的。
+	Audit Audit `json:"audit,omitempty"`
+}
+
+// Audit 是审计日志的保留策略。
+type Audit struct {
+	// Enabled 用指针以区分「没配」与「显式关闭」。没配 = 开启。
+	Enabled      *bool          `json:"enabled,omitempty"`
+	Dir          string         `json:"dir,omitempty"`
+	MaxBytes     int64          `json:"maxBytes,omitempty"`
+	MaxAge       model.Duration `json:"maxAge,omitempty"`
+	SegmentBytes int64          `json:"segmentBytes,omitempty"`
 }
 
 // History 是历史采样日志的策略。
@@ -228,6 +262,29 @@ func (f *File) Normalize() {
 			h.Deadband = 0
 		}
 	}
+	// 审计默认开启：nil 表示「没配」，不是「关掉」。
+	if f.Storage.Audit.Enabled == nil {
+		on := true
+		f.Storage.Audit.Enabled = &on
+	}
+	if f.Storage.Audit.Enabled != nil && *f.Storage.Audit.Enabled {
+		a := &f.Storage.Audit
+		if a.Dir == "" {
+			a.Dir = filepath.Join(f.Storage.Dir, "audit")
+		}
+		if a.MaxBytes <= 0 {
+			a.MaxBytes = 64 << 20
+		}
+		if a.MaxAge <= 0 {
+			a.MaxAge = model.Duration(90 * 24 * time.Hour)
+		}
+		if a.SegmentBytes <= 0 {
+			a.SegmentBytes = 8 << 20
+		}
+		if a.SegmentBytes > a.MaxBytes {
+			a.SegmentBytes = a.MaxBytes
+		}
+	}
 	if f.Logging.Level == "" {
 		f.Logging.Level = "info"
 	}
@@ -284,6 +341,9 @@ func (f *File) Validate() error {
 	}
 	if !siteRe.MatchString(f.Site) {
 		return fmt.Errorf("site %q: must match %s", f.Site, siteRe.String())
+	}
+	if err := f.validateServer(); err != nil {
+		return err
 	}
 	if len(f.Channels) == 0 {
 		return errors.New("channels: at least one channel required")
@@ -347,7 +407,89 @@ func (f *File) Validate() error {
 	if err := f.validateHistory(); err != nil {
 		return err
 	}
+	if err := f.validateAudit(); err != nil {
+		return err
+	}
 	return f.validateNorthbound()
+}
+
+// validateServer 校验凭据表。
+//
+// 凭据校验放在配置期而不是启动期：一份「用户表写错了」的配置如果能通过
+// Apply，运行中的进程就会带着半套身份继续服务，而被删掉的那个用户直到
+// 下次重启才发现自己的 Token 还能用。宁可在写入时就拒绝。
+func (f *File) validateServer() error {
+	seenUser := map[string]bool{}
+	seenToken := map[string]bool{}
+	if t := strings.TrimSpace(f.Server.Token); t != "" {
+		if err := auth.ValidateToken(t); err != nil {
+			return fmt.Errorf("server.token: %w", err)
+		}
+		seenToken[t] = true
+	}
+	for i, u := range f.Server.Users {
+		name := strings.TrimSpace(u.Name)
+		if name == "" {
+			return fmt.Errorf("server.users[%d]: name is required", i)
+		}
+		if seenUser[name] {
+			return fmt.Errorf("server.users[%d]: duplicate name %q", i, name)
+		}
+		seenUser[name] = true
+		if _, err := rbac.Parse(u.Role); err != nil {
+			return fmt.Errorf("server.users[%d] (%s): %w", i, name, err)
+		}
+		if u.Token != "" && u.TokenSha256 != "" {
+			return fmt.Errorf("server.users[%d] (%s): token and tokenSha256 are mutually exclusive", i, name)
+		}
+		switch {
+		case u.Token != "":
+			if err := auth.ValidateToken(u.Token); err != nil {
+				return fmt.Errorf("server.users[%d] (%s): %w", i, name, err)
+			}
+			if seenToken[u.Token] {
+				return fmt.Errorf("server.users[%d] (%s): duplicate token", i, name)
+			}
+			seenToken[u.Token] = true
+		case u.TokenSha256 != "":
+			if len(u.TokenSha256) != 64 {
+				return fmt.Errorf("server.users[%d] (%s): tokenSha256 must be 64 hex characters", i, name)
+			}
+			if _, err := hex.DecodeString(u.TokenSha256); err != nil {
+				return fmt.Errorf("server.users[%d] (%s): tokenSha256 is not valid hex: %v", i, name, err)
+			}
+		default:
+			return fmt.Errorf("server.users[%d] (%s): one of token or tokenSha256 is required", i, name)
+		}
+	}
+	return nil
+}
+
+// validateAudit 校验审计保留策略。
+func (f *File) validateAudit() error {
+	a := f.Storage.Audit
+	if a.Enabled == nil || !*a.Enabled {
+		return nil
+	}
+	if strings.TrimSpace(a.Dir) == "" {
+		return errors.New("storage.audit.dir: must not be empty")
+	}
+	if a.MaxBytes < 1024 {
+		return fmt.Errorf("storage.audit.maxBytes: %d is too small (min 1024)", a.MaxBytes)
+	}
+	if a.SegmentBytes < 1024 {
+		return fmt.Errorf("storage.audit.segmentBytes: %d is too small (min 1024)", a.SegmentBytes)
+	}
+	if a.SegmentBytes > a.MaxBytes {
+		return fmt.Errorf("storage.audit.segmentBytes: %d exceeds maxBytes %d", a.SegmentBytes, a.MaxBytes)
+	}
+	if a.MaxAge.Duration() <= 0 {
+		return fmt.Errorf("storage.audit.maxAge: must be > 0, got %s", a.MaxAge)
+	}
+	if a.MaxAge.Duration() > 5*365*24*time.Hour {
+		return fmt.Errorf("storage.audit.maxAge: %s exceeds the 5-year limit", a.MaxAge)
+	}
+	return nil
 }
 
 // validateHistory 校验历史库策略。
@@ -855,6 +997,9 @@ func (m *Manager) Apply(f *File, source string) (ApplyResult, error) {
 	if err := f.Validate(); err != nil {
 		return ApplyResult{}, err
 	}
+	// 提前算好「变更前」的版本号：Apply 内部会更新 m.current，等返回后再
+	// 取就拿到新值了。
+	beforeVersion, _ := m.currentVersion()
 	canonical, err := f.Canonical()
 	if err != nil {
 		return ApplyResult{}, err
@@ -866,7 +1011,7 @@ func (m *Manager) Apply(f *File, source string) (ApplyResult, error) {
 
 	if version == m.version {
 		return ApplyResult{
-			Version: version, Previous: version, Applied: false,
+			Version: version, Previous: beforeVersion, Applied: false,
 			DurationMs: time.Since(start).Milliseconds(),
 		}, nil
 	}
@@ -916,6 +1061,15 @@ func (m *Manager) Apply(f *File, source string) (ApplyResult, error) {
 		Version: version, Previous: prevVersion, Applied: true,
 		Changed: summary, DurationMs: time.Since(start).Milliseconds(),
 	}, nil
+}
+
+// currentVersion 返回当前生效配置的内容哈希版本。
+// Apply 用它判断「这次提交是否真的改了东西」。配置管理器不导出 m.mu，
+// 所以在这里包一层。
+func (m *Manager) currentVersion() (string, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.version, nil
 }
 
 // Rollback 回滚到指定版本。回滚本身产生一个新版本（内容等于目标版本）。

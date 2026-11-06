@@ -5,9 +5,9 @@
 | 项 | 数字 |
 |---|---|
 | 分析的参考方案 | 38 份（PA-01 … PA-38，其中 PA-06 合并了两个完全相同的仓库） |
-| 文档总量 | 53 份 Markdown / 15,305 行 |
-| 代码总量 | 40 个 Go 文件 / 15,356 行（其中测试 6,443 行） |
-| Go 包 | 17 个（1 个入口 + 16 个内部包，全部有测试） |
+| 文档总量 | 55 份 Markdown / 17,995 行（含 3 份 ADR） |
+| 代码总量 | 138 个 Go 文件 / 56,531 行（其中测试 24,613 行） |
+| Go 包 | 37 个（1 个入口 + 36 个内部包；35 个有测试） |
 | 第三方依赖 | 0（仅标准库，零 CGO） |
 
 ---
@@ -553,10 +553,13 @@ obs  ← 所有包（不依赖任何内部包）
 | `internal/outbox` | 持久队列：分区、WAL、确认位点、三重上限 | at-least-once；整批或前缀成功才推进位点 | 77.4% |
 | `internal/config` | 加载、校验、规范化、版本化、回滚 | 幂等 Normalize；原子写；失败自动恢复；北向参数、从站映射、计算点（编译/引用/类型/环）、报警（条件/引用/类型）与历史保留策略静态校验 | 86.8% |
 | `internal/obs` | 指标、结构化日志、日志环形缓冲 | 指标标签必须归一化（不能含原始 URL） | 88.2% |
-| `internal/northbound/httpapi` | REST + SSE + 认证 + 错误码 | 错误码稳定；响应不泄露凭据；报警/历史查询的未知参数取值必须报错而不是静默忽略 | 83.5% |
+| `internal/rbac` | 角色/权限矩阵（纯函数） | 未知角色/未知权限一律拒绝；`viewer ⊆ operator ⊆ admin`；高危命令按动作映射到 `command.danger` | 100% |
+| `internal/auth` | 凭据表：Token → 身份；`Reloadable` 支持热替换 | Token 先 SHA-256 再定长比较；无凭据进入 open 模式而不是造默认口令；拒绝弱口令；枚举永不返回 Token | 96.7% |
+| `internal/audit` | 审计存储：NDJSON 分段 + SHA-256 哈希链 + 查询/校验 | 序号连续；字段边界用「长度:内容」编码；整段淘汰后链仍可校验；尾部半行触发新段 | 79.5% |
+| `internal/northbound/httpapi` | REST + SSE + 认证/授权 + 错误码 | 错误码稳定；响应不泄露凭据；未知角色全拒；401 与 403 在审计里区分；报警/历史查询的未知参数取值必须报错而不是静默忽略 | 82.8% |
 | `internal/mqtt` | MQTT 3.1.1 客户端（北向发布 + 南向订阅共用，纯 Go 零依赖） | 单 goroutine 读 socket；QoS1 必须等到 PUBACK；`Ping` 必须等到 PINGRESP（写成功不算活着）；断线立即失败而非超时 | 70.3% |
 | `internal/mqtt/mqtttest` | 测试封装：`internal/sim/mqtt` 的 `*testing.T` 生命周期 + 等待断言 | 不另写 Broker（两份实现必然长歪）；开关一律走 setup 函数而非直接赋字段 | — |
-| `internal/runtime` | 唯一编排层 + 后端实现 + 看门狗 | 启动/关闭顺序；`configuredState` 与 `runtimeState` 分离；协议/传输匹配在装配期校验；只向驱动与报警引擎注入只读 `cache.Get`；北向 OPC UA 启停与热重建 | 79.6% |
+| `internal/runtime` | 唯一编排层 + 后端实现 + 看门狗 + 审计埋点 | 启动/关闭顺序（失败逆序收口）；`configuredState` 与 `runtimeState` 分离；协议/传输匹配在装配期校验；只向驱动与报警引擎注入只读 `cache.Get`；北向 OPC UA 启停与热重建；凭据表热替换后旧用户立即失效 | 80.8% |
 | `cmd/uic` | 单入口：run / sim / mbread / uaread / check / version | 关闭预算 10 秒；`uaread` 与 `mbread` 是不装第三方客户端即可自证链路的自检工具 | — |
 
 ### 9.2 测试与验证命令
@@ -569,7 +572,7 @@ go test -race -count=1 ./...                    # 竞态 + 全量测试
 go test -coverprofile=c.out ./... && go tool cover -func=c.out | tail -1
 ```
 
-当前状态：`go build` / `go vet` / `gofmt` 全部干净，`go test -race ./...` 33 个测试包全部通过
+当前状态：`go build` / `go vet` / `gofmt` 全部干净，`go test -race ./...` 35 个测试包全部通过
 （另有 `cmd/uic` 与 `internal/mqtt/mqtttest` 两个无测试文件的包）。
 
 ### 9.3 源码阅读建议顺序
@@ -601,8 +604,10 @@ go test -coverprofile=c.out ./... && go tool cover -func=c.out | tail -1
 
 | 方法 | 路径 | 用途 |
 |---|---|---|
-| GET | `/healthz` / `/readyz` | 存活 / 就绪（分离） |
+| GET | `/healthz` / `/readyz` | 存活 / 就绪（分离；免认证） |
 | GET | `/api/v1/health` | 汇总健康（设备/队列/降级统计） |
+| GET | `/api/v1/auth/me` | 我是谁（免认证；返回角色/权限/是否 open 模式） |
+| GET | `/api/v1/auth/users` | 账号清单（需 `audit.read`；只返回用户名与角色） |
 | GET | `/api/v1/version` | 版本、提交、构建时间、驱动 SDK 版本 |
 | GET | `/api/v1/metrics` | Prometheus 文本格式 |
 | GET | `/api/v1/devices` | 设备列表（含 `configuredState` / `runtimeState`） |
@@ -624,6 +629,9 @@ go test -coverprofile=c.out ./... && go tool cover -func=c.out | tail -1
 | GET | `/api/v1/stream` | SSE 实时流 |
 | GET | `/api/v1/history?device=&point=&from=&to=&step=&agg=&limit=` | 历史查询（原始点 / 定步长聚合） |
 | GET | `/api/v1/diagnostics/bundle` | 诊断 zip（配置脱敏） |
+| GET | `/api/v1/audit?user=&role=&action=&result=&q=&from=&to=&limit=&cursor=` | 审计查询（倒序 + 游标） |
+| GET | `/api/v1/audit/verify` | 校验哈希链，指出第一条不一致记录 |
+| GET | `/api/v1/audit/stats` | 审计水位（条数/段数/字节/最后序号） |
 
 OPC UA 服务端（同一份点位表的另一个出口）：
 
@@ -636,7 +644,9 @@ OPC UA 服务端（同一份点位表的另一个出口）：
 | 质量 | `DataValue.Status`：Good / Uncertain / Bad*；Bad 不带值 |
 | 写入 | 过 `Runtime.Write`，5 秒超时；只读点位 `BadNotWritable`，类型不符 `BadTypeMismatch` |
 
-**命令白名单**：`driver.restart`、`device.selftest`、`outbox.flush`、`outbox.drop`（需 confirm）、`config.rollback`（需 confirm）、`log.level`、`diag.bundle`。未知动作一律 400，不做猜测。
+**权限**：角色 `viewer` / `operator` / `admin`，权限按动作划分（`read`、`point.write`、`alarm.ack`、`command`、`command.danger`、`config.read`、`config.write`、`audit.read`、`diagnostics`），未知角色/权限一律拒绝。
+
+**命令白名单**：`driver.restart`、`device.selftest`、`outbox.flush`、`diag.bundle`（`command`）；`outbox.drop`（需 confirm）、`config.rollback`（需 confirm）、`log.level`（`command.danger`，仅 admin）。未知动作一律 400，不做猜测。
 
 **错误码**：`request.invalid`、`request.confirm_required`、`request.unknown_action`、`device.not_found`、`point.not_found`、`config.apply_failed`、`config.version_not_found`（404）、`outbox.empty`（409）…完整表见 `05-northbound-api-spec.md` §4.3。
 
@@ -685,8 +695,12 @@ OPC UA 服务端（同一份点位表的另一个出口）：
 | 历史的边界 | ⚠️ | 单点位查询（不做跨点 join / 多点多列）；不做样本级删除（只按段淘汰）；采样策略全局一套（需要区别对待时用死区与停用点位）；`dir`/`maxBytes`/`segmentBytes`/`maxAge` 改动需重启，`minInterval`/`heartbeat`/`deadband` 可热改 |
 | 历史窗口聚合（`avg(近 5 分钟)`） | ⏳ | 历史库已可查；「在报警/计算表达式里引用历史窗口」尚未接入（属 Wave 2 的表达式扩展） |
 | 配置版本/回滚/diff | ✅ | 内容哈希版本、快照、原子写、失败自动恢复、回滚缺版本返回 404 |
-| 认证 | ✅ | Bearer Token，常量时间比较；未实现 RBAC |
-| TLS | ⏳ | 配置项已定义；未接证书加载 |
+| 认证与授权 | ✅ | 多身份静态 Token（`server.users`，`token` 或 `tokenSha256`）；Token 先 SHA-256 再定长比较；三角色九权限按动作划分，`viewer ⊆ operator ⊆ admin`，未知角色/权限全拒；高危命令 handler 内二次判定；凭据表整体热替换，删掉的用户下一条请求即 401 |
+| 认证的边界 | ⚠️ | 不做会话/口令/过期/自助轮换（见 ADR-0003）；不做账户锁定与失败次数限制；未配置凭据时进入 open 模式并告警，不生成默认口令 |
+| 审计 | ✅ | 写入/命令/报警确认/配置变更/越权尝试逐条落盘（写入按点位逐项）；NDJSON 分段 + SHA-256 哈希链（`seq`/`prev`/`hash`）；`/audit` 倒序游标查询、`/audit/verify` 指认第一条不一致记录、`/audit/stats` 水位；默认开启，写失败只计数不阻断业务 |
+| 审计的边界 | ⚠️ | 不加密（能读文件即可看内容，但不含凭据）；哈希链不能自证「从第一段开始整体重写」（需外部锚点，Wave 2）；`dir`/`maxBytes`/`segmentBytes`/`maxAge` 改动需重启，其余即时生效 |
+| TLS | ✅ | `server.tls.enabled` + `certFile`/`keyFile`；开启但缺证书时回退明文并打 WARN（自签证书自动生成仍属 Wave 2） |
+| `uic token` | ✅ | 生成 ≥16 字符 base64url Token + `tokenSha256` + 可直接粘贴的 `server.users` 片段（`-count` / `-json`） |
 | `uic -check` | ✅ | 纯校验，不写快照/状态文件（可在 CI 里安全运行） |
 
 > 判断标准：**没实现的能力必须显式失败或显式告警，不允许静默降级。** 这是从 38 份分析里提炼出的第一条工程纪律（见 `02-synthesis/03-gap-analysis.md` §6「反风险」）。

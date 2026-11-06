@@ -586,16 +586,21 @@ type Record struct {
 | I-HQ-6 | 桶数上限 5000；超限在参数层拒绝，不先扫后判 |
 | I-HQ-7 | 没有数据返回 `200 + count:0`，不是 404 |
 
-### 11.4 三个「写磁盘」的东西，职责不同
+### 11.4 四个「写磁盘」的东西，职责不同
 
-| | Outbox | journal | history |
-|---|---|---|---|
-| 定位 | 还没送出去的队列 | 已经发生的事实留痕 | 有界的时间序列缓存 |
-| 写入 | 每条变化事件 | 每条通过死区的事件 | 按采样策略抽取 |
-| 生命周期 | 确认后删除 | 只追加，外部轮转 | 超限/过期整段淘汰 |
-| 失败影响 | 积压、告警 | 丢证据 | 丢曲线 |
-| 是否反压采集 | 否（有上限与降采样） | 否（缓冲写） | 否（失败只计数） |
-| 默认 | 有 sink 时开启 | 关闭 | 关闭 |
+| | Outbox | journal | history | audit |
+|---|---|---|---|---|
+| 定位 | 还没送出去的队列 | 已经发生的事实留痕 | 有界的时间序列缓存 | 谁在什么时候做了什么 |
+| 写入 | 每条变化事件 | 每条通过死区的事件 | 按采样策略抽取 | 每次写/命令/配置/拒绝 |
+| 生命周期 | 确认后删除 | 只追加，外部轮转 | 超限/过期整段淘汰 | 超限/过期整段淘汰 |
+| 失败影响 | 积压、告警 | 丢证据 | 丢曲线 | 丢追溯依据（业务不受影响） |
+| 是否反压采集 | 否（有上限与降采样） | 否（缓冲写） | 否（失败只计数） | 否（失败只计数 + ERROR 日志） |
+| 完整性机制 | 位点 + 确认 | 无 | 无 | SHA-256 哈希链 |
+| 默认 | 有 sink 时开启 | 关闭 | 关闭 | **开启** |
+
+审计与另外三者的关键区别：**前三个记录数据，审计记录动作**。因此审计默认
+开启——一个没有审计的网关在事故复盘时无法回答「是谁把设定值改成了 90」，
+而这恰恰是工业现场最需要回答的问题。
 
 ---
 
@@ -605,7 +610,15 @@ type Record struct {
 {
   "schemaVersion": 1,
   "site": "plant-a",
-  "server": { "listen": ":8080", "tls": { "enabled": false } },
+  "server": {
+    "listen": ":8080",
+    "tls": { "enabled": false },
+    "users": [
+      { "name": "viewer", "role": "viewer", "tokenSha256": "9deb…" },
+      { "name": "ops", "role": "operator", "tokenSha256": "8088…" },
+      { "name": "root", "role": "admin", "token": "明文仅用于首次部署，之后应换成哈希" }
+    ]
+  },
   "channels": [
     {
       "id": "ch-plc",
@@ -661,7 +674,13 @@ type Record struct {
     "outboxMaxBytes": 268435456,
     "outboxMaxRecords": 200000,
     "outboxTtl": "24h",
-    "journal": true
+    "journal": true,
+    "audit": {
+      "enabled": true,
+      "maxBytes": 67108864,
+      "segmentBytes": 8388608,
+      "maxAge": "2160h"
+    }
   },
   "logging": { "level": "info", "format": "json" }
 }
@@ -677,6 +696,7 @@ type Record struct {
 | `outboxTtl` | `24h` | 单条记录最长存活时间，过期丢弃并计数 |
 | `journal` | `false` | 开启本地 NDJSON 归档 sink，见下 |
 | `history` | 关闭 | 有界采样日志，见 §11 |
+| `audit` | 开启 | 操作审计，见 §11.4 与 API 规范 §4.10 |
 
 **`journal` 的定位**：它是一个**兜底 sink**，不是北向协议。开启后每条通过死区过滤的变化事件都会追加到 `<dir>/journal.ndjson`（一行一个 JSON，含 `schemaVersion`），并走与 MQTT/Webhook 完全相同的 Outbox 路径（同样的分区、确认位点、上限与重试语义）。
 
@@ -689,6 +709,25 @@ type Record struct {
 代价是磁盘写入。因此它默认关闭，且写入走批量 flush（≤64 条一次 `write`，`Stop` 时 `Sync`），不逐条 fsync。开启前应确认 `<dir>` 所在分区有足够空间，并配合 `outboxMaxBytes` 使用。
 
 > 注意：`journal` 与 MQTT/Webhook 是**并列**关系，不是替代关系。同时开启时，同一条事件会分别进入各自的 sink 分区，各自独立确认，互不影响。
+
+### 12.0.2 `server.users` 字段
+
+| 字段 | 必填 | 含义 |
+|---|---|---|
+| `name` | 是 | 唯一用户名，进入审计 `user` 字段 |
+| `role` | 是 | `viewer` / `operator` / `admin`；缺省按 `admin` 兼容旧配置 |
+| `token` | 与 `tokenSha256` 二选一 | 明文 Token，≥16 字符 |
+| `tokenSha256` | 与 `token` 二选一 | Token 的 SHA-256 十六进制串（64 字符） |
+
+三条不变量：
+
+1. **名称唯一、Token 唯一**：两个名字共用一个 Token 会让审计无法区分身份。
+2. **只存哈希也可以**：服务端先算 SHA-256 再定长比较，因此明文不需要落盘。
+3. **`server.token` 仍然有效**：它被当作名为 `api` 的 admin 凭据，仅为兼容
+   单凭据的老部署；新配置应改用 `server.users`。
+
+生成凭据用 `uic token`：它同时输出明文（给客户端）与 `tokenSha256`（给配置），
+并保证哈希编码与服务端期望的一致。
 
 ### 12.1 命名规则
 

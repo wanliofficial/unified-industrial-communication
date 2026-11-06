@@ -170,6 +170,35 @@ curl -s localhost:8092/api/v1/health | jq '.history'
 了就不再写「此刻仍然是 42」。查询左闭右闭、结果按时间升序、桶质量取桶内最差，
 非数值点位的 `min/max/avg` 是 `null` 而不是 0。
 
+认证、授权与审计（三角色 + 哈希链）：
+
+```bash
+./uic token -name ops -role operator     # 明文 Token + tokenSha256 + 可粘贴片段
+./uic -config examples/rbac.json         # REST :8093，三个演示用户
+TOKEN=Bnmcwphg0lxA1XTng-SuZJyfXqvYU8bR   # examples/rbac.md 里的 ops
+curl -s -H "Authorization: Bearer $TOKEN" localhost:8093/api/v1/points          # 200
+curl -s -X POST -H "Authorization: Bearer $TOKEN" \
+     localhost:8093/api/v1/commands -d '{"action":"outbox.drop","confirm":true}'  # 403
+curl -s -H "Authorization: Bearer KilpNTTr9xyEEaJi3uaJucEuNvobBtSH" \
+     'localhost:8093/api/v1/audit?result=denied' | jq
+```
+
+三个角色按**动作**划权限，且 `viewer ⊆ operator ⊆ admin`：`viewer` 只看；
+`operator` 能写点位、确认报警、跑普通命令、导诊断包；`admin` 多出配置、审计与
+高危命令（`outbox.drop` / `config.rollback` / `log.level`）。权限写在路由旁边，
+高危命令在 handler 里再判一次——新增命令时忘改路由也不会把危险动作漏给 operator。
+
+Token 在服务端先 SHA-256 再定长比较，配置可以只存 `tokenSha256`，泄露配置文件
+不等于泄露凭据。凭据表本身是可整体替换的，`server.users` 改动 apply 后**下一条
+请求**就按新表判定：删掉的用户立刻 401，而不是等重启。没配任何凭据时进入开放
+模式，启动横幅与 `auth_open_mode` WARN 会明说，而不是偷偷生成一个默认口令。
+
+审计是一份带 SHA-256 哈希链的 NDJSON：`seq` 连续、`prev`/`hash` 相连，删除或
+篡改任何一条都会被 `/api/v1/audit/verify` 指出来。写入、命令、报警确认、配置
+变更、越权尝试都记，且写入是**逐点位**记的——批量写一半失败时，能回答「到底
+哪个点没写进去」。审计默认开启；写失败只计数（`uic_audit_write_errors_total`）
+并记 ERROR，绝不让磁盘满导致产线停摆。
+
 ## 文档
 
 - **[docs/00-README.md](docs/00-README.md)** — 总索引：阅读路径、38 个参考方案总览、结论速查、代码地图、接口速查、实现边界
@@ -191,7 +220,7 @@ go test -race -count=1 ./...
 
 | 路径 | 内容 |
 |---|---|
-| `cmd/uic/` | 单入口：`run` / `sim`（Modbus / S7 / OPC UA / MQTT）/ `mbread` / `uaread` / `-check` / `version` |
+| `cmd/uic/` | 单入口：`run` / `sim`（Modbus / S7 / OPC UA / MQTT）/ `mbread` / `uaread` / `token` / `-check` / `version` |
 | `internal/model` | 通道 / 设备 / 点位 / 地址 / 采样 / 质量码 |
 | `internal/driver` | 驱动契约（Codec / Transport / Driver）、错误分类、注册表、只读 `Lookup` 注入 |
 | `internal/calc` | 零依赖表达式引擎（编译期类型检查、短路求值、引用 `device:point`） |
@@ -219,7 +248,10 @@ go test -race -count=1 ./...
 | `internal/outbox` | 持久上报队列（分区 / WAL / 确认位点 / 三重上限） |
 | `internal/config` | 配置校验 / 内容哈希版本 / 快照 / 回滚 |
 | `internal/obs` | 指标 / 结构化日志 / 日志环形缓冲 |
-| `internal/northbound/httpapi` | REST + SSE + 认证 + 错误码 |
+| `internal/rbac` | 角色 / 权限矩阵（viewer / operator / admin，按动作授权） |
+| `internal/auth` | 凭据表：Token → 身份；`Reloadable` 支持热替换；无凭据时 open 模式 |
+| `internal/audit` | 审计存储：NDJSON 分段 + SHA-256 哈希链 + 查询 / 校验 |
+| `internal/northbound/httpapi` | REST + SSE + 认证授权 + 错误码 |
 | `internal/northbound/opcua` | OPC UA 北向：点位表 → 地址空间，质量码映射，写穿透到南向 |
 | `internal/mqtt` | 自写 MQTT 3.1.1 客户端（北向发布 + 南向订阅共用；QoS0/1、retained、LWT、PING 往返探测） |
 | `internal/mqtt/mqtttest` | 测试封装：`internal/sim/mqtt` 的 `*testing.T` 生命周期 + 等待断言 |

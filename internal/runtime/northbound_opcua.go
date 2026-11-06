@@ -79,7 +79,7 @@ func (r *Runtime) OPCUASeeds() []nbopcua.Seed {
 // 与「REST 写」在设备侧是同一条链路。自己再写一条直连驱动的快捷路径，
 // 迟早会出现「REST 能写、SCADA 不能写」这种只在一个方向复现的问题。
 func (r *Runtime) OPCUAWrite(ctx context.Context, device, point string, v model.Value) nbopcua.Outcome {
-	res, err := r.Write(ctx, device, []httpapi.WriteItem{{Point: point, Value: v}})
+	res, err := r.Write(withSource(ctx, "opcua-server"), device, []httpapi.WriteItem{{Point: point, Value: v}})
 	if err != nil {
 		code, msg := apiErrorOf(err)
 		return nbopcua.Outcome{OK: false, Code: code, Message: msg}

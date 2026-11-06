@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"strings"
 	"time"
@@ -29,8 +30,12 @@ func (r *Runtime) Config() (json.RawMessage, error) {
 
 // ValidateConfig 只校验，不应用。
 func (r *Runtime) ValidateConfig(raw json.RawMessage) error {
+	filled, err := r.fillRedacted(raw)
+	if err != nil {
+		return err
+	}
 	var f config.File
-	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec := json.NewDecoder(bytes.NewReader(filled))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&f); err != nil {
 		return badConfig("cannot parse config: %v", err)
@@ -122,6 +127,161 @@ func redactValue(v any, key string) any {
 	}
 }
 
+// redactedValue 是 GET /config 用来替换凭据的字面量。apply 时必须把它
+// 还原回当前配置里的真实值。
+const redactedValue = "***"
+
+// fillRedacted 把提交配置里的 *** 占位符还原成当前配置里的对应值。
+//
+// 为什么必须做：GET /api/v1/config 会脱敏 token/password/secret 类字段，
+// 而最常见、也最安全的运维路径正是「读出配置 → 只改一个点位 → 写回去」。
+// 如果 apply 不接受占位符，这条路会死在
+// `server.users[0].tokenSha256 must be 64 hex characters` 上，运维只能整份
+// 重写配置——那才是真正容易把凭据改坏的场景。
+//
+// 语义：*** 表示「保持当前值不变」。想清空某个密码，就显式写空字符串或
+// 删掉该字段，不能靠 ***。
+func (r *Runtime) fillRedacted(raw json.RawMessage) (json.RawMessage, error) {
+	if !bytes.Contains(raw, []byte(redactedValue)) {
+		return raw, nil
+	}
+	canonical, err := r.cfg.Current().Canonical()
+	if err != nil {
+		return nil, httpapiInternal("encode current config", err)
+	}
+	var sub, cur any
+	if err := json.Unmarshal(raw, &sub); err != nil {
+		return nil, badConfig("cannot parse config: %v", err)
+	}
+	if err := json.Unmarshal(canonical, &cur); err != nil {
+		return nil, httpapiInternal("parse current config", err)
+	}
+	resolved, err := resolvePlaceholders(sub, cur, "")
+	if err != nil {
+		return nil, badConfig("%v", err)
+	}
+	out, err := json.Marshal(resolved)
+	if err != nil {
+		return nil, badConfig("cannot encode config: %v", err)
+	}
+	return out, nil
+}
+
+// resolvePlaceholders 按相同路径把 *** 换成 cur 里的值。
+//
+// 数组元素优先按 id/name 匹配而不是按下标：运维调整 users 顺序或删掉中间
+// 一项时，按下标会把 A 的密码安到 B 头上——这类错误不会报错，只会让人
+// 在几天后发现「某个账号登录不上、另一个账号拿到了不该有的权限」。
+func resolvePlaceholders(sub, cur any, path string) (any, error) {
+	switch x := sub.(type) {
+	case string:
+		if x != redactedValue {
+			return x, nil
+		}
+		if s, ok := cur.(string); ok {
+			return s, nil
+		}
+		return nil, fmt.Errorf("config: %s is a redacted placeholder but has no current value", pathOrRoot(path))
+	case map[string]any:
+		curMap, _ := cur.(map[string]any)
+		out := make(map[string]any, len(x))
+		for k, v := range x {
+			child := k
+			if path != "" {
+				child = path + "." + k
+			}
+			cv, ok := curMap[k]
+			if !ok {
+				if containsPlaceholder(v) {
+					return nil, fmt.Errorf("config: %s is a redacted placeholder but the field does not exist", child)
+				}
+				out[k] = v
+				continue
+			}
+			rv, err := resolvePlaceholders(v, cv, child)
+			if err != nil {
+				return nil, err
+			}
+			out[k] = rv
+		}
+		return out, nil
+	case []any:
+		curArr, _ := cur.([]any)
+		out := make([]any, len(x))
+		for i, v := range x {
+			idx := i
+			if key, val, ok := matchKey(v); ok {
+				idx = -1
+				for j, c := range curArr {
+					if k2, v2, ok2 := matchKey(c); ok2 && k2 == key && v2 == val {
+						idx = j
+						break
+					}
+				}
+			}
+			child := fmt.Sprintf("%s[%d]", path, i)
+			if idx < 0 || idx >= len(curArr) {
+				if containsPlaceholder(v) {
+					return nil, fmt.Errorf("config: %s is a redacted placeholder but no matching element exists", child)
+				}
+				out[i] = v
+				continue
+			}
+			rv, err := resolvePlaceholders(v, curArr[idx], child)
+			if err != nil {
+				return nil, err
+			}
+			out[i] = rv
+		}
+		return out, nil
+	default:
+		return sub, nil
+	}
+}
+
+// matchKey 返回数组元素用于匹配的键（id 或 name）与值。
+func matchKey(v any) (string, string, bool) {
+	m, ok := v.(map[string]any)
+	if !ok {
+		return "", "", false
+	}
+	for _, k := range []string{"id", "name"} {
+		if s, ok := m[k].(string); ok && s != "" {
+			return k, s, true
+		}
+	}
+	return "", "", false
+}
+
+// containsPlaceholder 判断子树里是否还有 ***（用于「新增字段里带占位符」
+// 这种无法还原的情况）。
+func containsPlaceholder(v any) bool {
+	switch x := v.(type) {
+	case string:
+		return x == redactedValue
+	case map[string]any:
+		for _, vv := range x {
+			if containsPlaceholder(vv) {
+				return true
+			}
+		}
+	case []any:
+		for _, vv := range x {
+			if containsPlaceholder(vv) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func pathOrRoot(p string) string {
+	if p == "" {
+		return "config"
+	}
+	return p
+}
+
 func isSecretKey(k string) bool {
 	k = strings.ToLower(k)
 	for _, s := range []string{"password", "token", "secret", "apikey", "api_key", "credential"} {
@@ -137,7 +297,8 @@ func isSecretKey(k string) bool {
 // ---------------------------------------------------------------------------
 
 // Command 执行一条白名单命令。未知动作一律拒绝，不做任何「猜测」。
-func (r *Runtime) Command(ctx context.Context, action string, params map[string]any) (any, error) {
+// command 是命令白名单的实际实现。导出的 Command 在它外面包一层审计。
+func (r *Runtime) command(ctx context.Context, action string, params map[string]any) (any, error) {
 	switch action {
 	case "driver.restart":
 		id, err := strParam(params, "device")
@@ -216,7 +377,7 @@ func (r *Runtime) Command(ctx context.Context, action string, params map[string]
 		if err != nil {
 			return nil, err
 		}
-		return r.Rollback(version)
+		return r.Rollback(ctx, version)
 
 	case "log.level":
 		level, err := strParam(params, "level")

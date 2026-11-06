@@ -9,6 +9,7 @@
 //	uic sim -protocol mqtt -listen 127.0.0.1:18830  # 内置 MQTT Broker（南向演示）
 //	uic mbread -addr 127.0.0.1:1502    # 不依赖第三方工具的从站读写自检
 //	uic uaread -addr 127.0.0.1:4840 -nodes ns=2;s=site/dev/point  # OPC UA 读写自检
+//	uic token -name ops -role operator   # 生成用户凭据（明文 + tokenSha256）
 //
 // 关闭顺序遵循 docs/03-product/02-architecture.md §11.2：
 // 停止接收流量 → 停调度 → 排空 Outbox → 关连接，总预算 10 秒。
@@ -67,6 +68,8 @@ func main() {
 		mbreadCmd(args)
 	case "uaread":
 		uareadCmd(args)
+	case "token":
+		tokenCmd(args)
 	case "version", "-v", "--version":
 		printVersion()
 	case "help", "-h", "--help":
@@ -89,6 +92,7 @@ func usage() {
   uic mbread -addr 127.0.0.1:1502 -area holding -offset 5 -write 777
   uic uaread -addr 127.0.0.1:4840 -nodes ns=2;s=site/dev/point [-type float64]
   uic uaread -addr 127.0.0.1:4840 -nodes ns=2;s=site/dev/setpoint -write 42.5
+  uic token [-name ops] [-role viewer|operator|admin] [-count N] [-json]
   uic version
 
 参数:
@@ -99,6 +103,9 @@ func usage() {
   -data       覆盖数据目录（默认取 config.storage.dir）
   -check      只校验配置并退出
   -version    打印版本并退出
+
+uic token 生成的凭据同时给出明文与 tokenSha256：
+  明文交给客户端，配置里只放 tokenSha256。明文只打印一次。
 `)
 }
 
@@ -172,14 +179,22 @@ func runCmd(args []string) {
 		errCh <- srv.ListenAndServe()
 	}()
 
-	auth := "disabled（仅限开发）"
-	if rt.Token() != "" {
-		auth = "bearer"
+	// 认证状态按「凭据表」报告，而不是按单个 Token 字段：多用户配置下
+	// server.token 可能为空，但认证是开着的。反过来，删光所有用户之后
+	// 必须明确喊出「open」，否则运维会以为还在鉴权。
+	authLine := "open（未配置凭据，任何能连上端口的人都是 admin）"
+	if st := rt.AuthStore(); st != nil && !st.Open() {
+		authLine = fmt.Sprintf("bearer（%d 个用户）", st.Len())
+	}
+	auditLine := "关闭"
+	if st, ok := rt.AuditStats(); ok {
+		auditLine = fmt.Sprintf("开启（%d 条，seq=%d）", st.Records, st.LastSeq)
 	}
 	fmt.Printf("uic %s | site=%s | config=%s\n", version, cfg.Site, rt.ConfigManager().Version())
 	fmt.Printf("  API   http://%s/api/v1\n", srv.Addr)
 	fmt.Printf("  SSE   http://%s/api/v1/stream\n", srv.Addr)
-	fmt.Printf("  认证  %s\n", auth)
+	fmt.Printf("  认证  %s\n", authLine)
+	fmt.Printf("  审计  %s\n", auditLine)
 	fmt.Printf("  设备  %d 台 / 通道 %d 条\n", len(cfg.Devices), len(cfg.Channels))
 	fmt.Println("  Ctrl+C 停止")
 

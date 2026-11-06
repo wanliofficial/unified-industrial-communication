@@ -182,7 +182,7 @@ func TestNorthboundOPCUAEndToEnd(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := rt.ApplyConfig(raw, "test"); err != nil {
+	if _, err := rt.ApplyConfig(context.Background(), raw, "test"); err != nil {
 		t.Fatalf("apply: %v", err)
 	}
 	rt.nbMu.Lock()
@@ -300,7 +300,7 @@ func TestNorthboundOPCUARestartFailureRestoresPrevious(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := rt.ApplyConfig(raw, "test"); err != nil {
+	if _, err := rt.ApplyConfig(context.Background(), raw, "test"); err != nil {
 		t.Fatalf("apply: %v", err)
 	}
 

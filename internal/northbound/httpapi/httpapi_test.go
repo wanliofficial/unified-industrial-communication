@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"uic/internal/alarm"
+	"uic/internal/audit"
 	"uic/internal/cache"
 	"uic/internal/config"
 	"uic/internal/history"
@@ -44,6 +45,9 @@ type fakeBackend struct {
 	streamFn func(filter func(model.Sample) bool, buffer int) (<-chan cache.Event, func())
 
 	bundle []byte
+
+	auditLog []audit.Record
+	auditOff bool
 
 	alarms      []alarm.Status
 	alarmCounts alarm.Counts
@@ -123,7 +127,7 @@ func (f *fakeBackend) ValidateConfig(raw json.RawMessage) error {
 	}
 	return nil
 }
-func (f *fakeBackend) ApplyConfig(raw json.RawMessage, source string) (config.ApplyResult, error) {
+func (f *fakeBackend) ApplyConfig(_ context.Context, raw json.RawMessage, source string) (config.ApplyResult, error) {
 	return f.applyRes, nil
 }
 func (f *fakeBackend) ConfigVersions() []config.VersionInfo { return f.versions }
@@ -134,7 +138,7 @@ func (f *fakeBackend) ConfigVersion(id string) (json.RawMessage, error) {
 	return nil, Errf(http.StatusNotFound, "config.version_not_found", "no such version %q", id)
 }
 func (f *fakeBackend) ConfigDiff(from, to string) (config.Diff, error) { return f.diff, nil }
-func (f *fakeBackend) Rollback(version string) (config.ApplyResult, error) {
+func (f *fakeBackend) Rollback(_ context.Context, version string) (config.ApplyResult, error) {
 	return f.rollbackR, nil
 }
 
@@ -241,6 +245,34 @@ func (f *fakeBackend) HistoryStats() (history.Stats, bool) {
 
 func (f *fakeBackend) DiagnosticsBundle(ctx context.Context) ([]byte, error) {
 	return f.bundle, nil
+}
+
+func (f *fakeBackend) AuditQuery(fl audit.Filter) (audit.Result, error) {
+	if f.auditOff {
+		return audit.Result{}, Errf(http.StatusConflict, "audit.disabled", "audit storage is not enabled")
+	}
+	items := make([]audit.Record, 0, len(f.auditLog))
+	for i := len(f.auditLog) - 1; i >= 0; i-- {
+		items = append(items, f.auditLog[i])
+	}
+	if fl.Limit > 0 && len(items) > fl.Limit {
+		items = items[:fl.Limit]
+	}
+	return audit.Result{Items: items, Total: len(items), Scanned: len(f.auditLog)}, nil
+}
+
+func (f *fakeBackend) AuditVerify() (audit.VerifyResult, error) {
+	if f.auditOff {
+		return audit.VerifyResult{}, Errf(http.StatusConflict, "audit.disabled", "audit storage is not enabled")
+	}
+	return audit.VerifyResult{Checked: len(f.auditLog), OK: true}, nil
+}
+
+func (f *fakeBackend) AuditStats() (audit.Stats, bool) {
+	if f.auditOff {
+		return audit.Stats{}, false
+	}
+	return audit.Stats{Records: uint64(len(f.auditLog)), LastSeq: uint64(len(f.auditLog))}, true
 }
 
 func (f *fakeBackend) RecordHTTP(path string, code int, d time.Duration) {

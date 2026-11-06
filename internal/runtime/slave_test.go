@@ -1,6 +1,7 @@
 package runtime
 
 import (
+	"context"
 	"encoding/binary"
 	"encoding/json"
 	"io"
@@ -197,7 +198,7 @@ func TestSlaveRebuildsOnConfigChange(t *testing.T) {
 	if err != nil {
 		t.Fatalf("marshal: %v", err)
 	}
-	if _, err := h.rt.ApplyConfig(raw, "test"); err != nil {
+	if _, err := h.rt.ApplyConfig(context.Background(), raw, "test"); err != nil {
 		t.Fatalf("apply: %v", err)
 	}
 

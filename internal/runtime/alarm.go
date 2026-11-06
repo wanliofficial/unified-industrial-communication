@@ -165,7 +165,8 @@ func (r *Runtime) AlarmCounts() alarm.Counts {
 //
 // 错误映射刻意区分 404 与 409：ID 不存在是调用方拿错了，而「这条规则现在
 // 没有报警」是状态过期——重试没有意义，但也不该被当成服务器故障。
-func (r *Runtime) AckAlarms(_ context.Context, ids []string, all bool, by string) ([]alarm.Status, error) {
+// ackAlarms 是确认的实际实现。导出的 AckAlarms 在它外面包一层审计。
+func (r *Runtime) ackAlarms(_ context.Context, ids []string, all bool, by string) ([]alarm.Status, error) {
 	if r.alarms == nil {
 		return nil, httpapi.Errf(http.StatusNotFound, "alarm.not_found", "no alarms are configured")
 	}
