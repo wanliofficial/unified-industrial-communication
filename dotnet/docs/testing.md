@@ -16,7 +16,7 @@ dotnet run --project tests/Uic.Tests -- --stop-on-fail      # 首个失败即停
 正常输出：
 
 ```
-141 passed, 0 failed, 1 skipped · 43.7s
+142 passed, 0 failed, 1 skipped · 36.1s
 ```
 
 跳过的一条是 OPC UA 验收（要绑端口、生成证书，默认不跑）。
@@ -53,7 +53,7 @@ dotnet run --project tests/Uic.Tests -- --stop-on-fail      # 首个失败即停
 | `mqtt/*` | 17 | 测试内 broker：CONNECT/SUBSCRIBE 字段、QoS0/1、主题渲染、重连补发、命令去重与权限 |
 | `template/*` | 3 | 50 实例批量生成、参数类型/缺失/未知参数拒绝、未声明占位符拒绝 |
 | `csv/*` | 3 | 地址表达式（参考号/区域偏移/分列）、按 id 合并与冲突行号、死区模式与量程列 |
-| `contract/*` | 12 | 进程内真实 Kestrel 的 REST 契约（含模板、CSV、导入导出、单点幂等） |
+| `contract/*` | 13 | 进程内真实 Kestrel 的 REST 契约（含驱动能力、模板、CSV、导入导出、单点幂等） |
 | `opcua/*` | 1 | 标准 OPC UA 客户端：浏览、读、写、订阅 |
 
 ## 规范用例 T1–T18 的对应关系

@@ -99,6 +99,7 @@ public static partial class RestApi
             ctx.Metrics.RenderPrometheus(), "text/plain; version=0.0.4; charset=utf-8"));
 
         MapDevices(app, ctx);
+        MapDrivers(app, ctx);
         MapConfig(app, ctx);
         MapTemplates(app, ctx);
         MapImportExport(app, ctx);

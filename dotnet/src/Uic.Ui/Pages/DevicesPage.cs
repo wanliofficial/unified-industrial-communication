@@ -17,6 +17,9 @@ public sealed class DevicesPage : IPage, IDisposable
     /// <summary>展开过的设备点位。列表本身不刷新时复用，避免每次展开都重拉一遍。</summary>
     private readonly Dictionary<string, PointDto[]> _expanded = new(StringComparer.Ordinal);
 
+    /// <summary>驱动能力缓存：能力徽标按 protocol（= 驱动 id）查表。</summary>
+    private Dictionary<string, DriverDto> _drivers = new(StringComparer.Ordinal);
+
     private bool _disposed;
     private string? _expandedDevice;
 
@@ -40,6 +43,7 @@ public sealed class DevicesPage : IPage, IDisposable
             (Ui.Star(0.8), "状态"),
             (Ui.Star(1.5), "设备"),
             (Ui.Star(1.5), "通道 / 协议"),
+            (Ui.Star(1.2), "能力"),
             (Ui.Star(0.9), "点位"),
             (Ui.Star(0.7), "成功率"),
             (Ui.Star(0.6), "P95"),
@@ -69,6 +73,8 @@ public sealed class DevicesPage : IPage, IDisposable
         {
             var page = await _api.DevicesAsync();
             if (_disposed) return;
+
+            _drivers = await LoadDriversAsync();
 
             var filter = _search.Text?.Trim();
 
@@ -106,6 +112,57 @@ public sealed class DevicesPage : IPage, IDisposable
         }
     }
 
+    private async Task<Dictionary<string, DriverDto>> LoadDriversAsync()
+    {
+        try
+        {
+            var drivers = await _api.DriversAsync();
+            return drivers.Items.ToDictionary(d => d.Id, StringComparer.Ordinal);
+        }
+        catch
+        {
+            // 能力徽标只是增强信息：驱动端点不可用时，设备列表照常显示。
+            return new Dictionary<string, DriverDto>(StringComparer.Ordinal);
+        }
+    }
+
+    private UIElement BuildCapabilities(DeviceSummaryDto device)
+    {
+        if (!_drivers.TryGetValue(device.Protocol, out var driver))
+            return Ui.Text("—", 11.5, Ui.Faint);
+
+        var caps = driver.Capabilities;
+        var panel = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 6 };
+
+        // 只放四个最常用的能力；完整八项在「驱动」页。单字 + 悬停提示，避免挤爆列宽。
+        panel.Children.Add(CapDot("读", caps.Read));
+        panel.Children.Add(CapDot("写", caps.Write));
+        panel.Children.Add(CapDot("订", caps.Subscribe));
+        panel.Children.Add(CapDot("浏", caps.Browse));
+
+        return panel;
+    }
+
+    private static UIElement CapDot(string label, string state)
+    {
+        var color = UiFormat.Color(UiFormat.CapColor(state));
+        var panel = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 3 };
+        panel.Children.Add(Ui.Dot(color, 6));
+        panel.Children.Add(Ui.Text(label, 11, color));
+
+        var box = new Border { Child = panel };
+        ToolTipService.SetToolTip(box, $"{label}：{StateLabel(state)}");
+        return box;
+    }
+
+    private static string StateLabel(string state) => state switch
+    {
+        "supported" => "支持",
+        "runtimeDependent" => "视运行时",
+        "experimental" => "实验",
+        _ => "不支持",
+    };
+
     private UIElement BuildDeviceRow(DeviceSummaryDto device)
     {
         var stateColor = UiFormat.Color(UiFormat.StateColor(device.RuntimeState));
@@ -134,6 +191,7 @@ public sealed class DevicesPage : IPage, IDisposable
             (Ui.Star(0.8), state),
             (Ui.Star(1.5), name),
             (Ui.Star(1.5), Ui.Text($"{device.Channel} · {device.Protocol}", 12, Ui.Muted, mono: true)),
+            (Ui.Star(1.2), BuildCapabilities(device)),
             (Ui.Star(0.9), points),
             (Ui.Star(0.7), Ui.Text(UiFormat.Percent(device.Stats.SuccessRate), 12, successColor)),
             (Ui.Star(0.6), Ui.Text($"{device.Stats.P95DurationMs:0} ms", 12, Ui.Muted, mono: true)),

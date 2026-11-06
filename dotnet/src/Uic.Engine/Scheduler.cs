@@ -39,6 +39,9 @@ public sealed class Scheduler : IAsyncDisposable
 
     public PointCache Cache => _cache;
     public ConfigDocument Config => _config;
+
+    /// <summary>已注册的驱动。北向的 /drivers 端点直接读它，不另存一份元数据。</summary>
+    public DriverRegistry Drivers => _drivers;
     public TimeSpan Uptime => DateTimeOffset.UtcNow - _startedAt;
     public IReadOnlyList<DeviceActor> Actors => _actors.Values.OrderBy(a => a.DeviceId, StringComparer.Ordinal).ToArray();
 

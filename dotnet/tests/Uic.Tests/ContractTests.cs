@@ -36,6 +36,7 @@ internal static class ContractTests
         tests.Add(new TestCase("contract/health_and_version_are_public", HealthAndVersionArePublic));
         tests.Add(new TestCase("contract/api_requires_bearer_token", ApiRequiresBearerToken));
         tests.Add(new TestCase("contract/devices_and_points_are_listed", DevicesAndPointsAreListed));
+        tests.Add(new TestCase("contract/drivers_expose_capability_states", DriversExposeCapabilityStates));
         tests.Add(new TestCase("contract/unknown_device_returns_error_envelope", UnknownDeviceReturnsEnvelope));
         tests.Add(new TestCase("contract/config_is_redacted", ConfigIsRedacted));
         tests.Add(new TestCase("contract/config_validate_reports_problems", ConfigValidateReportsProblems));
@@ -312,6 +313,53 @@ internal static class ContractTests
             t.Close(42, good.GetProperty("value").GetProperty("num").GetDouble(), 1e-9, "const waveform uses the baseline");
             t.Equal("°C", good.GetProperty("unit").GetString(), "unit comes from the config");
             t.Ok(good.GetProperty("seq").GetUInt64() > 0, "seq is assigned");
+        });
+    }
+
+    /// <summary>
+    /// 驱动能力是四态而不是布尔：把 unsupported 写成 false、把 runtimeDependent 写成 true
+    /// 都会让控制台给出错误结论。这条用例锁住线上名字，防止序列化悄悄变回数字。
+    /// </summary>
+    private static Task DriversExposeCapabilityStates(TestContext t)
+    {
+        return RunAsync(async () =>
+        {
+            await using var host = await Host.StartAsync(t);
+
+            using var document = await ReadJsonAsync(
+                t, await host.Client.SendAsync(Get("/api/v1/drivers"), t.Ct));
+
+            var items = document.RootElement.GetProperty("items");
+            t.Equal(4, items.GetArrayLength(), "all registered drivers are listed");
+
+            var byId = items.EnumerateArray().ToDictionary(
+                d => d.GetProperty("id").GetString()!,
+                d => d.Clone(),
+                StringComparer.Ordinal);
+
+            t.Ok(byId.ContainsKey("modbus-tcp") && byId.ContainsKey("modbus-rtu") &&
+                 byId.ContainsKey("modbus-ascii") && byId.ContainsKey("virtual"),
+                "the built-in drivers are present");
+
+            var modbus = byId["modbus-tcp"];
+            t.Equal("1.0", modbus.GetProperty("sdkVersion").GetString(), "sdk version is exposed");
+            t.Equal("supported", Cap(modbus, "read"), "modbus can read");
+            t.Equal("supported", Cap(modbus, "write"), "modbus can write");
+            t.Equal("supported", Cap(modbus, "multiRead"), "modbus batches reads");
+            t.Equal("supported", Cap(modbus, "bitAccess"), "modbus supports bit access");
+            t.Equal("unsupported", Cap(modbus, "subscribe"), "modbus master has no subscriptions");
+            t.Equal("unsupported", Cap(modbus, "browse"), "modbus has no address space to browse");
+
+            t.Equal("master", modbus.GetProperty("roles")[0].GetString(), "modbus is a master");
+            t.Equal("register", modbus.GetProperty("addressKinds")[0].GetString(), "modbus uses register addressing");
+
+            var virtualDriver = byId["virtual"];
+            t.Equal("supported", Cap(virtualDriver, "subscribe"), "the virtual device can push changes");
+            t.Equal("supported", Cap(virtualDriver, "browse"), "the virtual device exposes symbols");
+            t.Equal("unsupported", Cap(virtualDriver, "discovery"), "discovery stays unsupported");
+
+            static string? Cap(JsonElement driver, string name)
+                => driver.GetProperty("capabilities").GetProperty(name).GetString();
         });
     }
 

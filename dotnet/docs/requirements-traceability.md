@@ -11,7 +11,7 @@
 它们不是 §6.1「不做」清单里的项，属于真实缺口；逐协议现状、原因与补法见
 [protocol-status.md](protocol-status.md)。
 
-当前测试基线：**141 passed / 0 failed / 1 skipped**（跳过的是需要 `--opcua` 的 OPC UA 端到端用例）。
+当前测试基线：**142 passed / 0 failed / 1 skipped**（跳过的是需要 `--opcua` 的 OPC UA 端到端用例）。
 
 ## 1. 采集（FR-COL）
 
@@ -24,7 +24,7 @@
 | FR-COL-05 | OPC UA 客户端 | 未实现（首版缺口） | PRD 列为 M，本版本只实现 OPC UA **服务端**（`Uic.OpcUa`）。客户端需要会话/订阅/证书/重连，建议直接基于 `Opc.Ua.Client` 而不是手写栈 |
 | FR-COL-06 | MQTT 南向订阅取数 | 未实现（首版缺口） | PRD 列为 M，本版本的 MQTT 只做北向发布与下行命令；南向取数需要另一套连接生命周期、点位映射与质量传播，不能复用北向客户端 |
 | FR-COL-07 | 虚拟设备（正弦/斜坡/随机/常量/故障注入） | 已实现 | `loopback/*`、`contract/*` 都以 `virtual` 驱动跑通全链路；五类故障注入见 `Uic.Driver.Virtual` |
-| FR-COL-08 | 驱动能力四态声明 | 部分实现 | `CapState` 四态与 `Capabilities` 已在驱动元数据里声明；控制台的**四态徽标尚未渲染**，目前只通过代码/文档体现。补法：加 `GET /api/v1/drivers` 暴露 `Capabilities`，UI 设备页按四态上色 |
+| FR-COL-08 | 驱动能力四态声明 | 已实现 | `GET /api/v1/drivers` 暴露 `Capabilities`；控制台「驱动」页渲染八项四态徽标、设备页显示读写/订阅/浏览四项；`contract/drivers_expose_capability_states` 锁住四态线上名字 |
 | FR-COL-09 | 批量读规划（合并 / 非法跨越拒绝） | 已实现 | `planner/*` 八条：相邻合并、跨空洞不合并、按寄存器与位上限切分、按区域分离、每点恰好覆盖一次 |
 | FR-COL-10 | 每点位独立采集周期 | 刻意没做（S） | 当前只有设备级周期。补法：`DeviceActor` 已按 `PointRef` 规划窗口，把点位按 `EffectiveInterval` 分桶即可，不需要改驱动契约 |
 | FR-COL-11 | 写入（单点/多点），写后校验与超时 | 部分实现 | 单点/多点、逐点裁决、超时三态（`ok`/`disabled`/`timeout`）已实现：`contract/write_returns_per_point_results`。**写后回读校验**未做——Modbus 写成功只代表从站接受了请求，回读需要额外的读预算与判定策略 |
@@ -94,7 +94,7 @@
 
 | 编号 | 需求 | 状态 | 证据 / 说明 |
 |---|---|---|---|
-| FR-OPS-01 | Web 控制台（登录、设备、点位、监视、日志、配置） | 部分实现 | 五个页面都在（Uno WASM），`scripts/wasm-smoke.sh` 在 Playwright 里真跑首屏与 REST 调用；**没有「新建通道/设备」表单**，配置改动仍走配置页或 REST |
+| FR-OPS-01 | Web 控制台（登录、设备、点位、监视、日志、配置） | 部分实现 | 六个页面都在（Uno WASM，含驱动能力页），`scripts/wasm-smoke.sh` 在 Playwright 里真跑首屏与 REST 调用；**没有「新建通道/设备」表单**，配置改动仍走配置页或 REST |
 | FR-OPS-02 | 认证（本地账号 + 会话 Token，首次强制改密） | 刻意没做（M） | 首版只有配置里的单个 Bearer Token，没有账号库。这是与 PRD 差距最大的一条，见文末「红线」 |
 | FR-OPS-03 | RBAC（页面级 + 操作级，≥3 角色） | 刻意没做（S） | 依赖 FR-OPS-02；命令白名单是硬编码能力边界，不是角色 |
 | FR-OPS-04 | 审计日志（可查询、可导出） | 刻意没做（S） | 命令与配置变更只进环形日志，重启即清空；审计需要落盘与查询接口 |

@@ -153,6 +153,7 @@ public sealed partial class MainPage : Page
         IPage page = tag switch
         {
             "points" => new PointsPage(_api),
+            "drivers" => new DriversPage(_api),
             "monitor" => new MonitorPage(_api),
             "logs" => new LogsPage(_api),
             "config" => new ConfigPage(_api),

@@ -46,7 +46,7 @@ dotnet publish src/Uic.Ui -f net10.0-browserwasm -c Release -o /tmp/uic-ui
 dotnet run --project src/Uic.Host -- run --web /tmp/uic-ui/wwwroot
 ```
 
-浏览器打开 `http://127.0.0.1:8080/`。五个页面分别是设备、点位、监控、日志、配置，
+浏览器打开 `http://127.0.0.1:8080/`。六个页面分别是设备、驱动、点位、监控、日志、配置，
 全部只通过 REST 与 SSE 通信——前端不认识任何驱动实现，也不持有第二份状态。
 配置了 `northbound.rest.token` 时，首屏会先要求输入令牌（存在浏览器本地）。
 
@@ -100,7 +100,7 @@ dotnet run --project tests/Uic.Tests -- --opcua             # 额外跑 OPC UA �
 dotnet run --project tests/Uic.Tests -- --stop-on-fail
 ```
 
-正常情况下输出 `141 passed, 0 failed, 1 skipped`（跳过的是默认不启用的 OPC UA 用例）。
+正常情况下输出 `142 passed, 0 failed, 1 skipped`（跳过的是默认不启用的 OPC UA 用例）。
 黄金帧测试默认从仓库的 `testdata/golden/` 读取，可用 `UIC_TESTDATA` 指向别的目录。
 
 串口用例（T15–T18）会用 libc 开一对伪终端，在 Linux 上默认执行，其它平台报 `skip`；

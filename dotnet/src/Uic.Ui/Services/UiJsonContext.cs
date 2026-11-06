@@ -20,6 +20,7 @@ namespace Uic.Ui;
 [JsonSerializable(typeof(VersionDto))]
 [JsonSerializable(typeof(Paged<DeviceSummaryDto>))]
 [JsonSerializable(typeof(Paged<PointDto>))]
+[JsonSerializable(typeof(DriversDto))]
 [JsonSerializable(typeof(Paged<LogEntryDto>))]
 [JsonSerializable(typeof(ConfigResponseDto))]
 [JsonSerializable(typeof(Paged<ConfigVersionDto>))]

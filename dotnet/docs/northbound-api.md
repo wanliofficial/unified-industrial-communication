@@ -91,6 +91,49 @@
 }
 ```
 
+### 驱动
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| GET | `/api/v1/drivers` | 已注册驱动的能力、角色与寻址声明 |
+
+能力是四态而不是布尔——「某协议支持符号寻址」在不同型号上含义不同，
+用 `true` / `false` 只会撒谎：
+
+| 值 | 含义 |
+|---|---|
+| `supported` | 确定支持 |
+| `unsupported` | 确定不支持 |
+| `runtimeDependent` | 视设备型号 / 固件而定，不能当成保证 |
+| `experimental` | 有实现，但还没有经过现场验证 |
+
+```json
+{
+  "items": [
+    {
+      "id": "modbus-tcp",
+      "name": "Modbus TCP",
+      "version": "1.0.0",
+      "sdkVersion": "1.0",
+      "roles": ["master"],
+      "transports": ["tcp"],
+      "addressKinds": ["register"],
+      "capabilities": {
+        "read": "supported",
+        "write": "supported",
+        "subscribe": "unsupported",
+        "browse": "unsupported",
+        "discovery": "unsupported",
+        "multiRead": "supported",
+        "bitAccess": "supported",
+        "structTypes": "unsupported"
+      },
+      "description": "Modbus TCP 主站：FC1/2/3/4/5/6/15/16，位访问与四种字序。"
+    }
+  ]
+}
+```
+
 ### 设备与点位
 
 | 方法 | 路径 | 说明 |

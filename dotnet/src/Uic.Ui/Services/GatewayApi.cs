@@ -120,6 +120,10 @@ public sealed class GatewayApi
     public Task<Paged<DeviceSummaryDto>> DevicesAsync(int limit = 200, CancellationToken ct = default)
         => GetAsync<Paged<DeviceSummaryDto>>($"/api/v1/devices?limit={limit}", ct);
 
+    /// <summary>驱动元数据。控制台用它渲染四态能力徽标。</summary>
+    public Task<DriversDto> DriversAsync(CancellationToken ct = default)
+        => GetAsync<DriversDto>("/api/v1/drivers", ct);
+
     public Task<DeviceSummaryDto> DeviceAsync(string id, CancellationToken ct = default)
         => GetAsync<DeviceSummaryDto>($"/api/v1/devices/{Uri.EscapeDataString(id)}", ct);
 
@@ -313,6 +317,15 @@ public sealed record ProblemDto(string Device, string State, string? Reason, Dat
 
 public sealed record VersionDto(string Name, string Version, string ApiVersion, string SchemaVersion,
     string Site, string Runtime, DateTimeOffset StartedAt, string ConfigVersion);
+
+public sealed record DriversDto(DriverDto[] Items);
+
+public sealed record DriverDto(string Id, string Name, string Version, string SdkVersion,
+    string[] Roles, string[] Transports, string[] AddressKinds, CapabilitiesDto Capabilities,
+    string? Description);
+
+public sealed record CapabilitiesDto(string Read, string Write, string Subscribe, string Browse,
+    string Discovery, string MultiRead, string BitAccess, string StructTypes);
 
 public sealed record DeviceSummaryDto(string Id, string? Name, string Channel, string Protocol,
     string ConfiguredState, string RuntimeState, DateTimeOffset Since, int Generation,

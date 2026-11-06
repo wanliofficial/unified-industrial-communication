@@ -41,6 +41,7 @@
                     <ListView x:Name="NavList" SelectionMode="Single" SelectionChanged="OnNavSelectionChanged"
                               BorderThickness="0" Padding="6,0">
                         <ListViewItem Content="设备" Tag="devices" />
+                        <ListViewItem Content="驱动" Tag="drivers" />
                         <ListViewItem Content="点位" Tag="points" />
                         <ListViewItem Content="监视" Tag="monitor" />
                         <ListViewItem Content="日志" Tag="logs" />

@@ -32,6 +32,18 @@ public static class UiFormat
         _ => "#C0392B",
     };
 
+    /// <summary>
+    /// 能力四态的固定配色。颜色只表示「确定程度」，不表示好坏：
+    /// unsupported 是灰色而不是红色——很多协议本来就不该有订阅能力。
+    /// </summary>
+    public static string CapColor(string state) => state switch
+    {
+        "supported" => "#1E8E3E",
+        "runtimeDependent" => "#B26A00",
+        "experimental" => "#1D5FA8",
+        _ => "#8A94A3",
+    };
+
     public static string LevelColor(string level) => level.ToLowerInvariant() switch
     {
         "trace" or "debug" => "#8A94A3",
