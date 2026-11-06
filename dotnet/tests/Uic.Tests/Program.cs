@@ -34,6 +34,7 @@ LoopbackTests.Register(tests);
 SerialTests.Register(tests);
 MqttTests.Register(tests);
 MqttCommandTests.Register(tests);
+ConfigFeatureTests.Register(tests);
 ContractTests.Register(tests);
 OpcUaTests.Register(tests);
 

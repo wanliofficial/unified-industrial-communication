@@ -17,6 +17,9 @@ public static partial class ModelValidator
     [GeneratedRegex("^[a-z0-9][a-z0-9._-]{0,63}$")]
     private static partial Regex ItemRe();
 
+    public static bool IsValidItemId(string? id)
+        => !string.IsNullOrWhiteSpace(id) && ItemRe().IsMatch(id);
+
     public static IReadOnlyList<ValidationProblem> Validate(ConfigDocument doc)
     {
         var problems = new List<ValidationProblem>();

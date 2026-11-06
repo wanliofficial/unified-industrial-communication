@@ -1,4 +1,5 @@
 using System.Text.Json;
+using System.Text.Json.Nodes;
 using System.Text.Json.Serialization;
 using Uic.Domain;
 
@@ -139,6 +140,53 @@ public sealed record LogEntryDto(
     string Message,
     string? Device,
     string? Exception);
+
+public sealed record TemplateSummaryDto(
+    string Id,
+    string? Name,
+    string? Description,
+    string? Protocol,
+    IReadOnlyList<TemplateParameter> Parameters,
+    string? DeviceId);
+
+public sealed record InstantiateRequestDto(
+    IReadOnlyList<Dictionary<string, string?>>? Instances,
+    bool Apply,
+    string? Comment);
+
+public sealed record InstantiateResponseDto(
+    string TemplateId,
+    bool Applied,
+    string? Version,
+    IReadOnlyList<Device> Devices,
+    IReadOnlyList<ValidationProblem> Problems);
+
+public sealed record PointsImportRequestDto(string? Csv, bool? DryRun = null, string? Comment = null);
+
+public sealed record PointsImportResponseDto(
+    string Device,
+    bool Valid,
+    bool Applied,
+    string? Version,
+    IReadOnlyList<string> Added,
+    IReadOnlyList<string> Updated,
+    IReadOnlyList<Point> Points,
+    IReadOnlyList<ValidationProblem> Problems);
+
+public sealed record ConfigExportDto(
+    string GatewayVersion,
+    DateTimeOffset ExportedAt,
+    string ConfigVersion,
+    bool Redacted,
+    JsonNode? Config);
+
+public sealed record ConfigImportResponseDto(
+    bool Valid,
+    bool Applied,
+    string? Version,
+    IReadOnlyList<string> Migrations,
+    JsonNode? Config,
+    IReadOnlyList<ValidationProblem> Problems);
 
 /// <summary>契约序列化选项：与 <see cref="JsonDefaults"/> 一致，额外忽略 null。</summary>
 public static class ApiJson

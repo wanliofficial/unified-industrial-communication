@@ -153,42 +153,10 @@ public static partial class RestApi
             return Results.Json(new PagedResponse<LogEntryDto>(entries, null, entries.Length), ApiJson.Options);
         });
 
-        app.MapGet("/api/v1/diagnostics/bundle", (HttpContext http) =>
+        app.MapGet("/api/v1/diagnostics/bundle", () =>
         {
-            var config = ctx.Control.CurrentConfig;
-            var health = BuildHealth(ctx);
-
-            using var buffer = new MemoryStream();
-
-            using (var zip = new ZipArchive(buffer, ZipArchiveMode.Create, leaveOpen: true))
-            {
-                WriteEntry(zip, "manifest.json", JsonSerializer.Serialize(new
-                {
-                    generatedAt = DateTimeOffset.UtcNow,
-                    gateway = ctx.GatewayVersion,
-                    apiVersion = ApiVersion,
-                    schemaVersion = SchemaVersion,
-                    site = ctx.Site,
-                    configVersion = ctx.Control.ConfigVersion,
-                }, JsonDefaults.Indented));
-
-                WriteEntry(zip, "config.redacted.json",
-                    config is null ? "{}" : JsonSerializer.Serialize(Redact(config), JsonDefaults.Indented));
-
-                WriteEntry(zip, "metrics.txt", ctx.Metrics.RenderPrometheus());
-                WriteEntry(zip, "health.json", JsonSerializer.Serialize(health, JsonDefaults.Indented));
-                WriteEntry(zip, "devices.json",
-                    JsonSerializer.Serialize(ctx.Engine.DeviceViews().Select(ToSummary), JsonDefaults.Indented));
-
-                var logs = ctx.Logs.Snapshot(limit: 5000)
-                    .OrderBy(e => e.Seq)
-                    .Select(e => $"{e.At:O} [{e.Level}] {e.Category}: {e.Message}")
-                    .ToArray();
-                WriteEntry(zip, "logs/uic.log", string.Join('\n', logs));
-            }
-
-            return Results.File(buffer.ToArray(), "application/zip",
-                $"uic-diagnostics-{DateTimeOffset.UtcNow:yyyyMMdd-HHmmss}.zip");
+            var bytes = DiagnosticsBundle.Build(ctx);
+            return Results.File(bytes, "application/zip", DiagnosticsBundle.FileName(DateTimeOffset.UtcNow));
         });
 
         app.MapGet("/api/v1/diagnostics/network", async (HttpContext http, CancellationToken ct) =>
@@ -263,7 +231,7 @@ public static partial class RestApi
     }
 
     /// <summary>脱敏：口令与 token 一律替换，配置本身照常可读。</summary>
-    private static JsonObject Redact(ConfigDocument config)
+    internal static JsonObject Redact(ConfigDocument config)
     {
         var node = JsonNode.Parse(JsonSerializer.Serialize(config, JsonDefaults.Options)) as JsonObject
                    ?? new JsonObject();
@@ -350,14 +318,6 @@ public static partial class RestApi
 
         // 兼容直接提交整份配置的写法。
         return (body, comment);
-    }
-
-    private static void WriteEntry(ZipArchive zip, string name, string content)
-    {
-        var entry = zip.CreateEntry(name, CompressionLevel.Optimal);
-        using var stream = entry.Open();
-        var bytes = Encoding.UTF8.GetBytes(content);
-        stream.Write(bytes, 0, bytes.Length);
     }
 
     /// <summary>按设备/点位粒度统计变化，用于 apply 响应里的 changed 字段。</summary>

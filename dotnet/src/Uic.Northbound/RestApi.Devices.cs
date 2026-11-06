@@ -112,8 +112,8 @@ public static partial class RestApi
         {
             var request = await ReadWriteBodyAsync(http, point, ct).ConfigureAwait(false);
 
-            var response = await ExecuteWritesAsync(ctx, device, request.Writes, ct).ConfigureAwait(false);
-            return Results.Json(response, ApiJson.Options);
+            return await WriteWithIdempotencyAsync(http, ctx, device, $"point:{point}", request.Writes, ct)
+                .ConfigureAwait(false);
         });
 
         app.MapPost("/api/v1/points/{device}/write",
@@ -121,27 +121,57 @@ public static partial class RestApi
         {
             var request = await ReadWriteBodyAsync(http, singlePoint: null, ct).ConfigureAwait(false);
 
-            var idempotencyKey = http.Request.Headers["X-Idempotency-Key"].FirstOrDefault();
-            if (!string.IsNullOrWhiteSpace(idempotencyKey))
-            {
-                var cacheKey = device + "\u001f" + idempotencyKey;
-                if (Idempotency.TryGetValue(cacheKey, out var cached) &&
-                    DateTimeOffset.UtcNow - cached.At < TimeSpan.FromMinutes(5))
-                {
-                    http.Response.Headers["X-Idempotent-Replay"] = "true";
-                    return Results.Content(cached.Body, "application/json; charset=utf-8");
-                }
-
-                var fresh = await ExecuteWritesAsync(ctx, device, request.Writes, ct).ConfigureAwait(false);
-                var body = JsonSerializer.Serialize(fresh, ApiJson.Options);
-                Idempotency[cacheKey] = new IdempotentResponse(body, DateTimeOffset.UtcNow);
-
-                return Results.Content(body, "application/json; charset=utf-8");
-            }
-
-            var output = await ExecuteWritesAsync(ctx, device, request.Writes, ct).ConfigureAwait(false);
-            return Results.Json(output, ApiJson.Options);
+            return await WriteWithIdempotencyAsync(http, ctx, device, "batch", request.Writes, ct)
+                .ConfigureAwait(false);
         });
+    }
+
+    /// <summary>
+    /// 写请求的幂等外壳。单点与批量共用一份实现：只给批量加幂等键的接口，
+    /// 会让调用方误以为单点重投是安全的，而现场恰恰是单点重投最多。
+    /// </summary>
+    private static async Task<IResult> WriteWithIdempotencyAsync(
+        HttpContext http,
+        NorthboundContext ctx,
+        string device,
+        string scope,
+        IReadOnlyList<WriteItemDto> items,
+        CancellationToken ct)
+    {
+        var key = http.Request.Headers["X-Idempotency-Key"].FirstOrDefault();
+        if (string.IsNullOrWhiteSpace(key))
+        {
+            var response = await ExecuteWritesAsync(ctx, device, items, ct).ConfigureAwait(false);
+            return Results.Json(response, ApiJson.Options);
+        }
+
+        var cacheKey = device + "\u001f" + scope + "\u001f" + key;
+        var now = DateTimeOffset.UtcNow;
+
+        if (Idempotency.TryGetValue(cacheKey, out var cached) &&
+            now - cached.At < TimeSpan.FromMinutes(5))
+        {
+            http.Response.Headers["X-Idempotent-Replay"] = "true";
+            return Results.Content(cached.Body, "application/json; charset=utf-8");
+        }
+
+        var fresh = await ExecuteWritesAsync(ctx, device, items, ct).ConfigureAwait(false);
+        var body = JsonSerializer.Serialize(fresh, ApiJson.Options);
+        Idempotency[cacheKey] = new IdempotentResponse(body, now);
+
+        // 键的数量由调用方决定，长期运行的网关必须有上限；超过就把过窗的条目清掉。
+        if (Idempotency.Count > 1024) PruneIdempotency(now);
+
+        http.Response.Headers["X-Idempotent-Replay"] = "false";
+        return Results.Content(body, "application/json; charset=utf-8");
+    }
+
+    private static void PruneIdempotency(DateTimeOffset now)
+    {
+        foreach (var (key, entry) in Idempotency)
+        {
+            if (now - entry.At >= TimeSpan.FromMinutes(5)) Idempotency.TryRemove(key, out _);
+        }
     }
 
     // ------------------------------------------------------------------

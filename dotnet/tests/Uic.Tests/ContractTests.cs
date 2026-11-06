@@ -40,6 +40,11 @@ internal static class ContractTests
         tests.Add(new TestCase("contract/config_is_redacted", ConfigIsRedacted));
         tests.Add(new TestCase("contract/config_validate_reports_problems", ConfigValidateReportsProblems));
         tests.Add(new TestCase("contract/write_returns_per_point_results", WriteReturnsPerPointResults));
+        tests.Add(new TestCase("contract/single_point_write_is_idempotent", SinglePointWriteIsIdempotent));
+        tests.Add(new TestCase("contract/template_instantiates_and_applies_devices", TemplateInstantiatesAndApplies));
+        tests.Add(new TestCase("contract/points_csv_import_previews_and_applies", PointsCsvImportPreviewsAndApplies));
+        tests.Add(new TestCase("contract/config_export_import_round_trip", ConfigExportImportRoundTrip));
+        tests.Add(new TestCase("contract/config_import_migrates_legacy_shape", ConfigImportMigratesLegacy));
     }
 
     // ------------------------------------------------------------------
@@ -206,6 +211,13 @@ internal static class ContractTests
 
         if (auth) request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", Token);
 
+        return request;
+    }
+
+    private static HttpRequestMessage PostWithKey(string path, string json, string key)
+    {
+        var request = Post(path, json);
+        request.Headers.Add("X-Idempotency-Key", key);
         return request;
     }
 
@@ -441,6 +453,317 @@ internal static class ContractTests
             // 只读点位必须在网关层被拒，而不是发到设备上再失败。
             var readOnly = await host.Client.SendAsync(Post("/api/v1/points/nope/temp/write", body), t.Ct);
             t.Equal(HttpStatusCode.NotFound, readOnly.StatusCode, "unknown device is a 404");
+        });
+    }
+
+    /// <summary>
+    /// 单点写入也必须支持幂等键：现场重试最多的是单点，而不是 100 点的批量。
+    /// 第二次请求不能再去碰设备，响应要明确告诉调用方这是重放。
+    /// </summary>
+    private static Task SinglePointWriteIsIdempotent(TestContext t)
+    {
+        return RunAsync(async () =>
+        {
+            await using var host = await Host.StartAsync(t);
+            await WaitForPointAsync(host, "v1", "temp", t);
+
+            const string body = """
+                                { "value": { "type": "float64", "num": 88.5 } }
+                                """;
+
+            var first = await host.Client.SendAsync(
+                PostWithKey("/api/v1/points/v1/temp/write", body, "single-1"), t.Ct);
+
+            t.Equal(HttpStatusCode.OK, first.StatusCode, "the first write succeeds");
+            t.Equal("false", first.Headers.GetValues("X-Idempotent-Replay").Single(),
+                "the first response is not a replay");
+
+            var firstBody = await first.Content.ReadAsStringAsync(t.Ct);
+
+            var second = await host.Client.SendAsync(
+                PostWithKey("/api/v1/points/v1/temp/write", body, "single-1"), t.Ct);
+
+            t.Equal(HttpStatusCode.OK, second.StatusCode, "the repeat is accepted");
+            t.Equal("true", second.Headers.GetValues("X-Idempotent-Replay").Single(),
+                "the repeat is marked as a replay");
+            t.Equal(firstBody, await second.Content.ReadAsStringAsync(t.Ct),
+                "the cached response is returned verbatim");
+        });
+    }
+
+    /// <summary>
+    /// 模板实例化：先预览，再应用；批量 index 自动注入；重复 ID 拒绝。
+    /// </summary>
+    private static Task TemplateInstantiatesAndApplies(TestContext t)
+    {
+        return RunAsync(async () =>
+        {
+            await using var host = await Host.StartAsync(t);
+
+            const string template = """
+                                    {
+                                      "schemaVersion": 1,
+                                      "id": "virtual-meter",
+                                      "name": "虚拟表计",
+                                      "protocol": "virtual",
+                                      "parameters": [
+                                        { "name": "index", "type": "int", "required": true },
+                                        { "name": "base", "type": "int", "default": "0" },
+                                        { "name": "amplitude", "type": "string", "default": "10" }
+                                      ],
+                                      "device": {
+                                        "id": "meter-{index}",
+                                        "channelId": "virtual-bus",
+                                        "interval": "1s",
+                                        "labels": { "mode": "const", "amplitude": "{amplitude}", "baseline": "7" },
+                                        "points": [
+                                          {
+                                            "id": "voltage",
+                                            "address": { "kind": "register", "area": "holding", "offset": "{base}" },
+                                            "dataType": "float64",
+                                            "unit": "V"
+                                          }
+                                        ]
+                                      }
+                                    }
+                                    """;
+
+            var created = await host.Client.SendAsync(Post("/api/v1/templates", template), t.Ct);
+            t.Equal(HttpStatusCode.Created, created.StatusCode, "the template is stored");
+
+            const string previewBody = """
+                                       {
+                                         "instances": [
+                                           { "base": "10" },
+                                           { "base": "20" }
+                                         ],
+                                         "apply": false
+                                       }
+                                       """;
+
+            var preview = await host.Client.SendAsync(
+                Post("/api/v1/templates/virtual-meter/instantiate", previewBody), t.Ct);
+
+            t.Equal(HttpStatusCode.OK, preview.StatusCode, "the preview succeeds");
+
+            using (var document = await ReadJsonAsync(t, preview))
+            {
+                var devices = document.RootElement.GetProperty("devices");
+                t.Equal(2, devices.GetArrayLength(), "two devices are previewed");
+                t.Equal("meter-1", devices[0].GetProperty("id").GetString(), "index is injected");
+                t.Equal("meter-2", devices[1].GetProperty("id").GetString(), "the second index is injected");
+                t.Equal(10, devices[0].GetProperty("points")[0]
+                    .GetProperty("address").GetProperty("offset").GetInt32(),
+                    "a numeric placeholder becomes a JSON number");
+                t.Equal("virtual-meter", devices[0].GetProperty("templateId").GetString(),
+                    "the instance records its template");
+            }
+
+            var applied = await host.Client.SendAsync(
+                Post("/api/v1/templates/virtual-meter/instantiate",
+                    previewBody.Replace("\"apply\": false", "\"apply\": true")), t.Ct);
+
+            t.Equal(HttpStatusCode.OK, applied.StatusCode, "the apply succeeds");
+
+            using (var document = await ReadJsonAsync(t, applied))
+            {
+                t.Equal(true, document.RootElement.GetProperty("applied").GetBoolean(), "config was applied");
+                t.Ok(document.RootElement.GetProperty("version").GetString()!.StartsWith('v'),
+                    "a new version is produced");
+            }
+
+            var devicesNow = await host.Client.SendAsync(Get("/api/v1/devices?limit=100"), t.Ct);
+            using (var document = await ReadJsonAsync(t, devicesNow))
+            {
+                t.Equal(3, document.RootElement.GetProperty("total").GetInt32(),
+                    "the two instances join the existing device");
+            }
+
+            // 再应用一次必须被拒：ID 冲突是现场最常见的模板误用。
+            var duplicate = await host.Client.SendAsync(
+                Post("/api/v1/templates/virtual-meter/instantiate",
+                    previewBody.Replace("\"apply\": false", "\"apply\": true")), t.Ct);
+
+            t.Equal(HttpStatusCode.UnprocessableEntity, duplicate.StatusCode,
+                "duplicate device ids are rejected");
+        });
+    }
+
+    /// <summary>CSV 导入默认只预览；确认后才应用，并且按 id 合并而不是整表替换。</summary>
+    private static Task PointsCsvImportPreviewsAndApplies(TestContext t)
+    {
+        return RunAsync(async () =>
+        {
+            await using var host = await Host.StartAsync(t);
+
+            const string csv = """
+                               id,name,address,dataType,unit,writable
+                               extra,扩展点,40003,uint16,V,true
+                               temp2,备用温度,holding:10,float32,degC,true
+                               """;
+
+            var preview = await host.Client.SendAsync(
+                Post("/api/v1/devices/v1/points/import", JsonSerializer.Serialize(new { csv })), t.Ct);
+
+            t.Equal(HttpStatusCode.OK, preview.StatusCode, "the preview succeeds");
+
+            using (var document = await ReadJsonAsync(t, preview))
+            {
+                t.Equal(true, document.RootElement.GetProperty("valid").GetBoolean(), "the csv is valid");
+                t.Equal(false, document.RootElement.GetProperty("applied").GetBoolean(),
+                    "dry-run does not change the config");
+                t.Equal(2, document.RootElement.GetProperty("added").GetArrayLength(), "both rows are new");
+                t.Equal(2, document.RootElement.GetProperty("points").GetArrayLength(), "two points are previewed");
+            }
+
+            var applied = await host.Client.SendAsync(
+                Post("/api/v1/devices/v1/points/import?dryRun=false",
+                    JsonSerializer.Serialize(new { csv })), t.Ct);
+
+            t.Equal(HttpStatusCode.OK, applied.StatusCode, "the import applies");
+
+            using (var document = await ReadJsonAsync(t, applied))
+            {
+                t.Equal(true, document.RootElement.GetProperty("applied").GetBoolean(), "config was applied");
+                t.Ok(document.RootElement.GetProperty("version").GetString()!.StartsWith('v'),
+                    "a new version is produced");
+            }
+
+            var points = await host.Client.SendAsync(Get("/api/v1/points?device=v1&limit=100"), t.Ct);
+            using (var document = await ReadJsonAsync(t, points))
+            {
+                t.Equal(4, document.RootElement.GetProperty("total").GetInt32(),
+                    "the two imported points join the two existing points");
+            }
+
+            // 坏地址必须在预览阶段就报出来，并且带上行号。
+            var bad = await host.Client.SendAsync(
+                Post("/api/v1/devices/v1/points/import",
+                    JsonSerializer.Serialize(new { csv = "id,address\nbroken,nonsense" })), t.Ct);
+
+            using (var document = await ReadJsonAsync(t, bad))
+            {
+                t.Equal(false, document.RootElement.GetProperty("valid").GetBoolean(), "the bad row is rejected");
+                t.Equal(1, document.RootElement.GetProperty("problems").GetArrayLength(), "one problem is reported");
+                t.Contains(document.RootElement.GetProperty("problems")[0].GetProperty("path").GetString()!,
+                    "line 2", "the problem points at the offending line");
+            }
+        });
+    }
+
+    /// <summary>导出 → 导入必须能回到同一个配置版本内容。</summary>
+    private static Task ConfigExportImportRoundTrip(TestContext t)
+    {
+        return RunAsync(async () =>
+        {
+            await using var host = await Host.StartAsync(t);
+
+            var export = await host.Client.SendAsync(Get("/api/v1/config/export?redact=false"), t.Ct);
+            t.Equal(HttpStatusCode.OK, export.StatusCode, "the export succeeds");
+
+            using var document = await ReadJsonAsync(t, export);
+            var exported = document.RootElement.GetProperty("config");
+            t.Equal(false, document.RootElement.GetProperty("redacted").GetBoolean(),
+                "secrets are included when explicitly requested");
+
+            var importBody = JsonSerializer.Serialize(new
+            {
+                config = JsonSerializer.Deserialize<JsonElement>(exported.GetRawText()),
+                comment = "round trip",
+            });
+
+            var imported = await host.Client.SendAsync(
+                Post("/api/v1/config/import?apply=true", importBody), t.Ct);
+
+            t.Equal(HttpStatusCode.OK, imported.StatusCode, "the import succeeds");
+
+            using (var result = await ReadJsonAsync(t, imported))
+            {
+                t.Equal(true, result.RootElement.GetProperty("valid").GetBoolean(), "the imported config is valid");
+                t.Equal(true, result.RootElement.GetProperty("applied").GetBoolean(), "the import is applied");
+                t.Ok(result.RootElement.GetProperty("version").GetString()!.StartsWith('v'),
+                    "the import produces a new version");
+            }
+
+            var redactedExport = await host.Client.SendAsync(Get("/api/v1/config/export"), t.Ct);
+            using (var result = await ReadJsonAsync(t, redactedExport))
+            {
+                t.Equal(true, result.RootElement.GetProperty("redacted").GetBoolean(),
+                    "exports are redacted by default");
+                t.Equal("***",
+                    result.RootElement.GetProperty("config").GetProperty("northbound")
+                        .GetProperty("rest").GetProperty("token").GetString(),
+                    "the bearer token never leaves the gateway by default");
+            }
+        });
+    }
+
+    /// <summary>旧版配置在导入时就地升级，并且把升级项列出来——静默改写比拒绝更危险。</summary>
+    private static Task ConfigImportMigratesLegacy(TestContext t)
+    {
+        return RunAsync(async () =>
+        {
+            await using var host = await Host.StartAsync(t);
+
+            const string legacy = """
+                                  {
+                                    "schemaVersion": 1,
+                                    "site": "contract-site",
+                                    "channels": [
+                                      { "id": "virtual-bus", "protocol": "virtual", "transport": "none" }
+                                    ],
+                                    "devices": [
+                                      {
+                                        "id": "legacy-1",
+                                        "channelId": "virtual-bus",
+                                        "points": [
+                                          {
+                                            "id": "value",
+                                            "address": { "kind": "register", "area": "holding", "offset": 0 },
+                                            "dataType": "float64"
+                                          }
+                                        ]
+                                      }
+                                    ],
+                                    "server": { "listen": "0.0.0.0:9090" },
+                                    "northbound": {
+                                      "mqtt": {
+                                        "enabled": true,
+                                        "broker": "tcp://broker.local:1883",
+                                        "topic": "uic/{site}/{device}/{point}/value"
+                                      }
+                                    }
+                                  }
+                                  """;
+
+            var imported = await host.Client.SendAsync(
+                Post("/api/v1/config/import", JsonSerializer.Serialize(new
+                {
+                    config = JsonSerializer.Deserialize<JsonElement>(legacy),
+                })), t.Ct);
+
+            t.Equal(HttpStatusCode.OK, imported.StatusCode, "the legacy config is accepted");
+
+            using var document = await ReadJsonAsync(t, imported);
+            var root = document.RootElement;
+
+            t.Equal(false, root.GetProperty("applied").GetBoolean(), "import without ?apply=true only previews");
+            t.Equal(true, root.GetProperty("valid").GetBoolean(), "the migrated config is valid");
+
+            var migrations = root.GetProperty("migrations");
+            t.Ok(migrations.GetArrayLength() >= 2, "the two legacy shapes are reported");
+
+            var config = root.GetProperty("config");
+            t.Equal("0.0.0.0:9090",
+                config.GetProperty("northbound").GetProperty("rest").GetProperty("listen").GetString(),
+                "server.listen is moved under northbound.rest");
+            t.Equal("broker.local",
+                config.GetProperty("northbound").GetProperty("mqtt").GetProperty("host").GetString(),
+                "the broker URL is split into host");
+            t.Equal(1883,
+                config.GetProperty("northbound").GetProperty("mqtt").GetProperty("port").GetInt32(),
+                "the broker URL is split into port");
+            t.Ok(!config.TryGetProperty("server", out _), "the legacy section is removed");
         });
     }
 

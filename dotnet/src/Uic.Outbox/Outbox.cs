@@ -122,8 +122,17 @@ public sealed class Outbox : IAsyncDisposable
     }
 
     /// <summary>立刻冲刷一轮。API 的「立即上报」与测试都直接调它。</summary>
-    public async Task FlushAsync(CancellationToken ct)
+    public Task FlushAsync(CancellationToken ct) => FlushAsync(sink: null, ct);
+
+    /// <summary>
+    /// 只冲刷指定 sink（API 的 <c>outbox.flush</c> 支持 <c>sink?</c>）。
+    /// 指定不存在的 sink 必须报错而不是静默成功——操作员会以为积压已经推走了。
+    /// </summary>
+    public async Task FlushAsync(string? sink, CancellationToken ct)
     {
+        if (sink is not null && !_sinks.ContainsKey(sink))
+            throw new KeyNotFoundException($"outbox sink '{sink}' is not registered");
+
         await _flushLock.WaitAsync(ct).ConfigureAwait(false);
 
         // 一个分区失败不得拖住其他分区：分区存在的理由就是「互不影响」。
@@ -134,7 +143,8 @@ public sealed class Outbox : IAsyncDisposable
         {
             foreach (var (name, partition) in _partitions)
             {
-                if (!_sinks.TryGetValue(name, out var sink)) continue;
+                if (sink is not null && name != sink) continue;
+                if (!_sinks.TryGetValue(name, out var sinkImpl)) continue;
 
                 try
                 {
@@ -147,7 +157,7 @@ public sealed class Outbox : IAsyncDisposable
                             break;
                         }
 
-                        await sink.DeliverAsync(batch, ct).ConfigureAwait(false);
+                        await sinkImpl.DeliverAsync(batch, ct).ConfigureAwait(false);
                         partition.Ack(batch[^1].Id);
                     }
                 }

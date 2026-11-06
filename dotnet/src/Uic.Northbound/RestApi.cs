@@ -100,6 +100,8 @@ public static partial class RestApi
 
         MapDevices(app, ctx);
         MapConfig(app, ctx);
+        MapTemplates(app, ctx);
+        MapImportExport(app, ctx);
         MapDiagnostics(app, ctx);
         MapStream(app, ctx, hub);
 
@@ -217,7 +219,7 @@ public static partial class RestApi
         return new ReadyDto(checks.All(c => c.Ok), checks);
     }
 
-    private static HealthDto BuildHealth(NorthboundContext ctx)
+    internal static HealthDto BuildHealth(NorthboundContext ctx)
     {
         var stats = ctx.Outbox.Stats();
         var engineHealth = ctx.Engine.Health(stats.Pending, stats.DroppedTotal);
@@ -252,7 +254,7 @@ public static partial class RestApi
     // 共用小工具
     // ------------------------------------------------------------------
 
-    private static DeviceSummaryDto ToSummary(DeviceView v) => new(
+    internal static DeviceSummaryDto ToSummary(DeviceView v) => new(
         v.Id,
         v.Name,
         v.ChannelId,

@@ -114,6 +114,7 @@
             "path": "Status.Mode"
           },
           "dataType": "string",
+          "length": 16,
           "enabled": true
         }
       ],

@@ -13,6 +13,18 @@ public sealed class ConfigDocument
     public List<Device> Devices { get; init; } = new();
     public NorthboundOptions Northbound { get; init; } = new();
     public StorageOptions Storage { get; init; } = new();
+
+    /// <summary>替换设备列表，其余字段原样保留。模板/导入都靠它构造候选配置。</summary>
+    public ConfigDocument WithDevices(IReadOnlyList<Device> devices) => new()
+    {
+        SchemaVersion = SchemaVersion,
+        Site = Site,
+        Description = Description,
+        Channels = Channels,
+        Devices = devices.ToList(),
+        Northbound = Northbound,
+        Storage = Storage,
+    };
 }
 
 /// <summary>北向通道配置。每个通道独立启停，未实现的能力必须显式失败而不是静默降级。</summary>
@@ -127,6 +139,10 @@ public sealed class DurationConverter : JsonConverter<TimeSpan>
 
         static double Num(string s) => double.Parse(s, System.Globalization.CultureInfo.InvariantCulture);
 
+        // 复合写法（"1h0m0s"、"1h30m"）来自 Go 风格配置与旧示例。
+        // 只认「数字 + 单位」的重复序列，不接受任何表达式——配置文件不是脚本。
+        if (TryComposite(text, out var composite)) return composite;
+
         if (text.EndsWith("ms", StringComparison.OrdinalIgnoreCase)) return TimeSpan.FromMilliseconds(Num(text[..^2]));
         if (text.EndsWith("us", StringComparison.OrdinalIgnoreCase)) return TimeSpan.FromMicroseconds(Num(text[..^2]));
         if (text.EndsWith("ns", StringComparison.OrdinalIgnoreCase)) return TimeSpan.FromMicroseconds(Num(text[..^2]) / 1000d);
@@ -137,6 +153,71 @@ public sealed class DurationConverter : JsonConverter<TimeSpan>
 
         // 无单位时按毫秒处理，避免把 "1000" 误解成 1000 秒。
         return TimeSpan.FromMilliseconds(Num(text));
+    }
+
+    private static bool TryComposite(string text, out TimeSpan result)
+    {
+        result = TimeSpan.Zero;
+
+        var totalMs = 0d;
+        var index = 0;
+        var segments = 0;
+
+        while (index < text.Length)
+        {
+            var start = index;
+
+            while (index < text.Length && (char.IsAsciiDigit(text[index]) || text[index] == '.'))
+                index++;
+
+            if (index == start) return false;
+
+            if (!double.TryParse(text[start..index],
+                    System.Globalization.NumberStyles.Float,
+                    System.Globalization.CultureInfo.InvariantCulture, out var value))
+            {
+                return false;
+            }
+
+            if (index >= text.Length) return false;
+
+            string unit;
+
+            if (index + 1 < text.Length &&
+                (text.Substring(index, 2).Equals("ms", StringComparison.OrdinalIgnoreCase) ||
+                 text.Substring(index, 2).Equals("us", StringComparison.OrdinalIgnoreCase) ||
+                 text.Substring(index, 2).Equals("ns", StringComparison.OrdinalIgnoreCase)))
+            {
+                unit = text.Substring(index, 2).ToLowerInvariant();
+                index += 2;
+            }
+            else
+            {
+                unit = char.ToLowerInvariant(text[index]).ToString();
+                index++;
+            }
+
+            totalMs += unit switch
+            {
+                "ms" => value,
+                "us" or "µs" => value / 1000d,
+                "ns" => value / 1_000_000d,
+                "s" => value * 1000d,
+                "m" => value * 60_000d,
+                "h" => value * 3_600_000d,
+                "d" => value * 86_400_000d,
+                _ => double.NaN,
+            };
+
+            if (double.IsNaN(totalMs)) return false;
+
+            segments++;
+        }
+
+        if (segments == 0) return false;
+
+        result = TimeSpan.FromMilliseconds(totalMs);
+        return true;
     }
 
     public override void Write(Utf8JsonWriter writer, TimeSpan value, JsonSerializerOptions options)

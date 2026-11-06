@@ -34,6 +34,7 @@ public sealed class MqttCommandSink : IAsyncDisposable
         "device.selftest",
         "outbox.flush",
         "log.level",
+        "diag.bundle",
     };
 
     private readonly MqttClient _client;

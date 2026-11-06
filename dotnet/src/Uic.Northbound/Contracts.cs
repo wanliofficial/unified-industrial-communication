@@ -19,7 +19,10 @@ public interface IGatewayControl
     Task<ApplyOutcome> RollbackAsync(string versionId, CancellationToken ct);
     Task RestartDeviceAsync(string deviceId, CancellationToken ct);
     Task<bool> SelfTestAsync(string deviceId, CancellationToken ct);
-    Task FlushOutboxAsync(CancellationToken ct);
+    Task FlushOutboxAsync(string? sink, CancellationToken ct);
+
+    /// <summary>生成诊断包并返回落盘路径。构建逻辑与 HTTP 下载共用同一份实现。</summary>
+    Task<string> GenerateDiagnosticsAsync(CancellationToken ct);
     void SetLogLevel(string level);
 }
 

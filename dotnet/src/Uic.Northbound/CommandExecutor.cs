@@ -59,8 +59,21 @@ public static class CommandExecutor
             }
 
             case "outbox.flush":
-                await control.FlushOutboxAsync(ct).ConfigureAwait(false);
-                return new CommandResponseDto(request.Action, true, "outbox flushed");
+            {
+                // sink 为空表示全部；指定后只推那一条通道，便于「只补 MQTT 不补 journal」。
+                parameters.TryGetValue("sink", out var sink);
+                sink = string.IsNullOrWhiteSpace(sink) ? null : sink;
+
+                await control.FlushOutboxAsync(sink, ct).ConfigureAwait(false);
+                return new CommandResponseDto(request.Action, true,
+                    sink is null ? "outbox flushed" : $"outbox flushed for '{sink}'");
+            }
+
+            case "diag.bundle":
+            {
+                var path = await control.GenerateDiagnosticsAsync(ct).ConfigureAwait(false);
+                return new CommandResponseDto(request.Action, true, $"diagnostics bundle written to {path}");
+            }
 
             case "outbox.drop":
                 Require(scope, CommandScope.OutboxDrop, request.Action);

@@ -283,7 +283,22 @@ public sealed class GatewayRuntime : IGatewayControl, IAsyncDisposable
     public Task<bool> SelfTestAsync(string deviceId, CancellationToken ct)
         => _engine.SelfTestAsync(deviceId, ct);
 
-    public Task FlushOutboxAsync(CancellationToken ct) => _outbox.FlushAsync(ct);
+    public Task FlushOutboxAsync(string? sink, CancellationToken ct) => _outbox.FlushAsync(sink, ct);
+
+    public async Task<string> GenerateDiagnosticsAsync(CancellationToken ct)
+    {
+        // 诊断包写进 dataDir 而不是临时目录：现场排障时容器可能随时被替换，
+        // 操作员需要能在下一次重启前把文件拷走。
+        var dir = Path.Combine(_dataDir, "diagnostics");
+        Directory.CreateDirectory(dir);
+
+        var name = DiagnosticsBundle.FileName(DateTimeOffset.UtcNow);
+        var path = Path.Combine(dir, name);
+        var bytes = DiagnosticsBundle.Build(CreateNorthboundContext());
+
+        await File.WriteAllBytesAsync(path, bytes, ct).ConfigureAwait(false);
+        return path;
+    }
 
     public void SetLogLevel(string level)
     {

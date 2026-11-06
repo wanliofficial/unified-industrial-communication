@@ -280,16 +280,50 @@ data/
     versions/
       v6d22485a2e6d.json
       v6d22485a2e6d.meta.json   # 创建时间、注释、大小
+  templates/
+    modbus-meter.json    # 设备模板，与配置版本分开
+  diagnostics/
+    uic-diagnostics-20261105-091402.zip
   outbox/
     <sink>/records.ndjson
     <sink>/ack
 ```
+
+模板单独存放是有意的：模板是「怎么生成设备」的规则，配置是「现在有哪些设备」的事实。
+混在一起会让回滚把模板也带回去，也会让「改一个默认值」变成「现场 50 台设备一起变」。
 
 - **内容寻址**：`id = "v" + sha256(canonical json)[..12]`，同样的内容永远得到同一个 id；
 - **只增不改**：提交新版本不会动历史；回滚是把旧内容作为一次新提交，因此也能再回滚；
 - **启动优先级**：`current` 指针 > `--config` 指定的文件 > 内置兜底配置。
   运维回滚过之后重启，不会把旧文件重新捡回来；
 - **热更新**：按设备粒度 diff，只重启受影响的设备，其余采集不中断。
+
+## 旧配置迁移
+
+加载与导入都会先过一遍迁移链（`ConfigMigrations`）：
+
+| 旧写法 | 新写法 |
+|---|---|
+| `server.listen` | `northbound.rest.listen` |
+| `server.token` | `northbound.rest.token` |
+| `northbound.mqtt.broker`（`tcp://host:port`） | `northbound.mqtt.host` + `port` |
+| `storage.dir` | `storage.dataDir` |
+| `channels[].concurrency` | `channels[].maxConcurrency` |
+| `devices[].channel` | `devices[].channelId` |
+| `channels[].transport`（`{kind,address}` / `{kind,port,baud,…}` 对象） | 扁平化：`transport` 变字符串，`address` 拆成 `host`/`port`，串口参数落到 `channels[].serial` |
+| `serial.stopBits`（数字 `1` / `1.5` / `2`） | 字符串 `one` / `onePointFive` / `two` |
+
+时长也接受 Go 风格的复合写法（`1h0m0s`、`1h30m`、`2m30s`），
+因为早期示例配置就是这么写的。
+
+规则：
+
+1. `schemaVersion` 等于当前版本 → 原样使用；
+2. 小于当前版本 → 执行迁移，升级项在导入响应里逐条回显（静默改写比拒绝更难排查）；
+3. 大于当前版本 → 拒绝启动：不能「猜」新字段的语义，猜错会静默丢配置。
+
+迁移**不删字段以外的东西**：`logging`、`northbound.webhook` 这类当前版本不支持的段落
+原样保留、只是被忽略，等它们变成正式功能时再读，避免「升级即丢数据」。
 
 ## 校验
 

@@ -16,11 +16,14 @@ dotnet run --project tests/Uic.Tests -- --stop-on-fail      # 首个失败即停
 正常输出：
 
 ```
-115 passed, 0 failed, 1 skipped · 33.1s
+131 passed, 0 failed, 1 skipped · 46.2s
 ```
 
 跳过的一条是 OPC UA 验收（要绑端口、生成证书，默认不跑）。
 串口用例会自己开伪终端，Linux 上默认执行；其它平台报 `skip`，不算通过也不算失败。
+
+用例与 PRD 需求的逐条对应见 [requirements-traceability.md](requirements-traceability.md)：
+那里写明每条 FR 是「已实现 / 部分实现 / 刻意没做」，以及对应的用例名。
 
 运行器的行为：
 
@@ -42,13 +45,15 @@ dotnet run --project tests/Uic.Tests -- --stop-on-fail      # 首个失败即停
 | `cache/*` | 4 | 序号单调、只在变化时通知、移除设备、订阅者故障隔离 |
 | `planner/*` | 8 | 窗口合并、切分上限、区分离、非寄存器寻址 |
 | `outbox/*` | 8 | 位点推进、重启重放、批次、分区隔离、三重上限、半行容错 |
-| `config/*` | 8 | 内容寻址、回滚、启动优先级、非法文档、diff |
+| `config/*` | 12 | 内容寻址、回滚、启动优先级、非法文档、diff、旧配置迁移、复合时长、仓库示例可校验 |
 | `json/*` | 9 | 时长、枚举、值形状、UTC、往返稳定、前向兼容 |
 | `engine/*` | 2 | 同连接永不并发、状态机与代次 |
 | `loopback/*` | 12 | 主站 ↔ 内置从站的真实链路 |
 | `serial/*` | 6 | 真实伪终端上的 RTU / ASCII、半双工、deadline、关闭打断读 |
-| `mqtt/*` | 15 | 测试内 broker：CONNECT/SUBSCRIBE 字段、QoS0/1、主题渲染、重连补发、命令去重与权限 |
-| `contract/*` | 7 | 进程内真实 Kestrel 的 REST 契约 |
+| `mqtt/*` | 17 | 测试内 broker：CONNECT/SUBSCRIBE 字段、QoS0/1、主题渲染、重连补发、命令去重与权限 |
+| `template/*` | 3 | 50 实例批量生成、参数类型/缺失/未知参数拒绝、未声明占位符拒绝 |
+| `csv/*` | 2 | 地址表达式（参考号/区域偏移/分列）、按 id 合并与冲突行号 |
+| `contract/*` | 12 | 进程内真实 Kestrel 的 REST 契约（含模板、CSV、导入导出、单点幂等） |
 | `opcua/*` | 1 | 标准 OPC UA 客户端：浏览、读、写、订阅 |
 
 ## 规范用例 T1–T18 的对应关系
@@ -181,7 +186,7 @@ WebApplication.CreateBuilder → UseUrls("http://127.0.0.1:0")
   （漏了这条 broker 会一直重投同一条命令）；
 - 反例：CONNACK 非 0 时不报「已连接」但继续重试；入站 PUBLISH 不会被当成 PUBACK。
 
-命令通道（`MqttCommandSink`）另有 6 条端到端用例，用 stub `IGatewayControl` 计数
+命令通道（`MqttCommandSink`）另有 8 条端到端用例，用 stub `IGatewayControl` 计数
 来证明「执行了/没执行」而不是只看结果 JSON：
 
 | 用例 | 断言 |
@@ -192,6 +197,8 @@ WebApplication.CreateBuilder → UseUrls("http://127.0.0.1:0")
 | `command_privileged_action_is_forbidden` | `config.rollback` 返回 `command.forbidden`，控制面零调用 |
 | `command_missing_id_is_rejected` | 无 id 返回 `request.invalid`，一次也不执行 |
 | `command_resubscribes_after_reconnect` | broker 断链后重新订阅，命令在新会话上仍可执行 |
+| `command_outbox_flush_forwards_sink` | `outbox.flush` 的 `sink` 参数透传到控制面，而不是被静默忽略 |
+| `command_diag_bundle_is_whitelisted` | `diag.bundle` 在白名单内，且返回落盘路径 |
 
 这套用例抓到过三个真实缺陷，都属于「代码评审看不出来、上线才出问题」的类型：
 `ReadPacketAsync` 把剩余长度字节当成报文头（所有应答都被丢弃）、
@@ -253,6 +260,8 @@ WebApplication.CreateBuilder → UseUrls("http://127.0.0.1:0")
 | MQTT 命令去重只在进程内 | 幂等窗口 5 分钟、重启即清空；没有持久审计台账 | 需要跨重启幂等时用 REST 的 `X-Idempotency-Key`，或把命令记录落到外部存储 |
 | WASM 控制台只在 Chromium 上验过 | 未覆盖 Firefox / Safari、移动端与真实触屏 | 上线前在目标浏览器各跑一次同一套检查（换 Playwright 的 browser 参数） |
 | 真实硬件 | 全部用例都跑在内置从站 / 虚拟设备 / 伪终端上 | 现场接入时先用 `uic check` 与 `/api/v1/commands` 的 `device.selftest` |
+| 模板只支持 string/int/bool 三种参数 | 「按站点切换整段点位」这类复杂参数化做不到 | 这是刻意的：更强的模板等于一门配置语言，先把三种类型用透 |
+| CSV 导入一次只写一台设备 | 上千台设备的批量开通需要逐台调用 | 调用方循环；若需要「一个 CSV 覆盖多设备」，在文件里加 `device` 列再扩展 `PointCsv` |
 
 串口用例虽然跑在伪终端上，走的是与真串口完全相同的内核 tty 路径（termios、
 行规程、poller），所以 T15–T18 在 pty 上通过是有意义的；但它仍然不是

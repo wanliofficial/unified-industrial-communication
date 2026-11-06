@@ -24,6 +24,8 @@ internal static class MqttCommandTests
         tests.Add(new TestCase("mqtt/command_privileged_action_is_forbidden", PrivilegedActionIsForbidden));
         tests.Add(new TestCase("mqtt/command_missing_id_is_rejected", MissingIdIsRejected));
         tests.Add(new TestCase("mqtt/command_resubscribes_after_reconnect", ResubscribesAfterReconnect));
+        tests.Add(new TestCase("mqtt/command_outbox_flush_forwards_sink", OutboxFlushForwardsSink));
+        tests.Add(new TestCase("mqtt/command_diag_bundle_is_whitelisted", DiagBundleIsWhitelisted));
     }
 
     private static MqttOptions Options(int port) => new()
@@ -250,6 +252,58 @@ internal static class MqttCommandTests
         t.Equal(1, control.Flushes, "the command reaches the control surface on the new session");
     }
 
+    /// <summary>
+    /// outbox.flush 的 sink 参数必须透传：操作员只想补 MQTT 时，
+    /// 不能顺手把 journal 也推一遍（那会改变 journal 的位点）。
+    /// </summary>
+    private static async Task OutboxFlushForwardsSink(TestContext t)
+    {
+        await using var broker = new FakeMqttBroker();
+        var options = Options(broker.Port);
+
+        await using var sink = new MqttSink(options, "site-a", NullLogger.Instance);
+        var control = new StubControl();
+        await using var commands = new MqttCommandSink(
+            sink.Client, options, "site-a", control, NullLogger.Instance);
+
+        sink.Start();
+        await WaitUntil(t, () => broker.Subscriptions.Any(s => s.Topic == commands.Topic),
+            "the command topic is subscribed");
+
+        await broker.PublishToClientAsync(commands.Topic,
+            Payload("flush-1", "outbox.flush", new { sink = "mqtt" }));
+
+        var result = await AwaitResult(t, broker, commands.ResultTopic);
+
+        t.Equal(true, result["ok"]!.GetValue<bool>(), "the flush succeeds");
+        t.Equal(1, control.Flushes, "the control surface is invoked once");
+        t.Equal("mqtt", control.LastFlushSink, "the sink filter is forwarded instead of being ignored");
+    }
+
+    /// <summary>诊断包是白名单动作，且返回值里要有落盘路径（否则操作员不知道去哪拿）。</summary>
+    private static async Task DiagBundleIsWhitelisted(TestContext t)
+    {
+        await using var broker = new FakeMqttBroker();
+        var options = Options(broker.Port);
+
+        await using var sink = new MqttSink(options, "site-a", NullLogger.Instance);
+        var control = new StubControl();
+        await using var commands = new MqttCommandSink(
+            sink.Client, options, "site-a", control, NullLogger.Instance);
+
+        sink.Start();
+        await WaitUntil(t, () => broker.Subscriptions.Any(s => s.Topic == commands.Topic),
+            "the command topic is subscribed");
+
+        await broker.PublishToClientAsync(commands.Topic, Payload("diag-1", "diag.bundle"));
+
+        var result = await AwaitResult(t, broker, commands.ResultTopic);
+
+        t.Equal(true, result["ok"]!.GetValue<bool>(), "diag.bundle is allowed on the command channel");
+        t.Equal(1, control.Bundles, "the bundle is generated exactly once");
+        t.Contains(result["detail"]!.GetValue<string>(), "uic-diagnostics", "the detail names the written file");
+    }
+
     /// <summary>只统计被调用的控制面动作，用来证明「没有第二次执行」。</summary>
     private sealed class StubControl : IGatewayControl
     {
@@ -257,12 +311,15 @@ internal static class MqttCommandTests
         private int _rollbacks;
         private int _flushes;
         private int _selfTests;
+        private int _bundles;
 
         public int Restarts => Volatile.Read(ref _restarts);
         public int Rollbacks => Volatile.Read(ref _rollbacks);
         public int Flushes => Volatile.Read(ref _flushes);
         public int SelfTests => Volatile.Read(ref _selfTests);
+        public int Bundles => Volatile.Read(ref _bundles);
 
+        public string? LastFlushSink { get; private set; }
         public string? LastRestartDevice { get; private set; }
 
         public ConfigDocument CurrentConfig { get; } = new();
@@ -290,10 +347,17 @@ internal static class MqttCommandTests
             return Task.FromResult(true);
         }
 
-        public Task FlushOutboxAsync(CancellationToken ct)
+        public Task FlushOutboxAsync(string? sink, CancellationToken ct)
         {
+            LastFlushSink = sink;
             Interlocked.Increment(ref _flushes);
             return Task.CompletedTask;
+        }
+
+        public Task<string> GenerateDiagnosticsAsync(CancellationToken ct)
+        {
+            Interlocked.Increment(ref _bundles);
+            return Task.FromResult("/tmp/uic-diagnostics-test.zip");
         }
 
         public void SetLogLevel(string level) => throw new NotSupportedException("not used by this test");

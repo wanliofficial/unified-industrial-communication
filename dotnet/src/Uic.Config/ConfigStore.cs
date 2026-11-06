@@ -35,6 +35,7 @@ public sealed class ConfigStore
 
     public ConfigStore(string dataDir)
     {
+        DataDir = dataDir;
         _root = Path.Combine(dataDir, "config");
         _versionsDir = Path.Combine(_root, "versions");
         _currentFile = Path.Combine(_root, "current");
@@ -42,6 +43,7 @@ public sealed class ConfigStore
     }
 
     public string Root => _root;
+    public string DataDir { get; }
     public ConfigDocument? Current { get; private set; }
     public string CurrentId { get; private set; } = string.Empty;
 
@@ -57,10 +59,12 @@ public sealed class ConfigStore
 
     public static ConfigDocument Parse(string json, string origin = "<inline>")
     {
+        var migration = ConfigMigrations.Upgrade(json);
+
         ConfigDocument? doc;
         try
         {
-            doc = JsonSerializer.Deserialize<ConfigDocument>(json, JsonDefaults.Options);
+            doc = JsonSerializer.Deserialize<ConfigDocument>(migration.Json, JsonDefaults.Options);
         }
         catch (JsonException ex)
         {
@@ -96,9 +100,20 @@ public sealed class ConfigStore
     {
         document = null;
 
+        string upgraded;
         try
         {
-            document = JsonSerializer.Deserialize<ConfigDocument>(json, JsonDefaults.Options);
+            upgraded = ConfigMigrations.Upgrade(json).Json;
+        }
+        catch (ConfigException ex)
+        {
+            problems = ex.Problems;
+            return false;
+        }
+
+        try
+        {
+            document = JsonSerializer.Deserialize<ConfigDocument>(upgraded, JsonDefaults.Options);
         }
         catch (JsonException ex)
         {

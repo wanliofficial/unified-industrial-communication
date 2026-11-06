@@ -100,8 +100,9 @@
 | GET | `/api/v1/devices/{device}/points` | 该设备的点位（分页） |
 | GET | `/api/v1/points` | 全部点位（可按 `device` 过滤） |
 | GET | `/api/v1/points/{device}/{point}` | 单个点位当前值 |
-| POST | `/api/v1/points/{device}/{point}/write` | 写单个点位 |
+| POST | `/api/v1/points/{device}/{point}/write` | 写单个点位，支持 `X-Idempotency-Key` |
 | POST | `/api/v1/points/{device}/write` | 批量写，支持 `X-Idempotency-Key` |
+| POST | `/api/v1/devices/{device}/points/import` | 点表 CSV 导入（默认 dry-run） |
 
 分页响应统一为：
 
@@ -165,8 +166,79 @@
 
 - 只读点位、类型不匹配、越界在网关层就被拒，不会发到设备上；
 - 写请求在通道内插队到读之前（现场按「立即执行」比「先来后到」更符合直觉）；
-- 带 `X-Idempotency-Key` 时，5 分钟内的相同 key 直接返回首次结果并带
-  `X-Idempotent-Replay: true`，客户端超时重试不会写两次。
+- 单点与批量都接受 `X-Idempotency-Key`：5 分钟内的相同 key 直接返回首次结果并带
+  `X-Idempotent-Replay: true`，客户端超时重试不会写两次。首次响应带
+  `X-Idempotent-Replay: false`，两种状态都明确给出，避免调用方靠猜；
+- 幂等作用域是 `设备 + 单点/批量 + key`，同一个 key 用在另一个点位上不会被误判为重放。
+
+### 点表导入（CSV）
+
+`POST /api/v1/devices/{device}/points/import`，默认 **dry-run**：先看会新增/覆盖什么，
+确认后才落盘。现场最常见的操作失误是「一次手滑覆盖整张点表」，默认写库会把这种失误放大。
+
+请求体两种形态都接受：
+
+```json
+{ "csv": "id,name,address,dataType,unit\n...", "dryRun": false, "comment": "从 Excel 导入" }
+```
+
+或直接把裸 CSV 当请求体（`curl --data-binary @points.csv`）。
+查询串 `?dryRun=false` 优先于请求体，便于脚本显式表达「我确认要写」。
+
+列名大小写不敏感，接受 `id`、`name`、`address`/`area`+`offset`、`bit`、`length`、
+`dataType`、`byteOrder`、`unit`、`scale`、`bias`、`deadband`、`writable`、`enabled`。
+
+| 地址写法 | 示例 | 说明 |
+|---|---|---|
+| 区域:偏移 | `holding:100`、`coil:5.2` | `.` 后是位号 0..15 |
+| Modbus 参考号 | `40001`、`30010`、`00001.3` | 一基参考号，转为零基偏移 |
+| 分列填写 | `area=holding` + `offset=100` | 从 Excel 分列导入时更自然 |
+
+```json
+{
+  "device": "meter-1",
+  "valid": true,
+  "applied": false,
+  "added": ["extra"],
+  "updated": ["temp"],
+  "points": [ ... ],
+  "problems": []
+}
+```
+
+- 合并而不是整表替换：CSV 没提到的点位原样保留，同 `id` 的点位被覆盖；
+- 同一文件内 `id` 重复、地址无法解析、类型不认识都会在 dry-run 阶段按行号报出，
+  不会先写一半再失败；
+- 应用时走与 `config/apply` 相同的路径，只重启这一台设备。
+
+### 设备模板
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| GET | `/api/v1/templates` | 模板列表 |
+| GET | `/api/v1/templates/{id}` | 模板定义 |
+| POST | `/api/v1/templates` | 保存模板（同 id 覆盖） |
+| DELETE | `/api/v1/templates/{id}` | 删除模板 |
+| POST | `/api/v1/templates/{id}/instantiate` | 实例化（默认只预览） |
+
+模板保存在 `{dataDir}/templates`，与配置版本目录分开：模板是「怎么生成设备」的规则，
+配置是「现在有哪些设备」的事实。改模板不会重写已经应用的设备。
+
+模板参数只有 `string` / `int` / `bool` 三种类型，替换只发生在字符串字面量里的
+`{name}`，不执行任何表达式。整串就是一个占位符时按参数类型产出原生 JSON 类型
+（`int` 变数字、`bool` 变布尔），不会全部退化成字符串。
+
+```json
+{
+  "instances": [ { "base": "10" }, { "base": "20" } ],
+  "apply": true,
+  "comment": "批量开通 2 台表计"
+}
+```
+
+- 批量实例化未显式给 `index` 时自动注入 `1..N`，50 台设备不需要手写 50 个 `index`；
+- `apply: true` 时，实例化出的设备 id 与现有设备冲突会被拒（422），不会静默覆盖；
+- 保存模板时会静态检查「设备骨架里用了但参数表里没声明的占位符」，把错误挡在写入前。
 
 ### 配置
 
@@ -179,6 +251,8 @@
 | POST | `/api/v1/config/validate` | 校验，返回 `valid` + `problems[]` |
 | POST | `/api/v1/config/apply` | 提交并热更新 |
 | POST | `/api/v1/config/rollback` | 回滚到指定版本 |
+| GET | `/api/v1/config/export?redact=false` | 导出当前配置（默认脱敏） |
+| POST | `/api/v1/config/import?apply=true` | 导入配置（默认只校验与预览） |
 
 `validate` 的语义刻意是「永远返回 200 + 问题清单」：
 
@@ -203,6 +277,25 @@
 
 `apply` 只重启受影响的设备 —— 这是热更新能用在产线上的前提。
 
+### 导出与导入
+
+`GET /api/v1/config/export` 默认脱敏（`token` / `password` / `secret` → `***`）；
+只有显式 `?redact=false` 才导出明文，用于「整机迁移」这类明确知道风险的场景。
+
+`POST /api/v1/config/import` 默认只做「迁移 + 校验 + 预览」，加 `?apply=true` 才落盘。
+响应里的 `migrations` 列出实际执行的升级项，例如：
+
+```json
+{ "valid": true, "applied": false, "version": null,
+  "migrations": ["v0.server.listen -> northbound.rest.listen",
+                 "v0.northbound.mqtt.broker -> host/port"],
+  "config": { ... }, "problems": [] }
+```
+
+- `schemaVersion` 小于当前版本时自动升级；
+- 大于当前版本时直接拒绝：不能「猜」新字段的语义，猜错会静默丢配置；
+- 升级项必须回显：静默改写比拒绝更难排查。
+
 ### 命令
 
 `POST /api/v1/commands`：
@@ -215,9 +308,19 @@
 |---|---|---|
 | `driver.restart` | `device` | 重启单台设备的 actor（重新建链） |
 | `device.selftest` | `device` | 探活 + 读一个点，返回是否通过 |
-| `outbox.flush` | — | 立即冲刷一轮队列 |
-| `outbox.drop` | — | 需要 `confirm: true`；本版本明确返回未实现 |
+| `outbox.flush` | `sink?` | 立即冲刷一轮队列；给 `sink` 时只推那一条通道 |
+| `outbox.drop` | `sink`, `before` | 需要 `confirm: true`；本版本明确返回未实现 |
 | `config.rollback` | `version` | 等价于配置回滚端点 |
+| `log.level` | `level` | 动态调整日志级别 |
+| `diag.bundle` | — | 生成诊断包，返回落盘路径 |
+
+`outbox.flush` 带 `sink` 是为了「只补 MQTT 不补 journal」：不同 sink 有独立的位点，
+全量冲刷会把本来不需要重投的分区也推一遍。指定不存在的 sink 返回错误而不是静默成功 ——
+操作员会据此判断积压是否真的清空了。
+
+`diag.bundle` 与 `GET /api/v1/diagnostics/bundle` 共用同一份构建逻辑，
+区别只是前者把 zip 写到 `{dataDir}/diagnostics/` 并返回路径：
+现场排障时容器可能随时被替换，操作员需要能在下一次重启前把文件拷走。
 
 ### 诊断
 
@@ -316,7 +419,7 @@ Broker 重启或 ACL 变更后不需要人工重启网关。订阅被 Broker 拒
  "error":{"code":"command.forbidden","message":"command 'config.rollback' is not allowed on this channel"}}
 ```
 
-- 允许的动作：`driver.restart`、`device.selftest`、`outbox.flush`、`log.level`；
+- 允许的动作：`driver.restart`、`device.selftest`、`outbox.flush`、`log.level`、`diag.bundle`；
 - `config.rollback` 与 `outbox.drop` 固定返回 `command.forbidden`：这一版 MQTT
   只有匿名明文，切换整份配置与丢弃队列必须留在可挂 Bearer Token 的 REST 上；
 - 同一 `id` 在 **5 分钟窗口**内重复到达时不再执行，直接重放首次结果并标

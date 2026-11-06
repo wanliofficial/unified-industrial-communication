@@ -185,10 +185,51 @@ public sealed class Device
     /// <summary>驱动私有参数（波形、故障注入、方言开关等）。键名由驱动 ConfigFields 声明。</summary>
     public Dictionary<string, string> Labels { get; init; } = new(StringComparer.Ordinal);
 
+    /// <summary>实例化来源模板。只用于追溯，模板后续变更不会自动改写设备。</summary>
+    public string? TemplateId { get; init; }
+
     public List<Point> Points { get; init; } = new();
 
     public string? Label(string key) =>
         Labels.TryGetValue(key, out var v) && !string.IsNullOrWhiteSpace(v) ? v : null;
+
+    /// <summary>替换点位列表，其余字段原样保留（点表导入用）。</summary>
+    public Device WithPoints(IReadOnlyList<Point> points) => new()
+    {
+        Id = Id,
+        Name = Name,
+        ChannelId = ChannelId,
+        Enabled = Enabled,
+        Interval = Interval,
+        Timeout = Timeout,
+        Retries = Retries,
+        UnitId = UnitId,
+        ByteOrder = ByteOrder,
+        FailureThreshold = FailureThreshold,
+        RecoverInterval = RecoverInterval,
+        Labels = Labels,
+        TemplateId = TemplateId,
+        Points = points.ToList(),
+    };
+
+    /// <summary>记录实例来源模板。</summary>
+    public Device WithTemplateId(string templateId) => new()
+    {
+        Id = Id,
+        Name = Name,
+        ChannelId = ChannelId,
+        Enabled = Enabled,
+        Interval = Interval,
+        Timeout = Timeout,
+        Retries = Retries,
+        UnitId = UnitId,
+        ByteOrder = ByteOrder,
+        FailureThreshold = FailureThreshold,
+        RecoverInterval = RecoverInterval,
+        Labels = Labels,
+        TemplateId = templateId,
+        Points = Points,
+    };
 }
 
 /// <summary>点位。地址 + 类型 + 缩放 + 死区 + 单位。</summary>
