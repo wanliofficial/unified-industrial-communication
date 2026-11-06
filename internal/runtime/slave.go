@@ -128,6 +128,9 @@ func (r *Runtime) openSlaves(f *config.File) error {
 			Writer:  slaveWriter{rt: r},
 			Log:     r.log.With("slave", sc.ID),
 			Metrics: r.metrics,
+			// 版本号来自构建信息，而不是配置文件：上位机屏幕上显示的版本
+			// 必须与进程里跑的二进制一致，否则现场排障第一句话就问不出来。
+			Revision: r.version.Version,
 		})
 		if err != nil {
 			r.closeSlaves()
@@ -182,12 +185,13 @@ func (r *Runtime) syncSlaves(f *config.File) []string {
 			delete(r.slavePrints, id)
 		}
 		srv, err := slavemb.New(slavemb.Options{
-			Slave:   sc,
-			Points:  points,
-			Source:  slaveSource{rt: r},
-			Writer:  slaveWriter{rt: r},
-			Log:     r.log.With("slave", id),
-			Metrics: r.metrics,
+			Slave:    sc,
+			Points:   points,
+			Source:   slaveSource{rt: r},
+			Writer:   slaveWriter{rt: r},
+			Log:      r.log.With("slave", id),
+			Metrics:  r.metrics,
+			Revision: r.version.Version,
 		})
 		if err != nil {
 			r.log.Error("slave_rebuild_failed", "slave", id, "error", err.Error())

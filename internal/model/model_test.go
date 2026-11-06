@@ -463,6 +463,56 @@ func TestSlaveValidateBoundaries(t *testing.T) {
 	}
 }
 
+// 设备标识直接进 FC43 响应，长度与字符集在这里挡住：运行期才发现超长
+// 就只能返回异常码，而上位机看到的是「这台设备不支持识别」。
+func TestSlaveIdentityValidate(t *testing.T) {
+	points := map[string]Point{"plc/u16": {ID: "u16", DataType: TypeUint16}}
+	base := func() Slave {
+		return Slave{
+			ID: "scada", Listen: "127.0.0.1:1502",
+			Units: []SlaveUnit{{
+				UnitID:   1,
+				Mappings: []SlaveMapping{{Point: "plc/u16", Area: MappingHolding, Offset: 0}},
+			}},
+		}
+	}
+
+	ok := base()
+	ok.Identity = &SlaveIdentity{
+		VendorName: "ACME", ProductCode: "PLC-2000", MajorMinorRevision: "2.3",
+		VendorURL: "https://acme.example", ProductName: "ACME Controller",
+		ModelName: "PLC-2000-X", UserApplicationName: "Line 3",
+	}
+	if err := ok.Validate(points); err != nil {
+		t.Fatalf("valid identity: %v", err)
+	}
+
+	cases := map[string]func(*SlaveIdentity){
+		"vendor too long":   func(i *SlaveIdentity) { i.VendorName = strings.Repeat("x", 121) },
+		"revision too long": func(i *SlaveIdentity) { i.MajorMinorRevision = strings.Repeat("1", 33) },
+		"control char":      func(i *SlaveIdentity) { i.ProductCode = "PLC\x00" },
+		"del char":          func(i *SlaveIdentity) { i.ModelName = "PLC\x7f" },
+	}
+	for name, mut := range cases {
+		s := base()
+		s.Identity = &SlaveIdentity{VendorName: "ACME"}
+		mut(s.Identity)
+		if err := s.Validate(points); err == nil {
+			t.Fatalf("%s: expected error", name)
+		}
+	}
+
+	// 边界值恰好合法：120/32 字节都不是「超过」。
+	edge := base()
+	edge.Identity = &SlaveIdentity{
+		VendorName:         strings.Repeat("v", 120),
+		MajorMinorRevision: strings.Repeat("r", 32),
+	}
+	if err := edge.Validate(points); err != nil {
+		t.Fatalf("boundary identity: %v", err)
+	}
+}
+
 // 计算点地址：必须带表达式、不接受任何物理字段，且要有稳定的规范形式。
 // 规范形式进入缓存键与配置版本计算，因此表达式本身必须是它的一部分：
 // 改一个常数就意味着「这个点位换了算法」，不能被当成同一个版本。

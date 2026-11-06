@@ -789,15 +789,31 @@ type SlaveUnit struct {
 	Mappings  []SlaveMapping `json:"mappings"`
 }
 
+// SlaveIdentity 是从站对外暴露的设备标识（Modbus FC43 读设备标识 / FC17
+// 报告服务器 ID）。字段全部可选：空值由协议层填默认值。
+//
+// 它不是「产品信息展示」这么简单：SCADA 往往用 VendorName + ProductCode
+// 做设备类型识别与点表自动匹配，填错会让上位机把网关当成另一种设备。
+type SlaveIdentity struct {
+	VendorName          string `json:"vendorName,omitempty"`
+	ProductCode         string `json:"productCode,omitempty"`
+	MajorMinorRevision  string `json:"majorMinorRevision,omitempty"`
+	VendorURL           string `json:"vendorUrl,omitempty"`
+	ProductName         string `json:"productName,omitempty"`
+	ModelName           string `json:"modelName,omitempty"`
+	UserApplicationName string `json:"userApplicationName,omitempty"`
+}
+
 // Slave 是一个从站监听端点。
 //
 // 存在即启用：停用一个从站的方式是从配置里删掉它。额外的 enabled 字段
 // 只会制造「配置了但没生效」的状态，而这正是本项目要避免的那一类问题。
 type Slave struct {
-	ID             string      `json:"id"`
-	Listen         string      `json:"listen"`
-	MaxConnections int         `json:"maxConnections,omitempty"`
-	Units          []SlaveUnit `json:"units"`
+	ID             string         `json:"id"`
+	Listen         string         `json:"listen"`
+	MaxConnections int            `json:"maxConnections,omitempty"`
+	Identity       *SlaveIdentity `json:"identity,omitempty"`
+	Units          []SlaveUnit    `json:"units"`
 }
 
 // EffectiveMaxConnections 返回并发连接上限（默认 8，范围 1..64）。
@@ -841,6 +857,11 @@ func (s Slave) Validate(points map[string]Point) error {
 	if len(s.Units) == 0 {
 		return fmt.Errorf("slave %q: at least one unit required", s.ID)
 	}
+	if s.Identity != nil {
+		if err := s.Identity.Validate(); err != nil {
+			return fmt.Errorf("slave %q: %w", s.ID, err)
+		}
+	}
 	seen := make(map[int]bool, len(s.Units))
 	for _, u := range s.Units {
 		if err := u.Validate(points); err != nil {
@@ -850,6 +871,35 @@ func (s Slave) Validate(points map[string]Point) error {
 			return fmt.Errorf("slave %q: duplicate unitId %d", s.ID, u.UnitID)
 		}
 		seen[u.UnitID] = true
+	}
+	return nil
+}
+
+// Validate 校验设备标识。
+//
+// 长度上限不是审美问题：FC43 的响应必须塞进 253 字节的 PDU，单个对象值
+// 超过 120 字节时，哪怕只返回一个对象也可能放不下，主站只会看到异常码。
+func (i SlaveIdentity) Validate() error {
+	fields := []struct {
+		name string
+		val  string
+		max  int
+	}{
+		{"identity.vendorName", i.VendorName, 120},
+		{"identity.productCode", i.ProductCode, 120},
+		{"identity.majorMinorRevision", i.MajorMinorRevision, 32},
+		{"identity.vendorUrl", i.VendorURL, 120},
+		{"identity.productName", i.ProductName, 120},
+		{"identity.modelName", i.ModelName, 120},
+		{"identity.userApplicationName", i.UserApplicationName, 120},
+	}
+	for _, f := range fields {
+		if len(f.val) > f.max {
+			return fmt.Errorf("%s: %d bytes exceeds limit %d", f.name, len(f.val), f.max)
+		}
+		if strings.IndexFunc(f.val, func(r rune) bool { return r < 0x20 || r == 0x7f }) >= 0 {
+			return fmt.Errorf("%s: must not contain control characters", f.name)
+		}
 	}
 	return nil
 }

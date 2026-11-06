@@ -92,6 +92,11 @@ curl -s localhost:8093/api/v1/points/ua1/counter   # 每秒自增，由服务端
 `uic mbread` 是内置的极简主站：寄存器打印 uint16 / int16 / 十六进制并拼 float32，
 位区逐位打印。写入会穿透到真实设备，不是改缓存。
 
+从站还实现了诊断与设备识别：FC8（回显/清计数/六类计数）、FC11（事件计数器）、
+FC17（服务器 ID）、FC43/MEI 0x0E（读设备标识，支持 basic/regular/extended 与按
+对象读取，响应超长时自动分页）。`slaves[].identity` 可配置厂商、型号、版本等
+信息；不配时 basic 三件套也有默认值，版本取运行进程的构建版本。
+
 MQTT 北向（需要一个 Broker；`mosquitto` 或任意 MQTT 3.1.1 服务端均可）：
 
 ```bash
@@ -111,7 +116,7 @@ MQTT 南向（订阅别人发来的数据，方向相反）：
 ```bash
 ./uic sim -protocol mqtt -listen 127.0.0.1:18830 &   # 内置 Broker，每秒发布演示点位
 ./uic -config examples/mqtt-southbound.json          # REST :8087
-curl -s -H 'Authorization: Bearer dev-token' localhost:8087/api/v1/points
+curl -s -H 'Authorization: Bearer dev-token-0123456789' localhost:8087/api/v1/points
 #   6 点：纯文本标量 temp / counter，JSON 字段 running / mode / cycle，可写 setpoint
 #   写穿透：POST .../points/edge01/write  → 发布到 plant/line1/setpoint
 ```

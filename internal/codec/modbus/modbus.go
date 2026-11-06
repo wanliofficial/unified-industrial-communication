@@ -25,6 +25,12 @@ const (
 	FCWriteSingleRegister byte = 0x06
 	FCWriteMultipleCoils  byte = 0x0F
 	FCWriteMultipleRegs   byte = 0x10
+
+	// 诊断与识别类功能码（从站侧）。
+	FC08 byte = 0x08 // Diagnostics（子功能：回显/清计数/各类计数）
+	FC11 byte = 0x0B // Get Comm Event Counter
+	FC17 byte = 0x11 // Report Server ID
+	FC43 byte = 0x2B // Encapsulated Interface Transport（MEI 0x0E 读设备标识）
 )
 
 // 单次请求上限（协议规定）。

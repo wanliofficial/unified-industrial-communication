@@ -3,7 +3,7 @@
   "site": "s7-lab",
   "server": {
     "listen": "127.0.0.1:8085",
-    "token": "dev-token"
+    "token": "dev-token-0123456789"
   },
   "storage": {
     "dir": "./data-s7",

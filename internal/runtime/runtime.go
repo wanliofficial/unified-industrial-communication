@@ -191,6 +191,13 @@ func New(opt Options) (*Runtime, error) {
 		startedAt:  time.Now(),
 	}
 	r.declareMetrics()
+	// 版本信息必须早于任何子系统：从站（FC43）、MQTT 的 $birth、OPC UA 的
+	// BuildInfo 都会在启动阶段就把版本报给外部。晚一步赋值，这些对外声明
+	// 就会永久停留在空值上——配置热更新也不会纠正它们。
+	r.version = httpapi.VersionInfo{
+		Version: opt.Version, Commit: opt.Commit, BuildTime: opt.BuildTime,
+		GoVersion: runtime.Version(), Schema: config.SchemaVersion, APIVer: 1,
+	}
 	r.sched = scheduler.New(scheduler.Options{
 		// 设备运行态变化同时投递到 MQTT（retained）。scheduler 用独立
 		// goroutine 串行回调，所以即使 Broker 慢也不会拖住采集。
@@ -229,10 +236,6 @@ func New(opt Options) (*Runtime, error) {
 		Audit:         r,
 	}, r, logger)
 
-	r.version = httpapi.VersionInfo{
-		Version: opt.Version, Commit: opt.Commit, BuildTime: opt.BuildTime,
-		GoVersion: runtime.Version(), Schema: config.SchemaVersion, APIVer: 1,
-	}
 	return r, nil
 }
 

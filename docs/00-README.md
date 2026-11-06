@@ -5,8 +5,8 @@
 | 项 | 数字 |
 |---|---|
 | 分析的参考方案 | 38 份（PA-01 … PA-38，其中 PA-06 合并了两个完全相同的仓库） |
-| 文档总量 | 55 份 Markdown / 18,040 行（含 3 份 ADR） |
-| 代码总量 | 139 个 Go 文件 / 57,058 行（其中测试 24,960 行） |
+| 文档总量 | 55 份 Markdown / 18,124 行（含 3 份 ADR） |
+| 代码总量 | 141 个 Go 文件 / 57,907 行（其中测试 25,470 行） |
 | Go 包 | 37 个（1 个入口 + 36 个内部包；35 个有测试） |
 | 第三方依赖 | 0（仅标准库，零 CGO） |
 
@@ -102,7 +102,7 @@ OPC UA（二进制，SecurityPolicy None / 匿名）：
 ./uic -config examples/opcua.json
 curl -s localhost:8086/api/v1/points | jq '.items[] | {point, value, quality}'
 # 写穿透（服务端回读确认）：
-curl -s -X POST -H 'Authorization: Bearer dev-token' -H 'Content-Type: application/json' \
+curl -s -X POST -H 'Authorization: Bearer dev-token-0123456789' -H 'Content-Type: application/json' \
      -d '{"value":{"type":"float64","num":42.5},"confirm":true}' \
      localhost:8086/api/v1/points/ua1/setpoint/write
 ```
@@ -116,7 +116,7 @@ OPC UA 订阅（服务端推送；`Read` 不再逐点轮询）：
 ```bash
 ./uic sim -protocol opcua -listen 127.0.0.1:14840 &
 ./uic -config examples/opcua-subscribe.json
-curl -s -H 'Authorization: Bearer dev-token' localhost:8093/api/v1/points/ua1/counter
+curl -s -H 'Authorization: Bearer dev-token-0123456789' localhost:8093/api/v1/points/ua1/counter
 # channels[].subscribe / publishingInterval / samplingInterval
 ```
 服务端每秒改 Counter 与 CurrentTime，可用来观察 SSE。
@@ -141,6 +141,10 @@ curl -s -H 'Authorization: Bearer dev-token' localhost:8093/api/v1/points/ua1/co
 「区可写（holding/coil）」与「点位 `writable: true`」。写入会穿透到
 `Runtime.Write`，与 REST 写入共用设备 actor 与校验，不存在第二条绕过治理的写路径。
 
+从站同时实现诊断与设备识别（FC8 回显/清计数/六类计数、FC11 事件计数器、FC17
+服务器 ID、FC43/MEI 0x0E 读设备标识并支持分页）。`slaves[].identity` 可配置
+厂商/产品/型号/版本；版本缺省取运行进程的构建版本，上位机读到的版本与二进制一致。
+
 MQTT 北向（需要一个 Broker，任意 MQTT 3.1.1 服务端均可）：
 
 ```bash
@@ -161,7 +165,7 @@ MQTT 南向（订阅别人的数据，方向与上一节相反）：这是全项
 ```bash
 ./uic sim -protocol mqtt -listen 127.0.0.1:18830 &   # 内置 Broker，每秒发布演示点位
 ./uic -config examples/mqtt-southbound.json          # REST :8087
-curl -s -H 'Authorization: Bearer dev-token' \
+curl -s -H 'Authorization: Bearer dev-token-0123456789' \
      localhost:8087/api/v1/points | jq '.items[] | {point, value, quality}'
 ```
 
@@ -524,7 +528,7 @@ obs  ← 所有包（不依赖任何内部包）
 
 | 包 | 职责 | 关键不变量 | 覆盖率 |
 |---|---|---|---|
-| `internal/model` | 通道/设备/点位/地址/采样/质量码 | 不依赖任何内部包；不变量集中在 `Validate`；DB 号与 area 联动校验；计算点强制只读、4 类地址各有规范形式；订阅周期只在 `subscribe=true` 时允许出现 | 85.0% |
+| `internal/model` | 通道/设备/点位/地址/采样/质量码/从站映射与设备标识 | 不依赖任何内部包；不变量集中在 `Validate`；DB 号与 area 联动校验；计算点强制只读、4 类地址各有规范形式；订阅周期只在 `subscribe=true` 时允许出现；从站标识限长并禁控制字符 | 85.6% |
 | `internal/driver` | 驱动契约（Codec/Transport/Driver）、错误分类、注册表、只读 `Lookup` 注入 | 能力四态；`Conn` 不保证并发安全，由调用方串行；协议错误可用 `Kinded` 自带分类 | 87.0% |
 | `internal/codec/modbus` | Modbus 纯函数编解码（TCP/RTU/ASCII，主站与从站共用） | 无 I/O、无时钟、无可变状态 | 88.1% |
 | `internal/codec/value` | 协议无关值编解码（重排、数值/字符串/BCD） | 与协议无关；`Encode` 对 string/bytes 不猜宽度 | 95.0% |
@@ -542,7 +546,7 @@ obs  ← 所有包（不依赖任何内部包）
 | `internal/opcuaserver` | 可复用的 OPC UA 服务端内核（地址空间、订阅/发布、标准节点） | 与主站共用 codec/opcua；未激活会话拒绝读写；Variant 类型必须与节点 DataType 一致；Publish 在独立 goroutine，响应按 RequestId 乱序返回；`NewSimulator` 提供演示地址空间 | 82.2% |
 | `internal/northbound/opcua` | OPC UA 北向：点位表 → 地址空间 | 一点一变量；质量码映射到 `DataValue.Status`；写入过 `Runtime.Write`（设备 actor + 幂等）；配置变更按指纹重建，抢不到端口回退上一份配置 | 82.0% |
 | `internal/sim/mqtt` | 内置 MQTT 3.1.1 Broker，兼 `uic sim -protocol mqtt` 运行时 | 全项目唯一一份 Broker 实现；不做 QoS2/持久会话/TLS；QoS2 授予时降级为 1 | 79.3% |
-| `internal/slave/modbus` | Modbus TCP 从站（把点位暴露给外部主站） | 读走 cache、写走 Runtime.Write；未映射地址报错不补零；坏质量保留最后值并计数 | 73.8% |
+| `internal/slave/modbus` | Modbus TCP 从站（把点位暴露给外部主站） | 读走 cache、写走 Runtime.Write；未映射地址报错不补零；坏质量保留最后值并计数；支持诊断与设备识别（FC8/11/17/43） | 80.0% |
 | `internal/alarm` | 报警引擎：五态机、阈值/滞回/延时、表达式规则、确认、订阅 | 输入不可信时绝不改状态机；延时是「连续满足」；`cleared` 与 `active` 都要确认；状态只在内存 | 94.4% |
 | `internal/history` | 有界采样日志：NDJSON 分段、整段淘汰、原始查询与定步长聚合 | 一条记录不跨段；永远保留至少一段；末尾半行触发新段；查询升序、桶对齐、桶质量取最差；非数值点位不产出 `min/max/avg` | 83.5% |
 | `internal/calc` | 零依赖表达式引擎（编译期类型检查、短路求值） | 无 `eval`；引用是 `device:point`；除零/NaN/Inf/溢出都报错而不是降级 | 91.2% |
@@ -665,7 +669,7 @@ OPC UA 服务端（同一份点位表的另一个出口）：
 | S7 符号表 / 块上传 / 报警 | ❌ | 需要 S7 浏览与报警服务；点位必须手写地址 |
 | Modbus TCP 从站 | ✅ | `slaves[]` 存在即启用；四区（holding/input/coil/discrete）映射；跨映射与半值读；写穿透到 `Runtime.Write`；坏质量保留最后值并计入 `uic_slave_degraded_reads_total`；映射变化按指纹重建监听；`uic mbread` 可自检 |
 | Modbus RTU/ASCII 从站 | ❌ | 只做 TCP；串口从站需要与主站角色互斥，语义与治理规则都不同 |
-| Modbus 诊断功能码（FC8/FC11/FC17/FC43） | ❌ | 只实现读写类功能码（FC1/2/3/4/5/6/15/16） |
+| Modbus 诊断与识别（FC8/FC11/FC17/FC43） | ✅ | FC8 子功能 0x0000 回显、0x000A 清计数、0x000B~0x0012 各类计数（TCP 上 CRC/字符层错误恒为 0）；FC11 事件计数器（自身不计数、异常不计数）；FC17 产品代码 + 运行指示 0xFF；FC43/MEI 0x0E 读设备标识（basic/regular/extended 与按对象 id 读取，响应超 253 字节时按 `more`/`nextObjectID` 分页）；身份标识由 `slave.identity` 配置，缺省也保证 basic 三件套非空；版本号取构建信息 |
 | Modbus ASCII | ✅ | `:` + 十六进制 + LRC + CRLF 分帧；逐字符读到终止符并跳过 `:` 前杂散字节；与 RTU 共用 conn/codec；同一串口不允许混跑两种分帧（配置期报错） |
 | 虚拟驱动 | ✅ | 正弦/斜坡/随机/常量波形；丢包/超时/坏帧/地址错/断连五种故障注入 |
 | 调度与熔断 | ✅ | tick、actor、写优先、指数退避、熔断后转探活、代次隔离 |

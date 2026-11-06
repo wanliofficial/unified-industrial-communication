@@ -476,6 +476,15 @@ type Kinded interface{ Kind() ErrorKind }
     "id": "scada",
     "listen": "127.0.0.1:1502",
     "maxConnections": 8,
+    "identity": {
+      "vendorName": "UIC",
+      "productCode": "uic-gateway",
+      "majorMinorRevision": "1.0",
+      "vendorUrl": "https://example.com/",
+      "productName": "UIC 工业通信网关",
+      "modelName": "UIC-GW",
+      "userApplicationName": "Line 3"
+    },
     "units": [{
       "unitId": 1,
       "byteOrder": "ABCD",
@@ -586,13 +595,84 @@ Modbus 写请求 → decodeCellValue（按单元字节序还原） → Writer.Wr
 | `uic_slave_degraded_reads_total` | `slave` | 用非 good 质量数据应答的次数（值保留，质量靠指标暴露） |
 | `uic_slave_write_total` | `slave` / `result` | 写转发次数与结果 |
 
-#### 3.8.6 边界
+#### 3.8.6 诊断与设备识别（FC8 / FC11 / FC17 / FC43）
+
+读写类功能码解决「值是多少」，这四类解决「你是谁」。缺了它们，上位机的设备树
+里只有一堆无名寄存器；有它们，才能显示厂商/型号/版本，并在设备替换时自动匹配
+点表。它们都不碰映射表，因此失败语义也与读写不同：**永远不会因为「没有样本」
+而失败**。
+
+**FC8 Diagnostics**
+
+| 子功能 | 名称 | 行为 |
+|---|---|---|
+| `0x0000` | Return Query Data | 原样回显请求里的两个数据字节 |
+| `0x000A` | Clear Counters | 清 `requests` / `exceptions` / `events` 三个**协议计数** |
+| `0x000B` | Bus Message Count | 收到的消息总数（16 位截断） |
+| `0x000C` | Bus Communication Error Count | 恒为 0：TCP 没有 CRC/字符层 |
+| `0x000D` | Bus Exception Error Count | 返回过异常响应的请求数 |
+| `0x000E` | Server Message Count | 同 `0x000B`（本实现所有消息都进同一入口） |
+| `0x000F` | Server No Response Count | 恒为 0：TCP 从站总会应答 |
+| `0x0010` | Server NAK Count | 恒为 0：不产生 NAK |
+| `0x0011` | Server Busy Count | 恒为 0：不返回 `0x06` |
+| `0x0012` | Bus Character Overrun Count | 恒为 0：字节流由内核分帧，无此概念 |
+
+未知子功能返回异常 `0x01`；PDU 长度不是 5 字节返回 `0x03`。`0x000A` **只清协议
+计数，不动指标**：`uic_slave_requests_total` 是给监控系统看的水位，如果被对端
+一个诊断请求清零，监控曲线会出现无法解释的断崖。
+
+**FC11 Get Comm Event Counter**
+
+响应固定 5 字节：`FC` + `status`（恒 0）+ `event count`。
+
+- **自身不计数**：否则「读计数器」这个动作本身会让计数器增长，曲线变成查询频率，
+  而不是设备处理消息的速率。
+- **只统计成功处理的消息**：异常响应不算「成功完成」。这条语义在测试里固定下来。
+
+**FC17 Report Server ID**
+
+响应：`FC` + 字节数 + 产品代码（`identity.productCode`）+ 运行指示 `0xFF`（ON）。
+产品代码为空时用默认值 `uic-slave`；长度受配置校验限制（≤120 字节），保证
+`字节数` 字段不会溢出。
+
+**FC43 / MEI 0x0E Read Device Identification**
+
+请求 4 字节：`0x2B` + MEI `0x0E` + 读取码 + 对象 id。
+
+| 读取码 | 含义 | 返回对象 |
+|---|---|---|
+| 1 | basic（流式） | `0x00` 厂商名、`0x01` 产品代码、`0x02` 版本 |
+| 2 | regular（流式） | basic + `0x03` 厂商 URL、`0x04` 产品名、`0x05` 型号 |
+| 3 | extended（流式） | regular + `0x06` 应用名 |
+| 4 | 按对象 id 读取 | 只返回请求的那一个对象；不存在返回异常 `0x02` |
+
+响应头 7 字节：`FC` + `MEI` + `读取码` + `符合级别` + `More Follows` + `Next Object Id` +
+`对象个数`，随后是 `(对象 id, 长度, 值)` 序列。
+
+- **符合级别恒为 `0x83`**（extended + 流式与单对象访问）。按规范它描述**设备能力**，
+  不是「这次返回了哪些对象」；若随请求码变化，主站会误判本设备不支持按对象读取，
+  把已实现的能力藏起来。
+- **分页**：响应必须放进 253 字节 PDU。装不下时 `More Follows = 0xFF`，
+  `Next Object Id` 指向下一页起点，主站续读即可。每个对象**恰好出现一次**。
+- 未知 MEI 返回 `0x01`；未知读取码返回 `0x03`；空值对象直接省略（返回长度为 0 的
+  对象等于让上位机显示一个空字段）。
+
+**身份标识从哪来**
+
+`slave.identity` 全部字段可选；缺省值保证 basic 三件套非空（厂商 `UIC`、产品代码
+`uic-slave`、版本取运行版本）。`majorMinorRevision` 的空值会被**运行时构建版本**
+覆盖——上位机屏幕上的版本必须与进程里跑的二进制一致，否则现场排障第一个问题
+（「你跑的是哪个版本」）就答不上来。标识只是公开的产品信息，不要写入内部主机名、
+IP、序列号等资产信息：FC43 是匿名可读的。
+
+#### 3.8.7 边界
 
 | 项 | 状态 | 说明 |
 |---|---|---|
 | Modbus TCP 从站 | ✅ | MBAP、四区映射、读写、连接上限、热更新 |
 | Modbus RTU / ASCII 从站 | ❌ | 串口从站需要与主站角色互斥；本版本只做 TCP |
-| 诊断功能码（FC8/FC11/FC17/FC43） | ❌ | 只实现读写类功能码 |
+| 诊断功能码（FC8/FC11/FC17/FC43） | ✅ | 回显/清计数/六类计数、事件计数器、服务器 ID、读设备标识（basic/regular/extended/按对象读取 + 分页） |
+| 文件记录（FC14/15/20/21） | ❌ | 需要一套独立的记录寻址与流控；现场用它的设备很少，收益不抵复杂度 |
 | 多寄存器位写（掩码写，FC22） | ❌ | 从站不实现 FC22；主站侧的寄存器位写由主站驱动用 FC3+FC6 读-改-写完成，不依赖该功能码 |
 | 主动上报（unsolicited） | 不适用 | Modbus 本身是请求-响应模型 |
 

@@ -338,8 +338,10 @@ func TestIllegalFunction(t *testing.T) {
 		Mappings: []model.SlaveMapping{{Point: "plc/a", Area: model.MappingHolding, Offset: 0}},
 	}}}, points, &fakeSource{}, &fakeWriter{})
 
-	resp := dial(t, s, 1).roundTrip(t, 1, []byte{0x2B, 0x0E, 0x01, 0x00})
-	expectException(t, resp, 0x2B, 0x01)
+	// 0x41 不是任何已定义/已实现的功能码。这里不能用 0x2B：FC43 是实现了
+	// 的，用它当「非法功能」会随实现演进而变成一条假测试。
+	resp := dial(t, s, 1).roundTrip(t, 1, []byte{0x41})
+	expectException(t, resp, 0x41, 0x01)
 }
 
 // ---------------------------------------------------------------------------

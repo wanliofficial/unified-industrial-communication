@@ -215,3 +215,46 @@ func TestSlaveRebuildsOnConfigChange(t *testing.T) {
 		t.Log("listener address reused; mapping still verified")
 	}
 }
+
+// TestSlaveReportsBuildVersion 验证从站上报的版本来自构建信息，而不是配置
+// 文件或写死的常量。版本必须在启动步骤之前赋值——晚一步，FC43 就会永久
+// 停在 "1.0"，而配置热更新也不会纠正它。
+func TestSlaveReportsBuildVersion(t *testing.T) {
+	h := newHarness(t, withSlave(func(cfg map[string]any) {
+		cfg["slaves"].([]any)[0].(map[string]any)["identity"] = map[string]any{
+			"vendorName":          "ACME",
+			"productCode":         "UIC-GW",
+			"productName":         "UIC Gateway",
+			"modelName":           "UIC-100",
+			"vendorUrl":           "https://acme.example",
+			"userApplicationName": "Line 3",
+		}
+	}))
+	h.waitPointGood("sim01", "reg0")
+	c := dialSlave(t, h.rt.Slaves()["scada"])
+
+	// FC43 / MEI 0x0E / read basic (1)：vendor、product、revision。
+	resp := c.roundTrip(1, []byte{mb.FC43, 0x0E, 0x01, 0x00})
+	if len(resp) < 7 || resp[0] != mb.FC43 || resp[1] != 0x0E {
+		t.Fatalf("fc43 response = % x", resp)
+	}
+	objs := map[byte]string{}
+	body := resp[7:]
+	for i := 0; i < int(resp[6]); i++ {
+		if len(body) < 2 {
+			t.Fatalf("truncated objects: % x", resp)
+		}
+		id, n := body[0], int(body[1])
+		objs[id] = string(body[2 : 2+n])
+		body = body[2+n:]
+	}
+	if objs[0x00] != "ACME" {
+		t.Fatalf("vendor = %q", objs[0x00])
+	}
+	if objs[0x01] != "UIC-GW" {
+		t.Fatalf("product = %q", objs[0x01])
+	}
+	if objs[0x02] != "test" {
+		t.Fatalf("revision = %q, want the build version %q", objs[0x02], "test")
+	}
+}

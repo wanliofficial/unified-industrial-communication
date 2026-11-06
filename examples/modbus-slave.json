@@ -3,7 +3,7 @@
   "site": "slave-demo",
   "server": {
     "listen": "127.0.0.1:8086",
-    "token": "dev-token"
+    "token": "dev-token-0123456789"
   },
   "storage": {
     "dir": "./data-slave",
@@ -75,6 +75,14 @@
       "id": "scada",
       "listen": "127.0.0.1:1502",
       "maxConnections": 8,
+      "identity": {
+        "vendorName": "UIC",
+        "productCode": "uic-gateway",
+        "majorMinorRevision": "1.0",
+        "productName": "UIC 工业通信网关",
+        "modelName": "UIC-GW",
+        "userApplicationName": "从站演示"
+      },
       "units": [
         {
           "unitId": 1,
