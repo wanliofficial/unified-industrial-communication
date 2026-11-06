@@ -3,7 +3,7 @@
 //
 // 它与 codec/modbus、codec/s7 的定位相同：纯函数编解码，不做 I/O、
 // 不读时钟（除报文头的时间戳由调用方传入）、不持有连接状态。会话状态
-// 在 driver/opcua 里，地址空间在 sim/opcua 里。
+// 在 driver/opcua 里，地址空间在 opcuaserver 里。
 //
 // 只实现 SecurityPolicy=None / SecurityMode=None。这不是「先做个简化版」，
 // 而是一个明确的边界：证书链、签名与加密需要另一套密钥生命周期管理，

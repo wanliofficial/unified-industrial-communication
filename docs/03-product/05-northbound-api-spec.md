@@ -2,7 +2,7 @@
 
 > **版本**：API v1（`/api/v1`）
 > **上游**：`01-prd.md` FR-NOR-*、`02-architecture.md` §4.3
-> **代码对应**：`internal/northbound/httpapi`（REST + SSE）、`internal/mqtt` + `internal/runtime/mqtt_sink.go`（MQTT）、`internal/alarm`（报警引擎）；OPC UA 在 Wave 1 后半实现
+> **代码对应**：`internal/northbound/httpapi`（REST + SSE）、`internal/northbound/opcua` + `internal/opcuaserver`（OPC UA）、`internal/mqtt` + `internal/runtime/mqtt_sink.go`（MQTT）、`internal/alarm`（报警引擎）
 > **原则**：一个数据契约，四种传输（REST / SSE / MQTT / OPC UA）；语义一致，表达不同。
 
 ---
@@ -1116,19 +1116,33 @@ uic/{site}/$alarm/{alarmId}     QoS1, retained
 
 ## 7. OPC UA 映射
 
+> **代码对应**：`internal/northbound/opcua`（地址空间与推送）、`internal/opcuaserver`（服务端内核）。
+
 ### 7.1 地址空间
 
 ```
-Objects
- └── UIC (ns=2)
-      └── {site}
-           └── {device}          Object（类型：DeviceType）
-                ├── _state       String（collecting/faulted/...）
-                ├── _quality     String
-                └── {point}      Variable（类型映射见 7.2）
+Root
+└── Objects
+     └── {site}                  Object（站点）
+          └── {device}           Object（设备，DisplayName 用 device.name）
+               └── {point}       Variable（点位，DisplayName 用 point.name）
+     └── Server
+          ├── ServerStatus
+          │    └── CurrentTime   Variable（服务端每秒自动刷新）
+          ├── Types
+          └── Views
 ```
 
-**NodeId**：`ns=2;s={site}.{device}.{point}`（稳定，不随重启变化）。
+**NodeId**：变量为 `ns=2;s={site}/{device}/{point}`，目录同理少一级。
+用 `/` 而不是 `.`：点位 ID 允许 `-`（`line-a:power - 1` 里的减号有歧义问题），
+而设备 / 点位 ID 不允许 `/`，所以斜杠是**唯一不会与合法 ID 冲突**的分隔符。
+
+**只暴露 enabled 的设备与点位**。禁用的项不出现在地址空间里，而不是「出现但永远坏」——
+后者会让运维在客户端侧无法区分「这个点本来就是关的」与「这个点坏了」。
+
+**不暴露设备状态变量**：地址空间只承载点位值。设备运行态（`collecting` / `faulted` …）
+由 REST `/api/v1/devices` 与 MQTT retained `$state` 承载——把两套语义混在一个地址空间里，
+会让客户端无法区分「点位坏」与「设备坏」。
 
 ### 7.2 类型映射
 
@@ -1140,34 +1154,70 @@ Objects
 | `float32/64` | `Float/Double` |
 | `string` | `String` |
 | `bcd16/32` | `UInt16/UInt32`（值已转换） |
-| `datetime` | `DateTime` |
+
+写入按 OPC UA 规则**严格比对 Variant 类型**，不做隐式转换：把 Double 写进 String 节点
+必须返回 `BadTypeMismatch`，而不是「成功地」存进去一串 `"1"`。
 
 ### 7.3 质量映射
 
 | UIC Quality | OPC UA StatusCode |
 |---|---|
 | `good` | `Good` |
-| `uncertain` | `Uncertain` |
-| `stale` | `UncertainLastUsableValue` |
-| `bad` / `timeout` / `comm_error` / `address_error` | `BadCommunicationError` / `BadWaitingForInitialData` |
-| `not_connected` | `BadNotConnected` |
-| `disabled` | `BadOutOfService` |
+| `uncertain` / `stale` | `Uncertain`（值可信，只是不再新鲜；源时间戳如实反映年龄） |
+| `timeout` | `BadTimeout` |
+| `comm_error` | `BadNoCommunication` |
+| `address_error` | `BadNodeIDUnknown` |
+| `not_connected` / `disabled` | `BadNotConnected` |
+| 其他 | `BadNoData` |
+
+**Bad 状态不携带值**。带上最后一个好值，客户端会把「断了」显示成「还在跑」——
+这是现场最难察觉的一类错误。
 
 ### 7.4 订阅
 
-- 支持 `MonitoredItem`（DataChange）；
-- 采样间隔默认等于设备周期，可被客户端覆盖（下限 100ms）；
-- 队列大小默认 10；
-- 支持写：`Write` 服务映射到 REST 写入路径（同样的权限与审计）。
+- 支持 `CreateSubscription` / `CreateMonitoredItems` / `Publish` / `DeleteSubscriptions` / `SetPublishingMode`；
+- 监视项建立后立刻上报一次初始样本（含质量码），客户端不必等第一个发布周期；
+- 每个带序列号的通知在下一次 Publish 中确认；
+- 空闲时按 `MaxKeepAliveCount` 个发布周期发一条空通知，客户端靠它区分「没变化」与「失联」；
+- 值变化与质量迁移都推送——只推值变化会让「设备断了」在画面上表现为「值不动了」。
 
-### 7.5 安全
+### 7.5 写入
 
-| 项 | 默认 |
+`Write` 服务映射到 `Runtime.Write`（与 REST 写入同一条链路：设备 actor、类型校验、幂等），
+5 秒超时。状态码映射：
+
+| 网关错误码 | OPC UA StatusCode |
 |---|---|
-| Endpoint | `opc.tcp://0.0.0.0:4840` |
-| SecurityPolicy | `Basic256Sha256`（可选 `None`，需显式开启） |
-| 用户认证 | 用户名/口令（复用本地账号）或匿名只读 |
-| 证书 | 首次启动自动生成，支持导入企业 CA |
+| `point.not_found` | `BadNodeIDUnknown` |
+| `point.not_writable` / `point.disabled` | `BadNotWritable` |
+| `value.type_mismatch` | `BadTypeMismatch` |
+| `device.not_found` / `device.not_ready` / `service.not_ready` | `BadNoCommunication` |
+| 其他 | `BadInternalError` |
+
+**返回 Good 表示设备接受了写入**，不是「网关内存里改了个数」。设备没确认就返回 Good，
+SCADA 会显示一个从未生效的设定值。
+
+### 7.6 安全与边界
+
+| 项 | 当前实现 |
+|---|---|
+| Endpoint | `opc.tcp://{northbound.opcua.listen}`（默认 `:4840`） |
+| SecurityPolicy | **只支持 `None`**；配其他值在配置期报错 |
+| 用户认证 | **只支持匿名**；`allowAnonymous` 必须显式为 `true` |
+| 证书 | 不支持（证书轮换、信任列表属于另一套运维域） |
+| 历史 / 方法 / 事件 / 别名 / 分块 | 不支持；请求会得到 `BadServiceUnsupported` |
+
+不支持的组合在**配置期**失败，而不是运行期静默降级成无加密——后者是最危险的一种「兼容」。
+
+### 7.7 配置变更
+
+地址空间在启动时固化（NodeId 与 DataType 都写进了服务端内核）。配置热更新时按指纹
+（监听地址、站点、点位集合、类型、可写性）判断是否重建：
+
+- 指纹不变 → 不动服务端，SCADA 无感；
+- 指纹变化 → 关闭旧服务端、按新配置重建，SCADA 会经历一次重连；
+- 重建失败（例如新端口被占）→ **回退到上一份配置继续服务**，并留下 `opcua_server_restart_failed` 日志。
+  配置已落盘，不能因为北向抢不到端口就让整次 Apply 失败；但也绝不能让北向就这么消失。
 
 ---
 
@@ -1210,7 +1260,7 @@ Objects
 | `GET /api/v1/history` | 已实现 | 见 §4.8（原始点 + 定步长聚合、有界保留） |
 | `alarm.ack` 命令 | 已实现 | 同 §4.7.3 语义 |
 | MQTT | 已实现 | 见 §6（QoS0/1、retained 状态、断线补投） |
-| OPC UA | 规范已定义 | Wave 1 后半实现 |
+| OPC UA 北向 | 已实现 | 见 §7（地址空间、质量映射、写穿透、订阅、热重建） |
 | RBAC / 审计 / 诊断包 | 规范已定义 | Wave 1 后半实现 |
 
 ---

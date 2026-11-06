@@ -706,7 +706,7 @@ OPC UA 的 `Read` 是**逐项**返回 `DataValue.Status` 的：一个节点不�
 >    其余情况一律回退 `Read`——拿最后一次成功的读数冒充当前值，是这类
 >    实现最危险的失效模式。
 
-#### 3.9.8 内置服务端（`internal/sim/opcua`）
+#### 3.9.8 内置服务端（`internal/opcuaserver`）
 
 `uic sim -protocol opcua` 起一个最小服务端，用途与 Modbus/S7 的内置从站一致：
 
@@ -722,6 +722,27 @@ OPC UA 的 `Read` 是**逐项**返回 `DataValue.Status` 的：一个节点不�
 
 它**与主站共用同一份 `codec/opcua`**：主从分开实现编解码，会让「编码错」与
 「解码错」互相抵消，自测永远全绿。共用同一份实现才能保证测的是协议而不是笔误。
+
+服务端内核是独立包（`internal/opcuaserver`）而不是演示脚本的一部分，因为
+它有两个消费者：`NewSimulator(addr)` 起演示地址空间供 `uic sim -protocol opcua`
+与驱动一致性测试使用；`New(Config{...})` 被北向 OPC UA 用来暴露网关的点位表。
+同一个内核支撑两种角色，才能保证「演示里能用的东西，生产里也能用」。
+
+内核接口（北向用的是带 `OnWrite` 的那一版）：
+
+| 成员 | 用途 |
+|---|---|
+| `Config{Addr, Nodes, ApplicationName/URI, ProductURI, OnWrite, Log}` | 启动参数；`OnWrite` 为 nil 表示「直接写内存并推送」（演示语义） |
+| `New(Config) (*Server, error)` | 监听失败即返回错误 |
+| `Update(NodeID, Variant, StatusCode, time.Time)` | 写值 + 质量码并通知订阅者 |
+| `Value(id) (Variant, StatusCode, bool)` | 读当前值与质量（三返回值，质量不能省） |
+| `Set(id, Variant)` | 演示/测试用的便捷写入（Good 质量） |
+| `StandardNodes()` | Root/Objects/Server/ServerStatus/CurrentTime/Types/Views；`CurrentTime` 由内核每秒刷新 |
+
+`OnWrite` 的语义是**两阶段**：先 `RLock` 校验类型与可写性、解码出平台值，再在锁外
+调用回调，最后 `Lock` 写回并通知。北向模式下回调会走到真实设备，耗时以秒计；持锁
+调用会让这期间所有 Read/Browse 一起堵死。回调返回非 Good 时节点值保持不变——
+「写入被接受」与「值已经改了」是两件事。
 
 ---
 

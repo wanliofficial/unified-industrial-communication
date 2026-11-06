@@ -10,7 +10,7 @@ import (
 	ua "uic/internal/codec/opcua"
 	"uic/internal/driver"
 	"uic/internal/model"
-	simopc "uic/internal/sim/opcua"
+	opcuaserver "uic/internal/opcuaserver"
 )
 
 // 订阅测试跑在真实 TCP 上。原因和 driver_test.go 一样：这里要验证的是
@@ -24,7 +24,7 @@ func subChannel(addr string, interval time.Duration) model.Channel {
 	return ch
 }
 
-func openSub(t *testing.T, srv *simopc.Server, interval time.Duration) (*conn, func()) {
+func openSub(t *testing.T, srv *opcuaserver.Server, interval time.Duration) (*conn, func()) {
 	t.Helper()
 	ch := subChannel(srv.Addr(), interval)
 	c, err := New().Open(context.Background(), driver.OpenConfig{

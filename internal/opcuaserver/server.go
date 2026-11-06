@@ -1,14 +1,19 @@
-// Package opcua（sim）实现一个最小 OPC UA 服务端，用于自测、演示与驱动
-// 一致性测试。它与主站共用 codec/opcua，所以「Variant 怎么编码」「状态码
-// 怎么解释」这两件事不会在主从之间分叉。
+// Package opcuaserver 实现一个可复用的 OPC UA 二进制服务端内核：它把一张
+// 内存地址空间暴露成标准 OPC UA 服务端，供两种完全不同的角色使用——
 //
-// 边界：只实现 HEL/ACK、OPN、CreateSession/ActivateSession/CloseSession、
-// Read、Write、Browse、GetEndpoints 与订阅（CreateSubscription /
-// CreateMonitoredItems / Publish / DeleteSubscriptions）。不含历史、方法
-// 调用、事件、别名、证书。订阅只按「值变化」推送，没有采样定时器——
-// 这恰好是网关关心的那部分语义。它存在的意义是让主站在没有真实服务端的
-// 机器上跑通完整三层握手与推送链路，而不是模拟一套完整地址空间。
-package opcua
+//   - 演示/自测：`NewSimulator` 起一个带演示点位的小服务端，让主站在没有
+//     真实设备时也能跑通三层握手与推送链路；
+//   - 北向集成：网关把采集到的点位映射成地址空间，SCADA 直接读写。
+//
+// 两者共用同一份协议实现是刻意的。服务端编解码如果和客户端分开写，编码
+// 错误会被解码错误抵消，自测永远全绿；共用 codec/opcua 才能保证测的是
+// 协议而不是笔误。
+//
+// 边界：HEL/ACK、OPN、CreateSession/ActivateSession/CloseSession、Read、
+// Write、Browse、GetEndpoints，以及订阅（CreateSubscription /
+// CreateMonitoredItems / Publish / DeleteSubscriptions / SetPublishingMode）。
+// 不含历史读取、方法调用、事件、别名、证书、分块。
+package opcuaserver
 
 import (
 	"fmt"
@@ -20,10 +25,71 @@ import (
 	"uic/internal/model"
 )
 
-// Server 是内存地址空间的 OPC UA 服务端。
+// Node 是地址空间里的一个节点。
+//
+// 只有两种节点：对象（目录，靠 Parent 组成树）与变量（有值、可读、可能
+// 可写）。这个子集覆盖了「把点位暴露给 SCADA」需要的全部语义；引入
+// 方法、事件与类型系统会让服务端变成另一套产品。
+type Node struct {
+	ID     ua.NodeID
+	Parent ua.NodeID
+
+	// BrowseName 与 Namespace 决定客户端树上显示的名字。Namespace 与
+	// ID 的命名空间通常一致，但不强制：标准节点可以挂在自定义命名空间
+	// 的目录下。
+	BrowseName  string
+	Namespace   uint16
+	DisplayName string
+
+	// Class 是 ua.NodeClassObject / ua.NodeClassVariable。留空时按
+	// 「有 DataType 或 Value 就是变量」推断。
+	Class uint32
+
+	// DataType 决定变量对外声明的类型：它同时用于 DataType 属性读取、
+	// 写入类型校验与 Variant 编码。对象节点忽略。
+	DataType model.DataType
+	// Value 是当前值（变量节点）。初始值也放在这里。
+	Value ua.Variant
+	// Status 是随值一起返回的质量码。0 表示 Good；离线点位应当是
+	// Bad* 而不是「最后一个好值」——SCADA 靠它区分「没变」与「断了」。
+	Status ua.StatusCode
+	// UpdatedAt 是源时间戳；零值表示「用当前时间」。
+	UpdatedAt time.Time
+	// Writable 决定客户端能否写这个变量。
+	Writable bool
+}
+
+// Config 是服务端启动参数。
+type Config struct {
+	// Addr 是监听地址；"127.0.0.1:0" 表示自动分配端口。
+	Addr string
+	// Nodes 是完整地址空间。服务端不会自动补 Root/Objects——调用方要
+	// 自己（或通过标准节点辅助函数）建树，否则浏览结果会是一堆孤岛。
+	Nodes []Node
+
+	// ApplicationName / ApplicationURI 出现在 GetEndpoints 与会话响应里。
+	// 留空时给一组中性默认值，避免把演示名字带进生产。
+	ApplicationName string
+	ApplicationURI  string
+	ProductURI      string
+
+	// OnWrite 处理客户端的写请求。nil 表示「直接写内存值并推送」，
+	// 这是演示模式的语义。
+	//
+	// 北向集成必须设置它：把值转给南向设备，由真实设备确认。返回
+	// 非 Good 时节点值保持不变——「写入被接受」和「值已经改了」是两件
+	// 事，混在一起会让 SCADA 显示一个设备从未接受过的值。
+	OnWrite func(n Node, v model.Value, raw ua.Variant) ua.StatusCode
+
+	// Log 接收结构性事件（订阅建立/拒绝、写入被拒）。nil 表示丢弃。
+	Log func(msg string, args ...any)
+}
+
+// Server 是 OPC UA 服务端。
 type Server struct {
 	mu       sync.RWMutex
 	ln       net.Listener
+	cfg      Config
 	nodes    map[string]*node
 	order    []string
 	conns    map[net.Conn]struct{}
@@ -37,8 +103,12 @@ type Server struct {
 
 	wg     sync.WaitGroup
 	closed bool
+	doneCh chan struct{}
+	log    func(msg string, args ...any)
 }
 
+// node 是 Node 的内部形态：只在启动时由公开结构构造一次，运行期只改
+// value/status/at 三个字段。
 type node struct {
 	id       ua.NodeID
 	parent   ua.NodeID
@@ -47,23 +117,52 @@ type node struct {
 	class    uint32
 	ptype    model.DataType
 	value    ua.Variant
+	status   ua.StatusCode
+	at       time.Time
 	writable bool
+	// pub 是构造时的快照，OnWrite 拿到的就是它。写入回调不应该看到
+	// 服务端内部指针，否则一次误改就能让地址空间与真实设备长期不一致。
+	pub Node
 }
 
-// NewServer 创建服务端；addr 为 "127.0.0.1:0" 时自动分配端口。
-func NewServer(addr string) (*Server, error) {
-	ln, err := net.Listen("tcp", addr)
+// New 创建服务端并开始监听。监听失败直接返回错误：端口被占用必须让
+// 启动失败，而不是「网关起来了但 SCADA 永远连不上」。
+func New(cfg Config) (*Server, error) {
+	if cfg.ApplicationName == "" {
+		cfg.ApplicationName = "UIC OPC UA Server"
+	}
+	if cfg.ApplicationURI == "" {
+		cfg.ApplicationURI = "urn:uic:server"
+	}
+	if cfg.ProductURI == "" {
+		cfg.ProductURI = "urn:uic"
+	}
+	ln, err := net.Listen("tcp", cfg.Addr)
 	if err != nil {
 		return nil, err
 	}
 	s := &Server{
 		ln:       ln,
+		cfg:      cfg,
 		nodes:    map[string]*node{},
 		conns:    map[net.Conn]struct{}{},
 		sessions: map[uint32]bool{},
 		subs:     map[uint32]*subscription{},
+		doneCh:   make(chan struct{}),
+		log:      cfg.Log,
 	}
-	s.buildAddressSpace()
+	if s.log == nil {
+		s.log = func(string, ...any) {}
+	}
+	for _, n := range cfg.Nodes {
+		s.add(n)
+	}
+	// 标准 CurrentTime 由服务端自己维护：让调用方去起一个 ticking
+	// goroutine，结果一定是「演示时对、生产时忘了」。
+	if _, ok := s.nodes[ua.Numeric(0, 2258).String()]; ok {
+		s.wg.Add(1)
+		go s.clockLoop()
+	}
 	s.wg.Add(1)
 	go s.acceptLoop()
 	return s, nil
@@ -80,6 +179,7 @@ func (s *Server) Close() error {
 		return nil
 	}
 	s.closed = true
+	close(s.doneCh)
 	conns := make([]net.Conn, 0, len(s.conns))
 	for c := range s.conns {
 		conns = append(conns, c)
@@ -99,77 +199,55 @@ func (s *Server) Close() error {
 // 地址空间
 // ---------------------------------------------------------------------------
 
-// buildAddressSpace 建一棵足够演示的最小树：
-//
-//	Root
-//	└─ Objects
-//	   ├─ Server
-//	   │  └─ ServerStatus
-//	   │     └─ CurrentTime
-//	   └─ Plant
-//	      ├─ Counter / Temperature / Running / Label
-//	      └─ Setpoint（可写）
-//
-// 变量都挂在 ns=2 下，用字符串 NodeId：现场点位几乎都是这种形式，
-// 用数值 NodeId 演示会让 examples 与真实配置差得太远。
-func (s *Server) buildAddressSpace() {
-	s.add(node{id: ua.Numeric(0, ua.NodeRootFolder), browse: ua.QualifiedName{Name: "Root"}, display: "Root", class: ua.NodeClassObject})
-	s.add(node{id: ua.Numeric(0, ua.NodeObjectsFolder), parent: ua.Numeric(0, ua.NodeRootFolder), browse: ua.QualifiedName{Name: "Objects"}, display: "Objects", class: ua.NodeClassObject})
-	s.add(node{id: ua.Numeric(0, ua.NodeTypesFolder), parent: ua.Numeric(0, ua.NodeRootFolder), browse: ua.QualifiedName{Name: "Types"}, display: "Types", class: ua.NodeClassObject})
-	s.add(node{id: ua.Numeric(0, ua.NodeViewsFolder), parent: ua.Numeric(0, ua.NodeRootFolder), browse: ua.QualifiedName{Name: "Views"}, display: "Views", class: ua.NodeClassObject})
-
-	s.add(node{id: ua.Numeric(0, ua.NodeServer), parent: ua.Numeric(0, ua.NodeObjectsFolder), browse: ua.QualifiedName{Name: "Server"}, display: "Server", class: ua.NodeClassObject})
-	s.add(node{id: ua.Numeric(0, ua.NodeServerStatus), parent: ua.Numeric(0, ua.NodeServer), browse: ua.QualifiedName{Name: "ServerStatus"}, display: "ServerStatus", class: ua.NodeClassObject})
-	s.add(node{
-		id: ua.Numeric(0, 2258), parent: ua.Numeric(0, ua.NodeServerStatus),
-		browse: ua.QualifiedName{Name: "CurrentTime"}, display: "CurrentTime",
-		class: ua.NodeClassVariable, ptype: model.TypeString,
-		value: ua.Variant{Type: ua.TypeDateTime, Time: time.Now()},
-	})
-
-	plant := ua.StringNode(2, "Plant")
-	s.add(node{id: plant, parent: ua.Numeric(0, ua.NodeObjectsFolder), browse: ua.QualifiedName{Namespace: 2, Name: "Plant"}, display: "Plant", class: ua.NodeClassObject})
-
-	s.addVar(plant, 2, "Plant.Counter", "Counter", model.TypeInt32,
-		ua.Variant{Type: ua.TypeInt32, Int: 0}, false)
-	s.addVar(plant, 2, "Plant.Temperature", "Temperature", model.TypeFloat64,
-		ua.Variant{Type: ua.TypeDouble, Float: 21.5}, false)
-	s.addVar(plant, 2, "Plant.Running", "Running", model.TypeBool,
-		ua.Variant{Type: ua.TypeBoolean, Bool: true}, false)
-	s.addVar(plant, 2, "Plant.Label", "Label", model.TypeString,
-		ua.Variant{Type: ua.TypeString, Str: "SIM-01"}, true)
-	s.addVar(plant, 2, "Plant.Setpoint", "Setpoint", model.TypeFloat64,
-		ua.Variant{Type: ua.TypeDouble, Float: 60}, true)
-}
-
-func (s *Server) addVar(parent ua.NodeID, ns uint16, id, name string, t model.DataType, v ua.Variant, writable bool) {
-	s.add(node{
-		id: ua.StringNode(ns, id), parent: parent,
-		browse: ua.QualifiedName{Namespace: ns, Name: name}, display: name,
-		class: ua.NodeClassVariable, ptype: t, value: v, writable: writable,
-	})
-}
-
-func (s *Server) add(n node) {
-	key := n.id.String()
+func (s *Server) add(n Node) {
+	if n.Class == 0 {
+		if n.DataType != "" || n.Value.Type != 0 {
+			n.Class = ua.NodeClassVariable
+		} else {
+			n.Class = ua.NodeClassObject
+		}
+	}
+	if n.DisplayName == "" {
+		n.DisplayName = n.BrowseName
+	}
+	inner := &node{
+		id: n.ID, parent: n.Parent,
+		browse:  ua.QualifiedName{Namespace: n.Namespace, Name: n.BrowseName},
+		display: n.DisplayName, class: n.Class,
+		ptype: n.DataType, value: n.Value, status: n.Status, at: n.UpdatedAt,
+		writable: n.Writable, pub: n,
+	}
+	key := inner.id.String()
 	if _, ok := s.nodes[key]; ok {
 		return
 	}
-	s.nodes[key] = &n
+	s.nodes[key] = inner
 	s.order = append(s.order, key)
 }
 
-// Set 更新一个变量的值（按节点 NodeId 字符串定位）。供 sim 命令的
-// 计时器与测试使用。
+// Set 按 NodeId 字符串更新变量值（Good 质量）。演示计时器与测试用；
+// 需要带质量码时用 Update。
 func (s *Server) Set(id string, v ua.Variant) {
 	nid, err := ua.ParseNodeID(id)
 	if err != nil {
 		return
 	}
+	s.Update(nid, v, ua.StatusGood, time.Now())
+}
+
+// Update 更新变量值与质量码，并推送给所有监视该节点的订阅。
+//
+// 质量码决定 DataValue 是否携带值：Bad 状态按规范不该带值。带着旧值
+// 一起发「坏」，客户端会把旧值当当前值——这正是「设备断了但画面还在
+// 动」的成因。
+func (s *Server) Update(nid ua.NodeID, v ua.Variant, status ua.StatusCode, at time.Time) {
+	key := nid.String()
 	s.mu.Lock()
-	n, ok := s.nodes[nid.String()]
+	n, ok := s.nodes[key]
 	if ok {
 		n.value = v
+		n.status = status
+		n.at = at
 	}
 	s.mu.Unlock()
 	if !ok {
@@ -177,22 +255,22 @@ func (s *Server) Set(id string, v ua.Variant) {
 	}
 	// 先解锁再分发：notifyChange 要拿订阅锁，而 Publish 路径持有订阅锁
 	// 时会读节点表（判存在/类型），两把锁反序就是互等。
-	s.notifyChange(nid, v, ua.StatusGood, time.Now())
+	s.notifyChange(nid, v, status, at)
 }
 
-// Value 读取一个变量的当前值。
-func (s *Server) Value(id string) (ua.Variant, bool) {
+// Value 读取一个变量的当前值与质量码。
+func (s *Server) Value(id string) (ua.Variant, ua.StatusCode, bool) {
 	nid, err := ua.ParseNodeID(id)
 	if err != nil {
-		return ua.Variant{}, false
+		return ua.Variant{}, ua.StatusGood, false
 	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	n, ok := s.nodes[nid.String()]
 	if !ok {
-		return ua.Variant{}, false
+		return ua.Variant{}, ua.StatusGood, false
 	}
-	return n.value, true
+	return n.value, n.status, true
 }
 
 // ---------------------------------------------------------------------------
@@ -265,6 +343,9 @@ func (s *Server) handleConn(conn net.Conn) {
 		close(sess.done)
 		if sess.sessionID != 0 {
 			s.dropSessionSubscriptions(sess.sessionID)
+			s.mu.Lock()
+			delete(s.sessions, sess.sessionID)
+			s.mu.Unlock()
 		}
 	}()
 	buf := make([]byte, 8)
@@ -476,9 +557,9 @@ func (s *Server) endpoint() ua.EndpointDescription {
 	return ua.EndpointDescription{
 		EndpointURL: "opc.tcp://" + s.Addr(),
 		Server: ua.ApplicationDescription{
-			ApplicationURI:  "urn:uic:sim",
-			ProductURI:      "urn:uic",
-			ApplicationName: ua.LocalizedText{Text: "UIC Simulator"},
+			ApplicationURI:  s.cfg.ApplicationURI,
+			ProductURI:      s.cfg.ProductURI,
+			ApplicationName: ua.LocalizedText{Text: s.cfg.ApplicationName},
 			ApplicationType: ua.AppTypeServer,
 		},
 		SecurityMode:      ua.SecurityModeNone,
@@ -543,8 +624,8 @@ func (s *Server) handleActivateSession(sess *session, body []byte) (uint32, []by
 		return ua.SvcServiceFaultResponse, s.fault(nil, req.Header.RequestHandle,
 			ua.StatusBadSessionIDInvalid, "session not found")
 	}
-	// 只接受匿名令牌：演示服务端不该假装支持用户名密码，
-	// 否则调用方会以为「配置了用户就能用」。
+	// 只接受匿名令牌：服务端不该假装支持用户名密码，否则调用方会以为
+	// 「配置了用户就能用」。证书/用户体系是另一套运维域。
 	if req.UserIdentityToken.TypeID.ID != 321 {
 		return ua.SvcServiceFaultResponse, s.fault(nil, req.Header.RequestHandle,
 			ua.StatusBadUserAccessDenied, "only anonymous identity is supported")
@@ -582,8 +663,7 @@ func (s *Server) handleRead(sess *session, body []byte) (uint32, []byte) {
 				values[i] = ua.DataValue{Status: ua.StatusBadAttributeInvalid, SourceTimestamp: now, ServerTimestamp: now}
 				continue
 			}
-			v := n.value
-			values[i] = ua.DataValue{Value: &v, SourceTimestamp: now, ServerTimestamp: now}
+			values[i] = dataValueOf(n, now)
 		case ua.AttrDisplayName:
 			v := ua.Variant{Type: ua.TypeLocalized, Str: n.display}
 			values[i] = ua.DataValue{Value: &v, SourceTimestamp: now, ServerTimestamp: now}
@@ -606,6 +686,21 @@ func (s *Server) handleRead(sess *session, body []byte) (uint32, []byte) {
 	return ua.SvcReadResponse, resp.Encode()
 }
 
+// dataValueOf 把节点当前状态包成 DataValue。值只在 Good/Uncertain 时附加：
+// 按规范 Bad 不该带值，带上旧值会让客户端把「断了」显示成「还在跑」。
+func dataValueOf(n *node, now time.Time) ua.DataValue {
+	at := n.at
+	if at.IsZero() {
+		at = now
+	}
+	dv := ua.DataValue{Status: n.status, SourceTimestamp: at, ServerTimestamp: now}
+	if !n.status.IsBad() {
+		v := n.value
+		dv.Value = &v
+	}
+	return dv
+}
+
 func (s *Server) handleWrite(sess *session, body []byte) (uint32, []byte) {
 	req, err := ua.DecodeWriteRequest(body)
 	if err != nil {
@@ -615,19 +710,27 @@ func (s *Server) handleWrite(sess *session, body []byte) (uint32, []byte) {
 		return id, f
 	}
 
-	results := make([]ua.StatusCode, len(req.Nodes))
-	type change struct {
-		node ua.NodeID
-		val  ua.Variant
+	type planned struct {
+		index   int
+		pub     Node
+		model   model.Value
+		variant ua.Variant
 	}
-	var changes []change
-	s.mu.Lock()
+
+	results := make([]ua.StatusCode, len(req.Nodes))
+	var plans []planned
+
+	// 第一段只做校验与解码，不持锁调用外部写路径：北向模式下 OnWrite
+	// 会走到设备，耗时以秒计；持 s.mu 期间所有 Read/Browse 都会被堵住。
+	s.mu.RLock()
 	for i, wv := range req.Nodes {
 		n, ok := s.nodes[wv.NodeID.String()]
 		switch {
 		case !ok:
 			results[i] = ua.StatusBadNodeIDUnknown
 		case wv.AttributeID != ua.AttrValue:
+			results[i] = ua.StatusBadAttributeInvalid
+		case n.class != ua.NodeClassVariable:
 			results[i] = ua.StatusBadAttributeInvalid
 		case !n.writable:
 			results[i] = ua.StatusBadNotWritable
@@ -654,19 +757,39 @@ func (s *Server) handleWrite(sess *session, body []byte) (uint32, []byte) {
 				results[i] = ua.StatusBadTypeMismatch
 				continue
 			}
-			n.value = nv
-			results[i] = ua.StatusGood
-			changes = append(changes, change{node: wv.NodeID, val: nv})
+			plans = append(plans, planned{index: i, pub: n.pub, model: mv, variant: nv})
 		}
 	}
-	s.mu.Unlock()
+	s.mu.RUnlock()
 
-	// 写入也要触发订阅。少这一步，订阅客户端会看到「自己写进去的值
-	// 迟迟不回流」——现场表现为「控制生效了但状态栏不变」。
 	now := time.Now()
-	for _, ch := range changes {
-		s.notifyChange(ch.node, ch.val, ua.StatusGood, now)
+	for _, p := range plans {
+		if s.cfg.OnWrite != nil {
+			if st := s.cfg.OnWrite(p.pub, p.model, p.variant); !st.IsGood() {
+				results[p.index] = st
+				s.log("opcua_write_rejected",
+					"node", p.pub.ID.String(), "point", p.pub.BrowseName, "status", st.Text())
+				continue
+			}
+		}
+		key := p.pub.ID.String()
+		s.mu.Lock()
+		n, ok := s.nodes[key]
+		if !ok {
+			s.mu.Unlock()
+			results[p.index] = ua.StatusBadNodeIDUnknown
+			continue
+		}
+		n.value = p.variant
+		n.status = ua.StatusGood
+		n.at = now
+		s.mu.Unlock()
+		results[p.index] = ua.StatusGood
+		// 写入回流：订阅客户端必须看到自己写进去的值，否则现场表现为
+		// 「控制生效了但状态栏不变」。
+		s.notifyChange(p.pub.ID, p.variant, ua.StatusGood, now)
 	}
+
 	resp := ua.WriteResponse{Header: ua.ResponseHeader{
 		Timestamp: now, RequestHandle: req.Header.RequestHandle,
 	}, Results: results}

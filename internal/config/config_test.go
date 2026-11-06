@@ -542,6 +542,51 @@ func TestValidateMQTTNorthbound(t *testing.T) {
 	}
 }
 
+// 北向 OPC UA 只做 None/None + 匿名。任何「看起来更安全」的配置都必须
+// 显式失败——静默降级成无加密是最危险的一种兼容。
+func TestValidateOPCUANorthbound(t *testing.T) {
+	registerDrivers(t)
+	cases := []struct {
+		name string
+		mod  func(*File)
+		want string
+	}{
+		{"port conflict", func(f *File) {
+			f.Northbound.OPCUA = OPCUA{Enabled: true, Listen: f.Server.Listen, Policy: "None", AllowAnon: true}
+		}, "conflicts"},
+		{"anonymous required", func(f *File) {
+			f.Northbound.OPCUA = OPCUA{Enabled: true, Listen: ":4840", Policy: "None"}
+		}, "allowAnonymous"},
+		{"policy", func(f *File) {
+			f.Northbound.OPCUA = OPCUA{Enabled: true, Listen: ":4840", Policy: "Basic256Sha256", AllowAnon: true}
+		}, "Basic256Sha256"},
+	}
+	for _, c := range cases {
+		f := baseFile()
+		c.mod(f)
+		err := f.Validate()
+		if err == nil {
+			t.Fatalf("%s: expected error", c.name)
+		}
+		if !strings.Contains(err.Error(), c.want) {
+			t.Fatalf("%s: err = %v, want mention of %q", c.name, err, c.want)
+		}
+	}
+
+	f := baseFile()
+	f.Northbound.OPCUA = OPCUA{Enabled: true, AllowAnon: true}
+	if err := f.Validate(); err != nil {
+		t.Fatalf("defaults must make it valid: %v", err)
+	}
+	// 默认加密策略必须是本实现真正支持的那一个。
+	if f.Northbound.OPCUA.Policy != "None" {
+		t.Fatalf("default policy = %q", f.Northbound.OPCUA.Policy)
+	}
+	if f.Northbound.OPCUA.Listen != ":4840" {
+		t.Fatalf("default listen = %q", f.Northbound.OPCUA.Listen)
+	}
+}
+
 // QoS 用指针是为了区分「没写」与「写了 0」：两者的投递语义不同。
 func TestMQTTQoSTriState(t *testing.T) {
 	registerDrivers(t)

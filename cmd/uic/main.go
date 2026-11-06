@@ -1,4 +1,4 @@
-// Command uic 是单一可执行入口：run（默认）/ sim / mbread / version。
+// Command uic 是单一可执行入口：run（默认）/ sim / mbread / uaread / version。
 //
 //	uic -config config.json            # 前台运行
 //	uic run -config config.json        # 同上
@@ -8,6 +8,7 @@
 //	uic sim -protocol opcua -listen 127.0.0.1:14840 # 内置 OPC UA 服务端
 //	uic sim -protocol mqtt -listen 127.0.0.1:18830  # 内置 MQTT Broker（南向演示）
 //	uic mbread -addr 127.0.0.1:1502    # 不依赖第三方工具的从站读写自检
+//	uic uaread -addr 127.0.0.1:4840 -nodes ns=2;s=site/dev/point  # OPC UA 读写自检
 //
 // 关闭顺序遵循 docs/03-product/02-architecture.md §11.2：
 // 停止接收流量 → 停调度 → 排空 Outbox → 关连接，总预算 10 秒。
@@ -37,10 +38,10 @@ import (
 	"uic/internal/config"
 	"uic/internal/driver"
 	"uic/internal/model"
+	"uic/internal/opcuaserver"
 	uicruntime "uic/internal/runtime"
 	sim "uic/internal/sim/modbus"
 	simmqtt "uic/internal/sim/mqtt"
-	simopcua "uic/internal/sim/opcua"
 	sims7 "uic/internal/sim/s7"
 )
 
@@ -64,6 +65,8 @@ func main() {
 		simCmd(args)
 	case "mbread":
 		mbreadCmd(args)
+	case "uaread":
+		uareadCmd(args)
 	case "version", "-v", "--version":
 		printVersion()
 	case "help", "-h", "--help":
@@ -84,6 +87,8 @@ func usage() {
   uic sim [-listen 127.0.0.1:15020] [-protocol modbus|s7|opcua|mqtt]
   uic mbread -addr 127.0.0.1:1502 -unit 1 -area holding -offset 0 -qty 2
   uic mbread -addr 127.0.0.1:1502 -area holding -offset 5 -write 777
+  uic uaread -addr 127.0.0.1:4840 -nodes ns=2;s=site/dev/point [-type float64]
+  uic uaread -addr 127.0.0.1:4840 -nodes ns=2;s=site/dev/setpoint -write 42.5
   uic version
 
 参数:
@@ -279,9 +284,34 @@ func checkConfig(path string) int {
 	}
 	fmt.Printf("  outbox      %v\n", sinks)
 	if f.Northbound.MQTT.Enabled {
-		fmt.Printf("  mqtt        %s（qos %d）\n", f.Northbound.MQTT.Broker, f.Northbound.MQTT.QoS)
+		fmt.Printf("  mqtt        %s（qos %d）\n", f.Northbound.MQTT.Broker, f.Northbound.MQTT.EffectiveQoS())
+	}
+	if o := f.Northbound.OPCUA; o.Enabled {
+		exposed, writable := opcuaExposed(f)
+		fmt.Printf("  opcua       %s（%d 点，可写 %d，匿名）\n", o.Listen, exposed, writable)
 	}
 	return 0
+}
+
+// opcuaExposed 统计北向地址空间里的变量数，与 runtime.OPCUASpecs 保持同一
+// 口径：只看 enabled 的设备与点位。-check 的输出要和实际暴露的一致，否则
+// 「配置说 12 个点、客户端看到 9 个」会成为现场排查的噪音。
+func opcuaExposed(f config.File) (exposed, writable int) {
+	for _, d := range f.Devices {
+		if !d.Enabled {
+			continue
+		}
+		for _, p := range d.Points {
+			if !p.Enabled {
+				continue
+			}
+			exposed++
+			if p.Writable {
+				writable++
+			}
+		}
+	}
+	return exposed, writable
 }
 
 // humanBytes 用二进制单位打印容量。配置里是字节数（精确），但人读的是 MB。
@@ -460,7 +490,7 @@ func float32Bytes(v float32) []byte {
 // 初始值刻意做成混合类型（double / int32 / bool / string），
 // 这样 examples/opcua.json 一跑起来就能逐类核对类型映射是否正确。
 func simOPCUA(addr string) {
-	srv, err := simopcua.NewServer(addr)
+	srv, err := opcuaserver.NewSimulator(addr)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "启动 OPC UA 模拟服务端失败: %v\n", err)
 		os.Exit(1)

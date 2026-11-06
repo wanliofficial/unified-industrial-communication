@@ -38,6 +38,7 @@ const (
 const (
 	StatusGood                  StatusCode = 0x00000000
 	StatusGoodClamped           StatusCode = 0x00000200
+	StatusUncertain             StatusCode = 0x40000000
 	StatusBadUnexpectedError    StatusCode = 0x80010000
 	StatusBadInternalError      StatusCode = 0x80020000
 	StatusBadCommunicationError StatusCode = 0x80050000
@@ -84,6 +85,8 @@ func (s StatusCode) Text() string {
 		return "Good"
 	case StatusGoodClamped:
 		return "GoodClamped"
+	case StatusUncertain:
+		return "Uncertain"
 	case StatusBadUnexpectedError:
 		return "BadUnexpectedError"
 	case StatusBadInternalError:

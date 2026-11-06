@@ -1,4 +1,4 @@
-package opcua
+package opcuaserver
 
 import (
 	"sync"
@@ -259,9 +259,9 @@ func (s *Server) handleCreateMonitoredItems(sess *session, body []byte) (uint32,
 
 		s.mu.RLock()
 		n, ok := s.nodes[nid.String()]
-		var cur ua.Variant
+		var sample ua.DataValue
 		if ok {
-			cur = n.value
+			sample = dataValueOf(n, now)
 		}
 		s.mu.RUnlock()
 		if !ok {
@@ -289,10 +289,10 @@ func (s *Server) handleCreateMonitoredItems(sess *session, body []byte) (uint32,
 		sub.items[mi.id] = mi
 		sub.mu.Unlock()
 
-		// 初始样本：真实服务端在监视项建立后立刻上报一次当前值。
-		sub.enqueue(mi.clientHandle, ua.DataValue{
-			Value: &cur, SourceTimestamp: now, ServerTimestamp: now,
-		})
+		// 初始样本：真实服务端在监视项建立后立刻上报一次当前值（含质量码）。
+		// 少了这一步，客户端在第一个发布周期之前没有任何数据，「订阅」就
+		// 退化成了「轮询 + 一份缓存」。
+		sub.enqueue(mi.clientHandle, sample)
 
 		results[i] = ua.MonitoredItemCreateResult{
 			StatusCode:              ua.StatusGood,

@@ -82,6 +82,11 @@ type Runtime struct {
 	hist        *history.Store
 	histWriter  *historyWriter
 
+	// nbMu 只保护北向 OPC UA 实例的启停。不能复用 mu：reload 已经持着 mu
+	// 调 syncOPCUA，再拿一次就是自锁。
+	nbMu    sync.Mutex
+	nbOPCUA *opcuaNorthbound
+
 	mu          sync.Mutex
 	collectors  map[string]*collector
 	slaves      map[string]*slavemb.Server
@@ -215,6 +220,12 @@ func New(opt Options) (*Runtime, error) {
 		}
 		return nil, err
 	}
+	if err := r.openOPCUA(mgr.Current()); err != nil {
+		if logFile != nil {
+			_ = logFile.Close()
+		}
+		return nil, err
+	}
 	if err := r.openSinks(mgr.Current()); err != nil {
 		if logFile != nil {
 			_ = logFile.Close()
@@ -268,6 +279,8 @@ func (r *Runtime) declareMetrics() {
 	d("uic_history_evicted_total", "gauge", "因保留策略淘汰的段数")
 	d("uic_history_write_errors_total", "gauge", "历史写入失败次数")
 	d("uic_history_query_total", "counter", "历史查询次数与结果")
+	d("uic_opcua_server_up", "gauge", "北向 OPC UA 服务端是否在监听")
+	d("uic_opcua_server_writes_total", "counter", "北向 OPC UA 写入次数与结果")
 }
 
 // build 按配置创建采集器并注册到调度器。
@@ -357,6 +370,9 @@ func (r *Runtime) Stop(timeout time.Duration) error {
 		timeout = 10 * time.Second
 	}
 	r.ready.Store(false)
+	// 先关北向 OPC UA：它接受外部写入，必须在调度与设备开始收缩之前停止，
+	// 否则 SCADA 会看到「连接还在、写进去没反应」。
+	r.closeOPCUA()
 	if r.cancel != nil {
 		r.cancel()
 	}
@@ -523,7 +539,7 @@ func (r *Runtime) ApplyConfig(raw json.RawMessage, source string) (config.ApplyR
 		S config.Storage    `json:"s"`
 	}{after.Northbound, after.Storage})
 	if string(beforeNB) != string(afterNB) {
-		r.log.Warn("northbound_config_changed", "detail", "MQTT/OPC UA/Webhook 参数变更需重启进程生效")
+		r.log.Warn("northbound_config_changed", "detail", "MQTT/Webhook 参数变更需重启进程生效；OPC UA 北向已热重建")
 	}
 	// 历史库的目录与保留策略在 Open 时就固定了。采样参数可以热改，
 	// 但这四项不能——必须明确告诉运维「改了但没生效」，否则他会盯着
@@ -618,6 +634,9 @@ func (r *Runtime) reload(before *config.File) []string {
 		r.refreshAlarmMetrics()
 	}
 	restarted = append(restarted, r.syncSlaves(after)...)
+	// 北向 OPC UA 的地址空间在启动时固化，配置变了只能重建。这里做在
+	// 设备重建之后：新地址空间的种子值要来自最新的点位表。
+	r.syncOPCUA(after, before)
 	sort.Strings(restarted)
 	if len(restarted) > 0 {
 		r.log.Info("config_applied", "version", r.cfg.Version(), "restarted", restarted)

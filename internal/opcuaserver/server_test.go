@@ -1,4 +1,4 @@
-package opcua
+package opcuaserver
 
 import (
 	"net"
@@ -445,7 +445,7 @@ func TestWriteReadOnlyNodeRejected(t *testing.T) {
 	c.open()
 	token := c.createSession()
 
-	before, _ := srv.Value("ns=2;s=Plant.Temperature")
+	before, _, _ := srv.Value("ns=2;s=Plant.Temperature")
 	v := ua.Variant{Type: ua.TypeDouble, Float: 99}
 	_, body := c.call(ua.SvcWriteRequest, ua.WriteRequest{
 		Header: ua.RequestHeader{RequestHandle: 5, AuthenticationToken: token},
@@ -462,7 +462,7 @@ func TestWriteReadOnlyNodeRejected(t *testing.T) {
 	if len(resp.Results) != 1 || resp.Results[0] != ua.StatusBadNotWritable {
 		t.Fatalf("results %v", resp.Results)
 	}
-	after, _ := srv.Value("ns=2;s=Plant.Temperature")
+	after, _, _ := srv.Value("ns=2;s=Plant.Temperature")
 	if after.Float != before.Float {
 		t.Fatalf("value changed: %v -> %v", before.Float, after.Float)
 	}
@@ -495,7 +495,7 @@ func TestWriteTypeMismatchRejected(t *testing.T) {
 	if len(resp.Results) != 1 || resp.Results[0] != ua.StatusBadTypeMismatch {
 		t.Fatalf("results %v", resp.Results)
 	}
-	if cur, _ := srv.Value("ns=2;s=Plant.Label"); cur.Str != "SIM-01" {
+	if cur, _, _ := srv.Value("ns=2;s=Plant.Label"); cur.Str != "SIM-01" {
 		t.Fatalf("label changed to %q", cur.Str)
 	}
 }
@@ -693,11 +693,11 @@ func TestCloseSessionThenReadFails(t *testing.T) {
 func TestSetAndValueHelpers(t *testing.T) {
 	srv := newSim(t)
 
-	if _, ok := srv.Value("ns=2;s=Nope"); ok {
+	if _, _, ok := srv.Value("ns=2;s=Nope"); ok {
 		t.Fatal("unknown node must not be readable")
 	}
 	srv.Set("ns=2;s=Plant.Counter", ua.Variant{Type: ua.TypeInt32, Int: 42})
-	if v, ok := srv.Value("ns=2;s=Plant.Counter"); !ok || v.Int != 42 {
+	if v, st, ok := srv.Value("ns=2;s=Plant.Counter"); !ok || v.Int != 42 || !st.IsGood() {
 		t.Fatalf("value = %+v ok=%v", v, ok)
 	}
 	// 非法 NodeId 字符串不能让 Set 崩，也不能静默改错节点。
@@ -705,7 +705,7 @@ func TestSetAndValueHelpers(t *testing.T) {
 }
 
 func TestCloseIsIdempotent(t *testing.T) {
-	srv, err := NewServer("127.0.0.1:0")
+	srv, err := NewSimulator("127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -754,7 +754,7 @@ func TestConcurrentClients(t *testing.T) {
 
 func newSim(t *testing.T) *Server {
 	t.Helper()
-	srv, err := NewServer("127.0.0.1:0")
+	srv, err := NewSimulator("127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("start sim: %v", err)
 	}

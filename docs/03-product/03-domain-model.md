@@ -649,7 +649,12 @@ type Record struct {
   ],
   "northbound": {
     "mqtt": { "enabled": false, "broker": "tcp://127.0.0.1:1883", "topic": "uic/{site}/{device}/{point}/value", "qos": 1 },
-    "opcua": { "enabled": false, "listen": ":4840" }
+    "opcua": {
+      "enabled": true,
+      "listen": ":4840",
+      "policy": "None",
+      "allowAnonymous": true
+    }
   },
   "storage": {
     "dir": "./data",
@@ -685,7 +690,7 @@ type Record struct {
 
 > 注意：`journal` 与 MQTT/Webhook 是**并列**关系，不是替代关系。同时开启时，同一条事件会分别进入各自的 sink 分区，各自独立确认，互不影响。
 
-### 11.1 命名规则
+### 12.1 命名规则
 
 | 对象 | 规则 | 示例 |
 |---|---|---|
@@ -696,13 +701,34 @@ type Record struct {
 
 **保留字**：`_system`、`_internal`、`uic` 不允许作为 ID 前缀外的完整 ID。
 
-### 11.2 迁移
+### 12.2 迁移
 
 配置带 `schemaVersion`。加载时：
 
 1. 版本等于当前 → 直接使用；
 2. 版本小于当前 → 执行迁移链（`v1→v2→v3`），迁移结果写回并备份原文件；
 3. 版本大于当前 → 拒绝启动，提示升级程序。
+
+---
+
+### 12.3 北向 OPC UA 的地址空间映射
+
+`northbound.opcua` 是「点位表的另一个出口」，映射规则固定且可预测：
+
+| 平台概念 | 地址空间 | NodeId |
+|---|---|---|
+| 站点 | `Root/Objects/{site}`（目录） | `ns=2;s={site}` |
+| 设备 | `{site}/{device}`（目录） | `ns=2;s={site}/{device}` |
+| 点位 | `{site}/{device}/{point}`（变量） | `ns=2;s={site}/{device}/{point}` |
+
+**规则**：
+
+1. 只暴露 `enabled` 的设备与点位；禁用项不删除历史值，而是根本不出现——客户端不会读到一个永远坏的幽灵变量。
+2. 一点一变量，不做结构体聚合；`DisplayName` 用点位 `name`，`BrowseName` 用点位 ID。
+3. 质量码走 `DataValue.Status`：`good → Good`，`uncertain/stale → Uncertain`，`timeout → BadTimeout`，`comm_error → BadNoCommunication`，`address_error → BadNodeIdUnknown`，`not_connected/disabled → BadNotConnected`。Bad 状态不携带值。
+4. 写入必须穿透到南向设备（`Runtime.Write`，5 秒超时）；返回 Good 表示设备接受了写入。只读点位 `BadNotWritable`、类型不符 `BadTypeMismatch`、未知点位 `BadNodeIdUnknown`、设备不在跑 `BadNoCommunication`。
+5. 地址空间在启动时固化；配置热更新按指纹（监听地址、站点、点位集合、类型、可写性）判断是否重建。重建失败时回退上一份配置继续服务，并留下显式日志。
+6. `policy` 只接受 `None`，`allowAnonymous` 必须显式为 `true`——不支持的能力在配置期失败，而不是运行期静默降级。
 
 ---
 

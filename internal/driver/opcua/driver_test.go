@@ -10,15 +10,15 @@ import (
 	ua "uic/internal/codec/opcua"
 	"uic/internal/driver"
 	"uic/internal/model"
-	simopc "uic/internal/sim/opcua"
+	opcuaserver "uic/internal/opcuaserver"
 )
 
 // 这些用例跑在真实 TCP 上：OPC UA 的失败模式大多是状态机问题
 // （安全通道 / 会话的建立顺序、TokenId 失效、ERR 报文），内存流测不出来。
 
-func newSim(t *testing.T) *simopc.Server {
+func newSim(t *testing.T) *opcuaserver.Server {
 	t.Helper()
-	srv, err := simopc.NewServer("127.0.0.1:0")
+	srv, err := opcuaserver.NewSimulator("127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("start sim: %v", err)
 	}
@@ -34,7 +34,7 @@ func channel(addr string) model.Channel {
 	}
 }
 
-func open(t *testing.T, srv *simopc.Server) driver.Conn {
+func open(t *testing.T, srv *opcuaserver.Server) driver.Conn {
 	t.Helper()
 	ch := channel(srv.Addr())
 	c, err := New().Open(context.Background(), driver.OpenConfig{
@@ -241,7 +241,7 @@ func TestWriteThenReadBack(t *testing.T) {
 	if len(results) != 1 || !results[0].OK {
 		t.Fatalf("results %+v", results)
 	}
-	v, ok := srv.Value("ns=2;s=Plant.Setpoint")
+	v, _, ok := srv.Value("ns=2;s=Plant.Setpoint")
 	if !ok || v.Float != 42.5 {
 		t.Fatalf("server value = %+v", v)
 	}
@@ -275,7 +275,7 @@ func TestWriteToReadOnlyNodeIsPermissionError(t *testing.T) {
 	if k := driver.KindOf(results[0].Err); k != driver.ErrPermission {
 		t.Fatalf("kind = %s", k)
 	}
-	if v, _ := srv.Value("ns=2;s=Plant.Temperature"); v.Float == 99 {
+	if v, _, _ := srv.Value("ns=2;s=Plant.Temperature"); v.Float == 99 {
 		t.Fatal("read-only node was modified")
 	}
 }

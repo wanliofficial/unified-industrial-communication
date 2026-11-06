@@ -1,0 +1,120 @@
+{
+  "schemaVersion": 1,
+  "site": "north-lab",
+  "server": {
+    "listen": "127.0.0.1:8094"
+  },
+  "storage": {
+    "dir": "./data-opcua-north",
+    "journal": false,
+    "history": {
+      "enabled": false
+    }
+  },
+  "logging": {
+    "level": "info"
+  },
+  "northbound": {
+    "opcua": {
+      "enabled": true,
+      "listen": "127.0.0.1:14841",
+      "policy": "None",
+      "allowAnonymous": true
+    }
+  },
+  "channels": [
+    {
+      "id": "ch-virtual",
+      "protocol": "virtual",
+      "transport": {
+        "kind": "memory"
+      },
+      "concurrency": 4,
+      "timeout": "2s"
+    }
+  ],
+  "devices": [
+    {
+      "id": "line-a",
+      "name": "产线 A",
+      "channel": "ch-virtual",
+      "interval": "1s",
+      "timeout": "2s",
+      "enabled": true,
+      "labels": {
+        "mode": "sine"
+      },
+      "points": [
+        {
+          "id": "temperature",
+          "name": "温度",
+          "address": {
+            "kind": "register",
+            "area": "holding",
+            "length": 2,
+            "bit": -1
+          },
+          "dataType": "float32",
+          "unit": "℃",
+          "deadband": 0.2,
+          "enabled": true
+        },
+        {
+          "id": "pressure",
+          "name": "压力",
+          "address": {
+            "kind": "register",
+            "area": "holding",
+            "offset": 2,
+            "length": 4,
+            "bit": -1
+          },
+          "dataType": "float64",
+          "unit": "kPa",
+          "deadband": 0.5,
+          "enabled": true
+        },
+        {
+          "id": "running",
+          "name": "运行",
+          "address": {
+            "kind": "register",
+            "area": "coil",
+            "length": 1,
+            "bit": -1
+          },
+          "dataType": "bool",
+          "enabled": true
+        },
+        {
+          "id": "counter",
+          "name": "产量计数",
+          "address": {
+            "kind": "register",
+            "area": "holding",
+            "offset": 10,
+            "length": 2,
+            "bit": -1
+          },
+          "dataType": "uint32",
+          "enabled": true
+        },
+        {
+          "id": "setpoint",
+          "name": "温度设定",
+          "address": {
+            "kind": "register",
+            "area": "holding",
+            "offset": 20,
+            "length": 2,
+            "bit": -1
+          },
+          "dataType": "float32",
+          "unit": "℃",
+          "writable": true,
+          "enabled": true
+        }
+      ]
+    }
+  ]
+}

@@ -175,6 +175,22 @@ curl -s -H 'Authorization: Bearer dev-token' \
 （不会因此重连；只有「安静超过一个新鲜度窗口且 PING 往返失败」才判断链——
 拔网线、对端断电这类故障 TCP 自己不会报错）。
 
+OPC UA 北向（把点位表暴露成服务端地址空间）：
+
+```bash
+./uic -config examples/opcua-north.json        # REST :8094，OPC UA 服务端 :14841
+./uic uaread -addr 127.0.0.1:14841 \
+  -nodes 'ns=2;s=north-lab/line-a/temperature,ns=2;s=north-lab/line-a/setpoint' -type float32
+./uic uaread -addr 127.0.0.1:14841 -nodes 'ns=2;s=north-lab/line-a/setpoint' \
+  -type float32 -write 42.5
+```
+
+地址空间固定为 `Root/Objects/{site}/{device}/{point}`，变量 NodeId 是
+`ns=2;s={site}/{device}/{point}`，质量码走 `DataValue.Status`。写入真的走南向
+设备：只读点位回 `BadNotWritable`，未知点位回 `BadNodeIdUnknown`，设备没起来回
+`BadNoCommunication`——不会出现「网关内存改了数、设备没收到」却报成功的情况。
+`uic uaread` 与 `uic mbread` 一样，是不装第三方客户端即可自证链路的工具。
+
 计算点（纯表达式，没有任何物理链路）：
 
 ```bash
@@ -441,7 +457,7 @@ docs/
 | REST | 配置、查询、写入、命令 | ✅ 完整 |
 | SSE | 实时观察（浏览器/curl 友好） | ✅ 完整 |
 | MQTT | 变化上报 + 设备状态 | ✅ 完整（QoS0/1、retained `$state`/`$birth`、LWT `$death`、断线补投；不支持 QoS2/TLS/WebSocket） |
-| OPC UA | 被 SCADA 集成 | ⏳ 南向主站已完成（None/None + 匿名）；北向服务端未实现 |
+| OPC UA | 被 SCADA 集成 | ✅ 服务端地址空间（`Root/Objects/{site}/{device}/{point}`，`ns=2;s=...`）；质量码走 `DataValue.Status`；写入穿透到南向设备；支持订阅推送；None/None + 匿名，不支持证书/历史/方法/事件 |
 
 > 注意方向的对称性：MQTT 与 OPC UA 都**同时出现在南向和北向**，但这是两条独立的链路。
 > 北向 MQTT 是「把采集到的值发出去」，南向 MQTT 是「订阅设备发来的值」；两者共用
@@ -523,7 +539,8 @@ obs  ← 所有包（不依赖任何内部包）
 | `internal/driver/virtual` | 虚拟设备（波形 + 故障注入） | 故障按「第 n 次请求」精确注入一次 | 98.6% |
 | `internal/sim/modbus` | 内置 Modbus TCP 从站 | 复用同一份 codec，避免主从语义漂移 | 87.2% |
 | `internal/sim/s7` | 内置 S7 从站（内存 DB/M/I/Q 区） | 与主站共用 codec/s7；输入区只读；位写保邻位 | 71.9% |
-| `internal/sim/opcua` | 内置 OPC UA 服务端（内存地址空间 + 订阅/发布） | 与主站共用 codec/opcua；未激活会话拒绝读写；Variant 类型必须与节点 DataType 一致；Publish 在独立 goroutine，响应按 RequestId 乱序返回 | 83.8% |
+| `internal/opcuaserver` | 可复用的 OPC UA 服务端内核（地址空间、订阅/发布、标准节点） | 与主站共用 codec/opcua；未激活会话拒绝读写；Variant 类型必须与节点 DataType 一致；Publish 在独立 goroutine，响应按 RequestId 乱序返回；`NewSimulator` 提供演示地址空间 | 82.2% |
+| `internal/northbound/opcua` | OPC UA 北向：点位表 → 地址空间 | 一点一变量；质量码映射到 `DataValue.Status`；写入过 `Runtime.Write`（设备 actor + 幂等）；配置变更按指纹重建，抢不到端口回退上一份配置 | 82.0% |
 | `internal/sim/mqtt` | 内置 MQTT 3.1.1 Broker，兼 `uic sim -protocol mqtt` 运行时 | 全项目唯一一份 Broker 实现；不做 QoS2/持久会话/TLS；QoS2 授予时降级为 1 | 79.3% |
 | `internal/slave/modbus` | Modbus TCP 从站（把点位暴露给外部主站） | 读走 cache、写走 Runtime.Write；未映射地址报错不补零；坏质量保留最后值并计数 | 73.8% |
 | `internal/alarm` | 报警引擎：五态机、阈值/滞回/延时、表达式规则、确认、订阅 | 输入不可信时绝不改状态机；延时是「连续满足」；`cleared` 与 `active` 都要确认；状态只在内存 | 94.4% |
@@ -539,8 +556,8 @@ obs  ← 所有包（不依赖任何内部包）
 | `internal/northbound/httpapi` | REST + SSE + 认证 + 错误码 | 错误码稳定；响应不泄露凭据；报警/历史查询的未知参数取值必须报错而不是静默忽略 | 83.5% |
 | `internal/mqtt` | MQTT 3.1.1 客户端（北向发布 + 南向订阅共用，纯 Go 零依赖） | 单 goroutine 读 socket；QoS1 必须等到 PUBACK；`Ping` 必须等到 PINGRESP（写成功不算活着）；断线立即失败而非超时 | 70.3% |
 | `internal/mqtt/mqtttest` | 测试封装：`internal/sim/mqtt` 的 `*testing.T` 生命周期 + 等待断言 | 不另写 Broker（两份实现必然长歪）；开关一律走 setup 函数而非直接赋字段 | — |
-| `internal/runtime` | 唯一编排层 + 后端实现 + 看门狗 | 启动/关闭顺序；`configuredState` 与 `runtimeState` 分离；协议/传输匹配在装配期校验；只向驱动与报警引擎注入只读 `cache.Get` | 79.5% |
-| `cmd/uic` | 单入口：run / sim / check / version | 关闭预算 10 秒 | — |
+| `internal/runtime` | 唯一编排层 + 后端实现 + 看门狗 | 启动/关闭顺序；`configuredState` 与 `runtimeState` 分离；协议/传输匹配在装配期校验；只向驱动与报警引擎注入只读 `cache.Get`；北向 OPC UA 启停与热重建 | 79.6% |
+| `cmd/uic` | 单入口：run / sim / mbread / uaread / check / version | 关闭预算 10 秒；`uaread` 与 `mbread` 是不装第三方客户端即可自证链路的自检工具 | — |
 
 ### 9.2 测试与验证命令
 
@@ -552,7 +569,7 @@ go test -race -count=1 ./...                    # 竞态 + 全量测试
 go test -coverprofile=c.out ./... && go tool cover -func=c.out | tail -1
 ```
 
-当前状态：`go build` / `go vet` / `gofmt` 全部干净，`go test -race ./...` 31 个测试包全部通过
+当前状态：`go build` / `go vet` / `gofmt` 全部干净，`go test -race ./...` 33 个测试包全部通过
 （另有 `cmd/uic` 与 `internal/mqtt/mqtttest` 两个无测试文件的包）。
 
 ### 9.3 源码阅读建议顺序
@@ -574,6 +591,8 @@ go test -coverprofile=c.out ./... && go tool cover -func=c.out | tail -1
 14. internal/driver/computed/driver.go 拓扑求值、质量传播、无 IO 的驱动形态（30 分钟）
 15. internal/alarm/engine.go           五态机、滞回/延时、质量门控、按依赖索引（50 分钟）
 16. internal/history/store.go + query.go 分段追加、整段淘汰、扫描聚合（50 分钟）
+17. internal/opcuaserver/server.go     服务端内核：两阶段写、标准节点、订阅分发（50 分钟）
+18. internal/northbound/opcua/northbound.go 点位表→地址空间、质量映射、写穿透（40 分钟）
 ```
 
 ---
@@ -605,6 +624,17 @@ go test -coverprofile=c.out ./... && go tool cover -func=c.out | tail -1
 | GET | `/api/v1/stream` | SSE 实时流 |
 | GET | `/api/v1/history?device=&point=&from=&to=&step=&agg=&limit=` | 历史查询（原始点 / 定步长聚合） |
 | GET | `/api/v1/diagnostics/bundle` | 诊断 zip（配置脱敏） |
+
+OPC UA 服务端（同一份点位表的另一个出口）：
+
+| 项 | 约定 |
+|---|---|
+| 端点 | `opc.tcp://{northbound.opcua.listen}`（默认 `:4840`） |
+| 地址空间 | `Root/Objects/{site}/{device}` 目录 + `{point}` 变量 |
+| NodeId | 变量 `ns=2;s={site}/{device}/{point}`；目录同理少一级 |
+| 读写 | Read/Write/Browse/GetEndpoints + 订阅（CreateSubscription / MonitoredItems / Publish） |
+| 质量 | `DataValue.Status`：Good / Uncertain / Bad*；Bad 不带值 |
+| 写入 | 过 `Runtime.Write`，5 秒超时；只读点位 `BadNotWritable`，类型不符 `BadTypeMismatch` |
 
 **命令白名单**：`driver.restart`、`device.selftest`、`outbox.flush`、`outbox.drop`（需 confirm）、`config.rollback`（需 confirm）、`log.level`、`diag.bundle`。未知动作一律 400，不做猜测。
 
@@ -642,7 +672,8 @@ go test -coverprofile=c.out ./... && go tool cover -func=c.out | tail -1
 | OPC UA 订阅的边界 | ⚠️ | 不做同一连接上的多请求复用（那需要一套完整的多路复用器）；不实现 Republish 补取（跳号时靠下一条通知）；采样周期只发配置值，不做服务端采样率协商；`publishingInterval` / `samplingInterval` 必须配合 `subscribe=true` |
 | OPC UA 历史 / 方法 / 事件 / 证书 | ❌ | 证书体系是另一套运维域；方法与事件需要完整地址空间与权限模型；历史由自建有界采样日志承担（ADR-0002） |
 | OPC UA 服务端（内置演示） | ✅ | `uic sim -protocol opcua`：Root/Objects/Server/ServerStatus/CurrentTime + ns=2 Plant.{Counter,Temperature,Running,Label,Setpoint}；只读节点写入回 `BadNotWritable`；未知节点回 `BadNodeIdUnknown`；未实现的服务（方法调用/历史读取）回 `BadServiceUnsupported`；订阅按值变化推送，空闲按 KeepAlive 周期发空通知 |
-| OPC UA 北向（对外暴露为服务端） | ⏳ | 只完成南向主站与演示服务端；把 cache 映射成对外的地址空间属于 Wave 2 |
+| OPC UA 北向（对外暴露为服务端） | ✅ | 地址空间 `Root/Objects/{site}/{device}/{point}`（变量 `ns=2;s={site}/{device}/{point}`）；只暴露 enabled 的设备与点位；质量码走 `DataValue.Status`（good→Good，uncertain/stale→Uncertain，timeout/comm_error/address_error/not_connected→对应 Bad*）；写入穿透到 `Runtime.Write`（5 秒超时），拒绝码映射回 `BadNotWritable`/`BadTypeMismatch`/`BadNodeIdUnknown`/`BadNoCommunication`；订阅推送直接复用服务端内核；配置变更按指纹热重建，端口被占用时启动失败、热更新失败则回退上一份配置 |
+| OPC UA 北向的边界 | ⚠️ | 只做 None/None + 匿名（`allowAnonymous` 必须显式为 true）；不做历史读取、方法调用、事件、别名、分块；地址空间是平铺的两级目录（站点/设备/点位），不映射设备层级结构，也不暴露设备状态变量（状态看 REST `/api/v1/devices` 或 MQTT `$state`）；每次配置变更都会重建服务端，SCADA 会经历一次重连 |
 | 计算点（纯表达式） | ✅ | `protocol: "computed"` + `address.kind: "computed"` + `address.expr`；零依赖表达式引擎（编译期类型检查、短路求值、除零/NaN/Inf 报错）；同设备依赖在一次 `Read` 内按拓扑序闭合，跨设备最终一致；质量取最差且指名坏输入；整数四舍五入 + 越界判坏 |
 | 计算点的边界 | ⚠️ | 只读（写入返回 `point.not_writable`）；只支持数值与布尔（字符串/Bytes/BCD 拒绝）；引用写作 `device:point`，因 ID 允许 `-`，**减号两边要留空格**（`line-a:power-1` 是引用）；跨设备引用慢一拍 |
 | 计算点的环检测 | ✅ | 自引用、两点互引、**跨设备互引**都在配置期拒绝，报错打印完整路径（`a -> b -> a`） |

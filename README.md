@@ -54,6 +54,23 @@ curl -s localhost:8086/api/v1/points
 #   写穿透：curl -X POST .../points/ua1/setpoint/write
 ```
 
+OPC UA 北向（把点位表暴露成服务端地址空间，供 SCADA 直接读写）：
+
+```bash
+./uic -config examples/opcua-north.json        # REST :8094，OPC UA 服务端 :14841
+./uic uaread -addr 127.0.0.1:14841 \
+  -nodes 'ns=2;s=north-lab/line-a/temperature,ns=2;s=north-lab/line-a/setpoint' -type float32
+./uic uaread -addr 127.0.0.1:14841 -nodes 'ns=2;s=north-lab/line-a/setpoint' \
+  -type float32 -write 42.5
+#   NodeId 约定：ns=2;s={site}/{device}/{point}
+#   写入真的过南向设备；只读点位回 BadNotWritable，未知点位回 BadNodeIdUnknown
+```
+
+`uic uaread` 与 `uic mbread` 是同一类工具：不装任何第三方软件即可自证链路。
+北向写入复用 REST 的写入路径（设备 actor、类型校验、幂等），不存在第二条
+绕过治理的写路径。质量码走 `DataValue.Status`（Good / Uncertain / Bad*），
+不额外造一个 quality 变量。
+
 OPC UA 订阅（服务端推送，而不是每轮 Read 轮询）：
 
 ```bash
@@ -174,7 +191,7 @@ go test -race -count=1 ./...
 
 | 路径 | 内容 |
 |---|---|
-| `cmd/uic/` | 单入口：`run` / `sim`（Modbus / S7 / OPC UA / MQTT）/ `mbread` / `-check` / `version` |
+| `cmd/uic/` | 单入口：`run` / `sim`（Modbus / S7 / OPC UA / MQTT）/ `mbread` / `uaread` / `-check` / `version` |
 | `internal/model` | 通道 / 设备 / 点位 / 地址 / 采样 / 质量码 |
 | `internal/driver` | 驱动契约（Codec / Transport / Driver）、错误分类、注册表、只读 `Lookup` 注入 |
 | `internal/calc` | 零依赖表达式引擎（编译期类型检查、短路求值、引用 `device:point`） |
@@ -192,7 +209,7 @@ go test -race -count=1 ./...
 | `internal/driver/virtual` | 虚拟设备（波形 + 故障注入） |
 | `internal/sim/modbus` | 内置 Modbus TCP 从站 |
 | `internal/sim/s7` | 内置 S7 从站（内存 DB/M/I/Q 区） |
-| `internal/sim/opcua` | 内置 OPC UA 服务端（内存地址空间 + 订阅/发布） |
+| `internal/opcuaserver` | 可复用 OPC UA 服务端内核（地址空间 + 订阅/发布 + 标准节点） |
 | `internal/sim/mqtt` | 内置 MQTT 3.1.1 Broker（兼 `uic sim -protocol mqtt` 运行时） |
 | `internal/slave/modbus` | Modbus TCP 从站（把点位映射给外部主站，写穿透到南向） |
 | `internal/planner` | 点位 → 批量读请求 |
@@ -203,6 +220,7 @@ go test -race -count=1 ./...
 | `internal/config` | 配置校验 / 内容哈希版本 / 快照 / 回滚 |
 | `internal/obs` | 指标 / 结构化日志 / 日志环形缓冲 |
 | `internal/northbound/httpapi` | REST + SSE + 认证 + 错误码 |
+| `internal/northbound/opcua` | OPC UA 北向：点位表 → 地址空间，质量码映射，写穿透到南向 |
 | `internal/mqtt` | 自写 MQTT 3.1.1 客户端（北向发布 + 南向订阅共用；QoS0/1、retained、LWT、PING 往返探测） |
 | `internal/mqtt/mqtttest` | 测试封装：`internal/sim/mqtt` 的 `*testing.T` 生命周期 + 等待断言 |
 | `internal/runtime` | 唯一编排层 + 看门狗 + 后端实现（含各 sink 装配） |

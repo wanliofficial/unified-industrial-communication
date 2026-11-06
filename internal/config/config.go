@@ -250,7 +250,9 @@ func (f *File) Normalize() {
 		f.Northbound.OPCUA.Listen = ":4840"
 	}
 	if f.Northbound.OPCUA.Policy == "" {
-		f.Northbound.OPCUA.Policy = "Basic256Sha256"
+		// 默认必须是本实现真正支持的那一个：拿 Basic256Sha256 当默认值，
+		// 等于给每个启用者埋一条「启动就报错」或「配了加密其实没加密」。
+		f.Northbound.OPCUA.Policy = "None"
 	}
 	for i := range f.Channels {
 		if f.Channels[i].Concurrency == 0 {
@@ -620,6 +622,31 @@ func (f *File) validateNorthbound() error {
 		// 与运行时共用同一份地址规则：ssl:// 之类的 scheme 必须在这里就失败。
 		if _, err := mqtt.NormalizeAddr(m.Broker); err != nil {
 			return fmt.Errorf("northbound.mqtt.broker: %w", err)
+		}
+	}
+
+	o := f.Northbound.OPCUA
+	if o.Enabled {
+		if o.Listen == "" {
+			return errors.New("northbound.opcua.listen required when opcua.enabled")
+		}
+		// 端口冲突在这里拦一次：等到 Listen 失败只会得到一句
+		// "address already in use"，运维还得自己去猜是谁占了。
+		if listenConflicts(o.Listen, f.Server.Listen) {
+			return fmt.Errorf("northbound.opcua.listen %q conflicts with server.listen", o.Listen)
+		}
+		for _, s := range f.Slaves {
+			if listenConflicts(o.Listen, s.Listen) {
+				return fmt.Errorf("northbound.opcua.listen %q conflicts with slave %q", o.Listen, s.ID)
+			}
+		}
+		// 只做 None/None + 匿名。配置里写 true 之外的组合必须显式失败：
+		// 悄悄降级成「无加密」是最危险的一种「兼容」。
+		if !o.AllowAnon {
+			return errors.New("northbound.opcua.allowAnonymous must be true: only anonymous access is supported")
+		}
+		if !strings.EqualFold(o.Policy, "None") {
+			return fmt.Errorf("northbound.opcua.policy %q: only \"None\" is supported", o.Policy)
 		}
 	}
 	return nil

@@ -1,4 +1,4 @@
-package opcua
+package opcuaserver
 
 import (
 	"testing"

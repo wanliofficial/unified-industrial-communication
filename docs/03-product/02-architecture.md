@@ -89,6 +89,8 @@ internal/driver/mqtt    ──→ internal/mqtt（报文编解码 + 连接管理
 internal/driver/virtual ──→ internal/model
 internal/sim/modbus     ──→ internal/codec/modbus（复用同一编解码）
 internal/sim/mqtt       ──→ internal/mqtt（两侧共用同一份报文实现）
+internal/opcuaserver    ──→ internal/codec/opcua（服务端内核，演示与北向共用）
+internal/northbound/opcua ──→ internal/opcuaserver + internal/cache
 internal/slave/modbus   ──→ internal/codec/modbus + internal/cache
 ```
 
@@ -143,7 +145,7 @@ HTTP POST /points/{d}/{p}/write
 cache 变更事件
   ├→ SSE Hub：按订阅过滤 → 每客户端有界缓冲 → 慢客户端丢弃最旧
   ├→ Outbox：写入 WAL → 投递 worker → 成功后删除
-  ├→ OPC UA：更新节点值 + 触发 DataChange 通知
+  ├→ OPC UA：更新节点值 + 触发 DataChange 通知（直接订阅 cache，不经过 Outbox）
   └→ 指标：计数/延迟
 ```
 
@@ -387,12 +389,13 @@ uic_<subsystem>_<name>{<labels>}
 
 ```
 1. 标记 not ready（停止接收新请求）
-2. 停止 scheduler（取消所有采集 context）
-3. 等待在飞采集结束（≤ 5s）
-4. flush outbox（≤ 3s，未完成则保留）
-5. 关闭驱动连接
-6. 关闭 HTTP 服务（优雅）
-7. 退出
+2. 关闭北向 OPC UA（它接受外部写入，必须先于调度收缩）
+3. 停止 scheduler（取消所有采集 context）
+4. 等待在飞采集结束（≤ 5s）
+5. flush outbox（≤ 3s，未完成则保留）
+6. 关闭驱动连接
+7. 关闭 HTTP 服务（优雅）
+8. 退出
 ```
 
 **总预算 10 秒**，超时则强制退出并记录。

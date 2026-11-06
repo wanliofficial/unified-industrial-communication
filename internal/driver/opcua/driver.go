@@ -1113,8 +1113,8 @@ func qualityFor(err error) model.Quality {
 
 // parseTarget 归一化通道地址：允许 host:port 与 opc.tcp://host:port 两种写法。
 //
-// 统一在这里做，是因为配置里两种写法现场都会出现（抄自 UaExpert 的是 URL，
-// 手写的是 host:port）。让驱动同时接受，比在文档里要求用户改配置更可靠。
+// 统一在这里做，是因为配置里两种写法现场都会出现（从客户端工具里复制的是
+// URL，手写的是 host:port）。让驱动同时接受，比在文档里要求用户改配置更可靠。
 func parseTarget(raw string) (addr, endpoint string, err error) {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
