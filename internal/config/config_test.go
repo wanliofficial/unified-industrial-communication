@@ -19,12 +19,14 @@ import (
 
 func registerDrivers(t *testing.T) {
 	t.Helper()
-	if _, ok := driver.Get("virtual"); ok {
-		return
-	}
-	for _, d := range []driver.Driver{virtual.New(), modbus.New(), computed.New()} {
+	// 逐个检查而不是「virtual 在就整体跳过」：后者会让后加进列表的驱动
+	// 在同一个测试进程里永远注册不上（前面的用例已经注册过 virtual）。
+	for _, d := range []driver.Driver{virtual.New(), modbus.New(), modbus.NewRTU(), computed.New()} {
+		if _, ok := driver.Get(d.Meta().ID); ok {
+			continue
+		}
 		if err := driver.Register(d); err != nil {
-			t.Fatalf("register: %v", err)
+			t.Fatalf("register %s: %v", d.Meta().ID, err)
 		}
 	}
 }
@@ -1045,4 +1047,98 @@ func TestValidateHistory(t *testing.T) {
 			t.Fatal("changing the retention policy must change the config version")
 		}
 	})
+}
+
+// 串口是独占资源：同一物理端口不能既做主机又做从站，也不能被两个从站
+// 同时打开。半双工总线上两个角色会互相抢答，症状是「偶发 CRC 错」。
+//
+// 比较的是字面路径；符号链接/`by-id` 别名指向同一设备时这里看不出来，
+// 这一点写在驱动规范里，而不是假装能自动识别。
+func TestValidateSlaveSerialPorts(t *testing.T) {
+	registerDrivers(t)
+
+	serialSlave := func(id, port string) model.Slave {
+		return model.Slave{
+			ID:     id,
+			Serial: &model.SlaveSerial{Port: port, Framing: "rtu", Baud: 19200},
+			Units: []model.SlaveUnit{{
+				UnitID: 1,
+				Mappings: []model.SlaveMapping{
+					{Point: "dev1/p1", Area: model.MappingHolding, Offset: 0},
+				},
+			}},
+		}
+	}
+	withMaster := func(f *File, port string) {
+		f.Channels = []model.Channel{{
+			ID: "ch-rtu", Protocol: "modbus-rtu",
+			Transport: model.Transport{Kind: "serial", Port: port, Baud: 19200},
+		}}
+		f.Devices[0].ChannelID = "ch-rtu"
+	}
+
+	// 从站独占一个没被主站使用的端口：合法。
+	f := baseFile()
+	withMaster(f, "/dev/ttyUSB0")
+	f.Slaves = []model.Slave{serialSlave("scada", "/dev/ttyUSB1")}
+	if err := f.Validate(); err != nil {
+		t.Fatalf("distinct ports must be accepted: %v", err)
+	}
+
+	// 同一个端口既做主站又做从站：拒绝。
+	f = baseFile()
+	withMaster(f, "/dev/ttyUSB0")
+	f.Slaves = []model.Slave{serialSlave("scada", "/dev/ttyUSB0")}
+	if err := f.Validate(); err == nil {
+		t.Fatal("slave must not reuse a channel's serial port")
+	} else if !strings.Contains(err.Error(), "channel ch-rtu") {
+		t.Fatalf("error should name the conflicting owner: %v", err)
+	}
+
+	// 两个从站抢同一根串口：拒绝。
+	f = baseFile()
+	withMaster(f, "/dev/ttyUSB0")
+	f.Slaves = []model.Slave{serialSlave("scada", "/dev/ttyUSB1"), serialSlave("scada2", "/dev/ttyUSB1")}
+	if err := f.Validate(); err == nil {
+		t.Fatal("two slaves must not share one serial port")
+	}
+
+	// 字面路径不同即视为不同端口（有意保守：宁可漏报，也不要误伤
+	// 两条真正独立的链路）。
+	f = baseFile()
+	withMaster(f, "/dev/ttyUSB0")
+	f.Slaves = []model.Slave{serialSlave("scada", "/dev/serial/by-id/usb-1")}
+	if err := f.Validate(); err != nil {
+		t.Fatalf("different literal paths must be accepted: %v", err)
+	}
+}
+
+// 两个 TCP 从站监听同一地址同样是配置错误：真正的失败会推迟到第二个
+// bind，那时第一个从站已经起来了，启动失败的日志更难读。
+func TestValidateSlaveListenConflicts(t *testing.T) {
+	registerDrivers(t)
+	slave := func(id, listen string) model.Slave {
+		return model.Slave{
+			ID: id, Listen: listen,
+			Units: []model.SlaveUnit{{
+				UnitID: 1,
+				Mappings: []model.SlaveMapping{
+					{Point: "dev1/p1", Area: model.MappingHolding, Offset: 0},
+				},
+			}},
+		}
+	}
+
+	f := baseFile()
+	f.Slaves = []model.Slave{slave("a", "127.0.0.1:1502"), slave("b", "127.0.0.1:1502")}
+	if err := f.Validate(); err == nil {
+		t.Fatal("duplicate listen addresses must be rejected")
+	}
+
+	// 端口 0 是随机分配，两个从站都用 :0 不算冲突。
+	f = baseFile()
+	f.Slaves = []model.Slave{slave("a", "127.0.0.1:0"), slave("b", "127.0.0.1:0")}
+	if err := f.Validate(); err != nil {
+		t.Fatalf("port 0 must not conflict: %v", err)
+	}
 }

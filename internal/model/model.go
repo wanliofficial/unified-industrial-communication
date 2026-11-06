@@ -804,16 +804,99 @@ type SlaveIdentity struct {
 	UserApplicationName string `json:"userApplicationName,omitempty"`
 }
 
+// SlaveSerial 是从站的串口监听端点（Modbus RTU / ASCII 从站）。
+//
+// 与 TCP 从站的差别不只是「换一种传输」：
+//   - 一条串口线上可以挂多个 Unit ID，但同一时刻只服务一个请求；
+//   - 帧没有长度前缀，必须按功能码推导长度；CRC/LRC 错了只能丢弃并等
+//     下一个静默间隔重新同步；
+//   - 同一个物理端口不能既做从站又做主站（半双工总线上两个角色会互相
+//     抢答）。这条互斥由配置层跨通道检查。
+type SlaveSerial struct {
+	Port     string `json:"port"`
+	Baud     int    `json:"baud,omitempty"`
+	DataBits int    `json:"dataBits,omitempty"`
+	Parity   string `json:"parity,omitempty"`
+	StopBits int    `json:"stopBits,omitempty"`
+	// Framing 选择串口上的帧格式：rtu | ascii。
+	//
+	// 不做自动探测：两种帧的校验方式与分帧规则完全不同，探测失败会把
+	// 故障推迟到第一次采样，而且现场看到的只是「读不到数据」。
+	Framing string `json:"framing"`
+}
+
+// Normalized 补齐串口默认值。只把零值当作「未设置」。
+//
+// 与 transport.SerialConfig.Normalized 保持一致（model 不依赖内部包，
+// 因此这里是同一套规则的第二份表述；slave 包有交叉测试盯着两者）。
+func (s SlaveSerial) Normalized() SlaveSerial {
+	if s.Baud == 0 {
+		s.Baud = 9600
+	}
+	if s.DataBits == 0 {
+		s.DataBits = 8
+	}
+	if s.Parity == "" {
+		s.Parity = "none"
+	}
+	if s.StopBits == 0 {
+		s.StopBits = 1
+	}
+	return s
+}
+
+// Validate 校验串口参数。参数错了不会报错，只会「读不到东西」。
+func (s SlaveSerial) Validate() error {
+	if s.Port == "" {
+		return errors.New("serial.port: required")
+	}
+	switch s.Framing {
+	case "rtu", "ascii":
+	default:
+		return fmt.Errorf("serial.framing %q: must be rtu or ascii", s.Framing)
+	}
+	n := s.Normalized()
+	if n.DataBits < 5 || n.DataBits > 8 {
+		return fmt.Errorf("serial.dataBits %d: must be 5..8", n.DataBits)
+	}
+	switch n.Parity {
+	case "none", "even", "odd":
+	default:
+		return fmt.Errorf("serial.parity %q: must be none|even|odd", n.Parity)
+	}
+	if n.StopBits != 1 && n.StopBits != 2 {
+		return fmt.Errorf("serial.stopBits %d: must be 1 or 2", n.StopBits)
+	}
+	switch n.Baud {
+	case 300, 600, 1200, 2400, 4800, 9600, 19200, 38400, 57600, 115200, 230400, 460800, 921600:
+	default:
+		return fmt.Errorf("serial.baud %d: unsupported", n.Baud)
+	}
+	return nil
+}
+
 // Slave 是一个从站监听端点。
 //
 // 存在即启用：停用一个从站的方式是从配置里删掉它。额外的 enabled 字段
 // 只会制造「配置了但没生效」的状态，而这正是本项目要避免的那一类问题。
+//
+// Listen 与 Serial 二选一：前者是 TCP 监听，后者是串口（RTU/ASCII）。
 type Slave struct {
 	ID             string         `json:"id"`
-	Listen         string         `json:"listen"`
+	Listen         string         `json:"listen,omitempty"`
+	Serial         *SlaveSerial   `json:"serial,omitempty"`
 	MaxConnections int            `json:"maxConnections,omitempty"`
 	Identity       *SlaveIdentity `json:"identity,omitempty"`
 	Units          []SlaveUnit    `json:"units"`
+}
+
+// Endpoint 返回用于日志与诊断的端点描述。
+func (s Slave) Endpoint() string {
+	if s.Serial != nil {
+		n := s.Serial.Normalized()
+		return fmt.Sprintf("%s %s", n.Port, n.Framing)
+	}
+	return s.Listen
 }
 
 // EffectiveMaxConnections 返回并发连接上限（默认 8，范围 1..64）。
@@ -848,8 +931,24 @@ func (s Slave) Validate(points map[string]Point) error {
 	if !idRe.MatchString(s.ID) {
 		return fmt.Errorf("slave.id %q: must match %s", s.ID, idRe.String())
 	}
-	if s.Listen == "" {
-		return fmt.Errorf("slave %q: listen required", s.ID)
+	// 监听端点必须恰好选一个：两个都给会让「实际监听在哪」取决于实现
+	// 里 if 的先后，两个都不给则是一条永远起不来的配置。
+	hasTCP, hasSerial := s.Listen != "", s.Serial != nil
+	switch {
+	case hasTCP && hasSerial:
+		return fmt.Errorf("slave %q: listen and serial are mutually exclusive", s.ID)
+	case !hasTCP && !hasSerial:
+		return fmt.Errorf("slave %q: one of listen or serial required", s.ID)
+	}
+	if s.Serial != nil {
+		if err := s.Serial.Validate(); err != nil {
+			return fmt.Errorf("slave %q: %w", s.ID, err)
+		}
+		// 串口是单主站总线，连接数这个概念不成立。配了却不生效比报错
+		// 更糟：运维会以为「设了 8 就能接 8 条链路」。
+		if s.MaxConnections != 0 {
+			return fmt.Errorf("slave %q: maxConnections is not applicable to serial endpoints", s.ID)
+		}
 	}
 	if s.MaxConnections < 0 || s.MaxConnections > 64 {
 		return fmt.Errorf("slave %q: maxConnections %d out of range 0..64", s.ID, s.MaxConnections)

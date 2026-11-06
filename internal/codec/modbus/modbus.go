@@ -39,6 +39,12 @@ const (
 	MaxReadBits      = 2000
 )
 
+// RTUMaxFrame 是 RTU 帧的字节上限：地址(1) + PDU(253) + CRC(2)。
+//
+// 从站按它给「长度无法推导、只能读到静默」的帧兜底：没有上限时，一条
+// 持续有噪声的线路可以让缓冲区无限增长。
+const RTUMaxFrame = 1 + 253 + 2
+
 // Codec 是 Modbus 主站侧的编解码器。
 type Codec struct {
 	DeviceID string
@@ -526,6 +532,50 @@ func BuildRTU(unit byte, pdu []byte) []byte {
 	out = append(out, pdu...)
 	crc := CRC16(out)
 	return append(out, byte(crc), byte(crc>>8))
+}
+
+// RTURequestLen 由已收到的帧头推导**请求**整帧长度（地址 + PDU + CRC）。
+//
+// head 至少要包含地址与功能码（2 字节）。返回 ok=false 表示无法推导：
+// 功能码未知，或（FC15/16）字节数字段还没收到。调用方应当退回「读到
+// 链路静默」的分帧方式——绝不能猜：猜短了会把下一帧的开头当成这一帧
+// 的尾巴，猜长了会一直等一段永不到来的数据。
+//
+// 这里的长度表是**从站**解析请求用的；主站侧对应的表是
+// RTUExpectedResponseLen，两者不要合并：请求与响应的 PDU 形状不同，
+// 合成一张表会制造「读写都能过、但长度源不同」的隐式耦合。
+func RTURequestLen(head []byte) (int, bool) {
+	if len(head) < 2 {
+		return 0, false
+	}
+	switch head[1] {
+	// 读请求（地址 + FC + 起始地址 + 数量 + CRC）与单写请求
+	// （地址 + FC + 地址 + 值 + CRC）都是 8 字节；FC8 的诊断请求
+	// （子功能 + 数据各 2 字节）也是 8 字节。
+	case FCReadCoils, FCReadDiscreteInputs, FCReadHoldingRegs, FCReadInputRegs,
+		FCWriteSingleCoil, FCWriteSingleRegister, FC08:
+		return 8, true
+	// 没有数据字段的短请求。
+	case FC11, FC17:
+		return 4, true
+	case FCWriteMultipleCoils, FCWriteMultipleRegs:
+		// 字节数字段在帧内偏移 6（地址 1 + FC 1 + 起始 2 + 数量 2）。
+		if len(head) < 7 {
+			return 0, false
+		}
+		return 9 + int(head[6]), true
+	case FC43:
+		// 只实现 MEI 0x0E（读设备标识），请求固定 4 字节 PDU；
+		// 其他 MEI 是变长封装，交给静默分帧。
+		if len(head) < 3 {
+			return 0, false
+		}
+		if head[2] == 0x0E {
+			return 7, true
+		}
+		return 0, false
+	}
+	return 0, false
 }
 
 // RTUExpectedResponseLen 由请求 PDU 推导**正常**响应的帧总长（地址 + PDU + CRC）。

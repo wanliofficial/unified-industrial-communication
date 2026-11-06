@@ -92,6 +92,24 @@ curl -s localhost:8093/api/v1/points/ua1/counter   # 每秒自增，由服务端
 `uic mbread` 是内置的极简主站：寄存器打印 uint16 / int16 / 十六进制并拼 float32，
 位区逐位打印。写入会穿透到真实设备，不是改缓存。
 
+串口从站（RS-485 半双工；`serial.framing` 必须显式写 `rtu` 或 `ascii`）：
+
+```bash
+# 有硬件时把 serial.port 改成 /dev/ttyUSB0；没有硬件可用一对 pty 模拟总线：
+#   socat -d -d pty,raw,echo=0 pty,raw,echo=0
+./uic -config examples/modbus-slave-rtu.json &     # 从站打开 serial.port
+./uic mbread -transport rtu -port /dev/pts/11 -unit 1 -area holding -offset 0 -qty 2
+./uic mbread -transport rtu -port /dev/pts/11 -unit 1 -area holding -offset 2 -write 777
+# 串口参数：-baud / -dataBits / -parity / -stopBits（与配置同名）
+```
+
+串口上的地址语义与 TCP 不同，且都是刻意的：非本机单元号**静默**（同一条总线上
+还有别的从站），广播（单元 0）只执行写不回应，CRC/LRC 错后丢弃残字节重新同步，
+半帧直接丢弃而不是把下一帧的开头接上来。RTU 按功能码推导帧长，推不出来时（未知
+功能码）才退回 3.5 字符静默；ASCII 以 `:` 起始、CRLF 结束。USB 适配器掉线
+（EIO）会按 1s→2s→…→30s 退避重开，不需要重启进程。串口端口与主站通道、其他从站
+按字面路径互斥，配置期就会拒绝重复占用。
+
 从站还实现了诊断与设备识别：FC8（回显/清计数/六类计数）、FC11（事件计数器）、
 FC17（服务器 ID）、FC43/MEI 0x0E（读设备标识，支持 basic/regular/extended 与按
 对象读取，响应超长时自动分页）。`slaves[].identity` 可配置厂商、型号、版本等

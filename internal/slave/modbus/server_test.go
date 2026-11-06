@@ -35,10 +35,15 @@ type fakeWriter struct {
 }
 
 func (f *fakeWriter) Write(_ context.Context, reqs []WriteRequest) []WriteResult {
-	if f.mu != nil {
-		f.mu <- struct{}{}
-	}
 	f.got = append(f.got, reqs...)
+	// 通知放在 append 之后：测试收到信号再读 got 才有 happens-before，
+	// 否则 -race 会把「先发信号后写数据」判成数据竞争。
+	if f.mu != nil {
+		select {
+		case f.mu <- struct{}{}:
+		default:
+		}
+	}
 	out := make([]WriteResult, len(reqs))
 	for i := range out {
 		if f.fail {

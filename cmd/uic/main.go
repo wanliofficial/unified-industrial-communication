@@ -7,7 +7,8 @@
 //	uic sim -protocol s7 -listen 127.0.0.1:15102   # 内置 S7 从站
 //	uic sim -protocol opcua -listen 127.0.0.1:14840 # 内置 OPC UA 服务端
 //	uic sim -protocol mqtt -listen 127.0.0.1:18830  # 内置 MQTT Broker（南向演示）
-//	uic mbread -addr 127.0.0.1:1502    # 不依赖第三方工具的从站读写自检
+//	uic mbread -addr 127.0.0.1:1502    # 不依赖第三方工具的从站读写自检（TCP）
+//	uic mbread -transport rtu -port /dev/ttyUSB0 -unit 1   # 串口从站自检
 //	uic uaread -addr 127.0.0.1:4840 -nodes ns=2;s=site/dev/point  # OPC UA 读写自检
 //	uic token -name ops -role operator   # 生成用户凭据（明文 + tokenSha256）
 //
@@ -90,6 +91,7 @@ func usage() {
   uic sim [-listen 127.0.0.1:15020] [-protocol modbus|s7|opcua|mqtt]
   uic mbread -addr 127.0.0.1:1502 -unit 1 -area holding -offset 0 -qty 2
   uic mbread -addr 127.0.0.1:1502 -area holding -offset 5 -write 777
+  uic mbread -transport rtu|ascii -port /dev/ttyUSB0 [-baud 19200] [-parity even]
   uic uaread -addr 127.0.0.1:4840 -nodes ns=2;s=site/dev/point [-type float64]
   uic uaread -addr 127.0.0.1:4840 -nodes ns=2;s=site/dev/setpoint -write 42.5
   uic token [-name ops] [-role viewer|operator|admin] [-count N] [-json]

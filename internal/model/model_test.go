@@ -648,3 +648,79 @@ func TestChannelSubscriptionFields(t *testing.T) {
 		}
 	}
 }
+
+// 串口从站端点：listen 与 serial 必须恰好选一个，串口参数必须在配置期
+// 就拦住。串口参数错了不会报错，只会「读不到东西」——那是最难排查的一类
+// 故障，必须在加载配置时就失败。
+func TestSlaveSerialEndpoint(t *testing.T) {
+	points := map[string]Point{"plc/u16": {ID: "u16", DataType: TypeUint16}}
+	units := []SlaveUnit{{
+		UnitID:   1,
+		Mappings: []SlaveMapping{{Point: "plc/u16", Area: MappingHolding, Offset: 0}},
+	}}
+	base := func() Slave {
+		return Slave{
+			ID:     "scada",
+			Serial: &SlaveSerial{Port: "/dev/ttyUSB0", Framing: "rtu"},
+			Units:  units,
+		}
+	}
+	if err := base().Validate(points); err != nil {
+		t.Fatalf("valid serial slave: %v", err)
+	}
+	if got := base().Endpoint(); got != "/dev/ttyUSB0 rtu" {
+		t.Fatalf("endpoint = %q", got)
+	}
+
+	// 两个都给：实际监听在哪取决于实现里 if 的先后，是配置期必须拒绝的歧义。
+	both := base()
+	both.Listen = "127.0.0.1:1502"
+	if err := both.Validate(points); err == nil {
+		t.Fatal("listen + serial must be rejected")
+	}
+	// 两个都不给。
+	none := base()
+	none.Serial = nil
+	if err := none.Validate(points); err == nil {
+		t.Fatal("missing endpoint must be rejected")
+	}
+	// 连接数是 TCP 概念：串口上配了也不会生效，必须报错而不是忽略。
+	mc := base()
+	mc.MaxConnections = 4
+	if err := mc.Validate(points); err == nil {
+		t.Fatal("maxConnections on serial must be rejected")
+	}
+
+	cases := map[string]func(*SlaveSerial){
+		"missing port":  func(s *SlaveSerial) { s.Port = "" },
+		"bad framing":   func(s *SlaveSerial) { s.Framing = "modbus" },
+		"missing frame": func(s *SlaveSerial) { s.Framing = "" },
+		"bad baud":      func(s *SlaveSerial) { s.Baud = 1234 },
+		"bad parity":    func(s *SlaveSerial) { s.Parity = "mark" },
+		"bad data bits": func(s *SlaveSerial) { s.DataBits = 9 },
+		"bad stop bits": func(s *SlaveSerial) { s.StopBits = 3 },
+	}
+	for name, mut := range cases {
+		s := base()
+		mut(s.Serial)
+		if err := s.Validate(points); err == nil {
+			t.Fatalf("%s: expected error", name)
+		}
+	}
+
+	// 边界值：5 数据位、2 停止位、偶校验、921600 都是合法的。
+	edge := base()
+	edge.Serial = &SlaveSerial{
+		Port: "/dev/ttyS1", Framing: "ascii",
+		Baud: 921600, DataBits: 5, Parity: "even", StopBits: 2,
+	}
+	if err := edge.Validate(points); err != nil {
+		t.Fatalf("boundary serial params: %v", err)
+	}
+
+	// 零值补默认值，且负数不被悄悄改成默认值。
+	n := SlaveSerial{Port: "/dev/ttyS0", Framing: "rtu"}.Normalized()
+	if n.Baud != 9600 || n.DataBits != 8 || n.Parity != "none" || n.StopBits != 1 {
+		t.Fatalf("defaults = %+v", n)
+	}
+}

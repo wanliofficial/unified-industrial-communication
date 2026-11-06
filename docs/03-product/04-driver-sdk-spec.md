@@ -454,7 +454,7 @@ type Kinded interface{ Kind() ErrorKind }
 用于自测与演示。它与主站共用 `codec/s7`，所以「长度单位」这类语义不会在主从
 之间分叉——这是本项目对「自测有效性」的最低要求：测试夹具不能是另一套实现。
 
-### 3.8 Modbus TCP 从站
+### 3.8 Modbus 从站（TCP / RTU / ASCII）
 
 从站不是「把主站反过来写」。它与主站面对的问题域有三处根本不同：
 
@@ -467,6 +467,10 @@ type Kinded interface{ Kind() ErrorKind }
 
 因此从站是 `internal/slave/modbus` 而不是 `driver/modbus` 的一个模式：两者共享
 `codec/modbus` 的纯函数，但生命周期、并发模型与错误语义完全不同。
+
+串口端点（RTU / ASCII）复用同一套映射、读路径与写穿透逻辑，但**分帧与地址语义
+必须单独实现**——把 TCP 从站原样搬到串口，会在「其他从站的地址」「广播」「半帧」
+三处同时出错。差异集中在 §3.8.2。
 
 #### 3.8.1 配置即启用
 
@@ -512,13 +516,77 @@ type Kinded interface{ Kind() ErrorKind }
 3. 同一 `area` 内地址区间不允许重叠（不同区可以同偏移）。
 4. `offset + RegisterWidth() <= 65536`。
 5. `writable` 必须同时满足：区可写（holding/coil）**且**点位 `writable: true`。
-6. 从站 `listen` 不得与 `server.listen` 冲突。端口 0 永远不算冲突（测试与容器部署依赖它）。
+6. 从站 `listen` 不得与 `server.listen` 或其他从站的 `listen` 冲突。端口 0 永远不算冲突
+   （测试与容器部署依赖它）。
+7. `listen` 与 `serial` 恰好二选一：两个都给会产生「实际监听在哪」的歧义，两个都不给是
+   一条永远起不来的配置。
+8. `serial.port` 不得与任何 `channels[].transport.port`（串口主站）或其他从站重复。
+   半双工总线上两个角色会互相抢答。串口端点上出现 `maxConnections` 同样是配置错误。
 
 宽度来自 `Point.RegisterWidth()`：`bool`/`uint16` 为 1，`float32` 为 2，`float64` 为 4，
 `string`/`bytes` 的 `address.length` 是**寄存器个数**而不是字符数。这条规则单独抽成
 方法，就是为了避免每个调用点各自解释一遍 `length`。
 
-#### 3.8.2 读路径：对端要什么就给什么
+#### 3.8.2 串口端点（RTU / ASCII）
+
+串口从站与 TCP 从站共用同一份映射、读写与写穿透代码，但分帧与地址语义必须单独
+处理。四个差异，每一个都会让「把 TCP 从站原样搬到串口」的实现出错：
+
+| 维度 | TCP | 串口 RTU / ASCII |
+|---|---|---|
+| 分帧 | MBAP 长度字段 | RTU：按功能码推导长度，推不出来时靠 3.5 字符静默；ASCII：`:` 起始、CRLF 结束 |
+| 地址不是本机 | 回 `0x0B` | **必须静默**：一条总线上多台从站，替别人的地址应答就是串扰 |
+| 广播（地址 0） | 无此概念 | 执行写但不回应；广播读没有意义 |
+| 连接数 | `maxConnections` | 不适用：物理端口只有一个，同一时刻只服务一个请求 |
+
+**配置**（`listen` 换成 `serial`，其余字段完全一致）：
+
+```json
+{
+  "slaves": [{
+    "id": "scada-rtu",
+    "serial": {
+      "port": "/dev/ttyUSB0", "framing": "rtu", "baud": 19200,
+      "dataBits": 8, "parity": "none", "stopBits": 1
+    },
+    "units": [{ "unitId": 1, "mappings": [ ... ] }]
+  }]
+}
+```
+
+`serial.framing` 必须显式写 `rtu` 或 `ascii`，不做自动探测：两种帧的校验方式与
+分帧规则完全不同，探测失败只会把故障推迟到第一次采样。
+
+**RTU 分帧**：
+
+1. 等地址字节，读功能码。
+2. 已知功能码按表推导整帧长度，一次读满：读类固定 8 字节、FC11/FC17 为 4 字节、
+   FC15/16 为 `9 + byteCount`、FC43/MEI 0x0E 为 7 字节。
+3. 推导不出来（未知功能码、其他 MEI）时读到链路静默为止，再用 CRC 校验；上限
+   256 字节，防止一条噪声线把缓冲区撑爆。
+4. CRC 错：丢弃整帧，读到静默并 `tcflush` 残字节后重新同步。
+5. 半帧（帧内超时）：丢弃并重新同步——**绝不能**把下一帧的开头接上去。
+
+帧间静默按 3.5 个字符时间计算，下限 5 ms：USB 转串口适配器的转发延迟普遍在
+1..16 ms，严格按 9600 波特下的 3.6 ms 切帧会把完整帧截断，症状是「偶发 CRC 错」。
+
+**ASCII 分帧**：以 `:` 起始、CRLF 结束，帧外噪声逐字节丢弃；帧内字符间隔上限
+1 s（规范值）。响应按**同一分帧方式**回写（RTU 二进制、ASCII 十六进制文本）——
+用错对端会收到一条永远解析不了的帧。
+
+**广播与地址过滤**：串口上 `unit=0` 的写请求会被应用到全部单元并**不回应**；
+读请求直接忽略。非本机单元号的请求既不应答也不计数为错误——总线上每台从站都
+会收到它，谁回应都会造成串扰。
+
+**断线重连**：串口读返回非超时错误（USB 适配器掉线、EIO）时，从站按
+1s → 2s → … → 30s 退避重开同一路径，成功会记录 `slave_serial_reopened`。
+要求重启进程才能恢复一个「拔插一下就好」的适配器，是现场最不必要的停机。
+
+**指标**：串口特有的帧失败单独计数（见 §3.8.6 的 `uic_slave_bad_frames_total`）。
+把它们混进 `uic_slave_requests_total` 会让「对端发了多少请求」与「线路上坏了多少帧」
+两件事无法区分。
+
+#### 3.8.3 读路径：对端要什么就给什么
 
 主站可以读任意 `[offset, offset+qty)`，这段区间可能：
 
@@ -541,7 +609,7 @@ type Kinded interface{ Kind() ErrorKind }
 
 位区的读法按位打包（每 8 位一字节，低位在前），与寄存器区共享同一套映射查找。
 
-#### 3.8.3 写路径：必须穿透到南向
+#### 3.8.4 写路径：必须穿透到南向
 
 外部主站写从站，不是写本地缓存，而是要真的下发到 PLC。代码上只有一条路径：
 
@@ -569,14 +637,16 @@ Modbus 写请求 → decodeCellValue（按单元字节序还原） → Writer.Wr
 | 未知功能码 | 返回 `0x01` | — |
 | 报文长度/字节数与功能码不匹配 | 返回 `0x03` | 认出功能码但数据非法 |
 
-#### 3.8.4 连接与生命周期
+#### 3.8.5 连接与生命周期
 
 - accept 后按 `maxConnections`（默认 8，上限 64）占用槽位；超限**立刻关闭**而不是排队。
   排队会把「过载」伪装成「网络慢」。
 - 空闲连接按 `idleTimeout`（默认 5 分钟）回收。
-- `Close` 幂等：关闭监听、关闭全部连接、等待 goroutine 退出。
+- `Close` 幂等：关闭监听、关闭全部连接、等待 goroutine 退出；串口端点关闭串口句柄，
+  阻塞中的读会立刻返回，循环因此能退出。
 - 单个连接的事务是串行的：Modbus TCP 允许流水线，但多数主站不发；按序处理可以
   避免响应乱序带来的额外状态机。
+- 串口端点没有「连接」概念：一个端口、一条循环、同一时刻一个事务（RS-485 是半双工）。
 
 **热更新**：`syncSlaves` 比较指纹决定是否重建某个从站。指纹覆盖：
 
@@ -587,15 +657,16 @@ Modbus 写请求 → decodeCellValue（按单元字节序还原） → Writer.Wr
 一个字都没改，但线上字节完全不同。重建时先关旧监听再建新的；重建失败会记录
 `slave_rebuild_failed` 并保留其余从站，不让一个坏配置拖垮全部服务。
 
-#### 3.8.5 指标
+#### 3.8.6 指标
 
 | 指标 | 标签 | 含义 |
 |---|---|---|
-| `uic_slave_requests_total` | `slave` / `unit` / `fc` / `result` | 请求总数；`result=exception` 表示返回了异常码 |
+| `uic_slave_requests_total` | `slave` / `unit` / `fc` / `result` | 请求总数；`result=exception` 表示返回了异常码，`result=broadcast` 是串口广播写 |
 | `uic_slave_degraded_reads_total` | `slave` | 用非 good 质量数据应答的次数（值保留，质量靠指标暴露） |
 | `uic_slave_write_total` | `slave` / `result` | 写转发次数与结果 |
+| `uic_slave_bad_frames_total` | `slave` / `reason` | 串口帧失败：`crc` / `lrc` / `short` / `noise`；与「请求数」分开，才能区分线路质量与对端行为 |
 
-#### 3.8.6 诊断与设备识别（FC8 / FC11 / FC17 / FC43）
+#### 3.8.7 诊断与设备识别（FC8 / FC11 / FC17 / FC43）
 
 读写类功能码解决「值是多少」，这四类解决「你是谁」。缺了它们，上位机的设备树
 里只有一堆无名寄存器；有它们，才能显示厂商/型号/版本，并在设备替换时自动匹配
@@ -609,7 +680,7 @@ Modbus 写请求 → decodeCellValue（按单元字节序还原） → Writer.Wr
 | `0x0000` | Return Query Data | 原样回显请求里的两个数据字节 |
 | `0x000A` | Clear Counters | 清 `requests` / `exceptions` / `events` 三个**协议计数** |
 | `0x000B` | Bus Message Count | 收到的消息总数（16 位截断） |
-| `0x000C` | Bus Communication Error Count | 恒为 0：TCP 没有 CRC/字符层 |
+| `0x000C` | Bus Communication Error Count | TCP 上恒为 0（没有 CRC/字符层）；串口上返回 CRC/LRC 错误计数 |
 | `0x000D` | Bus Exception Error Count | 返回过异常响应的请求数 |
 | `0x000E` | Server Message Count | 同 `0x000B`（本实现所有消息都进同一入口） |
 | `0x000F` | Server No Response Count | 恒为 0：TCP 从站总会应答 |
@@ -618,7 +689,7 @@ Modbus 写请求 → decodeCellValue（按单元字节序还原） → Writer.Wr
 | `0x0012` | Bus Character Overrun Count | 恒为 0：字节流由内核分帧，无此概念 |
 
 未知子功能返回异常 `0x01`；PDU 长度不是 5 字节返回 `0x03`。`0x000A` **只清协议
-计数，不动指标**：`uic_slave_requests_total` 是给监控系统看的水位，如果被对端
+计数（含串口 CRC/LRC 计数），不动指标**：`uic_slave_requests_total` 是给监控系统看的水位，如果被对端
 一个诊断请求清零，监控曲线会出现无法解释的断崖。
 
 **FC11 Get Comm Event Counter**
@@ -665,13 +736,13 @@ Modbus 写请求 → decodeCellValue（按单元字节序还原） → Writer.Wr
 （「你跑的是哪个版本」）就答不上来。标识只是公开的产品信息，不要写入内部主机名、
 IP、序列号等资产信息：FC43 是匿名可读的。
 
-#### 3.8.7 边界
+#### 3.8.8 边界
 
 | 项 | 状态 | 说明 |
 |---|---|---|
 | Modbus TCP 从站 | ✅ | MBAP、四区映射、读写、连接上限、热更新 |
-| Modbus RTU / ASCII 从站 | ❌ | 串口从站需要与主站角色互斥；本版本只做 TCP |
-| 诊断功能码（FC8/FC11/FC17/FC43） | ✅ | 回显/清计数/六类计数、事件计数器、服务器 ID、读设备标识（basic/regular/extended/按对象读取 + 分页） |
+| Modbus RTU / ASCII 从站 | ✅ | 串口按功能码推导帧长（推不出来时读到静默）、非本机地址静默、广播写不回应、CRC/LRC 错后重新同步、掉线按退避重开；与主站角色按端口互斥（配置期校验） |
+| 诊断与识别（FC8/FC11/FC17/FC43） | ✅ | 回显/清计数/六类计数、事件计数器、服务器 ID、读设备标识（basic/regular/extended/按对象读取 + 分页） |
 | 文件记录（FC14/15/20/21） | ❌ | 需要一套独立的记录寻址与流控；现场用它的设备很少，收益不抵复杂度 |
 | 多寄存器位写（掩码写，FC22） | ❌ | 从站不实现 FC22；主站侧的寄存器位写由主站驱动用 FC3+FC6 读-改-写完成，不依赖该功能码 |
 | 主动上报（unsolicited） | 不适用 | Modbus 本身是请求-响应模型 |

@@ -101,6 +101,20 @@ func ParseASCII(b []byte) (unit byte, pdu []byte, err error) {
 	return raw[0], append([]byte(nil), raw[1:len(raw)-1]...), nil
 }
 
+// ASCIIRequestLen 由请求帧头推导整帧**字符数**（含 ':' 与 CRLF）。
+//
+// 与 RTU 一样，ok=false 表示长度无法推导，调用方应退回「读到 CRLF」的
+// 分帧方式。ASCII 帧以 CRLF 结束，理论上不预知长度也能读；预知长度的
+// 价值在于「帧被截断时不必等到字符超时才发现」。
+func ASCIIRequestLen(head []byte) (int, bool) {
+	rtu, ok := RTURequestLen(head)
+	if !ok {
+		return 0, false
+	}
+	// RTU 帧 = 地址 1 + PDU + CRC 2；ASCII = ':' + 2×(地址+PDU+LRC) + CRLF。
+	return 2*rtu + 1, true
+}
+
 // ASCIIExpectedResponseLen 由请求 PDU 推导**正常**响应的帧总字符数。
 //
 // ASCII 帧本身以 CRLF 分帧，理论上不需要预知长度；但有了它就能在读完

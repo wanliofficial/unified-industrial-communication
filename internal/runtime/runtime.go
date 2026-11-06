@@ -293,6 +293,7 @@ func (r *Runtime) declareMetrics() {
 	d("uic_slave_requests_total", "counter", "从站请求数（按单元/功能码/结果）")
 	d("uic_slave_degraded_reads_total", "counter", "从站用非好质量数据应答的次数")
 	d("uic_slave_write_total", "counter", "从站写入转发次数与结果")
+	d("uic_slave_bad_frames_total", "counter", "从站收到的坏帧数（按原因：crc/lrc/short/noise）")
 	d("uic_alarm_events_total", "counter", "报警状态迁移次数（按类型/级别）")
 	d("uic_alarm_active", "gauge", "当前未恢复的报警数（按级别，含已确认）")
 	d("uic_alarm_pending", "gauge", "处于 onDelay 等待期的报警数")

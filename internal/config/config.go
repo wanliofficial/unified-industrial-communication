@@ -726,7 +726,22 @@ func (f *File) validateSlaves() error {
 			points[d.ID+"/"+p.ID] = p
 		}
 	}
+	// 串口是独占资源：同一个物理端口不能既做主机又做从站，也不能被两个
+	// 从站同时打开。半双工总线上两个角色会互相抢答，症状是「偶发 CRC 错」
+	// 或「读到的值来自另一台设备」——必须在配置期拦住。
+	//
+	// 比较的是**字面路径**：`/dev/ttyUSB0` 与 `/dev/serial/by-id/...` 指
+	// 向同一台设备时这里看不出来。符号链接的风险写在驱动规范里，不假装
+	// 能自动识别。
+	serialOwner := make(map[string]string, len(f.Channels)+len(f.Slaves))
+	for _, ch := range f.Channels {
+		if ch.Transport.Kind == "serial" && ch.Transport.Port != "" {
+			serialOwner[ch.Transport.Port] = "channel " + ch.ID
+		}
+	}
 	seen := make(map[string]bool, len(f.Slaves))
+	type listenEntry struct{ id, addr string }
+	listens := make([]listenEntry, 0, len(f.Slaves))
 	for _, s := range f.Slaves {
 		if err := s.Validate(points); err != nil {
 			return err
@@ -735,10 +750,26 @@ func (f *File) validateSlaves() error {
 			return fmt.Errorf("slave %q: duplicate id", s.ID)
 		}
 		seen[s.ID] = true
+		if s.Serial != nil {
+			port := s.Serial.Normalized().Port
+			if owner, ok := serialOwner[port]; ok {
+				return fmt.Errorf("slave %q: serial port %q already used by %s; one port can be either a master or a slave, not both", s.ID, port, owner)
+			}
+			serialOwner[port] = "slave " + s.ID
+			continue
+		}
 		// 与北向 HTTP 监听撞端口是最常见的配置错误，值得单独拦一次。
 		if listenConflicts(s.Listen, f.Server.Listen) {
 			return fmt.Errorf("slave %q: listen %q conflicts with server.listen", s.ID, s.Listen)
 		}
+		// 两个从站监听同一地址同样要拦：真正的失败会推迟到第二个 bind，
+		// 那时第一个从站已经起来了，启动失败的日志会更难读。
+		for _, e := range listens {
+			if listenConflicts(s.Listen, e.addr) {
+				return fmt.Errorf("slave %q: listen %q conflicts with slave %q", s.ID, s.Listen, e.id)
+			}
+		}
+		listens = append(listens, listenEntry{s.ID, s.Listen})
 	}
 	return nil
 }

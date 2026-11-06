@@ -12,10 +12,11 @@ import (
 	"time"
 
 	mb "uic/internal/codec/modbus"
+	"uic/internal/transport"
 )
 
-// mbread 是一个极小的 Modbus TCP 主站，用来在没有第三方工具的情况下
-// 验证从站（内置或真实设备）。
+// mbread 是一个极小的 Modbus 主站，用来在没有第三方工具的情况下
+// 验证从站（内置、真实设备或本进程的串口从站）。
 //
 // 存在的理由：现场最缺的不是「功能」，而是「不依赖任何外部安装即可自证
 // 链路通」的手段。用 curl 验不了 Modbus，用商业工具又要求先装软件、再
@@ -25,7 +26,13 @@ import (
 // 边界：只做单次读写，不做轮询、不做重试、不解析设备型号。
 func mbreadCmd(args []string) {
 	fs := flag.NewFlagSet("mbread", flag.ExitOnError)
-	addr := fs.String("addr", "127.0.0.1:1502", "从站地址 host:port")
+	tr := fs.String("transport", "tcp", "传输：tcp | rtu | ascii")
+	addr := fs.String("addr", "127.0.0.1:1502", "从站地址 host:port（tcp）")
+	port := fs.String("port", "", "串口设备路径，如 /dev/ttyUSB0（rtu/ascii）")
+	baud := fs.Int("baud", 9600, "波特率（rtu/ascii）")
+	dataBits := fs.Int("dataBits", 8, "数据位 5..8（rtu/ascii）")
+	parity := fs.String("parity", "none", "校验：none | even | odd（rtu/ascii）")
+	stopBits := fs.Int("stopBits", 1, "停止位 1|2（rtu/ascii）")
 	unit := fs.Int("unit", 1, "从站单元号 0..247")
 	area := fs.String("area", "holding", "区：holding | input | coil | discrete")
 	offset := fs.Int("offset", 0, "起始地址")
@@ -39,28 +46,79 @@ func mbreadCmd(args []string) {
 		os.Exit(2)
 	}
 
-	conn, err := net.DialTimeout("tcp", *addr, *timeout)
+	bus, err := openBus(*tr, *addr, *port, transport.SerialConfig{
+		Port: *port, Baud: *baud, DataBits: *dataBits,
+		Parity: *parity, StopBits: *stopBits,
+	}, *timeout)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "连接 %s 失败: %v\n", *addr, err)
+		fmt.Fprintf(os.Stderr, "%v\n", err)
 		os.Exit(1)
 	}
-	defer conn.Close()
-	_ = conn.SetDeadline(time.Now().Add(*timeout))
+	defer bus.Close()
 
 	if *write != "" {
-		runWrite(conn, *area, *unit, *offset, *write)
+		runWrite(bus, *area, *unit, *offset, *write)
 		return
 	}
-	runRead(conn, *area, *unit, *offset, *qty)
+	runRead(bus, *area, *unit, *offset, *qty)
 }
 
-func mbRoundTrip(conn net.Conn, tx uint16, unit int, pdu []byte) ([]byte, error) {
+// mbBus 抽象「一条能承载一次 Modbus 事务的链路」。
+//
+// 用接口而不是给每个函数加 if transport == ...：TCP 与串口的差别集中在
+// **组帧与收帧**，读写解析、输出格式、错误文案应当完全一致——否则同一
+// 条命令在两种传输下的输出会悄悄分叉，排障时最容易看错。
+type mbBus interface {
+	Do(unit int, pdu []byte) ([]byte, error)
+	Close() error
+}
+
+func openBus(kind, addr, port string, serial transport.SerialConfig, timeout time.Duration) (mbBus, error) {
+	switch strings.ToLower(kind) {
+	case "tcp":
+		conn, err := net.DialTimeout("tcp", addr, timeout)
+		if err != nil {
+			return nil, fmt.Errorf("连接 %s 失败: %w", addr, err)
+		}
+		_ = conn.SetDeadline(time.Now().Add(timeout))
+		return &tcpBus{conn: conn, timeout: timeout}, nil
+	case "rtu", "ascii":
+		if port == "" {
+			return nil, fmt.Errorf("%s 传输需要 -port 指定串口设备", kind)
+		}
+		st, err := transport.OpenSerial(serial)
+		if err != nil {
+			return nil, fmt.Errorf("打开串口 %s 失败: %w", port, err)
+		}
+		b := &serialBus{st: st, framing: strings.ToLower(kind), timeout: timeout}
+		if d, ok := st.(transport.DeadlineSetter); ok {
+			_ = d.SetDeadline(time.Now().Add(timeout))
+		}
+		return b, nil
+	}
+	return nil, fmt.Errorf("未知传输 %q（tcp|rtu|ascii）", kind)
+}
+
+// ---------------------------------------------------------------------------
+// TCP
+// ---------------------------------------------------------------------------
+
+type tcpBus struct {
+	conn    net.Conn
+	tx      uint16
+	timeout time.Duration
+}
+
+func (b *tcpBus) Do(unit int, pdu []byte) ([]byte, error) {
+	b.tx++
+	tx := b.tx
+	_ = b.conn.SetDeadline(time.Now().Add(b.timeout))
 	frame := mb.BuildTCP(mb.Frame{Transaction: tx, Unit: uint8(unit), PDU: pdu})
-	if _, err := conn.Write(frame); err != nil {
+	if _, err := b.conn.Write(frame); err != nil {
 		return nil, fmt.Errorf("发送: %w", err)
 	}
 	head := make([]byte, 7)
-	if _, err := io.ReadFull(conn, head); err != nil {
+	if _, err := io.ReadFull(b.conn, head); err != nil {
 		return nil, fmt.Errorf("读取响应头: %w", err)
 	}
 	if binary.BigEndian.Uint16(head[0:2]) != tx {
@@ -72,7 +130,7 @@ func mbRoundTrip(conn net.Conn, tx uint16, unit int, pdu []byte) ([]byte, error)
 		return nil, fmt.Errorf("非法长度字段 %d", n)
 	}
 	body := make([]byte, n-1)
-	if _, err := io.ReadFull(conn, body); err != nil {
+	if _, err := io.ReadFull(b.conn, body); err != nil {
 		return nil, fmt.Errorf("读取响应体: %w", err)
 	}
 	if len(body) >= 2 && body[0]&0x80 != 0 {
@@ -81,7 +139,117 @@ func mbRoundTrip(conn net.Conn, tx uint16, unit int, pdu []byte) ([]byte, error)
 	return body, nil
 }
 
-func runRead(conn net.Conn, area string, unit, offset, qty int) {
+func (b *tcpBus) Close() error { return b.conn.Close() }
+
+// ---------------------------------------------------------------------------
+// 串口（RTU / ASCII）
+// ---------------------------------------------------------------------------
+
+type serialBus struct {
+	st      transport.Stream
+	framing string
+	timeout time.Duration
+}
+
+func (b *serialBus) Close() error { return b.st.Close() }
+
+func (b *serialBus) Do(unit int, pdu []byte) ([]byte, error) {
+	var req []byte
+	if b.framing == "ascii" {
+		req = mb.BuildASCII(uint8(unit), pdu)
+	} else {
+		req = mb.BuildRTU(uint8(unit), pdu)
+	}
+	// 发请求前清掉接收缓冲：上一轮的超时响应、线路噪声都会在这里变成
+	// 「功能码对不上」的伪故障。总线上多一台从站时尤其常见。
+	if d, ok := b.st.(interface{ Drain() error }); ok {
+		_ = d.Drain()
+	}
+	if d, ok := b.st.(transport.DeadlineSetter); ok {
+		_ = d.SetDeadline(time.Now().Add(b.timeout))
+	}
+	if err := b.st.Write(req); err != nil {
+		return nil, fmt.Errorf("发送: %w", err)
+	}
+
+	if b.framing == "ascii" {
+		return b.readASCII(pdu)
+	}
+	return b.readRTU(pdu)
+}
+
+// readRTU 读满一条 RTU 响应。
+//
+// 先读 2 字节（地址 + 功能码）判断异常帧（定长 5 字节）还是正常帧
+// （长度由请求推导），再一次性读满剩余部分。字节计数被写坏的从站会在
+// 读完固定长度后被 CRC 拒绝，而不是把主站挂到超时。
+func (b *serialBus) readRTU(reqPDU []byte) ([]byte, error) {
+	head, err := b.st.ReadFull(2)
+	if err != nil {
+		return nil, fmt.Errorf("读取响应（超时或链路断开，检查波特率/接线/单元号）: %w", err)
+	}
+	if head[1]&0x80 != 0 {
+		rest, err := b.st.ReadFull(3)
+		if err != nil {
+			return nil, fmt.Errorf("异常响应被截断: %w", err)
+		}
+		pdu, err := b.finishRTU(append(head, rest...))
+		if err != nil {
+			return nil, err
+		}
+		return pdu, fmt.Errorf("从站异常码 0x%02X（%s）", pdu[1], exceptionText(pdu[1]))
+	}
+	want, perr := mb.RTUExpectedResponseLen(reqPDU)
+	if perr != nil {
+		return nil, perr
+	}
+	if want < 2 || want > mb.RTUMaxFrame {
+		return nil, fmt.Errorf("不可信的 RTU 响应长度 %d", want)
+	}
+	rest, err := b.st.ReadFull(want - 2)
+	if err != nil {
+		return nil, fmt.Errorf("RTU 帧被截断（已读 2/%d 字节）: %w", want, err)
+	}
+	return b.finishRTU(append(head, rest...))
+}
+
+func (b *serialBus) finishRTU(frame []byte) ([]byte, error) {
+	_, pdu, err := mb.ParseRTU(frame)
+	if err != nil {
+		return nil, fmt.Errorf("RTU 校验失败（% x）: %w", frame, err)
+	}
+	return pdu, nil
+}
+
+// readASCII 读到 CRLF 为止。ASCII 帧自带分帧符，不需要预知长度；
+// 长度上限只是防止一条持续有噪声的线路把缓冲区撑爆。
+func (b *serialBus) readASCII(reqPDU []byte) ([]byte, error) {
+	frame := make([]byte, 0, 32)
+	for len(frame) < mb.ASCIIMaxFrame {
+		c, err := b.st.ReadFull(1)
+		if err != nil {
+			return nil, fmt.Errorf("读取响应（超时或链路断开，检查波特率/接线/单元号）: %w", err)
+		}
+		frame = append(frame, c[0])
+		if c[0] == '\n' {
+			break
+		}
+	}
+	_, pdu, err := mb.ParseASCII(frame)
+	if err != nil {
+		return nil, fmt.Errorf("ASCII 校验失败（%q）: %w", string(frame), err)
+	}
+	if len(pdu) >= 2 && pdu[0]&0x80 != 0 {
+		return pdu, fmt.Errorf("从站异常码 0x%02X（%s）", pdu[1], exceptionText(pdu[1]))
+	}
+	return pdu, nil
+}
+
+// ---------------------------------------------------------------------------
+// 命令
+// ---------------------------------------------------------------------------
+
+func runRead(bus mbBus, area string, unit, offset, qty int) {
 	fc, bits, err := areaFunc(area, false)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
@@ -101,7 +269,7 @@ func runRead(conn net.Conn, area string, unit, offset, qty int) {
 	binary.BigEndian.PutUint16(pdu[1:3], uint16(offset))
 	binary.BigEndian.PutUint16(pdu[3:5], uint16(qty))
 
-	resp, err := mbRoundTrip(conn, 1, unit, pdu)
+	resp, err := bus.Do(unit, pdu)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "%v\n", err)
 		os.Exit(1)
@@ -135,7 +303,7 @@ func runRead(conn net.Conn, area string, unit, offset, qty int) {
 	}
 }
 
-func runWrite(conn net.Conn, area string, unit, offset int, value string) {
+func runWrite(bus mbBus, area string, unit, offset int, value string) {
 	fc, bits, err := areaFunc(area, true)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
@@ -150,7 +318,7 @@ func runWrite(conn net.Conn, area string, unit, offset int, value string) {
 		pdu := []byte{mb.FCWriteSingleCoil, 0, 0, 0, 0}
 		binary.BigEndian.PutUint16(pdu[1:3], uint16(offset))
 		binary.BigEndian.PutUint16(pdu[3:5], v)
-		resp, err := mbRoundTrip(conn, 1, unit, pdu)
+		resp, err := bus.Do(unit, pdu)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "%v\n", err)
 			os.Exit(1)
@@ -166,7 +334,7 @@ func runWrite(conn net.Conn, area string, unit, offset int, value string) {
 	pdu := []byte{fc, 0, 0, 0, 0}
 	binary.BigEndian.PutUint16(pdu[1:3], uint16(offset))
 	binary.BigEndian.PutUint16(pdu[3:5], v)
-	resp, err := mbRoundTrip(conn, 1, unit, pdu)
+	resp, err := bus.Do(unit, pdu)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "%v\n", err)
 		os.Exit(1)
@@ -248,3 +416,10 @@ func exceptionText(code byte) string {
 	}
 	return "未知"
 }
+
+// 编译期断言：两个实现都满足接口。写在这里是为了让「新增一种传输却忘了
+// 实现 Do」在编译期就失败，而不是在运行时得到一个空指针。
+var (
+	_ mbBus = (*tcpBus)(nil)
+	_ mbBus = (*serialBus)(nil)
+)

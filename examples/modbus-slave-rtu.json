@@ -1,0 +1,103 @@
+{
+  "schemaVersion": 1,
+  "site": "slave-rtu-demo",
+  "server": {
+    "listen": "127.0.0.1:8087",
+    "token": "dev-token-0123456789"
+  },
+  "storage": {
+    "dir": "./data-slave-rtu",
+    "journal": true,
+    "outboxMaxRecords": 5000,
+    "outboxTtl": "10m"
+  },
+  "logging": {
+    "level": "info"
+  },
+  "channels": [
+    {
+      "id": "ch-virtual",
+      "protocol": "virtual",
+      "transport": {
+        "kind": "memory"
+      },
+      "concurrency": 2,
+      "timeout": "1s"
+    }
+  ],
+  "devices": [
+    {
+      "id": "line-a",
+      "name": "虚拟上游设备（正弦 + 计数）",
+      "channel": "ch-virtual",
+      "interval": "500ms",
+      "timeout": "1s",
+      "enabled": true,
+      "points": [
+        {
+          "id": "counter",
+          "name": "累计计数",
+          "address": { "kind": "register", "area": "holding", "offset": 0, "length": 2, "bit": -1 },
+          "dataType": "uint32",
+          "enabled": true
+        },
+        {
+          "id": "setpoint",
+          "name": "设定值",
+          "address": { "kind": "register", "area": "holding", "offset": 2, "length": 1, "bit": -1 },
+          "dataType": "uint16",
+          "writable": true,
+          "enabled": true
+        },
+        {
+          "id": "running",
+          "name": "运行标志",
+          "address": { "kind": "register", "area": "coil", "offset": 0, "length": 1, "bit": -1 },
+          "dataType": "bool",
+          "enabled": true
+        },
+        {
+          "id": "fault",
+          "name": "故障标志（只读）",
+          "address": { "kind": "register", "area": "discrete", "offset": 0, "length": 1, "bit": -1 },
+          "dataType": "bool",
+          "enabled": true
+        }
+      ]
+    }
+  ],
+  "slaves": [
+    {
+      "id": "scada-rtu",
+      "serial": {
+        "port": "/dev/ttyUSB0",
+        "framing": "rtu",
+        "baud": 19200,
+        "dataBits": 8,
+        "parity": "even",
+        "stopBits": 1
+      },
+      "identity": {
+        "vendorName": "UIC",
+        "productCode": "uic-gateway",
+        "majorMinorRevision": "1.0",
+        "vendorUrl": "https://example.com/",
+        "productName": "UIC 工业通信网关",
+        "modelName": "UIC-GW",
+        "userApplicationName": "Line A（RTU）"
+      },
+      "units": [
+        {
+          "unitId": 1,
+          "byteOrder": "ABCD",
+          "mappings": [
+            { "point": "line-a/counter", "area": "holding", "offset": 0 },
+            { "point": "line-a/setpoint", "area": "holding", "offset": 2, "writable": true },
+            { "point": "line-a/running", "area": "coil", "offset": 0 },
+            { "point": "line-a/fault", "area": "discrete", "offset": 0 }
+          ]
+        }
+      ]
+    }
+  ]
+}

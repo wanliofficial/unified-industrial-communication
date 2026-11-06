@@ -13,10 +13,11 @@
 //     真的下发到 PLC；这条路径必须复用北向写入的命令白名单与
 //     设备 actor，否则就有了第二个绕过治理的写入口。
 //
-// 边界：只支持 Modbus TCP（MBAP），不支持 RTU/ASCII 从站，不支持
-// 多主站串行共享（TCP 天然多连接）、不支持文件记录（FC14/15/20/21）。
-// 诊断与识别类功能码（FC8 / FC11 / FC17 / FC43）已实现——它们不碰映射表，
-// 但决定上位机能否把这个从站识别成「一台设备」而不是「一堆寄存器」。
+// 边界：支持 Modbus TCP（MBAP）与串口 RTU/ASCII 从站；不支持多主站
+// 共享同一条串口（一条物理线只有一个从站实例）、不支持文件记录
+// （FC14/15/20/21）。诊断与识别类功能码（FC8 / FC11 / FC17 / FC43）已实现
+// ——它们不碰映射表，但决定上位机能否把这个从站识别成「一台设备」而不是
+// 「一堆寄存器」。
 package modbus
 
 import (
@@ -37,6 +38,7 @@ import (
 	"uic/internal/codec/value"
 	"uic/internal/model"
 	"uic/internal/obs"
+	"uic/internal/transport"
 )
 
 // Source 提供映射点位的当前值。实现者必须并发安全。
@@ -79,16 +81,26 @@ type Options struct {
 
 	// WriteTimeout 是单次南向写入的总预算，默认 5s。
 	WriteTimeout time.Duration
-	// IdleTimeout 是空闲连接回收时间，默认 5 分钟。
+	// IdleTimeout 是空闲连接回收时间，默认 5 分钟（仅 TCP）。
 	IdleTimeout time.Duration
 	Log         *slog.Logger
 	Metrics     *obs.Metrics
+
+	// SerialOpener 打开串口，默认走 transport.OpenSerial。
+	// 仅供测试注入：生产路径不存在第二种打开方式。
+	SerialOpener func(transport.SerialConfig) (serialPort, error)
 }
 
-// Server 是一个 Modbus TCP 从站实例。
+// Server 是一个 Modbus 从站实例。TCP 与串口（RTU/ASCII）二选一。
 type Server struct {
 	id         string
+	addr       string
 	ln         net.Listener
+	st         serialPort
+	framing    string
+	serialCfg  transport.SerialConfig
+	gap        time.Duration
+	openSerial func(transport.SerialConfig) (serialPort, error)
 	units      map[int]*unit
 	src        Source
 	writer     Writer
@@ -108,6 +120,8 @@ type Server struct {
 	degraded   atomic.Uint64
 	writes     atomic.Uint64
 	writeErrs  atomic.Uint64
+	badFrames  atomic.Uint64
+	crcErrors  atomic.Uint64
 }
 
 // unit 是一个 Unit ID 的映射表。cells 按区拆分并排序，查找走二分。
@@ -129,11 +143,11 @@ type cell struct {
 
 func (c cell) end() int { return c.start + c.width }
 
-// New 校验配置、绑定端口并开始服务。
+// New 校验配置、绑定端点并开始服务。
 //
-// 绑定在构造期完成而不是 Start()：端口被占用是**启动期错误**，应该让
-// 进程带着明确的日志退出，而不是启动成功后在后台反复重试、让运维以为
-// 从站已经可用。
+// 绑定在构造期完成而不是 Start()：端口被占用（串口被占用）是**启动期
+// 错误**，应该让进程带着明确的日志退出，而不是启动成功后在后台反复重试、
+// 让运维以为从站已经可用。
 func New(opt Options) (*Server, error) {
 	if opt.Source == nil {
 		return nil, errors.New("slave/modbus: source required")
@@ -148,23 +162,19 @@ func New(opt Options) (*Server, error) {
 	if err != nil {
 		return nil, err
 	}
-	ln, err := net.Listen("tcp", opt.Slave.Listen)
-	if err != nil {
-		return nil, fmt.Errorf("slave %q: listen %s: %w", opt.Slave.ID, opt.Slave.Listen, err)
-	}
 	s := &Server{
-		id:      opt.Slave.ID,
-		ident:   newIdentity(opt.Slave.Identity, opt.Revision),
-		ln:      ln,
-		units:   units,
-		src:     opt.Source,
-		writer:  opt.Writer,
-		writeTo: opt.WriteTimeout,
-		idle:    opt.IdleTimeout,
-		log:     opt.Log,
-		met:     opt.Metrics,
-		slots:   make(chan struct{}, opt.Slave.EffectiveMaxConnections()),
-		conns:   map[net.Conn]struct{}{},
+		id:         opt.Slave.ID,
+		ident:      newIdentity(opt.Slave.Identity, opt.Revision),
+		units:      units,
+		src:        opt.Source,
+		writer:     opt.Writer,
+		writeTo:    opt.WriteTimeout,
+		idle:       opt.IdleTimeout,
+		log:        opt.Log,
+		met:        opt.Metrics,
+		slots:      make(chan struct{}, opt.Slave.EffectiveMaxConnections()),
+		conns:      map[net.Conn]struct{}{},
+		openSerial: opt.SerialOpener,
 	}
 	if s.writeTo <= 0 {
 		s.writeTo = 5 * time.Second
@@ -175,6 +185,35 @@ func New(opt Options) (*Server, error) {
 	if s.log == nil {
 		s.log = slog.Default()
 	}
+	if s.openSerial == nil {
+		s.openSerial = openSerial
+	}
+
+	if sl := opt.Slave.Serial; sl != nil {
+		n := sl.Normalized()
+		s.serialCfg = transport.SerialConfig{
+			Port: n.Port, Baud: n.Baud, DataBits: n.DataBits,
+			Parity: n.Parity, StopBits: n.StopBits,
+		}
+		s.framing = n.Framing
+		s.gap = frameGap(n)
+		s.addr = n.Port
+		st, err := s.openSerial(s.serialCfg)
+		if err != nil {
+			return nil, fmt.Errorf("slave %q: open serial %s: %w", opt.Slave.ID, n.Port, err)
+		}
+		s.st = st
+		s.wg.Add(1)
+		go s.serveSerial()
+		return s, nil
+	}
+
+	ln, err := net.Listen("tcp", opt.Slave.Listen)
+	if err != nil {
+		return nil, fmt.Errorf("slave %q: listen %s: %w", opt.Slave.ID, opt.Slave.Listen, err)
+	}
+	s.ln = ln
+	s.addr = ln.Addr().String()
 	s.wg.Add(1)
 	go s.acceptLoop()
 	return s, nil
@@ -183,8 +222,9 @@ func New(opt Options) (*Server, error) {
 // ID 返回从站标识。
 func (s *Server) ID() string { return s.id }
 
-// Addr 返回实际监听地址（配置为 :0 时可用来取随机端口）。
-func (s *Server) Addr() string { return s.ln.Addr().String() }
+// Addr 返回实际监听地址。TCP 配置为 :0 时返回内核分配的端口；
+// 串口返回设备路径（如 /dev/ttyUSB0）。
+func (s *Server) Addr() string { return s.addr }
 
 // Stats 返回累计计数，供指标与测试使用。
 type Stats struct {
@@ -193,6 +233,7 @@ type Stats struct {
 	Degraded   uint64
 	Writes     uint64
 	WriteErrs  uint64
+	BadFrames  uint64
 }
 
 // Stats 返回当前累计计数。
@@ -203,6 +244,7 @@ func (s *Server) Stats() Stats {
 		Degraded:   s.degraded.Load(),
 		Writes:     s.writes.Load(),
 		WriteErrs:  s.writeErrs.Load(),
+		BadFrames:  s.badFrames.Load(),
 	}
 }
 
@@ -219,14 +261,31 @@ func (s *Server) Close() error {
 		conns = append(conns, c)
 	}
 	s.conns = map[net.Conn]struct{}{}
+	ln, st := s.ln, s.st
 	s.mu.Unlock()
 
-	err := s.ln.Close()
+	var err error
+	if ln != nil {
+		if e := ln.Close(); e != nil {
+			err = e
+		}
+	}
+	if st != nil {
+		// 关串口会让阻塞中的 Read 立刻返回，串口循环因此能退出。
+		_ = st.Close()
+	}
 	for _, c := range conns {
 		_ = c.Close()
 	}
 	s.wg.Wait()
 	return err
+}
+
+// isClosed 供串口循环判断是否该退出。
+func (s *Server) isClosed() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.closed
 }
 
 func buildUnits(sl model.Slave, points map[string]model.Point) (map[int]*unit, error) {
@@ -328,44 +387,53 @@ func (s *Server) serve(c net.Conn) {
 			return
 		}
 		tx := binary.BigEndian.Uint16(head[0:2])
-		unitID := int(head[6])
-		s.requests.Add(1)
+		resp := s.respond(int(head[6]), pdu)
 
-		u, ok := s.units[unitID]
-		var resp []byte
-		if !ok {
-			// 网关目标不存在：0x0B 比「不响应」好——主站会看到确定的
-			// 错误码，而不是 3 秒超时后去查网络。
-			resp = mb.ExceptionPDU(pdu[0], 0x0B)
-		} else {
-			resp = s.handle(u, pdu)
-		}
-		if len(resp) >= 1 && resp[0]&0x80 != 0 {
-			s.exceptions.Add(1)
-			if s.met != nil {
-				s.met.Inc("uic_slave_requests_total", obs.Labels{
-					"slave": s.id, "unit": itoa(unitID),
-					"fc": itoa(int(pdu[0])), "result": "exception",
-				})
-			}
-		} else if s.met != nil {
-			s.met.Inc("uic_slave_requests_total", obs.Labels{
-				"slave": s.id, "unit": itoa(unitID),
-				"fc": itoa(int(pdu[0])), "result": "ok",
-			})
-		}
-		// FC11 自己不计数：主站读事件计数器时，读到的是「这条读之前」
-		// 已经完成的消息数，否则每次查询都会让计数 +1，曲线变成查询频率。
-		if len(resp) > 0 && resp[0]&0x80 == 0 && pdu[0] != mb.FC11 {
-			s.events.Add(1)
-		}
-
-		out := mb.BuildTCP(mb.Frame{Transaction: tx, Unit: uint8(unitID), PDU: resp})
+		out := mb.BuildTCP(mb.Frame{Transaction: tx, Unit: head[6], PDU: resp})
 		_ = c.SetWriteDeadline(time.Now().Add(10 * time.Second))
 		if _, err := c.Write(out); err != nil {
 			return
 		}
 	}
+}
+
+// respond 处理一个已解析的请求：查单元、生成响应、更新计数与指标。
+//
+// 未知单元的响应码是 0x0B（网关目标失败）而不是静默：TCP 上主站能收到
+// 确定的错误码，比等 3 秒超时再去查网络要好。串口不同——一条总线上有
+// 多个从站，替别人的地址应答就是串扰，所以串口路径在调用前就把非本机
+// 单元过滤掉了。
+func (s *Server) respond(unitID int, pdu []byte) []byte {
+	s.requests.Add(1)
+	u, ok := s.units[unitID]
+	var resp []byte
+	if !ok {
+		resp = mb.ExceptionPDU(pdu[0], 0x0B)
+	} else {
+		resp = s.handle(u, pdu)
+	}
+	if len(resp) >= 1 && resp[0]&0x80 != 0 {
+		s.exceptions.Add(1)
+		s.noteRequest(unitID, pdu[0], "exception")
+	} else {
+		s.noteRequest(unitID, pdu[0], "ok")
+	}
+	// FC11 自己不计数：主站读事件计数器时，读到的是「这条读之前」
+	// 已经完成的消息数，否则每次查询都会让计数 +1，曲线变成查询频率。
+	if len(resp) > 0 && resp[0]&0x80 == 0 && pdu[0] != mb.FC11 {
+		s.events.Add(1)
+	}
+	return resp
+}
+
+func (s *Server) noteRequest(unitID int, fc byte, result string) {
+	if s.met == nil {
+		return
+	}
+	s.met.Inc("uic_slave_requests_total", obs.Labels{
+		"slave": s.id, "unit": itoa(unitID),
+		"fc": itoa(int(fc)), "result": result,
+	})
 }
 
 func (s *Server) handle(u *unit, pdu []byte) []byte {
@@ -568,11 +636,16 @@ func (s *Server) diagnostics(pdu []byte) []byte {
 		s.requests.Store(0)
 		s.exceptions.Store(0)
 		s.events.Store(0)
+		s.crcErrors.Store(0)
 		out = 0
 	case 0x000B: // Bus Message Count
 		out = uint16(s.requests.Load())
-	case 0x000C: // Bus Communication Error Count：TCP 没有 CRC/字符层错误
-		out = 0
+	case 0x000C: // Bus Communication Error Count
+		// TCP 上恒为 0：没有 CRC/字符层；串口上如实报告 CRC/LRC 错误数，
+		// 否则这个「诊断」功能码在唯一有意义的总线上什么也没诊断。
+		if s.framing != "" {
+			out = uint16(s.crcErrors.Load())
+		}
 	case 0x000D: // Bus Exception Error Count
 		out = uint16(s.exceptions.Load())
 	case 0x000E: // Server Message Count
