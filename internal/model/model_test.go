@@ -222,6 +222,22 @@ func TestSampleValidateAndKey(t *testing.T) {
 	}
 }
 
+func TestWindowStatsAvg(t *testing.T) {
+	cases := []struct {
+		stats WindowStats
+		want  float64
+	}{
+		{WindowStats{Count: 0}, 0}, // 绝不返回 NaN
+		{WindowStats{Count: 1, Sum: 7, Min: 7, Max: 7}, 7},
+		{WindowStats{Count: 4, Sum: 40, Min: 5, Max: 15}, 10},
+	}
+	for _, c := range cases {
+		if got := c.stats.Avg(); got != c.want {
+			t.Errorf("Avg(%+v) = %v, want %v", c.stats, got, c.want)
+		}
+	}
+}
+
 func TestDurationJSON(t *testing.T) {
 	type wrapper struct {
 		D Duration `json:"d"`

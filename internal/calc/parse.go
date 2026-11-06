@@ -2,9 +2,11 @@ package calc
 
 import (
 	"fmt"
+	"math"
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // idRe 与 model 包的点位/设备 ID 规则保持一致（lowercase + 数字 + . _ -）。
@@ -22,12 +24,20 @@ const (
 	tokLParen // (
 	tokRParen // )
 	tokComma  // ,
+	// tokDuration 是时长字面量：500ms / 30s / 5m / 2h。
+	//
+	// 单独一种 token 而不是「数字 + 后缀标识符」：时长只能出现在窗口聚合
+	// 的第二个参数位置，词法层直接识别出来，才能让 `avg(x, 5m)` 与
+	// `avg(x, 5 * m)` 产生两种明确的结论（前者是窗口，后者是未知标识符）。
+	tokDuration
 )
 
 type token struct {
 	kind tokKind
 	text string
 	num  float64
+	// dur 只在 tokDuration 时有意义。
+	dur time.Duration
 	// badNum 标记「看起来像数字但解析失败」的 token（如 `1.2.3`）。
 	// 如果直接退回 0，表达式 `1.2.3 + x` 会算出一个毫无意义的和，
 	// 而配置校验会一路绿灯——这类静默降级必须在编译期暴露。
@@ -180,8 +190,69 @@ func lexNumber(src string, start int, out *[]token) int {
 		*out = append(*out, token{kind: tokNumber, text: text, badNum: true, pos: start})
 		return i
 	}
+	// 时长后缀。只认单后缀（ms/s/m/h），且后缀后面不能再跟标识符字符——
+	// 否则 `5mph` 会被切成「5 分钟」+「ph」，那种静默拆分比直接报错危险
+	// 得多。窗口长度有上下界（1s..24h），由 parser 在构造窗口节点时校验：
+	// 词法层只管「这是一个时长」，不管它是不是合理的窗口。
+	if unit, w := durationUnit(src, i); w > 0 {
+		end := i + w
+		if end < len(src) && (isRefChar(src[end]) || src[end] == ':') {
+			*out = append(*out, token{kind: tokDuration, text: src[start:scanWord(src, start)], badNum: true, pos: start})
+			return scanWord(src, start)
+		}
+		secs := v * float64(unit)
+		if math.IsInf(secs, 0) || math.IsNaN(secs) || secs > float64(math.MaxInt64) {
+			*out = append(*out, token{kind: tokDuration, text: src[start:end], badNum: true, pos: start})
+			return end
+		}
+		*out = append(*out, token{kind: tokDuration, text: src[start:end],
+			dur: time.Duration(secs), pos: start})
+		return end
+	}
+	// 大写单位（5S / 5M / 5H）明确报「非法时长」，而不是让它裂成
+	// 「数字 5」+「未知标识符 M」——后者会让人以为问题出在标识符上。
+	if w := upperDurationSuffix(src, i); w > 0 {
+		*out = append(*out, token{kind: tokDuration, text: src[start : i+w], badNum: true, pos: start})
+		return i + w
+	}
 	*out = append(*out, token{kind: tokNumber, text: text, num: v, pos: start})
 	return i
+}
+
+// durationUnit 报告 i 处的时长后缀及其字节宽度。0 表示没有后缀。
+//
+// "ms" 必须先于 "m" 判断，否则 `500ms` 会被读成 500 分钟 + 一个多余的 s。
+func durationUnit(src string, i int) (unit time.Duration, width int) {
+	if i >= len(src) {
+		return 0, 0
+	}
+	if strings.HasPrefix(src[i:], "ms") {
+		return time.Millisecond, 2
+	}
+	switch src[i] {
+	case 's':
+		return time.Second, 1
+	case 'm':
+		return time.Minute, 1
+	case 'h':
+		return time.Hour, 1
+	}
+	return 0, 0
+}
+
+// upperDurationSuffix 识别大写单位，只为了给出准确错误。
+func upperDurationSuffix(src string, i int) int {
+	if i >= len(src) {
+		return 0
+	}
+	if strings.HasPrefix(src[i:], "MS") {
+		return 2
+	}
+	switch src[i] {
+	case 'S', 'M', 'H':
+		return 1
+	}
+	return 0
 }
 
 func isDigit(c byte) bool { return c >= '0' && c <= '9' }
@@ -355,6 +426,13 @@ func (p *parser) parsePrimary() (node, error) {
 			return nil, fmt.Errorf("invalid number %q at offset %d", t.text, t.pos)
 		}
 		return &numLit{v: t.num}, nil
+	case tokDuration:
+		p.next()
+		if t.badNum {
+			return nil, fmt.Errorf("invalid duration %q at offset %d (use one of ms, s, m, h; e.g. 30s or 5m)",
+				t.text, t.pos)
+		}
+		return &durNode{d: t.dur}, nil
 	case tokLParen:
 		p.next()
 		inner, err := p.parseExpr()
@@ -388,8 +466,12 @@ func (p *parser) parsePrimary() (node, error) {
 }
 
 func (p *parser) parseCall(name token) (node, error) {
+	// 先判断函数是否存在，但窗口聚合里的 `count` 不是普通函数（它只有
+	// 「窗口内计数」这一种形式），因此对它放行到最后再判。
 	if _, err := lookupFunc(name.text); err != nil {
-		return nil, fmt.Errorf("offset %d: %w", name.pos, err)
+		if !isWindowFunc(name.text) {
+			return nil, fmt.Errorf("offset %d: %w", name.pos, err)
+		}
 	}
 	// 吃掉 '('
 	p.next()
@@ -411,7 +493,50 @@ func (p *parser) parseCall(name token) (node, error) {
 	if err := p.expect(tokRParen, "')'"); err != nil {
 		return nil, err
 	}
+	// 两个参数且第二个是时长字面量 → 时间窗口聚合。
+	//
+	// 之所以用「第二个参数是不是时长」而不是给窗口函数改名（如 avgw）：
+	// 现场的表达式是手写的，`avg(line-a:power, 5m)` 读起来就是它算的东西。
+	// 歧义也不存在——`avg` 的普通形式接受任意多个数值参数，而时长不是值。
+	if len(args) == 2 {
+		if d, ok := args[1].(*durNode); ok {
+			return buildWindow(name, args[0], d)
+		}
+	}
+	if name.text == "count" {
+		return nil, fmt.Errorf("offset %d: function count requires a duration window, e.g. count(%s, 5m)",
+			name.pos, "device:point")
+	}
 	return &callNode{name: name.text, args: args, pos: name.pos}, nil
+}
+
+// windowFuncs 是支持「时间窗口聚合」的函数名集合。
+//
+// 与普通聚合同名是刻意的：avg/min/max/sum 在不带窗口时是对**当前值**的
+// 聚合，带上窗口时是对**历史样本**的聚合，两者在语义上是同一件事的不同
+// 数据源。count 只在窗口形式下有定义（当前值的个数恒为 1，没有意义）。
+var windowFuncs = map[string]bool{
+	"avg": true, "min": true, "max": true, "sum": true, "count": true,
+}
+
+func isWindowFunc(name string) bool { return windowFuncs[name] }
+
+// buildWindow 把 `name(ref, duration)` 变成窗口节点，并在这里做完所有
+// 静态校验：函数名、第一参数必须是引用、窗口长度区间。
+func buildWindow(name token, first node, d *durNode) (node, error) {
+	if !isWindowFunc(name.text) {
+		return nil, fmt.Errorf("offset %d: function %s does not take a duration argument", name.pos, name.text)
+	}
+	ref, ok := first.(*refNode)
+	if !ok {
+		return nil, fmt.Errorf("offset %d: function %s: first argument of a window aggregate must be a point reference (device:point)",
+			name.pos, name.text)
+	}
+	if d.d < MinWindow || d.d > MaxWindow {
+		return nil, fmt.Errorf("offset %d: function %s: window %s out of range %s..%s",
+			name.pos, name.text, d.d, MinWindow, MaxWindow)
+	}
+	return &windowNode{name: name.text, ref: ref.text, window: d.d, pos: name.pos}, nil
 }
 
 // validateRef 在编译期检查引用写法。绝大多数写错都发生在这一步：

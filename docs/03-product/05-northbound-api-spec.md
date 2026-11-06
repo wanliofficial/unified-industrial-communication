@@ -839,7 +839,8 @@ curl -s 'localhost:8092/api/v1/history?device=press&point=power&from=-1h&step=1m
 - `health.history` 暴露 `records` / `bytes` / `segments` / `oldest` / `newest` /
   `evicted` / `writeErrors`；指标为 `uic_history_bytes`、`uic_history_segments`、
   `uic_history_records_total`、`uic_history_evicted_total`、
-  `uic_history_write_errors_total`、`uic_history_query_total{result}`。
+  `uic_history_write_errors_total`、`uic_history_query_total{result}`、
+  `uic_history_window_total{result}`（`ok` / `empty` / `unavailable`，窗口聚合专用）。
 
 ### 4.9 认证与授权
 

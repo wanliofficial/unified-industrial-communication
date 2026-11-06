@@ -244,7 +244,13 @@ func (r Rule) References() ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	return prog.Refs(), nil
+	// 窗口引用也是引用：配置层要检查它存在、是数值类型；漏掉它的后果是
+	// 一条永远 unknown 的报警（历史里根本没有那个点位的数据）。
+	refs := prog.Refs()
+	for _, w := range prog.Windows() {
+		refs = append(refs, w.Ref)
+	}
+	return refs, nil
 }
 
 // SplitRef 拆分 `device:point`。
@@ -346,12 +352,13 @@ func (c *compiled) holds(v float64) bool {
 }
 
 // eval 返回一次评估的结果。holding 为 true 时按恢复阈值判定（只影响阈值规则）。
-func (c *compiled) eval(lookup Lookup, holding bool) (cond bool, value float64, quality model.Quality, known bool, reason string) {
+func (c *compiled) eval(lookup Lookup, window calc.WindowResolver, holding bool) (cond bool, value float64, quality model.Quality, known bool, reason string) {
+	// 表达式规则即使没有 lookup 也能求值（窗口聚合只需要历史）。
+	if c.prog != nil {
+		return c.evalExpr(lookup, window)
+	}
 	if lookup == nil {
 		return false, 0, model.QualityNotConnected, false, "no value source"
-	}
-	if c.prog != nil {
-		return c.evalExpr(lookup)
 	}
 	s, ok := lookup(c.dev, c.pt)
 	if !ok {
@@ -374,10 +381,16 @@ func (c *compiled) eval(lookup Lookup, holding bool) (cond bool, value float64, 
 //
 // 短路求值意味着「没有被求值的引用」不会影响结果，因此也不参与质量判定：
 // `false && dead:x > 0` 的结果确实是 false，不属于「未知」。
-func (c *compiled) evalExpr(lookup Lookup) (bool, float64, model.Quality, bool, string) {
+func (c *compiled) evalExpr(lookup Lookup, window calc.WindowResolver) (bool, float64, model.Quality, bool, string) {
 	worst := model.QualityGood
 	badRef, badWhy := "", ""
 	get := func(ref string) (float64, bool) {
+		if lookup == nil {
+			if badRef == "" {
+				badRef, badWhy = ref, "no value source"
+			}
+			return 0, false
+		}
 		dev, pt, ok := SplitRef(ref)
 		if !ok {
 			if badRef == "" {
@@ -409,7 +422,7 @@ func (c *compiled) evalExpr(lookup Lookup) (bool, float64, model.Quality, bool, 
 		worst = worse(worst, s.Quality)
 		return v, true
 	}
-	b, err := c.prog.EvalBool(get)
+	b, err := c.prog.EvalBoolWindow(get, window)
 	if badRef != "" {
 		return false, 0, worst, false, "input " + badRef + ": " + badWhy
 	}
@@ -536,6 +549,13 @@ type Lookup func(device, point string) (model.Sample, bool)
 type Options struct {
 	Rules  []Rule
 	Lookup Lookup
+	// Window 提供历史窗口聚合（`avg(dev:pt, 5m)`）的数据源；nil 表示历史
+	// 未开启，此时带窗口的规则在评估时会得到 unknown（表达式求值失败），
+	// 而不是被悄悄判成「不满足」。
+	//
+	// 用闭包而不是 *history.Store：报警包不该依赖存储实现，测试也就能用
+	// 几行代码造出任意窗口数据。
+	Window calc.WindowResolver
 	Log    *slog.Logger
 	Now    func() time.Time
 	// Sweep 是兜底评估周期（默认 200ms）。它负责让「延时到点」在没有新
@@ -622,6 +642,7 @@ type Engine struct {
 	states map[string]*status
 	index  map[string][]*compiled // "device/point" → 依赖它的规则
 	lookup Lookup
+	window calc.WindowResolver
 	log    *slog.Logger
 	now    func() time.Time
 	sweep  time.Duration
@@ -656,6 +677,7 @@ func New(opt Options) (*Engine, error) {
 		states: map[string]*status{},
 		index:  map[string][]*compiled{},
 		lookup: opt.Lookup,
+		window: opt.Window,
 		log:    opt.Log,
 		now:    opt.Now,
 		sweep:  opt.Sweep,
@@ -853,7 +875,7 @@ func (e *Engine) evaluateLocked(c *compiled, now time.Time) {
 	}
 	prevState := st.state
 	activeLike := prevState == StateActive || prevState == StateAcked
-	cond, value, quality, known, reason := c.eval(e.lookup, activeLike)
+	cond, value, quality, known, reason := c.eval(e.lookup, e.window, activeLike)
 
 	st.quality = quality
 	st.known = known

@@ -59,6 +59,7 @@ Wave 3（6 个月） 规模化：集中管理 + 进程外驱动 + 多站点 + �
 | 24 | OPC UA 订阅（服务端推送） | 通道级 `subscribe` 开关（默认关闭 = 轮询）；CreateSubscription + CreateMonitoredItems + Publish 长轮询跑通；走**独立第二条连接**，Publish 不阻塞读写；每个带序列号的通知都在下一次 Publish 中确认（不确认会让服务端重传队列填满，表现为「跑一阵就不动了」）；`QueueSize=1 + DiscardOldest` 只保留最新值；监视项建立后立刻收到一次初始样本；建订阅失败让 `Open` 失败（不静默退化成轮询）；运行期断开自动重建，期间 `Read` 回退真读；`Close` 靠关闭 socket 打断阻塞中的 Publish，不等 15 秒保活超时；内置服务端同步支持订阅/发布，`Set` 与写穿透都触发通知 |
 | 25 | OPC UA 北向服务端（把点位表暴露给 SCADA） | 地址空间 `Root/Objects/{site}/{device}/{point}`，变量 NodeId `ns=2;s={site}/{device}/{point}`；只暴露 enabled 的设备与点位；质量码走 `DataValue.Status`（good→Good、uncertain/stale→Uncertain、timeout/comm_error/address_error/not_connected→对应 Bad*，Bad 不带值）；写入穿透到 `Runtime.Write`（5 秒超时），拒绝码映射回 `BadNotWritable`/`BadTypeMismatch`/`BadNodeIDUnknown`/`BadNoCommunication`；订阅推送复用服务端内核；只支持 None/None + 匿名，`policy`/`allowAnonymous` 在配置期强校验；配置按指纹热重建，端口被占用时启动失败、热更新抢不到端口回退上一份配置；`uic uaread` 可在不装第三方客户端时自检读写 |
 | 26 | 多身份认证 + RBAC + 操作审计（含 `uic token`） | 三个角色九项权限按**动作**定义，`viewer ⊆ operator ⊆ admin`，未知角色/权限一律拒绝；Token 先 SHA-256 再定长比较，配置可只存 `tokenSha256`，无凭据时进入 open 模式并在启动横幅与日志里明说；凭据表放在 `atomic.Pointer` 里整体替换，`server.users` 改动 apply 后**下一条请求**即按新表判定（删掉的用户立刻 401）；401（`result=error`）与 403（`result=denied`）在审计里区分；路由级权限写死在 `routes()` 里，高危命令（`outbox.drop`/`config.rollback`/`log.level`）在 handler 内二次判定；审计为 NDJSON 分段 + SHA-256 哈希链（`seq` 连续、字段「长度:内容」编码、整段淘汰后仍可验、半行触发新段），`/api/v1/audit` 可按用户/动作/结果/时间/关键字查询，`/audit/verify` 指出第一条不一致记录；审计默认开启，写失败只计数不阻断业务；`uic token` 生成 ≥16 字符随机 Token 并输出可直接粘贴的 `server.users` 片段 |
+| 27 | 历史窗口聚合（表达式里的 `avg(ref, 5m)`） | 计算点与报警规则共用同一套窗口语法：`avg/min/max/sum/count(ref, duration)`，窗口 1s..24h，单位 `ms/s/m/h`；只统计质量为 good 的数值样本（stale 与 bool/string 不计）；空窗口判失败而不是返回 0（计算点 bad、报警 unknown）；窗口引用不进 `Refs()`，因此不与当前值构成环；配置期校验历史已开启、引用存在且为数值、窗口不超过 `maxAge`；runtime 适配层带 TTL 缓存（`clamp(window/60, 1s, 30s)`，空窗口 1s，错误也缓存），让 200ms 报警兜底扫描不会打满磁盘 |
 
 ### 2.3 出口标准
 
@@ -129,7 +130,7 @@ curl -N localhost:8080/api/v1/stream?points=virtual-01/sine
 | 类别 | 内容 | 对应场景 |
 |---|---|---|
 | 协议 | MC 3E、FINS、EtherNet/IP + CIP、BACnet/IP、IEC 104、DL/T 645、CJ/T 188、ADS、OPC DA 桥接、Sparkplug B、SNMP | 汽车 / 3C / 水务 / 楼宇 |
-| 数据 | 有界采样历史库（NDJSON 分段，已落地）+ 降采样 + 保留策略 + 历史查询 API | 全部 |
+| 数据 | 有界采样历史库（NDJSON 分段，已落地）+ 降采样 + 保留策略 + 历史查询 API + 窗口聚合（`avg(ref, 5m)`，已落地） | 全部 |
 | 语义 | 单位/量程、计算点、报警判定（阈值/延时/组合） | 全部 |
 | 运维 | RBAC（3 角色）、审计查询/导出、诊断包、网络诊断、远程配置下发 | 无人值守 |
 | 组态 | 设备模板库（≥ 10 个）、点表 CSV 导入、批量实例化 | 集成商 |

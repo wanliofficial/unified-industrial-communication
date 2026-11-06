@@ -317,3 +317,31 @@ func TestComputedConfigValidation(t *testing.T) {
 		})
 	}
 }
+
+// 端到端：计算点从真实的历史库读窗口（而不是注入的假数据）。
+//
+// 这条用例覆盖的是装配顺序：openAlarms 早于 openHistory，如果适配器在
+// 构造时就把 history.Store 抓成 nil，这里的点位会永远 bad。
+func TestComputedWindowFromHistory(t *testing.T) {
+	h := newComputedHarness(t, func(cfg map[string]any) {
+		cfg["storage"].(map[string]any)["history"] = map[string]any{
+			"enabled": true, "minInterval": "100ms", "maxAge": "1h",
+		}
+		devs := cfg["devices"].([]any)
+		kpi := devs[1].(map[string]any)
+		kpi["points"] = append(kpi["points"].([]any), map[string]any{
+			"id": "avg5", "dataType": "float64", "enabled": true,
+			"address": map[string]any{"kind": "computed", "expr": "avg(src:a, 5m)"},
+		})
+	})
+
+	s := h.waitPointGood("kpi", "avg5")
+	if s.Value.Type != model.TypeFloat64 {
+		t.Fatalf("avg5 value = %+v", s.Value)
+	}
+	// 斜坡输入为正，5 分钟窗口的平均值也应为正。不断言具体数值：
+	// 它取决于用例跑到第几个采样周期。
+	if s.Value.Num <= 0 {
+		t.Fatalf("avg5 = %v, want a positive average", s.Value.Num)
+	}
+}

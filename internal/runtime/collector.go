@@ -115,6 +115,8 @@ func (c *collector) ensure(ctx context.Context, gen uint64) error {
 		// 只注入只读的 Get：计算点驱动能读到别的点位，但拿不到写入与订阅
 		// 能力，因此不可能绕过采集层的治理。
 		Lookup: c.rt.cache.Get,
+		// 历史窗口聚合（avg(x, 5m) 等）的只读数据源；同样带 TTL 缓存。
+		History: c.rt.historyWindow,
 	})
 	if err != nil {
 		return err

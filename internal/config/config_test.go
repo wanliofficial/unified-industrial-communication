@@ -1142,3 +1142,102 @@ func TestValidateSlaveListenConflicts(t *testing.T) {
 		t.Fatalf("port 0 must not conflict: %v", err)
 	}
 }
+
+// 窗口聚合在配置期要挡住四种「不报错但永远算不出值」的写法。
+func TestValidateHistoryWindows(t *testing.T) {
+	registerDrivers(t)
+
+	mk := func(expr string) *File {
+		f := baseFile()
+		// baseFile 的 p1 是 float32 寄存器；补一个文本点作为「不可聚合」对照。
+		f.Devices[0].Points = append(f.Devices[0].Points, model.Point{
+			ID: "label", DataType: model.TypeString, Enabled: true,
+			Address: model.Address{Kind: model.AddressRegister, Area: "holding", Offset: 4, Length: 1, Bit: -1},
+		})
+		f.Channels = append(f.Channels, model.Channel{
+			ID: "ch-calc", Protocol: "computed", Transport: model.Transport{Kind: "memory"},
+		})
+		f.Devices = append(f.Devices, model.Device{
+			ID: "kpi", ChannelID: "ch-calc", Interval: model.Duration(time.Second), Enabled: true,
+			Points: []model.Point{{
+				ID: "w", DataType: model.TypeFloat64, Enabled: true,
+				Address: model.Address{Kind: model.AddressComputed, Expr: expr},
+			}},
+		})
+		return f
+	}
+
+	t.Run("accepts when history is enabled", func(t *testing.T) {
+		f := mk("avg(dev1:p1, 5m) * 2")
+		f.Storage.History.Enabled = true
+		if err := f.Validate(); err != nil {
+			t.Fatalf("validate: %v", err)
+		}
+	})
+
+	cases := []struct {
+		name  string
+		expr  string
+		tweak func(*File)
+		want  string
+	}{
+		{
+			"history disabled", "avg(dev1:p1, 5m)", nil,
+			"storage.history.enabled is false",
+		},
+		{
+			"missing reference", "avg(dev1:nope, 5m)",
+			func(f *File) { f.Storage.History.Enabled = true },
+			"does not exist",
+		},
+		{
+			"text point has no numeric history", "avg(dev1:label, 5m)",
+			func(f *File) { f.Storage.History.Enabled = true },
+			"no numeric history",
+		},
+		{
+			"window longer than retention", "avg(dev1:p1, 2h)",
+			func(f *File) {
+				f.Storage.History.Enabled = true
+				f.Storage.History.MaxAge = model.Duration(time.Hour)
+			},
+			"exceeds storage.history.maxAge",
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			f := mk(c.expr)
+			if c.tweak != nil {
+				c.tweak(f)
+			}
+			err := f.Validate()
+			if err == nil || !strings.Contains(err.Error(), c.want) {
+				t.Fatalf("err = %v, want %q", err, c.want)
+			}
+		})
+	}
+
+	t.Run("alarm expression requires history", func(t *testing.T) {
+		f := baseFile()
+		f.Alarms = []alarm.Rule{{
+			ID: "avg-hot", Severity: alarm.SeverityWarning,
+			Expr: "avg(dev1:p1, 5m) > 10",
+		}}
+		err := f.Validate()
+		if err == nil || !strings.Contains(err.Error(), "storage.history.enabled is false") {
+			t.Fatalf("err = %v", err)
+		}
+	})
+
+	t.Run("alarm expression accepts when history is enabled", func(t *testing.T) {
+		f := baseFile()
+		f.Storage.History.Enabled = true
+		f.Alarms = []alarm.Rule{{
+			ID: "avg-hot", Severity: alarm.SeverityWarning,
+			Expr: "avg(dev1:p1, 5m) > 10",
+		}}
+		if err := f.Validate(); err != nil {
+			t.Fatalf("validate: %v", err)
+		}
+	})
+}

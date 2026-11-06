@@ -23,6 +23,9 @@ func (r *Runtime) openAlarms(f *config.File) error {
 		// 只注入只读的 cache.Get：报警引擎拿不到写入与订阅能力，
 		// 因此不可能绕过采集层的去重、死序与代次治理。
 		Lookup: r.cache.Get,
+		// 窗口聚合读历史；与 Lookup 一样是只读入口。历史未开启时
+		// 适配器返回 false，带窗口的规则评估为 unknown。
+		Window: r.calcWindow,
 		Log:    r.log,
 	})
 	if err != nil {

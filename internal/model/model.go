@@ -727,6 +727,30 @@ type Sample struct {
 // Key 返回快照键。
 func (s Sample) Key() string { return s.DeviceID + "/" + s.PointID }
 
+// WindowStats 是某个点位在一段时间窗口内的数值样本摘要。
+//
+// 放在 model 而不是 calc 或 history：它是三者之间的共享词表——历史库产出它、
+// 计算点消费它、报警通过计算点间接使用它。让 history 依赖 calc（或反过来）
+// 会把「表达式引擎」和「存储」绑在一起，而它们本可以各自独立测试。
+//
+// 只统计质量为 good 的数值样本：把 stale（断线时保留的最后值）算进平均，
+// 等于让一段没有数据的时间也参与计算，这是最隐蔽的一类假数据。
+type WindowStats struct {
+	Count int     `json:"count"`
+	Sum   float64 `json:"sum"`
+	Min   float64 `json:"min"`
+	Max   float64 `json:"max"`
+}
+
+// Avg 返回算术平均。Count 为 0 时返回 0：调用方必须先判 Count，
+// 但也绝不能因为漏判而得到 NaN（NaN 会一路传播成一条坏曲线）。
+func (w WindowStats) Avg() float64 {
+	if w.Count <= 0 {
+		return 0
+	}
+	return w.Sum / float64(w.Count)
+}
+
 // Validate 做最小一致性检查，防止坏值进入快照。
 func (s Sample) Validate() error {
 	if s.DeviceID == "" || s.PointID == "" {

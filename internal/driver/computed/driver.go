@@ -21,6 +21,7 @@ import (
 	"math"
 	"sort"
 	"strings"
+	"time"
 
 	"uic/internal/calc"
 	"uic/internal/driver"
@@ -75,6 +76,9 @@ type conn struct {
 	order  []*bound // 拓扑序：被依赖者在前
 	byID   map[string]*bound
 	lookup func(device, point string) (model.Sample, bool)
+	// history 提供历史窗口聚合的数据源；nil 表示历史未开启。此时带窗口
+	// 的表达式会得到一条明确的 bad 质量与原因，而不是一个假数字。
+	history func(ref string, window time.Duration) (model.WindowStats, bool)
 	// 求值需要的临时缓冲按 Read 分配，不放进 conn：Read 由设备 actor
 	// 串行调用，但把状态挂在连接上会让「同一连接被并发读」变成隐性错误。
 }
@@ -114,7 +118,7 @@ func (d *Driver) Open(ctx context.Context, cfg driver.OpenConfig) (driver.Conn, 
 	if err != nil {
 		return nil, driver.E(driver.ErrInternal, "open", cfg.Device.ID, err.Error(), false, nil)
 	}
-	return &conn{devID: cfg.Device.ID, order: order, byID: byID, lookup: cfg.Lookup}, nil
+	return &conn{devID: cfg.Device.ID, order: order, byID: byID, lookup: cfg.Lookup, history: cfg.History}, nil
 }
 
 // topoSort 返回「被依赖者在前」的顺序。环必须报错：环上的点位永远算不出
@@ -260,7 +264,17 @@ func (c *conn) evalOne(b *bound, vals map[string]model.Sample) model.Sample {
 	}
 
 	sample := model.Sample{DeviceID: c.devID, PointID: b.pt.ID, Unit: b.pt.Unit}
-	v, err := b.prog.Eval(resolve)
+	var window calc.WindowResolver
+	if c.history != nil {
+		window = func(ref string, d time.Duration) (calc.WindowStats, bool) {
+			st, ok := c.history(ref, d)
+			if !ok {
+				return calc.WindowStats{}, false
+			}
+			return calc.WindowStats{Count: st.Count, Sum: st.Sum, Min: st.Min, Max: st.Max}, true
+		}
+	}
+	v, err := b.prog.EvalWindow(resolve, window)
 	// 先看输入状态，再看求值错误：输入不可用时求值必然报「引用没有值」，
 	// 那是**结果**不是原因。真正的原因是某个输入超时/断链，质量码必须
 	// 如实反映它（timeout 与 bad 在排障时指向完全不同的动作）。

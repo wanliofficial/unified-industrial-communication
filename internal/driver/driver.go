@@ -13,6 +13,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	"uic/internal/model"
 )
@@ -106,6 +107,16 @@ type OpenConfig struct {
 	// 的，拿不到写入与订阅能力；驱动因此不可能绕过采集层的去重、死区、
 	// 序号与代次治理。为 nil 时驱动必须按「没有值」处理，而不是 panic。
 	Lookup func(device, point string) (model.Sample, bool)
+	// History 返回某点位在最近 window 内的数值样本摘要，供驱动/报警里的
+	// 历史窗口聚合（`avg(line-a:power, 5m)`）使用。
+	//
+	// 第二个返回值 false 表示「无法提供窗口数据」（历史未开启、查询失败），
+	// 与「窗口内没有 good 样本」不同。为 nil 时窗口聚合会显式失败，而不是
+	// 悄悄返回 0——没注入历史却写了一个窗口，是装配错误，必须被看见。
+	//
+	// 由 runtime 注入 history.Store 的适配器（带短 TTL 缓存，避免报警
+	// 200ms 的兜底扫描反复扫盘）。
+	History func(ref string, window time.Duration) (model.WindowStats, bool)
 }
 
 // Metrics 是驱动可用的最小埋点接口；可为 nil。

@@ -5,6 +5,7 @@ import (
 	"math"
 	"strings"
 	"testing"
+	"time"
 
 	"uic/internal/driver"
 	"uic/internal/model"
@@ -19,7 +20,15 @@ func point(id, expr string, dt model.DataType) model.Point {
 
 func open(t *testing.T, dev model.Device, lookup func(string, string) (model.Sample, bool)) driver.Conn {
 	t.Helper()
-	c, err := New().Open(context.Background(), driver.OpenConfig{Device: dev, Lookup: lookup})
+	return openWithHistory(t, dev, lookup, nil)
+}
+
+func openWithHistory(t *testing.T, dev model.Device, lookup func(string, string) (model.Sample, bool),
+	history func(ref string, window time.Duration) (model.WindowStats, bool)) driver.Conn {
+	t.Helper()
+	c, err := New().Open(context.Background(), driver.OpenConfig{
+		Device: dev, Lookup: lookup, History: history,
+	})
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
@@ -386,5 +395,93 @@ func TestSplitRef(t *testing.T) {
 		if dev != c.dev || pt != c.pt || ok != c.ok {
 			t.Errorf("splitRef(%q) = %q,%q,%v", c.in, dev, pt, ok)
 		}
+	}
+}
+
+// 窗口聚合的输入来自历史，不走 cache；质量规则也与普通引用不同：
+// 历史不可用时整个点位是 bad（而不是「某个输入坏了」）。
+func TestWindowAggregate(t *testing.T) {
+	var gotRef string
+	var gotWindow time.Duration
+	history := func(ref string, window time.Duration) (model.WindowStats, bool) {
+		gotRef, gotWindow = ref, window
+		return model.WindowStats{Count: 2, Sum: 10, Min: 4, Max: 6}, true
+	}
+	dev := model.Device{ID: "kpi", Points: []model.Point{
+		point("avg5", "avg(src:x, 5m)", model.TypeFloat64),
+		point("count5", "count(src:x, 5m)", model.TypeFloat64),
+		point("mixed", "src:x - avg(src:x, 5m)", model.TypeFloat64),
+	}}
+	lookup := func(dev, pt string) (model.Sample, bool) {
+		return model.Sample{DeviceID: dev, PointID: pt,
+			Value: model.NumValue(model.TypeFloat64, 20), Quality: model.QualityGood}, true
+	}
+	c := openWithHistory(t, dev, lookup, history)
+	got := read(t, c, "avg5", "count5", "mixed")
+	if got["avg5"].Value.Num != 5 {
+		t.Fatalf("avg5 = %v", got["avg5"].Value.Num)
+	}
+	if got["count5"].Value.Num != 2 {
+		t.Fatalf("count5 = %v", got["count5"].Value.Num)
+	}
+	if got["mixed"].Value.Num != 15 {
+		t.Fatalf("mixed = %v", got["mixed"].Value.Num)
+	}
+	for id, r := range got {
+		if r.Quality != model.QualityGood {
+			t.Fatalf("%s quality = %s (%v)", id, r.Quality, r.Err)
+		}
+	}
+	if gotRef != "src:x" || gotWindow != 5*time.Minute {
+		t.Fatalf("history called with %q/%v", gotRef, gotWindow)
+	}
+}
+
+func TestWindowAggregateFailures(t *testing.T) {
+	dev := model.Device{ID: "kpi", Points: []model.Point{
+		point("w", "avg(src:x, 5m)", model.TypeFloat64),
+	}}
+	cases := []struct {
+		name    string
+		history func(string, time.Duration) (model.WindowStats, bool)
+		want    string
+	}{
+		{"no history source", nil, "history is not available"},
+		{"history unavailable", func(string, time.Duration) (model.WindowStats, bool) {
+			return model.WindowStats{}, false
+		}, "history is unavailable"},
+		{"empty window", func(string, time.Duration) (model.WindowStats, bool) {
+			return model.WindowStats{}, true
+		}, "no good samples"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c := openWithHistory(t, dev, nil, tc.history)
+			got := read(t, c, "w")
+			s := got["w"]
+			if s.Quality != model.QualityBad {
+				t.Fatalf("quality = %s, want bad", s.Quality)
+			}
+			if s.Err == nil || !strings.Contains(s.Err.Error(), tc.want) {
+				t.Fatalf("err = %v, want %q", s.Err, tc.want)
+			}
+		})
+	}
+}
+
+// 窗口引用不算「当前值依赖」：base 读 mid 的过去，mid 读 base 的现在，
+// 不是环。如果实现把它们当依赖，Open 会以 dependency cycle 失败。
+func TestWindowReferenceIsNotACurrentValueDependency(t *testing.T) {
+	dev := model.Device{ID: "kpi", Points: []model.Point{
+		point("base", "avg(kpi:mid, 5m)", model.TypeFloat64),
+		point("mid", "kpi:base + 1", model.TypeFloat64),
+	}}
+	history := func(string, time.Duration) (model.WindowStats, bool) {
+		return model.WindowStats{Count: 1, Sum: 4, Min: 4, Max: 4}, true
+	}
+	c := openWithHistory(t, dev, nil, history)
+	got := read(t, c, "base", "mid")
+	if got["base"].Value.Num != 4 || got["mid"].Value.Num != 5 {
+		t.Fatalf("base=%v mid=%v", got["base"].Value.Num, got["mid"].Value.Num)
 	}
 }

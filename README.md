@@ -193,6 +193,24 @@ curl -s localhost:8092/api/v1/health | jq '.history'
 了就不再写「此刻仍然是 42」。查询左闭右闭、结果按时间升序、桶质量取桶内最差，
 非数值点位的 `min/max/avg` 是 `null` 而不是 0。
 
+历史窗口聚合（在计算点/报警表达式里直接引用历史）：
+
+```bash
+./uic -config examples/history-window.json    # REST :8095
+curl -s localhost:8095/api/v1/points | jq '.items[] | select(.device=="kpi") | {point,value}'
+#   avg1m = avg(press:power, 1m)    1 分钟平均功率
+#   peak5m = max(press:power, 5m)   5 分钟峰值
+#   samples5m = count(press:power, 5m)
+#   load_factor = press:power / avg(press:power, 1m)
+```
+
+`avg/min/max/sum/count(ref, 5m)`：第二个参数是时长时，聚合对象从「当前值」变成
+「最近一个窗口的历史样本」，窗口 1s..24h。永久有效的三条语义：**只统计 good 的
+数值样本**（stale 与开关量不计）；**空窗口是失败而不是 0**（计算点 bad、报警
+unknown）；**窗口引用不算当前值依赖**，所以 `a = avg(b, 5m)` 与 `b = a + 1`
+可以共存。历史只记变化 + 心跳，窗口里可能只有 1 个样本——想知道够不够，用
+`count()` 而不是猜。
+
 认证、授权与审计（三角色 + 哈希链）：
 
 ```bash

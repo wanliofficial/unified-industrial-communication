@@ -83,6 +83,7 @@ type Runtime struct {
 	alarms      *alarm.Engine
 	hist        *history.Store
 	histWriter  *historyWriter
+	win         *historyWindow
 	audit       *audit.Store
 	auth        *auth.Reloadable
 	auditErrors atomic.Uint64
@@ -191,6 +192,10 @@ func New(opt Options) (*Runtime, error) {
 		startedAt:  time.Now(),
 	}
 	r.declareMetrics()
+	// 窗口聚合的数据源必须在 openAlarms 之前就位（报警是第二步，历史是
+	// 第三步）。适配器内部按需读取 r.hist，因此这里构造时历史还没打开也
+	// 不会让它永久不可用。
+	r.win = r.newHistoryWindowSource()
 	// 版本信息必须早于任何子系统：从站（FC43）、MQTT 的 $birth、OPC UA 的
 	// BuildInfo 都会在启动阶段就把版本报给外部。晚一步赋值，这些对外声明
 	// 就会永久停留在空值上——配置热更新也不会纠正它们。
@@ -306,6 +311,7 @@ func (r *Runtime) declareMetrics() {
 	d("uic_history_evicted_total", "gauge", "因保留策略淘汰的段数")
 	d("uic_history_write_errors_total", "gauge", "历史写入失败次数")
 	d("uic_history_query_total", "counter", "历史查询次数与结果")
+	d("uic_history_window_total", "counter", "历史窗口聚合查询次数与结果（ok/empty/unavailable）")
 	d("uic_opcua_server_up", "gauge", "北向 OPC UA 服务端是否在监听")
 	d("uic_opcua_server_writes_total", "counter", "北向 OPC UA 写入次数与结果")
 	d("uic_audit_records_total", "counter", "写入审计日志的记录数")

@@ -115,6 +115,12 @@ func checkType(n node) (Kind, error) {
 		return KindBool, nil
 	case *refNode:
 		return KindNumber, nil
+	case *durNode:
+		// 时长不是值。给出这条错误而不是「unknown node」，是因为写错的人
+		// 通常只是把窗口函数的参数顺序写反了。
+		return "", fmt.Errorf("duration literal %s is only allowed as the second argument of avg/min/max/sum/count", x.d)
+	case *windowNode:
+		return KindNumber, nil
 	case *unaryNode:
 		k, err := checkType(x.x)
 		if err != nil {
@@ -254,6 +260,42 @@ func collectFuncs(n node) []string {
 			for _, a := range x.args {
 				walk(a)
 			}
+		case *windowNode:
+			if !seen[x.name] {
+				seen[x.name] = true
+				out = append(out, x.name)
+			}
+		}
+	}
+	walk(n)
+	return out
+}
+
+// collectWindows 收集表达式里的时间窗口聚合（按出现顺序去重）。
+//
+// 去重键包含窗口长度：同一个点位同时取 5 分钟均值和 1 小时均值，是两次
+// 不同的历史查询，都要保留。
+func collectWindows(n node) []WindowRef {
+	var out []WindowRef
+	seen := map[WindowRef]bool{}
+	var walk func(node)
+	walk = func(n node) {
+		switch x := n.(type) {
+		case *unaryNode:
+			walk(x.x)
+		case *binaryNode:
+			walk(x.l)
+			walk(x.r)
+		case *callNode:
+			for _, a := range x.args {
+				walk(a)
+			}
+		case *windowNode:
+			ref := WindowRef{Name: x.name, Ref: x.ref, Window: x.window}
+			if !seen[ref] {
+				seen[ref] = true
+				out = append(out, ref)
+			}
 		}
 	}
 	walk(n)
@@ -265,7 +307,7 @@ func collectFuncs(n node) []string {
 // `&&` 与 `||` **短路**：这不是性能优化，而是正确性的一部分——
 // `rate != 0 && total / rate > 10` 在 rate 为 0 时必须得到 false，而不是
 // 「除零错误」。现场写这种防护式表达式非常自然。
-func eval(n node, r Resolver) (float64, error) {
+func eval(n node, r Resolver, w WindowResolver) (float64, error) {
 	switch x := n.(type) {
 	case *numLit:
 		return x.v, nil
@@ -274,14 +316,21 @@ func eval(n node, r Resolver) (float64, error) {
 			return 1, nil
 		}
 		return 0, nil
+	case *durNode:
+		return 0, fmt.Errorf("duration literal %s is not a value", x.d)
+	case *windowNode:
+		return evalWindow(x, w)
 	case *refNode:
+		if r == nil {
+			return 0, fmt.Errorf("reference %q has no value source", x.text)
+		}
 		v, ok := r(x.text)
 		if !ok {
 			return 0, fmt.Errorf("reference %q has no value", x.text)
 		}
 		return v, nil
 	case *unaryNode:
-		v, err := eval(x.x, r)
+		v, err := eval(x.x, r, w)
 		if err != nil {
 			return 0, err
 		}
@@ -299,7 +348,7 @@ func eval(n node, r Resolver) (float64, error) {
 		return 0, fmt.Errorf("internal: unknown unary %q", x.op)
 	case *binaryNode:
 		if x.op == "&&" || x.op == "||" {
-			l, err := eval(x.l, r)
+			l, err := eval(x.l, r, w)
 			if err != nil {
 				return 0, err
 			}
@@ -309,7 +358,7 @@ func eval(n node, r Resolver) (float64, error) {
 			if x.op == "||" && l != 0 {
 				return 1, nil
 			}
-			v, err := eval(x.r, r)
+			v, err := eval(x.r, r, w)
 			if err != nil {
 				return 0, err
 			}
@@ -318,11 +367,11 @@ func eval(n node, r Resolver) (float64, error) {
 			}
 			return 0, nil
 		}
-		l, err := eval(x.l, r)
+		l, err := eval(x.l, r, w)
 		if err != nil {
 			return 0, err
 		}
-		rv, err := eval(x.r, r)
+		rv, err := eval(x.r, r, w)
 		if err != nil {
 			return 0, err
 		}
@@ -333,14 +382,14 @@ func eval(n node, r Resolver) (float64, error) {
 		return finite(v, x.op)
 	case *callNode:
 		if x.name == "if" {
-			c, err := eval(x.args[0], r)
+			c, err := eval(x.args[0], r, w)
 			if err != nil {
 				return 0, err
 			}
 			if c != 0 {
-				return eval(x.args[1], r)
+				return eval(x.args[1], r, w)
 			}
-			return eval(x.args[2], r)
+			return eval(x.args[2], r, w)
 		}
 		spec, err := lookupFunc(x.name)
 		if err != nil {
@@ -348,7 +397,7 @@ func eval(n node, r Resolver) (float64, error) {
 		}
 		args := make([]float64, len(x.args))
 		for i, a := range x.args {
-			v, err := eval(a, r)
+			v, err := eval(a, r, w)
 			if err != nil {
 				return 0, err
 			}
@@ -361,6 +410,44 @@ func eval(n node, r Resolver) (float64, error) {
 		return finite(v, x.name)
 	}
 	return 0, fmt.Errorf("internal: unknown node %T", n)
+}
+
+// evalWindow 求值一次历史窗口聚合。
+//
+// 三种失败分开报，因为它们的处置完全不同：
+//   - 没有注入历史（配置/装配错）→ 写表达式的人要改配置；
+//   - 历史查询失败（磁盘/IO）→ 运维要去看存储；
+//   - 窗口内没有 good 样本（数据还没积累够，或这段时间设备一直断线）→
+//     等一会儿或者查设备，表达式本身没错。
+func evalWindow(x *windowNode, w WindowResolver) (float64, error) {
+	if w == nil {
+		return 0, fmt.Errorf("%s(%s, %s): history is not available (storage.history.enabled must be true)",
+			x.name, x.ref, x.window)
+	}
+	st, ok := w(x.ref, x.window)
+	if !ok {
+		return 0, fmt.Errorf("%s(%s, %s): history is unavailable", x.name, x.ref, x.window)
+	}
+	if st.Count == 0 {
+		return 0, fmt.Errorf("%s(%s, %s): no good samples in the last %s",
+			x.name, x.ref, x.window, x.window)
+	}
+	var v float64
+	switch x.name {
+	case "avg":
+		v = st.Sum / float64(st.Count)
+	case "min":
+		v = st.Min
+	case "max":
+		v = st.Max
+	case "sum":
+		v = st.Sum
+	case "count":
+		v = float64(st.Count)
+	default:
+		return 0, fmt.Errorf("internal: unknown window aggregate %q", x.name)
+	}
+	return finite(v, x.name)
 }
 
 func applyBinary(op string, l, r float64) (float64, error) {

@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"uic/internal/calc"
 	"uic/internal/model"
 )
 
@@ -904,6 +905,91 @@ func TestReferences(t *testing.T) {
 	if _, err := r.References(); err == nil {
 		t.Fatal("want error for invalid expr")
 	}
+
+	// 窗口引用也是引用：配置层要靠它检查点位存在、是数值类型。
+	r = Rule{ID: "w", Severity: SeverityInfo, Expr: "avg(dev:a, 5m) > 1"}
+	refs, err = r.References()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(refs) != 1 || refs[0] != "dev:a" {
+		t.Fatalf("window refs = %v", refs)
+	}
+}
+
+// 报警的窗口条件：数据来自历史，不走 cache，因此质量判定也不同——
+// 历史不可用时是「未知」而不是「不满足」。
+func TestWindowCondition(t *testing.T) {
+	window := func(ref string, d time.Duration) (calc.WindowStats, bool) {
+		if ref != "dev:temp" || d != 5*time.Minute {
+			return calc.WindowStats{}, false
+		}
+		return calc.WindowStats{Count: 3, Sum: 270, Min: 80, Max: 100}, true
+	}
+	e := newWindowEngine(t, Rule{
+		ID: "hot", Severity: SeverityCritical,
+		Expr: "avg(dev:temp, 5m) > 80",
+	}, window)
+
+	e.Sweep()
+	st := mustState(t, e, "hot", StateActive)
+	if st.Value == nil || *st.Value != 1 {
+		t.Fatalf("value = %v, want 1 (condition true)", st.Value)
+	}
+	if st.Quality != model.QualityGood {
+		t.Fatalf("quality = %s", st.Quality)
+	}
+}
+
+func TestWindowConditionUnavailableIsUnknown(t *testing.T) {
+	cases := []struct {
+		name   string
+		window calc.WindowResolver
+		want   string
+	}{
+		{"no resolver", nil, "history is not available"},
+		{"history unavailable", func(string, time.Duration) (calc.WindowStats, bool) {
+			return calc.WindowStats{}, false
+		}, "history is unavailable"},
+		{"empty window", func(string, time.Duration) (calc.WindowStats, bool) {
+			return calc.WindowStats{}, true
+		}, "no good samples"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			e := newWindowEngine(t, Rule{
+				ID: "hot", Severity: SeverityCritical,
+				Expr: "avg(dev:temp, 5m) > 80",
+			}, tc.window)
+			e.Sweep()
+			st := mustState(t, e, "hot", StateNormal)
+			if st.Quality != model.QualityBad {
+				t.Fatalf("quality = %s, want bad", st.Quality)
+			}
+			if !strings.Contains(st.Reason, tc.want) {
+				t.Fatalf("reason = %q, want %q", st.Reason, tc.want)
+			}
+			if st.ValueKnown {
+				t.Fatal("unavailable history must not produce a known value")
+			}
+		})
+	}
+}
+
+func newWindowEngine(t *testing.T, rule Rule, window calc.WindowResolver) *Engine {
+	t.Helper()
+	e, err := New(Options{
+		Rules:  []Rule{rule},
+		Lookup: newSource().lookup,
+		Window: window,
+		Log:    slog.New(slog.NewTextHandler(discard{}, &slog.HandlerOptions{Level: slog.LevelError})),
+		Now:    newFakeClock().Now,
+		Sweep:  time.Hour,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	return e
 }
 
 // ---------------------------------------------------------------------------

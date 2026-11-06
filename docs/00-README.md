@@ -5,8 +5,8 @@
 | 项 | 数字 |
 |---|---|
 | 分析的参考方案 | 38 份（PA-01 … PA-38，其中 PA-06 合并了两个完全相同的仓库） |
-| 文档总量 | 55 份 Markdown / 18,195 行（含 3 份 ADR） |
-| 代码总量 | 145 个 Go 文件 / 59,658 行（其中测试 26,335 行） |
+| 文档总量 | 55 份 Markdown / 18,298 行（含 3 份 ADR） |
+| 代码总量 | 150 个 Go 文件 / 61,322 行（其中测试 27,278 行） |
 | Go 包 | 37 个（1 个入口 + 36 个内部包；35 个有测试） |
 | 第三方依赖 | 0（仅标准库，零 CGO） |
 
@@ -538,7 +538,7 @@ obs  ← 所有包（不依赖任何内部包）
 | **每通道信号量（写优先）** | 通道级并发上限；写请求插队到读之前 | 写入是人的操作，延迟可感知；读是后台任务，晚 100ms 无所谓 |
 | **代次隔离** | 每次重启设备递增 generation，旧 lease 的写入一律丢弃 | 解决「设备已删除，旧 goroutine 还在往 cache 写值」这类幽灵数据 |
 
-实现见 `internal/scheduler/`，测试见 `internal/scheduler/*_test.go`（覆盖率 87.7%）。
+实现见 `internal/scheduler/`，测试见 `internal/scheduler/*_test.go`（覆盖率 88.1%）。
 
 ---
 
@@ -548,7 +548,7 @@ obs  ← 所有包（不依赖任何内部包）
 
 | 包 | 职责 | 关键不变量 | 覆盖率 |
 |---|---|---|---|
-| `internal/model` | 通道/设备/点位/地址/采样/质量码/从站映射与设备标识 | 不依赖任何内部包；不变量集中在 `Validate`；DB 号与 area 联动校验；计算点强制只读、4 类地址各有规范形式；订阅周期只在 `subscribe=true` 时允许出现；从站标识限长并禁控制字符 | 87.0% |
+| `internal/model` | 通道/设备/点位/地址/采样/质量码/从站映射与设备标识/窗口摘要 | 不依赖任何内部包；不变量集中在 `Validate`；DB 号与 area 联动校验；计算点强制只读、4 类地址各有规范形式；订阅周期只在 `subscribe=true` 时允许出现；从站标识限长并禁控制字符；`WindowStats.Avg` 在 `Count=0` 时返回 0 而不是 NaN | 87.1% |
 | `internal/driver` | 驱动契约（Codec/Transport/Driver）、错误分类、注册表、只读 `Lookup` 注入 | 能力四态；`Conn` 不保证并发安全，由调用方串行；协议错误可用 `Kinded` 自带分类 | 87.0% |
 | `internal/codec/modbus` | Modbus 纯函数编解码（TCP/RTU/ASCII，主站与从站共用） | 无 I/O、无时钟、无可变状态 | 88.5% |
 | `internal/codec/value` | 协议无关值编解码（重排、数值/字符串/BCD） | 与协议无关；`Encode` 对 string/bytes 不猜宽度 | 95.0% |
@@ -559,7 +559,7 @@ obs  ← 所有包（不依赖任何内部包）
 | `internal/driver/s7` | S7（S7comm）主站 | COTP/Setup 握手不可省；按协商 PDU 与 20 项上限切块；逐项返回码映射质量码 | 79.9% |
 | `internal/driver/opcua` | OPC UA 二进制主站（None/None + 匿名）；可选订阅推送 | 三层状态（TCP/通道/会话）分开判断；按 RequestId 过滤迟到响应；节点越界判坏不截断；订阅走独立第二条连接，Read 优先本地表、失效即回退真读 | 76.2% |
 | `internal/driver/mqtt` | MQTT 南向（订阅取数）：把推送型协议适配成拉取契约 | `Read` 无网络交互，只读本地最新值表；质量码只反映新鲜度（good/stale/bad 三档）；一条消息都没有不算断链，安静到一个窗口且 PING 失败才判链 | 77.4% |
-| `internal/driver/computed` | 计算点：表达式驱动，无物理链路 | 同设备依赖在一次 `Read` 内按拓扑序闭合；输入不可用则不计算、质量取最差并指名输入；整数越界判坏不截断 | 92.4% |
+| `internal/driver/computed` | 计算点：表达式驱动，无物理链路 | 同设备依赖在一次 `Read` 内按拓扑序闭合；输入不可用则不计算、质量取最差并指名输入；整数越界判坏不截断；窗口聚合的数据来自只读 `OpenConfig.History`，缺失时显式失败 | 92.7% |
 | `internal/driver/virtual` | 虚拟设备（波形 + 故障注入） | 故障按「第 n 次请求」精确注入一次 | 98.6% |
 | `internal/sim/modbus` | 内置 Modbus TCP 从站 | 复用同一份 codec，避免主从语义漂移 | 87.2% |
 | `internal/sim/s7` | 内置 S7 从站（内存 DB/M/I/Q 区） | 与主站共用 codec/s7；输入区只读；位写保邻位 | 71.9% |
@@ -567,23 +567,23 @@ obs  ← 所有包（不依赖任何内部包）
 | `internal/northbound/opcua` | OPC UA 北向：点位表 → 地址空间 | 一点一变量；质量码映射到 `DataValue.Status`；写入过 `Runtime.Write`（设备 actor + 幂等）；配置变更按指纹重建，抢不到端口回退上一份配置 | 82.4% |
 | `internal/sim/mqtt` | 内置 MQTT 3.1.1 Broker，兼 `uic sim -protocol mqtt` 运行时 | 全项目唯一一份 Broker 实现；不做 QoS2/持久会话/TLS；QoS2 授予时降级为 1 | 79.3% |
 | `internal/slave/modbus` | Modbus 从站（TCP / RTU / ASCII，把点位暴露给外部主站） | 读走 cache、写走 Runtime.Write；未映射地址报错不补零；坏质量保留最后值并计数；RTU 按功能码推导帧长、ASCII 以 CRLF 分帧；非本机地址静默、广播只写不回；诊断与设备识别（FC8/11/17/43） | 81.4% |
-| `internal/alarm` | 报警引擎：五态机、阈值/滞回/延时、表达式规则、确认、订阅 | 输入不可信时绝不改状态机；延时是「连续满足」；`cleared` 与 `active` 都要确认；状态只在内存 | 94.4% |
-| `internal/history` | 有界采样日志：NDJSON 分段、整段淘汰、原始查询与定步长聚合 | 一条记录不跨段；永远保留至少一段；末尾半行触发新段；查询升序、桶对齐、桶质量取最差；非数值点位不产出 `min/max/avg` | 83.5% |
-| `internal/calc` | 零依赖表达式引擎（编译期类型检查、短路求值） | 无 `eval`；引用是 `device:point`；除零/NaN/Inf/溢出都报错而不是降级 | 91.2% |
+| `internal/alarm` | 报警引擎：五态机、阈值/滞回/延时、表达式规则（含历史窗口）、确认、订阅 | 输入不可信时绝不改状态机；延时是「连续满足」；`cleared` 与 `active` 都要确认；状态只在内存；窗口无样本时判 unknown 而不是「不满足」 | 93.8% |
+| `internal/history` | 有界采样日志：NDJSON 分段、整段淘汰、原始查询、定步长聚合与窗口摘要 | 一条记录不跨段；永远保留至少一段；末尾半行触发新段；查询升序、桶对齐、桶质量取最差；非数值点位不产出 `min/max/avg`；`WindowStats` 只统计 good 的数值样本，空窗口返回 `Count=0` 而非错误 | 84.0% |
+| `internal/calc` | 零依赖表达式引擎（编译期类型检查、短路求值、历史窗口聚合） | 无 `eval`；引用是 `device:point`；除零/NaN/Inf/溢出都报错而不是降级；窗口只允许 1s..24h，且只在第二个参数是时长时生效；窗口引用不进 `Refs()` | 92.7% |
 | `internal/planner` | 点位 → 批量读请求（ReadSpan） | 协议无关；按连续性/上限合并；按 `area:db` 分组；计算点合成单个 `expr` span（漏组会表现为全坏且无日志） | 92.6% |
-| `internal/scheduler` | tick、actor、信号量、退避、熔断、代次 | 同设备不并发；写优先；旧代次丢弃；状态回调不占采集路径 | 87.8% |
+| `internal/scheduler` | tick、actor、信号量、退避、熔断、代次 | 同设备不并发；写优先；旧代次丢弃；状态回调不占采集路径 | 88.1% |
 | `internal/pipeline` | 缩放、质量判定、死区过滤 | 质量不可用时不参与死区比较 | 92.7% |
 | `internal/cache` | 当前值唯一事实源 + 变更订阅 | 读写都要过这里，不允许模块自留副本 | 96.7% |
 | `internal/outbox` | 持久队列：分区、WAL、确认位点、三重上限 | at-least-once；整批或前缀成功才推进位点 | 77.4% |
-| `internal/config` | 加载、校验、规范化、版本化、回滚 | 幂等 Normalize；原子写；失败自动恢复；北向参数、从站映射、计算点（编译/引用/类型/环）、报警（条件/引用/类型）与历史保留策略静态校验 | 83.3% |
+| `internal/config` | 加载、校验、规范化、版本化、回滚 | 幂等 Normalize；原子写；失败自动恢复；北向参数、从站映射、计算点（编译/引用/类型/环/窗口）、报警（条件/引用/类型/窗口）与历史保留策略静态校验 | 83.6% |
 | `internal/obs` | 指标、结构化日志、日志环形缓冲 | 指标标签必须归一化（不能含原始 URL） | 88.2% |
 | `internal/rbac` | 角色/权限矩阵（纯函数） | 未知角色/未知权限一律拒绝；`viewer ⊆ operator ⊆ admin`；高危命令按动作映射到 `command.danger` | 100% |
 | `internal/auth` | 凭据表：Token → 身份；`Reloadable` 支持热替换 | Token 先 SHA-256 再定长比较；无凭据进入 open 模式而不是造默认口令；拒绝弱口令；枚举永不返回 Token | 96.7% |
 | `internal/audit` | 审计存储：NDJSON 分段 + SHA-256 哈希链 + 查询/校验 | 序号连续；字段边界用「长度:内容」编码；整段淘汰后链仍可校验；尾部半行触发新段 | 80.7% |
 | `internal/northbound/httpapi` | REST + SSE + 认证/授权 + 错误码 | 错误码稳定；响应不泄露凭据；未知角色全拒；401 与 403 在审计里区分；报警/历史查询的未知参数取值必须报错而不是静默忽略 | 83.4% |
-| `internal/mqtt` | MQTT 3.1.1 客户端（北向发布 + 南向订阅共用，纯 Go 零依赖） | 单 goroutine 读 socket；QoS1 必须等到 PUBACK；`Ping` 必须等到 PINGRESP（写成功不算活着）；断线立即失败而非超时 | 70.8% |
+| `internal/mqtt` | MQTT 3.1.1 客户端（北向发布 + 南向订阅共用，纯 Go 零依赖） | 单 goroutine 读 socket；QoS1 必须等到 PUBACK；`Ping` 必须等到 PINGRESP（写成功不算活着）；断线立即失败而非超时 | 70.3% |
 | `internal/mqtt/mqtttest` | 测试封装：`internal/sim/mqtt` 的 `*testing.T` 生命周期 + 等待断言 | 不另写 Broker（两份实现必然长歪）；开关一律走 setup 函数而非直接赋字段 | — |
-| `internal/runtime` | 唯一编排层 + 后端实现 + 看门狗 + 审计埋点 | 启动/关闭顺序（失败逆序收口）；`configuredState` 与 `runtimeState` 分离；协议/传输匹配在装配期校验；只向驱动与报警引擎注入只读 `cache.Get`；北向 OPC UA 启停与热重建；凭据表热替换后旧用户立即失效 | 80.9% |
+| `internal/runtime` | 唯一编排层 + 后端实现 + 看门狗 + 审计埋点 + 窗口缓存 | 启动/关闭顺序（失败逆序收口）；`configuredState` 与 `runtimeState` 分离；协议/传输匹配在装配期校验；只向驱动与报警引擎注入只读 `cache.Get` 与窗口数据源；北向 OPC UA 启停与热重建；凭据表热替换后旧用户立即失效 | 81.2% |
 | `cmd/uic` | 单入口：run / sim / mbread / uaread / check / version | 关闭预算 10 秒；`uaread` 与 `mbread` 是不装第三方客户端即可自证链路的自检工具 | — |
 
 ### 9.2 测试与验证命令
@@ -717,7 +717,8 @@ OPC UA 服务端（同一份点位表的另一个出口）：
 | 历史采样日志 | ✅ | `storage.history.enabled=true`：事件驱动 + 心跳补点（死区 / 最小间隔 / 质量变化 / `disabled` 不记）；NDJSON 分段、按字节上限与保留期整段淘汰且永远保留一段；掉电半行触发新段；查询左闭右闭、结果升序、桶起点对齐、桶质量取最差、桶数上限 5000 |
 | 历史查询 API | ✅ | `GET /api/v1/history`：原始点 + 定步长聚合（last/first/avg/min/max/count）；`from`/`to` 支持 RFC3339、`now` 与相对写法（`-1h`）；关掉时返回 `409 history.disabled` 而不是空结果 |
 | 历史的边界 | ⚠️ | 单点位查询（不做跨点 join / 多点多列）；不做样本级删除（只按段淘汰）；采样策略全局一套（需要区别对待时用死区与停用点位）；`dir`/`maxBytes`/`segmentBytes`/`maxAge` 改动需重启，`minInterval`/`heartbeat`/`deadband` 可热改 |
-| 历史窗口聚合（`avg(近 5 分钟)`） | ⏳ | 历史库已可查；「在报警/计算表达式里引用历史窗口」尚未接入（属 Wave 2 的表达式扩展） |
+| 历史窗口聚合（`avg(近 5 分钟)`） | ✅ | 表达式里写 `avg/min/max/sum/count(ref, 5m)`（窗口 1s..24h，单位 `ms`/`s`/`m`/`h`）；计算点与报警规则都能用；只统计质量为 good 的**数值**样本（stale/bool/string 不计入）；空窗口求值失败 → 计算点 bad、报警 unknown（不是 0，也不是「不满足」）；配置期强制 `storage.history.enabled=true`、引用存在且为数值类型、窗口不超过 `history.maxAge` |
+| 历史窗口聚合的代价与缓存 | ⚠️ | 每次求值都要扫历史段，因此 runtime 侧带短 TTL 缓存（`clamp(window/60, 1s, 30s)`，空窗口压到 1s）；历史只记「变化 + 心跳」，窗口内样本可能很少（`avg` 可能只基于 1 个样本），需要样本数时用 `count()`；窗口引用**不计入**计算点依赖图（读的是过去，不是当前值，因此不构成环） |
 | 配置版本/回滚/diff | ✅ | 内容哈希版本、快照、原子写、失败自动恢复、回滚缺版本返回 404 |
 | 认证与授权 | ✅ | 多身份静态 Token（`server.users`，`token` 或 `tokenSha256`）；Token 先 SHA-256 再定长比较；三角色九权限按动作划分，`viewer ⊆ operator ⊆ admin`，未知角色/权限全拒；高危命令 handler 内二次判定；凭据表整体热替换，删掉的用户下一条请求即 401 |
 | 认证的边界 | ⚠️ | 不做会话/口令/过期/自助轮换（见 ADR-0003）；不做账户锁定与失败次数限制；未配置凭据时进入 open 模式并告警，不生成默认口令 |

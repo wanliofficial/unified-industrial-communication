@@ -1,0 +1,131 @@
+{
+  "schemaVersion": 1,
+  "site": "window-site",
+  "server": {
+    "listen": "127.0.0.1:8095",
+    "tls": {
+      "enabled": false
+    }
+  },
+  "channels": [
+    {
+      "id": "ch-virtual",
+      "protocol": "virtual",
+      "transport": {
+        "kind": "memory"
+      },
+      "concurrency": 4,
+      "timeout": "2s"
+    },
+    {
+      "id": "ch-calc",
+      "protocol": "computed",
+      "transport": {
+        "kind": "memory"
+      },
+      "concurrency": 1,
+      "timeout": "1s"
+    }
+  ],
+  "devices": [
+    {
+      "id": "press",
+      "name": "压机（正弦功率）",
+      "channel": "ch-virtual",
+      "interval": "500ms",
+      "timeout": "2s",
+      "enabled": true,
+      "points": [
+        {
+          "id": "power",
+          "name": "功率",
+          "address": {
+            "kind": "register",
+            "area": "holding",
+            "offset": 0,
+            "length": 2,
+            "bit": -1
+          },
+          "dataType": "float64",
+          "unit": "kW",
+          "enabled": true
+        }
+      ],
+      "labels": {
+        "mode": "sine"
+      }
+    },
+    {
+      "id": "kpi",
+      "name": "压机统计量（从历史窗口计算）",
+      "channel": "ch-calc",
+      "interval": "2s",
+      "timeout": "1s",
+      "enabled": true,
+      "points": [
+        {
+          "id": "avg1m",
+          "name": "1 分钟平均功率",
+          "address": {
+            "kind": "computed",
+            "expr": "avg(press:power, 1m)"
+          },
+          "dataType": "float64",
+          "unit": "kW",
+          "enabled": true
+        },
+        {
+          "id": "peak5m",
+          "name": "5 分钟峰值",
+          "address": {
+            "kind": "computed",
+            "expr": "max(press:power, 5m)"
+          },
+          "dataType": "float64",
+          "unit": "kW",
+          "enabled": true
+        },
+        {
+          "id": "samples5m",
+          "name": "5 分钟样本数",
+          "address": {
+            "kind": "computed",
+            "expr": "count(press:power, 5m)"
+          },
+          "dataType": "float64",
+          "enabled": true
+        },
+        {
+          "id": "load_factor",
+          "name": "当前值 / 1 分钟均值",
+          "address": {
+            "kind": "computed",
+            "expr": "press:power / avg(press:power, 1m)"
+          },
+          "dataType": "float64",
+          "enabled": true
+        }
+      ]
+    }
+  ],
+  "storage": {
+    "dir": "./data-window",
+    "outboxMaxBytes": 8388608,
+    "outboxMaxRecords": 20000,
+    "outboxTtl": "1h0m0s",
+    "journal": false,
+    "history": {
+      "enabled": true,
+      "maxBytes": 33554432,
+      "maxAge": "1h0m0s",
+      "segmentBytes": 4194304,
+      "minInterval": "1s",
+      "heartbeat": "30s",
+      "deadband": 0
+    }
+  },
+  "logging": {
+    "level": "info",
+    "format": "json"
+  }
+}

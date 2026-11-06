@@ -581,6 +581,53 @@ func (f *File) validateAlarms() error {
 					r.ID, ref, p.DataType)
 			}
 		}
+		if r.Expr != "" {
+			prog, err := calc.Compile(r.Expr)
+			if err != nil {
+				return fmt.Errorf("alarm %q: %w", r.ID, err)
+			}
+			if err := f.validateWindows("alarm \""+r.ID+"\"", prog, index); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// validateWindows 校验表达式里的历史窗口聚合。
+//
+// 三条检查全部是静态的，也都对应一种「不报错但永远算不出值」的现场：
+//   - 历史没开启 → 窗口求值必然失败，报警永远 unknown；
+//   - 引用的点位不存在 / 是文本点 → 历史里根本没有可聚合的数值；
+//   - 窗口比保留期长 → 老样本已经被淘汰，聚合悄悄只覆盖了最近一段，
+//     结果「看起来正常」但含义与配置写的不一致。
+func (f *File) validateWindows(where string, prog *calc.Program, index map[pointKey]model.Point) error {
+	if !prog.UsesWindow() {
+		return nil
+	}
+	if !f.Storage.History.Enabled {
+		return fmt.Errorf("%s: expression %q uses a history window, but storage.history.enabled is false",
+			where, prog.String())
+	}
+	maxAge := f.Storage.History.MaxAge.Duration()
+	for _, w := range prog.Windows() {
+		dev, pt, ok := splitRef(w.Ref)
+		if !ok {
+			return fmt.Errorf("%s: malformed window reference %q", where, w.Ref)
+		}
+		p, exists := index[pointKey{dev, pt}]
+		if !exists {
+			return fmt.Errorf("%s: window reference %q does not exist", where, w.Ref)
+		}
+		if !p.DataType.IsNumeric() {
+			return fmt.Errorf("%s: window reference %q is %s, which has no numeric history",
+				where, w.Ref, p.DataType)
+		}
+		if maxAge > 0 && w.Window > maxAge {
+			return fmt.Errorf("%s: window %s for %q exceeds storage.history.maxAge %s; "+
+				"older samples are evicted, so the aggregate would silently cover less than configured",
+				where, w.Window, w.Ref, maxAge)
+		}
 	}
 	return nil
 }
@@ -629,6 +676,10 @@ func (f *File) validateComputed() error {
 				if _, exists := index[pointKey{dev, pt}]; !exists {
 					return fmt.Errorf("device %q point %q: reference %q does not exist", d.ID, p.ID, ref)
 				}
+			}
+			if err := f.validateWindows(
+				fmt.Sprintf("device %q point %q", d.ID, p.ID), prog, index); err != nil {
+				return err
 			}
 		}
 	}
