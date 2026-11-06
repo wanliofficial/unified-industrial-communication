@@ -233,7 +233,11 @@ func TestSubscribeRejectsInvalidNodeID(t *testing.T) {
 }
 
 // Close 不能被长轮询拖住：Publish 的等待上限是 15 秒起，
-// 关闭必须在一秒内完成。
+// 关闭必须在很短时间内完成。
+//
+// 上限取 5 秒而不是 1 秒：`-race` 下整包并行跑时，调度延迟足以让一次
+// 正常的 Close 超过 1 秒（实测 2.0s）。5 秒仍远低于 15 秒的保活下限，
+// 「没有等 Publish 超时」这个断言依旧成立，但不会因为机器忙而误报。
 func TestCloseDoesNotWaitForPublishTimeout(t *testing.T) {
 	srv := newSim(t)
 	c, _ := openSub(t, srv, 200*time.Millisecond)
@@ -245,7 +249,7 @@ func TestCloseDoesNotWaitForPublishTimeout(t *testing.T) {
 	if err := c.Close(); err != nil {
 		t.Fatalf("close: %v", err)
 	}
-	if d := time.Since(start); d > time.Second {
+	if d := time.Since(start); d > 5*time.Second {
 		t.Fatalf("close took %v", d)
 	}
 	// 幂等：第二次关闭不能 panic 也不能重新建链。
