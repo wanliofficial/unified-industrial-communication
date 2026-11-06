@@ -38,7 +38,10 @@
           },
           "dataType": "float32",
           "unit": "℃",
-          "deadband": 0.2,
+          "deadband": 2,
+          "deadbandMode": "percent",
+          "rangeMin": -20,
+          "rangeMax": 120,
           "enabled": true
         },
         {

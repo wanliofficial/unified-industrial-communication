@@ -232,6 +232,19 @@ public sealed class Device
     };
 }
 
+/// <summary>死区判定方式。三种方式解决的是三种现场噪声，不能互相替代。</summary>
+public enum DeadbandMode
+{
+    /// <summary>绝对值：|Δ| &gt; deadband。默认，单位与点位一致。</summary>
+    Absolute,
+
+    /// <summary>量程百分比：|Δ| &gt; deadband% × (rangeMax - rangeMin)。要求配置量程。</summary>
+    Percent,
+
+    /// <summary>变化率：|Δ| / Δt(秒) &gt; deadband。用于抑制慢漂移、保留突跳。</summary>
+    Rate,
+}
+
 /// <summary>点位。地址 + 类型 + 缩放 + 死区 + 单位。</summary>
 public sealed class Point
 {
@@ -244,8 +257,17 @@ public sealed class Point
     public double Scale { get; init; } = 1;
     public double Offset { get; init; }
 
-    /// <summary>死区（绝对值）。为空表示不启用死区过滤。</summary>
+    /// <summary>死区阈值。含义由 <see cref="DeadbandMode"/> 决定；为空表示不启用死区过滤。</summary>
     public double? Deadband { get; init; }
+
+    /// <summary>死区判定方式。默认绝对值，兼容旧配置。</summary>
+    public DeadbandMode DeadbandMode { get; init; } = DeadbandMode.Absolute;
+
+    /// <summary>量程下限。与 <see cref="RangeMax"/> 成对出现，百分比死区与上位机显示都用它。</summary>
+    public double? RangeMin { get; init; }
+
+    /// <summary>量程上限。</summary>
+    public double? RangeMax { get; init; }
 
     public string? Unit { get; init; }
     public bool Writable { get; init; } = true;

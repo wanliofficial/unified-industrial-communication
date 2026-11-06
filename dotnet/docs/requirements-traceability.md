@@ -11,7 +11,7 @@
 它们不是 §6.1「不做」清单里的项，属于真实缺口；逐协议现状、原因与补法见
 [protocol-status.md](protocol-status.md)。
 
-当前测试基线：**136 passed / 0 failed / 1 skipped**（跳过的是需要 `--opcua` 的 OPC UA 端到端用例）。
+当前测试基线：**141 passed / 0 failed / 1 skipped**（跳过的是需要 `--opcua` 的 OPC UA 端到端用例）。
 
 ## 1. 采集（FR-COL）
 
@@ -69,9 +69,9 @@
 | 编号 | 需求 | 状态 | 证据 / 说明 |
 |---|---|---|---|
 | FR-PROC-01 | 线性缩放与偏移 | 已实现 | `pipeline/scale_and_offset`、`pipeline/rounding_for_integer_types` |
-| FR-PROC-02 | 死区（绝对值/百分比/变化率） | 部分实现 | **只有绝对值**：`pipeline/deadband_*` 四条。百分比/变化率需要点位级配置字段与窗口状态 |
+| FR-PROC-02 | 死区（绝对值/百分比/变化率） | 已实现 | `pipeline/deadband_percent_uses_range_span`、`pipeline/deadband_rate_uses_elapsed_time`、`cache/publish_configured_applies_point_rule`、`csv/imports_deadband_mode_and_range`；`Point.DeadbandMode` 与 `Pipeline.ExceedsDeadband` 三种模式，语义见 [configuration.md](configuration.md#死区) |
 | FR-PROC-03 | 质量传播（Bad/Stale 不参与计算与上报） | 已实现 | `pipeline/bad_quality_skips_scaling`、`pipeline/bad_quality_preserves_reason`、`pipeline/deadband_reports_quality_transitions` |
-| FR-PROC-04 | 单位与量程元数据 | 部分实现 | `unit` 已贯穿配置与北向输出；**量程（min/max）字段未做** |
+| FR-PROC-04 | 单位与量程元数据 | 已实现 | `unit` 贯穿配置与北向；`rangeMin`/`rangeMax` 进入 `Point`、配置校验、CSV 导入与点位 JSON，证据 `config/deadband_and_range_rules`、`csv/imports_deadband_mode_and_range` |
 | FR-PROC-05 | 计算点（表达式） | 刻意没做（C） | Wave 2；`Pipeline` 已留出质量传播点 |
 | FR-PROC-06 | 报警判定 | 刻意没做（C） | Wave 2；需要独立的报警状态机、确认与抑制 |
 

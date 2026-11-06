@@ -68,7 +68,7 @@
 3. `IConn.ReadAsync(spans)` 一次往返拿回整窗；
 4. `ModbusCodec` 按点位类型与字节序解出 `RawSample`；
 5. `Pipeline.Process` 做缩放/偏移、质量传播、整数类型的取整；
-6. `PointCache.Publish` 判断是否越过死区，只有「确实变化」才通知订阅者；
+6. `PointCache.PublishConfigured` 按点位的死区模式（绝对值 / 量程百分比 / 变化率）判断是否越过阈值，只有「确实变化」才通知订阅者；
 7. `SampleFanout` 把变化序列化成一行 JSON，追加到每个 sink 的分区。
 
 失败路径同样是数据：驱动异常被折成质量码（`timeout` / `comm_error` / `address_error` …），
@@ -114,6 +114,8 @@ OPC UA 不走队列：它是「读当前值 + 订阅变化」的拉模型，
 `Quality` 区分 `bad`（值不可信）、`timeout`、`comm_error`、`address_error`、`not_connected`、`disabled`。
 「配置了但从没采到」返回 `not_connected` 并附 0 占位值，而不是编一个看起来正常的 0。
 死区比较只在两侧都是 `good` 时按数值判断；质量跳变本身永远上报。
+阈值可以是绝对值、量程百分比或变化率（单位/秒），由点位配置决定，语义见
+[configuration.md](configuration.md#死区)。
 
 ### 4. 线上契约只有一份
 

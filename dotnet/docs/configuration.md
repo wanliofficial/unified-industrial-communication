@@ -150,11 +150,43 @@
 | `dataType` | `uint16` | 见下 |
 | `byteOrder` | 继承设备 | 32/64 位值的排列 |
 | `scale` / `offset` | `1` / `0` | 线性变换 `值 × scale + offset` |
-| `deadband` | 不启用 | 死区（绝对值）；`>= 0` |
+| `deadband` | 不启用 | 死区阈值；含义由 `deadbandMode` 决定，`>= 0` |
+| `deadbandMode` | `absolute` | `absolute` / `percent` / `rate`，见下 |
+| `rangeMin` / `rangeMax` | — | 量程下限 / 上限；必须成对出现且 `rangeMin < rangeMax` |
 | `unit` | — | 单位，原样带到北向 |
 | `writable` | `true` | 只读点位在驱动层就被拒，不会发到线上 |
 | `enabled` | `true` | |
 | `length` | `0` | `string`/`bytes` 的字节长度（1..1024） |
+
+### 死区
+
+`deadband` 不是「有变化就报」，而是「变化超过阈值才报」。三种模式对应三种现场噪声：
+
+| `deadbandMode` | 判定 | 适用 |
+|---|---|---|
+| `absolute`（默认） | `\|Δ\| > deadband` | 噪声幅度稳定，阈值就是工程量 |
+| `percent` | `\|Δ\| > deadband% × (rangeMax - rangeMin)` | 同一套点表跨不同量程复用；要求量程，`deadband` 取 `(0, 100]` |
+| `rate` | `\|Δ\| / Δt(秒) > deadband` | 抑制慢漂移、保留突跳；`deadband` 是「单位/秒」，必须 `> 0` |
+
+- `Δ` 是**相邻两次采集**的差，不是「上次上报」的差；`Δt` 取两条样本的 `collectedAt`。
+- 阈值相等不报（严格大于）。
+- `Δt <= 0`（时钟回拨、同一时刻的两条样本）时按「上报」处理——宁可多一条，也不把变化吞掉。
+- 质量变化永远上报，即使数值没变；坏质量之间的反复跳变不重复上报。
+- 百分比模式必须配量程，否则阈值无法解释；这些组合在启动前由配置校验拦下。
+
+```json
+{
+  "id": "temperature",
+  "dataType": "float32",
+  "unit": "℃",
+  "deadband": 2,
+  "deadbandMode": "percent",
+  "rangeMin": -20,
+  "rangeMax": 120
+}
+```
+
+上面这个点位在 -20..120 的量程上，变化超过 `2% × 140 = 2.8 ℃` 才上报。
 
 ### 地址
 

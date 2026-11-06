@@ -25,11 +25,22 @@ public sealed class PointCache
 
     /// <summary>写入并返回「是否发生变化且应上报」。订阅者按顺序收到通知。</summary>
     public bool Publish(Sample sample, double? deadband)
+        => Publish(sample, deadband, DeadbandMode.Absolute, null, null);
+
+    /// <summary>
+    /// 按点位配置的死区方式判定（绝对值 / 量程百分比 / 变化率）。
+    /// 名字刻意不叫 Publish 重载：与 <c>Publish(sample, null)</c> 放在一起会产生重载歧义。
+    /// </summary>
+    public bool PublishConfigured(Sample sample, Point point)
+        => Publish(sample, point.Deadband, point.DeadbandMode, point.RangeMin, point.RangeMax);
+
+    private bool Publish(
+        Sample sample, double? deadband, DeadbandMode mode, double? rangeMin, double? rangeMax)
     {
         var key = (sample.DeviceId, sample.PointId);
         var previous = _values.TryGetValue(key, out var p) ? p : null;
 
-        var changed = Pipeline.ExceedsDeadband(previous, sample, deadband);
+        var changed = Pipeline.ExceedsDeadband(previous, sample, deadband, mode, rangeMin, rangeMax);
         _values[key] = sample;
 
         if (!changed) return false;

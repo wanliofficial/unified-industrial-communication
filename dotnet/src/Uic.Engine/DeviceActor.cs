@@ -299,7 +299,7 @@ public sealed class DeviceActor : IAsyncDisposable
 
                     var seq = _cache.NextSeq(_device.Id, sample.PointId);
                     var processed = Pipeline.Process(_device, point, sample, seq, now);
-                    _cache.Publish(processed, point.Deadband);
+                    _cache.PublishConfigured(processed, point);
                 }
 
                 if (allBad)
@@ -413,7 +413,7 @@ public sealed class DeviceActor : IAsyncDisposable
                 seq,
                 message);
 
-            _cache.Publish(sample, point.Deadband);
+            _cache.PublishConfigured(sample, point);
         }
 
         if (!countsTowardBreaker)

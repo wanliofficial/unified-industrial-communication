@@ -398,7 +398,11 @@ public static partial class RestApi
                 null,
                 DateTimeOffset.UtcNow,
                 0,
-                point.Writable);
+                point.Writable,
+                point.Deadband,
+                JsonEnum.ToWire(point.DeadbandMode),
+                point.RangeMin,
+                point.RangeMax);
         }
 
         return new PointDto(
@@ -411,7 +415,11 @@ public static partial class RestApi
             sample.DeviceTime,
             sample.CollectedAt,
             sample.Seq,
-            point.Writable);
+            point.Writable,
+            point.Deadband,
+            JsonEnum.ToWire(point.DeadbandMode),
+            point.RangeMin,
+            point.RangeMax);
     }
 
     private static int ParseInt(string? text, int fallback)
@@ -448,4 +456,8 @@ public sealed record PointDto(
     DateTimeOffset? DeviceTime,
     DateTimeOffset CollectedAt,
     ulong Seq,
-    bool Writable);
+    bool Writable,
+    double? Deadband,
+    string DeadbandMode,
+    double? RangeMin,
+    double? RangeMax);

@@ -22,6 +22,9 @@ internal static class PipelineTests
         tests.Add(new TestCase("pipeline/deadband_ignores_noise_below_threshold", DeadbandIgnoresNoiseBelowThreshold));
         tests.Add(new TestCase("pipeline/deadband_reports_quality_transitions", DeadbandReportsQualityTransitions));
         tests.Add(new TestCase("pipeline/deadband_compares_non_numeric_by_equality", DeadbandComparesNonNumeric));
+        tests.Add(new TestCase("pipeline/deadband_percent_uses_range_span", DeadbandPercentUsesRangeSpan));
+        tests.Add(new TestCase("pipeline/deadband_rate_uses_elapsed_time", DeadbandRateUsesElapsedTime));
+        tests.Add(new TestCase("cache/publish_configured_applies_point_rule", CachePublishConfiguredAppliesRule));
         tests.Add(new TestCase("cache/publish_sequence_is_monotonic", CacheSequenceIsMonotonic));
         tests.Add(new TestCase("cache/publish_notifies_only_on_change", CacheNotifiesOnlyOnChange));
         tests.Add(new TestCase("cache/remove_device_clears_state", CacheRemoveDeviceClearsState));
@@ -42,7 +45,10 @@ internal static class PipelineTests
         double scale = 1,
         double offset = 0,
         double? deadband = null,
-        string? unit = null) => new()
+        string? unit = null,
+        DeadbandMode deadbandMode = DeadbandMode.Absolute,
+        double? rangeMin = null,
+        double? rangeMax = null) => new()
     {
         Id = id,
         Address = Address.Register("holding", 0),
@@ -50,6 +56,9 @@ internal static class PipelineTests
         Scale = scale,
         Offset = offset,
         Deadband = deadband,
+        DeadbandMode = deadbandMode,
+        RangeMin = rangeMin,
+        RangeMax = rangeMax,
         Unit = unit,
     };
 
@@ -171,6 +180,70 @@ internal static class PipelineTests
         return Task.CompletedTask;
     }
 
+    /// <summary>
+    /// 百分比死区按量程归一：5% 在 0–100 上是 5 个单位，在 0–10 上是 0.5。
+    /// 点表从别的项目抄过来时，换的是量程而不是灵敏度。
+    /// </summary>
+    private static Task DeadbandPercentUsesRangeSpan(TestContext t)
+    {
+        var point = Point("pct", DataType.Float64, deadband: 5,
+            deadbandMode: DeadbandMode.Percent, rangeMin: 0, rangeMax: 100);
+        var previous = SampleOf(10, Quality.Good);
+
+        t.Ok(!Pipeline.ExceedsDeadband(previous, SampleOf(14.9, Quality.Good), point),
+            "4.9 of a 100-unit span is inside 5%");
+        t.Ok(!Pipeline.ExceedsDeadband(previous, SampleOf(15, Quality.Good), point),
+            "the threshold itself does not report (strict comparison)");
+        t.Ok(Pipeline.ExceedsDeadband(previous, SampleOf(15.1, Quality.Good), point),
+            "5.1 of a 100-unit span crosses 5%");
+
+        var narrow = Point("pct", DataType.Float64, deadband: 5,
+            deadbandMode: DeadbandMode.Percent, rangeMin: 0, rangeMax: 10);
+        t.Ok(Pipeline.ExceedsDeadband(previous, SampleOf(10.6, Quality.Good), narrow),
+            "the same 5% on a 0-10 span is only 0.5 units");
+
+        return Task.CompletedTask;
+    }
+
+    /// <summary>
+    /// 变化率死区看的是「单位/秒」而不是「单位」：1 秒内涨 1.9 不报，
+    /// 同样 1.9 的涨幅发生在 2 秒里更不该报，2.1/秒才报。
+    /// </summary>
+    private static Task DeadbandRateUsesElapsedTime(TestContext t)
+    {
+        var point = Point("rate", DataType.Float64, deadband: 2, deadbandMode: DeadbandMode.Rate);
+        var t0 = new DateTimeOffset(2026, 11, 6, 8, 0, 0, TimeSpan.Zero);
+        var previous = SampleAt(10, Quality.Good, t0);
+
+        t.Ok(!Pipeline.ExceedsDeadband(previous, SampleAt(11.9, Quality.Good, t0.AddSeconds(1)), point),
+            "1.9/s is inside a 2/s threshold");
+        t.Ok(Pipeline.ExceedsDeadband(previous, SampleAt(12.1, Quality.Good, t0.AddSeconds(1)), point),
+            "2.1/s crosses a 2/s threshold");
+        t.Ok(!Pipeline.ExceedsDeadband(previous, SampleAt(13.9, Quality.Good, t0.AddSeconds(2)), point),
+            "the same 3.9 units over 2s is only 1.95/s");
+        t.Ok(Pipeline.ExceedsDeadband(previous, SampleAt(10.5, Quality.Good, t0), point),
+            "zero elapsed time reports instead of hiding a change");
+
+        return Task.CompletedTask;
+    }
+
+    private static Task CachePublishConfiguredAppliesRule(TestContext t)
+    {
+        var cache = new PointCache();
+        var point = Point("pct", DataType.Float64, deadband: 10,
+            deadbandMode: DeadbandMode.Percent, rangeMin: 0, rangeMax: 100);
+
+        t.Ok(cache.PublishConfigured(SampleOf(10, Quality.Good), point), "the first sample reports");
+        // 死区比较的是「相邻两次采集」，不是「上次上报」：15 距 10 只有 5，被吞掉；
+        // 26 距 15 是 11，越过 10% 的阈值。
+        t.Ok(!cache.PublishConfigured(SampleOf(15, Quality.Good), point),
+            "5 of a 100-unit span stays inside 10%");
+        t.Ok(cache.PublishConfigured(SampleOf(26, Quality.Good), point),
+            "11 of a 100-unit span crosses 10%");
+
+        return Task.CompletedTask;
+    }
+
     private static Task CacheSequenceIsMonotonic(TestContext t)
     {
         var cache = new PointCache();
@@ -234,6 +307,9 @@ internal static class PipelineTests
         return Task.CompletedTask;
     }
 
-    private static Sample SampleOf(double value, Quality quality) => new(
-        "d", "p", DataValue.Number(DataType.Float64, value), quality, null, null, DateTimeOffset.UtcNow, 1);
+    private static Sample SampleOf(double value, Quality quality)
+        => SampleAt(value, quality, DateTimeOffset.UtcNow);
+
+    private static Sample SampleAt(double value, Quality quality, DateTimeOffset at) => new(
+        "d", "p", DataValue.Number(DataType.Float64, value), quality, null, null, at, 1);
 }

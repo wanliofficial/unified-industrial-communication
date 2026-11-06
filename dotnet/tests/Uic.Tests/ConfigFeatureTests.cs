@@ -20,6 +20,8 @@ internal static class ConfigFeatureTests
         tests.Add(new TestCase("template/store_rejects_unknown_placeholder", StoreRejectsUnknownPlaceholder));
         tests.Add(new TestCase("csv/address_expressions", AddressExpressions));
         tests.Add(new TestCase("csv/import_merges_and_reports_conflicts", ImportMergesAndReportsConflicts));
+        tests.Add(new TestCase("csv/imports_deadband_mode_and_range", ImportDeadbandModeAndRange));
+        tests.Add(new TestCase("config/deadband_and_range_rules", DeadbandAndRangeRules));
         tests.Add(new TestCase("config/migration_is_explicit_and_versioned", MigrationIsExplicitAndVersioned));
         tests.Add(new TestCase("config/migrates_v0_legacy_shapes", MigratesLegacyShapes));
         tests.Add(new TestCase("config/composite_durations_parse", CompositeDurationsParse));
@@ -231,6 +233,100 @@ internal static class ConfigFeatureTests
 
         t.Ok(!broken.Ok, "a bad address is rejected");
         t.Contains(string.Join("; ", broken.Problems), "line 2", "the problem points at the row");
+
+        return Task.CompletedTask;
+    }
+
+    /// <summary>
+    /// 百分比死区与量程必须能通过 CSV 导入：现场点表就是 Excel，
+    /// 只支持 JSON 等于逼人手工改配置。
+    /// </summary>
+    private static Task ImportDeadbandModeAndRange(TestContext t)
+    {
+        var csv = """
+                  id,address,dataType,deadband,deadbandMode,rangeMin,rangeMax
+                  pct,holding:0,float32,5,percent,0,100
+                  rate,holding:2,float32,2,rate,,
+                  """;
+
+        var result = PointCsv.Import(csv, Array.Empty<Point>(), "d1");
+        t.Ok(result.Ok, $"the csv is valid: {string.Join("; ", result.Problems)}");
+
+        var pct = result.Points.Single(p => p.Id == "pct");
+        t.Equal(DeadbandMode.Percent, pct.DeadbandMode, "percent mode is parsed");
+        t.Close(5, pct.Deadband!.Value, 1e-9, "the threshold is a percentage");
+        t.Close(0, pct.RangeMin!.Value, 1e-9, "rangeMin is parsed");
+        t.Close(100, pct.RangeMax!.Value, 1e-9, "rangeMax is parsed");
+
+        var rate = result.Points.Single(p => p.Id == "rate");
+        t.Equal(DeadbandMode.Rate, rate.DeadbandMode, "rate mode is parsed");
+        t.Ok(rate.RangeMin is null && rate.RangeMax is null, "rate does not require a range");
+
+        // 拼错的模式必须当场拒绝：静默退回绝对值会让死区悄悄失效。
+        var broken = PointCsv.Import("""
+                                     id,address,deadband,deadbandMode
+                                     bad,holding:0,5,percentage
+                                     """, Array.Empty<Point>(), "d1");
+        t.Ok(!broken.Ok, "an unknown deadband mode is rejected");
+        t.Contains(string.Join("; ", broken.Problems), "line 2", "the problem points at the row");
+
+        return Task.CompletedTask;
+    }
+
+    private const string TestPointAddress =
+        "\"address\": { \"kind\": \"register\", \"area\": \"holding\", \"offset\": 0 }";
+
+    /// <summary>
+    /// 量程与死区组合的静态规则。写错的死区不会报错、只会让数据看起来「一直没变化」，
+    /// 所以这些组合必须在启动前被拒绝。
+    /// </summary>
+    private static Task DeadbandAndRangeRules(TestContext t)
+    {
+        static string Document(string point) => """
+            {
+              "schemaVersion": 1,
+              "site": "rules",
+              "channels": [{ "id": "ch", "protocol": "virtual", "transport": "none" }],
+              "devices": [{
+                "id": "d1", "channelId": "ch", "interval": "1s",
+                "points": [ { POINT } ]
+              }]
+            }
+            """.Replace("POINT", point);
+
+        static string PointJson(string extra) => $"\"id\": \"p\", {TestPointAddress}{extra}";
+
+        void Expect(string point, string path, string message)
+        {
+            try
+            {
+                ConfigStore.Parse(Document(point), "inline.json");
+                t.Fail($"{message}: invalid point was accepted");
+            }
+            catch (ConfigException ex)
+            {
+                t.Contains(string.Join("; ", ex.Problems), path, message);
+            }
+        }
+
+        Expect(PointJson(", \"rangeMin\": 0"),
+            "rangeMin", "a lone rangeMin is rejected");
+        Expect(PointJson(", \"rangeMin\": 10, \"rangeMax\": 10"),
+            "rangeMax", "rangeMax must be greater than rangeMin");
+        Expect(PointJson(", \"deadband\": 5, \"deadbandMode\": \"percent\""),
+            "rangeMin", "percent mode requires a range");
+        Expect(PointJson(", \"deadband\": 150, \"deadbandMode\": \"percent\", \"rangeMin\": 0, \"rangeMax\": 100"),
+            "deadband", "percent above 100 is a typo, not a threshold");
+        Expect(PointJson(", \"deadband\": 0, \"deadbandMode\": \"rate\""),
+            "deadband", "rate mode requires a positive threshold");
+
+        var valid = ConfigStore.Parse(
+            Document(PointJson(", \"deadband\": 5, \"deadbandMode\": \"percent\", \"rangeMin\": 0, \"rangeMax\": 100")),
+            "inline.json");
+
+        var point = valid.Devices[0].Points[0];
+        t.Equal(DeadbandMode.Percent, point.DeadbandMode, "the mode round-trips");
+        t.Close(100, point.RangeMax!.Value, 1e-9, "the range round-trips");
 
         return Task.CompletedTask;
     }

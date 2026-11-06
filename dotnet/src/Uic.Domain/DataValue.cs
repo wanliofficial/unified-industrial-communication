@@ -175,4 +175,36 @@ public static class JsonEnum
     public static string ToWire(RuntimeState s) => s.ToString().ToLowerInvariant();
 
     public static string ToWire(ConfiguredState s) => s.ToString().ToLowerInvariant();
+
+    public static string ToWire(DeadbandMode mode) => mode switch
+    {
+        DeadbandMode.Percent => "percent",
+        DeadbandMode.Rate => "rate",
+        _ => "absolute",
+    };
+
+    // 与 DataType 一样大小写不敏感：CSV 导入与手写配置都不该被大小写卡住。
+    public static DeadbandMode ParseDeadbandMode(string s)
+        => TryParseDeadbandMode(s, out var mode) ? mode : DeadbandMode.Absolute;
+
+    /// <summary>严格解析：CSV 导入要靠返回值拒绝拼错的模式，而不是静默退回绝对值。</summary>
+    public static bool TryParseDeadbandMode(string s, out DeadbandMode mode)
+    {
+        switch (s.Trim().ToLowerInvariant())
+        {
+            case "":
+            case "absolute":
+                mode = DeadbandMode.Absolute;
+                return true;
+            case "percent":
+                mode = DeadbandMode.Percent;
+                return true;
+            case "rate":
+                mode = DeadbandMode.Rate;
+                return true;
+            default:
+                mode = DeadbandMode.Absolute;
+                return false;
+        }
+    }
 }

@@ -43,6 +43,21 @@ public static class Pipeline
 
     /// <summary>死区判定。返回 true 表示「变化超过阈值，应当上报」。</summary>
     public static bool ExceedsDeadband(Sample? previous, Sample next, double? deadband)
+        => ExceedsDeadband(previous, next, deadband, DeadbandMode.Absolute, null, null);
+
+    /// <summary>按点位配置的死区方式判定。量程与模式缺一不可的情况在配置校验里已经拦住。</summary>
+    public static bool ExceedsDeadband(Sample? previous, Sample next, Point point)
+        => ExceedsDeadband(previous, next, point.Deadband, point.DeadbandMode,
+            point.RangeMin, point.RangeMax);
+
+    /// <summary>指定死区方式与量程的完整重载（百分比/变化率需要它们）。</summary>
+    public static bool ExceedsDeadband(
+        Sample? previous,
+        Sample next,
+        double? deadband,
+        DeadbandMode mode,
+        double? rangeMin = null,
+        double? rangeMax = null)
     {
         if (previous is null) return true;
 
@@ -56,7 +71,32 @@ public static class Pipeline
         if (!previous.Value.IsNumeric || !next.Value.IsNumeric)
             return !SameValue(previous.Value, next.Value);
 
-        return Math.Abs(next.Value.AsNumber() - previous.Value.AsNumber()) > deadband.Value;
+        var delta = Math.Abs(next.Value.AsNumber() - previous.Value.AsNumber());
+
+        return mode switch
+        {
+            // 百分比死区按量程归一：这样同一个「5%」在 0–100 和 0–10 的量程上
+            // 含义一致，点表抄来抄去也不会变成另一种灵敏度。
+            DeadbandMode.Percent when rangeMin is { } min && rangeMax is { } max && max > min
+                => delta > (max - min) * deadband.Value / 100.0,
+
+            // 变化率：Δ/Δt 与阈值比较。时间窗来自两个样本的采集时刻，
+            // 不做滑动平均——那属于计算点，不属于死区。
+            DeadbandMode.Rate => ExceedsRate(previous, next, delta, deadband.Value),
+
+            _ => delta > deadband.Value,
+        };
+    }
+
+    private static bool ExceedsRate(Sample previous, Sample next, double delta, double perSecond)
+    {
+        var seconds = (next.CollectedAt - previous.CollectedAt).TotalSeconds;
+
+        // 时间没有前进（时钟回拨、同一时刻的两条样本）时算不出速率。
+        // 宁可上报一条，也不要把变化吞掉。
+        if (!(seconds > 0)) return true;
+
+        return delta / seconds > perSecond;
     }
 
     private static bool SameValue(DataValue a, DataValue b)

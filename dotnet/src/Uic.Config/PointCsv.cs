@@ -23,7 +23,7 @@ public sealed record PointCsvResult(
 ///
 /// 列名大小写不敏感，接受常见别名：
 /// <c>id, name, address, area, offset, bit, length, dataType, byteOrder, unit,
-/// scale, bias, deadband, writable, enabled, byteLength</c>。
+/// scale, bias, deadband, deadbandMode, rangeMin, rangeMax, writable, enabled, byteLength</c>。
 /// </summary>
 public static class PointCsv
 {
@@ -76,8 +76,10 @@ public static class PointCsv
             var row = rows[i];
             var line = row.Line;
 
+            // 表头键已归一化成小写并去掉下划线/空格，这里也必须归一化再查，
+            // 否则 camelCase 列名（如 deadbandMode）永远匹配不上。
             string? Field(string name)
-                => header.TryGetValue(name, out var index) && index < row.Fields.Count
+                => header.TryGetValue(Normalize(name), out var index) && index < row.Fields.Count
                     ? row.Fields[index].Trim()
                     : null;
 
@@ -158,11 +160,20 @@ public static class PointCsv
                 continue;
             }
 
-            if (deadband is < 0)
+            var deadbandMode = DeadbandMode.Absolute;
+            var modeText = Field("deadbandMode");
+            if (!string.IsNullOrWhiteSpace(modeText))
             {
-                problems.Add(new ValidationProblem($"line {line}.deadband", "must be >= 0"));
-                continue;
+                if (!JsonEnum.TryParseDeadbandMode(modeText, out deadbandMode))
+                {
+                    problems.Add(new ValidationProblem($"line {line}.deadbandMode",
+                        $"unknown deadband mode '{modeText}' (absolute/percent/rate)"));
+                    continue;
+                }
             }
+
+            var rangeMin = ParseNullableDouble(Field("rangeMin"), line, "rangeMin", problems);
+            var rangeMax = ParseNullableDouble(Field("rangeMax"), line, "rangeMax", problems);
 
             var point = new Point
             {
@@ -174,11 +185,23 @@ public static class PointCsv
                 Scale = scale,
                 Offset = bias,
                 Deadband = deadband,
+                DeadbandMode = deadbandMode,
+                RangeMin = rangeMin,
+                RangeMax = rangeMax,
                 Unit = Field("unit"),
                 Writable = writable,
                 Enabled = enabled,
                 Length = byteLength,
             };
+
+            // 与启动时的校验共用一套规则：能导入的配置必须能启动。
+            var pointProblems = new List<ValidationProblem>();
+            ModelValidator.ValidatePoint(point, $"line {line}", pointProblems);
+            if (pointProblems.Count > 0)
+            {
+                problems.AddRange(pointProblems);
+                continue;
+            }
 
             points.Add(point);
 

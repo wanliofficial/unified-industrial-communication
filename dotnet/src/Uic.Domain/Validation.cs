@@ -76,36 +76,8 @@ public static partial class ModelValidator
             foreach (var p in dev.Points)
             {
                 var pp = $"{dp}.points[{p.Id}]";
-                if (!ItemRe().IsMatch(p.Id)) Add($"{pp}.id", "must match ^[a-z0-9][a-z0-9._-]{0,63}$");
                 if (!pointIds.Add(p.Id)) Add($"{pp}.id", "duplicate point id in device");
-                p.Address.Validate(problems, $"{pp}.address");
-
-                if (p.DataType is DataType.String or DataType.Bytes)
-                {
-                    if (p.Length <= 0) Add($"{pp}.length", "required for string/bytes");
-                    if (p.Length > 1024) Add($"{pp}.length", "must be <= 1024");
-                }
-
-                // 寄存器长度必须与数据类型匹配，否则批量窗口会算错。
-                var expected = p.DataType.Registers();
-                if (p.Address.Kind == AddressKind.Register && p.DataType is not (DataType.String or DataType.Bytes))
-                {
-                    if (p.Address.Length > 0 && p.Address.Length < expected)
-                        Add($"{pp}.address.length", $"{p.DataType} needs {expected} register(s), got {p.Address.Length}");
-                }
-
-                if (p.DataType == DataType.Bool && p.Address.Area is not null)
-                {
-                    var area = p.Address.Area.ToLowerInvariant();
-                    if (area is "coil" or "coils" or "discrete" or "discrete_input" or "discreteinput")
-                    {
-                        if (p.Address.Bit != -1)
-                            Add($"{pp}.address.bit", "bit index is only valid for word areas");
-                    }
-                }
-
-                if (p.Deadband is < 0) Add($"{pp}.deadband", "must be >= 0");
-                if (double.IsNaN(p.Scale) || p.Scale == 0) Add($"{pp}.scale", "must be non-zero");
+                ValidatePoint(p, pp, problems);
             }
         }
 
@@ -210,6 +182,72 @@ public static partial class ModelValidator
             throw new ConfigException(
                 $"configuration is invalid ({problems.Count} problem(s))",
                 problems);
+        }
+    }
+
+    /// <summary>
+    /// 点位自身的校验。抽出来是为了让 CSV 导入与配置校验共用同一套规则——
+    /// 两处各写一份，迟早出现「CSV 能导入、启动时被拒」。
+    /// </summary>
+    public static void ValidatePoint(Point p, string pp, List<ValidationProblem> problems)
+    {
+        void Add(string path, string msg) => problems.Add(new ValidationProblem(path, msg));
+
+        if (!ItemRe().IsMatch(p.Id)) Add($"{pp}.id", "must match ^[a-z0-9][a-z0-9._-]{0,63}$");
+        p.Address.Validate(problems, $"{pp}.address");
+
+        if (p.DataType is DataType.String or DataType.Bytes)
+        {
+            if (p.Length <= 0) Add($"{pp}.length", "required for string/bytes");
+            if (p.Length > 1024) Add($"{pp}.length", "must be <= 1024");
+        }
+
+        // 寄存器长度必须与数据类型匹配，否则批量窗口会算错。
+        var expected = p.DataType.Registers();
+        if (p.Address.Kind == AddressKind.Register && p.DataType is not (DataType.String or DataType.Bytes))
+        {
+            if (p.Address.Length > 0 && p.Address.Length < expected)
+                Add($"{pp}.address.length", $"{p.DataType} needs {expected} register(s), got {p.Address.Length}");
+        }
+
+        if (p.DataType == DataType.Bool && p.Address.Area is not null)
+        {
+            var area = p.Address.Area.ToLowerInvariant();
+            if (area is "coil" or "coils" or "discrete" or "discrete_input" or "discreteinput")
+            {
+                if (p.Address.Bit != -1)
+                    Add($"{pp}.address.bit", "bit index is only valid for word areas");
+            }
+        }
+
+        if (p.Deadband is < 0) Add($"{pp}.deadband", "must be >= 0");
+        if (double.IsNaN(p.Scale) || p.Scale == 0) Add($"{pp}.scale", "must be non-zero");
+
+        // 量程必须成对出现：只有上限或只有下限都无法解释「百分比」。
+        if ((p.RangeMin is null) != (p.RangeMax is null))
+            Add($"{pp}.rangeMin", "rangeMin and rangeMax must be provided together");
+        else if (p.RangeMin is { } rangeMin && p.RangeMax is { } rangeMax && rangeMin >= rangeMax)
+            Add($"{pp}.rangeMax", "must be greater than rangeMin");
+
+        switch (p.DeadbandMode)
+        {
+            case DeadbandMode.Percent:
+                if (p.RangeMin is null || p.RangeMax is null)
+                    Add($"{pp}.rangeMin", "required when deadbandMode is 'percent'");
+                if (p.Deadband is null or <= 0 or > 100)
+                    Add($"{pp}.deadband", "must be in (0, 100] for deadbandMode 'percent'");
+                break;
+
+            case DeadbandMode.Rate:
+                // 变化率的单位是「每秒」，0 或负数没有意义。
+                if (p.Deadband is null or <= 0)
+                    Add($"{pp}.deadband", "must be > 0 for deadbandMode 'rate'");
+                break;
+
+            default:
+                if (!Enum.IsDefined(p.DeadbandMode))
+                    Add($"{pp}.deadbandMode", $"unknown '{p.DeadbandMode}'");
+                break;
         }
     }
 }

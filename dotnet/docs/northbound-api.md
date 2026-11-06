@@ -128,9 +128,17 @@
   "deviceTime": null,
   "collectedAt": "2026-11-05T09:14:02.113Z",
   "seq": 812,
-  "writable": true
+  "writable": true,
+  "deadband": 5,
+  "deadbandMode": "percent",
+  "rangeMin": 0,
+  "rangeMax": 100
 }
 ```
+
+`deadband` / `deadbandMode` / `rangeMin` / `rangeMax` 原样来自点位配置：上位机既能显示量程，
+也能用同一套规则自行过滤，不必猜网关用的阈值。取值范围见
+[configuration.md](configuration.md#死区)。
 
 「配置了但从没采到」返回 `quality: "not_connected"` 与 0 占位值，不会编一个看起来正常的读数。
 
@@ -186,7 +194,8 @@
 查询串 `?dryRun=false` 优先于请求体，便于脚本显式表达「我确认要写」。
 
 列名大小写不敏感，接受 `id`、`name`、`address`/`area`+`offset`、`bit`、`length`、
-`dataType`、`byteOrder`、`unit`、`scale`、`bias`、`deadband`、`writable`、`enabled`。
+`dataType`、`byteOrder`、`unit`、`scale`、`bias`、`deadband`、`deadbandMode`、
+`rangeMin`、`rangeMax`、`writable`、`enabled`、`byteLength`。
 
 | 地址写法 | 示例 | 说明 |
 |---|---|---|
