@@ -135,7 +135,11 @@ type framed interface {
 }
 
 type conn struct {
-	mu    sync.Mutex
+	mu sync.Mutex
+	// wmu 串行化写入。写本身已经是低频路径，而「读-改-写」要求同一寄存器的
+	// 两次事务之间不被同一驱动的其他写入插进来——否则两个并发写入会互相
+	// 覆盖对方改的位。读不加这把锁：读之间没有互斥需求。
+	wmu   sync.Mutex
 	cfg   driver.OpenConfig
 	tr    framed
 	codec *mbcodec.Codec
@@ -189,9 +193,20 @@ func (c *conn) readSpan(ctx context.Context, span driver.ReadSpan) ([]driver.Raw
 }
 
 func (c *conn) Write(ctx context.Context, reqs []driver.WriteRequest) ([]driver.WriteResult, error) {
+	c.wmu.Lock()
+	defer c.wmu.Unlock()
+
 	results := make([]driver.WriteResult, 0, len(reqs))
 	var firstErr error
 	for _, req := range reqs {
+		if needsBitRMW(req) {
+			res, err := c.writeBitRMW(ctx, req)
+			results = append(results, res)
+			if err != nil && firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
 		pdu, err := c.codec.EncodeWrite(req)
 		if err != nil {
 			results = append(results, driver.WriteResult{PointID: req.PointID, Quality: model.QualityBad, Err: err})
@@ -219,6 +234,65 @@ func (c *conn) Write(ctx context.Context, reqs []driver.WriteRequest) ([]driver.
 		results = append(results, res)
 	}
 	return results, firstErr
+}
+
+// needsBitRMW 判断一次写入是否需要「读-改-写」：布尔点落在保持寄存器里，
+// 且指明了具体位号。线圈是整位区（FC5 直接写），不在此列。
+func needsBitRMW(req driver.WriteRequest) bool {
+	return req.DataType == model.TypeBool &&
+		req.Address.Kind == model.AddressRegister &&
+		mbcodec.IsHoldingArea(req.Address.Area) &&
+		req.Address.Bit >= 0
+}
+
+// writeBitRMW 以「读整字 → 改一位 → 写整字」完成寄存器内位写。
+//
+// 为什么不能直接写 FC6：写 0/1 会把同一寄存器里的其他 15 位一并覆盖。
+// 这类错误在调试时表现为「改了 A 点，B 点跟着变了」，而配置与代码都看不出
+// 问题——必须从协议层就避免。
+//
+// 原子性边界（诚实说明）：
+//   - 同一驱动的并发写入由 wmu 串行化，两个位写不会互相吞掉；
+//   - 同一串口总线上的其他设备若恰好写同一个 unit 的同一个寄存器，仍可能
+//     插在这两帧之间。那是配置冲突（一个寄存器只能有一个所有者），不是
+//     驱动能替用户解决的；文档里已写明。
+//   - 另一个主站（SCADA 直连同一从站）不受本驱动控制，同样需要现场约束。
+func (c *conn) writeBitRMW(ctx context.Context, req driver.WriteRequest) (driver.WriteResult, error) {
+	bit := req.Address.Bit
+	if bit < 0 || bit > 15 {
+		err := driver.E(driver.ErrAddress, "write", c.cfg.Device.ID,
+			"register bit write requires address.bit 0..15", false, nil)
+		return driver.WriteResult{PointID: req.PointID, Quality: model.QualityAddressError, Err: err}, err
+	}
+
+	pdu, err := c.codec.EncodeReadRegisters(req.Address.Offset, 1)
+	if err != nil {
+		return driver.WriteResult{PointID: req.PointID, Quality: model.QualityAddressError, Err: err}, err
+	}
+	resp, err := c.tr.RoundTrip(ctx, pdu)
+	if err != nil {
+		return driver.WriteResult{PointID: req.PointID, Quality: model.QualityCommError, Err: err}, err
+	}
+	words, err := c.codec.DecodeRegisters(resp, 1)
+	if err != nil {
+		return driver.WriteResult{PointID: req.PointID, Quality: qualityOf(err), Err: err}, err
+	}
+
+	next := mbcodec.WordSetBit(words[0], bit, req.Value.Bool)
+	wpdu, err := c.codec.EncodeWriteRegister(req.Address.Offset, next)
+	if err != nil {
+		return driver.WriteResult{PointID: req.PointID, Quality: model.QualityAddressError, Err: err}, err
+	}
+	resp, err = c.tr.RoundTrip(ctx, wpdu)
+	if err != nil {
+		return driver.WriteResult{PointID: req.PointID, Quality: model.QualityCommError, Err: err}, err
+	}
+	res, err := c.codec.DecodeWrite(req, resp)
+	if err != nil {
+		res.Quality = model.QualityBad
+		res.Err = err
+	}
+	return res, err
 }
 
 func (c *conn) Close() error {

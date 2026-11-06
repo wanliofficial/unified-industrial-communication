@@ -301,6 +301,121 @@ func TestWriteCoil(t *testing.T) {
 	}
 }
 
+// TestWriteRegisterBitReadModifyWrite 验证「只改一位，其它位不动」。
+func TestWriteRegisterBitReadModifyWrite(t *testing.T) {
+	s := newSim(t)
+	// bit15..bit12 = 0xF，bit3 = 1，bit0 = 1：其余位必须原样保留。
+	s.SetHolding(5, 0xF009)
+	c := openConn(t, s, 1)
+	ctx := context.Background()
+
+	bitReq := func(v bool) driver.WriteRequest {
+		return driver.WriteRequest{
+			PointID: "b3", DataType: model.TypeBool, Value: model.BoolValue(v),
+			Address: model.Address{Kind: model.AddressRegister, Area: "holding", Offset: 5, Length: 1, Bit: 3},
+		}
+	}
+	res, err := c.Write(ctx, []driver.WriteRequest{bitReq(false)})
+	if err != nil {
+		t.Fatalf("clear bit3: %v", err)
+	}
+	if len(res) != 1 || !res[0].OK || res[0].Quality != model.QualityGood {
+		t.Fatalf("clear bit3 result = %+v", res)
+	}
+	if got := s.Holding(5); got != 0xF001 {
+		t.Fatalf("after clear: holding[5] = %#04x, want 0xF001", got)
+	}
+
+	res, err = c.Write(ctx, []driver.WriteRequest{bitReq(true)})
+	if err != nil || !res[0].OK {
+		t.Fatalf("set bit3: %+v %v", res, err)
+	}
+	if got := s.Holding(5); got != 0xF009 {
+		t.Fatalf("after set: holding[5] = %#04x, want 0xF009", got)
+	}
+
+	// 批量：位写与整字写混在一批里，互不影响。
+	res, err = c.Write(ctx, []driver.WriteRequest{
+		bitReq(false),
+		{PointID: "w", DataType: model.TypeUint16, Value: model.NumValue(model.TypeUint16, 0x00FF),
+			Address: model.Address{Kind: model.AddressRegister, Area: "holding", Offset: 9, Length: 1, Bit: -1}},
+	})
+	if err != nil {
+		t.Fatalf("batch: %v", err)
+	}
+	if !res[0].OK || !res[1].OK {
+		t.Fatalf("batch results = %+v", res)
+	}
+	if got := s.Holding(5); got != 0xF001 {
+		t.Fatalf("batch bit write = %#04x", got)
+	}
+	if got := s.Holding(9); got != 0x00FF {
+		t.Fatalf("batch word write = %#04x", got)
+	}
+}
+
+// TestWriteRegisterBitRequiresBit 明确拒绝「往整字写真假」：0/1 都不是
+// 用户想要的意思，静默选一个就会覆盖其它 15 位。
+func TestWriteRegisterBitRequiresBit(t *testing.T) {
+	s := newSim(t)
+	s.SetHolding(5, 0xFF00)
+	c := openConn(t, s, 1)
+	res, err := c.Write(context.Background(), []driver.WriteRequest{{
+		PointID: "b", DataType: model.TypeBool, Value: model.BoolValue(true),
+		Address: model.Address{Kind: model.AddressRegister, Area: "holding", Offset: 5, Length: 1, Bit: -1},
+	}})
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	if res[0].OK {
+		t.Fatalf("result = %+v", res)
+	}
+	if got := s.Holding(5); got != 0xFF00 {
+		t.Fatalf("holding changed to %#04x", got)
+	}
+}
+
+// TestWriteRegisterBitReadFails 验证读回失败时不会继续写：宁可这次失败，
+// 也不能在「不知道其它位」的情况下覆盖整字。
+func TestWriteRegisterBitReadFails(t *testing.T) {
+	s := newSim(t)
+	s.SetHolding(5, 0xFFFF)
+	c := openConn(t, s, 1)
+	_ = s.Close()
+
+	res, err := c.Write(context.Background(), []driver.WriteRequest{{
+		PointID: "b", DataType: model.TypeBool, Value: model.BoolValue(false),
+		Address: model.Address{Kind: model.AddressRegister, Area: "holding", Offset: 5, Length: 1, Bit: 3},
+	}})
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	if res[0].OK || res[0].Quality == model.QualityGood {
+		t.Fatalf("result = %+v", res)
+	}
+}
+
+// TestWriteRegisterBitRejectsReadOnlyArea 保证 input/discrete 不会被当成
+// holding 的同一偏移写进去。
+func TestWriteRegisterBitRejectsReadOnlyArea(t *testing.T) {
+	s := newSim(t)
+	s.SetHolding(5, 0xFF00)
+	c := openConn(t, s, 1)
+	res, err := c.Write(context.Background(), []driver.WriteRequest{{
+		PointID: "b", DataType: model.TypeBool, Value: model.BoolValue(true),
+		Address: model.Address{Kind: model.AddressRegister, Area: "input", Offset: 5, Length: 1, Bit: 3},
+	}})
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	if res[0].OK {
+		t.Fatalf("result = %+v", res)
+	}
+	if got := s.Holding(5); got != 0xFF00 {
+		t.Fatalf("holding[5] changed to %#04x", got)
+	}
+}
+
 // 写只读区（input）必须逐项失败，且不影响同批次其他项。
 func TestWriteOneFailureDoesNotAbortBatch(t *testing.T) {
 	s := newSim(t)

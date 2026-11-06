@@ -216,23 +216,33 @@ func (c *Codec) EncodeWrite(req driver.WriteRequest) ([]byte, error) {
 	}
 	area := strings.ToLower(req.Address.Area)
 	if req.DataType == model.TypeBool {
-		if area != "coil" && area != "coils" {
-			return nil, driver.E(driver.ErrUnsupported, "encode", c.DeviceID, "bool write requires coil area", false, nil)
+		switch {
+		case isCoilArea(area):
+			pdu := make([]byte, 5)
+			pdu[0] = FCWriteSingleCoil
+			binary.BigEndian.PutUint16(pdu[1:3], uint16(req.Address.Offset))
+			if req.Value.Bool {
+				binary.BigEndian.PutUint16(pdu[3:5], 0xFF00)
+			}
+			return pdu, nil
+		case isHoldingArea(area):
+			// 写寄存器里的某一位是「两帧事务」：先读回整字，改位，再写回。
+			// 纯函数编解码层只负责单帧，所以这里明确拒绝；驱动在
+			// writeBitRMW 里完成整个事务。如果放行单帧写，会把整字覆盖成
+			// 0/1，把同一寄存器里的其他位全部清掉。
+			return nil, driver.E(driver.ErrUnsupported, "encode", c.DeviceID,
+				"bool write into a holding register requires address.bit and is done by the driver (read-modify-write)", false, nil)
+		default:
+			return nil, driver.E(driver.ErrPermission, "encode", c.DeviceID,
+				fmt.Sprintf("area %q is read-only", req.Address.Area), false, nil)
 		}
-		pdu := make([]byte, 5)
-		pdu[0] = FCWriteSingleCoil
-		binary.BigEndian.PutUint16(pdu[1:3], uint16(req.Address.Offset))
-		if req.Value.Bool {
-			binary.BigEndian.PutUint16(pdu[3:5], 0xFF00)
-		}
-		return pdu, nil
 	}
 	if !req.DataType.IsNumeric() {
 		return nil, driver.E(driver.ErrUnsupported, "encode", c.DeviceID, "non-numeric write unsupported", false, nil)
 	}
 	// FC6/FC16 只能写保持寄存器。input/discrete 是只读区：若放行，会把值
 	// 写进 holding 的同一偏移，造成「写成功了但写错了地方」的静默错误。
-	if area != "holding" && area != "holding_register" && area != "hr" {
+	if !isHoldingArea(area) {
 		return nil, driver.E(driver.ErrPermission, "encode", c.DeviceID,
 			fmt.Sprintf("area %q is read-only", req.Address.Area), false, nil)
 	}
@@ -257,6 +267,95 @@ func (c *Codec) EncodeWrite(req driver.WriteRequest) ([]byte, error) {
 	return pdu, nil
 }
 
+// EncodeReadRegisters 生成 FC3 读保持寄存器 PDU。读-改-写用它先取回整字。
+func (c *Codec) EncodeReadRegisters(offset, qty int) ([]byte, error) {
+	if offset < 0 || offset > 0xFFFF {
+		return nil, driver.E(driver.ErrAddress, "encode", c.DeviceID,
+			fmt.Sprintf("register offset %d out of range 0..65535", offset), false, nil)
+	}
+	if qty <= 0 || qty > MaxReadRegisters {
+		return nil, driver.E(driver.ErrInternal, "encode", c.DeviceID,
+			fmt.Sprintf("register quantity %d out of range 1..%d", qty, MaxReadRegisters), false, nil)
+	}
+	pdu := make([]byte, 5)
+	pdu[0] = FCReadHoldingRegs
+	binary.BigEndian.PutUint16(pdu[1:3], uint16(offset))
+	binary.BigEndian.PutUint16(pdu[3:5], uint16(qty))
+	return pdu, nil
+}
+
+// DecodeRegisters 解析 FC3 响应为 16 位字（大端）。
+//
+// 它只做「字」这一层的解析，不绑定数据类型：读-改-写关心的是原始位，
+// 用数据类型解码再编码会引入缩放与字节序两处不必要的失真。
+func (c *Codec) DecodeRegisters(resp []byte, qty int) ([]uint16, error) {
+	if len(resp) == 0 {
+		return nil, driver.E(driver.ErrProtocol, "decode", c.DeviceID, "empty response", true, nil)
+	}
+	if resp[0]&0x80 != 0 {
+		return nil, exceptionError(c.DeviceID, resp)
+	}
+	if resp[0] != FCReadHoldingRegs {
+		return nil, driver.E(driver.ErrProtocol, "decode", c.DeviceID,
+			fmt.Sprintf("function echo %#x, want %#x", resp[0], FCReadHoldingRegs), true, nil)
+	}
+	if len(resp) < 2 {
+		return nil, driver.E(driver.ErrProtocol, "decode", c.DeviceID, "missing byte count", true, nil)
+	}
+	bc := int(resp[1])
+	if bc != qty*2 {
+		return nil, driver.E(driver.ErrProtocol, "decode", c.DeviceID,
+			fmt.Sprintf("byte count %d, want %d", bc, qty*2), true, nil)
+	}
+	if len(resp) < 2+bc {
+		return nil, driver.E(driver.ErrProtocol, "decode", c.DeviceID,
+			fmt.Sprintf("truncated payload: have %d bytes, need %d", len(resp)-2, bc), true, nil)
+	}
+	out := make([]uint16, qty)
+	for i := 0; i < qty; i++ {
+		out[i] = binary.BigEndian.Uint16(resp[2+i*2:])
+	}
+	return out, nil
+}
+
+// EncodeWriteRegister 生成 FC6 写单个寄存器 PDU。
+func (c *Codec) EncodeWriteRegister(offset int, word uint16) ([]byte, error) {
+	if offset < 0 || offset > 0xFFFF {
+		return nil, driver.E(driver.ErrAddress, "encode", c.DeviceID,
+			fmt.Sprintf("register offset %d out of range 0..65535", offset), false, nil)
+	}
+	pdu := make([]byte, 5)
+	pdu[0] = FCWriteSingleRegister
+	binary.BigEndian.PutUint16(pdu[1:3], uint16(offset))
+	binary.BigEndian.PutUint16(pdu[3:5], word)
+	return pdu, nil
+}
+
+// WordSetBit 返回把 word 的第 bit 位置为 v 后的值。
+//
+// 读-改-写的全部正确性都压在这一行上：mask 只碰目标位，其余 15 位原样保留。
+func WordSetBit(word uint16, bit int, v bool) uint16 {
+	if bit < 0 || bit > 15 {
+		return word
+	}
+	mask := uint16(1) << uint(bit)
+	if v {
+		return word | mask
+	}
+	return word &^ mask
+}
+
+func isCoilArea(area string) bool {
+	return area == "coil" || area == "coils"
+}
+
+func isHoldingArea(area string) bool {
+	return area == "holding" || area == "holding_register" || area == "hr"
+}
+
+// IsHoldingArea 供驱动判断某个区是否可写（FC6/FC16 只能写保持寄存器）。
+func IsHoldingArea(area string) bool { return isHoldingArea(strings.ToLower(area)) }
+
 // DecodeWrite 校验写响应。
 func (c *Codec) DecodeWrite(req driver.WriteRequest, resp []byte) (driver.WriteResult, error) {
 	if len(resp) == 0 {
@@ -271,6 +370,13 @@ func (c *Codec) DecodeWrite(req driver.WriteRequest, resp []byte) (driver.WriteR
 	}
 	if len(resp) < 5 {
 		return driver.WriteResult{PointID: req.PointID}, driver.E(driver.ErrProtocol, "decode", c.DeviceID, "short write response", true, nil)
+	}
+	// 回显地址必须与请求一致：总线上串了回包（或从站把地址理解错）时，
+	// 不回读确认的写入会「成功」得毫无声息。值本身不比较——有些设备会对
+	// 线圈/寄存器做掩码，只回显地址与数量。
+	if got, want := binary.BigEndian.Uint16(resp[1:3]), uint16(req.Address.Offset); got != want {
+		return driver.WriteResult{PointID: req.PointID}, driver.E(driver.ErrProtocol, "decode", c.DeviceID,
+			fmt.Sprintf("write echo address %d, want %d", got, want), true, nil)
 	}
 	return driver.WriteResult{PointID: req.PointID, OK: true, Quality: model.QualityGood}, nil
 }

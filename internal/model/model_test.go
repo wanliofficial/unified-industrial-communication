@@ -27,16 +27,17 @@ func TestPointValidate(t *testing.T) {
 		t.Fatalf("valid point: %v", err)
 	}
 	cases := map[string]func(*Point){
-		"bad id":          func(p *Point) { p.ID = "P 1" },
-		"empty area":      func(p *Point) { p.Address.Area = "" },
-		"negative offset": func(p *Point) { p.Address.Offset = -1 },
-		"length too big":  func(p *Point) { p.Address.Length = 126 },
-		"bad bit":         func(p *Point) { p.Address.Bit = 16 },
-		"bit on non-bool": func(p *Point) { p.Address.Bit = 4 },
-		"bad type":        func(p *Point) { p.DataType = "float128" },
-		"bad byte order":  func(p *Point) { p.ByteOrder = "XYZW" },
-		"short interval":  func(p *Point) { p.Interval = Duration(10 * time.Millisecond) },
-		"mixed fields":    func(p *Point) { p.Address.Path = "DB1" },
+		"bad id":               func(p *Point) { p.ID = "P 1" },
+		"empty area":           func(p *Point) { p.Address.Area = "" },
+		"negative offset":      func(p *Point) { p.Address.Offset = -1 },
+		"length too big":       func(p *Point) { p.Address.Length = 126 },
+		"bad bit":              func(p *Point) { p.Address.Bit = 16 },
+		"bit on non-bool":      func(p *Point) { p.Address.Bit = 4 },
+		"bit zero on non-bool": func(p *Point) { p.Address.Bit = 0 },
+		"bad type":             func(p *Point) { p.DataType = "float128" },
+		"bad byte order":       func(p *Point) { p.ByteOrder = "XYZW" },
+		"short interval":       func(p *Point) { p.Interval = Duration(10 * time.Millisecond) },
+		"mixed fields":         func(p *Point) { p.Address.Path = "DB1" },
 	}
 	for name, mut := range cases {
 		p := validPoint()

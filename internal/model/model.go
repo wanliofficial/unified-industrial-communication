@@ -490,8 +490,8 @@ func (p Point) Validate() error {
 	if p.Interval < 0 || (p.Interval > 0 && p.Interval.Duration() < 100*time.Millisecond) {
 		return fmt.Errorf("point %q: interval must be 0 or >= 100ms", p.ID)
 	}
-	if p.Address.Kind == AddressRegister && p.Address.Bit > 0 && p.DataType != TypeBool {
-		return fmt.Errorf("point %q: address.bit > 0 requires bool dataType", p.ID)
+	if p.Address.Kind == AddressRegister && p.Address.Bit >= 0 && p.DataType != TypeBool {
+		return fmt.Errorf("point %q: address.bit >= 0 requires bool dataType", p.ID)
 	}
 	if p.Address.Kind == AddressComputed {
 		// 计算点是纯函数的结果，没有可以写回去的地址。允许它 writable 会

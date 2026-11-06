@@ -129,7 +129,8 @@ func TestEncodeWriteGolden(t *testing.T) {
 	if !bytes.Equal(pdu, want) {
 		t.Fatalf("PDU = % x, want % x", pdu, want)
 	}
-	res, err := c.DecodeWrite(driver.WriteRequest{PointID: "sp"}, pdu)
+	res, err := c.DecodeWrite(driver.WriteRequest{PointID: "sp",
+		Address: model.Address{Kind: model.AddressRegister, Area: "holding", Offset: 5, Length: 1, Bit: -1}}, pdu)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -164,6 +165,95 @@ func TestEncodeWriteRejectsReadOnlyArea(t *testing.T) {
 	})
 	if driver.KindOf(err) != driver.ErrUnsupported {
 		t.Fatalf("bool write to register kind = %s (%v)", driver.KindOf(err), err)
+	}
+}
+
+// TestWordSetBit 保证读-改-写只碰目标位——这是整个功能唯一不能错的一行。
+func TestWordSetBit(t *testing.T) {
+	const base = uint16(0xA5A5) // 1010 0101 1010 0101
+	if got := WordSetBit(base, 3, true); got != 0xA5AD {
+		t.Fatalf("set bit3 = %#04x", got)
+	}
+	if got := WordSetBit(base, 0, false); got != 0xA5A4 {
+		t.Fatalf("clear bit0 = %#04x", got)
+	}
+	if got := WordSetBit(base, 15, false); got != 0x25A5 {
+		t.Fatalf("clear bit15 = %#04x", got)
+	}
+	// 越界位号不改动：调用方应该已经拒绝，但纯函数不该 panic 或静默改错位。
+	for _, bit := range []int{-1, 16, 99} {
+		if got := WordSetBit(base, bit, true); got != base {
+			t.Fatalf("bit %d changed the word to %#04x", bit, got)
+		}
+	}
+}
+
+func TestEncodeReadRegistersGolden(t *testing.T) {
+	c := NewCodec("dev-1")
+	pdu, err := c.EncodeReadRegisters(5, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []byte{0x03, 0x00, 0x05, 0x00, 0x01}
+	if !bytes.Equal(pdu, want) {
+		t.Fatalf("PDU = % x, want % x", pdu, want)
+	}
+	words, err := c.DecodeRegisters([]byte{0x03, 0x02, 0x12, 0x34}, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(words) != 1 || words[0] != 0x1234 {
+		t.Fatalf("words = %#v", words)
+	}
+}
+
+func TestDecodeRegistersRejectsBadResponses(t *testing.T) {
+	c := NewCodec("dev-1")
+	cases := map[string][]byte{
+		"empty":       {},
+		"byte count":  {0x03, 0x04, 0x00, 0x01},
+		"truncated":   {0x03, 0x02, 0x00},
+		"wrong func":  {0x04, 0x02, 0x00, 0x01},
+		"exception 2": {0x83, 0x02},
+	}
+	for name, resp := range cases {
+		_, err := c.DecodeRegisters(resp, 1)
+		if err == nil {
+			t.Fatalf("%s: expected error", name)
+		}
+	}
+	if _, err := c.DecodeRegisters([]byte{0x83, 0x02}, 1); driver.KindOf(err) != driver.ErrAddress {
+		t.Fatalf("exception kind = %s", driver.KindOf(err))
+	}
+}
+
+func TestEncodeWriteRegisterGolden(t *testing.T) {
+	c := NewCodec("dev-1")
+	pdu, err := c.EncodeWriteRegister(9, 0x8001)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []byte{0x06, 0x00, 0x09, 0x80, 0x01}
+	if !bytes.Equal(pdu, want) {
+		t.Fatalf("PDU = % x, want % x", pdu, want)
+	}
+}
+
+// TestDecodeWriteChecksEchoAddress 防止串包被当成写成功。
+func TestDecodeWriteChecksEchoAddress(t *testing.T) {
+	c := NewCodec("dev-1")
+	req := driver.WriteRequest{
+		PointID:  "b3",
+		Address:  model.Address{Kind: model.AddressRegister, Area: "holding", Offset: 5, Length: 1, Bit: 3},
+		DataType: model.TypeBool, Value: model.BoolValue(true),
+	}
+	if _, err := c.DecodeWrite(req, []byte{0x06, 0x00, 0x06, 0x00, 0x08}); err == nil {
+		t.Fatal("mismatched echo address must be a protocol error")
+	} else if driver.KindOf(err) != driver.ErrProtocol {
+		t.Fatalf("kind = %s", driver.KindOf(err))
+	}
+	if res, err := c.DecodeWrite(req, []byte{0x06, 0x00, 0x05, 0x00, 0x08}); err != nil || !res.OK {
+		t.Fatalf("matching echo: %+v %v", res, err)
 	}
 }
 
