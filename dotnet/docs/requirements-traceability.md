@@ -7,20 +7,22 @@
 - 「刻意没做」= 有意识不做，给出原因与补法（与 [implementation-notes.md](implementation-notes.md) 的「刻意没做」一致）。
 
 首版的目标范围是 PRD §6.1 的 Wave 1 子集：**Modbus 三封装 + 虚拟设备 + 四北向通道 + 配置治理 + Outbox + 可观测**。
-S7、OPC UA 客户端、MQTT 南向等不在这个子集里的协议，按「加一个协议」的扩展点接入，不在首版代码里。
+需要说清楚的一点：**S7、OPC UA 客户端、MQTT 南向在 PRD 里是 M 级要求，本版本没有实现**，
+它们不是 §6.1「不做」清单里的项，属于真实缺口；逐协议现状、原因与补法见
+[protocol-status.md](protocol-status.md)。
 
-当前测试基线：**131 passed / 0 failed / 1 skipped**（跳过的是需要 `--opcua` 的 OPC UA 端到端用例）。
+当前测试基线：**136 passed / 0 failed / 1 skipped**（跳过的是需要 `--opcua` 的 OPC UA 端到端用例）。
 
 ## 1. 采集（FR-COL）
 
 | 编号 | 需求 | 状态 | 证据 / 说明 |
 |---|---|---|---|
 | FR-COL-01 | Modbus TCP 主站，FC1/2/3/4/5/6/15/16 | 已实现 | `golden/read_coils_10`、`golden/write_multiple_regs_float32`、`loopback/*`；编解码覆盖 0x01–0x06/0x0F/0x10 |
-| FR-COL-02 | Modbus RTU/ASCII 主站，含串口参数与帧间延时 | 已实现 | `serial/rtu_golden_frame_over_pty`、`serial/ascii_golden_frame_over_pty`、`serial/half_duplex_does_not_cross_responses`；波特率 300–921600 可配，帧间延时按半双工等待 |
+| FR-COL-02 | Modbus RTU/ASCII 主站，含串口参数与帧间延时 | 部分实现 | `serial/rtu_golden_frame_over_pty`、`serial/ascii_golden_frame_over_pty`、`serial/half_duplex_does_not_cross_responses`；波特率 300–921600 可配，半双工由通道闸门 + 发送前清空输入缓冲保证。**没有单独的 3.5 字符静默定时器**，帧边界靠长度/功能码 + CRC 判定；遇到挑剔帧间静默的仪表要在 `RtuFraming` 补 |
 | FR-COL-03 | Modbus TCP 从站 | 已实现 | 内置从站被主站回环读写：`loopback/write_then_read_back`、`loopback/write_to_missing_register_is_rejected` |
-| FR-COL-04 | S7comm 主站 | 刻意没做 | PRD §6.1 首版不做。驱动边界只有 `IDriver`/`IConn`，接入时按 [implementation-notes.md](implementation-notes.md) 的五步走 |
-| FR-COL-05 | OPC UA 客户端 | 刻意没做 | 同上；本版本只实现 OPC UA **服务端**（`Uic.OpcUa`） |
-| FR-COL-06 | MQTT 南向订阅取数 | 刻意没做 | 本版本的 MQTT 只做北向发布与下行命令；南向取数需要另一套连接生命周期与点位映射 |
+| FR-COL-04 | S7comm 主站 | 未实现（首版缺口） | PRD 列为 M，本版本没有代码。驱动边界只有 `IDriver`/`IConn`，接入时按 [protocol-status.md](protocol-status.md) 的五步走；TPKT/COTP 分帧、PDU 协商、DB/IB/QB/MB 区都要新写 |
+| FR-COL-05 | OPC UA 客户端 | 未实现（首版缺口） | PRD 列为 M，本版本只实现 OPC UA **服务端**（`Uic.OpcUa`）。客户端需要会话/订阅/证书/重连，建议直接基于 `Opc.Ua.Client` 而不是手写栈 |
+| FR-COL-06 | MQTT 南向订阅取数 | 未实现（首版缺口） | PRD 列为 M，本版本的 MQTT 只做北向发布与下行命令；南向取数需要另一套连接生命周期、点位映射与质量传播，不能复用北向客户端 |
 | FR-COL-07 | 虚拟设备（正弦/斜坡/随机/常量/故障注入） | 已实现 | `loopback/*`、`contract/*` 都以 `virtual` 驱动跑通全链路；五类故障注入见 `Uic.Driver.Virtual` |
 | FR-COL-08 | 驱动能力四态声明 | 部分实现 | `CapState` 四态与 `Capabilities` 已在驱动元数据里声明；控制台的**四态徽标尚未渲染**，目前只通过代码/文档体现。补法：加 `GET /api/v1/drivers` 暴露 `Capabilities`，UI 设备页按四态上色 |
 | FR-COL-09 | 批量读规划（合并 / 非法跨越拒绝） | 已实现 | `planner/*` 八条：相邻合并、跨空洞不合并、按寄存器与位上限切分、按区域分离、每点恰好覆盖一次 |
@@ -53,8 +55,8 @@ S7、OPC UA 客户端、MQTT 南向等不在这个子集里的协议，按「加
 | FR-RUN-01 | 时间片调度，避免同周期设备同时打满 | 部分实现 | 每设备独立 `nextDue` + 50 ms tick + 失败退避抖动，能自然错开；**没有按设备数显式分配相位**，100 台设备同周期时首轮仍可能重叠。补法：启动时按 `index * tick / n` 初始化 `nextDue` |
 | FR-RUN-02 | 每设备串行、跨设备并行 | 已实现 | `engine/conn_is_never_called_concurrently`、`loopback/*` |
 | FR-RUN-03 | 通道并发上限与写优先 | 已实现 | `ChannelGate`：写等待计数让新读让路；`engine/conn_is_never_called_concurrently` 验证不重叠 |
-| FR-RUN-04 | 指数退避 + 抖动重连 | 已实现 | `DeviceActor.LoopAsync`：`interval × 2^failures` 上限为 `RecoverInterval`，叠加 10% 抖动 |
-| FR-RUN-05 | 熔断（连续失败降级 + 定期探活） | 已实现 | `DeviceActor` 状态机 + `ProbeInterval`；`engine/actor_reports_state_and_generation` |
+| FR-RUN-04 | 指数退避 + 抖动重连 | 已实现 | `DeviceActor.LoopAsync`：`interval × 2^failures` 上限为 `RecoverInterval`，叠加 10% 抖动；`devices[].retries` 只重试临时性失败，重试前先断开避免迟到帧：`engine/transient_failure_is_retried`、`engine/bad_quality_batch_is_retried`、`engine/deadline_is_retried_as_timeout`、`engine/permanent_failure_is_not_retried`、`engine/retries_are_finite` |
+| FR-RUN-05 | 熔断（连续失败降级 + 定期探活） | 已实现 | `DeviceActor` 状态机 + `ProbeInterval`；`engine/actor_reports_state_and_generation`。`address` 类错误不参与熔断（点表问题不该把设备判离线）：`engine/permanent_failure_is_not_retried` |
 | FR-RUN-06 | 代次隔离（旧结果丢弃） | 已实现 | `engine/actor_reports_state_and_generation`；`CollectOnceAsync` 逐样本比对代次 |
 | FR-RUN-07 | 质量码 ≥8 态 + 时间戳三分离 | 已实现 | 9 态 `Quality`；`Sample` 含 `DeviceTime`/`CollectedAt`/`AppliedAt`，见 `json/datavalue_wire_shape_is_stable` |
 | FR-RUN-08 | 单调时钟用于调度与超时 | 部分实现 | 耗时统计用 `Stopwatch`；**设备到期时间仍用 `DateTimeOffset.UtcNow`**（抖动/跳变会推迟一轮采集，但不会中断）。补法：`nextDue` 改用 `Stopwatch.GetTimestamp()` |

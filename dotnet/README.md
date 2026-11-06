@@ -100,7 +100,7 @@ dotnet run --project tests/Uic.Tests -- --opcua             # 额外跑 OPC UA �
 dotnet run --project tests/Uic.Tests -- --stop-on-fail
 ```
 
-正常情况下输出 `131 passed, 0 failed, 1 skipped`（跳过的是默认不启用的 OPC UA 用例）。
+正常情况下输出 `136 passed, 0 failed, 1 skipped`（跳过的是默认不启用的 OPC UA 用例）。
 黄金帧测试默认从仓库的 `testdata/golden/` 读取，可用 `UIC_TESTDATA` 指向别的目录。
 
 串口用例（T15–T18）会用 libc 开一对伪终端，在 Linux 上默认执行，其它平台报 `skip`；
@@ -115,7 +115,8 @@ scripts/mqtt-interop.sh --keep   # 保留配置、日志与抓包，便于排查
 ```
 
 覆盖范围与规范用例（T1–T18）的对应关系见 [docs/testing.md](docs/testing.md)，
-PRD 需求逐条追溯见 [docs/requirements-traceability.md](docs/requirements-traceability.md)。
+PRD 需求逐条追溯见 [docs/requirements-traceability.md](docs/requirements-traceability.md)，
+逐协议的实现现状见 [docs/protocol-status.md](docs/protocol-status.md)。
 
 ## 目录
 
@@ -165,4 +166,5 @@ docs/                 架构、配置、北向契约、测试矩阵、实现说�
 - [docs/northbound-api.md](docs/northbound-api.md) —— REST / SSE / MQTT / OPC UA 契约
 - [docs/testing.md](docs/testing.md) —— 测试矩阵、黄金帧格式、留白说明
 - [docs/requirements-traceability.md](docs/requirements-traceability.md) —— PRD 每条 FR/NFR 的落地状态、证据与补法
+- [docs/protocol-status.md](docs/protocol-status.md) —— 每个协议做到哪一步、缺什么、为什么
 - [docs/implementation-notes.md](docs/implementation-notes.md) —— 与设计文档的对应关系、已知边界

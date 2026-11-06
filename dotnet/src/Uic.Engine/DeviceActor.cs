@@ -260,69 +260,129 @@ public sealed class DeviceActor : IAsyncDisposable
     {
         var started = Stopwatch.GetTimestamp();
 
-        try
+        // 重试只针对「临时性」失败：超时、连接断开。地址越界、协议错、权限不足
+        // 重试一百次也是同样的结果，只会把故障拖得更久。
+        var attempts = Math.Clamp(_device.Retries, 0, 10) + 1;
+
+        for (var attempt = 1; ; attempt++)
         {
-            var conn = await EnsureConnAsync(ct).ConfigureAwait(false);
-
-            using var lease = await _gate.EnterReadAsync(ct).ConfigureAwait(false);
-            using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
-            timeout.CancelAfter(_device.Timeout ?? _channel.Timeout);
-
-            var raw = await conn.ReadAsync(_spans, timeout.Token).ConfigureAwait(false);
-
-            var generation = Volatile.Read(ref _generation);
-            var now = DateTimeOffset.UtcNow;
-
-            foreach (var sample in raw)
+            try
             {
-                // 代次隔离：设备重启/重连后，旧连接迟到的结果一律丢弃。
-                if (generation != Volatile.Read(ref _generation)) break;
+                var conn = await EnsureConnAsync(ct).ConfigureAwait(false);
 
-                if (!_pointsById.TryGetValue(sample.PointId, out var point)) continue;
-                if (!point.Enabled) continue;
+                using var lease = await _gate.EnterReadAsync(ct).ConfigureAwait(false);
+                using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
+                timeout.CancelAfter(_device.Timeout ?? _channel.Timeout);
 
-                var seq = _cache.NextSeq(_device.Id, sample.PointId);
-                var processed = Pipeline.Process(_device, point, sample, seq, now);
-                _cache.Publish(processed, point.Deadband);
-            }
+                var raw = await conn.ReadAsync(_spans, timeout.Token).ConfigureAwait(false);
 
-            Interlocked.Increment(ref _readsTotal);
+                // 全部点位都坏 = 这一轮失败；只按「请求是否成功」统计会掩盖协议层问题。
+                // 先判断再发布：需要重试时就把这批坏值丢掉，否则界面会闪一下 Bad 再变回 Good。
+                var allBad = raw.Count > 0 && raw.All(r => r.Quality != Quality.Good);
 
-            // 全部点位都坏 = 这一轮失败；只按「请求是否成功」统计会掩盖协议层问题。
-            var allBad = raw.Count > 0 && raw.All(r => r.Quality != Quality.Good);
-            if (allBad) Interlocked.Increment(ref _readsFailed);
+                if (allBad && IsTemporary(raw[0].Quality) && attempt < attempts)
+                {
+                    await RetryAsync(attempt, attempts, raw[0].Error, ct).ConfigureAwait(false);
+                    continue;
+                }
 
-            lock (_stateLock)
-            {
-                _durations.Enqueue(Stopwatch.GetElapsedTime(started).TotalMilliseconds);
-                while (_durations.Count > 256) _durations.Dequeue();
-            }
+                var generation = Volatile.Read(ref _generation);
+                var now = DateTimeOffset.UtcNow;
 
-            if (allBad)
-            {
-                Fail(raw.FirstOrDefault()?.Error ?? "all points returned non-good quality", Quality.CommError);
+                foreach (var sample in raw)
+                {
+                    // 代次隔离：设备重启/重连后，旧连接迟到的结果一律丢弃。
+                    if (generation != Volatile.Read(ref _generation)) break;
+
+                    if (!_pointsById.TryGetValue(sample.PointId, out var point)) continue;
+                    if (!point.Enabled) continue;
+
+                    var seq = _cache.NextSeq(_device.Id, sample.PointId);
+                    var processed = Pipeline.Process(_device, point, sample, seq, now);
+                    _cache.Publish(processed, point.Deadband);
+                }
+
+                if (allBad)
+                {
+                    Interlocked.Increment(ref _readsTotal);
+                    Interlocked.Increment(ref _readsFailed);
+                    RecordDuration(Stopwatch.GetElapsedTime(started).TotalMilliseconds);
+
+                    Fail(raw[0].Error ?? "all points returned non-good quality", raw[0].Quality);
+                    return;
+                }
+
+                Interlocked.Increment(ref _readsTotal);
+                RecordDuration(Stopwatch.GetElapsedTime(started).TotalMilliseconds);
+
+                _consecutiveFailures = 0;
+                _lastError = null;
+                _lastSuccessAt = now;
+                SetState(RuntimeState.Collecting);
                 return;
             }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch (OperationCanceledException)
+            {
+                // 设备级 deadline 到期，而传输层没先报自己的超时（常见于串口读超时
+                // 配得比设备 timeout 长）。语义上这就是超时：可重试，质量码用 timeout，
+                // 而不是含糊的 bad。
+                var budget = _device.Timeout ?? _channel.Timeout;
+                var message = $"read deadline exceeded after {budget.TotalMilliseconds:0}ms";
 
-            _consecutiveFailures = 0;
-            _lastError = null;
-            _lastSuccessAt = now;
-            SetState(RuntimeState.Collecting);
-        }
-        catch (OperationCanceledException) when (ct.IsCancellationRequested)
-        {
-            throw;
-        }
-        catch (Exception ex)
-        {
-            Interlocked.Increment(ref _readsTotal);
-            Interlocked.Increment(ref _readsFailed);
-            RecordDuration(Stopwatch.GetElapsedTime(started).TotalMilliseconds);
+                if (attempt < attempts)
+                {
+                    await RetryAsync(attempt, attempts, message, ct).ConfigureAwait(false);
+                    continue;
+                }
 
-            var quality = ex is DriverException de ? QualityMap.From(de.Kind) : Quality.Bad;
-            Fail(ex.Message, quality);
+                Interlocked.Increment(ref _readsTotal);
+                Interlocked.Increment(ref _readsFailed);
+                RecordDuration(Stopwatch.GetElapsedTime(started).TotalMilliseconds);
+
+                Fail(message, Quality.Timeout);
+                return;
+            }
+            catch (Exception ex)
+            {
+                var driverError = ex as DriverException;
+                var quality = driverError is null ? Quality.Bad : QualityMap.From(driverError.Kind);
+                var temporary = driverError?.Temporary == true;
+
+                if (temporary && attempt < attempts)
+                {
+                    await RetryAsync(attempt, attempts, ex.Message, ct).ConfigureAwait(false);
+                    continue;
+                }
+
+                Interlocked.Increment(ref _readsTotal);
+                Interlocked.Increment(ref _readsFailed);
+                RecordDuration(Stopwatch.GetElapsedTime(started).TotalMilliseconds);
+
+                Fail(ex.Message, quality);
+                return;
+            }
         }
     }
+
+    /// <summary>
+    /// 重试前先断开：超时后链路上可能还有迟到的响应，复用连接会把旧帧当成新请求的回复。
+    /// 重连的代价（一次 Probe）远小于「拿到一个错的值」。
+    /// </summary>
+    private async Task RetryAsync(int attempt, int attempts, string? error, CancellationToken ct)
+    {
+        _log.LogDebug("device {Device} retrying ({Attempt}/{Total}) after: {Error}",
+            _device.Id, attempt, attempts - 1, error);
+
+        await CloseConnAsync().ConfigureAwait(false);
+        ct.ThrowIfCancellationRequested();
+    }
+
+    private static bool IsTemporary(Quality quality)
+        => quality is Quality.Timeout or Quality.CommError;
 
     /// <summary>
     /// 失败时把本轮点位全部标成对应质量。
@@ -330,7 +390,11 @@ public sealed class DeviceActor : IAsyncDisposable
     /// </summary>
     private void Fail(string message, Quality quality)
     {
-        _consecutiveFailures++;
+        // 地址错是点表配置问题，不是链路问题：把它算进熔断计数会让「一个点位写错」
+        // 拖垮整台设备，现场看到的是设备离线而不是「这条地址不存在」。
+        var countsTowardBreaker = quality != Quality.AddressError;
+        if (countsTowardBreaker) _consecutiveFailures++;
+
         _lastError = message;
 
         var now = DateTimeOffset.UtcNow;
@@ -350,6 +414,14 @@ public sealed class DeviceActor : IAsyncDisposable
                 message);
 
             _cache.Publish(sample, point.Deadband);
+        }
+
+        if (!countsTowardBreaker)
+        {
+            // 链路本身是通的，状态回到采集：错误只体现在点位质量上。
+            // 这里不能直接 return，否则首轮就遇到地址错的设备会永远停在 connecting。
+            SetState(RuntimeState.Collecting);
+            return;
         }
 
         if (_consecutiveFailures >= _device.FailureThreshold)

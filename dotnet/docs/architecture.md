@@ -129,7 +129,9 @@ OPC UA 不走队列：它是「读当前值 + 订阅变化」的拉模型，
 ### 5. 驱动 SDK 收窄到能测
 
 `IDriver` 只有 `Meta` 和 `Open`；`IConn` 只有 `Probe` / `Read` / `Write` / `Dispose`。
-错误用 `DriverException(Kind, Temporary, …)` 表达，上层据此决定重试还是熔断。
+错误用 `DriverException(Kind, Temporary, …)` 表达，上层据此决定重试还是熔断：
+`Temporary` 的（超时、连接断开）按 `devices[].retries` 重试；`address` 类错误既不重试、
+也不计入熔断——点表配错不该让整台设备被判定离线。
 新增协议只需实现这两个接口并在 `DriverRegistry` 注册，不需要改调度、北向或 UI。
 
 ### 6. 一个进程，两种形态
@@ -149,6 +151,8 @@ Configured ──start──► Connecting ──probe ok──► Collecting
 
 - `Configured` / `Disabled`：配置态与运行态分离，「配置了但没采」能被看见；
 - `Faulted` 只探活不采集，恢复后自动回到 `Collecting`；
+- 进 `Degraded` 的门槛是「连续通信失败」；`address` 类错误（点表地址不存在）
+  不计入这个计数，设备保持 `Collecting`，错误只体现在点位质量上；
 - 每次重启设备 actor 递增 `generation`，旧 actor 的迟到回调按代次丢弃，
   避免「旧连接的超时把新连接的状态改坏」。
 

@@ -16,7 +16,7 @@ dotnet run --project tests/Uic.Tests -- --stop-on-fail      # 首个失败即停
 正常输出：
 
 ```
-131 passed, 0 failed, 1 skipped · 46.2s
+136 passed, 0 failed, 1 skipped · 43.0s
 ```
 
 跳过的一条是 OPC UA 验收（要绑端口、生成证书，默认不跑）。
@@ -47,7 +47,7 @@ dotnet run --project tests/Uic.Tests -- --stop-on-fail      # 首个失败即停
 | `outbox/*` | 8 | 位点推进、重启重放、批次、分区隔离、三重上限、半行容错 |
 | `config/*` | 12 | 内容寻址、回滚、启动优先级、非法文档、diff、旧配置迁移、复合时长、仓库示例可校验 |
 | `json/*` | 9 | 时长、枚举、值形状、UTC、往返稳定、前向兼容 |
-| `engine/*` | 2 | 同连接永不并发、状态机与代次 |
+| `engine/*` | 7 | 同连接永不并发、状态机与代次、临时失败重试、坏质量整批重试、deadline 超时重试、确定性错误不重试、重试次数有限 |
 | `loopback/*` | 12 | 主站 ↔ 内置从站的真实链路 |
 | `serial/*` | 6 | 真实伪终端上的 RTU / ASCII、半双工、deadline、关闭打断读 |
 | `mqtt/*` | 17 | 测试内 broker：CONNECT/SUBSCRIBE 字段、QoS0/1、主题渲染、重连补发、命令去重与权限 |
@@ -65,7 +65,7 @@ dotnet run --project tests/Uic.Tests -- --stop-on-fail      # 首个失败即停
 | T3 | 单点读 | `loopback/read_returns_values_in_order` + `codec/read_limits` | |
 | T4 | 批量读 | `loopback/read_returns_values_in_order`、`loopback/planner_windows_round_trip` | 结果数量与顺序都断言 |
 | T5 | 空批量读 | `loopback/empty_batch_is_a_no_op` | 读与写都返回空，且不发帧 |
-| T6 | 地址越界 | `loopback/read_maps_exception_to_quality` | 越界在编码阶段就被拦，质量码 `address_error` |
+| T6 | 地址越界 | `loopback/read_maps_exception_to_quality`、`engine/permanent_failure_is_not_retried` | 越界在编码阶段就被拦，质量码 `address_error`；上层既不重试，也不把它计入熔断 |
 | T7 | 写入回读 | `loopback/write_then_read_back` | |
 | T8 | 写入只读点 | `loopback/write_to_missing_register_is_rejected`、`codec/write_rejects_readonly_and_bit_mismatch` | |
 | T9 | 取消上下文 | `loopback/cancellation_returns_promptly` | 断言 500 ms 内返回 |
@@ -78,6 +78,9 @@ dotnet run --project tests/Uic.Tests -- --stop-on-fail      # 首个失败即停
 | T16 | 沉默从站 | `loopback/silent_slave_times_out`、`serial/silent_slave_times_out` | TCP 与串口各一条，都是 300 ms 超时且不挂死 |
 | T17 | 串口 deadline | `serial/read_returns_near_deadline` | 返回时间落在 deadline 附近，既不是瞬间返回也不是 N 倍 |
 | T18 | 关闭打断读 | `serial/close_interrupts_blocked_read` | 阻塞中的读在关闭后 2 s 内返回 |
+
+T1–T18 只约束驱动本身。重试次数、重试只针对临时性失败、重试耗尽后的降级
+这些属于调度层的决定，由 `DeviceActor` 的用例覆盖（见上表 `engine/*`）。
 
 ### 串口用例怎么跑
 
