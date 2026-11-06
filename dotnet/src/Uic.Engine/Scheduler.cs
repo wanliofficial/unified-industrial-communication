@@ -61,9 +61,10 @@ public sealed class Scheduler : IAsyncDisposable
             _gates.GetOrAdd(channel.Id, _ => new ChannelGate(channel.MaxConcurrency));
         }
 
-        foreach (var device in config.Devices)
+        for (var i = 0; i < config.Devices.Count; i++)
         {
-            var actor = CreateActor(config, device);
+            var device = config.Devices[i];
+            var actor = CreateActor(config, device, i, config.Devices.Count);
             _actors[device.Id] = actor;
             actor.Start();
         }
@@ -103,8 +104,9 @@ public sealed class Scheduler : IAsyncDisposable
                 _gates.GetOrAdd(channel.Id, _ => new ChannelGate(channel.MaxConcurrency));
             }
 
-            foreach (var device in next.Devices)
+            for (var i = 0; i < next.Devices.Count; i++)
             {
+                var device = next.Devices[i];
                 var changed = !beforeById.TryGetValue(device.Id, out var old) || !SameDevice(old, device);
                 var channelChanged = ChannelChangedForDevice(before, next, device);
 
@@ -124,7 +126,7 @@ public sealed class Scheduler : IAsyncDisposable
                     added.Add(device.Id);
                 }
 
-                var actor = CreateActor(next, device);
+                var actor = CreateActor(next, device, i, next.Devices.Count);
                 _actors[device.Id] = actor;
                 actor.Start();
             }
@@ -162,7 +164,7 @@ public sealed class Scheduler : IAsyncDisposable
         return JsonSerializer.Serialize(a, JsonDefaults.Options) != JsonSerializer.Serialize(b, JsonDefaults.Options);
     }
 
-    private DeviceActor CreateActor(ConfigDocument config, Device device)
+    private DeviceActor CreateActor(ConfigDocument config, Device device, int index, int total)
     {
         var channel = config.Channels.FirstOrDefault(c => c.Id == device.ChannelId)
                       ?? throw new InvalidOperationException(
@@ -175,7 +177,10 @@ public sealed class Scheduler : IAsyncDisposable
         var gate = _gates.GetOrAdd(channel.Id, _ => new ChannelGate(channel.MaxConcurrency));
         var log = _logs.CreateLogger($"uic.device.{device.Id}");
 
-        return new DeviceActor(device, channel, driver, _cache, gate, log, _options);
+        // 相位在 actor 启动时生效：新加/重启的设备也不会和老设备挤在同一个 tick。
+        var phase = ScheduleMath.PhaseOffset(index, total, device.Interval);
+
+        return new DeviceActor(device, channel, driver, _cache, gate, log, _options, phase);
     }
 
     private static bool SameDevice(Device a, Device b)

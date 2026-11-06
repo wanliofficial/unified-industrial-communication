@@ -11,7 +11,7 @@
 它们不是 §6.1「不做」清单里的项，属于真实缺口；逐协议现状、原因与补法见
 [protocol-status.md](protocol-status.md)。
 
-当前测试基线：**142 passed / 0 failed / 1 skipped**（跳过的是需要 `--opcua` 的 OPC UA 端到端用例）。
+当前测试基线：**145 passed / 0 failed / 1 skipped**（跳过的是需要 `--opcua` 的 OPC UA 端到端用例）。
 
 ## 1. 采集（FR-COL）
 
@@ -52,14 +52,14 @@
 
 | 编号 | 需求 | 状态 | 证据 / 说明 |
 |---|---|---|---|
-| FR-RUN-01 | 时间片调度，避免同周期设备同时打满 | 部分实现 | 每设备独立 `nextDue` + 50 ms tick + 失败退避抖动，能自然错开；**没有按设备数显式分配相位**，100 台设备同周期时首轮仍可能重叠。补法：启动时按 `index * tick / n` 初始化 `nextDue` |
+| FR-RUN-01 | 时间片调度，避免同周期设备同时打满 | 已实现 | 每设备独立 `nextDue` + 50 ms tick；启动时按 `index/count` 把设备自己的 interval 均分（100 台 1s 设备即每 10 ms 一台），失败退避再叠加抖动：`schedule/phase_spreads_devices`、`schedule/scheduler_assigns_phases` |
 | FR-RUN-02 | 每设备串行、跨设备并行 | 已实现 | `engine/conn_is_never_called_concurrently`、`loopback/*` |
 | FR-RUN-03 | 通道并发上限与写优先 | 已实现 | `ChannelGate`：写等待计数让新读让路；`engine/conn_is_never_called_concurrently` 验证不重叠 |
 | FR-RUN-04 | 指数退避 + 抖动重连 | 已实现 | `DeviceActor.LoopAsync`：`interval × 2^failures` 上限为 `RecoverInterval`，叠加 10% 抖动；`devices[].retries` 只重试临时性失败，重试前先断开避免迟到帧：`engine/transient_failure_is_retried`、`engine/bad_quality_batch_is_retried`、`engine/deadline_is_retried_as_timeout`、`engine/permanent_failure_is_not_retried`、`engine/retries_are_finite` |
 | FR-RUN-05 | 熔断（连续失败降级 + 定期探活） | 已实现 | `DeviceActor` 状态机 + `ProbeInterval`；`engine/actor_reports_state_and_generation`。`address` 类错误不参与熔断（点表问题不该把设备判离线）：`engine/permanent_failure_is_not_retried` |
 | FR-RUN-06 | 代次隔离（旧结果丢弃） | 已实现 | `engine/actor_reports_state_and_generation`；`CollectOnceAsync` 逐样本比对代次 |
 | FR-RUN-07 | 质量码 ≥8 态 + 时间戳三分离 | 已实现 | 9 态 `Quality`；`Sample` 含 `DeviceTime`/`CollectedAt`/`AppliedAt`，见 `json/datavalue_wire_shape_is_stable` |
-| FR-RUN-08 | 单调时钟用于调度与超时 | 部分实现 | 耗时统计用 `Stopwatch`；**设备到期时间仍用 `DateTimeOffset.UtcNow`**（抖动/跳变会推迟一轮采集，但不会中断）。补法：`nextDue` 改用 `Stopwatch.GetTimestamp()` |
+| FR-RUN-08 | 单调时钟用于调度与超时 | 已实现 | `nextDue` 与等待都基于 `Stopwatch.GetTimestamp()` + `ScheduleMath`；NTP 校时/手工改钟不会推迟或提前采集。样本时间戳仍用墙上时钟：`schedule/monotonic_arithmetic` |
 | FR-RUN-09 | 运行态与配置态分离 | 已实现 | `ConfiguredState` / `RuntimeState` 两套枚举，API 同时返回 |
 | FR-RUN-10 | 看门狗（采集心跳 + 资源水位降级） | 部分实现 | `DeviceStateWatcher` 检测「超过 max(10 周期, 30 s) 无新样本」并记 `uic_watchdog_stale_total`；**资源水位（磁盘/内存）降级未做** |
 | FR-RUN-11 | 优雅退出（停调度、flush 队列、关连接） | 已实现 | `GatewayRuntime.DisposeAsync` 先 flush（3 s）再发 `$death`；SIGTERM 由 Kestrel 的 `RunAsync` 触发生命周期 |

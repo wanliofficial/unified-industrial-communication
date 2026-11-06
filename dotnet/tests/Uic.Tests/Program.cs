@@ -26,6 +26,7 @@ catch (Exception ex) when (ex is DirectoryNotFoundException or InvalidDataExcept
 CodecTests.Register(tests);
 PipelineTests.Register(tests);
 EngineTests.Register(tests);
+ScheduleTests.Register(tests);
 PlannerTests.Register(tests);
 OutboxTests.Register(tests);
 ConfigStoreTests.Register(tests);

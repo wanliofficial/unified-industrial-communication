@@ -63,7 +63,7 @@
 
 ### 南向：一次采集
 
-1. `DeviceActor` 按 `device.interval` 唤醒（调度 tick 50 ms，多设备均匀铺开）；
+1. `DeviceActor` 按 `device.interval` 唤醒（调度 tick 50 ms；启动相位把同周期设备均匀铺开；到期时间用单调时钟，NTP 校时不会打乱节奏）；
 2. `ReadPlanner` 把点位合并成若干「寄存器窗口」——连续地址合并、按区分离、按协议上限切分；
 3. `IConn.ReadAsync(spans)` 一次往返拿回整窗；
 4. `ModbusCodec` 按点位类型与字节序解出 `RawSample`；

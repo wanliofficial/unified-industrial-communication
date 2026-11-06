@@ -97,6 +97,7 @@ public sealed class DeviceActor : IAsyncDisposable
     private readonly ChannelGate _gate;
     private readonly ILogger _log;
     private readonly SchedulerOptions _options;
+    private readonly TimeSpan _startPhase;
     private readonly IReadOnlyList<PointRef> _points;
     private readonly IReadOnlyList<ReadSpan> _spans;
     private readonly Dictionary<string, Point> _pointsById;
@@ -125,7 +126,8 @@ public sealed class DeviceActor : IAsyncDisposable
         PointCache cache,
         ChannelGate gate,
         ILogger log,
-        SchedulerOptions options)
+        SchedulerOptions options,
+        TimeSpan? startPhase = null)
     {
         _device = device;
         _channel = channel;
@@ -134,6 +136,7 @@ public sealed class DeviceActor : IAsyncDisposable
         _gate = gate;
         _log = log;
         _options = options;
+        _startPhase = startPhase ?? TimeSpan.Zero;
         _pointsById = device.Points.ToDictionary(p => p.Id, StringComparer.Ordinal);
         _points = device.Points.Where(p => p.Enabled).Select(p => PointRef.Of(device, p)).ToArray();
         _spans = ReadPlanner.Plan(_points);
@@ -146,6 +149,9 @@ public sealed class DeviceActor : IAsyncDisposable
     public RuntimeState State { get { lock (_stateLock) return _state; } }
     public ConfiguredState ConfiguredState => _device.Enabled ? ConfiguredState.Enabled : ConfiguredState.Disabled;
     public IReadOnlyList<ReadSpan> Spans => _spans;
+
+    /// <summary>启动相位。调度器按设备序号铺开，避免同周期设备在同一毫秒醒来。</summary>
+    public TimeSpan StartPhase => _startPhase;
 
     public DeviceStats Stats
     {
@@ -213,15 +219,16 @@ public sealed class DeviceActor : IAsyncDisposable
 
     private async Task LoopAsync(CancellationToken ct)
     {
-        var nextDue = DateTimeOffset.UtcNow;
+        // 单调时间戳，不受 NTP 校时/手工改钟影响。
+        var nextDue = Stopwatch.GetTimestamp() + ScheduleMath.ToTimestamp(_startPhase);
 
         while (!ct.IsCancellationRequested)
         {
-            var now = DateTimeOffset.UtcNow;
+            var now = Stopwatch.GetTimestamp();
 
             if (now < nextDue)
             {
-                var wait = nextDue - now;
+                var wait = ScheduleMath.Remaining(now, nextDue);
                 if (wait > _options.Tick) wait = _options.Tick;
 
                 try { await Task.Delay(wait, ct).ConfigureAwait(false); }
@@ -252,7 +259,8 @@ public sealed class DeviceActor : IAsyncDisposable
                     Math.Max(_device.Interval.TotalMilliseconds, _device.RecoverInterval.TotalMilliseconds)));
 
             var jitterMs = Random.Shared.NextDouble() * 0.1 * backoff.TotalMilliseconds;
-            nextDue = DateTimeOffset.UtcNow + backoff + TimeSpan.FromMilliseconds(jitterMs);
+            var delay = backoff + TimeSpan.FromMilliseconds(jitterMs);
+            nextDue = Stopwatch.GetTimestamp() + ScheduleMath.ToTimestamp(delay);
         }
     }
 
