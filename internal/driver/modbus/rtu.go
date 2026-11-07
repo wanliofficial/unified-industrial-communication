@@ -9,6 +9,7 @@ import (
 	mbcodec "uic/internal/codec/modbus"
 	"uic/internal/driver"
 	"uic/internal/transport"
+	"uic/internal/transport/serialport"
 )
 
 // RTU 是 Modbus RTU 主站驱动。
@@ -53,7 +54,7 @@ func (d *RTU) Meta() driver.Meta {
 // Open 打开串口并建立 RTU 分帧。
 //
 // 同一串口上挂多台从站时，每个设备会各自 Open 一次。物理串口由
-// acquirePort 做引用计数复用，事务由 portRef 的总线锁串行化。
+// serialport.Acquire 做引用计数复用，事务由 Ref 的总线锁串行化。
 func (d *RTU) Open(ctx context.Context, cfg driver.OpenConfig) (driver.Conn, error) {
 	t := cfg.Channel.Transport
 	if t.Kind != "serial" {
@@ -75,7 +76,7 @@ func (d *RTU) Open(ctx context.Context, cfg driver.OpenConfig) (driver.Conn, err
 	if opener == nil {
 		opener = transport.OpenSerial
 	}
-	ref, err := acquirePort("rtu", sc, opener)
+	ref, err := serialport.Acquire("rtu", sc, opener)
 	if err != nil {
 		// 打开串口失败通常是「设备被拔了/权限不对/参数被占用」，属可重试。
 		return nil, driver.E(driver.ErrDisconnected, "open", cfg.Device.ID,
@@ -97,7 +98,7 @@ func (d *RTU) Open(ctx context.Context, cfg driver.OpenConfig) (driver.Conn, err
 
 // rtuPortFraming 在共享串口上做 RTU 分帧：整个写-读过程持有总线锁。
 type rtuPortFraming struct {
-	ref     *portRef
+	ref     *serialport.Ref
 	unit    uint8
 	gap     time.Duration
 	closeMu sync.Mutex
@@ -105,16 +106,16 @@ type rtuPortFraming struct {
 }
 
 func (t *rtuPortFraming) ProbeLink(ctx context.Context) error {
-	t.ref.port.mu.Lock()
-	defer t.ref.port.mu.Unlock()
+	t.ref.Lock()
+	defer t.ref.Unlock()
 
 	inner := &rtuFraming{stream: t.ref, unit: t.unit, gap: t.gap}
 	return inner.ProbeLink(ctx)
 }
 
 func (t *rtuPortFraming) RoundTrip(ctx context.Context, pdu []byte) ([]byte, error) {
-	t.ref.port.mu.Lock()
-	defer t.ref.port.mu.Unlock()
+	t.ref.Lock()
+	defer t.ref.Unlock()
 
 	inner := &rtuFraming{stream: t.ref, unit: t.unit, gap: t.gap}
 	resp, err := inner.RoundTrip(ctx, pdu)

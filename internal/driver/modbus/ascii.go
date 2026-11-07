@@ -9,6 +9,7 @@ import (
 	mbcodec "uic/internal/codec/modbus"
 	"uic/internal/driver"
 	"uic/internal/transport"
+	"uic/internal/transport/serialport"
 )
 
 // ASCII 是 Modbus ASCII 主站驱动。
@@ -77,7 +78,7 @@ func (d *ASCII) Open(ctx context.Context, cfg driver.OpenConfig) (driver.Conn, e
 	}
 	// proto 参与端口冲突判定：同一根物理线上不可能同时跑 RTU 与 ASCII，
 	// 静默复用会让两种分帧交错，症状是「随机 CRC/LRC 错」。
-	ref, err := acquirePort("ascii", sc, opener)
+	ref, err := serialport.Acquire("ascii", sc, opener)
 	if err != nil {
 		return nil, driver.E(driver.ErrDisconnected, "open", cfg.Device.ID,
 			fmt.Sprintf("open serial %s failed", sc.Port), true, err)
@@ -198,7 +199,7 @@ func (t *asciiFraming) readFrame(ctx context.Context) ([]byte, error) {
 
 // asciiPortFraming 在共享串口上做 ASCII 分帧：整个写-读过程持有总线锁。
 type asciiPortFraming struct {
-	ref     *portRef
+	ref     *serialport.Ref
 	unit    uint8
 	gap     time.Duration
 	closeMu sync.Mutex
@@ -206,15 +207,15 @@ type asciiPortFraming struct {
 }
 
 func (t *asciiPortFraming) ProbeLink(ctx context.Context) error {
-	t.ref.port.mu.Lock()
-	defer t.ref.port.mu.Unlock()
+	t.ref.Lock()
+	defer t.ref.Unlock()
 	inner := &asciiFraming{stream: t.ref, unit: t.unit, gap: t.gap}
 	return inner.ProbeLink(ctx)
 }
 
 func (t *asciiPortFraming) RoundTrip(ctx context.Context, pdu []byte) ([]byte, error) {
-	t.ref.port.mu.Lock()
-	defer t.ref.port.mu.Unlock()
+	t.ref.Lock()
+	defer t.ref.Unlock()
 
 	inner := &asciiFraming{stream: t.ref, unit: t.unit, gap: t.gap}
 	resp, err := inner.RoundTrip(ctx, pdu)

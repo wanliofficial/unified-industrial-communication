@@ -19,13 +19,17 @@ import (
 	"uic/internal/driver"
 	"uic/internal/model"
 	"uic/internal/transport"
+	"uic/internal/transport/serialport"
 )
 
 // Dialer 允许测试注入内存链路。
 type Dialer func(ctx context.Context, addr string, timeout time.Duration) (transport.Stream, error)
 
 // SerialOpener 允许测试注入内存串口。
-type SerialOpener func(cfg transport.SerialConfig) (transport.Stream, error)
+//
+// 定义为 serialport.Opener 的别名而不是新类型：否则「共享串口」包与调用方
+// 之间每次传递都要显式转换，而那些转换点恰好散落在最容易漏改的错误分支里。
+type SerialOpener = serialport.Opener
 
 // Driver 是 Modbus 主站驱动。
 type Driver struct {

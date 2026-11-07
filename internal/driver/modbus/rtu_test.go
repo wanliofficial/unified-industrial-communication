@@ -12,6 +12,7 @@ import (
 	"uic/internal/driver"
 	"uic/internal/model"
 	"uic/internal/transport"
+	"uic/internal/transport/serialport"
 )
 
 // ---------------------------------------------------------------------------
@@ -401,7 +402,7 @@ func TestRTUCloseReleasesPort(t *testing.T) {
 	c1 := open("dev1")
 	c2 := open("dev2")
 
-	if n := openPortCount(); n != 1 {
+	if n := serialport.Count(); n != 1 {
 		t.Fatalf("shared port count = %d, want 1", n)
 	}
 	_ = c1.Close()
@@ -424,13 +425,13 @@ func TestAcquirePortRejectsParamConflict(t *testing.T) {
 	f := &fakeSerial{}
 	opener := func(transport.SerialConfig) (transport.Stream, error) { return f, nil }
 
-	ref, err := acquirePort("rtu", transport.SerialConfig{Port: "/dev/fake2", Baud: 9600}, opener)
+	ref, err := serialport.Acquire("rtu", transport.SerialConfig{Port: "/dev/fake2", Baud: 9600}, opener)
 	if err != nil {
 		t.Fatalf("first acquire: %v", err)
 	}
 	defer func() { _ = ref.Close() }()
 
-	_, err = acquirePort("rtu", transport.SerialConfig{Port: "/dev/fake2", Baud: 19200}, opener)
+	_, err = serialport.Acquire("rtu", transport.SerialConfig{Port: "/dev/fake2", Baud: 19200}, opener)
 	if err == nil {
 		t.Fatal("conflicting baud must be rejected")
 	}
@@ -444,11 +445,11 @@ func TestAcquirePortReusesSameConfig(t *testing.T) {
 		return f, nil
 	}
 	cfg := transport.SerialConfig{Port: "/dev/fake3", Baud: 9600}
-	r1, err := acquirePort("rtu", cfg, opener)
+	r1, err := serialport.Acquire("rtu", cfg, opener)
 	if err != nil {
 		t.Fatal(err)
 	}
-	r2, err := acquirePort("rtu", cfg, opener)
+	r2, err := serialport.Acquire("rtu", cfg, opener)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -457,7 +458,7 @@ func TestAcquirePortReusesSameConfig(t *testing.T) {
 	}
 	_ = r1.Close()
 	_ = r2.Close()
-	if n := openPortCount(); n != 0 {
+	if n := serialport.Count(); n != 0 {
 		t.Fatalf("leaked %d ports", n)
 	}
 }
