@@ -139,9 +139,10 @@ func TestBuildReadRejectsBadItems(t *testing.T) {
 }
 
 func TestParseReadAck(t *testing.T) {
-	// TPKT 总长 = 4 + 3 + (10 头 + 2 参数 + 5 数据) = 24
-	frame := mustHex(t, "0300001802f080"+
-		"32030000000200020005"+
+	// ACK_DATA 是 12 字节头：数据长度之后还有 error class / error code。
+	// TPKT 总长 = 4 + 3 + (12 头 + 2 参数 + 5 数据) = 26
+	frame := mustHex(t, "0300001a02f080"+
+		"32030000000200020005"+"0000"+
 		"0401"+
 		"ff0400087f")
 	pdu, err := Parse(frame)
@@ -164,9 +165,9 @@ func TestParseReadAck(t *testing.T) {
 // 长度单位：BIT/BYTE/WORD/DWORD 用位，INT/DINT/REAL 用字节。混淆会读出半个值。
 func TestParseReadAckLengthUnits(t *testing.T) {
 	// 4 字节 REAL：传输尺寸 0x07（REAL），长度 4 → 4 字节数据。
-	// TPKT 总长 = 4 + 3 + (10 头 + 2 参数 + 8 数据) = 27
-	frame := mustHex(t, "0300001b02f080"+
-		"32030000000200020008"+
+	// TPKT 总长 = 4 + 3 + (12 头 + 2 参数 + 8 数据) = 29
+	frame := mustHex(t, "0300001d02f080"+
+		"32030000000200020008"+"0000"+
 		"0401"+
 		"ff0700043f800000")
 	pdu, err := Parse(frame)
@@ -187,14 +188,6 @@ func TestParseReadAckLengthUnits(t *testing.T) {
 }
 
 func TestParseReadAckItemError(t *testing.T) {
-	frame := mustHex(t, "0300001802f080"+
-		"32030000000200020005"+
-		"0401"+
-		"0a0000")
-	// 上面 data 只有 3 字节，补一个 0 让它达到声明的 5 字节。
-	frame = append(frame, 0x00)
-	_ = frame
-
 	pdu := PDU{
 		ROSCTR: ROSCTRAckData,
 		Param:  []byte{FuncRead, 1},
@@ -352,5 +345,76 @@ func TestItemErrorText(t *testing.T) {
 		if got := (ItemError{Code: code}).CodeText(); got != want {
 			t.Fatalf("%#x -> %q, want %q", code, got, want)
 		}
+	}
+}
+
+// ACK / ACK_DATA 是 12 字节头，Job / UserData 是 10 字节头。这条差别
+// 决定了参数区从 10 还是 12 开始；混用会让整帧数据错位两字节。
+func TestHeaderLen(t *testing.T) {
+	cases := map[byte]int{
+		ROSCTRJob:      10,
+		ROSCTRJobAck:   12,
+		ROSCTRAckData:  12,
+		ROSCTRUserData: 10,
+	}
+	for rosctr, want := range cases {
+		if got := HeaderLen(rosctr); got != want {
+			t.Errorf("HeaderLen(%#02x) = %d, want %d", rosctr, got, want)
+		}
+	}
+}
+
+func TestBuildPDUAddsErrorBytesForAck(t *testing.T) {
+	pdu := BuildPDU(ROSCTRAckData, 7, []byte{0x04, 0x01}, []byte{0xFF})
+	if len(pdu) != 12+2+1 {
+		t.Fatalf("len = %d, want 15", len(pdu))
+	}
+	if pdu[10] != 0 || pdu[11] != 0 {
+		t.Fatalf("error bytes = % x, want 00 00", pdu[10:12])
+	}
+	if !bytes.Equal(pdu[12:14], []byte{0x04, 0x01}) || pdu[14] != 0xFF {
+		t.Fatalf("param/data misplaced: % x", pdu[12:])
+	}
+
+	// Job 不应该被塞进两个字节。
+	job := BuildPDU(ROSCTRJob, 7, []byte{0x01}, nil)
+	if len(job) != 10+1 {
+		t.Fatalf("job len = %d, want 11", len(job))
+	}
+}
+
+func TestBuildPDUError(t *testing.T) {
+	pdu := BuildPDUError(ROSCTRAckData, 1, 0x81, 0x04, nil, nil)
+	if len(pdu) != 12 || pdu[10] != 0x81 || pdu[11] != 0x04 {
+		t.Fatalf("pdu = % x", pdu)
+	}
+}
+
+func TestParseACKErrorBytes(t *testing.T) {
+	// 12 字节头 + 0 参数 + 0 数据，error class/code = 81 04。
+	pdu := mustHex(t, "3203"+"0000"+"0001"+"0000"+"0000"+"8104")
+	got, err := Parse(TPKT(append([]byte{0x02, 0xF0, 0x80}, pdu...)))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if got.ErrClass != 0x81 || got.ErrCode != 0x04 {
+		t.Fatalf("error = %#02x/%#02x", got.ErrClass, got.ErrCode)
+	}
+	if got.Error() == nil {
+		t.Fatal("Error() must report a non-zero header error")
+	}
+	if len(got.Param) != 0 || len(got.Data) != 0 {
+		t.Fatalf("param/data = % x / % x", got.Param, got.Data)
+	}
+
+	// 同样的字节按 Job 解析会少读两个字节——这正是修复前的行为。
+	// 这里验证 UserData 的 10 字节头仍然正确。
+	ud := BuildPDU(ROSCTRUserData, 1, []byte{1, 2}, nil)
+	got, err = Parse(TPKT(append([]byte{0x02, 0xF0, 0x80}, ud...)))
+	if err != nil {
+		t.Fatalf("userdata parse: %v", err)
+	}
+	if len(got.Param) != 2 || got.Param[0] != 1 || got.Param[1] != 2 {
+		t.Fatalf("userdata param = % x", got.Param)
 	}
 }

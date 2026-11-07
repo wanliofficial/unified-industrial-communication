@@ -23,9 +23,10 @@ const (
 	TPKTVersion = 0x03
 	S7ProtoID   = 0x32
 
-	ROSCTRJob     = 0x01 // 请求
-	ROSCTRJobAck  = 0x02 // 确认（无数据）
-	ROSCTRAckData = 0x03 // 确认 + 数据
+	ROSCTRJob      = 0x01 // 请求
+	ROSCTRJobAck   = 0x02 // 确认（无数据）
+	ROSCTRAckData  = 0x03 // 确认 + 数据
+	ROSCTRUserData = 0x07 // 用户数据（块目录/SZL 等）
 
 	COTPCR = 0xE0 // 连接请求
 	COTPCC = 0xD0 // 连接确认
@@ -155,17 +156,49 @@ func ParseCOTPConnect(b []byte) error {
 	return nil
 }
 
+// HeaderLen 返回该类报文的 S7 头长度。
+//
+// 这是 S7 里最容易写错的一处：Job（请求）与 UserData 是 10 字节头，
+// 而 ACK / ACK_DATA 在数据长度之后还多两个字节的 error class / error
+// code，参数区从偏移 12 开始。把 ACK 当 10 字节解析会把这 2 个字节当成
+// 参数区的前两个字节——单点读写的响应「看起来能解」，但参数长度一错，
+// 后面的数据区就整体错位两字节。
+func HeaderLen(rosctr byte) int {
+	switch rosctr {
+	case ROSCTRJobAck, ROSCTRAckData:
+		return 12
+	}
+	return 10
+}
+
 // BuildPDU 生成 S7 头 + 参数区 + 数据区（不含 COTP/TPKT）。
+//
+// ACK / ACK_DATA 会自动带上两个零错误字节；要构造带错误的报文用
+// BuildPDUError。
 func BuildPDU(rosctr byte, ref uint16, param, data []byte) []byte {
-	out := make([]byte, 10+len(param)+len(data))
+	return buildPDU(rosctr, ref, 0, 0, param, data)
+}
+
+// BuildPDUError 生成带 error class / error code 的 ACK / ACK_DATA。
+// 对 Job / UserData 调用时这两个参数没有位置，会被忽略。
+func BuildPDUError(rosctr byte, ref uint16, class, code byte, param, data []byte) []byte {
+	return buildPDU(rosctr, ref, class, code, param, data)
+}
+
+func buildPDU(rosctr byte, ref uint16, class, code byte, param, data []byte) []byte {
+	hdr := HeaderLen(rosctr)
+	out := make([]byte, hdr+len(param)+len(data))
 	out[0] = S7ProtoID
 	out[1] = rosctr
 	// out[2:4] redundancy id = 0
 	binary.BigEndian.PutUint16(out[4:6], ref)
 	binary.BigEndian.PutUint16(out[6:8], uint16(len(param)))
 	binary.BigEndian.PutUint16(out[8:10], uint16(len(data)))
-	copy(out[10:], param)
-	copy(out[10+len(param):], data)
+	if hdr == 12 {
+		out[10], out[11] = class, code
+	}
+	copy(out[hdr:], param)
+	copy(out[hdr+len(param):], data)
 	return out
 }
 
@@ -181,10 +214,24 @@ func WrapDT(pdu []byte) []byte {
 
 // PDU 是解析后的 S7 报文。
 type PDU struct {
-	ROSCTR byte
-	Ref    uint16
-	Param  []byte
-	Data   []byte
+	ROSCTR   byte
+	Ref      uint16
+	ErrClass byte // 仅 ACK / ACK_DATA
+	ErrCode  byte // 仅 ACK / ACK_DATA
+	Param    []byte
+	Data     []byte
+}
+
+// Error 返回报文头顶层的错误。nil 表示无错误。
+//
+// 顶层错误与「单项错误码」是两件事：顶层非零意味着整帧失败（例如功能
+// 不支持、会话未建立），此时参数区与数据区的内容都不可信；单项返回码
+// 在数据区里，只影响对应点位。
+func (p PDU) Error() error {
+	if p.ErrClass == 0 && p.ErrCode == 0 {
+		return nil
+	}
+	return fmt.Errorf("s7: pdu error class=%#02x code=%#02x", p.ErrClass, p.ErrCode)
 }
 
 // Parse 剥离 COTP DT 与 S7 头，返回参数区与数据区。
@@ -212,18 +259,26 @@ func Parse(b []byte) (PDU, error) {
 	if payload[0] != S7ProtoID {
 		return PDU{}, fmt.Errorf("s7: protocol id %#02x, want 0x32", payload[0])
 	}
+	hdr := HeaderLen(payload[1])
+	if len(payload) < hdr {
+		return PDU{}, fmt.Errorf("s7: s7 header too short for rosctr %#02x (%d)", payload[1], len(payload))
+	}
 	paramLen := int(binary.BigEndian.Uint16(payload[6:8]))
 	dataLen := int(binary.BigEndian.Uint16(payload[8:10]))
-	if len(payload) < 10+paramLen+dataLen {
+	if len(payload) < hdr+paramLen+dataLen {
 		return PDU{}, fmt.Errorf("s7: pdu truncated: header says %d, have %d",
-			10+paramLen+dataLen, len(payload))
+			hdr+paramLen+dataLen, len(payload))
 	}
-	return PDU{
+	p := PDU{
 		ROSCTR: payload[1],
 		Ref:    binary.BigEndian.Uint16(payload[4:6]),
-		Param:  payload[10 : 10+paramLen],
-		Data:   payload[10+paramLen : 10+paramLen+dataLen],
-	}, nil
+		Param:  payload[hdr : hdr+paramLen],
+		Data:   payload[hdr+paramLen : hdr+paramLen+dataLen],
+	}
+	if hdr == 12 {
+		p.ErrClass, p.ErrCode = payload[10], payload[11]
+	}
+	return p, nil
 }
 
 // SetupParams 生成「建立通信」参数区（请求最大 PDU 长度）。

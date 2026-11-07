@@ -236,6 +236,11 @@ func (c *conn) readPDU(ctx context.Context) (s7.PDU, error) {
 	if err != nil {
 		return s7.PDU{}, driver.E(driver.ErrProtocol, "read", c.deviceID, err.Error(), true, err)
 	}
+	if err := resp.Error(); err != nil {
+		// ACK / ACK_DATA 的顶层错误意味着整帧失败，参数区与数据区都不可信。
+		// 继续按单项返回码解析会得到一串「看似正常」的错位数据。
+		return s7.PDU{}, driver.E(driver.ErrProtocol, "read", c.deviceID, err.Error(), true, err)
+	}
 	return resp, nil
 }
 
