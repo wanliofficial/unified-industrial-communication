@@ -45,7 +45,7 @@ public static partial class RestApi
 
         app.MapPost("/api/v1/config/apply", async (HttpContext http, CancellationToken ct) =>
         {
-            var (doc, comment) = await ReadConfigAsync(http, ct).ConfigureAwait(false);
+            var (doc, comment) = await ReadConfigAsync(http, ctx.Control.CurrentConfig, ct).ConfigureAwait(false);
 
             var before = ctx.Control.CurrentConfig;
             var started = Stopwatch.GetTimestamp();
@@ -98,7 +98,12 @@ public static partial class RestApi
                         ?? throw ApiException.NotFound("config.version_not_found", $"version '{to}' not found");
 
             var entries = ConfigStore.Diff(before, after)
-                .Select(e => new DiffEntryDto(e.Path, e.Kind, e.Before, e.After))
+                .Select(e => new DiffEntryDto(
+                    e.Path,
+                    e.Kind,
+                    // 差异会展示字段值；凭据字段不能因为「变了」就泄露明文。
+                    RedactedSecrets.MaskIfSecret(e.Path, e.Before),
+                    RedactedSecrets.MaskIfSecret(e.Path, e.After)))
                 .ToArray();
 
             return Results.Json(new DiffResponseDto(from, to, entries), ApiJson.Options);
@@ -274,10 +279,14 @@ public static partial class RestApi
     }
 
     /// <summary>接受 <c>{"config": {...}}</c> 或 <c>{"json": "..."}</c> 两种提交形态。</summary>
-    private static async Task<(ConfigDocument Doc, string? Comment)> ReadConfigAsync(HttpContext http, CancellationToken ct)
+    private static async Task<(ConfigDocument Doc, string? Comment)> ReadConfigAsync(
+        HttpContext http, ConfigDocument? current, CancellationToken ct)
     {
         var (text, comment) = await ReadConfigTextAsync(http, ct).ConfigureAwait(false);
-        return (ConfigStore.Parse(text, "request"), comment);
+
+        // 客户端大概率是把 GET /config 读到的脱敏配置改一处再提交；
+        // 先把 "***" 还原成当前密钥，避免无关编辑把令牌改成占位符。
+        return (ConfigStore.Parse(RedactedSecrets.Restore(text, current), "request"), comment);
     }
 
     /// <summary>只取出配置原文，不做校验：校验端点要把问题一次性列出来，而不是抛第一条。</summary>

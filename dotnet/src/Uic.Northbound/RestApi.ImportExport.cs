@@ -110,7 +110,9 @@ public static partial class RestApi
         {
             var (text, comment) = await ReadConfigTextAsync(http, ct).ConfigureAwait(false);
 
-            var migration = ConfigMigrations.Upgrade(text);
+            // 默认导出是脱敏的；导入它时同样把 "***" 还原，避免把密钥写成占位符。
+            var migration = ConfigMigrations.Upgrade(
+                RedactedSecrets.Restore(text, ctx.Control.CurrentConfig));
 
             var parsed = ConfigStore.TryParse(migration.Json, "import", out var document, out var problems);
             if (!parsed || document is null || problems.Count > 0)

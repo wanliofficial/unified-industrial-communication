@@ -11,7 +11,7 @@
 它们不是 §6.1「不做」清单里的项，属于真实缺口；逐协议现状、原因与补法见
 [protocol-status.md](protocol-status.md)。
 
-当前测试基线：**164 passed / 0 failed / 1 skipped**（跳过的是需要 `--opcua` 的 OPC UA 端到端用例）。
+当前测试基线：**166 passed / 0 failed / 1 skipped**（跳过的是需要 `--opcua` 的 OPC UA 端到端用例）。
 
 ## 1. 采集（FR-COL）
 
@@ -42,11 +42,11 @@
 | FR-CFG-06 | 命名唯一性与非法字符校验 | 已实现 | `config/rejects_invalid_documents`；通道/设备/点位各自的重复 id 与命名规则都在 `ModelValidator` 里一次列全 |
 | FR-CFG-07 | 配置 Schema 校验（启动即校验） | 已实现 | `config/rejects_invalid_documents`、`contract/config_validate_reports_problems`；非法配置退出码 2 |
 | FR-CFG-08 | 配置版本化（内容哈希）+ 历史列表 | 已实现 | `config/id_is_content_addressed`、`config/recommit_of_identical_content_keeps_one_version`、`config/bootstrap_prefers_current_pointer` |
-| FR-CFG-09 | 配置差异对比 | 已实现 | `config/diff_finds_changed_added_removed`、`config/diff_text_is_human_readable`；字段级 JSON Pointer |
+| FR-CFG-09 | 配置差异对比 | 已实现 | `config/diff_finds_changed_added_removed`、`config/diff_text_is_human_readable`；字段级 JSON Pointer；凭据字段的前后值在 REST 响应里脱敏（`contract/config_is_redacted`） |
 | FR-CFG-10 | 一键回滚（回滚也产生新版本） | 已实现 | `config/rollback_adds_a_version` |
 | FR-CFG-11 | 配置原子写（临时文件 + fsync + rename） | 已实现 | `ConfigStore.AtomicWrite`；`config/reload_after_restart` 验证重启后仍读得到 |
 | FR-CFG-12 | 热更新：只重启受影响设备 | 已实现 | `contract/template_instantiates_and_applies_devices`（apply 后返回 `restartedDevices`）；diff 按设备/点位粒度 |
-| FR-CFG-13 | 配置导入/导出（跨版本迁移） | 已实现 | `config/migration_is_explicit_and_versioned`、`config/migrates_v0_legacy_shapes`、`config/repository_examples_validate`（仓库 `examples/` 三个示例都能直接 `check` 通过）、`contract/config_export_import_round_trip`、`contract/config_import_migrates_legacy_shape`。迁移覆盖 `server.*`、`storage.dir`、`concurrency`、`devices[].channel`、transport 对象、数字 stopBits；时长接受 Go 复合写法 |
+| FR-CFG-13 | 配置导入/导出（跨版本迁移） | 已实现 | `config/migration_is_explicit_and_versioned`、`config/migrates_v0_legacy_shapes`、`config/repository_examples_validate`（仓库 `examples/` 三个示例都能直接 `check` 通过）、`contract/config_export_import_round_trip`、`contract/config_import_migrates_legacy_shape`、`config/redacted_secrets_are_restored`、`contract/apply_keeps_redacted_secrets`（默认导出的 `***` 在 apply/import 时按同路径还原）。迁移覆盖 `server.*`、`storage.dir`、`concurrency`、`devices[].channel`、transport 对象、数字 stopBits；时长接受 Go 复合写法 |
 
 ## 3. 调度与运行时（FR-RUN）
 
@@ -141,6 +141,7 @@
 | 安全：配置文件无明文口令 | 红线 | 不满足 | 见 FR-OPS-09 |
 | 安全：未认证即可写点位 | 红线 | 满足（配置了 token 时） | 写端点走鉴权中间件；不配 token 时等同于开放 |
 | 安全：诊断包含凭据 | 红线 | 满足 | `Redact` 把 `token`/`password`/`secret` 替换为 `***`，`contract/config_is_redacted` 验证 |
+| 安全：脱敏配置回写不降级凭据 | — | 满足 | `apply`/`import` 把同路径的 `***` 还原成当前值，显式空串仍表示清空；`config/redacted_secrets_are_restored`、`contract/apply_keeps_redacted_secrets` |
 | 可观测：日志字段 | `ts/level/msg/device/...` | 已实现 | 环形缓冲与 JSON 行文件共用同一套字段：`ts/level/category/msg/device/exception`；`logs/json_line_fields_are_complete` |
 | 兼容：配置向后兼容 ≥2 大版本 | 自动迁移 | 已实现（现有 v0 形状） | `ConfigMigrations` 覆盖 7 条 v0 规则（server.listen/token、storage.dir、mqtt.broker、channels[].concurrency、channels[].transport 对象、serial.stopBits、devices[].channel）；`config/migrates_v0_legacy_shapes` 逐项断言迁移结果，`config/migration_is_explicit_and_versioned` 验证升级项回显与「更新版本拒绝启动」。仓库只有 v1，尚不存在第二个历史主版本可测 |
 | 兼容：浏览器最近 2 个版本 | Chrome/Edge/Firefox | 已验证 Chrome | `scripts/wasm-smoke.sh` 用 Playwright Chromium；其余浏览器未跑 |

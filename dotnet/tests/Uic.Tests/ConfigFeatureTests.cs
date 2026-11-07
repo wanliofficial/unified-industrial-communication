@@ -1,6 +1,7 @@
 using System.Text.Json.Nodes;
 using Uic.Config;
 using Uic.Domain;
+using Uic.Northbound;
 
 namespace Uic.Tests;
 
@@ -25,6 +26,7 @@ internal static class ConfigFeatureTests
         tests.Add(new TestCase("config/migration_is_explicit_and_versioned", MigrationIsExplicitAndVersioned));
         tests.Add(new TestCase("config/migrates_v0_legacy_shapes", MigratesLegacyShapes));
         tests.Add(new TestCase("config/composite_durations_parse", CompositeDurationsParse));
+        tests.Add(new TestCase("config/redacted_secrets_are_restored", RedactedSecretsAreRestored));
         tests.Add(new TestCase("config/repository_examples_validate", RepositoryExamplesValidate));
     }
 
@@ -481,6 +483,44 @@ internal static class ConfigFeatureTests
         t.Equal("ch-modbus", devices[0]!.AsObject()["channelId"]!.GetValue<string>(),
             "the device points at the migrated channel id");
         t.Ok(devices[0]!.AsObject()["channel"] is null, "the legacy device field is removed");
+
+        return Task.CompletedTask;
+    }
+
+    /// <summary>
+    /// 控制台读到的配置是脱敏的；把 <c>"***"</c> 原样提交回去时必须还原成当前密钥。
+    /// 否则一次无关的编辑（加设备、改名）就会把 API 令牌改成字面量，等于锁死入口。
+    /// </summary>
+    private static Task RedactedSecretsAreRestored(TestContext t)
+    {
+        var node = JsonNode.Parse(JsonDefaults.ToJson(DemoConfig.Build()))!.AsObject();
+        node["northbound"]!["rest"]!["token"] = "api-token";
+        node["northbound"]!["mqtt"]!["username"] = "mqtt-user";
+        node["northbound"]!["mqtt"]!["password"] = "mqtt-secret";
+
+        var current = ConfigStore.Parse(node.ToJsonString());
+
+        var redacted = RestApi.Redact(current);
+        t.Equal(RedactedSecrets.Placeholder, redacted["northbound"]!["rest"]!["token"]!.GetValue<string>(),
+            "the read-back token is a placeholder");
+
+        // 模拟控制台改一个与安全无关的字段，其余（含占位符）原样提交。
+        redacted["devices"]![0]!["name"] = "改过的设备名";
+
+        var restored = ConfigStore.Parse(
+            RedactedSecrets.Restore(redacted.ToJsonString(), current));
+
+        t.Equal("api-token", restored.Northbound.Rest.Token, "the API token is restored");
+        t.Equal("mqtt-secret", restored.Northbound.Mqtt.Password, "the MQTT password is restored");
+        t.Equal("mqtt-user", restored.Northbound.Mqtt.Username, "non-secret fields are untouched");
+        t.Equal("改过的设备名", restored.Devices[0].Name, "the intended edit survives");
+
+        // 显式清空口令不能被「还原」回来，否则用户永远删不掉一个泄漏的凭据。
+        redacted["northbound"]!["rest"]!["token"] = "";
+        var cleared = ConfigStore.Parse(
+            RedactedSecrets.Restore(redacted.ToJsonString(), current));
+        t.Equal(string.Empty, cleared.Northbound.Rest.Token ?? string.Empty,
+            "an explicitly cleared token stays cleared");
 
         return Task.CompletedTask;
     }

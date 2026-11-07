@@ -319,7 +319,7 @@
 | GET | `/api/v1/config` | 当前配置（口令类字段脱敏为 `***`） |
 | GET | `/api/v1/config/versions` | 版本列表 |
 | GET | `/api/v1/config/versions/{id}` | 某个版本的完整内容 |
-| GET | `/api/v1/config/diff?from=&to=` | 两个版本的语义差异 |
+| GET | `/api/v1/config/diff?from=&to=` | 两个版本的语义差异（凭据字段的值同样脱敏为 `***`） |
 | POST | `/api/v1/config/validate` | 校验，返回 `valid` + `problems[]` |
 | POST | `/api/v1/config/apply` | 提交并热更新 |
 | POST | `/api/v1/config/rollback` | 回滚到指定版本 |
@@ -348,6 +348,12 @@
 ```
 
 `apply` 只重启受影响的设备 —— 这是热更新能用在产线上的前提。
+
+**脱敏占位符的往返语义**：`apply` 与 `import` 接受「读回来、改一处、再提交」的配置。
+提交值里位于 `token` / `password` / `secret` 字段的 `"***"` 会被还原成当前配置中同路径的值，
+因此改设备名或加点位不会把凭据覆盖成字面量 `***`。若当前配置里没有对应值，
+占位符保持原样交给校验；显式提交空串仍表示清空该凭据。
+配置差异（`/config/diff`）只保留「哪个字段变了」，凭据字段的前后值同样显示为 `***`。
 
 ### 导出与导入
 

@@ -4,6 +4,7 @@ using System.Net.Http.Headers;
 using System.Net.Http.Json;
 using System.Text;
 using System.Text.Json;
+using System.Text.Json.Nodes;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Hosting.Server;
@@ -35,6 +36,7 @@ internal static class ContractTests
     {
         tests.Add(new TestCase("contract/health_and_version_are_public", HealthAndVersionArePublic));
         tests.Add(new TestCase("contract/resource_pressure_degrades_health", ResourcePressureDegradesHealth));
+        tests.Add(new TestCase("contract/apply_keeps_redacted_secrets", ApplyKeepsRedactedSecrets));
         tests.Add(new TestCase("contract/api_requires_bearer_token", ApiRequiresBearerToken));
         tests.Add(new TestCase("contract/devices_and_points_are_listed", DevicesAndPointsAreListed));
         tests.Add(new TestCase("contract/drivers_expose_capability_states", DriversExposeCapabilityStates));
@@ -326,6 +328,45 @@ internal static class ContractTests
         });
     }
 
+    /// <summary>
+    /// 控制台「读配置 → 改一处 → 应用」的闭环：GET 会把密钥脱敏成 <c>"***"</c>，
+    /// 原样提交回来时服务端必须还原，否则一次改名就会把 API 令牌写成占位符。
+    /// 这里走真实 HTTP，因为错误可能只发生在解析/应用这段装配里。
+    /// </summary>
+    private static Task ApplyKeepsRedactedSecrets(TestContext t)
+    {
+        return RunAsync(async () =>
+        {
+            await using var host = await Host.StartAsync(t);
+
+            using var envelope = await ReadJsonAsync(t, await host.Client.SendAsync(
+                Get("/api/v1/config"), t.Ct));
+
+            var config = envelope.RootElement.GetProperty("config").Clone();
+
+            t.Equal(RedactedSecrets.Placeholder,
+                config.GetProperty("northbound").GetProperty("rest").GetProperty("token").GetString(),
+                "the read-back token is a placeholder");
+
+            // 模拟控制台里改一台设备的名字，其余字段（含占位符）原样提交。
+            var devices = config.GetProperty("devices").EnumerateArray().ToArray();
+            var edited = JsonNode.Parse(config.GetRawText())!.AsObject();
+            edited["devices"]![0]!["name"] = "改名后的设备";
+
+            using var applied = await ReadJsonAsync(t, await host.Client.SendAsync(
+                Post("/api/v1/config/apply", edited.ToJsonString()), t.Ct));
+
+            var root = applied.RootElement;
+            t.Equal(true, root.GetProperty("applied").GetBoolean(), "the config is applied");
+
+            var current = host.Runtime.CurrentConfig;
+            t.Equal(Token, current.Northbound.Rest.Token,
+                "the token survives the redacted round-trip");
+            t.Equal("改名后的设备", current.Devices[0].Name, "the intended edit is applied");
+            t.Equal(devices.Length, current.Devices.Count, "no device was added or dropped");
+        });
+    }
+
     private static ConfigDocument WithStorage(ConfigDocument source, StorageOptions storage) => new()
     {
         SchemaVersion = source.SchemaVersion,
@@ -495,6 +536,22 @@ internal static class ContractTests
             // 配置本身要能看，口令类字段必须看不到：现场投屏时这是硬要求。
             t.Equal("***", token, "the bearer token is redacted");
             t.Equal("contract-site", config.GetProperty("site").GetString(), "the rest of the config is readable");
+
+            // 差异接口会展示字段值；轮换令牌后，前后值都不能是明文。
+            var from = root.GetProperty("version").GetString()!;
+            var edited = JsonNode.Parse(config.GetRawText())!.AsObject();
+            edited["northbound"]!["rest"]!["token"] = "rotated-token";
+
+            await host.Client.SendAsync(Post("/api/v1/config/apply", edited.ToJsonString()), t.Ct);
+
+            using var diff = await ReadJsonAsync(t, await host.Client.SendAsync(
+                Get($"/api/v1/config/diff?from={from}"), t.Ct));
+
+            var tokenEntry = diff.RootElement.GetProperty("entries").EnumerateArray()
+                .Single(e => e.GetProperty("path").GetString() == "northbound.rest.token");
+
+            t.Equal("***", tokenEntry.GetProperty("before").GetString(), "the old token is not leaked");
+            t.Equal("***", tokenEntry.GetProperty("after").GetString(), "the new token is not leaked");
         });
     }
 
