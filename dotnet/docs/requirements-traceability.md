@@ -142,7 +142,7 @@
 | 安全：未认证即可写点位 | 红线 | 满足（配置了 token 时） | 写端点走鉴权中间件；不配 token 时等同于开放 |
 | 安全：诊断包含凭据 | 红线 | 满足 | `Redact` 把 `token`/`password`/`secret` 替换为 `***`，`contract/config_is_redacted` 验证 |
 | 可观测：日志字段 | `ts/level/msg/device/...` | 已实现 | 环形缓冲与 JSON 行文件共用同一套字段：`ts/level/category/msg/device/exception`；`logs/json_line_fields_are_complete` |
-| 兼容：配置向后兼容 ≥2 大版本 | 自动迁移 | 部分实现 | 迁移链已就位，但只有 v0→v1 两条真实规则 |
+| 兼容：配置向后兼容 ≥2 大版本 | 自动迁移 | 已实现（现有 v0 形状） | `ConfigMigrations` 覆盖 7 条 v0 规则（server.listen/token、storage.dir、mqtt.broker、channels[].concurrency、channels[].transport 对象、serial.stopBits、devices[].channel）；`config/migrates_v0_legacy_shapes` 逐项断言迁移结果，`config/migration_is_explicit_and_versioned` 验证升级项回显与「更新版本拒绝启动」。仓库只有 v1，尚不存在第二个历史主版本可测 |
 | 兼容：浏览器最近 2 个版本 | Chrome/Edge/Firefox | 已验证 Chrome | `scripts/wasm-smoke.sh` 用 Playwright Chromium；其余浏览器未跑 |
 | 可维护：单文件 ≤600 行 | — | 已实现 | 新增端点都拆成 `RestApi.*.cs` partial |
 | 可维护：依赖数量 ≤10 | 直接依赖 | 已实现 | 生产 4 个（日志抽象、串口、OPC UA Server/Configuration）+ ASP.NET Core 框架引用；测试 1 个 |
