@@ -34,10 +34,10 @@ cmd/ + internal/            可运行的最小骨架（不是伪代码，能采�
 
 ### 1.2 它不是什么
 
-- 不是协议库大杂烩。当前实现了 13 个驱动（Modbus TCP / RTU / ASCII 主站、S7、OPC UA、MQTT 南向订阅、
-  MC 3E、FINS、EtherNet/IP CIP、BACnet/IP、计算点、virtual），外加 Modbus 从站（TCP / RTU / ASCII）、
-  七个内置模拟从站/Broker（Modbus TCP、S7、MC 3E、FINS、CIP、BACnet/IP、MQTT）与一个内置 OPC UA
-  服务端、一个零依赖报警引擎与一个有界历史采样日志；其余协议在
+- 不是协议库大杂烩。当前实现了 14 个驱动（Modbus TCP / RTU / ASCII 主站、S7、OPC UA、MQTT 南向订阅、
+  MC 3E、FINS、EtherNet/IP CIP、BACnet/IP、IEC 60870-5-104、计算点、virtual），外加 Modbus 从站
+  （TCP / RTU / ASCII）、八个内置模拟从站/Broker（Modbus TCP、S7、MC 3E、FINS、CIP、BACnet/IP、
+  IEC 104、MQTT）与一个内置 OPC UA 服务端、一个零依赖报警引擎与一个有界历史采样日志；其余协议在
   `04-protocol-catalog.md` 里按工作量排了三波，没有假装已经支持。
   注意 MQTT 出现了两次且**互不相干**：北向是「网关把数据发出去」（sink），南向是「网关订阅别人发来的数据」（driver）。
 - 不是组态软件。不做画面、不做报表、不做自研时序库——理由见 `02-synthesis/01-capability-matrix.md` §6.4。
@@ -201,6 +201,41 @@ BACnet/IP 只做 **ReadProperty（0x0C）/ WriteProperty（0x0F）**，不做广
 多状态 UNSIGNED、字符串 CHARACTER STRING），不是由平台 `dataType` 决定；
 可写性同样由对象决定——`analog-input` 的 `present-value` 永远只读。
 UDP 无连接，驱动用 8 位 invoke ID 配对并把整条会话串行化，迟到应答直接丢弃。
+
+IEC 60870-5-104（调度侧主站，TCP 2404）：
+
+```bash
+./uic sim -protocol iec104 -listen 127.0.0.1:2404 &   # 内置 IEC 104 从站
+./uic -config examples/iec104.json
+curl -s -H 'Authorization: Bearer dev-token-0123456789' localhost:8091/api/v1/points
+#   14 点：短浮点 42.5/7.25、标度化 1234、被取代值（质量 uncertain）、
+#         带时标值、单点 on/off、双点 1/2、累计量每秒自增、
+#         单点命令 + 短浮点/标度化设定值 + 双点遥控（可写）
+#   自检（不需要网关）：./uic iec104read -addr 127.0.0.1:2404 -ca 1
+#   只验链路层：./uic iec104read -addr 127.0.0.1:2404 -probe
+#   下发命令：./uic iec104read -addr 127.0.0.1:2404 -area double-command -cmd-ioa 2003 -write off
+```
+
+IEC 104 与前面所有协议的根本差别是**数据由从站推上来**：主站建链（STARTDT）后做一次
+站总召唤拿快照，之后设备按变化主动上送；没有「读第 1001 号点」这种动作。因此驱动的
+`Read` **不做任何网络交互**，只查本地最新值表（与 MQTT 南向同一模式），一次读多少点
+的成本都一样。累计量不在站召唤范围内，`Open` 里固定再发一次电能量召唤；设备不支持时
+它回否定确认，按调试日志处理，不影响连接。
+
+质量码只来自两处：ASDU 里的品质位（`IV`→bad、`NT`→stale、`SB`/`BL`/`OV`→uncertain）
+与链路是否活着（TESTFR 往返）。**刻意不做「多久没更新就降级」**——104 只在值变化时
+上送，一个温度半小时不变是正常的，按时间降级会把整页刷成 stale。
+
+点位用 `kind=register` 寻址，`offset` 即 IOA（1..16777215），`area` 取
+`ioa` / `single-command` / `double-command` / `setpoint-float` / `setpoint-scaled` /
+`setpoint-normalized` 之一。**命令类型由 `area` 声明而不是由 `dataType` 推导**：同一个
+`float32` 可能是短浮点设定值，也可能是放大 100 倍的标度化整数。双点命令只接受 1（分）/
+2（合），0 与 3 是标准里的「不允许」，本地即拒。同一个 IOA 可以挂两个点位
+（`area=ioa` 读状态 + `area=double-command` 写命令），这是遥信/遥控共用编号的常见形态。
+
+`iec104read` 不依赖点表：驱动维护一张 4096 条上限的**旁路表**，按 IOA 记录设备实际
+送过的原始对象（类型标识、传送原因、是否带时标），所以初次接一台陌生设备就能先看清
+「它送什么」再写点表。双点的 0/3 中间态原样显示成「不确定 (3)」，不硬转成布尔。
 
 OPC UA（二进制，SecurityPolicy None / 匿名）：
 
@@ -691,6 +726,9 @@ obs  ← 所有包（不依赖任何内部包）
 | `internal/codec/bacnet` | BACnet/IP 纯函数编解码（BVLC/NPDU/APDU、application 与 context 标签、对象属性请求与应答、Error/Reject/Abort、对象类型与属性名表） | 无 I/O、无时钟、无可变状态；BVLC 长度只算 NPDU+APDU；Forwarded-NPDU 跳过 4 字节转发信息；application 与 context 的 LVT 含义分开实现；BOOLEAN 的 LVT 直接承载值；数值用最短字节数；编号解析只接受纯十进制（`-1` 不会被吃掉减号） | 90.8% |
 | `internal/driver/bacnet` | BACnet/IP 主站（对象属性读写、UDP invoke ID 配对、按对象语义选写标签、错误类映射） | 只做 ReadProperty/WriteProperty；UDP 用 connected socket，整条会话串行化；按 invoke 丢弃迟到应答；超时重发 2 次、断链不重试；写 `present-value` 的标签由对象语义决定；读数值宽松、bool/string 严格 | 87.3% |
 | `internal/sim/bacnet` | BACnet/IP 内置从站（对象表、属性读写、数组下标、写权限、类型收敛） | 与主站共用 codec/bacnet；AI 的 present-value 只读、AV 可写；数组下标越界与「对标量带下标」都回 invalid-array-index；写入按目标属性类型收敛，不收的类型回 invalid-data-type；垃圾报文静默丢弃 | 85.2% |
+| `internal/codec/iec104` | IEC 60870-5-104 纯函数编解码（APCI 三种帧型、ASDU 头与信息对象、元素宽度表、归一化/标度化/短浮点、CP56Time2a、品质位、命令构造、类型/原因名表） | 无 I/O、无时钟、无可变状态；长度字段只算控制域+ASDU；U 帧功能码低两位必须 `11`；I 帧无 ASDU 直接判错；`ParseFrame` 只解析已切好的整帧，不做流式重组；SIQ/DIQ 品质位整体左移 3 位、QDS 低 5 位，两者不混用；CP56Time2a 逐位掩保留位 | 91.2% |
+| `internal/driver/iec104` | IEC 60870-5-104 主站（STARTDT/STOPDT/TESTFR、站总召唤、电能量召唤、最新值表、五种命令、否定确认分类、旁路表） | 只做平衡式 TCP；`Read` 不产生网络交互；质量只来自 ASDU 品质位与链路活性，不按「多久没更新」降级；召唤超时不拆链、EndOfInit 重新召唤并 1 秒去重；命令类型由 `area` 声明；双点 0/3 本地即拒；写成功先填缓存并标 uncertain，但只补「没有」或「比命令更旧（`sentAt`）」的条目（避免覆盖紧跟确认的突发上送）；否定确认 44/45→protocol、46/47→address、其它→permission；旁路表 4096 条上限 | 93.0% |
+| `internal/sim/iec104` | IEC 60870-5-104 内置从站（对象表、STARTDT 门控、站总召唤快照、电能量召唤、命令三段式、突发上送） | 与主站共用 codec/iec104；STARTDT 之前不发数据；站召唤跳过纯命令对象；SQ=1 分组不跨类型；累计量只走电能量召唤且每秒自增；只读对象回否定确认「未知 IOA」；乱序 I 帧立即断链；`Close` 幂等 | 95.7% |
 | `internal/planner` | 点位 → 批量读请求（ReadSpan） | 协议无关；按连续性/上限合并；按 `area:db` 分组；计算点合成单个 `expr` span（漏组会表现为全坏且无日志） | 92.6% |
 | `internal/scheduler` | tick、actor、信号量、退避、熔断、代次 | 同设备不并发；写优先；旧代次丢弃；状态回调不占采集路径 | 88.1% |
 | `internal/pipeline` | 缩放、质量判定、死区过滤 | 质量不可用时不参与死区比较 | 92.7% |
@@ -717,7 +755,7 @@ go test -race -count=1 ./...                    # 竞态 + 全量测试
 go test -coverprofile=c.out ./... && go tool cover -func=c.out | tail -1
 ```
 
-当前状态：`go build` / `go vet` / `gofmt` 全部干净，`go test -race ./...` 50 个测试包全部通过
+当前状态：`go build` / `go vet` / `gofmt` 全部干净，`go test -race ./...` 53 个测试包全部通过
 （仅 `internal/mqtt/mqtttest` 是纯测试辅助包，没有自己的测试文件）。
 
 ### 9.3 源码阅读建议顺序
@@ -822,6 +860,8 @@ OPC UA 服务端（同一份点位表的另一个出口）：
 | EtherNet/IP + CIP 主站 + 内置从站 | ✅ | `internal/codec/enip` + `internal/driver/enip` + `internal/sim/enip` + `uic enipread` + `examples/enip.json`；只做 CIP 显式报文 + TCP 44818 + 符号标签（隐式 I/O、对象/属性寻址、结构体展开配置期即拒）；三层封装（24 字节封装头 / CPF / CIP）、封装长度只算负载、CPF 奇数条目对齐、发送方上下文严格校验；CIP 无事务号，整条会话串行化；地址字段按 CIP 重解释（标签名/元素 offset/按类型解释的 length/位号）；数值线上小端，整元素反转后走统一解码；类型以设备应答为准；STRING 为「4 字节长度 + 容量」；bytes 两阶段读；多服务合包（450 字节拆批、单次 400 字节上限）且设备不支持时自动退回；位写 RMW 只回写目标元素；状态码统一分类，封装 0x64 判可重试；三层测试含真实 TCP 回环与错误路径脚本流 |
 | BACnet/IP 主站 + 内置从站 | ✅ | `internal/codec/bacnet` + `internal/driver/bacnet` + `internal/sim/bacnet` + `uic bacread` + `examples/bacnet.json`；只做 ReadProperty（0x0C）/ WriteProperty（0x0F）（不做 Who-Is/I-Am、COV、批量读、分段）；四层封装（BVLC/NPDU/APDU/标签），BVLC 长度只算 NPDU+APDU，Forwarded-NPDU 跳过 4 字节转发头；application 与 context 的 LVT 含义分开实现（context 6/7 是 opening/closing），BOOLEAN 的 LVT 直接承载值；点位用 `kind=object` 寻址（对象类型/实例/属性/数组下标，都支持名字或编号）；写 `present-value` 的标签由对象语义决定（REAL/ENUMERATED/UNSIGNED/CHARACTER STRING）；UDP 用 connected socket、8 位 invoke ID 配对、整条会话串行化、迟到应答丢弃、超时重发 2 次；错误类 1/2→address、40/27→permission、3→disconnected（可重试）、4→permission；三层测试含真实 UDP 回环 |
 | BACnet/IP 的边界 | ⚠️ | 不做广播发现、COV 订阅、ReadPropertyMultiple、分段传输、对象浏览；优先级数组可读但不暴露写优先级（避免「写了一直不生效、其实是更高优先级压住」）；实例号必须写在配置里，不能靠发现补齐 |
+| IEC 60870-5-104 主站 + 内置从站 | ✅ | `internal/codec/iec104` + `internal/driver/iec104` + `internal/sim/iec104` + `uic iec104read` + `examples/iec104.json`；只做平衡式 TCP + STARTDT/STOPDT/TESTFR + 站总召唤 + 电能量召唤 + 单点/双点/设定值命令（不做 101 串口、文件传输、时钟同步写路径、冗余通道、带时标命令、组召唤）；APCI 长度只算控制域+ASDU、U 帧功能码低两位必须 `11`、I 帧空载荷判错；`Read` 只查本地最新值表不产生网络交互；质量只来自 ASDU 品质位与 TESTFR 活性（**不做按时间降级**——104 只在变化时上送）；`Open` 只等 STARTDT、召唤超时不拆链、电能量召唤无条件发送、EndOfInit 触发重新召唤并去重；命令类型由 `area` 声明，双点只接受 1/2（0/3 本地即拒），写成功先填缓存标 uncertain；旁路表 `Observed` 让 CLI 不依赖点表就能列出「设备送什么」；三层测试含真实 TCP 回环与注入式假链路 |
+| IEC 104 的边界 | ⚠️ | 不做非平衡式（101 串口）、文件传输、驱动侧时钟同步、冗余通道切换、带时标命令、组召唤；没有「列举 IOA」这种协议动作，点表发现只能靠驱动旁路表（被动观察），设备不发就永远看不到；`Subscribe` 声明 supported 但对外仍是 `Read` 拉取契约 |
 | Modbus TCP 从站 | ✅ | `slaves[]` 存在即启用；四区（holding/input/coil/discrete）映射；跨映射与半值读；写穿透到 `Runtime.Write`；坏质量保留最后值并计入 `uic_slave_degraded_reads_total`；映射变化按指纹重建监听；`uic mbread` 可自检 |
 | Modbus RTU/ASCII 从站 | ✅ | `serial.port` + `serial.framing`（rtu/ascii）；RTU 按功能码推导帧长、推不出来时读到 3.5 字符静默（下限 5ms 对抗 USB 转发延迟）；ASCII 以 `:` 起始、CRLF 结束；非本机单元号静默、广播只写不回、CRC/LRC 错后 `tcflush` 重同步、半帧丢弃；USB 适配器掉线按 1s→2s→…→30s 退避重开；端口与主站通道及其他从站按字面路径互斥（配置期拒绝） |
 | Modbus 诊断与识别（FC8/FC11/FC17/FC43） | ✅ | FC8 子功能 0x0000 回显、0x000A 清计数、0x000B~0x0012 各类计数（TCP 上 CRC/字符层错误恒为 0）；FC11 事件计数器（自身不计数、异常不计数）；FC17 产品代码 + 运行指示 0xFF；FC43/MEI 0x0E 读设备标识（basic/regular/extended 与按对象 id 读取，响应超 253 字节时按 `more`/`nextObjectID` 分页）；身份标识由 `slave.identity` 配置，缺省也保证 basic 三件套非空；版本号取构建信息 |

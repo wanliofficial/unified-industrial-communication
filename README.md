@@ -339,6 +339,39 @@ BACnet/IP 只做 ReadProperty（0x0C）/ WriteProperty（0x0F），不做 Who-Is
 决定；可写性同样由对象决定——`analog-input` 的 `present-value` 永远只读。
 UDP 无连接，驱动用 8 位 invoke ID 配对，并把整条会话串行化，迟到应答直接丢弃。
 
+IEC 60870-5-104 调度主站（TCP 2404）：
+
+```bash
+./uic sim -protocol iec104 -listen 127.0.0.1:2404 &   # 内置 IEC 104 从站
+./uic -config examples/iec104.json
+curl -s -H 'Authorization: Bearer dev-token-0123456789' localhost:8091/api/v1/points
+#   14 点：短浮点 42.5/7.25、标度化 1234、被取代值（uncertain）、带时标值、
+#         单点 on/off、双点 1/2、累计量每秒自增、
+#         单点命令 + 短浮点/标度化设定值 + 双点遥控（可写）
+#   自检（不需要网关）：./uic iec104read -addr 127.0.0.1:2404 -ca 1
+#   只验链路层：./uic iec104read -addr 127.0.0.1:2404 -probe
+#   下发命令：./uic iec104read -addr 127.0.0.1:2404 -area double-command -cmd-ioa 2003 -write off
+```
+
+IEC 104 与其它协议的根本差别是**数据由从站推上来**：建链（STARTDT）后做一次站总召唤
+拿快照，之后设备按变化主动上送，没有「读第 1001 号点」这种动作。所以驱动的 `Read`
+**不做任何网络交互**，只查本地最新值表（与 MQTT 南向同一模式）。累计量不在站召唤范围
+内，`Open` 里固定再发一次电能量召唤；设备不支持时回否定确认，按调试日志处理。
+
+质量码只来自两处：ASDU 品质位（`IV`→bad、`NT`→stale、`SB`/`BL`/`OV`→uncertain）与
+链路是否活着（TESTFR 往返）。**刻意不做「多久没更新就降级」**——104 只在变化时上送，
+一个温度半小时不变是正常的，按时间降级会让整页看起来都不新鲜。
+
+点位用 `kind=register` 寻址，`offset` 即 IOA（1..16777215），`area` 取 `ioa` /
+`single-command` / `double-command` / `setpoint-float` / `setpoint-scaled` /
+`setpoint-normalized`。命令类型由 `area` 声明，不由 `dataType` 推导：同一个 `float32`
+可能是短浮点设定值，也可能是放大 100 倍的标度化整数。双点命令只接受 1（分）/2（合），
+0 与 3 是标准里的「不允许」，本地即拒。同一 IOA 可挂两个点位（读状态 + 写命令）。
+
+`iec104read` 不依赖点表：驱动旁路表按 IOA 记录设备实际送过的原始对象（类型标识、
+传送原因、时标），初次接陌生设备时先看清「它送什么」再写点表。双点的 0/3 中间态
+原样显示成「不确定 (3)」，不硬转成布尔。
+
 FINS 只做 FINS/TCP；FINS/UDP 与 Host Link 配置期即拒。建链先做节点号协商（命令 0
 → 1），`device.unitId>0` 覆盖目标节点、0 用协商值。`offset` 是**字地址**、`bit` 是
 字内位号（`CIO0.3` → `offset=0, bit=3`）；字访问 2 字节/字，位访问**1 字节/位**；
@@ -365,7 +398,7 @@ go test -race -count=1 ./...
 
 | 路径 | 内容 |
 |---|---|
-| `cmd/uic/` | 单入口：`run` / `sim`（Modbus / S7 / OPC UA / MQTT / MC / FINS / EtherNet-IP / BACnet-IP）/ `mbread` / `mcread` / `finsread` / `enipread` / `bacread` / `uaread` / `s7blocks` / `s7upload` / `instantiate` / `import` / `token` / `-check` / `version` |
+| `cmd/uic/` | 单入口：`run` / `sim`（Modbus / S7 / OPC UA / MQTT / MC / FINS / EtherNet-IP / BACnet-IP / IEC 104）/ `mbread` / `mcread` / `finsread` / `enipread` / `bacread` / `iec104read` / `uaread` / `s7blocks` / `s7upload` / `instantiate` / `import` / `token` / `-check` / `version` |
 | `internal/model` | 通道 / 设备 / 点位 / 地址 / 采样 / 质量码 |
 | `internal/driver` | 驱动契约（Codec / Transport / Driver）、错误分类、注册表、只读 `Lookup` 注入 |
 | `internal/calc` | 零依赖表达式引擎（编译期类型检查、短路求值、引用 `device:point`） |
@@ -381,6 +414,9 @@ go test -race -count=1 ./...
 | `internal/codec/bacnet` | BACnet/IP 纯函数编解码（BVLC / NPDU / APDU / 标签 / 对象属性名表 / Read-WriteProperty） |
 | `internal/driver/bacnet` | BACnet/IP 主站（对象属性读写、UDP invoke ID 配对、按对象语义选写标签、错误类映射） |
 | `internal/sim/bacnet` | BACnet/IP 内置从站（对象表 / 属性读写 / 数组下标 / 写权限 / 类型收敛） |
+| `internal/codec/iec104` | IEC 60870-5-104 纯函数编解码（APCI 三种帧型 / ASDU / 元素宽度 / CP56Time2a / 品质位 / 命令构造 / 类型与原因名表） |
+| `internal/driver/iec104` | IEC 104 主站（STARTDT 建链、站总召唤、电能量召唤、最新值表、五种命令、否定确认分类、旁路表） |
+| `internal/sim/iec104` | IEC 104 内置从站（对象表 / STARTDT 门控 / 召唤快照 / 命令三段式 / 突发上送） |
 | `internal/template` | 设备模板：参数校验 / 字符串字面量替换 / 实例化后完整校验 |
 | `internal/pointtable` | 点表 CSV：列别名 / 地址表达式 / 按协议推导宽度 / 合并动作 |
 | `internal/alarm` | 报警引擎：五态机 / 滞回 / 延时 / 表达式规则 / 确认 / 订阅 |
