@@ -5,9 +5,9 @@
 | 项 | 数字 |
 |---|---|
 | 分析的参考方案 | 38 份（PA-01 … PA-38，其中 PA-06 合并了两个完全相同的仓库） |
-| 文档总量 | 55 份 Markdown / 18,524 行（含 3 份 ADR） |
-| 代码总量 | 174 个 Go 文件 / 68,145 行（其中测试 29,598 行 / 945 个测试函数） |
-| Go 包 | 42 个（1 个入口 + 41 个内部包；41 个有测试） |
+| 文档总量 | 55 份 Markdown / 18,766 行（含 3 份 ADR） |
+| 代码总量 | 184 个 Go 文件 / 71,419 行（其中测试 31,085 行 / 1,006 个测试函数） |
+| Go 包 | 45 个（1 个入口 + 44 个内部包；44 个有测试） |
 | 第三方依赖 | 0（仅标准库，零 CGO） |
 
 ---
@@ -141,6 +141,24 @@ curl -s localhost:8087/api/v1/points
 MC 3E 只做二进制帧 + TCP；ASCII/4E/UDP 形态配置期即拒。位软元件（M/X/Y/B…）按位
 打包、首点是 bit0；X/Y 编号按十六进制理解（`X1F` 填 31）；字软元件上的 bool 必须
 显式 `address.bit`（0..15），驱动做读整字→改位→写整字的 RMW，不清零邻位。
+
+欧姆龙 FINS（FINS/TCP 9600）：
+
+```bash
+./uic sim -protocol fins -listen 127.0.0.1:9600 &   # 内置 FINS 从站
+./uic -config examples/fins.json
+curl -s -H 'Authorization: Bearer dev-token-0123456789' localhost:8088/api/v1/points
+#   6 点：DM0 uint16=1234、DM1 int16=5678、DM2 float32=48.0(低字在前)、
+#         CIO0.0 run=true、CIO0.1 fault 可写 bool、DM10 counter 每秒自增
+#   自检（不需要网关）：./uic finsread -addr 127.0.0.1:9600 -area dm -offset 0 -qty 2
+#   位读写：./uic finsread -addr 127.0.0.1:9600 -area cio -offset 0 -bit 1 -write on
+```
+
+FINS 只做 FINS/TCP；FINS/UDP 与 Host Link 配置期即拒。建链先做**节点号协商**
+（命令 0 → 1），`device.unitId>0` 覆盖目标节点、0 用协商值。`offset` 是**字地址**、
+`bit` 是字内位号（`CIO0.3` → `offset=0, bit=3`）；字访问 2 字节/字，位访问
+**1 字节/位**；32 位值低字在前（默认 CDAB）、64 位 DCBA；当前 EM 区无位访问码，
+bool 走 RMW，要按位读就用 `em0`..`em12`。
 
 OPC UA（二进制，SecurityPolicy None / 匿名）：
 
@@ -622,6 +640,9 @@ obs  ← 所有包（不依赖任何内部包）
 | `internal/codec/mc` | 三菱 MC 3E 纯函数编解码（帧头/设备码表/位打包/结束码/24 位设备号） | 无 I/O、无时钟、无可变状态；起始设备号 3 字节小端；位软元件按位打包（首点 bit0）；`Lookup`/`ByCode` 大小写不敏感；结束代码表 `0xC052/53/54/56`→地址错 | 86.5% |
 | `internal/driver/mc` | MC 3E 主站驱动（字/位读写、字软元件 bool 的 RMW、字序归一化、结束码分类） | 只做 3E 二进制帧 + TCP；字软元件 bool 必须显式 `address.bit`，驱动读整字→改位→写整字不清零邻位；字序归一化后按 `byteOrder` 解码默认 CDAB；结束码映射质量码 | 56.9% |
 | `internal/sim/mc` | MC 3E 内置从站（内存字/位表、按区读写、越界/未知设备结束码） | 一问一答；未配置编号读返回 0、写落表；越界返回 0xC054；设备码反查 | 89.8% |
+| `internal/codec/fins` | 欧姆龙 FINS 纯函数编解码（FINS/TCP 封装、节点协商、内存区码表、字/位读写命令、结束码） | 无 I/O、无时钟、无可变状态；TCP 长度只含「命令+错误码+负载」；读/写 MRC 同为 0x01、靠 SRC 区分；位访问一位一字节（不是按位打包）；当前 EM 区无位访问码 | 96.6% |
+| `internal/driver/fins` | FINS/TCP 主站驱动（节点号协商、字/位读写、当前 EM 区 bool 的 RMW、低字在前字序、结束码分类、SID 校验） | 只做 FINS/TCP；`offset` 是字地址、`bit` 是字内位号；`unitId>0` 覆盖目标节点；字/位混合 span 拆两次事务再按原序合并；节点协商失败归类为可重试连接错 | 81.4% |
+| `internal/sim/fins` | FINS/TCP 内置从站（节点分配、字内存表同时承载字/位视图、结束码） | 未配置地址读 0、写落表；位写只改目标位；越界 0x1103、未知区码 0x1101、点数 0/超限 0x1102；节点冲突回 `0x24` | 85.5% |
 | `internal/planner` | 点位 → 批量读请求（ReadSpan） | 协议无关；按连续性/上限合并；按 `area:db` 分组；计算点合成单个 `expr` span（漏组会表现为全坏且无日志） | 92.6% |
 | `internal/scheduler` | tick、actor、信号量、退避、熔断、代次 | 同设备不并发；写优先；旧代次丢弃；状态回调不占采集路径 | 88.1% |
 | `internal/pipeline` | 缩放、质量判定、死区过滤 | 质量不可用时不参与死区比较 | 92.7% |
@@ -636,7 +657,7 @@ obs  ← 所有包（不依赖任何内部包）
 | `internal/mqtt` | MQTT 3.1.1 客户端（北向发布 + 南向订阅共用，纯 Go 零依赖） | 单 goroutine 读 socket；QoS1 必须等到 PUBACK；`Ping` 必须等到 PINGRESP（写成功不算活着）；断线立即失败而非超时 | 70.3% |
 | `internal/mqtt/mqtttest` | 测试封装：`internal/sim/mqtt` 的 `*testing.T` 生命周期 + 等待断言 | 不另写 Broker（两份实现必然长歪）；开关一律走 setup 函数而非直接赋字段 | — |
 | `internal/runtime` | 唯一编排层 + 后端实现 + 看门狗 + 审计埋点 + 窗口缓存 | 启动/关闭顺序（失败逆序收口）；`configuredState` 与 `runtimeState` 分离；协议/传输匹配在装配期校验；只向驱动与报警引擎注入只读 `cache.Get` 与窗口数据源；北向 OPC UA 启停与热重建；凭据表热替换后旧用户立即失效 | 81.3% |
-| `cmd/uic` | 单入口：run / sim / mbread / mcread / uaread / s7blocks / s7upload / instantiate / import / token / check / version | 关闭预算 10 秒；`uaread`、`mbread`、`mcread` 是不装第三方客户端即可自证链路的自检工具；块服务放在 CLI 而不是北向 API（动作重、数据大、归操作系统账号管）；模板实例化与点表导入只产出文件，不在运行期动态生成设备 | — |
+| `cmd/uic` | 单入口：run / sim / mbread / mcread / finsread / uaread / s7blocks / s7upload / instantiate / import / token / check / version | 关闭预算 10 秒；`uaread`、`mbread`、`mcread`、`finsread` 是不装第三方客户端即可自证链路的自检工具；块服务放在 CLI 而不是北向 API（动作重、数据大、归操作系统账号管）；模板实例化与点表导入只产出文件，不在运行期动态生成设备 | — |
 
 ### 9.2 测试与验证命令
 
@@ -648,7 +669,7 @@ go test -race -count=1 ./...                    # 竞态 + 全量测试
 go test -coverprofile=c.out ./... && go tool cover -func=c.out | tail -1
 ```
 
-当前状态：`go build` / `go vet` / `gofmt` 全部干净，`go test -race ./...` 41 个测试包全部通过
+当前状态：`go build` / `go vet` / `gofmt` 全部干净，`go test -race ./...` 44 个测试包全部通过
 （仅 `internal/mqtt/mqtttest` 是纯测试辅助包，没有自己的测试文件）。
 
 ### 9.3 源码阅读建议顺序
@@ -676,6 +697,7 @@ go test -coverprofile=c.out ./... && go tool cover -func=c.out | tail -1
 20. internal/template/template.go 字符串字面量替换与「不做算术」的边界（30 分钟）
 21. internal/pointtable/address.go + csv.go 协议感知的地址解析与行错误聚合（40 分钟）
 22. internal/codec/mc + driver/mc + sim/mc 三菱 MC 3E 三层：帧、RMW 位写、内置从站（60 分钟）
+23. internal/codec/fins + driver/fins + sim/fins 欧姆龙 FINS 三层：套娃封装、节点协商、一位一字节（70 分钟）
 ```
 
 ---
@@ -747,6 +769,7 @@ OPC UA 服务端（同一份点位表的另一个出口）：
 | 设备模板库 / 实例化 | ✅ | `internal/template` + `uic instantiate` + `examples/templates/` 11 份模板；只做整值替换（无算术），实例化结果必须通过完整校验；模板库测试逐份实例化并跑 `model.Device.Validate` |
 | 点表 CSV 导入 | ✅ | `internal/pointtable` + `uic import`；列别名、协议感知的地址解析与长度推导、行错误聚合、new/unchanged/replaced/conflict 合并；默认拒绝静默覆盖 |
 | 三菱 MC 3E 主站 + 内置从站 | ✅ | `internal/codec/mc` + `internal/driver/mc` + `internal/sim/mc` + `uic mcread` + `examples/mc.json`；只做 3E 二进制帧 + TCP；位软元件按位打包、X/Y 按十六进制、字软元件 bool 走 RMW 不清零邻位；结束码 0xC052/53/54/56→address_error；主站/从站/编解码三层测试 |
+| 欧姆龙 FINS 主站 + 内置从站 | ✅ | `internal/codec/fins` + `internal/driver/fins` + `internal/sim/fins` + `uic finsread` + `examples/fins.json`；只做 FINS/TCP（FINS/UDP 与 Host Link 配置期即拒）；三层封装（FINS/TCP 头 / 10 字节 FINS 帧头 / 命令）各自独立；建链先做节点号协商，`unitId>0` 覆盖目标节点；读写 MRC 同为 0x01、靠 SRC 区分；`offset` 是字地址、`bit` 是字内位号；位访问一位一字节，32 位低字在前（CDAB）、64 位 DCBA；当前 EM 区无位码，bool 走 RMW；结束码 0x11xx→address_error、0x02xx/0x03xx→comm_error；每帧校验 SID；三层测试含真实 TCP 回环 |
 | Modbus TCP 从站 | ✅ | `slaves[]` 存在即启用；四区（holding/input/coil/discrete）映射；跨映射与半值读；写穿透到 `Runtime.Write`；坏质量保留最后值并计入 `uic_slave_degraded_reads_total`；映射变化按指纹重建监听；`uic mbread` 可自检 |
 | Modbus RTU/ASCII 从站 | ✅ | `serial.port` + `serial.framing`（rtu/ascii）；RTU 按功能码推导帧长、推不出来时读到 3.5 字符静默（下限 5ms 对抗 USB 转发延迟）；ASCII 以 `:` 起始、CRLF 结束；非本机单元号静默、广播只写不回、CRC/LRC 错后 `tcflush` 重同步、半帧丢弃；USB 适配器掉线按 1s→2s→…→30s 退避重开；端口与主站通道及其他从站按字面路径互斥（配置期拒绝） |
 | Modbus 诊断与识别（FC8/FC11/FC17/FC43） | ✅ | FC8 子功能 0x0000 回显、0x000A 清计数、0x000B~0x0012 各类计数（TCP 上 CRC/字符层错误恒为 0）；FC11 事件计数器（自身不计数、异常不计数）；FC17 产品代码 + 运行指示 0xFF；FC43/MEI 0x0E 读设备标识（basic/regular/extended 与按对象 id 读取，响应超 253 字节时按 `more`/`nextObjectID` 分页）；身份标识由 `slave.identity` 配置，缺省也保证 basic 三件套非空；版本号取构建信息 |

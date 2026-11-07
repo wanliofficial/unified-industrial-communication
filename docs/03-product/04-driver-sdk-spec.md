@@ -1123,6 +1123,204 @@ SLMP 的 UDP 形态一律不支持，配置期就拒绝。
 `./uic -config examples/mc.json` 起网关，`curl :8087/api/v1/points` 应看到 d0=1234、
 d1=5678、d2=48.0、run=true、fault=false。`uic mcread` 不依赖网关即可单独读写 PLC。
 
+### 3.10.6 欧姆龙 FINS（FINS/TCP，端口 9600）
+
+FINS（Factory Interface Network Service）是欧姆龙的现场网络协议族。本驱动只实现
+**FINS/TCP**（以太网单元，端口 9600），覆盖 CIO/WR/HR/AR/DM/EM 内存区的字/位读写；
+**FINS/UDP、Host Link（串口）、FINS 的板卡/网络路由形态一律不支持**，配置期就拒绝
+（`transport.kind` 必须是 `tcp`）。
+
+只做内存区读写（`0101`/`0102`）是刻意划的边界：PLC 运行模式切换、时钟读写、强制
+置位/复位、文件读写都不放进采集驱动。它们不是「读点位」的一部分，而误用的代价
+（停机、写坏程序区）远高于收益。需要这些操作的现场用厂商工具。
+
+#### 3.10.6.1 三层封装，缺一不可
+
+FINS 的帧是「套娃」结构，三层各自有独立的长度/命令/错误语义：
+
+```
+┌─ FINS/TCP 头（16 字节）─────────────────────────────┐
+│ "FINS" | 长度(4, 大端) | 命令(4) | 错误码(4)          │
+├─ FINS 帧头（10 字节）───────────────────────────────┤
+│ ICF RSV GCT DNA DA1 DA2 SNA SA1 SA2 SID             │
+├─ FINS 命令（2 字节 + 参数/数据）────────────────────┤
+│ MRC SRC | 参数区 [| 写数据]                          │
+└─────────────────────────────────────────────────────┘
+```
+
+| 层 | 长度语义 | 易错点 |
+|---|---|---|
+| FINS/TCP | **不含 magic 与长度字段自身**：`命令+错误码+负载` | 按「整包长度」填会让对端多等 8 字节，表现为首次读写超时；反过来少填则会吞掉下一帧的头，第二帧才错位 |
+| FINS 帧 | 由外层长度隐式给出，帧内无长度字段 | 只能靠外层长度切帧；没有「读到 0 就结束」这种约定 |
+| 结束码 | 响应在 `MRC SRC` 之后跟 2 字节结束码 | 请求里没有这两个字节；`Data` 必须从第 14 字节起算 |
+
+FINS/TCP 的三个命令：
+
+| 命令 | 方向 | 长度字段 | 负载 |
+|---|---|---|---|
+| `0` 节点号请求 | 客户端 → PLC | `12` | 客户端节点号(4)，0 = 请 PLC 分配 |
+| `1` 节点号响应 | PLC → 客户端 | `16` | 客户端节点(4) + 服务端节点(4) |
+| `2` FINS 帧 | 双向 | `8 + len(FINS 帧)` | 完整 FINS 帧 |
+
+握手失败/节点冲突时 PLC 回**只有 8 字节长度**的命令 1（无节点号），错误码放在第
+12..15 字节；错误码 `0x24` 表示「客户端节点号与服务端相同」。驱动与内置从站都按
+这个最短形态构造/解析，避免把错误响应当成正常响应去读节点号。
+
+#### 3.10.6.2 节点号协商（握手）
+
+真实 PLC 的每一帧都要填「目标节点」和「源节点」，而这两个值只能从握手拿到：
+
+1. 客户端发命令 0，`clientNode=0`（自动分配）；
+2. PLC 回命令 1，负载第 4 字节是分配给我的节点号，第 8 字节是它自己的节点号；
+3. 之后每一帧：`DA1 = PLC 节点`，`SA1 = 本机节点`。
+
+驱动的默认行为是「目标 = 握手返回的 PLC 节点」，`device.unitId > 0` 时覆盖它
+（同一台 PLC 上的多块 CPU / 跨网段时用）。`unitId` 上限 254：0 是「未指定」，
+255 是广播，都不是合法的单播目标。
+
+节点号协商失败的分类是**可重试的连接错**而不是协议错：端口刚起来、PLC 还在初始化、
+同一 IP 上一个进程刚断开但节点未释放，都会得到 `0x20`（连接数满）/`0x21`（节点已被
+占用）。把它们当协议错会让设备永久停在 `failed`，必须靠人工介入。
+
+#### 3.10.6.3 地址语义：`offset` 是字地址，`bit` 是字内位号
+
+这是与三菱 MC 最大的差异。MC 的位软元件有独立编号空间（`M0`、`X1F`），FINS 的位是
+**字地址 + 位号**：`CIO 0.3` 表示「CIO 第 0 个字的第 3 位」。因此配置里：
+
+```json
+{ "id": "run",   "address": { "kind": "register", "area": "cio", "offset": 0, "bit": 0 }, "dataType": "bool" }
+{ "id": "dm100", "address": { "kind": "register", "area": "dm",  "offset": 100, "length": 1, "bit": -1 }, "dataType": "uint16" }
+```
+
+| 规则 | 违反时的行为 |
+|---|---|
+| `address.offset` 必填，范围 0..65535，表示**字**地址 | 超出范围在构造帧时判 `address_error` |
+| 位点位必须给 `address.bit`（0..15，0 = LSB） | 该区支持位访问时报地址错；只有字访问码的区退化为 RMW（见下） |
+| 字点位用 `address.bit = -1` 表示「整字」 | 与模型层的其余寄存器协议一致 |
+| `length` 表示**字数**，不是字节数 | 多字类型（int32/float32/float64）按类型宽度推导，字符串/字节必须显式给 |
+
+**位访问与字访问用不同的内存区码**，这是第二个易错点：
+
+| 区 | 字访问码 | 位访问码 | 说明 |
+|---|---|---|---|
+| CIO | `0xB0` | `0x30` | 继电器区，最常用于状态位 |
+| WR | `0xB1` | `0x31` | 工作区 |
+| HR | `0xB2` | `0x32` | 保持继电器 |
+| AR | `0xB3` | `0x33` | 辅助继电器 |
+| DM | `0x82` | `0x02` | 数据存储器，最常用于参数与配方 |
+| EM（当前区） | `0x98` | — | 只有字访问码（见下） |
+| EM bank 0..12 | `0xA0..0xAC` | `0x20..0x2C` | 扩展存储器 |
+
+配置里的区名接受 `d`/`w`/`h`/`a` 简写（映射到 `dm`/`wr`/`hr`/`ar`），大小写不敏感；
+`Areas()` 返回固定顺序供表单与文档使用，`ByWordCode`/`ByBitCode`/`BitToWordCode`
+供内置从站反查。主站与从站共用同一张表，避免两边对同一个区名的理解漂移。
+
+**当前 EM 区的位访问码是刻意留空的**：不同机型/手册对 `0x98` 对应的位访问码表述
+不一（有的写 `0x18`，有的要求先切 bank），猜错会读到别的区的数据——这比报错危险
+得多。因此 `em` 上的 bool 走「读整字 → 只改目标位 → 写整字」的 RMW；要按位直接
+访问就用带 bank 的区名（`em0`..`em12`）。
+
+#### 3.10.6.4 命令参数与数据宽度
+
+读与写的**命令码都是 `MRC=0x01`，靠 `SRC` 区分动作**（`0x01` 读 / `0x02` 写）：
+看起来像「主命令相同、子命令不同」，但和 MC 的「子命令表示字/位」正好相反——这里
+字/位由**区码**决定，子命令表示读写。写错会让 PLC 把读当写执行。
+
+参数区统一 6 字节：
+
+```
+区码(1) | 起始字地址(2, 大端) | 位号(1) | 点数(2, 大端) [| 写数据]
+```
+
+| 访问方式 | 点数单位 | 写数据宽度 | 读响应宽度 |
+|---|---|---|---|
+| 字访问 | 字 | `点数 × 2` 字节，字内大端 | `点数 × 2` 字节 |
+| 位访问 | 位 | `点数 × 1` 字节，每字节 0/1 | `点数 × 1` 字节，每字节 0/1 |
+
+位访问「一位一字节」是三菱（按位打包）与 S7（按位在字节内）之外的第三种约定，
+必须按协议实现，不能想当然地复用前面的打包函数。
+
+上限：字访问 `≤ 999` 字，位访问 `≤ 1998` 位（`MaxWords`/`MaxBits`），
+整帧负载 `≤ 2012` 字节（`MaxPayload`）。驱动按更保守的块切分：字读 `480 字/块`、
+位读 `120 字（=1920 位）/块`，并把跨度覆盖到的整段一起读，避免同一次采集里对
+同一段地址发多条请求。
+
+#### 3.10.6.5 字序：低字在前
+
+FINS 的多字数值是「每个字大端、**低字在前**」：
+
+| 类型 | 线上字节 | 解码用的 `byteOrder` |
+|---|---|---|
+| `uint16`/`int16` | 1 字，大端 | 无关 |
+| `uint32`/`int32`/`float32` | 低字在前（`0x0000 0x4240` = 48.0） | `CDAB`（默认） |
+| `float64`/`int64` | 整体按字倒序 | `DCBA`（默认） |
+
+用户显式配置 `byteOrder` 时以配置为准（有些设备做了字交换）。字符串/字节不做字内
+交换：`"AB"` 在 DM 里就是 `0x4142`，按地址宽度补零或截断。
+
+#### 3.10.6.6 结束码与质量映射
+
+响应在 `MRC SRC` 后跟 2 字节结束码，`0x0000` 才是成功：
+
+| 结束码 | 含义 | 映射质量 |
+|---|---|---|
+| `0x1101` | 区类型不匹配（区码不认识） | `address_error` |
+| `0x1102` | 地址范围超限（点数过多） | `address_error` |
+| `0x1103` | 地址越界 | `address_error` |
+| `0x1104` | 地址写保护 | `address_error` |
+| `0x0201`..`0x0205` | 本节点不在网 / 令牌超时 / 重试超限 / 路由表错 | `comm_error` |
+| `0x0301`/`0x0302` | 目标节点不在网 / 单元缺失 | `comm_error` |
+| `0x1001`/`0x1002` | 命令过长 / 过短 | `bad`（协议错） |
+| `0x0401` | 未定义命令 | `bad`（协议错） |
+| 其余 | 厂商扩展 | `bad` |
+
+TCP 封装层错误码（`0x01` 非 FINS 头、`0x02` 长度过长、`0x03` 不支持的命令、
+`0x20` 连接数满、`0x21` 节点已占用……）一律映射 `comm_error`，且**可重试**。
+
+此外驱动会校验响应帧的 `SID` 与发送时一致：`SID` 不匹配说明收到的不是本次事务的
+应答（异步/串包/旧连接残留），必须判协议错，绝不能把上一帧的数据当成本帧结果。
+
+#### 3.10.6.7 位置与自检
+
+| 内容 | 路径 |
+|---|---|
+| 编解码 | `internal/codec/fins`（`Build`/`BuildCommand`/`Parse`/`BuildMemoryRead`/`BuildMemoryWrite`/`Lookup`/`EndCodeError`） |
+| 主站驱动 | `internal/driver/fins`（`Meta`/`Open`/`Read`/`Write`/`Probe`，内部 `framing` 负责封装与 SID） |
+| 内置从站 | `internal/sim/fins`（`NewServer`/`SetWord`/`SetBit`/`GetWord`） |
+| CLI | `uic finsread -addr 127.0.0.1:9600 -area dm -offset 0 -qty 2` |
+| 示例 | `examples/fins.json`（DM0/DM1 整数、DM2 float32 CDAB、CIO0.0/0.1 位、DM10 自增计数器） |
+
+内置从站的位/字视图**共用一张字内存表**：写 `CIO0.1` 后读 `CIO0` 字能看到第 1 位
+变化，读 `CIO11` 字也不会被 `CIO10` 的位写污染。内存模型是「未配置地址读 0、写落表」，
+与真实 PLC 读未定义寄存器得 0 的行为一致；越界返回 `0x1103`。
+
+自检链路（无硬件）：
+
+```
+./uic sim -protocol fins -listen 127.0.0.1:9600 &
+./uic -config examples/fins.json &
+curl -H 'Authorization: Bearer dev-token-0123456789' \
+     http://127.0.0.1:8088/api/v1/points
+# dm0=1234  dm1=5678  temp=48  run=true  fault=false  counter=每秒自增
+```
+
+`uic finsread` 不依赖网关即可单独验证「能连上」和「能读到数」两件事：
+
+```
+./uic finsread -addr 127.0.0.1:9600 -area dm -offset 0 -qty 4      # 字读
+./uic finsread -addr 127.0.0.1:9600 -area cio -offset 0 -bit 0     # 位读
+./uic finsread -addr 127.0.0.1:9600 -area cio -offset 0 -bit 1 -write on   # 位写
+./uic finsread -addr 127.0.0.1:9600 -area dm -offset 20 -write 4660        # 字写
+```
+
+测试矩阵（当前覆盖）：
+
+| 层 | 用例 |
+|---|---|
+| `codec/fins` | 节点请求/响应金帧、字/位读命令金帧、响应解析、结束码分类、区表与码反查、位=0 的写、TCP 封装、边界与上限 |
+| `driver/fins` | 握手、字读、float32 低字在前、位读、位写、`em` RMW、结束码→质量、SID 不匹配、非 TCP 拒绝、能力声明 |
+| `sim/fins` | 真实 TCP 回环：字读写、float32、位读写共享字内存、字/位混合 span、字符串、越界地址、`unitId` 覆盖 |
+
 ### 3.11 计算点（`computed`）
 
 这是全项目**唯一没有物理链路**的驱动：点位不从任何设备读取，而是由其他点位的值
@@ -1409,6 +1607,7 @@ type OpError struct {
 | `modbus-ascii` | supported | supported | unsupported | unsupported | unsupported | supported | supported |
 | `s7` | supported | supported | unsupported | unsupported | unsupported | supported | supported |
 | `mc`（MC 3E） | supported | supported | unsupported | unsupported | unsupported | supported | supported |
+| `fins`（FINS/TCP） | supported | supported | unsupported | unsupported | unsupported | supported | supported |
 | `opcua` | supported | supported | supported ⁴ | unsupported | experimental | supported | unsupported |
 | `mqtt`（南向订阅） | supported | supported | supported ¹ | unsupported | unsupported | supported ² | unsupported |
 | `computed`（计算点） | supported | unsupported ³ | unsupported | unsupported | unsupported | supported | unsupported |
