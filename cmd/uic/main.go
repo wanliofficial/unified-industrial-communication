@@ -1,4 +1,4 @@
-// Command uic 是单一可执行入口：run（默认）/ sim / mbread / mcread / uaread / s7blocks / s7upload / instantiate / import / token / version。
+// Command uic 是单一可执行入口：run（默认）/ sim / mbread / mcread / finsread / uaread / s7blocks / s7upload / instantiate / import / token / version。
 //
 //	uic -config config.json            # 前台运行
 //	uic run -config config.json        # 同上
@@ -10,6 +10,7 @@
 //	uic mbread -addr 127.0.0.1:1502    # 不依赖第三方工具的从站读写自检（TCP）
 //	uic mbread -transport rtu -port /dev/ttyUSB0 -unit 1   # 串口从站自检
 //	uic mcread -addr 127.0.0.1:5000 -area d -offset 100 -qty 2   # MC 3E 自检
+//	uic finsread -addr 127.0.0.1:9600 -area dm -offset 100 -qty 2 # 欧姆龙 FINS 自检
 //	uic uaread -addr 127.0.0.1:4840 -nodes ns=2;s=site/dev/point  # OPC UA 读写自检
 //	uic s7blocks -addr 127.0.0.1:15102   # S7 块目录（-type db / -num 1 可细看）
 //	uic s7upload -addr 127.0.0.1:15102 -type db -num 1 -out db1.bin  # 块上传备份
@@ -45,6 +46,7 @@ import (
 	"uic/internal/model"
 	"uic/internal/opcuaserver"
 	uicruntime "uic/internal/runtime"
+	finsim "uic/internal/sim/fins"
 	mcsim "uic/internal/sim/mc"
 	sim "uic/internal/sim/modbus"
 	simmqtt "uic/internal/sim/mqtt"
@@ -71,6 +73,8 @@ func main() {
 		simCmd(args)
 	case "mcread":
 		mcreadCmd(args)
+	case "finsread":
+		finsreadCmd(args)
 	case "uaread":
 		uareadCmd(args)
 	case "s7blocks":
@@ -100,11 +104,13 @@ func usage() {
 用法:
   uic [run] -config config.json [-listen :8080] [-token TOKEN]
   uic -check -config config.json
-  uic sim [-listen 127.0.0.1:15020] [-protocol modbus|s7|opcua|mqtt]
+  uic sim [-listen 127.0.0.1:15020] [-protocol modbus|s7|opcua|mqtt|mc|fins]
   uic mbread -addr 127.0.0.1:1502 -unit 1 -area holding -offset 0 -qty 2
   uic mbread -addr 127.0.0.1:1502 -area holding -offset 5 -write 777
   uic mcread -addr 127.0.0.1:5000 -area d -offset 100 -qty 2
   uic mcread -addr 127.0.0.1:5000 -area m -offset 0 -qty 16 -write on
+  uic finsread -addr 127.0.0.1:9600 -area dm -offset 100 -qty 2
+  uic finsread -addr 127.0.0.1:9600 -area cio -offset 10 -bit 3 -write on
   uic mbread -transport rtu|ascii -port /dev/ttyUSB0 [-baud 19200] [-parity even]
   uic uaread -addr 127.0.0.1:4840 -nodes ns=2;s=site/dev/point [-type float64]
   uic uaread -addr 127.0.0.1:4840 -nodes ns=2;s=site/dev/setpoint -write 42.5
@@ -410,7 +416,7 @@ func simCmd(args []string) {
 	fs := flag.NewFlagSet("sim", flag.ExitOnError)
 	addr := fs.String("listen", "127.0.0.1:15020", "监听地址")
 	size := fs.Int("size", 1024, "寄存器数量")
-	proto := fs.String("protocol", "modbus", "从站协议：modbus | s7 | opcua | mqtt | mc")
+	proto := fs.String("protocol", "modbus", "从站协议：modbus | s7 | opcua | mqtt | mc | fins")
 	pdu := fs.Int("pdu", 480, "S7 协商 PDU 长度（240/480/960）")
 	fs.Parse(args)
 
@@ -427,9 +433,12 @@ func simCmd(args []string) {
 	case "mc":
 		simMC(*addr)
 		return
+	case "fins":
+		simFINS(*addr)
+		return
 	case "modbus":
 	default:
-		fmt.Fprintf(os.Stderr, "未知协议 %q（支持 modbus | s7 | opcua | mqtt | mc）\n", *proto)
+		fmt.Fprintf(os.Stderr, "未知协议 %q（支持 modbus | s7 | opcua | mqtt | mc | fins）\n", *proto)
 		os.Exit(2)
 	}
 
@@ -507,6 +516,50 @@ func simMC(addr string) {
 			case <-t.C:
 				n++
 				srv.SetWord("d", 10, n)
+			}
+		}
+	}()
+
+	<-ctx.Done()
+	_ = srv.Close()
+	slog.Info("sim_stopped")
+}
+
+// simFINS 启动内置 FINS/TCP 从站。初始值与 examples/fins.json 对应，
+// 便于 `./uic sim -protocol fins -listen 127.0.0.1:9600 &` 之后直接跑
+// `./uic -config examples/fins.json` 观察链路。
+func simFINS(addr string) {
+	srv, err := finsim.NewServer(addr)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "启动 FINS 从站失败: %v\n", err)
+		os.Exit(1)
+	}
+	srv.SetWord("dm", 0, 1234)
+	srv.SetWord("dm", 1, 5678)
+	// float32 48.0 = 0x42400000；FINS 低字在前：DM2=0x0000，DM3=0x4240。
+	srv.SetWord("dm", 2, 0x0000)
+	srv.SetWord("dm", 3, 0x4240)
+	srv.SetBit("cio", 0, 0, true)
+
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	fmt.Printf("fins/tcp slave listening on %s\n", srv.Addr())
+	fmt.Println("  DM0=1234  DM1=5678  DM2..3=float32(48.0, low word first)  CIO0.0=true")
+	fmt.Println("  DM10 每秒自增，可用于观察 SSE")
+	fmt.Println("  Ctrl+C 停止")
+
+	go func() {
+		t := time.NewTicker(time.Second)
+		defer t.Stop()
+		var n uint16
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				n++
+				srv.SetWord("dm", 10, n)
 			}
 		}
 	}()
