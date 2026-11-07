@@ -1,4 +1,4 @@
-// Command uic 是单一可执行入口：run（默认）/ sim / mbread / uaread / s7blocks / s7upload / token / version。
+// Command uic 是单一可执行入口：run（默认）/ sim / mbread / uaread / s7blocks / s7upload / instantiate / import / token / version。
 //
 //	uic -config config.json            # 前台运行
 //	uic run -config config.json        # 同上
@@ -75,6 +75,10 @@ func main() {
 		s7blocksCmd(args)
 	case "s7upload":
 		s7uploadCmd(args)
+	case "instantiate":
+		instantiateCmd(args)
+	case "import":
+		importCmd(args)
 	case "token":
 		tokenCmd(args)
 	case "version", "-v", "--version":
@@ -102,6 +106,9 @@ func usage() {
   uic uaread -addr 127.0.0.1:4840 -nodes ns=2;s=site/dev/setpoint -write 42.5
   uic s7blocks -addr 127.0.0.1:15102 [-type db [-num 1]] [-json]
   uic s7upload -addr 127.0.0.1:15102 -type db -num 1 [-out db1.bin|-]
+  uic instantiate -template meter.json -param index=1 -channel ch-meter [-out meter-1.json]
+  uic import -csv points.csv -device press -channel ch-modbus -protocol modbus-tcp
+  uic import -csv points.csv -device press -config config.json -out config.new.json [-dry-run]
   uic token [-name ops] [-role viewer|operator|admin] [-count N] [-json]
   uic version
 
