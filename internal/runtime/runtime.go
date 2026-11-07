@@ -38,6 +38,7 @@ import (
 	"uic/internal/driver/computed"
 	enipdrv "uic/internal/driver/enip"
 	finsdrv "uic/internal/driver/fins"
+	"uic/internal/driver/iec104"
 	mcdrv "uic/internal/driver/mc"
 	"uic/internal/driver/modbus"
 	mqttdriver "uic/internal/driver/mqtt"
@@ -141,6 +142,7 @@ func RegisterBuiltins() error {
 			finsdrv.New(),
 			enipdrv.New(),
 			bacnetdrv.New(),
+			iec104.New(),
 		} {
 			if err := driver.Register(d); err != nil {
 				registerErr = err

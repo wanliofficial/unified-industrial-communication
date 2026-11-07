@@ -1,4 +1,4 @@
-// Command uic 是单一可执行入口：run（默认）/ sim / mbread / mcread / finsread / enipread / bacread / uaread / s7blocks / s7upload / instantiate / import / token / version。
+// Command uic 是单一可执行入口：run（默认）/ sim / mbread / mcread / finsread / enipread / bacread / iec104read / uaread / s7blocks / s7upload / instantiate / import / token / version。
 //
 //	uic -config config.json            # 前台运行
 //	uic run -config config.json        # 同上
@@ -13,6 +13,7 @@
 //	uic finsread -addr 127.0.0.1:9600 -area dm -offset 100 -qty 2 # 欧姆龙 FINS 自检
 //	uic enipread -addr 127.0.0.1:44818 -tag DINT_TAG  # EtherNet/IP CIP 自检
 //	uic bacread -addr 127.0.0.1:47808 -type analog-input -instance 1  # BACnet/IP 自检
+//	uic iec104read -addr 127.0.0.1:2404 -ca 1   # IEC 60870-5-104 自检（总召唤 + 上送对象）
 //	uic uaread -addr 127.0.0.1:4840 -nodes ns=2;s=site/dev/point  # OPC UA 读写自检
 //	uic s7blocks -addr 127.0.0.1:15102   # S7 块目录（-type db / -num 1 可细看）
 //	uic s7upload -addr 127.0.0.1:15102 -type db -num 1 -out db1.bin  # 块上传备份
@@ -51,6 +52,7 @@ import (
 	bacnetsim "uic/internal/sim/bacnet"
 	enipsim "uic/internal/sim/enip"
 	finsim "uic/internal/sim/fins"
+	iec104sim "uic/internal/sim/iec104"
 	mcsim "uic/internal/sim/mc"
 	sim "uic/internal/sim/modbus"
 	simmqtt "uic/internal/sim/mqtt"
@@ -83,6 +85,8 @@ func main() {
 		enipreadCmd(args)
 	case "bacread":
 		bacreadCmd(args)
+	case "iec104read":
+		iec104readCmd(args)
 	case "uaread":
 		uareadCmd(args)
 	case "s7blocks":
@@ -112,7 +116,7 @@ func usage() {
 用法:
   uic [run] -config config.json [-listen :8080] [-token TOKEN]
   uic -check -config config.json
-  uic sim [-listen 127.0.0.1:15020] [-protocol modbus|s7|opcua|mqtt|mc|fins|enip|bacnet]
+  uic sim [-listen 127.0.0.1:15020] [-protocol modbus|s7|opcua|mqtt|mc|fins|enip|bacnet|iec104]
   uic mbread -addr 127.0.0.1:1502 -unit 1 -area holding -offset 0 -qty 2
   uic mbread -addr 127.0.0.1:1502 -area holding -offset 5 -write 777
   uic mcread -addr 127.0.0.1:5000 -area d -offset 100 -qty 2
@@ -123,6 +127,8 @@ func usage() {
   uic enipread -addr 127.0.0.1:44818 -tag BOOL_TAG -type bool -write on
   uic bacread -addr 127.0.0.1:47808 -type analog-input -instance 1
   uic bacread -addr 127.0.0.1:47808 -type analog-value -instance 2 -write 55.5
+  uic iec104read -addr 127.0.0.1:2404 -ca 1 [-ioa 1001,1002] [-json]
+  uic iec104read -addr 127.0.0.1:2404 -area single-command -cmd-ioa 4001 -write on
   uic mbread -transport rtu|ascii -port /dev/ttyUSB0 [-baud 19200] [-parity even]
   uic uaread -addr 127.0.0.1:4840 -nodes ns=2;s=site/dev/point [-type float64]
   uic uaread -addr 127.0.0.1:4840 -nodes ns=2;s=site/dev/setpoint -write 42.5
@@ -428,7 +434,7 @@ func simCmd(args []string) {
 	fs := flag.NewFlagSet("sim", flag.ExitOnError)
 	addr := fs.String("listen", "127.0.0.1:15020", "监听地址")
 	size := fs.Int("size", 1024, "寄存器数量")
-	proto := fs.String("protocol", "modbus", "从站协议：modbus | s7 | opcua | mqtt | mc | fins | enip | bacnet")
+	proto := fs.String("protocol", "modbus", "从站协议：modbus | s7 | opcua | mqtt | mc | fins | enip | bacnet | iec104")
 	pdu := fs.Int("pdu", 480, "S7 协商 PDU 长度（240/480/960）")
 	fs.Parse(args)
 
@@ -454,9 +460,12 @@ func simCmd(args []string) {
 	case "bacnet":
 		simBACnet(*addr)
 		return
+	case "iec104":
+		simIEC104(*addr)
+		return
 	case "modbus":
 	default:
-		fmt.Fprintf(os.Stderr, "未知协议 %q（支持 modbus | s7 | opcua | mqtt | mc | fins | enip | bacnet）\n", *proto)
+		fmt.Fprintf(os.Stderr, "未知协议 %q（支持 modbus | s7 | opcua | mqtt | mc | fins | enip | bacnet | iec104）\n", *proto)
 		os.Exit(2)
 	}
 
@@ -790,6 +799,33 @@ func simENIP(addr string) {
 	fmt.Println("  DINT_TAG=1234  INT_TAG=5678  REAL_TAG=48.0  BOOL_TAG=true")
 	fmt.Println("  STRING_TAG=\"PUMP-01\"  DINT_ARRAY=[10,20,30,40]")
 	fmt.Println("  COUNTER 每秒自增，可用于观察 SSE")
+	fmt.Println("  Ctrl+C 停止")
+
+	<-ctx.Done()
+	_ = srv.Close()
+	slog.Info("sim_stopped")
+}
+
+// simIEC104 启动内置 IEC 60870-5-104（TCP）从站。
+//
+// 默认对象表覆盖了监视方向的主要类型（短浮点、标度化、单点、双点、累计量、
+// 带时标）与控制方向的三种命令（单点、短浮点、标度化），初始值与
+// examples/iec104.json 一一对应，便于「起从站 → 跑网关 → 看点位」。
+func simIEC104(addr string) {
+	srv, err := iec104sim.NewServer(addr)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "启动 IEC 104 从站失败: %v\n", err)
+		os.Exit(1)
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	fmt.Printf("iec 60870-5-104 slave listening on %s (CA=1)\n", srv.Addr())
+	fmt.Println("  监视方向：1001=42.5  1002=7.25  1003=1234(标度化)  1004=0.5(取代)")
+	fmt.Println("            1005=-3.5(带时标)  2001=on  2002=off  2003=double 2(可遥控)")
+	fmt.Println("            2004=double 1  3001=1000(累计量，每秒自增)")
+	fmt.Println("  控制方向：4001=单点  4002=短浮点设定值  4003=标度化设定值（可写）")
 	fmt.Println("  Ctrl+C 停止")
 
 	<-ctx.Done()
