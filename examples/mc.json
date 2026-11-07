@@ -1,0 +1,87 @@
+{
+  "schemaVersion": 1,
+  "site": "mc-lab",
+  "server": {
+    "listen": "127.0.0.1:8087",
+    "token": "dev-token-0123456789"
+  },
+  "storage": {
+    "dir": "./data-mc",
+    "journal": true,
+    "outboxMaxRecords": 5000,
+    "outboxTtl": "10m"
+  },
+  "logging": {
+    "level": "info"
+  },
+  "northbound": {
+    "webhook": {
+      "enabled": false,
+      "url": "http://127.0.0.1:9999/ingest",
+      "timeout": "3s"
+    }
+  },
+  "channels": [
+    {
+      "id": "ch-mc",
+      "protocol": "mc",
+      "transport": {
+        "kind": "tcp",
+        "address": "127.0.0.1:5000"
+      },
+      "concurrency": 1,
+      "timeout": "2s"
+    }
+  ],
+  "devices": [
+    {
+      "id": "plc01",
+      "name": "一号 PLC（MC 3E，TCP 5000）",
+      "channel": "ch-mc",
+      "interval": "1s",
+      "timeout": "2s",
+      "enabled": true,
+      "points": [
+        {
+          "id": "d0",
+          "name": "D0 字（uint16）",
+          "address": { "kind": "register", "area": "d", "offset": 0, "length": 1, "bit": -1 },
+          "dataType": "uint16",
+          "unit": "",
+          "enabled": true
+        },
+        {
+          "id": "d1",
+          "name": "D1 字（int16）",
+          "address": { "kind": "register", "area": "d", "offset": 1, "length": 1, "bit": -1 },
+          "dataType": "int16",
+          "enabled": true
+        },
+        {
+          "id": "d2",
+          "name": "D2 字（float32，CDAB）",
+          "address": { "kind": "register", "area": "d", "offset": 2, "length": 2, "bit": -1 },
+          "dataType": "float32",
+          "byteOrder": "CDAB",
+          "unit": "degC",
+          "enabled": true
+        },
+        {
+          "id": "run",
+          "name": "运行标志（M0）",
+          "address": { "kind": "register", "area": "m", "offset": 0, "length": 1, "bit": -1 },
+          "dataType": "bool",
+          "enabled": true
+        },
+        {
+          "id": "fault",
+          "name": "故障（M1，可写）",
+          "address": { "kind": "register", "area": "m", "offset": 1, "length": 1, "bit": -1 },
+          "dataType": "bool",
+          "writable": true,
+          "enabled": true
+        }
+      ]
+    }
+  ]
+}
