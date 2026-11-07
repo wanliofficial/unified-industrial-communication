@@ -1076,6 +1076,53 @@ QoS 取 1：控制命令不能是 fire-and-forget。
 等待断言。两份 Broker 会慢慢长成不同行为，最终制造出「客户端测试通过、换真 Broker 失败」
 这类最难查的分歧。
 
+### 3.10.5 三菱 MC（3E 二进制帧，TCP）
+
+三菱的 MC 协议是 PLC 世界与 Modbus/S7 并列的第三极。本驱动只实现 **3E 二进制帧 + TCP**
+（线上端口 5000），覆盖 D/W/R/ZR 等字软元件与 M/X/Y/B/F/L 等位软元件；ASCII 帧、4E 帧、
+SLMP 的 UDP 形态一律不支持，配置期就拒绝。
+
+**帧结构**（请求，所有多字节字段小端）：
+
+```
+50 00 | 网络号(00) | PC号(FF) | 目标模块IO(2) | 目标站号(00) | 数据长度(2) |
+监视定时器(2) | 命令(2) | 子命令(2) | 设备码(1) | 起始设备号(3) | 点数(2) | [数据]
+```
+
+响应把「命令之后」换成「结束代码(2) + 数据」。
+
+| 字段 | 说明 | 易错点 |
+|---|---|---|
+| 子命令 | `0x0000` 字读写 / `0x0001` 位读写 | 位/字用子命令区分，不是用设备码 |
+| 起始设备号 | **3 字节小端** | 不是 4 字节，也不是大端 |
+| 设备码 | `0xA8`=D、`0xB4`=W、`0x90`=M、`0x9C`=X… | 一张固定表，未收录区在配置期报错 |
+| 结束代码 | 非零即错误 | `0xC052/53/54/56` → `address_error`，其余协议错 |
+
+**三个最容易写错的细节**（已固化在 `codec/mc`）：
+
+1. **位软元件按位打包**：首点在第一个字节的 bit0，一点一字节是错的。
+2. **X/Y/B/W 的编号按十六进制理解**：`X1F` 在线上是数值 31，配置里 `offset=31`。
+3. **字软元件上的 bool 点位必须显式给 `address.bit`（0..15）**，驱动做「读整字 → 只改
+   目标位 → 写整字」的 RMW，绝不清零邻位。没有位号的 bool 在字软元件上判地址错。
+
+**字序**：MC 原生是「字内小端、低字在前」。驱动在解码时先把每个字的两个字节对调
+（归一化到「字内大端」），再按用户配置的 `byteOrder` 走 `value.Decode`；默认 `CDAB`。
+字符串/字节类型按地址宽度补零或截断，再按字对调。
+
+**位置**：
+
+| 内容 | 路径 |
+|---|---|
+| 编解码 | `internal/codec/mc`（`BuildRead`/`BuildWrite`/`ParseResponse`/`PackBits`/`ByCode`） |
+| 主站驱动 | `internal/driver/mc`（`Meta`/`Open`/`Read`/`Write`/`Probe`） |
+| 内置从站 | `internal/sim/mc`（`NewServer`/`SetWord`/`SetBit`） |
+| CLI | `uic mcread -addr 127.0.0.1:5000 -area d -offset 100 -qty 2` |
+| 示例 | `examples/mc.json`（D0/D1 整数、D2 float32 CDAB、M0/M1 位） |
+
+自检链路（无硬件）：`./uic sim -protocol mc -listen 127.0.0.1:5000 &` 起内置从站，
+`./uic -config examples/mc.json` 起网关，`curl :8087/api/v1/points` 应看到 d0=1234、
+d1=5678、d2=48.0、run=true、fault=false。`uic mcread` 不依赖网关即可单独读写 PLC。
+
 ### 3.11 计算点（`computed`）
 
 这是全项目**唯一没有物理链路**的驱动：点位不从任何设备读取，而是由其他点位的值
@@ -1361,6 +1408,7 @@ type OpError struct {
 | `modbus-rtu` | supported | supported | unsupported | unsupported | unsupported | supported | supported |
 | `modbus-ascii` | supported | supported | unsupported | unsupported | unsupported | supported | supported |
 | `s7` | supported | supported | unsupported | unsupported | unsupported | supported | supported |
+| `mc`（MC 3E） | supported | supported | unsupported | unsupported | unsupported | supported | supported |
 | `opcua` | supported | supported | supported ⁴ | unsupported | experimental | supported | unsupported |
 | `mqtt`（南向订阅） | supported | supported | supported ¹ | unsupported | unsupported | supported ² | unsupported |
 | `computed`（计算点） | supported | unsupported ³ | unsupported | unsupported | unsupported | supported | unsupported |

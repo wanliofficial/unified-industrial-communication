@@ -63,6 +63,7 @@ Wave 3（6 个月） 规模化：集中管理 + 进程外驱动 + 多站点 + �
 | 28 | S7 块服务（目录 / 属性 / 上传，含 `uic s7blocks`/`s7upload`） | 修正 S7 头长度：ACK/ACK_DATA 为 12 字节（多 error class/code），Job/UserData 为 10 字节；USER_DATA 组 0x03 实现 ListAll（数据区 `0A 00 0000`）、ListBlocksOfType、BlockInfo（78 字节属性，块号 5 位 ASCII）；Job 0x1D/0x1E/0x1F 实现三段式上传，分片以 `param[1]` 判最后一片、块长度取 5 位十进制 ASCII、失败也补 End 释放 PLC 会话；单块上限 16MB/65536 片；`Session` 一次性连接不进调度；内置从站同步支持，`uic s7blocks`/`s7upload` 可无第三方工具自检 |
 | 29 | 设备模板库 + 实例化（含 `uic instantiate`） | 占位符 `{name}` 只替换字符串字面量、**不做算术**；整字面量是占位符时 int/float/bool 落成 JSON 数字/布尔；参数名允许 camelCase；未知字段/参数/占位符、键里的占位符、默认值类型不符一律在模板加载期报错；必填缺失一次列全；实例 `templateId` 记录来源；`examples/templates` 提供 11 份可校验模板，库测试逐份实例化并跑 `model.Device.Validate`；`uic instantiate` 只生成文件，不在运行期动态生成设备 |
 | 30 | 点表 CSV 导入（含 `uic import`） | 列名大小写/空格/下划线不敏感，支持中英文别名，未知列报错；`point/address/type` 必填；行错误带行号列名并聚合（前 8 条 + 其余计数）；重复点位 ID 是错误、重复地址只是警告；`length` 列先于地址解析，字符串/字节类型能只写偏移；协议决定地址种类与宽度（Modbus 寄存器数 / S7 字节数 / 未知协议必须显式 length）；`#selector` 只允许 MQTT；合并动作为 new/unchanged/replaced/conflict，默认拒绝静默覆盖，`-dry-run` 与真写共用同一份结果 |
+| 31 | 三菱 MC 3E 主站 + 内置从站（含 `uic mcread`） | 只做 3E 二进制帧 + TCP（端口 5000），ASCII/4E/UDP 形态配置期即拒；帧头 9 字节、起始设备号 3 字节小端、子命令 0x0000 字/0x0001 位；设备码表 D/W/R/ZR/SD/SW/TN/CN（字）+ M/X/Y/B/F/L/SM/SB/S（位），未收录区报错；位软元件按位打包（首点 bit0），X/Y 编号按十六进制理解（`X1F`→offset 31）；字软元件 bool 必须显式 `address.bit`（0..15），驱动做 RMW 不清零邻位；字序归一化（字内小端→大端）后按 `byteOrder` 解码，默认 CDAB；结束代码 0xC052/53/54/56→`address_error`；`internal/sim/mc` 内置从站 + `examples/mc.json` + `uic mcread` 自检；主站/从站/编解码三层测试 |
 
 ### 2.3 出口标准
 
@@ -132,7 +133,7 @@ curl -N localhost:8080/api/v1/stream?points=virtual-01/sine
 
 | 类别 | 内容 | 对应场景 |
 |---|---|---|
-| 协议 | MC 3E、FINS、EtherNet/IP + CIP、BACnet/IP、IEC 104、DL/T 645、CJ/T 188、ADS、OPC DA 桥接、Sparkplug B、SNMP | 汽车 / 3C / 水务 / 楼宇 |
+| 协议 | MC 3E（已落地）、FINS、EtherNet/IP + CIP、BACnet/IP、IEC 104、DL/T 645、CJ/T 188、ADS、OPC DA 桥接、Sparkplug B、SNMP | 汽车 / 3C / 水务 / 楼宇 |
 | 数据 | 有界采样历史库（NDJSON 分段，已落地）+ 降采样 + 保留策略 + 历史查询 API + 窗口聚合（`avg(ref, 5m)`，已落地） | 全部 |
 | 语义 | 单位/量程、计算点、报警判定（阈值/延时/组合） | 全部 |
 | 运维 | RBAC（3 角色）、审计查询/导出、诊断包、网络诊断、远程配置下发 | 无人值守 |

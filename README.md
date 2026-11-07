@@ -274,6 +274,20 @@ JSON 数字/布尔，其余情况按字符串转义。点表导入默认**不覆
 内容不同即冲突，必须显式 `-replace`，避免「地址改了一半」把调好的缩放、死区、
 单位一起冲掉。`-dry-run` 与真正写入走同一份合并结果。
 
+三菱 MC（3E 二进制帧，TCP 5000）：
+
+```bash
+./uic sim -protocol mc -listen 127.0.0.1:5000 &   # 内置 MC 从站
+./uic -config examples/mc.json
+curl -s localhost:8087/api/v1/points
+#   5 点：D0 uint16=1234、D1 int16=5678、D2 float32=48.0(CDAB)、M0 bool、M1 可写 bool
+#   自检（不需要网关）：./uic mcread -addr 127.0.0.1:5000 -area d -offset 0 -qty 2
+```
+
+MC 3E 只做二进制帧 + TCP；ASCII/4E/UDP 形态配置期即拒。位软元件（M/X/Y/B）按位
+打包、首点是 bit0；X/Y 编号按十六进制理解（`X1F` 填 31）；字软元件上的 bool 必须
+显式 `address.bit`（0..15），驱动做读整字→改位→写整字的 RMW，不清零邻位。
+
 ## 文档
 
 - **[docs/00-README.md](docs/00-README.md)** — 总索引：阅读路径、38 个参考方案总览、结论速查、代码地图、接口速查、实现边界
@@ -295,10 +309,13 @@ go test -race -count=1 ./...
 
 | 路径 | 内容 |
 |---|---|
-| `cmd/uic/` | 单入口：`run` / `sim`（Modbus / S7 / OPC UA / MQTT）/ `mbread` / `uaread` / `s7blocks` / `s7upload` / `instantiate` / `import` / `token` / `-check` / `version` |
+| `cmd/uic/` | 单入口：`run` / `sim`（Modbus / S7 / OPC UA / MQTT / MC）/ `mbread` / `mcread` / `uaread` / `s7blocks` / `s7upload` / `instantiate` / `import` / `token` / `-check` / `version` |
 | `internal/model` | 通道 / 设备 / 点位 / 地址 / 采样 / 质量码 |
 | `internal/driver` | 驱动契约（Codec / Transport / Driver）、错误分类、注册表、只读 `Lookup` 注入 |
 | `internal/calc` | 零依赖表达式引擎（编译期类型检查、短路求值、引用 `device:point`） |
+| `internal/codec/mc` | 三菱 MC 3E 纯函数编解码（帧头、设备码表、位打包、结束码、24 位设备号） |
+| `internal/driver/mc` | MC 3E 主站驱动（字/位读写、字软元件 bool 的 RMW、字序归一化、结束码分类） |
+| `internal/sim/mc` | MC 3E 内置从站（内存字/位表、按区读写、越界/未知设备结束码） |
 | `internal/template` | 设备模板：参数校验 / 字符串字面量替换 / 实例化后完整校验 |
 | `internal/pointtable` | 点表 CSV：列别名 / 地址表达式 / 按协议推导宽度 / 合并动作 |
 | `internal/alarm` | 报警引擎：五态机 / 滞回 / 延时 / 表达式规则 / 确认 / 订阅 |
