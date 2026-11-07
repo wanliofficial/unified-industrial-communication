@@ -85,11 +85,25 @@
   "devices": { "total": 12, "collecting": 10, "degraded": 1, "faulted": 1 },
   "points":  { "total": 486, "good": 470, "stale": 8, "bad": 8 },
   "outbox":  { "pending": 0, "droppedLastHour": 0 },
+  "resources": {
+    "status": "degraded",
+    "diskLow": true,
+    "memoryHigh": false,
+    "freeBytes": 104857600,
+    "diskTotalBytes": 4294967296,
+    "workingSetBytes": 83886080,
+    "since": "2026-11-05T09:10:02.119Z"
+  },
   "problems": [
-    { "device": "meter-3", "state": "faulted", "reason": "connect timed out", "since": "2026-11-05T09:12:31.882Z" }
+    { "device": "meter-3", "state": "faulted", "reason": "connect timed out", "since": "2026-11-05T09:12:31.882Z" },
+    { "device": "$resources", "state": "degraded", "reason": "free disk space is below the watermark; history and file logging are paused", "since": "2026-11-05T09:10:02.119Z" }
   ]
 }
 ```
+
+`resources` 只在运行时装配了资源看门狗时出现；`freeBytes` / `diskTotalBytes` /
+`workingSetBytes` 为 `null` 表示平台读不到该项，不是 0。资源告急不会把已经
+`faulted` 的设备状态掩盖成 `degraded`——故障优先。
 
 ### 驱动
 

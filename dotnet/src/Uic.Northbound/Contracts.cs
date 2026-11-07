@@ -46,7 +46,8 @@ public sealed record NorthboundContext(
     RestOptions Rest,
     string Site,
     string GatewayVersion,
-    DateTimeOffset StartedAt);
+    DateTimeOffset StartedAt,
+    IResourceStatusSource? Resources = null);
 
 /// <summary>业务错误。统一由中间件渲染成契约里的 error 信封。</summary>
 public sealed class ApiException : Exception

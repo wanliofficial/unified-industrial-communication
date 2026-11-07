@@ -49,17 +49,26 @@ public sealed class GatewayRuntime : IGatewayControl, IAsyncDisposable
     private readonly JsonLineFileLogProvider? _fileLog;
     private readonly SampleFanout _fanout;
     private readonly DeviceStateWatcher _watcher;
+    private readonly ResourceMonitor _resources;
     private readonly string _dataDir;
     private readonly string _gatewayVersion;
     private readonly DateTimeOffset _startedAt = DateTimeOffset.UtcNow;
 
     private readonly SemaphoreSlim _applyGate = new(1, 1);
 
+    /// <summary>
+    /// 保护 journal 挂载与目标集合。配置热更新在 apply 线程跑，资源看门狗在自己的
+    /// 定时线程跑，两边的「停历史/开历史」必须串行，否则会出现「刚停掉又被配置
+    /// 更新挂回去」的状态，而看门狗只在状态跳变时触发，不会再纠正它。
+    /// </summary>
+    private readonly object _sinkGate = new();
+
     private MqttSink? _mqtt;
     private MqttCommandSink? _mqttCommands;
     private JournalSink? _journal;
     private UicOpcUaServer? _opcUa;
     private ConfigDocument _config;
+    private bool _historySuspended;
     private int _disposed;
 
     private GatewayRuntime(
@@ -108,6 +117,16 @@ public sealed class GatewayRuntime : IGatewayControl, IAsyncDisposable
             logs.CreateLogger("uic.watchdog"),
             _metrics);
         _watcher.Start();
+
+        // 资源看门狗最后启动：它的降级动作要停 journal、停文件日志，
+        // 这些对象必须先存在。启动时的第一次检查会立即给出当前水位。
+        _resources = new ResourceMonitor(
+            () => ResourceMonitor.Sample(_dataDir),
+            logs.CreateLogger("uic.resources"),
+            _metrics,
+            ResourceLimits.FromStorage(storage));
+        _resources.Changed += OnResourceChanged;
+        _resources.Start();
 
         RegisterGauges();
     }
@@ -208,7 +227,8 @@ public sealed class GatewayRuntime : IGatewayControl, IAsyncDisposable
             restOverride ?? _config.Northbound.Rest,
             _config.Site,
             _gatewayVersion,
-            _startedAt);
+            _startedAt,
+            _resources);
 
     // ------------------------------------------------------------------
     // IGatewayControl
@@ -246,6 +266,9 @@ public sealed class GatewayRuntime : IGatewayControl, IAsyncDisposable
 
             ConfigureSinks(doc, before);
             _fanout.SetTargets(Targets(doc));
+
+            // 水位阈值可以热更新；下一次检查立即生效，不必等进程重启。
+            _resources.Configure(ResourceLimits.FromStorage(doc.Storage));
 
             if (before is null || !SameJson(before.Northbound.OpcUa, doc.Northbound.OpcUa) || before.Site != doc.Site)
             {
@@ -330,12 +353,65 @@ public sealed class GatewayRuntime : IGatewayControl, IAsyncDisposable
     // 北向 sink 装配
     // ------------------------------------------------------------------
 
-    private static IReadOnlyList<string> Targets(ConfigDocument config)
+    private IReadOnlyList<string> Targets(ConfigDocument config)
     {
-        var targets = new List<string>(2);
-        if (config.Northbound.Mqtt.Enabled) targets.Add("mqtt");
-        if (config.Storage.Journal) targets.Add("journal");
-        return targets;
+        lock (_sinkGate)
+        {
+            var targets = new List<string>(2);
+            if (config.Northbound.Mqtt.Enabled) targets.Add("mqtt");
+
+            // 磁盘降级期间不再写 journal：区域空间要留给 Outbox 落盘。
+            // 已排队的记录不删除，恢复后继续从原位点投递。
+            if (config.Storage.Journal && !_historySuspended) targets.Add("journal");
+            return targets;
+        }
+    }
+
+    /// <summary>
+    /// 磁盘水位降级时停历史（journal）。停的是「新增」而不是「已有」：
+    /// 已排队的记录保留，恢复后继续投递，避免为了省空间把没送出去的数据也删了。
+    /// </summary>
+    private void SetHistorySuspended(bool suspended)
+    {
+        lock (_sinkGate)
+        {
+            if (_historySuspended == suspended) return;
+            _historySuspended = suspended;
+
+            if (suspended)
+            {
+                if (_journal is null) return;
+
+                _outbox.RemoveSink("journal");
+                var old = _journal;
+                _journal = null;
+                _ = old.DisposeAsync().AsTask();
+                _log.LogWarning("journal sink paused: disk free space is below the watermark");
+                return;
+            }
+
+            if (_journal is not null || !_config.Storage.Journal) return;
+
+            _journal = new JournalSink(Path.Combine(_dataDir, "journal"));
+            _outbox.RegisterSink(_journal);
+            _log.LogInformation("journal sink resumed at {Path}", _journal.FilePath);
+        }
+    }
+
+    private void OnResourceChanged(ResourceStatus status)
+    {
+        if (status.DiskLow)
+        {
+            // 先停文件日志再停 journal：先砍掉最不重要的写入。
+            _fileLog?.Suspend();
+        }
+        else
+        {
+            _fileLog?.Resume();
+        }
+
+        SetHistorySuspended(status.DiskLow);
+        _fanout.SetTargets(Targets(_config));
     }
 
     private void ConfigureSinks(ConfigDocument config, ConfigDocument? previous)
@@ -393,25 +469,29 @@ public sealed class GatewayRuntime : IGatewayControl, IAsyncDisposable
             }
         }
 
-        var journalWanted = config.Storage.Journal;
-        if (_journal is null && journalWanted)
+        lock (_sinkGate)
         {
-            _journal = new JournalSink(Path.Combine(_dataDir, "journal"));
-            _outbox.RegisterSink(_journal);
-            _log.LogInformation("journal sink started at {Path}", _journal.FilePath);
-        }
-        else if (_journal is not null && !journalWanted)
-        {
-            _outbox.RemoveSink("journal");
-            var old = _journal;
-            _journal = null;
-            _ = old.DisposeAsync().AsTask();
+            var journalWanted = config.Storage.Journal;
+            if (_journal is null && journalWanted && !_historySuspended)
+            {
+                _journal = new JournalSink(Path.Combine(_dataDir, "journal"));
+                _outbox.RegisterSink(_journal);
+                _log.LogInformation("journal sink started at {Path}", _journal.FilePath);
+            }
+            else if (_journal is not null && !journalWanted)
+            {
+                _outbox.RemoveSink("journal");
+                var old = _journal;
+                _journal = null;
+                _ = old.DisposeAsync().AsTask();
+            }
         }
 
         if (previous is not null && !SameJson(previous.Storage, config.Storage))
         {
             _log.LogWarning(
-                "storage limits changed; outbox keeps its startup configuration until restart (batches/retention)");
+                "storage limits changed; outbox keeps its startup configuration until restart (batches/retention), " +
+                "resource watermarks apply immediately");
         }
     }
 
@@ -433,12 +513,20 @@ public sealed class GatewayRuntime : IGatewayControl, IAsyncDisposable
             "OPC UA write requests accepted");
         _metrics.Gauge("uic_opcua_write_failures_total", () => _opcUa?.NodeManager.WriteFailures ?? 0,
             "OPC UA write requests that failed");
+        _metrics.Gauge("uic_disk_free_bytes",
+            () => _resources.Status.Reading.FreeBytes ?? -1,
+            "bytes available in the data directory partition (-1 when unknown)");
+        _metrics.Gauge("uic_resources_degraded",
+            () => _resources.Status.Degraded ? 1 : 0,
+            "1 when disk or memory is below the configured watermark");
     }
 
     public async ValueTask DisposeAsync()
     {
         if (Interlocked.Exchange(ref _disposed, 1) != 0) return;
 
+        // 先停资源看门狗：否则它会在关闭过程中把 journal 又挂回去。
+        await _resources.DisposeAsync().ConfigureAwait(false);
         await _watcher.DisposeAsync().ConfigureAwait(false);
         _fanout.Dispose();
 

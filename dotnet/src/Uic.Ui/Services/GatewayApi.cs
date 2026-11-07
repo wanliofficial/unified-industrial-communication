@@ -305,7 +305,12 @@ public sealed record CommandRequest(string Action,
 public sealed record Paged<T>(T[] Items, string? NextCursor, int Total);
 
 public sealed record HealthDto(string Status, long UptimeSeconds, DevicesHealthDto Devices,
-    PointsHealthDto Points, OutboxHealthDto Outbox, ProblemDto[] Problems);
+    PointsHealthDto Points, OutboxHealthDto Outbox, ProblemDto[] Problems,
+    ResourcesHealthDto? Resources = null);
+
+/// <summary>资源水位。null 读取值表示平台没提供，不是 0。</summary>
+public sealed record ResourcesHealthDto(string Status, bool DiskLow, bool MemoryHigh,
+    long? FreeBytes, long? DiskTotalBytes, long? WorkingSetBytes, DateTimeOffset Since);
 
 public sealed record DevicesHealthDto(int Total, int Collecting, int Degraded, int Faulted);
 

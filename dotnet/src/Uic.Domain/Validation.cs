@@ -171,6 +171,23 @@ public static partial class ModelValidator
             }
         }
 
+        var storage = doc.Storage;
+        if (storage.MinFreeBytes < 0)
+            Add("storage.minFreeBytes", "must be >= 0; 0 disables the disk watermark");
+        if (storage.ResumeFreeBytes < 0)
+            Add("storage.resumeFreeBytes", "must be >= 0");
+        if (storage.ResumeFreeBytes > 0 && storage.MinFreeBytes == 0)
+            Add("storage.resumeFreeBytes", "requires minFreeBytes");
+        if (storage.MinFreeBytes > 0 && storage.ResumeFreeBytes > 0 &&
+            storage.ResumeFreeBytes <= storage.MinFreeBytes)
+            Add("storage.resumeFreeBytes",
+                "must be greater than minFreeBytes so recovery does not flap");
+        if (storage.MaxMemoryBytes < 0)
+            Add("storage.maxMemoryBytes", "must be >= 0; 0 disables the memory watermark");
+        if (storage.ResourceCheckInterval < TimeSpan.FromSeconds(1) ||
+            storage.ResourceCheckInterval > TimeSpan.FromHours(1))
+            Add("storage.resourceCheckInterval", "must be 1s..1h");
+
         var file = doc.Logging.File;
 
         // 即使当前 disabled 也校验：配置里留一个错值，等现场打开时就变成启动失败，

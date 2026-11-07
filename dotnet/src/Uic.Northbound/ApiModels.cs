@@ -69,7 +69,18 @@ public sealed record HealthDto(
     DevicesHealthDto Devices,
     PointsHealthDto Points,
     OutboxHealthDto Outbox,
-    IReadOnlyList<ProblemDto> Problems);
+    IReadOnlyList<ProblemDto> Problems,
+    ResourcesHealthDto? Resources = null);
+
+/// <summary>资源水位。两个读取值都可能为 null：平台不提供磁盘信息时不能谎报成 0。</summary>
+public sealed record ResourcesHealthDto(
+    string Status,
+    bool DiskLow,
+    bool MemoryHigh,
+    long? FreeBytes,
+    long? DiskTotalBytes,
+    long? WorkingSetBytes,
+    DateTimeOffset Since);
 
 public sealed record DevicesHealthDto(int Total, int Collecting, int Degraded, int Faulted);
 

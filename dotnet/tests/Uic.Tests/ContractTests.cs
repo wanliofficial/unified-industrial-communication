@@ -34,6 +34,7 @@ internal static class ContractTests
     public static void Register(List<TestCase> tests)
     {
         tests.Add(new TestCase("contract/health_and_version_are_public", HealthAndVersionArePublic));
+        tests.Add(new TestCase("contract/resource_pressure_degrades_health", ResourcePressureDegradesHealth));
         tests.Add(new TestCase("contract/api_requires_bearer_token", ApiRequiresBearerToken));
         tests.Add(new TestCase("contract/devices_and_points_are_listed", DevicesAndPointsAreListed));
         tests.Add(new TestCase("contract/drivers_expose_capability_states", DriversExposeCapabilityStates));
@@ -68,7 +69,9 @@ internal static class ContractTests
 
         public HttpClient Client { get; }
 
-        public static async Task<Host> StartAsync(TestContext t)
+        public GatewayRuntime Runtime => _runtime;
+
+        public static async Task<Host> StartAsync(TestContext t, Func<ConfigDocument>? config = null)
         {
             var ring = new RingBufferLogProvider(128);
             var logs = LoggerFactory.Create(builder =>
@@ -82,7 +85,7 @@ internal static class ContractTests
             {
                 DataDir = t.TempDir,
                 GatewayVersion = "0.0.0-test",
-                Fallback = BuildConfig,
+                Fallback = config ?? BuildConfig,
             };
 
             var runtime = await GatewayRuntime.CreateAsync(options, Drivers(), logs, ring, t.Ct);
@@ -264,12 +267,82 @@ internal static class ContractTests
         });
     }
 
+    private static Task ResourcePressureDegradesHealth(TestContext t)
+    {
+        return RunAsync(async () =>
+        {
+            // 用一个必然超过真实剩余空间的阈值制造磁盘告急：比 mock 探针更接近
+            // 「装配是否正确」这个问题——资源看门狗、health、journal 停止必须联动。
+            var config = WithStorage(BuildConfig(), new StorageOptions
+            {
+                Journal = true,
+                MinFreeBytes = long.MaxValue / 2,
+                ResumeFreeBytes = long.MaxValue / 2 + 1,
+            });
+
+            await using var host = await Host.StartAsync(t, () => config);
+
+            t.Ok(!host.Runtime.Outbox.Sinks.Contains("journal"),
+                "journal is not registered while the disk watermark is breached");
+
+            using var health = await ReadJsonAsync(t, await host.Client.SendAsync(
+                Get("/api/v1/health"), t.Ct));
+
+            var root = health.RootElement;
+            t.Equal("degraded", root.GetProperty("status").GetString(),
+                "health reports degraded for resource pressure");
+
+            var resources = root.GetProperty("resources");
+            t.Equal("degraded", resources.GetProperty("status").GetString(), "the resource block agrees");
+            t.Equal(true, resources.GetProperty("diskLow").GetBoolean(), "diskLow is set");
+            t.Equal(false, resources.GetProperty("memoryHigh").GetBoolean(), "memory is not involved");
+            t.Ok(resources.GetProperty("freeBytes").ValueKind == JsonValueKind.Number,
+                "the real free-space reading is exposed");
+
+            var problems = root.GetProperty("problems");
+            t.Ok(problems.EnumerateArray().Any(p =>
+                    p.GetProperty("device").GetString() == "$resources"),
+                "the problem list names the resource watermark");
+
+            var metrics = await host.Client.GetStringAsync("/api/v1/metrics", t.Ct);
+            t.Contains(metrics, "uic_resources_degraded 1", "the gauge reflects the degraded state");
+
+            // 阈值撤回后必须自动恢复：看门狗只在跳变时触发，恢复路径没写对就会
+            // 「降级一次、永久停写」，这正是资源降级最容易踩的坑。
+            var recovered = WithStorage(config, new StorageOptions { Journal = true });
+            var outcome = await host.Runtime.ApplyConfigAsync(recovered, "watermark removed", t.Ct);
+
+            t.Ok(outcome.Applied, "the config with cleared watermarks is applied");
+            t.Ok(host.Runtime.Outbox.Sinks.Contains("journal"),
+                "journal is registered again after recovery");
+
+            using var healthy = await ReadJsonAsync(t, await host.Client.SendAsync(
+                Get("/api/v1/health"), t.Ct));
+
+            t.Equal("ok", healthy.RootElement.GetProperty("status").GetString(),
+                "health returns to ok after recovery");
+            t.Equal("ok", healthy.RootElement.GetProperty("resources").GetProperty("status").GetString(),
+                "the resource block returns to ok");
+        });
+    }
+
+    private static ConfigDocument WithStorage(ConfigDocument source, StorageOptions storage) => new()
+    {
+        SchemaVersion = source.SchemaVersion,
+        Site = source.Site,
+        Description = source.Description,
+        Channels = source.Channels,
+        Devices = source.Devices,
+        Northbound = source.Northbound,
+        Logging = source.Logging,
+        Storage = storage,
+    };
+
     private static Task ApiRequiresBearerToken(TestContext t)
     {
         return RunAsync(async () =>
         {
             await using var host = await Host.StartAsync(t);
-
             var anonymous = await host.Client.SendAsync(Get("/api/v1/devices", auth: false), t.Ct);
             t.Equal(HttpStatusCode.Unauthorized, anonymous.StatusCode, "no token is rejected");
             t.Ok(anonymous.Headers.WwwAuthenticate.Any(h => h.Scheme == "Bearer"),

@@ -33,6 +33,7 @@ public sealed class JsonLineFileLogProvider : ILoggerProvider
     private FileStream? _stream;
     private long _bytes;
     private int _writeFailed;
+    private int _suspended;
     private int _disposed;
 
     /// <summary>当前活动文件；未启用或尚未配置时为 null。主要给用例和诊断包使用。</summary>
@@ -67,7 +68,9 @@ public sealed class JsonLineFileLogProvider : ILoggerProvider
             _options = options;
             _directory = directory;
 
-            if (!options.Enabled)
+            // 降级期间即使配置发生变化也只记住新目标，不重新打开文件：
+            // 否则一次配置热更新就会把「磁盘告急时停写」这件事悄悄撤销。
+            if (_suspended != 0 || !options.Enabled)
             {
                 CloseLocked();
                 return;
@@ -76,20 +79,56 @@ public sealed class JsonLineFileLogProvider : ILoggerProvider
             if (sameTarget) return;
 
             CloseLocked();
+            Open(directory, options);
+        }
+    }
 
-            try
-            {
-                Directory.CreateDirectory(directory);
-                var path = Path.Combine(directory, options.FileName);
-                OpenLocked(path);
-            }
-            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
-            {
-                // 打不开文件不能拖垮网关：配置错误在启动日志里说明一次即可。
-                CloseLocked();
-                Console.Error.WriteLine(
-                    $"file logging disabled: cannot open '{Path.Combine(directory, options.FileName)}': {ex.Message}");
-            }
+    /// <summary>
+    /// 暂停落盘（磁盘水位降级）。已有的文件立即关闭，后续日志只进内存环；
+    /// 配置保留，<see cref="Resume"/> 时按原设置重新打开。
+    /// </summary>
+    public void Suspend()
+    {
+        lock (_gate)
+        {
+            if (_disposed != 0 || _suspended != 0) return;
+            _suspended = 1;
+            CloseLocked();
+        }
+    }
+
+    /// <summary>解除暂停，恢复原有配置对应的文件。</summary>
+    public void Resume()
+    {
+        lock (_gate)
+        {
+            if (_disposed != 0 || _suspended == 0) return;
+            _suspended = 0;
+
+            if (!_options.Enabled) return;
+            Open(_directory, _options);
+        }
+    }
+
+    public bool IsSuspended
+    {
+        get { lock (_gate) return _suspended != 0; }
+    }
+
+    private void Open(string directory, FileLogOptions options)
+    {
+        try
+        {
+            Directory.CreateDirectory(directory);
+            var path = Path.Combine(directory, options.FileName);
+            OpenLocked(path);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            // 打不开文件不能拖垮网关：配置错误在启动日志里说明一次即可。
+            CloseLocked();
+            Console.Error.WriteLine(
+                $"file logging disabled: cannot open '{Path.Combine(directory, options.FileName)}': {ex.Message}");
         }
     }
 

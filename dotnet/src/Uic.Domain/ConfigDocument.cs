@@ -109,6 +109,22 @@ public sealed class StorageOptions
     public TimeSpan OutboxTtl { get; init; } = TimeSpan.FromHours(24);
     public int OutboxBatchSize { get; init; } = 64;
     public TimeSpan OutboxFlushInterval { get; init; } = TimeSpan.FromSeconds(1);
+
+    /// <summary>
+    /// 数据目录所在分区的剩余空间低于该值时进入降级：暂停文件日志与 journal，
+    /// 健康状态转 degraded，给 Outbox 留出最后一点写盘空间。0 表示不检查。
+    /// 没有默认值是因为「多少算少」完全取决于设备：1GB 的盒子与机房虚拟机不是一回事。
+    /// </summary>
+    public long MinFreeBytes { get; init; }
+
+    /// <summary>恢复到该值以上才解除降级；0 表示取 minFreeBytes 的两倍作为回差。</summary>
+    public long ResumeFreeBytes { get; init; }
+
+    /// <summary>进程工作集超过该值时进入降级（只告警，不主动释放内存）。0 表示不检查。</summary>
+    public long MaxMemoryBytes { get; init; }
+
+    /// <summary>资源水位检查间隔。1 秒 .. 1 小时。</summary>
+    public TimeSpan ResourceCheckInterval { get; init; } = TimeSpan.FromSeconds(10);
 }
 
 /// <summary>日志配置。默认不落盘：边缘设备磁盘小，没显式配置就不该悄悄写文件。</summary>

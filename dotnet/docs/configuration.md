@@ -298,8 +298,42 @@
 | `outboxTtl` | `24h` | 超过这个时长的记录直接丢弃 |
 | `outboxBatchSize` | `64` | 一次投递的最大条数 |
 | `outboxFlushInterval` | `1s` | 后台冲刷间隔 |
+| `minFreeBytes` | `0` | 数据目录剩余空间低于该值进入降级；`0` = 不检查 |
+| `resumeFreeBytes` | `0` | 恢复到该值以上才解除降级；`0` = 取 `minFreeBytes` 的两倍 |
+| `maxMemoryBytes` | `0` | 进程工作集超过该值进入降级；`0` = 不检查 |
+| `resourceCheckInterval` | `10s` | 资源水位检查间隔，`1s .. 1h` |
 
 超限时丢最旧的并计数，`/api/v1/health` 与指标里都能看到丢弃数。
+
+### 资源水位降级
+
+磁盘与内存的水位都必须显式配置：1 GB 的盒子和机房虚拟机对「多少算少」的答案不同，
+给一个默认值只会在某类现场变成误报。进入降级后：
+
+- **磁盘低于 `minFreeBytes`**：文件日志立即停写（`Suspend`），journal 通道摘掉，
+  新样本不再往历史里追加；已排队的记录不删除，恢复后继续投递。区域空间留给 Outbox 落盘。
+  `/api/v1/health` 的 `status` 转 `degraded`，`problems` 里出现 `device: "$resources"`，
+  并记 `uic_resource_pressure_total{kind="disk"}`。
+- **工作集超过 `maxMemoryBytes`**：只把健康状态转 `degraded` 并告警，不主动释放内存
+  （强停采集或清缓存会让数据缺口比内存压力更糟）。
+
+恢复到 `resumeFreeBytes`（内存为上限的 90%）以上自动解除：文件日志重新打开，
+journal 重新挂载。进入线与恢复线之间的回差是刻意的——单阈值会在边界反复停/开，
+产生的日志比要防的问题还多。
+
+```json
+{
+  "storage": {
+    "dataDir": "/var/lib/uic",
+    "minFreeBytes": 268435456,
+    "resumeFreeBytes": 536870912,
+    "maxMemoryBytes": 134217728,
+    "resourceCheckInterval": "10s"
+  }
+}
+```
+
+阈值支持热更新：改完配置立即按新线判定一次，不必重启进程。
 
 ## `logging`
 

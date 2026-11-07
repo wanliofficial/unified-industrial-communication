@@ -11,7 +11,7 @@
 它们不是 §6.1「不做」清单里的项，属于真实缺口；逐协议现状、原因与补法见
 [protocol-status.md](protocol-status.md)。
 
-当前测试基线：**155 passed / 0 failed / 1 skipped**（跳过的是需要 `--opcua` 的 OPC UA 端到端用例）。
+当前测试基线：**161 passed / 0 failed / 1 skipped**（跳过的是需要 `--opcua` 的 OPC UA 端到端用例）。
 
 ## 1. 采集（FR-COL）
 
@@ -61,7 +61,7 @@
 | FR-RUN-07 | 质量码 ≥8 态 + 时间戳三分离 | 已实现 | 9 态 `Quality`；`Sample` 含 `DeviceTime`/`CollectedAt`/`AppliedAt`，见 `json/datavalue_wire_shape_is_stable` |
 | FR-RUN-08 | 单调时钟用于调度与超时 | 已实现 | `nextDue` 与等待都基于 `Stopwatch.GetTimestamp()` + `ScheduleMath`；NTP 校时/手工改钟不会推迟或提前采集。样本时间戳仍用墙上时钟：`schedule/monotonic_arithmetic` |
 | FR-RUN-09 | 运行态与配置态分离 | 已实现 | `ConfiguredState` / `RuntimeState` 两套枚举，API 同时返回 |
-| FR-RUN-10 | 看门狗（采集心跳 + 资源水位降级） | 部分实现 | `DeviceStateWatcher` 检测「超过 max(10 周期, 30 s) 无新样本」并记 `uic_watchdog_stale_total`；**资源水位（磁盘/内存）降级未做** |
+| FR-RUN-10 | 看门狗（采集心跳 + 资源水位降级） | 已实现 | 采集心跳：`DeviceStateWatcher` 检测「超过 max(10 周期, 30 s) 无新样本」并记 `uic_watchdog_stale_total`；恢复由 `DeviceActor` 的读超时与重连完成，进程级僵死交给外部 supervisor（NFR 故障矩阵）。资源水位：`ResourceMonitor` 按 `storage.minFreeBytes/resumeFreeBytes/maxMemoryBytes` 判定，磁盘告急时暂停文件日志与 journal、健康转 `degraded`、`problems` 标 `$resources`，恢复后自动重启；证据 `resources/disk_pressure_has_hysteresis`、`resources/memory_pressure_has_hysteresis`、`resources/unreadable_probe_is_not_pressure`、`resources/file_log_pauses_during_pressure`、`contract/resource_pressure_degrades_health` |
 | FR-RUN-11 | 优雅退出（停调度、flush 队列、关连接） | 已实现 | `GatewayRuntime.DisposeAsync` 先 flush（3 s）再发 `$death`；SIGTERM 由 Kestrel 的 `RunAsync` 触发生命周期 |
 
 ## 4. 数据处理（FR-PROC）

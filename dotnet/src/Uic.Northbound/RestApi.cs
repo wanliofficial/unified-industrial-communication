@@ -224,6 +224,7 @@ public static partial class RestApi
     {
         var stats = ctx.Outbox.Stats();
         var engineHealth = ctx.Engine.Health(stats.Pending, stats.DroppedTotal);
+        var resourceStatus = ctx.Resources?.Status;
 
         var problems = ctx.Engine.Actors
             .Where(a => a.State is RuntimeState.Faulted or RuntimeState.Degraded)
@@ -232,10 +233,27 @@ public static partial class RestApi
                 JsonEnum.ToWire(a.State),
                 a.Stats.LastError,
                 a.ToView(0, 0).Since))
-            .ToArray();
+            .ToList();
+
+        if (resourceStatus is { Degraded: true })
+        {
+            // 资源问题不是设备问题，但必须出现在同一张问题清单里：
+            // 运维看见 degraded 却找不到原因，比不报还糟。
+            problems.Add(new ProblemDto(
+                "$resources",
+                "degraded",
+                resourceStatus.DiskLow
+                    ? "free disk space is below the watermark; history and file logging are paused"
+                    : "working set exceeds the configured memory limit",
+                resourceStatus.Since));
+        }
+
+        // 故障优先于资源告警：设备已经 faulted 时再多一个 degraded 不会增加信息量。
+        var status = engineHealth.Status;
+        if (resourceStatus is { Degraded: true } && status == "ok") status = "degraded";
 
         return new HealthDto(
-            engineHealth.Status,
+            status,
             engineHealth.UptimeSeconds,
             new DevicesHealthDto(
                 engineHealth.DevicesTotal,
@@ -248,7 +266,17 @@ public static partial class RestApi
                 engineHealth.PointsStale,
                 engineHealth.PointsBad),
             new OutboxHealthDto(stats.Pending, stats.DroppedTotal),
-            problems);
+            problems,
+            resourceStatus is null
+                ? null
+                : new ResourcesHealthDto(
+                    resourceStatus.Degraded ? "degraded" : "ok",
+                    resourceStatus.DiskLow,
+                    resourceStatus.MemoryHigh,
+                    resourceStatus.Reading.FreeBytes,
+                    resourceStatus.Reading.DiskTotalBytes,
+                    resourceStatus.Reading.WorkingSetBytes,
+                    resourceStatus.Since));
     }
 
     // ------------------------------------------------------------------
