@@ -16,7 +16,7 @@ dotnet run --project tests/Uic.Tests -- --stop-on-fail      # 首个失败即停
 正常输出：
 
 ```
-162 passed, 0 failed, 1 skipped · 36.8s
+163 passed, 0 failed, 1 skipped · 36.2s
 ```
 
 跳过的一条是 OPC UA 验收（要绑端口、生成证书，默认不跑）。
@@ -52,7 +52,7 @@ dotnet run --project tests/Uic.Tests -- --stop-on-fail      # 首个失败即停
 | `engine/*` | 10 | 同连接永不并发、状态机与代次、临时失败重试、坏质量整批重试、deadline 超时重试、确定性错误不重试、重试次数有限、写后回读一致/不一致/不开启 |
 | `schedule/*` | 3 | 启动相位均匀铺开、单调时间换算与到期边界、调度器实际分配相位 |
 | `loopback/*` | 12 | 主站 ↔ 内置从站的真实链路 |
-| `serial/*` | 6 | 真实伪终端上的 RTU / ASCII、半双工、deadline、关闭打断读 |
+| `serial/*` | 7 | 真实伪终端上的 RTU / ASCII、半双工、帧间静默、deadline、关闭打断读 |
 | `mqtt/*` | 17 | 测试内 broker：CONNECT/SUBSCRIBE 字段、QoS0/1、主题渲染、重连补发、命令去重与权限 |
 | `template/*` | 3 | 50 实例批量生成、参数类型/缺失/未知参数拒绝、未声明占位符拒绝 |
 | `csv/*` | 3 | 地址表达式（参考号/区域偏移/分列）、按 id 合并与冲突行号、死区模式与量程列 |

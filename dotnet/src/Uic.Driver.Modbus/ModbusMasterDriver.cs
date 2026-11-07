@@ -1,4 +1,5 @@
 using System.Buffers.Binary;
+using System.Diagnostics;
 using System.Text;
 using Uic.Codec.Modbus;
 using Uic.Domain;
@@ -289,6 +290,10 @@ internal sealed class RtuFraming : IModbusFraming
         await _lease.Mutex.WaitAsync(ct).ConfigureAwait(false);
         try
         {
+            // Modbus over Serial Line 要求帧间至少 3.5 个字符时间。共享端口上
+            // 多台从站交替发请求，缺了这段静默，部分仪表会直接丢帧。
+            await _lease.WaitFrameGapAsync(ct).ConfigureAwait(false);
+
             _lease.Stream.DiscardInBuffer();
 
             var frame = ModbusRtuFrame.Build((byte)_ctx.Device.UnitId, pdu);
@@ -339,6 +344,9 @@ internal sealed class RtuFraming : IModbusFraming
         }
         finally
         {
+            // 事务无论成功还是超时，都从「最后一次总线活动」重新计时：
+            // 超时后马上重发会把上一帧的迟到响应撞进新事务。
+            _lease.MarkFrameEnd();
             _lease.Mutex.Release();
         }
     }
@@ -365,6 +373,10 @@ internal sealed class AsciiFraming : IModbusFraming
         await _lease.Mutex.WaitAsync(ct).ConfigureAwait(false);
         try
         {
+            // ASCII 同样按帧间隔发送：总线上混挂 RTU/ASCII 仪表时，
+            // 静默时间由物理层决定，与封装格式无关。
+            await _lease.WaitFrameGapAsync(ct).ConfigureAwait(false);
+
             _lease.Stream.DiscardInBuffer();
 
             var frame = ModbusAsciiFrame.Build((byte)_ctx.Device.UnitId, pdu);
@@ -402,6 +414,7 @@ internal sealed class AsciiFraming : IModbusFraming
         }
         finally
         {
+            _lease.MarkFrameEnd();
             _lease.Mutex.Release();
         }
     }
@@ -423,15 +436,8 @@ internal sealed class AsciiFraming : IModbusFraming
 /// </summary>
 internal static class SerialPortTable
 {
-    private static readonly Dictionary<string, SharedSerial> Ports = new(StringComparer.Ordinal);
+    private static readonly Dictionary<string, SerialBus> Ports = new(StringComparer.Ordinal);
     private static readonly SemaphoreSlim Gate = new(1, 1);
-
-    private sealed class SharedSerial
-    {
-        public required SerialByteStream Stream { get; init; }
-        public required SemaphoreSlim Mutex { get; init; }
-        public int Refs;
-    }
 
     public static async Task<SerialLease> AcquireAsync(Channel channel)
     {
@@ -440,18 +446,19 @@ internal static class SerialPortTable
         await Gate.WaitAsync().ConfigureAwait(false);
         try
         {
-            if (!Ports.TryGetValue(options.Port, out var shared))
+            if (!Ports.TryGetValue(options.Port, out var bus))
             {
-                shared = new SharedSerial
+                bus = new SerialBus
                 {
+                    Port = options.Port,
                     Stream = SerialByteStream.Open(options),
                     Mutex = new SemaphoreSlim(1, 1),
                 };
-                Ports[options.Port] = shared;
+                Ports[options.Port] = bus;
             }
 
-            shared.Refs++;
-            return new SerialLease(options.Port, shared.Stream, shared.Mutex);
+            bus.Refs++;
+            return new SerialLease(bus, ModbusSerialTiming.FrameGap(options.Baud));
         }
         finally
         {
@@ -464,10 +471,10 @@ internal static class SerialPortTable
         await Gate.WaitAsync().ConfigureAwait(false);
         try
         {
-            if (!Ports.TryGetValue(lease.Port, out var shared)) return;
+            if (!Ports.TryGetValue(lease.Port, out var bus)) return;
 
-            shared.Refs--;
-            if (shared.Refs > 0) return;
+            bus.Refs--;
+            if (bus.Refs > 0) return;
 
             Ports.Remove(lease.Port);
 
@@ -475,7 +482,7 @@ internal static class SerialPortTable
             // 还要再 Release 一次，所以信号量不能在这里 Dispose。
             // SemaphoreSlim 除 AvailableWaitHandle 外不持有非托管资源，
             // 交给 GC 即可。
-            await shared.Stream.DisposeAsync().ConfigureAwait(false);
+            await bus.Stream.DisposeAsync().ConfigureAwait(false);
         }
         finally
         {
@@ -484,16 +491,66 @@ internal static class SerialPortTable
     }
 }
 
+/// <summary>
+/// 一条物理串口总线。帧间隔的计时必须挂在总线上而不是设备上：
+/// 同一根 RS-485 上多台从站轮流发请求，静默时间是全总线共享的。
+/// </summary>
+internal sealed class SerialBus
+{
+    public required string Port { get; init; }
+    public required SerialByteStream Stream { get; init; }
+    public required SemaphoreSlim Mutex { get; init; }
+    public int Refs;
+
+    private long _lastFrameEnd;
+
+    /// <summary>一次事务结束（成功或超时）时调用，作为下一帧静默的起点。</summary>
+    public void MarkFrameEnd() => Volatile.Write(ref _lastFrameEnd, Stopwatch.GetTimestamp());
+
+    public async Task WaitFrameGapAsync(TimeSpan gap, CancellationToken ct)
+    {
+        var last = Volatile.Read(ref _lastFrameEnd);
+        if (last == 0 || gap <= TimeSpan.Zero) return;
+
+        var remaining = gap - Stopwatch.GetElapsedTime(last);
+        if (remaining <= TimeSpan.Zero) return;
+
+        await Task.Delay(remaining, ct).ConfigureAwait(false);
+    }
+}
+
+/// <summary>Modbus over Serial Line 的帧间静默。</summary>
+internal static class ModbusSerialTiming
+{
+    /// <summary>
+    /// 3.5 个字符时间（每字符按 11 位：1 起始 + 8 数据 + 1 校验 + 1 停止）。
+    /// 规范对 &gt;19200 bps 的链路规定固定 1.75 ms，不再按波特率缩放；
+    /// 低速链路必须按实际波特率算，9600 bps 时约 4 ms。
+    /// </summary>
+    public static TimeSpan FrameGap(int baud)
+    {
+        if (baud <= 0) return TimeSpan.FromMilliseconds(1.75);
+        if (baud > 19200) return TimeSpan.FromMilliseconds(1.75);
+        return TimeSpan.FromMilliseconds(3.5 * 11d * 1000d / baud);
+    }
+}
+
 internal sealed class SerialLease
 {
-    public string Port { get; }
-    public IByteStream Stream { get; }
-    public SemaphoreSlim Mutex { get; }
+    private readonly SerialBus _bus;
 
-    public SerialLease(string port, IByteStream stream, SemaphoreSlim mutex)
+    public SerialLease(SerialBus bus, TimeSpan frameGap)
     {
-        Port = port;
-        Stream = stream;
-        Mutex = mutex;
+        _bus = bus;
+        FrameGap = frameGap;
     }
+
+    public string Port => _bus.Port;
+    public IByteStream Stream => _bus.Stream;
+    public SemaphoreSlim Mutex => _bus.Mutex;
+    public TimeSpan FrameGap { get; }
+
+    public void MarkFrameEnd() => _bus.MarkFrameEnd();
+
+    public Task WaitFrameGapAsync(CancellationToken ct) => _bus.WaitFrameGapAsync(FrameGap, ct);
 }

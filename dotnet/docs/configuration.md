@@ -109,6 +109,9 @@
 `parity` 取 `none|odd|even|mark|space`，`stopBits` 取 `one|onePointFive|two`，
 `baud` 300..921600，`readTimeoutMs` 10..60000。
 
+RTU/ASCII 主站按 3.5 个字符时间做帧间静默（9600 bps 约 4 ms；>19200 bps 按规范
+固定 1.75 ms）。静默挂在物理串口上，同一根 RS-485 上多台从站交替发请求时也成立。
+
 ## 设备 `devices[]`
 
 | 字段 | 默认 | 说明 |

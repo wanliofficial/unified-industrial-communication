@@ -11,14 +11,14 @@
 它们不是 §6.1「不做」清单里的项，属于真实缺口；逐协议现状、原因与补法见
 [protocol-status.md](protocol-status.md)。
 
-当前测试基线：**162 passed / 0 failed / 1 skipped**（跳过的是需要 `--opcua` 的 OPC UA 端到端用例）。
+当前测试基线：**163 passed / 0 failed / 1 skipped**（跳过的是需要 `--opcua` 的 OPC UA 端到端用例）。
 
 ## 1. 采集（FR-COL）
 
 | 编号 | 需求 | 状态 | 证据 / 说明 |
 |---|---|---|---|
 | FR-COL-01 | Modbus TCP 主站，FC1/2/3/4/5/6/15/16 | 已实现 | `golden/read_coils_10`、`golden/write_multiple_regs_float32`、`loopback/*`；编解码覆盖 0x01–0x06/0x0F/0x10 |
-| FR-COL-02 | Modbus RTU/ASCII 主站，含串口参数与帧间延时 | 部分实现 | `serial/rtu_golden_frame_over_pty`、`serial/ascii_golden_frame_over_pty`、`serial/half_duplex_does_not_cross_responses`；波特率 300–921600 可配，半双工由通道闸门 + 发送前清空输入缓冲保证。**没有单独的 3.5 字符静默定时器**，帧边界靠长度/功能码 + CRC 判定；遇到挑剔帧间静默的仪表要在 `RtuFraming` 补 |
+| FR-COL-02 | Modbus RTU/ASCII 主站，含串口参数与帧间延时 | 已实现 | `serial/rtu_golden_frame_over_pty`、`serial/ascii_golden_frame_over_pty`、`serial/half_duplex_does_not_cross_responses`；波特率 300–921600 可配，半双工由通道闸门 + 发送前清空输入缓冲保证。帧间静默按 3.5 字符时间（>19200 bps 固定 1.75 ms），计时挂在物理串口上，多从站共享：`serial/rtu_waits_between_frames` |
 | FR-COL-03 | Modbus TCP 从站 | 已实现 | 内置从站被主站回环读写：`loopback/write_then_read_back`、`loopback/write_to_missing_register_is_rejected` |
 | FR-COL-04 | S7comm 主站 | 未实现（首版缺口） | PRD 列为 M，本版本没有代码。驱动边界只有 `IDriver`/`IConn`，接入时按 [protocol-status.md](protocol-status.md) 的五步走；TPKT/COTP 分帧、PDU 协商、DB/IB/QB/MB 区都要新写 |
 | FR-COL-05 | OPC UA 客户端 | 未实现（首版缺口） | PRD 列为 M，本版本只实现 OPC UA **服务端**（`Uic.OpcUa`）。客户端需要会话/订阅/证书/重连，建议直接基于 `Opc.Ua.Client` 而不是手写栈 |

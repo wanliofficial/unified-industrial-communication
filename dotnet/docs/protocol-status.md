@@ -67,19 +67,20 @@
 | 字节序 | ABCD / CDAB / BADC / DCBA，点位级可覆盖设备级 |
 | 数据类型 | bool、有/无符号 16/32/64、float32/64、string、BCD16/32、bytes |
 | TCP | MBAP + 事务号校验；事务号不匹配直接丢弃（防止把上一次超时的迟到响应当成新结果） |
-| RTU | CRC16；帧边界按功能码/字节数推导；发送前清空输入缓冲；同一串口半双工串行 |
+| RTU | CRC16；帧边界按功能码/字节数推导；发送前清空输入缓冲；3.5 字符帧间静默；同一串口半双工串行 |
 | ASCII | `:` 起始、LRC 校验、CRLF 结束 |
 | 串口参数 | 端口、300–921600 波特率、数据位、`none/odd/even/mark/space` 校验、`one/onePointFive/two` 停止位、读超时 |
 | 超时与重试 | 设备级 `timeout` + `retries`（只重试临时性失败）；重试前断开重连 |
 | 探活 | 连接建立时读一个保持寄存器，确认链路与会话都可用 |
 
-没有单独实现 3.5 字符静默定时器：帧边界由长度字段/功能码与 CRC 判定，发送前清空
-输入缓冲，避免迟到字节被当成本帧。这在 Linux 的串口驱动 + `System.IO.Ports` 下够用，
-但如果遇到对帧间静默特别挑剔的仪表，需要在 `RtuFraming` 里补一个按波特率计算的间隔。
+帧间静默由 `ModbusSerialTiming` 计算：3.5 个字符时间（每字符 11 位），
+9600 bps 约 4 ms；>19200 bps 按规范固定 1.75 ms。计时挂在物理串口上，
+同一根 RS-485 上多台从站交替发请求时也共享这段静默；超时后同样重新计时，
+避免迟到响应撞进下一次事务。帧边界仍由长度字段/功能码与 CRC 判定。
 
 测试证据：`golden/*`（8 份 Modbus 黄金帧）、`codec/*`、`planner/*` 八条、
 `serial/rtu_golden_frame_over_pty`、`serial/ascii_golden_frame_over_pty`、
-`serial/half_duplex_does_not_cross_responses`、`loopback/*`。
+`serial/half_duplex_does_not_cross_responses`、`serial/rtu_waits_between_frames`、`loopback/*`。
 
 ### 2.2 从站（仿真）
 

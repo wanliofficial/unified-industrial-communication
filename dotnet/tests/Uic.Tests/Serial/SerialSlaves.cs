@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Text;
 using Uic.Codec.Modbus;
 using Uic.Sim.Modbus;
@@ -20,6 +21,7 @@ internal sealed class RtuSlave : IDisposable
     private readonly CancellationTokenSource _cts = new();
     private readonly Thread _worker;
     private readonly List<byte[]> _requests = new();
+    private readonly List<long> _requestStamps = new();
     private readonly object _lock = new();
 
     private int _disposed;
@@ -50,6 +52,12 @@ internal sealed class RtuSlave : IDisposable
         get { lock (_lock) return _requests.ToArray(); }
     }
 
+    /// <summary>每帧读完的时刻（单调时钟），用来断言帧间静默。</summary>
+    public IReadOnlyList<long> RequestStamps
+    {
+        get { lock (_lock) return _requestStamps.ToArray(); }
+    }
+
     /// <summary>后台线程的异常。线程里未捕获异常会直接杀进程，所以记下来交给用例断言。</summary>
     public string? Fault { get; private set; }
 
@@ -73,7 +81,11 @@ internal sealed class RtuSlave : IDisposable
         {
             var frame = TryReadFrame();
             if (frame is null) continue;
-            lock (_lock) _requests.Add(frame);
+            lock (_lock)
+            {
+                _requests.Add(frame);
+                _requestStamps.Add(Stopwatch.GetTimestamp());
+            }
 
             if (Silent) continue;
 

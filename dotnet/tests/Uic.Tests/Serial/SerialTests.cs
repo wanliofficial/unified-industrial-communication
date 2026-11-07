@@ -28,9 +28,10 @@ internal static class SerialTests
         tests.Add(new TestCase("serial/read_returns_near_deadline", ReadReturnsNearDeadline));
         tests.Add(new TestCase("serial/close_interrupts_blocked_read", CloseInterruptsBlockedRead));
         tests.Add(new TestCase("serial/half_duplex_does_not_cross_responses", HalfDuplexDoesNotCrossResponses));
+        tests.Add(new TestCase("serial/rtu_waits_between_frames", RtuWaitsBetweenFrames));
     }
 
-    private static Channel SerialChannel(PtyPair pty, string protocol, int readTimeoutMs = 300, int maxConcurrency = 1) => new()
+    private static Channel SerialChannel(PtyPair pty, string protocol, int readTimeoutMs = 300, int maxConcurrency = 1, int baud = 9600) => new()
     {
         Id = "ser-1",
         Protocol = protocol,
@@ -41,7 +42,7 @@ internal static class SerialTests
         Serial = new SerialOptions
         {
             Port = pty.SlavePath,
-            Baud = 9600,
+            Baud = baud,
             DataBits = 8,
             Parity = "none",
             StopBits = "one",
@@ -309,6 +310,48 @@ internal static class SerialTests
                 t.Equal(want2, s2!.Value!.AsNumber(),
                     $"{deviceId}.p2 comes from its own unit, not the other one");
             }
+        });
+    }
+
+    /// <summary>
+    /// Modbus over Serial Line 要求两帧之间至少 3.5 个字符时间的静默。
+    /// 用 300 bps 把这段静默放大到约 128 ms：没有实现时两个事务间隔只有几毫秒，
+    /// 有实现时至少 100 ms，断言不会受调度抖动影响。
+    /// </summary>
+    private static Task RtuWaitsBetweenFrames(TestContext t)
+    {
+        return RunAsync(async () =>
+        {
+            using var pty = PtyPair.Open();
+
+            var model = new ModbusSlaveModel();
+            model.SeedHolding(100, 10, 11);
+
+            using var slave = new RtuSlave(pty, (1, model)) { ReplyDelay = TimeSpan.Zero };
+            slave.Start();
+
+            var channel = SerialChannel(pty, "modbus-rtu", readTimeoutMs: 500, baud: 300);
+            var device = Unit("unit-1", 1);
+            await using var conn = Open(channel, device, ModbusLink.Rtu);
+
+            var spans = Plan(device).ToArray();
+
+            var first = await conn.ReadAsync(spans, t.Ct);
+            var second = await conn.ReadAsync(spans, t.Ct);
+
+            t.Equal(Quality.Good, first[0].Quality, "the first transaction succeeds");
+            t.Equal(Quality.Good, second[0].Quality, "the second transaction succeeds");
+
+            await WaitForAsync(() => slave.RequestCount >= 2, t);
+
+            var stamps = slave.RequestStamps;
+            var gap = Stopwatch.GetElapsedTime(stamps[0], stamps[1]);
+
+            t.Ok(gap >= TimeSpan.FromMilliseconds(100),
+                $"consecutive requests are separated by 3.5 character times at 300 bps " +
+                $"(got {gap.TotalMilliseconds:F0} ms)");
+
+            t.Ok(slave.Fault is null, $"the fake slave stayed healthy: {slave.Fault}");
         });
     }
 
