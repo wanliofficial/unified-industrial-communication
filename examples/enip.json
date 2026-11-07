@@ -1,0 +1,100 @@
+{
+  "schemaVersion": 1,
+  "site": "enip-lab",
+  "server": {
+    "listen": "127.0.0.1:8089",
+    "token": "dev-token-0123456789"
+  },
+  "storage": {
+    "dir": "./data-enip",
+    "journal": true,
+    "outboxMaxRecords": 5000,
+    "outboxTtl": "10m"
+  },
+  "logging": {
+    "level": "info"
+  },
+  "northbound": {
+    "webhook": {
+      "enabled": false,
+      "url": "http://127.0.0.1:9999/ingest",
+      "timeout": "3s"
+    }
+  },
+  "channels": [
+    {
+      "id": "ch-enip",
+      "protocol": "enip",
+      "transport": {
+        "kind": "tcp",
+        "address": "127.0.0.1:44818"
+      },
+      "concurrency": 1,
+      "timeout": "2s"
+    }
+  ],
+  "devices": [
+    {
+      "id": "plc01",
+      "name": "一号 PLC（EtherNet/IP CIP 显式报文，8089）",
+      "channel": "ch-enip",
+      "interval": "1s",
+      "timeout": "2s",
+      "enabled": true,
+      "points": [
+        {
+          "id": "dint",
+          "name": "DINT_TAG（int32）",
+          "address": { "kind": "register", "area": "DINT_TAG", "offset": 0, "length": 0, "bit": -1 },
+          "dataType": "int32",
+          "enabled": true
+        },
+        {
+          "id": "int16",
+          "name": "INT_TAG（int16）",
+          "address": { "kind": "register", "area": "INT_TAG", "offset": 0, "length": 0, "bit": -1 },
+          "dataType": "int16",
+          "enabled": true
+        },
+        {
+          "id": "temp",
+          "name": "REAL_TAG 温度（float32，可写）",
+          "address": { "kind": "register", "area": "REAL_TAG", "offset": 0, "length": 0, "bit": -1 },
+          "dataType": "float32",
+          "unit": "degC",
+          "writable": true,
+          "enabled": true
+        },
+        {
+          "id": "run",
+          "name": "BOOL_TAG 运行标志",
+          "address": { "kind": "register", "area": "BOOL_TAG", "offset": 0, "length": 0, "bit": -1 },
+          "dataType": "bool",
+          "enabled": true
+        },
+        {
+          "id": "name",
+          "name": "STRING_TAG（字符串）",
+          "address": { "kind": "register", "area": "STRING_TAG", "offset": 0, "length": 0, "bit": -1 },
+          "dataType": "string",
+          "enabled": true
+        },
+        {
+          "id": "fault",
+          "name": "DINT_TAG 的 bit1（可写，验证 RMW 不清邻位）",
+          "address": { "kind": "register", "area": "DINT_TAG", "offset": 0, "bit": 1 },
+          "dataType": "bool",
+          "writable": true,
+          "enabled": true
+        },
+        {
+          "id": "counter",
+          "name": "COUNTER（每秒自增，用来看 SSE）",
+          "address": { "kind": "register", "area": "COUNTER", "offset": 0, "length": 0, "bit": -1 },
+          "dataType": "int32",
+          "enabled": true
+        }
+      ]
+    }
+  ]
+}

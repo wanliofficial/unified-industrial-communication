@@ -35,6 +35,7 @@ import (
 	"uic/internal/config"
 	"uic/internal/driver"
 	"uic/internal/driver/computed"
+	enipdrv "uic/internal/driver/enip"
 	finsdrv "uic/internal/driver/fins"
 	mcdrv "uic/internal/driver/mc"
 	"uic/internal/driver/modbus"
@@ -137,6 +138,7 @@ func RegisterBuiltins() error {
 			s7.New(), opcuadriver.New(), mqttdriver.New(), computed.New(), virtual.New(),
 			mcdrv.New(),
 			finsdrv.New(),
+			enipdrv.New(),
 		} {
 			if err := driver.Register(d); err != nil {
 				registerErr = err
