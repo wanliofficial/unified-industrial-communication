@@ -5,9 +5,9 @@
 | 项 | 数字 |
 |---|---|
 | 分析的参考方案 | 38 份（PA-01 … PA-38，其中 PA-06 合并了两个完全相同的仓库） |
-| 文档总量 | 55 份 Markdown / 18,357 行（含 3 份 ADR） |
-| 代码总量 | 155 个 Go 文件 / 63,364 行（其中测试 28,029 行 / 887 个测试函数） |
-| Go 包 | 37 个（1 个入口 + 36 个内部包；35 个有测试） |
+| 文档总量 | 55 份 Markdown / 18,475 行（含 3 份 ADR） |
+| 代码总量 | 167 个 Go 文件 / 66,097 行（其中测试 28,893 行 / 920 个测试函数） |
+| Go 包 | 39 个（1 个入口 + 38 个内部包；38 个有测试） |
 | 第三方依赖 | 0（仅标准库，零 CGO） |
 
 ---
@@ -107,6 +107,26 @@ curl -s localhost:8085/api/v1/points | jq '.items[] | {point, value, quality}'
 不是其它查询用的 `FF 09`；**上传的长度是 5 位十进制 ASCII**，分片以 `param[1]`
 判断是否最后一片。上传失败也会补一条 End——不释放 PLC 侧会话，反复重试几次
 就可能把上传会话耗尽。
+
+组态（模板实例化 + 点表 CSV 导入）：
+
+```bash
+# 模板库在 examples/templates/*.json（电表 / 变频器 / 温控器 / IO / 流量计 /
+# 冷水机组 / S7 PLC / S7 产线 / OPC UA 机床 / MQTT 传感器 / 计算点 KPI）
+./uic instantiate -template examples/templates/modbus-meter.json \
+    -param index=1 -param unitId=3 -channel ch-modbus -out meter-1.json
+
+# 点表 CSV：先预览，再写回整份配置
+./uic import -csv points.csv -device press -channel ch-modbus \
+    -config examples/modbus-loopback.json -dry-run
+./uic import -csv points.csv -device press -config examples/modbus-loopback.json \
+    -out config.new.json -replace
+```
+
+模板只做**整值替换**，不做算术：`{base + 2}` 不是合法占位符，需要偏移的点位
+各自声明参数。`int`/`float`/`bool` 参数在「整个字面量就是一个占位符」时落成
+JSON 数字/布尔。点表导入默认不覆盖已有点位：同 ID 内容不同即冲突，必须显式
+`-replace`；`-dry-run` 与真写共用同一份合并结果。
 
 OPC UA（二进制，SecurityPolicy None / 匿名）：
 
@@ -583,6 +603,8 @@ obs  ← 所有包（不依赖任何内部包）
 | `internal/alarm` | 报警引擎：五态机、阈值/滞回/延时、表达式规则（含历史窗口）、确认、订阅 | 输入不可信时绝不改状态机；延时是「连续满足」；`cleared` 与 `active` 都要确认；状态只在内存；窗口无样本时判 unknown 而不是「不满足」 | 93.8% |
 | `internal/history` | 有界采样日志：NDJSON 分段、整段淘汰、原始查询、定步长聚合与窗口摘要 | 一条记录不跨段；永远保留至少一段；末尾半行触发新段；查询升序、桶对齐、桶质量取最差；非数值点位不产出 `min/max/avg`；`WindowStats` 只统计 good 的数值样本，空窗口返回 `Count=0` 而非错误 | 84.0% |
 | `internal/calc` | 零依赖表达式引擎（编译期类型检查、短路求值、历史窗口聚合） | 无 `eval`；引用是 `device:point`；除零/NaN/Inf/溢出都报错而不是降级；窗口只允许 1s..24h，且只在第二个参数是时长时生效；窗口引用不进 `Refs()` | 92.7% |
+| `internal/template` | 设备模板：参数校验、字符串字面量替换、实例化后完整校验 | 占位符只替换字符串字面量且不做算术；整字面量是占位符时 int/float/bool 落成 JSON 数字/布尔；未知字段/参数/占位符与键里的占位符一律报错；必填缺失一次列全 | 92.5% |
+| `internal/pointtable` | 点表 CSV：列别名、地址表达式、按协议推导宽度、合并动作 | 列名大小写/空格/下划线不敏感；未知列报错；行错误带行号列名并聚合；重复 ID 是错误、重复地址是警告；`length` 先于地址解析；`#selector` 只允许 MQTT；默认拒绝静默覆盖 | 88.4% |
 | `internal/planner` | 点位 → 批量读请求（ReadSpan） | 协议无关；按连续性/上限合并；按 `area:db` 分组；计算点合成单个 `expr` span（漏组会表现为全坏且无日志） | 92.6% |
 | `internal/scheduler` | tick、actor、信号量、退避、熔断、代次 | 同设备不并发；写优先；旧代次丢弃；状态回调不占采集路径 | 88.1% |
 | `internal/pipeline` | 缩放、质量判定、死区过滤 | 质量不可用时不参与死区比较 | 92.7% |
@@ -597,7 +619,7 @@ obs  ← 所有包（不依赖任何内部包）
 | `internal/mqtt` | MQTT 3.1.1 客户端（北向发布 + 南向订阅共用，纯 Go 零依赖） | 单 goroutine 读 socket；QoS1 必须等到 PUBACK；`Ping` 必须等到 PINGRESP（写成功不算活着）；断线立即失败而非超时 | 70.3% |
 | `internal/mqtt/mqtttest` | 测试封装：`internal/sim/mqtt` 的 `*testing.T` 生命周期 + 等待断言 | 不另写 Broker（两份实现必然长歪）；开关一律走 setup 函数而非直接赋字段 | — |
 | `internal/runtime` | 唯一编排层 + 后端实现 + 看门狗 + 审计埋点 + 窗口缓存 | 启动/关闭顺序（失败逆序收口）；`configuredState` 与 `runtimeState` 分离；协议/传输匹配在装配期校验；只向驱动与报警引擎注入只读 `cache.Get` 与窗口数据源；北向 OPC UA 启停与热重建；凭据表热替换后旧用户立即失效 | 81.3% |
-| `cmd/uic` | 单入口：run / sim / mbread / uaread / s7blocks / s7upload / token / check / version | 关闭预算 10 秒；`uaread` 与 `mbread` 是不装第三方客户端即可自证链路的自检工具；块服务放在 CLI 而不是北向 API（动作重、数据大、归操作系统账号管） | — |
+| `cmd/uic` | 单入口：run / sim / mbread / uaread / s7blocks / s7upload / instantiate / import / token / check / version | 关闭预算 10 秒；`uaread` 与 `mbread` 是不装第三方客户端即可自证链路的自检工具；块服务放在 CLI 而不是北向 API（动作重、数据大、归操作系统账号管）；模板实例化与点表导入只产出文件，不在运行期动态生成设备 | — |
 
 ### 9.2 测试与验证命令
 
@@ -609,8 +631,8 @@ go test -race -count=1 ./...                    # 竞态 + 全量测试
 go test -coverprofile=c.out ./... && go tool cover -func=c.out | tail -1
 ```
 
-当前状态：`go build` / `go vet` / `gofmt` 全部干净，`go test -race ./...` 35 个测试包全部通过
-（另有 `cmd/uic` 与 `internal/mqtt/mqtttest` 两个无测试文件的包）。
+当前状态：`go build` / `go vet` / `gofmt` 全部干净，`go test -race ./...` 38 个测试包全部通过
+（仅 `internal/mqtt/mqtttest` 是纯测试辅助包，没有自己的测试文件）。
 
 ### 9.3 源码阅读建议顺序
 
@@ -634,6 +656,8 @@ go test -coverprofile=c.out ./... && go tool cover -func=c.out | tail -1
 17. internal/opcuaserver/server.go     服务端内核：两阶段写、标准节点、订阅分发（50 分钟）
 18. internal/northbound/opcua/northbound.go 点位表→地址空间、质量映射、写穿透（40 分钟）
 19. internal/codec/s7/block.go + driver/s7/session.go 有状态块服务：三段式上传与会话释放（40 分钟）
+20. internal/template/template.go 字符串字面量替换与「不做算术」的边界（30 分钟）
+21. internal/pointtable/address.go + csv.go 协议感知的地址解析与行错误聚合（40 分钟）
 ```
 
 ---
@@ -702,6 +726,8 @@ OPC UA 服务端（同一份点位表的另一个出口）：
 | S7 主站 | ✅ | TPKT/COTP/S7comm 分层；COTP 目的 TSAP 按 rack/slot 计算；Setup 协商 PDU 后按「20 项 / PDU 预算」切块；DB/I/Q/M/C/T 区读写与位访问；逐项返回码分类（越界/缺 DB→地址错、写输入区→权限错）；部分失败保留好样本 |
 | S7 块服务（目录 / 属性 / 上传） | ✅ | USER_DATA 组 0x03：列七类块数量、列某类型块号、读单块 78 字节属性；Job 0x1D/0x1E/0x1F 三段式上传（块长度是 5 位十进制 ASCII，分片以 `param[1]` 判最后一片，失败也补 End 释放 PLC 会话）；`uic s7blocks` / `uic s7upload` 可自检；单块上限 16MB |
 | S7 符号表 / 报警订阅 | ❌ | 符号寻址需要 S7 浏览服务，报警需要独立 PDU 通道；点位仍需手写地址 |
+| 设备模板库 / 实例化 | ✅ | `internal/template` + `uic instantiate` + `examples/templates/` 11 份模板；只做整值替换（无算术），实例化结果必须通过完整校验；模板库测试逐份实例化并跑 `model.Device.Validate` |
+| 点表 CSV 导入 | ✅ | `internal/pointtable` + `uic import`；列别名、协议感知的地址解析与长度推导、行错误聚合、new/unchanged/replaced/conflict 合并；默认拒绝静默覆盖 |
 | Modbus TCP 从站 | ✅ | `slaves[]` 存在即启用；四区（holding/input/coil/discrete）映射；跨映射与半值读；写穿透到 `Runtime.Write`；坏质量保留最后值并计入 `uic_slave_degraded_reads_total`；映射变化按指纹重建监听；`uic mbread` 可自检 |
 | Modbus RTU/ASCII 从站 | ✅ | `serial.port` + `serial.framing`（rtu/ascii）；RTU 按功能码推导帧长、推不出来时读到 3.5 字符静默（下限 5ms 对抗 USB 转发延迟）；ASCII 以 `:` 起始、CRLF 结束；非本机单元号静默、广播只写不回、CRC/LRC 错后 `tcflush` 重同步、半帧丢弃；USB 适配器掉线按 1s→2s→…→30s 退避重开；端口与主站通道及其他从站按字面路径互斥（配置期拒绝） |
 | Modbus 诊断与识别（FC8/FC11/FC17/FC43） | ✅ | FC8 子功能 0x0000 回显、0x000A 清计数、0x000B~0x0012 各类计数（TCP 上 CRC/字符层错误恒为 0）；FC11 事件计数器（自身不计数、异常不计数）；FC17 产品代码 + 运行指示 0xFF；FC43/MEI 0x0E 读设备标识（basic/regular/extended 与按对象 id 读取，响应超 253 字节时按 `more`/`nextObjectID` 分页）；身份标识由 `slave.identity` 配置，缺省也保证 basic 三件套非空；版本号取构建信息 |

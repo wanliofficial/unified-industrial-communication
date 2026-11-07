@@ -253,6 +253,27 @@ Token 在服务端先 SHA-256 再定长比较，配置可以只存 `tokenSha256`
 哪个点没写进去」。审计默认开启；写失败只计数（`uic_audit_write_errors_total`）
 并记 ERROR，绝不让磁盘满导致产线停摆。
 
+组态（模板实例化 + 点表 CSV 导入）：
+
+```bash
+# 模板库：examples/templates/*.json
+cat examples/templates/modbus-meter.json
+./uic instantiate -template examples/templates/modbus-meter.json \
+    -param index=1 -param unitId=3 -channel ch-modbus -out meter-1.json
+
+# 点表 CSV：先预览，再写回整份配置
+./uic import -csv points.csv -device press -channel ch-modbus \
+    -config examples/modbus-loopback.json -dry-run
+./uic import -csv points.csv -device press -channel ch-modbus \
+    -config examples/modbus-loopback.json -out config.new.json -replace
+```
+
+模板只做**整值替换**，不做算术：`{base + 2}` 不是合法占位符。需要偏移的点位
+各自声明参数。`int` / `float` / `bool` 参数在「整个字面量就是一个占位符」时落成
+JSON 数字/布尔，其余情况按字符串转义。点表导入默认**不覆盖**已有点位：同 ID
+内容不同即冲突，必须显式 `-replace`，避免「地址改了一半」把调好的缩放、死区、
+单位一起冲掉。`-dry-run` 与真正写入走同一份合并结果。
+
 ## 文档
 
 - **[docs/00-README.md](docs/00-README.md)** — 总索引：阅读路径、38 个参考方案总览、结论速查、代码地图、接口速查、实现边界
@@ -274,10 +295,12 @@ go test -race -count=1 ./...
 
 | 路径 | 内容 |
 |---|---|
-| `cmd/uic/` | 单入口：`run` / `sim`（Modbus / S7 / OPC UA / MQTT）/ `mbread` / `uaread` / `s7blocks` / `s7upload` / `token` / `-check` / `version` |
+| `cmd/uic/` | 单入口：`run` / `sim`（Modbus / S7 / OPC UA / MQTT）/ `mbread` / `uaread` / `s7blocks` / `s7upload` / `instantiate` / `import` / `token` / `-check` / `version` |
 | `internal/model` | 通道 / 设备 / 点位 / 地址 / 采样 / 质量码 |
 | `internal/driver` | 驱动契约（Codec / Transport / Driver）、错误分类、注册表、只读 `Lookup` 注入 |
 | `internal/calc` | 零依赖表达式引擎（编译期类型检查、短路求值、引用 `device:point`） |
+| `internal/template` | 设备模板：参数校验 / 字符串字面量替换 / 实例化后完整校验 |
+| `internal/pointtable` | 点表 CSV：列别名 / 地址表达式 / 按协议推导宽度 / 合并动作 |
 | `internal/alarm` | 报警引擎：五态机 / 滞回 / 延时 / 表达式规则 / 确认 / 订阅 |
 | `internal/history` | 有界采样日志：NDJSON 分段 / 整段淘汰 / 原始查询与定步长聚合 |
 | `internal/codec/modbus` | Modbus 纯函数编解码（主站与从站共用） |
@@ -300,7 +323,7 @@ go test -race -count=1 ./...
 | `internal/pipeline` | 缩放 / 质量 / 死区 |
 | `internal/cache` | 当前值唯一事实源 + 变更订阅 |
 | `internal/outbox` | 持久上报队列（分区 / WAL / 确认位点 / 三重上限） |
-| `internal/config` | 配置校验 / 内容哈希版本 / 快照 / 回滚 |
+| `internal/config` | 配置校验 / 内容哈希版本 / 快照 / 回滚 / 原子写 |
 | `internal/obs` | 指标 / 结构化日志 / 日志环形缓冲 |
 | `internal/rbac` | 角色 / 权限矩阵（viewer / operator / admin，按动作授权） |
 | `internal/auth` | 凭据表：Token → 身份；`Reloadable` 支持热替换；无凭据时 open 模式 |

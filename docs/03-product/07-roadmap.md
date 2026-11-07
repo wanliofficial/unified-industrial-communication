@@ -61,6 +61,8 @@ Wave 3（6 个月） 规模化：集中管理 + 进程外驱动 + 多站点 + �
 | 26 | 多身份认证 + RBAC + 操作审计（含 `uic token`） | 三个角色九项权限按**动作**定义，`viewer ⊆ operator ⊆ admin`，未知角色/权限一律拒绝；Token 先 SHA-256 再定长比较，配置可只存 `tokenSha256`，无凭据时进入 open 模式并在启动横幅与日志里明说；凭据表放在 `atomic.Pointer` 里整体替换，`server.users` 改动 apply 后**下一条请求**即按新表判定（删掉的用户立刻 401）；401（`result=error`）与 403（`result=denied`）在审计里区分；路由级权限写死在 `routes()` 里，高危命令（`outbox.drop`/`config.rollback`/`log.level`）在 handler 内二次判定；审计为 NDJSON 分段 + SHA-256 哈希链（`seq` 连续、字段「长度:内容」编码、整段淘汰后仍可验、半行触发新段），`/api/v1/audit` 可按用户/动作/结果/时间/关键字查询，`/audit/verify` 指出第一条不一致记录；审计默认开启，写失败只计数不阻断业务；`uic token` 生成 ≥16 字符随机 Token 并输出可直接粘贴的 `server.users` 片段 |
 | 27 | 历史窗口聚合（表达式里的 `avg(ref, 5m)`） | 计算点与报警规则共用同一套窗口语法：`avg/min/max/sum/count(ref, duration)`，窗口 1s..24h，单位 `ms/s/m/h`；只统计质量为 good 的数值样本（stale 与 bool/string 不计）；空窗口判失败而不是返回 0（计算点 bad、报警 unknown）；窗口引用不进 `Refs()`，因此不与当前值构成环；配置期校验历史已开启、引用存在且为数值、窗口不超过 `maxAge`；runtime 适配层带 TTL 缓存（`clamp(window/60, 1s, 30s)`，空窗口 1s，错误也缓存），让 200ms 报警兜底扫描不会打满磁盘 |
 | 28 | S7 块服务（目录 / 属性 / 上传，含 `uic s7blocks`/`s7upload`） | 修正 S7 头长度：ACK/ACK_DATA 为 12 字节（多 error class/code），Job/UserData 为 10 字节；USER_DATA 组 0x03 实现 ListAll（数据区 `0A 00 0000`）、ListBlocksOfType、BlockInfo（78 字节属性，块号 5 位 ASCII）；Job 0x1D/0x1E/0x1F 实现三段式上传，分片以 `param[1]` 判最后一片、块长度取 5 位十进制 ASCII、失败也补 End 释放 PLC 会话；单块上限 16MB/65536 片；`Session` 一次性连接不进调度；内置从站同步支持，`uic s7blocks`/`s7upload` 可无第三方工具自检 |
+| 29 | 设备模板库 + 实例化（含 `uic instantiate`） | 占位符 `{name}` 只替换字符串字面量、**不做算术**；整字面量是占位符时 int/float/bool 落成 JSON 数字/布尔；参数名允许 camelCase；未知字段/参数/占位符、键里的占位符、默认值类型不符一律在模板加载期报错；必填缺失一次列全；实例 `templateId` 记录来源；`examples/templates` 提供 11 份可校验模板，库测试逐份实例化并跑 `model.Device.Validate`；`uic instantiate` 只生成文件，不在运行期动态生成设备 |
+| 30 | 点表 CSV 导入（含 `uic import`） | 列名大小写/空格/下划线不敏感，支持中英文别名，未知列报错；`point/address/type` 必填；行错误带行号列名并聚合（前 8 条 + 其余计数）；重复点位 ID 是错误、重复地址只是警告；`length` 列先于地址解析，字符串/字节类型能只写偏移；协议决定地址种类与宽度（Modbus 寄存器数 / S7 字节数 / 未知协议必须显式 length）；`#selector` 只允许 MQTT；合并动作为 new/unchanged/replaced/conflict，默认拒绝静默覆盖，`-dry-run` 与真写共用同一份结果 |
 
 ### 2.3 出口标准
 
@@ -134,7 +136,7 @@ curl -N localhost:8080/api/v1/stream?points=virtual-01/sine
 | 数据 | 有界采样历史库（NDJSON 分段，已落地）+ 降采样 + 保留策略 + 历史查询 API + 窗口聚合（`avg(ref, 5m)`，已落地） | 全部 |
 | 语义 | 单位/量程、计算点、报警判定（阈值/延时/组合） | 全部 |
 | 运维 | RBAC（3 角色）、审计查询/导出、诊断包、网络诊断、远程配置下发 | 无人值守 |
-| 组态 | 设备模板库（≥ 10 个）、点表 CSV 导入、批量实例化 | 集成商 |
+| 组态 | 设备模板库（≥ 10 个，已落地）、点表 CSV 导入（已落地）、批量实例化（`uic instantiate` 已落地） | 集成商 |
 | 安全 | 证书管理、API Token 管理、审计完整性 | 政企 |
 | 测试 | 负载测试（1000 设备）、驱动一致性扩展 | 全部 |
 

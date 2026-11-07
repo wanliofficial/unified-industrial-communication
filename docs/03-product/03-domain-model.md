@@ -815,25 +815,35 @@ type WindowStats struct {
 
 ---
 
-## 13. 模板（Template）
+## 13. 模板与点表导入（组态入口）
+
+### 13.1 设备模板（Template）
 
 ```json
 {
   "id": "modbus-meter",
+  "name": "三相电表（Modbus）",
   "protocol": "modbus-tcp",
   "parameters": [
-    { "name": "host", "type": "string", "required": true },
+    { "name": "index", "type": "string", "required": true },
     { "name": "unitId", "type": "int", "default": 1 },
-    { "name": "base", "type": "int", "default": 0 }
+    { "name": "base", "type": "int", "default": 0 },
+    { "name": "ratio", "type": "float", "default": 0.1 },
+    { "name": "enabled", "type": "bool", "default": true }
   ],
   "device": {
     "id": "meter-{index}",
+    "name": "电表 {index}",
+    "unitId": "{unitId}",
+    "enabled": "{enabled}",
     "interval": "5s",
     "points": [
       {
         "id": "voltage",
+        "name": "电压 {index}",
         "address": { "kind": "register", "area": "holding", "offset": "{base}", "length": 2, "bit": -1 },
-        "dataType": "float32", "byteOrder": "CDAB", "unit": "V"
+        "dataType": "float32", "byteOrder": "CDAB", "unit": "V", "scale": "{ratio}",
+        "enabled": true
       }
     ]
   }
@@ -842,10 +852,89 @@ type WindowStats struct {
 
 **规则**：
 
-1. 参数替换只发生在**字符串字面量**中，不执行表达式（避免注入）；
-2. 数值参数参与 `offset` 计算时必须是整数；
-3. 实例化后必须通过完整校验（等价于手工配置）；
-4. 模板定义与实例配置分开存储，模板变更不影响已实例化的设备（除非显式「同步模板」）。
+1. 占位符语法是 `{name}`，名称匹配 `[A-Za-z][A-Za-z0-9_]{0,31}`（允许 `unitId` 这类 camelCase）。
+2. 参数替换只发生在**字符串字面量**中，**不做任何算术**。`{base + 2}` 不是合法的占位符；需要偏移的点位各自声明参数（或多写几个参数）。模板是数据，不是程序——一旦允许表达式，模板就变成一门需要调试的语言。
+3. 当**整个字面量恰好是一个占位符**时，`int`/`float`/`bool` 参数落成 JSON 数字/布尔（`"unitId": "{unitId}"` → `"unitId": 1`）；`string` 参数仍落成 JSON 字符串，并按 JSON 规则转义。
+4. 占位符出现在**对象的键**里直接报错：键必须字面量，否则生成的结构不可预测。
+5. 未知字段、未知参数、未声明的占位符一律报错。拼错的键（`paramters`）被静默忽略，会让「为什么参数没生效」变成考古。
+6. 默认值的 JSON 类型必须与参数类型一致：`string` 要求 `"default": "abc"`，`int` 要求 `"default": 1`。`"default": "2"` 在整数参数上不是「凑合能用」，而是错误。
+7. 必填参数缺失时，错误信息一次列出**全部**缺失项，而不是只报第一个。
+8. 实例化后必须通过完整校验（等价于手工配置）；`channel` 不在模板里时由 `-channel` 提供。
+9. 实例的 `templateId` 记录来源模板；模板定义与实例配置分开存储，模板变更不影响已实例化的设备。
+
+**位置**：
+
+| 内容 | 路径 |
+|---|---|
+| 实现 | `internal/template`（`Parse` / `Load` / `Validate` / `Placeholders` / `Instantiate`） |
+| 模板库 | `examples/templates/*.json`（≥10 份：电表、变频器、温控器、IO、流量计、冷水机组、S7 PLC、S7 产线、OPC UA 机床、MQTT 传感器、计算点 KPI） |
+| CLI | `uic instantiate -template ... -param k=v -channel ... [-out file] [-json]` |
+
+CLI 只输出文件，**不**把设备直接塞进运行期配置：在运行期按模板动态生成设备会让配置随时间漂移，热更新与回滚都失去意义。
+
+### 13.2 点表 CSV 导入
+
+现场拿到的通常是一份 Excel。导入器负责把它变成 `[]model.Point`，并在写入配置之前把静态错误全部报出来。
+
+**列**（大小写不敏感；空格、`_`、`-` 会被忽略；支持中英文别名）：
+
+| 规范列 | 别名示例 | 必填 | 说明 |
+|---|---|---|---|
+| `point` | `id` / `pointId` / `点位` / `点号` | 是 | 点位 ID，必须匹配 `^[a-z0-9][a-z0-9._-]{0,63}$` |
+| `address` | `addr` / `地址` | 是 | 地址表达式，见下 |
+| `type` | `dataType` / `数据类型` / `类型` | 是 | 平台数据类型 |
+| `name` | `名称` | 否 | 显示名 |
+| `unit` | `单位` | 否 | 工程单位 |
+| `scale` / `bias` / `deadband` | `系数` / `偏置` / `死区` | 否 | 浮点；`scale=0` 报错（省略才表示 1） |
+| `writable` | `可写` | 否 | `true/false/yes/no/1/0`，默认 `false` |
+| `enabled` | `启用` | 否 | 默认 `true` |
+| `byteOrder` | `字节序` | 否 | `ABCD/CDAB/BADC/DCBA` |
+| `interval` | `周期` | 否 | 设备周期的覆盖值，≥ 100ms |
+| `length` | `长度` | 否 | 寄存器宽度；字符串/字节类型必填 |
+| `description` | `desc` / `描述` | 否 | 备注 |
+
+**地址表达式**（与 `model.Address.Canonical()` 对齐）：
+
+```
+holding:100[.bit][:length]      Modbus 保持寄存器
+input:7 / coil:5 / discrete:9   Modbus 其他区
+db1:0[.bit][:length]            S7 数据块
+db:1:0:2                        S7 数据块的另一种写法
+input:0 / output:0 / merker:0   S7 其他区
+ns=2;s=Plant.Temp              OPC UA 符号
+plant/line1#data.temp          MQTT 主题 + 载荷字段选择器
+analogInput:1.presentValue     对象地址
+file:1/0:5                     文件/记录地址
+expr:line-a:power / line-a:rate 计算点表达式
+```
+
+- 协议决定地址种类与长度推导：Modbus 的 `length` 是寄存器个数（1 个 = 16 位），S7 的是字节数。字符串/字节类型没有可推导宽度，必须显式给出。
+- `#selector` 只允许 MQTT（以及 `virtual` 这类复合协议）；贴到 OPC UA 列上会在导入时报错。
+- 未知协议要求显式 `length`：宁可让人写清楚，也不猜一个宽度去读真实设备。
+
+**错误与警告**：
+
+- 行错误带行号与列名，一次性聚合（前 8 条展开 + 其余计数）；一行出错不影响其它行继续解析。
+- 同一设备内**重复点位 ID 是错误**；**重复地址只是警告**（两个点读同一地址有时是有意的，例如不同缩放/单位）。
+- `length` 与类型宽度不一致、地址里与 `length` 列同时给出且不同，分别是警告与错误。
+
+**合并策略**（`uic import`）：
+
+| 动作 | 触发 | 行为 |
+|---|---|---|
+| `new` | 点位 ID 不存在 | 追加 |
+| `unchanged` | 内容完全一致 | 保持原样（幂等重导） |
+| `replaced` | 内容不同 + `-replace` | 覆盖，并在摘要里列出差异字段 |
+| `conflict` | 内容不同 + 无 `-replace` | 整体失败，提示用 `-replace` |
+
+默认拒绝覆盖，是因为点表导入最常见的破坏是「地址改了一半」；静默覆盖会让已经调好的缩放、死区、单位一起消失。`-dry-run` 与真正写入走同一份合并结果，预览不会和实际结果分叉。
+
+**位置**：
+
+| 内容 | 路径 |
+|---|---|
+| 实现 | `internal/pointtable`（`ParseCSV` / `ParseAddress` / `ParseAddressWithLength` / `Merge`） |
+| CLI | `uic import -csv ... -device ... [-channel ...] [-protocol ...] [-config base.json] [-out file] [-replace] [-dry-run] [-json]` |
 
 ---
 
