@@ -545,3 +545,61 @@ func TestErrTextAndHash(t *testing.T) {
 		t.Fatalf("hash unstable: %q %q %q", a, b, c)
 	}
 }
+
+// 写入时省略 value.type：运行时按点位 dataType 补齐。回读确认必须用
+// 「补齐后的值」比较，否则空类型永远不等于读回类型，一次成功的写入会被
+// 报成 uncertain——前端看到的提示是「读回值不一致」，而设备里其实已经写进去了。
+func TestWriteConfirmWithoutExplicitType(t *testing.T) {
+	h := newHarness(t, nil)
+	h.waitPointGood("sim01", "write_me")
+
+	code, body := h.do(http.MethodPost, "/api/v1/points/sim01/write",
+		`{"writes":[{"point":"write_me","value":{"num":321},"confirm":true}]}`)
+	if code != 200 {
+		t.Fatalf("write = %d %s", code, body)
+	}
+	var wr struct {
+		Results []httpapi.WriteResult `json:"results"`
+	}
+	if err := json.Unmarshal(body, &wr); err != nil {
+		t.Fatal(err)
+	}
+	if len(wr.Results) != 1 || !wr.Results[0].OK {
+		t.Fatalf("results = %+v", wr.Results)
+	}
+	if wr.Results[0].Quality != model.QualityGood {
+		t.Fatalf("quality = %s (%s)", wr.Results[0].Quality, wr.Results[0].Message)
+	}
+	if got := h.sim.Holding(5); got != 321 {
+		t.Fatalf("sim holding[5] = %d, want 321", got)
+	}
+}
+
+func TestValuesMatch(t *testing.T) {
+	num := func(typ model.DataType, v float64) model.Value { return model.NumValue(typ, v) }
+	cases := []struct {
+		name string
+		got  model.Value
+		want model.Value
+		ok   bool
+	}{
+		{"identical int", num(model.TypeUint16, 777), num(model.TypeUint16, 777), true},
+		{"different int", num(model.TypeUint16, 778), num(model.TypeUint16, 777), false},
+		{"int vs float tag", num(model.TypeFloat32, 62), num(model.TypeUint32, 62), true},
+		{"float32 rounding", num(model.TypeFloat32, 0.10000000149011612), num(model.TypeFloat32, 0.1), true},
+		{"float32 real difference", num(model.TypeFloat32, 0.11), num(model.TypeFloat32, 0.1), false},
+		{"float64 rounding", num(model.TypeFloat64, 0.30000000000000004), num(model.TypeFloat64, 0.3), true},
+		{"bool same", model.BoolValue(true), model.BoolValue(true), true},
+		{"bool differs", model.BoolValue(false), model.BoolValue(true), false},
+		{"bool vs number", num(model.TypeUint16, 1), model.BoolValue(true), false},
+		{"string same", model.TextValue(model.TypeString, "PUMP-01"), model.TextValue(model.TypeString, "PUMP-01"), true},
+		{"string differs", model.TextValue(model.TypeString, "PUMP-02"), model.TextValue(model.TypeString, "PUMP-01"), false},
+		{"string vs bytes", model.BytesValue([]byte("x")), model.TextValue(model.TypeString, "x"), false},
+		{"empty type", num("", 1), num("", 1), true},
+	}
+	for _, tc := range cases {
+		if got := valuesMatch(tc.got, tc.want); got != tc.ok {
+			t.Fatalf("%s: valuesMatch = %v, want %v", tc.name, got, tc.ok)
+		}
+	}
+}

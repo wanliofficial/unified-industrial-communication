@@ -2,6 +2,7 @@ package runtime
 
 import (
 	"context"
+	"math"
 	"sync"
 	"time"
 
@@ -356,9 +357,13 @@ func (c *collector) write(ctx context.Context, reqs []preparedWrite, confirm boo
 			Point: wr.PointID, OK: true, Quality: model.QualityUncertain, AppliedAt: &at,
 		}
 		// 乐观更新：让 UI/SSE 立刻看到目标值，下一次采集负责确认。
+		//
+		// 必须用 req.Value 而不是 item.Value：调用方可以省略 value.type，
+		// 由运行时按点位 dataType 补齐。item.Value 是补之前的原始请求，
+		// 拿它写进缓存会得到一个「没有类型」的采样。
 		c.rt.cache.Set(model.Sample{
 			DeviceID: c.dev.ID, PointID: wr.PointID,
-			Value: reqs[i].item.Value, Quality: model.QualityUncertain,
+			Value: reqs[i].req.Value, Quality: model.QualityUncertain,
 			CollectedAt: now, Seq: c.seq, Unit: reqs[i].pt.Unit,
 		})
 	}
@@ -395,7 +400,7 @@ func (c *collector) confirm(ctx context.Context, reqs []preparedWrite, results [
 			continue
 		}
 		got := raws[0]
-		if got.Quality.IsUsable() && got.Value.Equal(p.item.Value) {
+		if got.Quality.IsUsable() && valuesMatch(got.Value, p.req.Value) {
 			results[i].Quality = model.QualityGood
 			c.rt.cache.Set(model.Sample{
 				DeviceID: c.dev.ID, PointID: p.item.Point, Value: got.Value,
@@ -410,4 +415,47 @@ func (c *collector) confirm(ctx context.Context, reqs []preparedWrite, results [
 			Quality: model.QualityUncertain, CollectedAt: at, Seq: c.seq, Unit: p.pt.Unit,
 		})
 	}
+}
+
+// valuesMatch 判断读回值是否等于刚写入的值。
+//
+// 不能直接用 Value.Equal 做逐位比较，两点原因：
+//
+//  1. 调用方可以省略 value.type，由运行时按点位 dataType 补齐。要比较的
+//     是「补齐后的请求值」，而不是原始 JSON——否则空类型永远不等于读回
+//     类型，每次写都报「读回不一致」。
+//  2. 设备把浮点存成 32/64 位。写入 0.1 读回 0.10000000149 是正常的
+//     二次舍入，逐位相等会把一次成功写入报成 uncertain。
+//
+// 布尔与字符串保持严格：`true` 读成 `false`、`on` 读成 `on ` 都是真问题，
+// 放宽只会把它掩盖成「已写入」。
+func valuesMatch(got, want model.Value) bool {
+	switch want.Type {
+	case model.TypeBool:
+		return got.Type == want.Type && got.Bool == want.Bool
+	case model.TypeString, model.TypeBytes:
+		return got.Type == want.Type && got.Text == want.Text
+	}
+	if !want.Type.IsNumeric() || !got.Type.IsNumeric() {
+		return want.Type == got.Type && got.Equal(want)
+	}
+	var eps float64
+	switch want.Type {
+	case model.TypeFloat32:
+		// float32 的有效位约 7 位十进制，1e-6 留一位余量。
+		eps = 1e-6
+	case model.TypeFloat64:
+		eps = 1e-12
+	case model.TypeBCD16, model.TypeBCD32:
+		eps = 1e-6
+	default:
+		// 整数：必须完全相等。读回 777.0000001 说明设备做了缩放，
+		// 那不是这次写入的值。
+		return got.Num == want.Num
+	}
+	scale := math.Abs(want.Num)
+	if scale < 1 {
+		scale = 1
+	}
+	return math.Abs(got.Num-want.Num) <= eps*scale
 }
