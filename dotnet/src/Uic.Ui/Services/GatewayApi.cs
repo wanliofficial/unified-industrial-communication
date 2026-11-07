@@ -352,7 +352,7 @@ public sealed record DataValueDto(string Type, double? Num, bool? Bool, string? 
     public string Display => Type switch
     {
         "bool" => Bool == true ? "true" : Bool == false ? "false" : "—",
-        "string" or "bytes" => Text ?? "—",
+        "string" or "bytes" or "datetime" => Text ?? "—",
         _ => Num is { } n
             ? Math.Abs(n - Math.Round(n)) < 1e-9
                 ? n.ToString("0", System.Globalization.CultureInfo.InvariantCulture)

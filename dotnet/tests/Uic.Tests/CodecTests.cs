@@ -18,6 +18,7 @@ internal static class CodecTests
         tests.Add(new TestCase("codec/byte_order_encodes_as_expected", ByteOrderEncodesAsExpected));
         tests.Add(new TestCase("codec/byte_order_roundtrip", ByteOrderRoundtrip));
         tests.Add(new TestCase("codec/bcd_roundtrip", BcdRoundtrip));
+        tests.Add(new TestCase("codec/datetime_is_unix_milliseconds", DateTimeIsUnixMilliseconds));
         tests.Add(new TestCase("codec/window_rejects_invalid_spans", WindowRejectsInvalidSpans));
         tests.Add(new TestCase("codec/window_merges_and_measures", WindowMergesAndMeasures));
         tests.Add(new TestCase("codec/write_rejects_readonly_and_bit_mismatch", WriteRejectsReadOnlyAndBitMismatch));
@@ -100,6 +101,45 @@ internal static class CodecTests
         t.Throws<FormatException>(
             () => ValueCodec.Decode(Convert.FromHexString("1A34"), DataType.Bcd16, ByteOrder.ABCD),
             "bcd with a non-decimal nibble");
+
+        return Task.CompletedTask;
+    }
+
+    /// <summary>
+    /// 时间型点位按现场最常见的约定编解码：4 个寄存器里的 int64 Unix 毫秒（UTC）。
+    /// 用 Montgomery 之外的固定时刻断言字节，确保「大端 + 毫秒」不会被悄悄改成秒或本地时间。
+    /// </summary>
+    private static Task DateTimeIsUnixMilliseconds(TestContext t)
+    {
+        var local = new DateTimeOffset(2026, 11, 5, 20, 47, 46, 123, TimeSpan.FromHours(8));
+        var value = DataValue.DateTime(local);
+
+        t.Equal(DataType.DateTime, value.Type, "datetime factory sets the type");
+        t.Equal("2026-11-05T12:47:46.123Z", value.Text, "the value is normalized to ISO-8601 UTC");
+        t.Equal(4, DataType.DateTime.Registers(), "datetime occupies four registers");
+        t.Ok(!DataType.DateTime.IsNumeric(), "datetime is not a numeric type, so scaling does not apply");
+
+        var raw = ValueCodec.Encode(value, DataType.DateTime, ByteOrder.ABCD, 4);
+        t.Equal("000001A1ABC041CB", Hex(raw), "int64 unix milliseconds, big-endian");
+
+        var decoded = ValueCodec.Decode(raw, DataType.DateTime, ByteOrder.ABCD);
+        t.Equal("2026-11-05T12:47:46.123Z", decoded.Text, "decode returns the same instant");
+        t.Ok(decoded.Matches(value), "encoder and decoder agree");
+
+        // 四态字节序同样适用于 64 位时间值；只验证往返，具体排列与 Int64 一致。
+        foreach (var order in Enum.GetValues<ByteOrder>())
+        {
+            var round = ValueCodec.Decode(
+                ValueCodec.Encode(value, DataType.DateTime, order, 4), DataType.DateTime, order);
+            t.Ok(round.Matches(value), $"{order}: datetime round-trips");
+        }
+
+        // 文本坏了必须报错：写成 0 会变成 1970-01-01，在趋势图上看起来像合法读数。
+        t.Throws<FormatException>(
+            () => ValueCodec.Encode(
+                new DataValue { Type = DataType.DateTime, Text = "not-a-timestamp" },
+                DataType.DateTime, ByteOrder.ABCD, 4),
+            "an invalid datetime is rejected instead of encoded as the epoch");
 
         return Task.CompletedTask;
     }

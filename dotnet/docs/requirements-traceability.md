@@ -11,7 +11,7 @@
 它们不是 §6.1「不做」清单里的项，属于真实缺口；逐协议现状、原因与补法见
 [protocol-status.md](protocol-status.md)。
 
-当前测试基线：**163 passed / 0 failed / 1 skipped**（跳过的是需要 `--opcua` 的 OPC UA 端到端用例）。
+当前测试基线：**164 passed / 0 failed / 1 skipped**（跳过的是需要 `--opcua` 的 OPC UA 端到端用例）。
 
 ## 1. 采集（FR-COL）
 
@@ -35,7 +35,7 @@
 | 编号 | 需求 | 状态 | 证据 / 说明 |
 |---|---|---|---|
 | FR-CFG-01 | 四类寻址统一模型 | 部分实现 | `Address` 已含 register/symbol/object/file 四类字段与校验；**只有 register 有驱动实现**，其余三类是扩展点 |
-| FR-CFG-02 | 数据类型系统（≥8 类，含数组） | 部分实现 | 12 种标量类型（bool/int/uint 16/32/64/float 32/64/string/BCD16/BCD32/bytes）；**datetime 与数组未做** |
+| FR-CFG-02 | 数据类型系统（≥8 类，含数组） | 部分实现 | 13 种标量类型（bool/int/uint 16/32/64/float 32/64/string/BCD16/BCD32/bytes/datetime）；datetime 固定 4 寄存器 int64 Unix 毫秒 UTC，北向用 ISO-8601 UTC 文本：`codec/datetime_is_unix_milliseconds`、`json/datavalue_wire_shape_is_stable`、`opcua/anonymous_session_read_write_subscribe`。**数组未做** |
 | FR-CFG-03 | 字节序 ABCD/CDAB/BADC/DCBA | 已实现 | `codec/byte_order_encodes_as_expected`、`codec/byte_order_roundtrip`、`json/enums_are_lowercase_wire_names` |
 | FR-CFG-04 | 设备模板 + 参数化实例化（≥50 实例） | 已实现 | `template/instantiate_fifty_devices`（50 个实例逐个断言）、`contract/template_instantiates_and_applies_devices`、`template/rejects_bad_parameters`、`template/store_rejects_unknown_placeholder` |
 | FR-CFG-05 | 点表 CSV 导入（地址表达式 + 命名规则） | 已实现 | `csv/address_expressions`、`csv/import_merges_and_reports_conflicts`、`contract/points_csv_import_previews_and_applies`；支持 `40001` / `holding:100` / 分列三种写法 |

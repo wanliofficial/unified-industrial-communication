@@ -112,6 +112,7 @@ internal static class JsonTests
                      DataValue.Number(DataType.Float64, -0.125),
                      DataValue.Boolean(true),
                      DataValue.String("运行"),
+                     DataValue.DateTime(new DateTimeOffset(2026, 11, 5, 12, 47, 46, 123, TimeSpan.Zero)),
                  })
         {
             var json = JsonSerializer.Serialize(value, JsonDefaults.Options);
@@ -150,6 +151,13 @@ internal static class JsonTests
         // 未使用的字段不写空值：消费方用「字段存在性」判断类型是常见做法。
         t.Ok(!JsonSerializer.Serialize(DataValue.Boolean(false), JsonDefaults.Options).Contains("num"),
             "no stray num field");
+
+        // 时间值走 text 字段，且固定为 UTC + Z：消费方不必猜时区。
+        t.Equal("{\"type\":\"datetime\",\"text\":\"2026-11-05T12:47:46.123Z\"}",
+            JsonSerializer.Serialize(
+                DataValue.DateTime(new DateTimeOffset(2026, 11, 5, 20, 47, 46, 123, TimeSpan.FromHours(8))),
+                JsonDefaults.Options),
+            "datetime shape");
 
         return Task.CompletedTask;
     }

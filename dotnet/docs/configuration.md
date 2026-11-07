@@ -222,9 +222,13 @@ RTU/ASCII 主站按 3.5 个字符时间做帧间静默（9600 bps 约 4 ms；>19
 ### 数据类型
 
 `bool`、`int16`、`uint16`、`int32`、`uint32`、`int64`、`uint64`、
-`float32`、`float64`、`string`、`bcd16`、`bcd32`、`bytes`。
+`float32`、`float64`、`string`、`bcd16`、`bcd32`、`bytes`、`datetime`。
 
 写法和北向值里的 `type` 完全一样（小写）。旧版本配置文件里的 `uInt16` 之类的拼写仍能读入。
+
+`datetime` 固定占 4 个寄存器，线上编码是有符号 64 位 Unix 毫秒（UTC），字节序同样受
+`byteOrder` 影响；北向值用 ISO-8601 UTC 文本（`2026-11-05T12:47:46.123Z`）表示，
+消费方不必猜时区或单位。写入非法时间会直接报错，不会退化成 1970-01-01。
 
 ### 字节序
 

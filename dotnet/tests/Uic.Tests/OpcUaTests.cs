@@ -113,6 +113,34 @@ internal static class OpcUaTests
             t.Close(77.5, Convert.ToDouble(after.Value, System.Globalization.CultureInfo.InvariantCulture),
                 1e-6, "the written value is read back");
 
+            // ---- datetime：必须映射成 OPC UA DateTime，而不是数字或字符串 ----
+            var stampId = new NodeId($"{site}.v1.stamp", uicNode.NamespaceIndex);
+            var stamp = ReadEventually(session, stampId, t);
+
+            t.Ok(StatusCode.IsGood(stamp.StatusCode), $"read {stampId} ({stamp.StatusCode})");
+            t.Ok(stamp.Value is DateTime, $"datetime points surface as DateTime (got {stamp.Value?.GetType().Name})");
+
+            var readAt = ((DateTime)stamp.Value!).ToUniversalTime();
+            t.Ok(Math.Abs((DateTime.UtcNow - readAt).TotalMinutes) < 5,
+                $"the virtual device reports a current timestamp (got {readAt:O})");
+
+            // 写回一个固定时刻：FromClr 必须按 UTC 解释，写后回读要得到同一毫秒。
+            var fixedAt = new DateTime(2026, 11, 5, 12, 47, 46, 123, DateTimeKind.Utc);
+            var stampWrite = new WriteValue
+            {
+                NodeId = stampId,
+                AttributeId = Attributes.Value,
+                Value = new Opc.Ua.DataValue(new Variant(fixedAt)) { StatusCode = StatusCodes.Good },
+            };
+
+            session.Write(null, new WriteValueCollection { stampWrite }, out var stampStatuses, out _);
+            t.Ok(StatusCode.IsGood(stampStatuses[0]), $"write {stampId} ({stampStatuses[0]})");
+
+            var stampBack = ReadEventually(session, stampId, t,
+                accept: v => v is DateTime dt && dt.ToUniversalTime() == fixedAt);
+            t.Ok(stampBack.Value is DateTime back && back.ToUniversalTime() == fixedAt,
+                $"the written datetime is read back (got {stampBack.Value})");
+
             // ---- 订阅 ----
             var subscription = new Subscription(session.DefaultSubscription)
             {
@@ -165,7 +193,8 @@ internal static class OpcUaTests
         }
     }
 
-    private static Opc.Ua.DataValue ReadEventually(Session session, NodeId id, TestContext t, double? expected = null)
+    private static Opc.Ua.DataValue ReadEventually(
+        Session session, NodeId id, TestContext t, double? expected = null, Func<object?, bool>? accept = null)
     {
         var value = session.ReadValue(id);
         var deadline = Stopwatch.StartNew();
@@ -174,10 +203,15 @@ internal static class OpcUaTests
         {
             if (StatusCode.IsGood(value.StatusCode) && value.Value is not null)
             {
-                if (expected is null) return value;
+                if (expected is null && accept is null) return value;
+                if (accept is not null && accept(value.Value)) return value;
 
-                var actual = Convert.ToDouble(value.Value, System.Globalization.CultureInfo.InvariantCulture);
-                if (Math.Abs(actual - expected.Value) <= 1e-6 * Math.Max(1, Math.Abs(expected.Value))) return value;
+                if (expected is not null)
+                {
+                    var actual = Convert.ToDouble(value.Value, System.Globalization.CultureInfo.InvariantCulture);
+                    if (Math.Abs(actual - expected.Value) <= 1e-6 * Math.Max(1, Math.Abs(expected.Value)))
+                        return value;
+                }
             }
 
             Thread.Sleep(50);
@@ -325,6 +359,13 @@ internal static class OpcUaTests
                         Name = "标志位",
                         Address = Address.Register("coil", 0),
                         DataType = DataType.Bool,
+                    },
+                    new()
+                    {
+                        Id = "stamp",
+                        Name = "采集时间戳",
+                        Address = Address.Register("holding", 10),
+                        DataType = DataType.DateTime,
                     },
                 },
             },

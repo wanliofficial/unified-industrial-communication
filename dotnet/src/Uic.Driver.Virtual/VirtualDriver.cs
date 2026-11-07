@@ -183,6 +183,8 @@ internal sealed class VirtualConn : IConn
             DataType.Bool => DataValue.Boolean(raw > _baseline),
             DataType.Float32 or DataType.Float64 => DataValue.Number(p.DataType, raw),
             DataType.String => DataValue.String($"dev-{_device.Id}-{p.Id}"),
+            // 时间型点位给当前时刻：让北向消费者能直接看到「最近一次采集时间」这类值。
+            DataType.DateTime => DataValue.DateTime(DateTimeOffset.UtcNow),
             _ => DataValue.Number(p.DataType, Math.Round(raw)),
         };
     }

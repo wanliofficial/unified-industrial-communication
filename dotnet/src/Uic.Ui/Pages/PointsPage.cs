@@ -330,6 +330,21 @@ public sealed class PointsPage : IPage, IDisposable
                 value = new DataValueDto(type, null, null, raw);
                 return true;
 
+            case "datetime":
+                if (!DateTimeOffset.TryParse(raw, culture,
+                        System.Globalization.DateTimeStyles.AssumeUniversal |
+                        System.Globalization.DateTimeStyles.AdjustToUniversal,
+                        out var instant))
+                {
+                    error = "datetime 点位请填 ISO-8601 时间，例如 2026-11-05T12:47:46.123Z。";
+                    return false;
+                }
+
+                // 统一成北向契约的 UTC 毫秒写法，不把本地时区带出去。
+                value = new DataValueDto(type, null, null, instant.ToUniversalTime().ToString(
+                    "yyyy-MM-ddTHH:mm:ss.fffZ", culture));
+                return true;
+
             case "bcd16" or "bcd32":
             case "int16" or "uint16" or "int32" or "uint32" or "int64" or "uint64":
                 if (!long.TryParse(raw, System.Globalization.NumberStyles.Integer, culture, out var integer))

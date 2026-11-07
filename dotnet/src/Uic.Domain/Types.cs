@@ -25,6 +25,7 @@ public enum DataType
     Bcd16,
     Bcd32,
     Bytes,
+    DateTime,
 }
 
 /// <summary>32/64 位值在 16 位寄存器之间的排列。四态是现场最常见的差异来源。</summary>
@@ -82,6 +83,7 @@ public static class DataTypeExtensions
         [DataType.Float64] = 8,
         [DataType.Bcd16] = 2,
         [DataType.Bcd32] = 4,
+        [DataType.DateTime] = 8,
     };
 
     /// <summary>字节宽度；bool 为 0（按位寻址），string/bytes 为 -1（需显式长度）。</summary>

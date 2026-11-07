@@ -16,7 +16,7 @@ dotnet run --project tests/Uic.Tests -- --stop-on-fail      # 首个失败即停
 正常输出：
 
 ```
-163 passed, 0 failed, 1 skipped · 36.2s
+164 passed, 0 failed, 1 skipped · 36.1s
 ```
 
 跳过的一条是 OPC UA 验收（要绑端口、生成证书，默认不跑）。
@@ -40,7 +40,7 @@ dotnet run --project tests/Uic.Tests -- --stop-on-fail      # 首个失败即停
 | 分组 | 数量 | 覆盖 |
 |---|---|---|
 | `golden/*` | 16 | 字节级：请求与响应完全匹配（T14） |
-| `codec/*` | 12 | 校验和、字节序、BCD、窗口、异常码、分帧容错 |
+| `codec/*` | 13 | 校验和、字节序、BCD、时间值、窗口、异常码、分帧容错 |
 | `pipeline/*` | 10 | 缩放/偏移、整数取整、质量传播、三种死区模式 |
 | `cache/*` | 5 | 序号单调、只在变化时通知、按点位死区判定、移除设备、订阅者故障隔离 |
 | `planner/*` | 8 | 窗口合并、切分上限、区分离、非寄存器寻址 |

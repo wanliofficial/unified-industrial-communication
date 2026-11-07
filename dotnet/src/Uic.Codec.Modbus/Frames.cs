@@ -63,6 +63,9 @@ public static class ValueCodec
             DataType.String => DataValue.String(
                 System.Text.Encoding.ASCII.GetString(buf).TrimEnd('\0', ' ')),
             DataType.Bytes => DataValue.Bytes(buf),
+            // 现场常见的「时间寄存器」是 4 个寄存器里的 int64 Unix 毫秒（UTC）。
+            DataType.DateTime => DataValue.DateTime(
+                DateTimeOffset.FromUnixTimeMilliseconds(BinaryPrimitives.ReadInt64BigEndian(buf))),
             _ => throw new NotSupportedException($"type {type} is not decodable"),
         };
     }
@@ -121,6 +124,13 @@ public static class ValueCodec
             case DataType.Bytes:
                 var raw = Convert.FromBase64String(value.Text ?? string.Empty);
                 Array.Copy(raw, buf, Math.Min(raw.Length, buf.Length));
+                break;
+            case DataType.DateTime:
+                // 写不出去的时间宁可报错也不写 0：0 是 1970-01-01，
+                // 在趋势图上看起来像一个合法读数，比写入失败更难发现。
+                if (!value.TryGetDateTime(out var timestamp))
+                    throw new FormatException($"'{value.Text}' is not a valid datetime value");
+                BinaryPrimitives.WriteInt64BigEndian(buf, timestamp.ToUnixTimeMilliseconds());
                 break;
             default:
                 throw new NotSupportedException($"type {type} is not encodable");

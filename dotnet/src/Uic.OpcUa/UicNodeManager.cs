@@ -599,6 +599,7 @@ public sealed class UicNodeManager : CustomNodeManager2
         DomainType.Bcd16 => DataTypeIds.UInt16,
         DomainType.Bcd32 => DataTypeIds.UInt32,
         DomainType.Bytes => DataTypeIds.ByteString,
+        DomainType.DateTime => DataTypeIds.DateTime,
         _ => DataTypeIds.String,
     };
 
@@ -632,6 +633,10 @@ public sealed class UicNodeManager : CustomNodeManager2
         DomainType.Bcd16 => (ushort)value.AsNumber(),
         DomainType.Bcd32 => (uint)value.AsNumber(),
         DomainType.Bytes => Convert.FromBase64String(value.Text ?? string.Empty),
+        // OPC UA 的 DateTime 用 System.DateTime 表达，且规定为 UTC。
+        DomainType.DateTime => value.TryGetDateTime(out var instant)
+            ? instant.UtcDateTime
+            : DateTime.MinValue,
         _ => value.Text is not null ? DomainValue.String(value.Text) : DomainValue.Number(type, value.AsNumber()),
     };
 
@@ -656,6 +661,22 @@ public sealed class UicNodeManager : CustomNodeManager2
             return raw is byte[] bytes
                 ? DomainValue.Bytes(bytes)
                 : throw new InvalidCastException($"expected ByteString, got {raw.GetType().Name}");
+        }
+
+        if (type == DomainType.DateTime)
+        {
+            // 客户端可能送 Local 或 Unspecified，统一按 UTC 解释：
+            // 同一份点位配置在不同时区的服务器上必须得到同一个时刻。
+            var instant = raw switch
+            {
+                System.DateTime dt => dt.Kind == DateTimeKind.Local
+                    ? new DateTimeOffset(dt).ToUniversalTime()
+                    : new DateTimeOffset(DateTime.SpecifyKind(dt, DateTimeKind.Utc)),
+                System.DateTimeOffset dto => dto.ToUniversalTime(),
+                _ => throw new InvalidCastException($"expected DateTime, got {raw.GetType().Name}"),
+            };
+
+            return DomainValue.DateTime(instant);
         }
 
         var number = Convert.ToDouble(raw, System.Globalization.CultureInfo.InvariantCulture);

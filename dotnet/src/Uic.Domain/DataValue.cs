@@ -21,6 +21,32 @@ public sealed record DataValue
     public static DataValue Bytes(ReadOnlySpan<byte> value) =>
         new() { Type = DataType.Bytes, Text = Convert.ToBase64String(value) };
 
+    /// <summary>
+    /// 时间值统一存成 ISO-8601 UTC 文本（毫秒精度）。用文本而不是 double：
+    /// 1970 年至今的毫秒数约 1.8e12，仍在 2^53 以内，但把「UTC 时间」表达成数字
+    /// 会让北向消费者必须自己猜时区与单位；文本形态在 REST/MQTT/日志里都能直接读。
+    /// </summary>
+    public static DataValue DateTime(DateTimeOffset value) => new()
+    {
+        Type = DataType.DateTime,
+        Text = value.ToUniversalTime().ToString(
+            "yyyy-MM-ddTHH:mm:ss.fffZ", System.Globalization.CultureInfo.InvariantCulture),
+    };
+
+    /// <summary>解析时间值。非法文本返回 false，由调用方决定是报错还是跳过。</summary>
+    public bool TryGetDateTime(out DateTimeOffset value)
+    {
+        value = default;
+        if (Type != DataType.DateTime || Text is null) return false;
+
+        return System.DateTimeOffset.TryParse(
+            Text,
+            System.Globalization.CultureInfo.InvariantCulture,
+            System.Globalization.DateTimeStyles.AssumeUniversal |
+            System.Globalization.DateTimeStyles.AdjustToUniversal,
+            out value);
+    }
+
     public bool IsNumeric => Num.HasValue;
     public double AsNumber() => Num ?? (Bool == true ? 1d : 0d);
     public bool AsBool() => Bool ?? (Num.HasValue && Math.Abs(Num.Value) > double.Epsilon);
@@ -47,7 +73,7 @@ public sealed record DataValue
     public override string ToString() => Type switch
     {
         DataType.Bool => Bool?.ToString() ?? "null",
-        DataType.String or DataType.Bytes => Text ?? "null",
+        DataType.String or DataType.Bytes or DataType.DateTime => Text ?? "null",
         _ => Num?.ToString("R", System.Globalization.CultureInfo.InvariantCulture) ?? "null",
     };
 }
@@ -142,6 +168,7 @@ public static class JsonEnum
         DataType.Bcd16 => "bcd16",
         DataType.Bcd32 => "bcd32",
         DataType.Bytes => "bytes",
+        DataType.DateTime => "datetime",
         _ => "uint16",
     };
 
@@ -161,6 +188,7 @@ public static class JsonEnum
         "bcd16" => DataType.Bcd16,
         "bcd32" => DataType.Bcd32,
         "bytes" => DataType.Bytes,
+        "datetime" => DataType.DateTime,
         _ => DataType.UInt16,
     };
 
