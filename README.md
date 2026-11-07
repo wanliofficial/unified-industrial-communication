@@ -300,6 +300,25 @@ curl -s -H 'Authorization: Bearer dev-token-0123456789' localhost:8088/api/v1/po
 #   位读写：./uic finsread -addr 127.0.0.1:9600 -area cio -offset 0 -bit 1 -write on
 ```
 
+EtherNet/IP + CIP 显式报文（TCP 44818）：
+
+```bash
+./uic sim -protocol enip -listen 127.0.0.1:44818 &   # 内置 CIP 从站
+./uic -config examples/enip.json
+curl -s -H 'Authorization: Bearer dev-token-0123456789' localhost:8089/api/v1/points
+#   7 点：DINT=1234、INT=5678、REAL=48.0 可写、BOOL=true、STRING="PUMP-01"、
+#         DINT_TAG.bit1 可写 bool、COUNTER 每秒自增
+#   自检（不需要网关）：./uic enipread -addr 127.0.0.1:44818 -tag DINT_TAG
+#   位读写：./uic enipread -addr 127.0.0.1:44818 -tag DINT_TAG -type bool -bit 1 -write off
+```
+
+EtherNet/IP 只做 **CIP 显式报文 + 符号标签**（Read/Write Tag），不做隐式 I/O（UDP 2222）、
+不做对象/属性寻址、不做结构体/数组自动展开。`address.area` 是标签名（大小写不敏感）、
+`offset` 是数组起始元素、`length` 是 bytes 字节数/string 字符容量、`bit` 是整数标签内的
+位号（-1 表示标签本身是 BOOL）。数值线上小端；同宽有符号/无符号可互换，类型以应答里的
+实际类型为准；bytes 两阶段读（先学宽度再按区间重读）；一轮多条读走 Multiple Service
+Packet，设备不支持时自动退回逐条请求。
+
 FINS 只做 FINS/TCP；FINS/UDP 与 Host Link 配置期即拒。建链先做节点号协商（命令 0
 → 1），`device.unitId>0` 覆盖目标节点、0 用协商值。`offset` 是**字地址**、`bit` 是
 字内位号（`CIO0.3` → `offset=0, bit=3`）；字访问 2 字节/字，位访问**1 字节/位**；
@@ -326,7 +345,7 @@ go test -race -count=1 ./...
 
 | 路径 | 内容 |
 |---|---|
-| `cmd/uic/` | 单入口：`run` / `sim`（Modbus / S7 / OPC UA / MQTT / MC / FINS）/ `mbread` / `mcread` / `finsread` / `uaread` / `s7blocks` / `s7upload` / `instantiate` / `import` / `token` / `-check` / `version` |
+| `cmd/uic/` | 单入口：`run` / `sim`（Modbus / S7 / OPC UA / MQTT / MC / FINS / EtherNet-IP）/ `mbread` / `mcread` / `finsread` / `enipread` / `uaread` / `s7blocks` / `s7upload` / `instantiate` / `import` / `token` / `-check` / `version` |
 | `internal/model` | 通道 / 设备 / 点位 / 地址 / 采样 / 质量码 |
 | `internal/driver` | 驱动契约（Codec / Transport / Driver）、错误分类、注册表、只读 `Lookup` 注入 |
 | `internal/calc` | 零依赖表达式引擎（编译期类型检查、短路求值、引用 `device:point`） |
@@ -336,6 +355,9 @@ go test -race -count=1 ./...
 | `internal/codec/fins` | 欧姆龙 FINS 纯函数编解码（FINS/TCP 封装、节点协商、内存区码表、字/位读写、结束码） |
 | `internal/driver/fins` | FINS/TCP 主站驱动（节点号协商、字/位读写、RMW 位写、低字在前字序、结束码分类、SID 校验） |
 | `internal/sim/fins` | FINS/TCP 内置从站（节点分配、字内存表同时承载字/位视图、结束码） |
+| `internal/codec/enip` | EtherNet/IP 纯函数编解码（封装头 / CPF / SendRRData / CIP 请求应答 / 符号路径 / Read/Write Tag / 多服务合包 / 类型表） |
+| `internal/driver/enip` | CIP 显式报文主站（标签读写、数组 offset、STRING、bytes 两阶段读、位 RMW、多服务合包与自动退回） |
+| `internal/sim/enip` | EtherNet/IP 内置从站（RegisterSession / Read/Write Tag / 多服务合包 / 默认标签表） |
 | `internal/template` | 设备模板：参数校验 / 字符串字面量替换 / 实例化后完整校验 |
 | `internal/pointtable` | 点表 CSV：列别名 / 地址表达式 / 按协议推导宽度 / 合并动作 |
 | `internal/alarm` | 报警引擎：五态机 / 滞回 / 延时 / 表达式规则 / 确认 / 订阅 |

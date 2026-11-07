@@ -1321,6 +1321,211 @@ curl -H 'Authorization: Bearer dev-token-0123456789' \
 | `driver/fins` | 握手、字读、float32 低字在前、位读、位写、`em` RMW、结束码→质量、SID 不匹配、非 TCP 拒绝、能力声明 |
 | `sim/fins` | 真实 TCP 回环：字读写、float32、位读写共享字内存、字/位混合 span、字符串、越界地址、`unitId` 覆盖 |
 
+### 3.10.7 EtherNet/IP（CIP 显式报文，TCP 44818）
+
+EtherNet/IP 是标准组织定义的工业以太网协议族，CIP（Common Industrial Protocol）是它的
+应用层。本驱动只实现 **CIP 显式报文 + TCP 44818 + 符号标签访问**：
+
+- Read Tag（0x4C）/ Write Tag（0x4D）；
+- Multiple Service Packet（0x0A）把一轮采集里的多条读合并成一个报文；
+- STRING（4 字节长度 + 字符容量）、原子数值类型、BOOL、整数标签里的位；
+- 设备不支持多服务合包时自动退回逐条请求，并记住结论。
+
+**不做**的事情同样重要：不做隐式 I/O（UDP 2222 的 Class 1 连接）、不做对象/属性寻址
+（Identity/Message Router 对象只用于 Probe 与合包路径）、不做结构体/数组的自动展开。
+理由见 §3.10.7.8。
+
+#### 3.10.7.1 三层封装，每层的「长度」含义都不同
+
+```
+┌─ 封装头（24 字节，全部小端）──────────────────────────┐
+│ 命令(2) 长度(2) 会话句柄(4) 状态(4) 发送方上下文(8) 选项(4) │
+├─ CPF（通用报文格式）──────────────────────────────────┤
+│ 接口句柄(4)=0 超时(2)=0 条目数(2)=2 + 条目...            │
+│   条目 1：类型 0x0000（空地址），长度 0                   │
+│   条目 2：类型 0x00B2（未连接数据），长度 N + CIP 报文      │
+├─ CIP 报文───────────────────────────────────────────┤
+│ 服务(1) 路径字数(1) 路径(2N) 请求数据                   │
+└──────────────────────────────────────────────────────┘
+```
+
+三个易错点，都已固化在 `codec/enip`：
+
+| 细节 | 正确做法 | 写错的后果 |
+|---|---|---|
+| 封装头 `length` | **只算负载**，不含 24 字节头 | 对端一直等数据，表现为超时 |
+| CPF 条目对齐 | 奇数长度条目后补 1 个零字节 | 后一条目从奇地址开始，类型/长度全错 |
+| 发送方上下文 | 8 字节原样回显，用于配对请求与应答 | 交错时把上一条应答当成这一条的 |
+
+`roundTrip` 对这个上下文做**严格校验**，只放行全零：少数嵌入式协议栈确实不实现该字段，
+为此拒绝会让设备完全不可用。非零且不匹配一律判协议错，而不是继续解析。
+
+#### 3.10.7.2 会话与事务
+
+建链顺序是：TCP 连接 → RegisterSession（0x65）→ 后续 SendRRData（0x6F）→ 关闭时
+UnRegisterSession（0x66，无应答）。
+
+- **协议版本必须是 1，选项必须是 0**：其它值说明对端不是我们理解的 EtherNet/IP 封装，
+  继续往下走只会把错误藏到更深处；
+- 会话句柄由设备分配，返回 0 视为失败（0 是「无会话」的保留值）；
+- CIP 显式报文**没有事务号**，靠一问一答定界。因此 `conn.mu` 串行化整条会话，
+  两个请求交错会让响应对不上请求，这类错误在现场极难定位；
+- 关闭前尽力发 UnRegisterSession，失败不影响关闭。不发会让设备侧的会话表
+  短暂堆积（部分 PLC 的会话数上限很低）。
+
+#### 3.10.7.3 地址语义：标签名 + 元素偏移
+
+CIP 的 Read Tag 请求**没有偏移参数**，只有一个「元素个数」。因此地址复用
+`model.AddressRegister`，但字段含义按 CIP 重新解释：
+
+| 字段 | 含义 |
+|---|---|
+| `address.area` | 标签名（大小写不敏感）。程序域标签写 `Program:Main.Tag` |
+| `address.offset` | 数组的起始元素下标（0 起） |
+| `address.length` | `bytes` 是字节数；`string` 是字符容量；数值/bool 固定 1 |
+| `address.bit` | `-1` 表示标签本身是 BOOL；`0..63` 表示从整数标签取一位（写走 RMW） |
+
+**为什么不用 `PointRef.Length` 当元素数**：它按「16 位寄存器数」推导，int32 会得到 2，
+而 CIP 的 int32 是 1 个元素。直接把 2 传给 Read Tag 会读到两个元素，数据长度翻倍，
+解码取第一个元素时看似正确，直到某天标签是数组才发现错位。驱动因此只认
+`address.length`。
+
+`offset > 0` 的读做法是「读 0..offset 的 `offset+1` 个元素，再切片」；写做法是
+「读整段 → 改目标元素 → 写整段」，保留前缀元素。CIP 没有「从第 N 个元素开始写」的
+参数，直接写 count=1 会把元素 0 覆盖掉。
+
+#### 3.10.7.4 类型、字节序与 STRING
+
+CIP 数值在线上是**小端**，而平台 `value` 包约定大端。驱动对每个元素先整体反转，
+再走 `value.Decode(..., OrderABCD)`；写入反向。这样「CIP 的小端」与「Modbus/S7 的字序
+配置」共享同一套解码语义，不会出现两份符号扩展实现。
+
+| 平台类型 | CIP 类型码 | 宽度 |
+|---|---|---|
+| `bool` | BOOL 0xC1 | 1 字节/元素 |
+| `int16` / `uint16` | INT 0xC3 / UINT 0xC7 | 2 |
+| `int32` / `uint32` | DINT 0xC4 / UDINT 0xC8 | 4 |
+| `int64` / `uint64` | LINT 0xC5 / ULINT 0xC9 | 8 |
+| `float32` / `float64` | REAL 0xCA / LREAL 0xCB | 4 / 8 |
+| `string` | STRING 0xD0 | 4 字节长度 + 字符容量 |
+| `bytes` | 由设备实际类型决定 | 见下 |
+
+**类型兼容**：同宽的有符号/无符号可以互换（现场把 DINT 标签配成 uint32 很常见），
+浮点与非浮点、不同宽度一律判地址错。驱动从应答里读**实际类型**再与配置比对，
+而不是盲信配置——否则 REAL 标签配成 int32 会把位模式当整数返回，值是假的但质量是 good。
+
+**STRING** 是常见的 PLC 结构：4 字节小端长度 + 字符 + 补零。容量必须显式给（默认 82）。
+读时按长度截断并去掉尾部 NUL；写时超长截断，长度字段跟着截断。
+
+**bytes** 是唯一需要两阶段读的类型：先读 `offset+1` 个元素学实际类型与宽度，再按
+`offset + ceil(length/width)` 重读并切片。原因很简单：CIP 的类型信息只在应答里，
+配置里没有；而 `bytes` 点位的意义就是「不关心它是什么类型，只要这段原始字节」。
+写入同理：先读覆盖区间并保留邻字节，再按实际类型写回。
+
+#### 3.10.7.5 多服务合包与自动退回
+
+一轮采集里每条标签一次往返，在 20 个点位、10ms RTT 的链路上就是 200ms。Multiple
+Service Packet 把这些读合成一个报文：路径固定指向 Message Router
+（class 0x02 / instance 0x01），请求数据是「条数 + 每条相对偏移 + 嵌入报文」。
+
+驱动的策略：
+
+- 单次合包的**保守上限是 450 字节**（嵌入区 + 偏移表），超过就拆批；
+- 单次读/写的数据量**保守上限 400 字节**：CIP 连接的标准报文尺寸通常 504，
+  超过后设备回 0x06（partial transfer）。与其让设备报错，不如在驱动侧明确拒绝
+  并提示「缩小 length」；
+- 设备回 0x08/0x14（服务不支持 / 属性不支持）时**关掉合包并退回逐条请求**，
+  本批立刻重发；一次不支持之后不再尝试，避免每轮采集都先失败一次；
+- 嵌入应答按条目解析：某一条错误只让那个点位变 bad，不牵连整批。
+
+#### 3.10.7.6 位访问：读元素 → 改一位 → 写回
+
+`address.bit >= 0` 表示「从整数标签里取一位」。读：读 `offset+1` 个元素，按实际类型
+宽度定位元素，取第 `bit` 位（0..width*8-1）。写：读整元素、改一位、写回**整个元素**。
+
+为什么不是「读整标签 → 改 → 写整标签」：写整个数组会把其它元素也覆盖，哪怕值没变，
+也会在 PLC 侧产生一次无谓的写入（部分 PLC 会因此触发变更事件/记录）。只回写目标元素
+是能做到的最小写。
+
+`bit` 超出元素宽度判地址错，**不会**悄悄读到下一个元素——那是最难排查的一类错：
+配置写错一位，读到的却是邻位的值，而且看起来完全合理。
+
+#### 3.10.7.7 错误与质量映射
+
+CIP 通用状态在 `codec/enip` 里分类，驱动只做「错误 → 质量码」的最后一步：
+
+| CIP 状态 | 分类 | 质量码 | 说明 |
+|---|---|---|---|
+| 0x04 / 0x05 / 0x13 / 0x15 / 0x16 | `ErrAddress` | `address_error` | 路径段错 / 目标不存在 / 数据不够 / 数据过多 / 对象不存在 |
+| 0x08 / 0x14 | `ErrUnsupported` | `bad` | 服务/属性不支持 |
+| 0x0E / 0x0F | `ErrPermission` | `bad` | 属性只读 / 权限不足 |
+| 0x01 / 0x02 / 0x07 / 0x0C / 0x10 | `ErrDisconnected` | `comm_error` | 连接失败/资源不足/连接丢失/状态冲突 |
+| 其它 | `ErrProtocol` | `bad` | 协议错 |
+
+封装状态里 **0x64（会话句柄无效）单独归为可重试**：会话过期后重新建链会重新注册，
+属于自愈路径；其它状态判协议错，不重试。这条区分很重要——把 0x64 当永久错误会让
+一次网络闪断把设备标成坏点直到人工重启；把它当通用重试又会对着配置错误反复重连。
+
+#### 3.10.7.8 能力边界（刻意的）
+
+| 不做 | 理由 |
+|---|---|
+| 隐式 I/O（UDP 2222，Class 1） | 需要连接参数协商、RPI、组包与看门狗，属于另一套实时模型；与本平台的「采集」语义不同 |
+| 对象/属性寻址 | 属性段编码在不同厂商文档里有 0x2C/0x30 两种说法，没有真机验证前不猜——猜错会读到**别的对象**的属性，比报错危险得多 |
+| 结构体/数组自动展开 | 需要 Member/Element 段与符号实例 ID 解析；标签名 `.Member` 的编码在不同固件上行为不一致 |
+| 符号列表浏览 | 需要配合 FTP/HTTP 或厂商专有服务，CIP 本身不提供统一接口 |
+
+`Probe` 用 Get Attributes All（Identity 对象 class 0x01 / instance 0x01）验证链路：
+返回 0x08/0x14 也视为「CIP 层通」——Identity 对象不是必选实现，为此拒绝连接会误伤。
+
+#### 3.10.7.9 位置与自检
+
+| 内容 | 路径 |
+|---|---|
+| 编解码 | `internal/codec/enip`（`BuildPacket`/`ParseHeader`/`BuildCPF`/`ParseSendRRData`/`BuildRequest`/`BuildReadTag`/`BuildWriteTag`/`BuildMultiple`/`SymbolicPath`/`LogicalPath`/`EncodeString`/`StatusError`） |
+| 主站驱动 | `internal/driver/enip`（`Meta`/`Open`/`Read`/`Write`/`Probe`，内部 `readBatch`/`sendMultiple`/`writeBit`） |
+| 内置从站 | `internal/sim/enip`（`NewServer`/`SetDINT`/`SetINT`/`SetREAL`/`SetBool`/`SetString`/`SetArray`/`SetMultipleSupported`） |
+| CLI | `uic enipread -addr 127.0.0.1:44818 -tag DINT_TAG` |
+| 示例 | `examples/enip.json`（DINT/INT/REAL/BOOL/STRING、整数位、自增计数器） |
+
+内置从站的标签表是「类型 + 元素数 + 小端字节」，`Set*` 显式指定类型，避免从站自己的
+猜测掩盖主站的类型校验问题。默认标签：`DINT_TAG=1234`、`INT_TAG=5678`、`REAL_TAG=48.0`、
+`BOOL_TAG=true`、`STRING_TAG="PUMP-01"`（容量 82）、`DINT_ARRAY=[10,20,30,40]`、
+`COUNTER` 每秒自增。
+
+自检链路（无硬件）：
+
+```
+./uic sim -protocol enip -listen 127.0.0.1:44818 &
+./uic -config examples/enip.json &
+curl -H 'Authorization: Bearer dev-token-0123456789' \
+     http://127.0.0.1:8089/api/v1/points
+# dint=1234  int16=5678  temp=48  run=true  name="PUMP-01"
+# fault=DINT_TAG 的 bit1  counter=每秒自增
+```
+
+`uic enipread` 不依赖网关即可单独验证「能连上」和「能读到数」：
+
+```
+./uic enipread -addr 127.0.0.1:44818 -tag DINT_TAG                  # 数值读
+./uic enipread -addr 127.0.0.1:44818 -tag REAL_TAG -type real       # 类型别名
+./uic enipread -addr 127.0.0.1:44818 -tag REAL_TAG -type real -write 12.5
+./uic enipread -addr 127.0.0.1:44818 -tag DINT_TAG -type bool -bit 1 -write off
+./uic enipread -addr 127.0.0.1:44818 -tag DINT_ARRAY -type bytes -length 8
+./uic enipread -addr 127.0.0.1:44818 -tag DINT_ARRAY -type bytes -length 4 -write hex:01020304
+```
+
+`SINT/USINT` 在 CLI 里映射为 `bytes`（平台没有 1 字节整数类型），必须配 `-length`；
+驱动会从应答里学实际宽度，不会把 1 字节当 2 字节。
+
+测试矩阵（当前覆盖）：
+
+| 层 | 用例 |
+|---|---|
+| `codec/enip` | 封装头/长度语义、CPF 奇数对齐与越界、SendRRData、RegisterSession、CIP 请求/应答、附加状态、符号路径偶对齐、逻辑路径 8/16/32 位、Read/Write Tag 金帧、多服务偏移表、类型表、字符串编解码 |
+| `driver/enip` | 注册与状态、命令/上下文错位、原子类型、大小写、STRING、bytes 两阶段读、数组 offset、位读/位写保邻位、offset 写保前缀、多服务合包与拆批、MSP 自动退回、错类型/越界位/未知标签、会话失效可重试、Probe 容忍不支持、能力声明 |
+| `sim/enip` | 真实 TCP 回环：注册/注销/坏版本/未知命令、Read/Write Tag 与错误码 0x03/0x05/0x13/0x15、STRING 写、多服务与关闭、非符号路径、`SetTag` 校验、默认标签 |
+
 ### 3.11 计算点（`computed`）
 
 这是全项目**唯一没有物理链路**的驱动：点位不从任何设备读取，而是由其他点位的值
@@ -1608,6 +1813,7 @@ type OpError struct {
 | `s7` | supported | supported | unsupported | unsupported | unsupported | supported | supported |
 | `mc`（MC 3E） | supported | supported | unsupported | unsupported | unsupported | supported | supported |
 | `fins`（FINS/TCP） | supported | supported | unsupported | unsupported | unsupported | supported | supported |
+| `enip`（CIP 显式报文） | supported | supported | unsupported | unsupported | unsupported | supported | supported |
 | `opcua` | supported | supported | supported ⁴ | unsupported | experimental | supported | unsupported |
 | `mqtt`（南向订阅） | supported | supported | supported ¹ | unsupported | unsupported | supported ² | unsupported |
 | `computed`（计算点） | supported | unsupported ³ | unsupported | unsupported | unsupported | supported | unsupported |

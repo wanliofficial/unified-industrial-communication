@@ -5,9 +5,9 @@
 | 项 | 数字 |
 |---|---|
 | 分析的参考方案 | 38 份（PA-01 … PA-38，其中 PA-06 合并了两个完全相同的仓库） |
-| 文档总量 | 55 份 Markdown / 18,766 行（含 3 份 ADR） |
-| 代码总量 | 184 个 Go 文件 / 71,419 行（其中测试 31,085 行 / 1,006 个测试函数） |
-| Go 包 | 45 个（1 个入口 + 44 个内部包；44 个有测试） |
+| 文档总量 | 55 份 Markdown / 18,997 行（含 3 份 ADR） |
+| 代码总量 | 192 个 Go 文件 / 76,209 行（其中测试 33,245 行 / 1,112 个测试函数） |
+| Go 包 | 48 个（1 个入口 + 47 个内部包；47 个有测试） |
 | 第三方依赖 | 0（仅标准库，零 CGO） |
 
 ---
@@ -153,6 +153,25 @@ curl -s -H 'Authorization: Bearer dev-token-0123456789' localhost:8088/api/v1/po
 #   自检（不需要网关）：./uic finsread -addr 127.0.0.1:9600 -area dm -offset 0 -qty 2
 #   位读写：./uic finsread -addr 127.0.0.1:9600 -area cio -offset 0 -bit 1 -write on
 ```
+
+EtherNet/IP + CIP 显式报文（TCP 44818）：
+
+```bash
+./uic sim -protocol enip -listen 127.0.0.1:44818 &   # 内置 CIP 从站
+./uic -config examples/enip.json
+curl -s -H 'Authorization: Bearer dev-token-0123456789' localhost:8089/api/v1/points
+#   7 点：DINT=1234、INT=5678、REAL=48.0 可写、BOOL=true、STRING="PUMP-01"、
+#         DINT_TAG.bit1 可写 bool、COUNTER 每秒自增
+#   自检（不需要网关）：./uic enipread -addr 127.0.0.1:44818 -tag DINT_TAG
+#   位读写：./uic enipread -addr 127.0.0.1:44818 -tag DINT_TAG -type bool -bit 1 -write off
+```
+
+EtherNet/IP 只做 **CIP 显式报文 + 符号标签**（Read/Write Tag），不做隐式 I/O（UDP 2222）、
+不做对象/属性寻址、不做结构体/数组自动展开。`address.area` 是标签名（大小写不敏感）、
+`offset` 是数组起始元素、`length` 是 bytes 字节数/string 字符容量、`bit` 是整数标签内的
+位号（-1 表示标签本身是 BOOL）。数值线上小端；同宽有符号/无符号可互换，类型以应答里的
+实际类型为准；bytes 两阶段读（先学宽度再按区间重读）；一轮多条读走 Multiple Service
+Packet，设备不支持时自动退回逐条请求。
 
 FINS 只做 FINS/TCP；FINS/UDP 与 Host Link 配置期即拒。建链先做**节点号协商**
 （命令 0 → 1），`device.unitId>0` 覆盖目标节点、0 用协商值。`offset` 是**字地址**、
@@ -643,6 +662,9 @@ obs  ← 所有包（不依赖任何内部包）
 | `internal/codec/fins` | 欧姆龙 FINS 纯函数编解码（FINS/TCP 封装、节点协商、内存区码表、字/位读写命令、结束码） | 无 I/O、无时钟、无可变状态；TCP 长度只含「命令+错误码+负载」；读/写 MRC 同为 0x01、靠 SRC 区分；位访问一位一字节（不是按位打包）；当前 EM 区无位访问码 | 96.6% |
 | `internal/driver/fins` | FINS/TCP 主站驱动（节点号协商、字/位读写、当前 EM 区 bool 的 RMW、低字在前字序、结束码分类、SID 校验） | 只做 FINS/TCP；`offset` 是字地址、`bit` 是字内位号；`unitId>0` 覆盖目标节点；字/位混合 span 拆两次事务再按原序合并；节点协商失败归类为可重试连接错 | 81.4% |
 | `internal/sim/fins` | FINS/TCP 内置从站（节点分配、字内存表同时承载字/位视图、结束码） | 未配置地址读 0、写落表；位写只改目标位；越界 0x1103、未知区码 0x1101、点数 0/超限 0x1102；节点冲突回 `0x24` | 85.5% |
+| `internal/codec/enip` | EtherNet/IP 纯函数编解码（封装头/CPF/SendRRData/RegisterSession、CIP 请求与应答、符号路径与逻辑路径、Read/Write Tag、多服务合包、类型表、STRING） | 无 I/O、无时钟、无可变状态；封装长度只算负载（不含 24 字节头）；CPF 奇数条目补 1 字节对齐；发送方上下文原样回显；属性段不做（0x2C/0x30 编码有歧义）；CIP 状态码在 codec 层统一分类 | 97.0% |
+| `internal/driver/enip` | CIP 显式报文主站（RegisterSession、符号标签读/写、数组 offset、STRING、bytes 两阶段读、位 RMW、多服务合包与自动退回） | 只做显式报文 + TCP；`address.length` 按类型解释（不能用 `PointRef.Length` 当元素数）；数值线上小端，解码先整元素反转再走 `value.Decode(ABCD)`；类型以应答里的实际类型为准；offset 写读整段再改目标元素；设备回 0x08/0x14 自动关合包；封装状态 0x64 单独判可重试 | 87.4% |
+| `internal/sim/enip` | EtherNet/IP 内置从站（RegisterSession/UnRegister、Read/Write Tag、多服务合包、默认标签表） | 与主站共用 codec/enip；标签表显式指定类型与元素数；未配置标签回 0x05、越界 0x15、类型不匹配 0x03、数据不足 0x13；`SetMultipleSupported(false)` 验证主站退回路径 | 87.4% |
 | `internal/planner` | 点位 → 批量读请求（ReadSpan） | 协议无关；按连续性/上限合并；按 `area:db` 分组；计算点合成单个 `expr` span（漏组会表现为全坏且无日志） | 92.6% |
 | `internal/scheduler` | tick、actor、信号量、退避、熔断、代次 | 同设备不并发；写优先；旧代次丢弃；状态回调不占采集路径 | 88.1% |
 | `internal/pipeline` | 缩放、质量判定、死区过滤 | 质量不可用时不参与死区比较 | 92.7% |
@@ -657,7 +679,7 @@ obs  ← 所有包（不依赖任何内部包）
 | `internal/mqtt` | MQTT 3.1.1 客户端（北向发布 + 南向订阅共用，纯 Go 零依赖） | 单 goroutine 读 socket；QoS1 必须等到 PUBACK；`Ping` 必须等到 PINGRESP（写成功不算活着）；断线立即失败而非超时 | 70.3% |
 | `internal/mqtt/mqtttest` | 测试封装：`internal/sim/mqtt` 的 `*testing.T` 生命周期 + 等待断言 | 不另写 Broker（两份实现必然长歪）；开关一律走 setup 函数而非直接赋字段 | — |
 | `internal/runtime` | 唯一编排层 + 后端实现 + 看门狗 + 审计埋点 + 窗口缓存 | 启动/关闭顺序（失败逆序收口）；`configuredState` 与 `runtimeState` 分离；协议/传输匹配在装配期校验；只向驱动与报警引擎注入只读 `cache.Get` 与窗口数据源；北向 OPC UA 启停与热重建；凭据表热替换后旧用户立即失效 | 81.3% |
-| `cmd/uic` | 单入口：run / sim / mbread / mcread / finsread / uaread / s7blocks / s7upload / instantiate / import / token / check / version | 关闭预算 10 秒；`uaread`、`mbread`、`mcread`、`finsread` 是不装第三方客户端即可自证链路的自检工具；块服务放在 CLI 而不是北向 API（动作重、数据大、归操作系统账号管）；模板实例化与点表导入只产出文件，不在运行期动态生成设备 | — |
+| `cmd/uic` | 单入口：run / sim / mbread / mcread / finsread / enipread / uaread / s7blocks / s7upload / instantiate / import / token / check / version | 关闭预算 10 秒；`uaread`、`mbread`、`mcread`、`finsread`、`enipread` 是不装第三方客户端即可自证链路的自检工具；块服务放在 CLI 而不是北向 API（动作重、数据大、归操作系统账号管）；模板实例化与点表导入只产出文件，不在运行期动态生成设备 | — |
 
 ### 9.2 测试与验证命令
 
@@ -669,7 +691,7 @@ go test -race -count=1 ./...                    # 竞态 + 全量测试
 go test -coverprofile=c.out ./... && go tool cover -func=c.out | tail -1
 ```
 
-当前状态：`go build` / `go vet` / `gofmt` 全部干净，`go test -race ./...` 44 个测试包全部通过
+当前状态：`go build` / `go vet` / `gofmt` 全部干净，`go test -race ./...` 47 个测试包全部通过
 （仅 `internal/mqtt/mqtttest` 是纯测试辅助包，没有自己的测试文件）。
 
 ### 9.3 源码阅读建议顺序
@@ -698,6 +720,7 @@ go test -coverprofile=c.out ./... && go tool cover -func=c.out | tail -1
 21. internal/pointtable/address.go + csv.go 协议感知的地址解析与行错误聚合（40 分钟）
 22. internal/codec/mc + driver/mc + sim/mc 三菱 MC 3E 三层：帧、RMW 位写、内置从站（60 分钟）
 23. internal/codec/fins + driver/fins + sim/fins 欧姆龙 FINS 三层：套娃封装、节点协商、一位一字节（70 分钟）
+24. internal/codec/enip + driver/enip + sim/enip EtherNet/IP 三层：三层封装、标签寻址、多服务合包（80 分钟）
 ```
 
 ---
@@ -770,6 +793,7 @@ OPC UA 服务端（同一份点位表的另一个出口）：
 | 点表 CSV 导入 | ✅ | `internal/pointtable` + `uic import`；列别名、协议感知的地址解析与长度推导、行错误聚合、new/unchanged/replaced/conflict 合并；默认拒绝静默覆盖 |
 | 三菱 MC 3E 主站 + 内置从站 | ✅ | `internal/codec/mc` + `internal/driver/mc` + `internal/sim/mc` + `uic mcread` + `examples/mc.json`；只做 3E 二进制帧 + TCP；位软元件按位打包、X/Y 按十六进制、字软元件 bool 走 RMW 不清零邻位；结束码 0xC052/53/54/56→address_error；主站/从站/编解码三层测试 |
 | 欧姆龙 FINS 主站 + 内置从站 | ✅ | `internal/codec/fins` + `internal/driver/fins` + `internal/sim/fins` + `uic finsread` + `examples/fins.json`；只做 FINS/TCP（FINS/UDP 与 Host Link 配置期即拒）；三层封装（FINS/TCP 头 / 10 字节 FINS 帧头 / 命令）各自独立；建链先做节点号协商，`unitId>0` 覆盖目标节点；读写 MRC 同为 0x01、靠 SRC 区分；`offset` 是字地址、`bit` 是字内位号；位访问一位一字节，32 位低字在前（CDAB）、64 位 DCBA；当前 EM 区无位码，bool 走 RMW；结束码 0x11xx→address_error、0x02xx/0x03xx→comm_error；每帧校验 SID；三层测试含真实 TCP 回环 |
+| EtherNet/IP + CIP 主站 + 内置从站 | ✅ | `internal/codec/enip` + `internal/driver/enip` + `internal/sim/enip` + `uic enipread` + `examples/enip.json`；只做 CIP 显式报文 + TCP 44818 + 符号标签（隐式 I/O、对象/属性寻址、结构体展开配置期即拒）；三层封装（24 字节封装头 / CPF / CIP）、封装长度只算负载、CPF 奇数条目对齐、发送方上下文严格校验；CIP 无事务号，整条会话串行化；地址字段按 CIP 重解释（标签名/元素 offset/按类型解释的 length/位号）；数值线上小端，整元素反转后走统一解码；类型以设备应答为准；STRING 为「4 字节长度 + 容量」；bytes 两阶段读；多服务合包（450 字节拆批、单次 400 字节上限）且设备不支持时自动退回；位写 RMW 只回写目标元素；状态码统一分类，封装 0x64 判可重试；三层测试含真实 TCP 回环与错误路径脚本流 |
 | Modbus TCP 从站 | ✅ | `slaves[]` 存在即启用；四区（holding/input/coil/discrete）映射；跨映射与半值读；写穿透到 `Runtime.Write`；坏质量保留最后值并计入 `uic_slave_degraded_reads_total`；映射变化按指纹重建监听；`uic mbread` 可自检 |
 | Modbus RTU/ASCII 从站 | ✅ | `serial.port` + `serial.framing`（rtu/ascii）；RTU 按功能码推导帧长、推不出来时读到 3.5 字符静默（下限 5ms 对抗 USB 转发延迟）；ASCII 以 `:` 起始、CRLF 结束；非本机单元号静默、广播只写不回、CRC/LRC 错后 `tcflush` 重同步、半帧丢弃；USB 适配器掉线按 1s→2s→…→30s 退避重开；端口与主站通道及其他从站按字面路径互斥（配置期拒绝） |
 | Modbus 诊断与识别（FC8/FC11/FC17/FC43） | ✅ | FC8 子功能 0x0000 回显、0x000A 清计数、0x000B~0x0012 各类计数（TCP 上 CRC/字符层错误恒为 0）；FC11 事件计数器（自身不计数、异常不计数）；FC17 产品代码 + 运行指示 0xFF；FC43/MEI 0x0E 读设备标识（basic/regular/extended 与按对象 id 读取，响应超 253 字节时按 `more`/`nextObjectID` 分页）；身份标识由 `slave.identity` 配置，缺省也保证 basic 三件套非空；版本号取构建信息 |
