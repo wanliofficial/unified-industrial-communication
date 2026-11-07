@@ -11,7 +11,7 @@
 它们不是 §6.1「不做」清单里的项，属于真实缺口；逐协议现状、原因与补法见
 [protocol-status.md](protocol-status.md)。
 
-当前测试基线：**178 passed / 0 failed / 1 skipped**（跳过的是需要 `--opcua` 的 OPC UA 端到端用例）。
+当前测试基线：**181 passed / 0 failed / 1 skipped**（跳过的是需要 `--opcua` 的 OPC UA 端到端用例）。
 
 ## 1. 采集（FR-COL）
 
@@ -86,7 +86,7 @@
 | FR-NOR-05 | OPC UA 服务端 | 已实现 | `opcua/anonymous_session_read_write_subscribe`（需 `--opcua`） |
 | FR-NOR-06 | Outbox 持久补发（至少一次） | 已实现 | `outbox/advances_only_on_success`、`outbox/replays_after_restart`、`outbox/tolerates_a_torn_last_line`；`mqtt/command_*` 验证重连后的位点 |
 | FR-NOR-07 | 北向多目标并行 | 已实现 | `Outbox` 按 sink 分区，一个分区失败不拖住其他分区：`outbox/partitions_are_independent` |
-| FR-NOR-08 | 历史查询（时间范围/降采样/分页） | 部分实现 | `GET /api/v1/history` 从 journal NDJSON 顺序扫描：`from`/`to` 时间范围、`interval` 每点位每桶保留最后一条、`limit`+`cursor` 分页；按 `(device, point, seq)` 去重并跳过坏行。证据 `history/filters_by_time_and_identity`、`history/downsamples_each_point_per_bucket`、`history/dedupes_redelivered_lines`、`history/skips_malformed_lines`、`history/handles_lines_across_read_buffer`、`contract/history_query_reads_journal`。**性能目标未达标**：线性扫描，本机 20 万行全量扫描约 1 s，推算 100 万行超过 2 s；下一步给 journal 写「时间→偏移」索引或换时序库，接口形状不变 |
+| FR-NOR-08 | 历史查询（时间范围/降采样/分页） | 已实现 | `GET /api/v1/history` 从 journal NDJSON 两段式扫描：先按字节取「时间 + 设备 + 点位 + 序号」做过滤、去重与选桶，扫描结束后按文件偏移回读胜出行才做完整 JSON 解析。`from`/`to` 时间范围、`interval` 每点位每桶保留最后一条、`limit`+`cursor` 分页；按 `(device, point, seq)` 去重并跳过坏行。证据 `history/filters_by_time_and_identity`、`history/downsamples_each_point_per_bucket`、`history/downsamples_across_read_buffer_boundary`、`history/dedupes_redelivered_lines`、`history/skips_malformed_lines`、`history/handles_lines_across_read_buffer`、`history/falls_back_on_escaped_names`、`history/skips_impossible_calendar_dates`、`contract/history_query_reads_journal`。**性能达标**：本机 100 万行 / 152 MB 单文件，全范围 + `5m` 降采样约 1.0–1.3 s（PRD 目标 < 2 s），单设备 + `1m` 约 0.4 s，最近 30 分钟约 0.3 s；不降采样返回 100 万行约 5–8 s（受输出规模限制）。仍是全文扫描，没有时间索引；再上一个量级应换时序库，接口形状不变 |
 | FR-NOR-09 | Sparkplug B | 刻意没做（C） | Wave 2；可作为新的 MQTT sink 接入 |
 | FR-NOR-10 | 数据契约版本（`schemaVersion`） | 已实现 | REST/SSE/MQTT/OPC UA 输出都带 `schemaVersion`；`json/unknown_fields_are_tolerated` 保证前向兼容 |
 

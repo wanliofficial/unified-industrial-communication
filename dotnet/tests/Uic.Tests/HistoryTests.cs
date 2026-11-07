@@ -20,6 +20,9 @@ internal static class HistoryTests
         tests.Add(new TestCase("history/missing_journal_is_empty", MissingJournalIsEmpty));
         tests.Add(new TestCase("history/skips_malformed_lines", SkipsMalformedLines));
         tests.Add(new TestCase("history/handles_lines_across_read_buffer", HandlesLinesAcrossReadBuffer));
+        tests.Add(new TestCase("history/downsamples_across_read_buffer_boundary", DownsamplesAcrossReadBufferBoundary));
+        tests.Add(new TestCase("history/falls_back_on_escaped_names", FallsBackOnEscapedNames));
+        tests.Add(new TestCase("history/skips_impossible_calendar_dates", SkipsImpossibleCalendarDates));
     }
 
     private static Task FiltersByTimeAndIdentity(TestContext t)
@@ -135,6 +138,94 @@ internal static class HistoryTests
             {
                 t.Equal(1, items.Count, "the long line is read exactly once");
                 t.Equal(unit.Length, items[0].Unit?.Length ?? -1, "the whole unit string survives");
+            },
+            _ => { });
+    }
+
+    private static Task DownsamplesAcrossReadBufferBoundary(TestContext t)
+    {
+        var dir = t.TempDir;
+        var t0 = new DateTimeOffset(2026, 11, 7, 8, 0, 0, TimeSpan.Zero);
+
+        // 2000 行 × 约 150 字节 > 256 KiB 读缓冲，保证「胜出行」散布在多个缓冲区里。
+        // 降采样阶段按文件偏移回读，偏移算错就会读到别人的行。
+        var samples = new List<Sample>();
+        for (var i = 0; i < 2000; i++)
+        {
+            samples.Add(Sample($"dev{i % 4}", $"p{i % 7}", (ulong)(i + 1), t0.AddSeconds(i), i));
+        }
+
+        WriteJournal(dir, samples.ToArray());
+
+        return QueryAndAssert(t, dir, new HistoryQuery(
+                null, null, t0.AddSeconds(-1), t0.AddMinutes(60), TimeSpan.FromMinutes(1)),
+            items =>
+            {
+                // 每个 (设备, 点位, 分钟) 桶留下时刻最大的那条，且值能被原样读回。
+                var expected = samples
+                    .GroupBy(s => (s.DeviceId, s.PointId, s.CollectedAt.ToUnixTimeSeconds() / 60))
+                    .Select(g => g.MaxBy(s => s.CollectedAt)!)
+                    .OrderBy(s => s.CollectedAt)
+                    .ThenBy(s => s.DeviceId, StringComparer.Ordinal)
+                    .ThenBy(s => s.PointId, StringComparer.Ordinal)
+                    .ToList();
+
+                t.Equal(expected.Count, items.Count, "one winner per bucket across buffer boundaries");
+                for (var i = 0; i < expected.Count; i++)
+                {
+                    t.Equal(expected[i].Value.Num!.Value, items[i].Value.Num!.Value, $"winner {i} value");
+                    t.Equal(expected[i].Seq, items[i].Seq, $"winner {i} seq");
+                }
+            },
+            _ => { });
+    }
+
+    private static Task FallsBackOnEscapedNames(TestContext t)
+    {
+        var dir = t.TempDir;
+        var t0 = new DateTimeOffset(2026, 11, 7, 8, 0, 0, TimeSpan.Zero);
+
+        // 中文设备名在 journal 里是 \uXXXX 转义。字节快路径不能按原文比较，
+        // 必须退回完整解析，否则「按设备过滤」会一行都匹配不到。
+        WriteJournal(dir,
+            Sample("设备-一号", "温度", 1, t0.AddSeconds(1), 21.5),
+            Sample("设备-二号", "温度", 2, t0.AddSeconds(2), 22.5));
+
+        return QueryAndAssert(t, dir, new HistoryQuery(
+                "设备-一号", null, t0.AddMinutes(-1), t0.AddMinutes(1), null),
+            items =>
+            {
+                t.Equal(1, items.Count, "escaped names still match after JSON unescaping");
+                t.Equal("设备-一号", items[0].Device, "the device id round-trips");
+                t.Equal(21.5, items[0].Value.Num!.Value, "the value is intact");
+            },
+            _ => { });
+    }
+
+    private static Task SkipsImpossibleCalendarDates(TestContext t)
+    {
+        var dir = t.TempDir;
+        var t0 = new DateTimeOffset(2026, 11, 7, 8, 0, 0, TimeSpan.Zero);
+
+        var path = JournalPath(dir);
+        Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+
+        // 2 月 30 日不存在。快路径自己算 ticks 时必须拒绝它，
+        // 否则同一行在快、慢两条路径上会得到不同结论。
+        var bad = ApiJson.Serialize(SampleDto.From(Sample("dev", "p", 1, t0, 1)))
+            .Replace("2026-11-07T08:00:00.000Z", "2026-02-30T08:00:00.000Z");
+
+        File.WriteAllLines(path, new[]
+        {
+            bad,
+            ApiJson.Serialize(SampleDto.From(Sample("dev", "p", 2, t0.AddSeconds(1), 2))),
+        });
+
+        return QueryAndAssert(t, dir, new HistoryQuery(null, null, t0.AddMinutes(-1), t0.AddMinutes(1), null),
+            items =>
+            {
+                t.Equal(1, items.Count, "the impossible date is skipped");
+                t.Equal(2d, items[0].Value.Num!.Value, "the valid line after it survives");
             },
             _ => { });
     }
