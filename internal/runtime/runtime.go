@@ -34,6 +34,7 @@ import (
 	"uic/internal/cache"
 	"uic/internal/config"
 	"uic/internal/driver"
+	bacnetdrv "uic/internal/driver/bacnet"
 	"uic/internal/driver/computed"
 	enipdrv "uic/internal/driver/enip"
 	finsdrv "uic/internal/driver/fins"
@@ -139,6 +140,7 @@ func RegisterBuiltins() error {
 			mcdrv.New(),
 			finsdrv.New(),
 			enipdrv.New(),
+			bacnetdrv.New(),
 		} {
 			if err := driver.Register(d); err != nil {
 				registerErr = err

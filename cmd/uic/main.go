@@ -1,4 +1,4 @@
-// Command uic 是单一可执行入口：run（默认）/ sim / mbread / mcread / finsread / enipread / uaread / s7blocks / s7upload / instantiate / import / token / version。
+// Command uic 是单一可执行入口：run（默认）/ sim / mbread / mcread / finsread / enipread / bacread / uaread / s7blocks / s7upload / instantiate / import / token / version。
 //
 //	uic -config config.json            # 前台运行
 //	uic run -config config.json        # 同上
@@ -12,6 +12,7 @@
 //	uic mcread -addr 127.0.0.1:5000 -area d -offset 100 -qty 2   # MC 3E 自检
 //	uic finsread -addr 127.0.0.1:9600 -area dm -offset 100 -qty 2 # 欧姆龙 FINS 自检
 //	uic enipread -addr 127.0.0.1:44818 -tag DINT_TAG  # EtherNet/IP CIP 自检
+//	uic bacread -addr 127.0.0.1:47808 -type analog-input -instance 1  # BACnet/IP 自检
 //	uic uaread -addr 127.0.0.1:4840 -nodes ns=2;s=site/dev/point  # OPC UA 读写自检
 //	uic s7blocks -addr 127.0.0.1:15102   # S7 块目录（-type db / -num 1 可细看）
 //	uic s7upload -addr 127.0.0.1:15102 -type db -num 1 -out db1.bin  # 块上传备份
@@ -47,6 +48,7 @@ import (
 	"uic/internal/model"
 	"uic/internal/opcuaserver"
 	uicruntime "uic/internal/runtime"
+	bacnetsim "uic/internal/sim/bacnet"
 	enipsim "uic/internal/sim/enip"
 	finsim "uic/internal/sim/fins"
 	mcsim "uic/internal/sim/mc"
@@ -79,6 +81,8 @@ func main() {
 		finsreadCmd(args)
 	case "enipread":
 		enipreadCmd(args)
+	case "bacread":
+		bacreadCmd(args)
 	case "uaread":
 		uareadCmd(args)
 	case "s7blocks":
@@ -108,7 +112,7 @@ func usage() {
 用法:
   uic [run] -config config.json [-listen :8080] [-token TOKEN]
   uic -check -config config.json
-  uic sim [-listen 127.0.0.1:15020] [-protocol modbus|s7|opcua|mqtt|mc|fins|enip]
+  uic sim [-listen 127.0.0.1:15020] [-protocol modbus|s7|opcua|mqtt|mc|fins|enip|bacnet]
   uic mbread -addr 127.0.0.1:1502 -unit 1 -area holding -offset 0 -qty 2
   uic mbread -addr 127.0.0.1:1502 -area holding -offset 5 -write 777
   uic mcread -addr 127.0.0.1:5000 -area d -offset 100 -qty 2
@@ -117,6 +121,8 @@ func usage() {
   uic finsread -addr 127.0.0.1:9600 -area cio -offset 10 -bit 3 -write on
   uic enipread -addr 127.0.0.1:44818 -tag DINT_TAG [-type dint]
   uic enipread -addr 127.0.0.1:44818 -tag BOOL_TAG -type bool -write on
+  uic bacread -addr 127.0.0.1:47808 -type analog-input -instance 1
+  uic bacread -addr 127.0.0.1:47808 -type analog-value -instance 2 -write 55.5
   uic mbread -transport rtu|ascii -port /dev/ttyUSB0 [-baud 19200] [-parity even]
   uic uaread -addr 127.0.0.1:4840 -nodes ns=2;s=site/dev/point [-type float64]
   uic uaread -addr 127.0.0.1:4840 -nodes ns=2;s=site/dev/setpoint -write 42.5
@@ -422,7 +428,7 @@ func simCmd(args []string) {
 	fs := flag.NewFlagSet("sim", flag.ExitOnError)
 	addr := fs.String("listen", "127.0.0.1:15020", "监听地址")
 	size := fs.Int("size", 1024, "寄存器数量")
-	proto := fs.String("protocol", "modbus", "从站协议：modbus | s7 | opcua | mqtt | mc | fins | enip")
+	proto := fs.String("protocol", "modbus", "从站协议：modbus | s7 | opcua | mqtt | mc | fins | enip | bacnet")
 	pdu := fs.Int("pdu", 480, "S7 协商 PDU 长度（240/480/960）")
 	fs.Parse(args)
 
@@ -445,9 +451,12 @@ func simCmd(args []string) {
 	case "enip":
 		simENIP(*addr)
 		return
+	case "bacnet":
+		simBACnet(*addr)
+		return
 	case "modbus":
 	default:
-		fmt.Fprintf(os.Stderr, "未知协议 %q（支持 modbus | s7 | opcua | mqtt | mc | fins | enip）\n", *proto)
+		fmt.Fprintf(os.Stderr, "未知协议 %q（支持 modbus | s7 | opcua | mqtt | mc | fins | enip | bacnet）\n", *proto)
 		os.Exit(2)
 	}
 
@@ -781,6 +790,31 @@ func simENIP(addr string) {
 	fmt.Println("  DINT_TAG=1234  INT_TAG=5678  REAL_TAG=48.0  BOOL_TAG=true")
 	fmt.Println("  STRING_TAG=\"PUMP-01\"  DINT_ARRAY=[10,20,30,40]")
 	fmt.Println("  COUNTER 每秒自增，可用于观察 SSE")
+	fmt.Println("  Ctrl+C 停止")
+
+	<-ctx.Done()
+	_ = srv.Close()
+	slog.Info("sim_stopped")
+}
+
+// simBACnet 启动内置 BACnet/IP（UDP）从站。初始值与 examples/bacnet.json
+// 对应，便于 `./uic sim -protocol bacnet -listen 127.0.0.1:47808 &` 之后
+// 直接跑 `./uic -config examples/bacnet.json`。
+func simBACnet(addr string) {
+	srv, err := bacnetsim.NewServer(addr)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "启动 BACnet/IP 从站失败: %v\n", err)
+		os.Exit(1)
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	fmt.Printf("bacnet/ip slave listening on %s\n", srv.Addr())
+	fmt.Println("  analog-input:1.present-value=42.5  object-name=\"AI-1\"  units=62")
+	fmt.Println("  analog-value:2.present-value=0（可写）  priority-array 16 级")
+	fmt.Println("  binary-input:1.present-value=1（active）  character-string:1=\"PUMP-01\"（可写）")
+	fmt.Println("  analog-value:3 每秒自增，可用于观察 SSE")
 	fmt.Println("  Ctrl+C 停止")
 
 	<-ctx.Done()

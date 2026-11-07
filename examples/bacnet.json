@@ -1,0 +1,143 @@
+{
+  "schemaVersion": 1,
+  "site": "bacnet-lab",
+  "server": {
+    "listen": "127.0.0.1:8090",
+    "token": "dev-token-0123456789"
+  },
+  "storage": {
+    "dir": "./data-bacnet",
+    "journal": true,
+    "outboxMaxRecords": 5000,
+    "outboxTtl": "10m"
+  },
+  "logging": {
+    "level": "info"
+  },
+  "northbound": {
+    "webhook": {
+      "enabled": false,
+      "url": "http://127.0.0.1:9999/ingest",
+      "timeout": "3s"
+    }
+  },
+  "channels": [
+    {
+      "id": "ch-bacnet",
+      "protocol": "bacnet",
+      "transport": {
+        "kind": "udp",
+        "address": "127.0.0.1:47808"
+      },
+      "concurrency": 1,
+      "timeout": "2s"
+    }
+  ],
+  "devices": [
+    {
+      "id": "ahu01",
+      "name": "一号机组（BACnet/IP，UDP 47808）",
+      "channel": "ch-bacnet",
+      "interval": "1s",
+      "timeout": "2s",
+      "enabled": true,
+      "points": [
+        {
+          "id": "temp",
+          "name": "送风温度（analog-input:1 present-value）",
+          "address": {
+            "kind": "object",
+            "objectType": "analog-input",
+            "instance": 1,
+            "property": "present-value",
+            "propIndex": 0
+          },
+          "dataType": "float32",
+          "unit": "degC",
+          "enabled": true
+        },
+        {
+          "id": "name",
+          "name": "对象名称（object-name，字符串）",
+          "address": {
+            "kind": "object",
+            "objectType": "analog-input",
+            "instance": 1,
+            "property": "object-name",
+            "propIndex": 0
+          },
+          "dataType": "string",
+          "enabled": true
+        },
+        {
+          "id": "units",
+          "name": "工程单位（units，枚举）",
+          "address": {
+            "kind": "object",
+            "objectType": "analog-input",
+            "instance": 1,
+            "property": "units",
+            "propIndex": 0
+          },
+          "dataType": "uint32",
+          "enabled": true
+        },
+        {
+          "id": "setpoint",
+          "name": "设定值（analog-value:2 present-value，可写）",
+          "address": {
+            "kind": "object",
+            "objectType": "analog-value",
+            "instance": 2,
+            "property": "present-value",
+            "propIndex": 0
+          },
+          "dataType": "float32",
+          "unit": "degC",
+          "writable": true,
+          "enabled": true
+        },
+        {
+          "id": "run",
+          "name": "运行状态（binary-input:1 present-value）",
+          "address": {
+            "kind": "object",
+            "objectType": "binary-input",
+            "instance": 1,
+            "property": "present-value",
+            "propIndex": 0
+          },
+          "dataType": "bool",
+          "enabled": true
+        },
+        {
+          "id": "label",
+          "name": "设备标牌（character-string:1，可写）",
+          "address": {
+            "kind": "object",
+            "objectType": "character-string",
+            "instance": 1,
+            "property": "present-value",
+            "propIndex": 0
+          },
+          "dataType": "string",
+          "writable": true,
+          "enabled": true
+        },
+        {
+          "id": "counter",
+          "name": "analog-value:3（每秒自增，用来看 SSE）",
+          "address": {
+            "kind": "object",
+            "objectType": "analog-value",
+            "instance": 3,
+            "property": "present-value",
+            "propIndex": 0
+          },
+          "dataType": "float32",
+          "enabled": true
+        }
+      ]
+    }
+  ]
+}
