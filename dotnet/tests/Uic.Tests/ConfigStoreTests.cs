@@ -19,6 +19,7 @@ internal static class ConfigStoreTests
         tests.Add(new TestCase("config/rollback_adds_a_version", RollbackAddsAVersion));
         tests.Add(new TestCase("config/bootstrap_prefers_current_pointer", BootstrapPrefersCurrentPointer));
         tests.Add(new TestCase("config/rejects_invalid_documents", RejectsInvalidDocuments));
+        tests.Add(new TestCase("config/rejects_twenty_invalid_shapes", RejectsTwentyInvalidShapes));
         tests.Add(new TestCase("config/diff_finds_changed_added_removed", DiffFindsChanges));
         tests.Add(new TestCase("config/diff_text_is_human_readable", DiffTextIsReadable));
         tests.Add(new TestCase("config/reload_after_restart", ReloadAfterRestart));
@@ -161,6 +162,107 @@ internal static class ConfigStoreTests
         t.Throws<ConfigException>(
             () => store.Commit(new ConfigDocument { Site = string.Empty }), "commit validates");
         t.Equal(0, store.Versions().Count, "nothing was written for an invalid document");
+
+        return Task.CompletedTask;
+    }
+
+    /// <summary>
+    /// NFR「注入 20 类非法配置」：每类只改一个字段，断言拒绝理由落在预期路径上。
+    /// 逐条覆盖而不是一个大杂烩，是为了失败时能直接指向「哪条规则漏了」。
+    /// </summary>
+    private static Task RejectsTwentyInvalidShapes(TestContext t)
+    {
+        var cases = new (string Name, Action<JsonObject> Mutate, string Path)[]
+        {
+            ("unsupported schema version", n => n["schemaVersion"] = 2, "schemaVersion"),
+            ("empty site", n => n["site"] = "", "site"),
+            ("malformed channel id", n => n["channels"]![0]!["id"] = "BAD", "channels[BAD].id"),
+            ("missing channel protocol", n => n["channels"]![0]!["protocol"] = "",
+                "channels[virtual-bus].protocol"),
+            ("zero channel concurrency", n => n["channels"]![0]!["maxConcurrency"] = 0,
+                "channels[virtual-bus].maxConcurrency"),
+            ("zero channel timeout", n => n["channels"]![0]!["timeout"] = "0s",
+                "channels[virtual-bus].timeout"),
+            ("unknown transport", n => n["channels"]![1]!["transport"] = "canbus",
+                "channels[modbus-tcp-1].transport"),
+            ("tcp without host", n => n["channels"]![1]!["host"] = "",
+                "channels[modbus-tcp-1].host"),
+            ("tcp port out of range", n => n["channels"]![1]!["port"] = 70000,
+                "channels[modbus-tcp-1].port"),
+            ("serial without port", n =>
+            {
+                var channel = n["channels"]![1]!.AsObject();
+                channel["transport"] = "serial";
+                channel["serial"] = JsonNode.Parse("""{"port":"","baud":100}""");
+            }, "channels[modbus-tcp-1].serial.port"),
+            ("malformed device id", n => n["devices"]![0]!["id"] = "BAD", "devices[BAD].id"),
+            ("device points at a missing channel", n => n["devices"]![0]!["channelId"] = "missing",
+                "devices[virtual-1].channelId"),
+            ("device interval below 10ms", n => n["devices"]![0]!["interval"] = "1ms",
+                "devices[virtual-1].interval"),
+            ("device unit id out of range", n => n["devices"]![0]!["unitId"] = 0,
+                "devices[virtual-1].unitId"),
+            ("device without points", n => n["devices"]![0]!["points"] = new JsonArray(),
+                "devices[virtual-1].points"),
+            ("malformed point id", n => n["devices"]![0]!["points"]![0]!["id"] = "BAD",
+                "devices[virtual-1].points[BAD].id"),
+            ("register address without area", n =>
+                n["devices"]![0]!["points"]![0]!["address"]!["area"] = "",
+                "devices[virtual-1].points[temperature].address.area"),
+            ("register span shorter than the type", n =>
+                n["devices"]![0]!["points"]![0]!["address"]!["length"] = 1,
+                "devices[virtual-1].points[temperature].address.length"),
+            ("negative deadband", n => n["devices"]![0]!["points"]![0]!["deadband"] = -1,
+                "devices[virtual-1].points[temperature].deadband"),
+            ("rate deadband must be positive", n =>
+            {
+                n["devices"]![0]!["points"]![0]!["deadbandMode"] = "rate";
+                n["devices"]![0]!["points"]![0]!["deadband"] = 0;
+            }, "devices[virtual-1].points[temperature].deadband"),
+            ("log file too small", n => n["logging"]!["file"]!["maxBytes"] = 100,
+                "logging.file.maxBytes"),
+            ("mqtt qos2", n =>
+            {
+                n["northbound"]!["mqtt"]!["enabled"] = true;
+                n["northbound"]!["mqtt"]!["qos"] = 2;
+            }, "northbound.mqtt.qos"),
+            ("opc ua certificate policy", n =>
+            {
+                n["northbound"]!["opcUa"]!["enabled"] = true;
+                n["northbound"]!["opcUa"]!["securityPolicy"] = "Basic256Sha256";
+            }, "northbound.opcUa.securityPolicy"),
+            ("negative memory watermark", n => n["storage"]!["maxMemoryBytes"] = -1,
+                "storage.maxMemoryBytes"),
+        };
+
+        t.Ok(cases.Length >= 20, $"the matrix covers at least twenty classes (got {cases.Length})");
+
+        foreach (var (name, mutate, path) in cases)
+        {
+            var node = JsonNode.Parse(JsonDefaults.ToJson(DemoConfig.Build()))!.AsObject();
+            mutate(node);
+
+            try
+            {
+                ConfigStore.Parse(node.ToJsonString(), "invalid.json");
+                t.Fail($"{name}: an invalid document must be rejected");
+            }
+            catch (ConfigException ex)
+            {
+                var hit = ex.Problems.Any(p =>
+                    string.Equals(p.Path, path, StringComparison.Ordinal) ||
+                    p.Path.StartsWith(path + ".", StringComparison.Ordinal));
+
+                t.Ok(hit, $"{name}: expected a problem at '{path}', got " +
+                           string.Join(", ", ex.Problems.Select(p => p.Path)));
+            }
+        }
+
+        // 24 次失败之后合法配置仍能提交：拒绝不能留下半成品或污染当前指针。
+        var store = new ConfigStore(t.TempDir);
+        var id = store.Commit(DemoConfig.Build(), "valid after rejections");
+        t.Equal(1, store.Versions().Count, "failed attempts never create versions");
+        t.Ok(store.LoadVersion(id) is not null, "the valid version is readable");
 
         return Task.CompletedTask;
     }

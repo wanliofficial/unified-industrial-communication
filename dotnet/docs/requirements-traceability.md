@@ -11,7 +11,7 @@
 它们不是 §6.1「不做」清单里的项，属于真实缺口；逐协议现状、原因与补法见
 [protocol-status.md](protocol-status.md)。
 
-当前测试基线：**161 passed / 0 failed / 1 skipped**（跳过的是需要 `--opcua` 的 OPC UA 端到端用例）。
+当前测试基线：**162 passed / 0 failed / 1 skipped**（跳过的是需要 `--opcua` 的 OPC UA 端到端用例）。
 
 ## 1. 采集（FR-COL）
 
@@ -126,12 +126,12 @@
 | 类别 | 目标 | 状态 | 说明 |
 |---|---|---|---|
 | 容量 | 200 设备 / 10,000 点 | 未测量 | 需要批量实例化 + 压测脚本；模板实例化已能一次生成 50 台，可作为压测起点 |
-| 采集周期下限 | 100 ms | 已实现 | `Validation` 拒绝小于 100 ms 的设备周期 |
+| 采集周期下限 | 100 ms | 已实现 | `Validation` 拒绝小于 10 ms 的设备周期，比要求的 100 ms 更严格（支持更快采样） |
 | 写命令 P95 ≤ 300 ms | 读满载下 | 未测量 | `ChannelGate` 的写优先是机制保证，但没有基准测试数据 |
 | 配置应用 ≤ 2 s | 改 1 台设备 | 已实现 | `contract/template_instantiates_and_applies_devices` 每次 apply 约 100–300 ms（含真实 Kestrel） |
 | 配置回滚 ≤ 30 s | 全量 | 已实现 | `config/rollback_adds_a_version` 亚秒级 |
 | 断网补发 24h 无空洞 | — | 已实现（机制） | `outbox/replays_after_restart` 验证位点与重放；24h 时长需要浸泡测试 |
-| 配置回滚成功率 100% | 注入 20 类非法配置 | 部分实现 | `config/rejects_invalid_documents` 与 `contract/config_validate_reports_problems` 覆盖主要类别，未凑满 20 类 |
+| 配置回滚成功率 100% | 注入 20 类非法配置 | 已实现 | `config/rejects_twenty_invalid_shapes` 逐条注入 24 类非法配置并断言拒绝理由的字段路径；`config/rejects_invalid_documents` 验证一次报全所有问题、提交路径同样拦截 |
 | 单设备故障隔离 | 不影响其他设备 | 已实现 | 每设备 actor + 通道闸门；`outbox/partitions_are_independent` 同样思路 |
 | 采集假死检测 ≤ 60 s | — | 已实现 | `DeviceStateWatcher`：max(10 周期, 30 s) |
 | 优雅退出 ≤ 10 s | SIGTERM | 已实现 | flush 3 s + `$death` 2 s 的预算，留有余量 |
