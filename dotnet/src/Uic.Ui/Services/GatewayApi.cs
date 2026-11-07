@@ -344,7 +344,11 @@ public sealed record PointsSummaryDto(int Total, int Good, int Bad);
 
 public sealed record PointDto(string Device, string Point, string? Name, DataValueDto Value,
     string Quality, string? Unit, DateTimeOffset? DeviceTime, DateTimeOffset CollectedAt, ulong Seq,
-    bool Writable);
+    bool Writable,
+    // 点位周期：Interval 只在覆盖设备周期时出现；EffectiveInterval 始终有值，
+    // 操作员据此判断「这个点位多久没更新算过期」，不必去翻设备配置。
+    [property: JsonConverter(typeof(DurationConverter))] TimeSpan? Interval = null,
+    [property: JsonConverter(typeof(DurationConverter))] TimeSpan EffectiveInterval = default);
 
 public sealed record DataValueDto(string Type, double? Num, bool? Bool, string? Text)
 {

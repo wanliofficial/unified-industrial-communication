@@ -160,10 +160,32 @@ RTU/ASCII 主站按 3.5 个字符时间做帧间静默（9600 bps 约 4 ms；>19
 | `deadband` | 不启用 | 死区阈值；含义由 `deadbandMode` 决定，`>= 0` |
 | `deadbandMode` | `absolute` | `absolute` / `percent` / `rate`，见下 |
 | `rangeMin` / `rangeMax` | — | 量程下限 / 上限；必须成对出现且 `rangeMin < rangeMax` |
+| `interval` | 继承设备 | 点位自己的采集周期：空或 `0` 表示继承设备，非 0 时 `100ms..24h` |
 | `unit` | — | 单位，原样带到北向 |
 | `writable` | `true` | 只读点位在驱动层就被拒，不会发到线上 |
 | `enabled` | `true` | |
 | `length` | `0` | `string`/`bytes` 的字节长度（1..1024） |
+
+### 点位周期
+
+同一个 `device.interval` 不一定适合所有点位：流量、位置这类快变量要 100ms，
+液位、温度这类慢变量 10s 就够。`interval` 允许点位覆盖设备周期：
+
+```json
+"points": [
+  { "id": "flow",  "interval": "100ms", "address": { "area": "holding", "offset": 10 }, "dataType": "float32" },
+  { "id": "level", "interval": "10s",   "address": { "area": "holding", "offset": 12 }, "dataType": "float32" }
+]
+```
+
+- 每个点位按自己的有效周期读取，同一设备上的请求仍然**串行**：按周期分组后，
+  每轮只读到期的组，到期的多组合并成一次往返；
+- 设备仍然只有一个连接与一个采集循环，不存在「快慢两条链路互相抢串口」；
+- 读窗口按组分别规划：快慢点位即使地址相邻也不会被合成一个请求，这是周期的代价；
+- 某一组失败只把该组的点位标成坏质量，不会牵连还没到期的慢变量；
+- 看门狗按设备内最慢的点位周期判断「采集停滞」，只挂慢变量的设备不会误报；
+- 低于 `100ms` 属于「该用订阅型协议」的区间，校验会直接拒绝；
+- CSV 导入用 `interval` 列，写法与 JSON 一致（`100ms` / `1s` / `2m`，纯数字按毫秒）。
 
 ### 死区
 

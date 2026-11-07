@@ -27,6 +27,8 @@ internal static class EngineTests
         tests.Add(new TestCase("engine/write_confirmation_reads_back", WriteConfirmationReadsBack));
         tests.Add(new TestCase("engine/write_confirmation_detects_mismatch", WriteConfirmationDetectsMismatch));
         tests.Add(new TestCase("engine/write_without_confirmation_skips_readback", WriteWithoutConfirmationSkipsReadback));
+        tests.Add(new TestCase("engine/point_interval_overrides_device_period", PointIntervalOverridesDevicePeriod));
+        tests.Add(new TestCase("engine/point_interval_failure_is_scoped_to_due_bucket", PointIntervalFailureIsScoped));
     }
 
     /// <summary>
@@ -351,6 +353,214 @@ internal static class EngineTests
                 var index = Interlocked.Increment(ref _owner.Reads) - 1;
                 var step = index < _owner._steps.Count ? _owner._steps[index] : _owner._fallback;
                 return Task.FromResult(step(spans));
+            }
+
+            public Task<IReadOnlyList<WriteResult>> WriteAsync(
+                IReadOnlyList<WriteCommand> commands, CancellationToken ct)
+                => Task.FromResult<IReadOnlyList<WriteResult>>(commands
+                    .Select(c => new WriteResult(c.Point.Id, true, Quality.Good, DateTimeOffset.UtcNow))
+                    .ToArray());
+
+            public ValueTask DisposeAsync() => ValueTask.CompletedTask;
+        }
+    }
+
+    /// <summary>
+    /// FR-COL-10：点位周期可以覆盖设备周期。
+    ///
+    /// 「快变量 100ms、慢变量 10s 并存」是这条需求的验收标准，而它同时受两个约束：
+    /// 每个点位按自己的节奏读，同一设备上的请求仍然串行。用例用 1s 的设备周期
+    /// 加一个 100ms 的点位，数一数两种节奏确实分开了。
+    /// </summary>
+    private static Task PointIntervalOverridesDevicePeriod(TestContext t)
+    {
+        return RunAsync(async () =>
+        {
+            var driver = new BucketDriver();
+            var device = new Device
+            {
+                Id = "dev-1",
+                ChannelId = "ch-1",
+                Interval = TimeSpan.FromSeconds(1),
+                Points = new List<Point>
+                {
+                    new()
+                    {
+                        Id = "fast",
+                        Address = Address.Register("holding", 0),
+                        DataType = DataType.UInt16,
+                        Interval = TimeSpan.FromMilliseconds(100),
+                    },
+                    new()
+                    {
+                        Id = "slow",
+                        Address = Address.Register("holding", 1),
+                        DataType = DataType.UInt16,
+                    },
+                },
+            };
+
+            var actor = new DeviceActor(
+                device,
+                BuildChannel(),
+                driver,
+                new PointCache(),
+                new ChannelGate(1),
+                NullLogger.Instance,
+                new SchedulerOptions { Tick = TimeSpan.FromMilliseconds(5) });
+
+            t.Equal(2, actor.CollectionIntervals.Count, "the points fall into two cadences");
+            t.Equal(TimeSpan.FromMilliseconds(100), actor.CollectionIntervals[0],
+                "the fast cadence comes first");
+            t.Equal(TimeSpan.FromSeconds(1), actor.CollectionIntervals[1],
+                "the point without an interval inherits the device period");
+            t.Equal(TimeSpan.FromSeconds(1), actor.SlowestInterval,
+                "the watchdog threshold follows the slowest cadence");
+
+            actor.Start();
+            await Task.Delay(700, t.Ct);
+            await actor.StopAsync();
+
+            var fast = driver.ReadsOf("fast");
+            var slow = driver.ReadsOf("slow");
+
+            t.Ok(fast >= 5, $"the fast point really runs at 100ms (reads={fast})");
+            t.Equal(1, slow, "the slow point is read once within 700ms");
+            t.Ok(fast > slow * 3, $"the two cadences are separated (fast={fast}, slow={slow})");
+            t.Equal(0, driver.Overlaps, "per-point cadences still never overlap on one connection");
+        });
+    }
+
+    /// <summary>
+    /// 快周期那个桶读失败时，只有它自己的点位变坏。
+    ///
+    /// 如果失败把整台设备的点位都标成坏值，现场会看到「慢变量也故障」的假象，
+    /// 而这台设备其实只是快变量那条窗口出了通信问题。
+    /// </summary>
+    private static Task PointIntervalFailureIsScoped(TestContext t)
+    {
+        return RunAsync(async () =>
+        {
+            var driver = new BucketDriver { FailFastAfterFirstRead = true };
+            var device = new Device
+            {
+                Id = "dev-1",
+                ChannelId = "ch-1",
+                Interval = TimeSpan.FromSeconds(1),
+                Points = new List<Point>
+                {
+                    new()
+                    {
+                        Id = "fast",
+                        Address = Address.Register("holding", 0),
+                        DataType = DataType.UInt16,
+                        Interval = TimeSpan.FromMilliseconds(100),
+                    },
+                    new()
+                    {
+                        Id = "slow",
+                        Address = Address.Register("holding", 1),
+                        DataType = DataType.UInt16,
+                    },
+                },
+            };
+
+            var cache = new PointCache();
+            var actor = new DeviceActor(
+                device,
+                BuildChannel(),
+                driver,
+                cache,
+                new ChannelGate(1),
+                NullLogger.Instance,
+                new SchedulerOptions { Tick = TimeSpan.FromMilliseconds(5) });
+
+            actor.Start();
+            await Task.Delay(450, t.Ct);
+            await actor.StopAsync();
+
+            t.Ok(driver.ReadsOf("fast") >= 2, "the fast bucket was attempted again after the failure");
+            t.Equal(Quality.CommError, cache.Get("dev-1", "fast")!.Quality,
+                "the failing bucket reports the communication error");
+
+            t.Equal(Quality.Good, cache.Get("dev-1", "slow")!.Quality,
+                "the slow point keeps its last good value");
+            t.Equal(1UL, cache.Get("dev-1", "slow")!.Seq,
+                "the slow point is not re-read by the fast bucket's schedule");
+            t.Equal(1, driver.ReadsOf("slow"), "the slow point was only read on the merged first round");
+        });
+    }
+
+    /// <summary>
+    /// 记录每个点位被读了多少次，并可选地让「含 fast 的读取」在首轮之后失败。
+    /// 周期用例要的是「哪个点位在什么时候被读到」，只有驱动自己数得清。
+    /// </summary>
+    private sealed class BucketDriver : IDriver
+    {
+        private readonly Dictionary<string, int> _reads = new(StringComparer.Ordinal);
+        private int _calls;
+        private int _inFlight;
+
+        public bool FailFastAfterFirstRead { get; init; }
+        public int Overlaps;
+
+        public int ReadsOf(string point)
+        {
+            lock (_reads) return _reads.TryGetValue(point, out var n) ? n : 0;
+        }
+
+        public DriverMeta Meta { get; } = new()
+        {
+            Id = "bucket",
+            Name = "周期驱动",
+            Transports = new[] { "none" },
+            Roles = new[] { DriverRole.Master },
+        };
+
+        public IConn Open(OpenContext context) => new Conn(this);
+
+        private sealed class Conn : IConn
+        {
+            private readonly BucketDriver _owner;
+
+            public Conn(BucketDriver owner) => _owner = owner;
+
+            public Task ProbeAsync(CancellationToken ct) => Task.CompletedTask;
+
+            public Task<IReadOnlyList<RawSample>> ReadAsync(
+                IReadOnlyList<ReadSpan> spans, CancellationToken ct)
+            {
+                if (Interlocked.Increment(ref _owner._inFlight) > 1)
+                    Interlocked.Increment(ref _owner.Overlaps);
+
+                try
+                {
+                    var call = Interlocked.Increment(ref _owner._calls);
+                    var ids = spans.SelectMany(s => s.Points).Select(p => p.Id).ToArray();
+
+                    lock (_owner._reads)
+                    {
+                        foreach (var id in ids)
+                            _owner._reads[id] = (_owner._reads.TryGetValue(id, out var n) ? n : 0) + 1;
+                    }
+
+                    if (_owner.FailFastAfterFirstRead &&
+                        call > 1 &&
+                        ids.Contains("fast", StringComparer.Ordinal))
+                    {
+                        throw DriverException.Connection("bucket", "read", "fast window link down");
+                    }
+
+                    IReadOnlyList<RawSample> raw = spans.SelectMany(s => s.Points)
+                        .Select(p => new RawSample(p.Id, DataValue.Number(p.DataType, 1), Quality.Good, null))
+                        .ToArray();
+
+                    return Task.FromResult(raw);
+                }
+                finally
+                {
+                    Interlocked.Decrement(ref _owner._inFlight);
+                }
             }
 
             public Task<IReadOnlyList<WriteResult>> WriteAsync(

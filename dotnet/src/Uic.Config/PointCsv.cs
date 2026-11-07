@@ -23,7 +23,7 @@ public sealed record PointCsvResult(
 ///
 /// 列名大小写不敏感，接受常见别名：
 /// <c>id, name, address, area, offset, bit, length, dataType, byteOrder, unit,
-/// scale, bias, deadband, deadbandMode, rangeMin, rangeMax, writable, enabled, byteLength</c>。
+/// scale, bias, deadband, deadbandMode, rangeMin, rangeMax, interval, writable, enabled, byteLength</c>。
 /// </summary>
 public static class PointCsv
 {
@@ -174,6 +174,7 @@ public static class PointCsv
 
             var rangeMin = ParseNullableDouble(Field("rangeMin"), line, "rangeMin", problems);
             var rangeMax = ParseNullableDouble(Field("rangeMax"), line, "rangeMax", problems);
+            var interval = ParseDuration(Field("interval"), line, "interval", problems);
 
             var point = new Point
             {
@@ -188,6 +189,7 @@ public static class PointCsv
                 DeadbandMode = deadbandMode,
                 RangeMin = rangeMin,
                 RangeMax = rangeMax,
+                Interval = interval,
                 Unit = Field("unit"),
                 Writable = writable,
                 Enabled = enabled,
@@ -517,6 +519,28 @@ public static class PointCsv
 
         problems.Add(new ValidationProblem($"line {line}.{column}", $"'{text}' is not an integer"));
         return fallback;
+    }
+
+    /// <summary>
+    /// 周期列接受 <c>100ms</c> / <c>1s</c> / <c>2m</c> 与纯数字（按毫秒）。
+    /// 空值表示继承设备周期；非法值记问题，而不是悄悄退回设备周期——
+    /// 现场以为「已经改成 100ms」而实际按 10s 采集是最难查的一类问题。
+    /// </summary>
+    private static TimeSpan? ParseDuration(string? text, int line, string column,
+        List<ValidationProblem> problems)
+    {
+        if (string.IsNullOrWhiteSpace(text)) return null;
+
+        try
+        {
+            return DurationConverter.Parse(text);
+        }
+        catch (FormatException)
+        {
+            problems.Add(new ValidationProblem($"line {line}.{column}",
+                $"'{text}' is not a duration (for example 100ms, 1s, 2m)"));
+            return null;
+        }
     }
 
     private static bool ParseBool(string? text, bool fallback, int line, string column,

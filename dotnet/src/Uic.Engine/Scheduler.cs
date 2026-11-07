@@ -178,9 +178,26 @@ public sealed class Scheduler : IAsyncDisposable
         var log = _logs.CreateLogger($"uic.device.{device.Id}");
 
         // 相位在 actor 启动时生效：新加/重启的设备也不会和老设备挤在同一个 tick。
-        var phase = ScheduleMath.PhaseOffset(index, total, device.Interval);
+        // 按设备内最快的周期铺开：若有 100ms 的点位，按 10s 的设备周期铺相会让它
+        // 白等好几秒才出第一个值（而现场正是靠这个快值判断设备是否上线）。
+        var phase = ScheduleMath.PhaseOffset(index, total, FastestInterval(device));
 
         return new DeviceActor(device, channel, driver, _cache, gate, log, _options, phase);
+    }
+
+    /// <summary>设备内实际最快的采集周期（点位覆盖优先）。</summary>
+    private static TimeSpan FastestInterval(Device device)
+    {
+        var fastest = device.Interval;
+
+        foreach (var point in device.Points)
+        {
+            if (!point.Enabled) continue;
+            var effective = point.EffectiveInterval(device);
+            if (effective > TimeSpan.Zero && effective < fastest) fastest = effective;
+        }
+
+        return fastest;
     }
 
     private static bool SameDevice(Device a, Device b)

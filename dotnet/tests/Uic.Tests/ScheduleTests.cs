@@ -20,6 +20,7 @@ internal static class ScheduleTests
         tests.Add(new TestCase("schedule/phase_spreads_devices", PhaseSpreadsDevices));
         tests.Add(new TestCase("schedule/monotonic_arithmetic", MonotonicArithmetic));
         tests.Add(new TestCase("schedule/scheduler_assigns_phases", SchedulerAssignsPhases));
+        tests.Add(new TestCase("schedule/phase_follows_fastest_point", PhaseFollowsFastestPoint));
     }
 
     private static Task PhaseSpreadsDevices(TestContext t)
@@ -127,6 +128,78 @@ internal static class ScheduleTests
             t.Close(250, phases[1], 1e-9, "device 1 is offset a quarter");
             t.Close(500, phases[2], 1e-9, "device 2 is offset half");
             t.Close(750, phases[3], 1e-9, "device 3 is offset three quarters");
+        });
+    }
+
+    /// <summary>
+    /// 相位要按设备内最快的周期算。
+    ///
+    /// 一台 10s 设备上挂了一个 100ms 的点位，如果按设备周期铺相，第二台设备的
+    /// 快值会白等 5s 才第一次出现——现场会用这个值判断设备是否上线，
+    /// 5s 的空白与「设备没起来」看起来一模一样。
+    /// </summary>
+    private static Task PhaseFollowsFastestPoint(TestContext t)
+    {
+        return RunAsync(async () =>
+        {
+            var registry = new DriverRegistry();
+            registry.Register(new NoopDriver());
+
+            var config = new ConfigDocument
+            {
+                Site = "phase",
+                Northbound = new NorthboundOptions(),
+                Channels =
+                {
+                    new Channel
+                    {
+                        Id = "ch",
+                        Protocol = "noop",
+                        Transport = "none",
+                        MaxConcurrency = 1,
+                        Timeout = TimeSpan.FromSeconds(1),
+                        ConnectTimeout = TimeSpan.FromSeconds(1),
+                    },
+                },
+            };
+
+            for (var i = 0; i < 2; i++)
+            {
+                config.Devices.Add(new Device
+                {
+                    Id = $"dev-{i}",
+                    ChannelId = "ch",
+                    Interval = TimeSpan.FromSeconds(10),
+                    Points =
+                    {
+                        new Point
+                        {
+                            Id = "fast",
+                            Address = Address.Register("holding", 0),
+                            DataType = DataType.UInt16,
+                            Interval = TimeSpan.FromMilliseconds(100),
+                        },
+                        new Point
+                        {
+                            Id = "slow",
+                            Address = Address.Register("holding", 1),
+                            DataType = DataType.UInt16,
+                        },
+                    },
+                });
+            }
+
+            await using var scheduler = new Scheduler(
+                registry, new PointCache(), NullLoggerFactory.Instance,
+                new SchedulerOptions { Tick = TimeSpan.FromMilliseconds(10) });
+
+            scheduler.Start(config);
+
+            var phases = scheduler.Actors.Select(a => a.StartPhase.TotalMilliseconds).ToArray();
+
+            t.Close(0, phases[0], 1e-9, "the first device starts immediately");
+            t.Close(50, phases[1], 1e-9,
+                "the offset follows the 100ms point, not the 10s device interval");
         });
     }
 

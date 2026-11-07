@@ -269,6 +269,19 @@ public sealed class Point
     /// <summary>量程上限。</summary>
     public double? RangeMax { get; init; }
 
+    /// <summary>
+    /// 点位自己的采集周期。为空或 0 表示继承设备周期。
+    ///
+    /// 快变量（流量、位置）和慢变量（液位、温度）挂在同一台 PLC 上很常见，
+    /// 全按最快周期读会把链路的预算浪费在慢变量上；全按最慢周期读又会漏掉快变量。
+    /// 允许点位覆盖周期，才能在一台设备上做到「100ms 与 10s 并存」。
+    /// </summary>
+    public TimeSpan? Interval { get; init; }
+
+    /// <summary>有效周期：点位覆盖优先，否则继承设备。0 与空值等价。</summary>
+    public TimeSpan EffectiveInterval(Device device)
+        => Interval is { } own && own > TimeSpan.Zero ? own : device.Interval;
+
     public string? Unit { get; init; }
     public bool Writable { get; init; } = true;
     public bool Enabled { get; init; } = true;

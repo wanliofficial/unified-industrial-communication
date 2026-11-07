@@ -260,6 +260,7 @@ public sealed class DevicesPage : IPage, IDisposable
             (Ui.Star(1.4), "点位"),
             (Ui.Star(1.0), "值"),
             (Ui.Star(0.7), "质量"),
+            (Ui.Star(0.6), "周期"),
             (Ui.Star(0.7), "单位"),
             (Ui.Star(1.2), "采集时间"),
             (Ui.Star(1.6), "名称")));
@@ -270,6 +271,8 @@ public sealed class DevicesPage : IPage, IDisposable
                 (Ui.Star(1.4), Ui.Text(point.Point, 12, Ui.Ink, mono: true)),
                 (Ui.Star(1.0), Ui.Text(point.Value.Display, 12, Ui.Ink, mono: true)),
                 (Ui.Star(0.7), Ui.Chip(point.Quality, UiFormat.Color(UiFormat.QualityColor(point.Quality)))),
+                (Ui.Star(0.6), Ui.Text(UiFormat.Duration(point.EffectiveInterval), 11.5,
+                    point.Interval is null ? Ui.Faint : Ui.Ink, mono: true)),
                 (Ui.Star(0.7), Ui.Text(point.Unit ?? "—", 11.5, Ui.Faint)),
                 (Ui.Star(1.2), Ui.Text(UiFormat.Time(point.CollectedAt), 11.5, Ui.Faint, mono: true)),
                 (Ui.Star(1.6), Ui.Text(point.Name ?? "—", 11.5, Ui.Faint))));

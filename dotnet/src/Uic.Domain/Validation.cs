@@ -274,6 +274,15 @@ public static partial class ModelValidator
         if (p.Deadband is < 0) Add($"{pp}.deadband", "must be >= 0");
         if (double.IsNaN(p.Scale) || p.Scale == 0) Add($"{pp}.scale", "must be non-zero");
 
+        // 0 与空值都表示「继承设备周期」。下限 100ms 是 PRD 的硬约束：
+        // 再快就该用订阅型协议，而不是让主站轮询把链路打满。
+        if (p.Interval is { } pointInterval &&
+            pointInterval != TimeSpan.Zero &&
+            (pointInterval < TimeSpan.FromMilliseconds(100) || pointInterval > TimeSpan.FromHours(24)))
+        {
+            Add($"{pp}.interval", "must be 0 (inherit the device) or 100ms..24h");
+        }
+
         // 量程必须成对出现：只有上限或只有下限都无法解释「百分比」。
         if ((p.RangeMin is null) != (p.RangeMax is null))
             Add($"{pp}.rangeMin", "rangeMin and rangeMax must be provided together");

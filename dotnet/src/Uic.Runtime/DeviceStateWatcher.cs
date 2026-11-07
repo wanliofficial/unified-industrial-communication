@@ -114,9 +114,12 @@ public sealed class DeviceStateWatcher : IAsyncDisposable
         if (samples.Count == 0) return;
 
         var newest = samples.Max(s => s.CollectedAt);
+
+        // 阈值按设备内最慢的点位周期算：一台只挂慢变量的设备按设备周期
+        // 判断会把完全正常的采集误报成停滞。
         var threshold = TimeSpan.FromMilliseconds(Math.Max(
             MinimumStaleAge.TotalMilliseconds,
-            actor.Device.Interval.TotalMilliseconds * 10));
+            actor.SlowestInterval.TotalMilliseconds * 10));
 
         if (now - newest <= threshold) return;
 

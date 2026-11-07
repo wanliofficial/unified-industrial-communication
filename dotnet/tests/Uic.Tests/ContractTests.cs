@@ -50,6 +50,7 @@ internal static class ContractTests
         tests.Add(new TestCase("contract/points_csv_import_previews_and_applies", PointsCsvImportPreviewsAndApplies));
         tests.Add(new TestCase("contract/config_export_import_round_trip", ConfigExportImportRoundTrip));
         tests.Add(new TestCase("contract/config_import_migrates_legacy_shape", ConfigImportMigratesLegacy));
+        tests.Add(new TestCase("contract/points_expose_effective_interval", PointsExposeEffectiveInterval));
     }
 
     // ------------------------------------------------------------------
@@ -511,6 +512,42 @@ internal static class ContractTests
             t.Close(42, good.GetProperty("value").GetProperty("num").GetDouble(), 1e-9, "const waveform uses the baseline");
             t.Equal("°C", good.GetProperty("unit").GetString(), "unit comes from the config");
             t.Ok(good.GetProperty("seq").GetUInt64() > 0, "seq is assigned");
+        });
+    }
+
+    /// <summary>
+    /// 点位周期要出现在线上契约里：上位机需要知道「这个点位多久没更新算过期」。
+    /// 继承设备周期时 `interval` 省略，`effectiveInterval` 始终给出解析后的值。
+    /// </summary>
+    private static Task PointsExposeEffectiveInterval(TestContext t)
+    {
+        return RunAsync(async () =>
+        {
+            // 配置模型的属性是 init-only，改配置只能走「序列化 → 改 JSON → 解析」，
+            // 顺带验证 `interval` 的线上写法能被读回来。
+            var node = JsonNode.Parse(JsonDefaults.ToJson(BuildConfig()))!.AsObject();
+            node["devices"]![0]!["points"]![0]!["interval"] = "500ms";
+            var source = ConfigStore.Parse(node.ToJsonString());
+
+            await using var host = await Host.StartAsync(t, () => source);
+
+            using var document = await ReadJsonAsync(
+                t, await host.Client.SendAsync(Get("/api/v1/points/v1/temp"), t.Ct));
+
+            var point = document.RootElement;
+            t.Equal("500ms", point.GetProperty("interval").GetString(),
+                "an overridden point interval is reported");
+            t.Equal("500ms", point.GetProperty("effectiveInterval").GetString(),
+                "the effective interval equals the override");
+
+            using var inherited = await ReadJsonAsync(
+                t, await host.Client.SendAsync(Get("/api/v1/points/v1/flag"), t.Ct));
+
+            var flag = inherited.RootElement;
+            t.Ok(!flag.TryGetProperty("interval", out _),
+                "an inherited interval is omitted rather than sent as null");
+            t.Equal("200ms", flag.GetProperty("effectiveInterval").GetString(),
+                "the inherited cadence is the device interval");
         });
     }
 

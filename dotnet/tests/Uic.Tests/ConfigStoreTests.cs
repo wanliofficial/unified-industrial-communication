@@ -214,6 +214,9 @@ internal static class ConfigStoreTests
                 "devices[virtual-1].points[temperature].address.length"),
             ("negative deadband", n => n["devices"]![0]!["points"]![0]!["deadband"] = -1,
                 "devices[virtual-1].points[temperature].deadband"),
+            ("point interval below 100ms", n =>
+                n["devices"]![0]!["points"]![0]!["interval"] = "50ms",
+                "devices[virtual-1].points[temperature].interval"),
             ("rate deadband must be positive", n =>
             {
                 n["devices"]![0]!["points"]![0]!["deadbandMode"] = "rate";

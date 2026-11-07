@@ -100,6 +100,9 @@ public sealed class DeviceActor : IAsyncDisposable
     private readonly TimeSpan _startPhase;
     private readonly IReadOnlyList<PointRef> _points;
     private readonly IReadOnlyList<ReadSpan> _spans;
+    private readonly IReadOnlyList<CollectBucket> _buckets;
+    private readonly TimeSpan _baseInterval;
+    private readonly TimeSpan _slowestInterval;
     private readonly Dictionary<string, Point> _pointsById;
 
     private readonly object _stateLock = new();
@@ -140,6 +143,25 @@ public sealed class DeviceActor : IAsyncDisposable
         _pointsById = device.Points.ToDictionary(p => p.Id, StringComparer.Ordinal);
         _points = device.Points.Where(p => p.Enabled).Select(p => PointRef.Of(device, p)).ToArray();
         _spans = ReadPlanner.Plan(_points);
+
+        // 点位周期可以覆盖设备周期：按有效周期分桶，每一轮只读「到期」的桶。
+        //
+        // 不给每个周期单独开循环，是因为同一设备上的请求必须串行（事务号、
+        // 半双工、PDU 协商都经不起交错）；一个循环按到期时间合并读取，
+        // 既保住了串行，又让快慢变量各按各的节奏走。
+        var buckets = new List<CollectBucket>();
+        foreach (var group in device.Points
+                     .Where(p => p.Enabled)
+                     .GroupBy(p => p.EffectiveInterval(device))
+                     .OrderBy(g => g.Key))
+        {
+            var refs = group.Select(p => PointRef.Of(device, p)).ToArray();
+            buckets.Add(new CollectBucket(group.Key, ReadPlanner.Plan(refs)));
+        }
+
+        _buckets = buckets;
+        _baseInterval = _buckets.Count == 0 ? device.Interval : _buckets[0].Interval;
+        _slowestInterval = _buckets.Count == 0 ? device.Interval : _buckets[^1].Interval;
     }
 
     public string DeviceId => _device.Id;
@@ -148,7 +170,22 @@ public sealed class DeviceActor : IAsyncDisposable
     public int Generation => Volatile.Read(ref _generation);
     public RuntimeState State { get { lock (_stateLock) return _state; } }
     public ConfiguredState ConfiguredState => _device.Enabled ? ConfiguredState.Enabled : ConfiguredState.Disabled;
+
+    /// <summary>
+    /// 全设备合并后的读窗口（不区分周期）。协议自检与「整台设备一次读」的调用方用它；
+    /// 实际采集按 <see cref="CollectionIntervals"/> 分组各自规划，不再共用这份计划。
+    /// </summary>
     public IReadOnlyList<ReadSpan> Spans => _spans;
+
+    /// <summary>
+    /// 设备内最慢的点位周期。看门狗用它判断「多久没有新样本才算采集停滞」：
+    /// 只有慢变量的设备按最快周期算会把正常状态误报成故障。
+    /// </summary>
+    public TimeSpan SlowestInterval => _slowestInterval;
+
+    /// <summary>实际生效的采集周期分组，升序。诊断与控制台用。</summary>
+    public IReadOnlyList<TimeSpan> CollectionIntervals
+        => _buckets.Select(b => b.Interval).ToArray();
 
     /// <summary>启动相位。调度器按设备序号铺开，避免同周期设备在同一毫秒醒来。</summary>
     public TimeSpan StartPhase => _startPhase;
@@ -220,11 +257,28 @@ public sealed class DeviceActor : IAsyncDisposable
     private async Task LoopAsync(CancellationToken ct)
     {
         // 单调时间戳，不受 NTP 校时/手工改钟影响。
-        var nextDue = Stopwatch.GetTimestamp() + ScheduleMath.ToTimestamp(_startPhase);
+        var started = Stopwatch.GetTimestamp();
+        var phase = ScheduleMath.ToTimestamp(_startPhase);
+
+        // 所有周期分组共用启动相位：设备之间已经铺开，设备内部再错开会让
+        // 「快变量每 100ms、慢变量每 10s」的第一次读数毫无必要地晚到。
+        foreach (var bucket in _buckets) bucket.NextDue = started + phase;
 
         while (!ct.IsCancellationRequested)
         {
+            if (_buckets.Count == 0)
+            {
+                // 点位全部被禁用：没有可读的东西，但设备本身是「在跑」的。
+                // 保持 Configured 会让控制台把一个正常部署显示成未启动。
+                SetState(RuntimeState.Collecting);
+
+                try { await Task.Delay(Timeout.Infinite, ct).ConfigureAwait(false); }
+                catch (OperationCanceledException) { return; }
+                continue;
+            }
+
             var now = Stopwatch.GetTimestamp();
+            var nextDue = _buckets.Min(b => b.NextDue);
 
             if (now < nextDue)
             {
@@ -237,9 +291,17 @@ public sealed class DeviceActor : IAsyncDisposable
                 continue;
             }
 
+            var due = _buckets.Where(b => b.NextDue <= now).ToArray();
+
+            // 到期的桶合并成一次读取：同一设备上的请求必须串行，
+            // 分两次调用只会多一轮往返。
+            var spans = due.Length == 1
+                ? due[0].Spans
+                : due.SelectMany(b => b.Spans).ToArray();
+
             try
             {
-                await CollectOnceAsync(ct).ConfigureAwait(false);
+                await CollectOnceAsync(spans, ct).ConfigureAwait(false);
             }
             catch (OperationCanceledException) when (ct.IsCancellationRequested)
             {
@@ -251,20 +313,40 @@ public sealed class DeviceActor : IAsyncDisposable
                 _log.LogError(ex, "device {Device} collection loop caught unexpected error", _device.Id);
             }
 
-            // 退避：失败越多，下次尝试越晚；上限为设备恢复间隔。
-            var backoff = _consecutiveFailures == 0
-                ? _device.Interval
-                : TimeSpan.FromMilliseconds(Math.Min(
-                    _device.Interval.TotalMilliseconds * Math.Pow(2, Math.Min(_consecutiveFailures, 6)),
-                    Math.Max(_device.Interval.TotalMilliseconds, _device.RecoverInterval.TotalMilliseconds)));
+            var finished = Stopwatch.GetTimestamp();
 
-            var jitterMs = Random.Shared.NextDouble() * 0.1 * backoff.TotalMilliseconds;
-            var delay = backoff + TimeSpan.FromMilliseconds(jitterMs);
-            nextDue = Stopwatch.GetTimestamp() + ScheduleMath.ToTimestamp(delay);
+            if (_consecutiveFailures > 0)
+            {
+                // 链路有故障时整台设备一起退避：只让快周期继续打，
+                // 只会把已经超时的设备压得更死。
+                var retryAt = finished + ScheduleMath.ToTimestamp(BackoffDelay());
+                foreach (var bucket in _buckets)
+                    bucket.NextDue = Math.Max(bucket.NextDue, retryAt);
+
+                continue;
+            }
+
+            // 从本轮结束时间起算：采集耗时不额外扣除，但也不补发积压的周期。
+            // 补发会让一次卡顿之后立刻来一串突发请求，对现场链路毫无好处。
+            foreach (var bucket in due)
+                bucket.NextDue = finished + bucket.IntervalTicks;
         }
     }
 
-    private async Task CollectOnceAsync(CancellationToken ct)
+    /// <summary>
+    /// 失败退避：按最快周期的 2^n 增长，上限取恢复间隔。
+    /// 基数用最快周期而不是设备周期——点位覆盖后两者可能差几个数量级。
+    /// </summary>
+    private TimeSpan BackoffDelay()
+    {
+        var baseMs = _baseInterval.TotalMilliseconds;
+        var ceiling = Math.Max(baseMs, _device.RecoverInterval.TotalMilliseconds);
+        var backoffMs = Math.Min(baseMs * Math.Pow(2, Math.Min(_consecutiveFailures, 6)), ceiling);
+        var jitter = Random.Shared.NextDouble() * 0.1 * backoffMs;
+        return TimeSpan.FromMilliseconds(backoffMs + jitter);
+    }
+
+    private async Task CollectOnceAsync(IReadOnlyList<ReadSpan> spans, CancellationToken ct)
     {
         var started = Stopwatch.GetTimestamp();
 
@@ -282,7 +364,7 @@ public sealed class DeviceActor : IAsyncDisposable
                 using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
                 timeout.CancelAfter(_device.Timeout ?? _channel.Timeout);
 
-                var raw = await conn.ReadAsync(_spans, timeout.Token).ConfigureAwait(false);
+                var raw = await conn.ReadAsync(spans, timeout.Token).ConfigureAwait(false);
 
                 // 全部点位都坏 = 这一轮失败；只按「请求是否成功」统计会掩盖协议层问题。
                 // 先判断再发布：需要重试时就把这批坏值丢掉，否则界面会闪一下 Bad 再变回 Good。
@@ -316,7 +398,7 @@ public sealed class DeviceActor : IAsyncDisposable
                     Interlocked.Increment(ref _readsFailed);
                     RecordDuration(Stopwatch.GetElapsedTime(started).TotalMilliseconds);
 
-                    Fail(raw[0].Error ?? "all points returned non-good quality", raw[0].Quality);
+                    Fail(raw[0].Error ?? "all points returned non-good quality", raw[0].Quality, spans);
                     return;
                 }
 
@@ -351,7 +433,7 @@ public sealed class DeviceActor : IAsyncDisposable
                 Interlocked.Increment(ref _readsFailed);
                 RecordDuration(Stopwatch.GetElapsedTime(started).TotalMilliseconds);
 
-                Fail(message, Quality.Timeout);
+                Fail(message, Quality.Timeout, spans);
                 return;
             }
             catch (Exception ex)
@@ -370,7 +452,7 @@ public sealed class DeviceActor : IAsyncDisposable
                 Interlocked.Increment(ref _readsFailed);
                 RecordDuration(Stopwatch.GetElapsedTime(started).TotalMilliseconds);
 
-                Fail(ex.Message, quality);
+                Fail(ex.Message, quality, spans);
                 return;
             }
         }
@@ -395,8 +477,11 @@ public sealed class DeviceActor : IAsyncDisposable
     /// <summary>
     /// 失败时把本轮点位全部标成对应质量。
     /// 不这么做，界面上会保留上一次的好值，看起来一切正常——这是最危险的假象。
+    ///
+    /// 只标本轮真正读过的点位：周期覆盖之后，一次失败可能只影响快变量的那个桶，
+    /// 把慢变量也一起打成坏值会凭空制造一片「设备故障」。
     /// </summary>
-    private void Fail(string message, Quality quality)
+    private void Fail(string message, Quality quality, IReadOnlyList<ReadSpan> spans)
     {
         // 地址错是点表配置问题，不是链路问题：把它算进熔断计数会让「一个点位写错」
         // 拖垮整台设备，现场看到的是设备离线而不是「这条地址不存在」。
@@ -405,8 +490,13 @@ public sealed class DeviceActor : IAsyncDisposable
 
         _lastError = message;
 
+        var failed = spans
+            .SelectMany(s => s.Points)
+            .Select(p => p.Id)
+            .ToHashSet(StringComparer.Ordinal);
+
         var now = DateTimeOffset.UtcNow;
-        foreach (var point in _device.Points.Where(p => p.Enabled))
+        foreach (var point in _device.Points.Where(p => p.Enabled && failed.Contains(p.Id)))
         {
             var seq = _cache.NextSeq(_device.Id, point.Id);
             var previous = _cache.Get(_device.Id, point.Id);
@@ -690,6 +780,30 @@ public sealed class DeviceActor : IAsyncDisposable
         if (Interlocked.Exchange(ref _disposed, 1) != 0) return;
         await StopAsync().ConfigureAwait(false);
         _connLock.Dispose();
+    }
+
+    /// <summary>
+    /// 一个采集周期分组：同一有效周期的点位，以及它们的读窗口计划。
+    /// <see cref="NextDue"/> 只在采集循环线程里读写，不需要同步。
+    /// </summary>
+    private sealed class CollectBucket
+    {
+        public CollectBucket(TimeSpan interval, IReadOnlyList<ReadSpan> spans)
+        {
+            Interval = interval;
+            IntervalTicks = ScheduleMath.ToTimestamp(interval);
+            Spans = spans;
+        }
+
+        public TimeSpan Interval { get; }
+
+        /// <summary>周期换算成 <see cref="Stopwatch"/> 时间戳单位，避免每轮重复取整。</summary>
+        public long IntervalTicks { get; }
+
+        public IReadOnlyList<ReadSpan> Spans { get; }
+
+        /// <summary>下一到期时刻（<see cref="Stopwatch"/> 时间戳）。</summary>
+        public long NextDue { get; set; }
     }
 }
 

@@ -22,6 +22,7 @@ internal static class ConfigFeatureTests
         tests.Add(new TestCase("csv/address_expressions", AddressExpressions));
         tests.Add(new TestCase("csv/import_merges_and_reports_conflicts", ImportMergesAndReportsConflicts));
         tests.Add(new TestCase("csv/imports_deadband_mode_and_range", ImportDeadbandModeAndRange));
+        tests.Add(new TestCase("csv/imports_point_interval", ImportPointInterval));
         tests.Add(new TestCase("config/deadband_and_range_rules", DeadbandAndRangeRules));
         tests.Add(new TestCase("config/migration_is_explicit_and_versioned", MigrationIsExplicitAndVersioned));
         tests.Add(new TestCase("config/migrates_v0_legacy_shapes", MigratesLegacyShapes));
@@ -271,6 +272,44 @@ internal static class ConfigFeatureTests
                                      """, Array.Empty<Point>(), "d1");
         t.Ok(!broken.Ok, "an unknown deadband mode is rejected");
         t.Contains(string.Join("; ", broken.Problems), "line 2", "the problem points at the row");
+
+        return Task.CompletedTask;
+    }
+
+    /// <summary>
+    /// 点位周期也要能从 CSV 进来：现场点表是 Excel，让运维为了一个 100ms
+    /// 去手改 JSON 不现实。空单元格表示继承设备周期，非法值必须当场拒绝。
+    /// </summary>
+    private static Task ImportPointInterval(TestContext t)
+    {
+        var csv = """
+                  id,address,dataType,interval
+                  fast,holding:0,uint16,100ms
+                  slow,holding:1,uint16,
+                  """;
+
+        var result = PointCsv.Import(csv, Array.Empty<Point>(), "d1");
+        t.Ok(result.Ok, $"the csv is valid: {string.Join("; ", result.Problems)}");
+
+        t.Equal(TimeSpan.FromMilliseconds(100), result.Points.Single(p => p.Id == "fast").Interval,
+            "the interval column is parsed as a duration");
+        t.Equal(null, result.Points.Single(p => p.Id == "slow").Interval,
+            "an empty cell means the device period is inherited");
+
+        // 低于下限和拼错都要拒绝：静默退回设备周期会让「已经改了」变成假象。
+        var tooFast = PointCsv.Import("""
+                                       id,address,interval
+                                       fast,holding:0,50ms
+                                       """, Array.Empty<Point>(), "d1");
+        t.Ok(!tooFast.Ok, "an interval below 100ms is rejected");
+        t.Contains(string.Join("; ", tooFast.Problems), "interval", "the problem names the field");
+
+        var garbage = PointCsv.Import("""
+                                      id,address,interval
+                                      fast,holding:0,soon
+                                      """, Array.Empty<Point>(), "d1");
+        t.Ok(!garbage.Ok, "a non-duration is rejected");
+        t.Contains(string.Join("; ", garbage.Problems), "line 2", "the problem points at the row");
 
         return Task.CompletedTask;
     }

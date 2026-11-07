@@ -11,7 +11,7 @@
 它们不是 §6.1「不做」清单里的项，属于真实缺口；逐协议现状、原因与补法见
 [protocol-status.md](protocol-status.md)。
 
-当前测试基线：**173 passed / 0 failed / 1 skipped**（跳过的是需要 `--opcua` 的 OPC UA 端到端用例）。
+当前测试基线：**178 passed / 0 failed / 1 skipped**（跳过的是需要 `--opcua` 的 OPC UA 端到端用例）。
 
 ## 1. 采集（FR-COL）
 
@@ -26,7 +26,7 @@
 | FR-COL-07 | 虚拟设备（正弦/斜坡/随机/常量/故障注入） | 已实现 | `loopback/*`、`contract/*` 都以 `virtual` 驱动跑通全链路；五类故障注入见 `Uic.Driver.Virtual` |
 | FR-COL-08 | 驱动能力四态声明 | 已实现 | `GET /api/v1/drivers` 暴露 `Capabilities`；控制台「驱动」页渲染八项四态徽标、设备页显示读写/订阅/浏览四项；`contract/drivers_expose_capability_states` 锁住四态线上名字 |
 | FR-COL-09 | 批量读规划（合并 / 非法跨越拒绝） | 已实现 | `planner/*` 八条：相邻合并、跨空洞不合并、按寄存器与位上限切分、按区域分离、每点恰好覆盖一次 |
-| FR-COL-10 | 每点位独立采集周期 | 刻意没做（S） | 当前只有设备级周期。补法：`DeviceActor` 已按 `PointRef` 规划窗口，把点位按 `EffectiveInterval` 分桶即可，不需要改驱动契约 |
+| FR-COL-10 | 每点位独立采集周期 | 已实现 | `Point.interval` 覆盖设备周期（空/0 表示继承，非 0 时 100ms..24h）；`DeviceActor` 按有效周期分桶，每轮只读到期的桶并合并成一次串行读取，快慢变量互不拖累。证据 `engine/point_interval_overrides_device_period`（1s 设备 + 100ms 点位）、`engine/point_interval_failure_is_scoped_to_due_bucket`、`csv/imports_point_interval`、`schedule/phase_follows_fastest_point`、`contract/points_expose_effective_interval`；看门狗阈值取设备内最慢周期，启动相位取最快周期，点位 DTO 暴露 `interval` 与 `effectiveInterval` |
 | FR-COL-11 | 写入（单点/多点），写后校验与超时 | 已实现 | 单点/多点、逐点裁决、超时三态（`ok`/`disabled`/`timeout`）已实现：`contract/write_returns_per_point_results`。`confirm: true` 在同一个通道租约内立即回读并比较，结果带 `verified`；不一致返回 `ok=false` + `uncertain` + `verify.mismatch`：`engine/write_confirmation_reads_back`、`engine/write_confirmation_detects_mismatch`、`engine/write_without_confirmation_skips_readback` |
 | FR-COL-12 | 订阅型协议（COV/事件/通知） | 刻意没做（C） | 路线图 Wave 2；`Capabilities.Subscribe` 已有四态占位 |
 
@@ -126,14 +126,14 @@
 | 类别 | 目标 | 状态 | 说明 |
 |---|---|---|---|
 | 容量 | 200 设备 / 10,000 点 | 未测量 | 需要批量实例化 + 压测脚本；模板实例化已能一次生成 50 台，可作为压测起点 |
-| 采集周期下限 | 100 ms | 已实现 | `Validation` 拒绝小于 10 ms 的设备周期，比要求的 100 ms 更严格（支持更快采样） |
+| 采集周期下限 | 100 ms | 已实现 | 点位 `interval` 只接受 `0`（继承）或 `100ms..24h`，低于 100 ms 直接拒绝；设备级 `interval` 下限仍是 10 ms（命令行/自测需要更快轮询），见 `config/rejects_twenty_invalid_shapes`、`csv/imports_point_interval` |
 | 写命令 P95 ≤ 300 ms | 读满载下 | 未测量 | `ChannelGate` 的写优先是机制保证，但没有基准测试数据 |
 | 配置应用 ≤ 2 s | 改 1 台设备 | 已实现 | `contract/template_instantiates_and_applies_devices` 每次 apply 约 100–300 ms（含真实 Kestrel） |
 | 配置回滚 ≤ 30 s | 全量 | 已实现 | `config/rollback_adds_a_version` 亚秒级 |
 | 断网补发 24h 无空洞 | — | 已实现（机制） | `outbox/replays_after_restart` 验证位点与重放；24h 时长需要浸泡测试 |
-| 配置回滚成功率 100% | 注入 20 类非法配置 | 已实现 | `config/rejects_twenty_invalid_shapes` 逐条注入 24 类非法配置并断言拒绝理由的字段路径；`config/rejects_invalid_documents` 验证一次报全所有问题、提交路径同样拦截 |
+| 配置回滚成功率 100% | 注入 20 类非法配置 | 已实现 | `config/rejects_twenty_invalid_shapes` 逐条注入 25 类非法配置并断言拒绝理由的字段路径；`config/rejects_invalid_documents` 验证一次报全所有问题、提交路径同样拦截 |
 | 单设备故障隔离 | 不影响其他设备 | 已实现 | 每设备 actor + 通道闸门；`outbox/partitions_are_independent` 同样思路 |
-| 采集假死检测 ≤ 60 s | — | 已实现 | `DeviceStateWatcher`：max(10 周期, 30 s) |
+| 采集假死检测 ≤ 60 s | — | 已实现 | `DeviceStateWatcher`：max(10 × 设备内最慢点位周期, 30 s) |
 | 优雅退出 ≤ 10 s | SIGTERM | 已实现 | flush 3 s + `$death` 2 s 的预算，留有余量 |
 | 掉电配置完整性 | 100% | 已实现（机制） | 临时文件 + `Flush(flushToDisk: true)` + `File.Move(overwrite)` |
 | 故障注入矩阵 12 类 | 全通过 | 部分实现 | 连接拒绝/中断/超时/半包/错 CRC/异常码/部分响应/慢响应/Broker 断线都有用例；磁盘满、时钟跳变、进程假死属环境级，未自动化 |

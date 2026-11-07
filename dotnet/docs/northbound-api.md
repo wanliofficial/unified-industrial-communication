@@ -189,13 +189,19 @@
   "deadband": 5,
   "deadbandMode": "percent",
   "rangeMin": 0,
-  "rangeMax": 100
+  "rangeMax": 100,
+  "interval": "500ms",
+  "effectiveInterval": "500ms"
 }
 ```
 
 `deadband` / `deadbandMode` / `rangeMin` / `rangeMax` 原样来自点位配置：上位机既能显示量程，
 也能用同一套规则自行过滤，不必猜网关用的阈值。取值范围见
 [configuration.md](configuration.md#死区)。
+
+`interval` 是点位自己的周期；继承设备周期时该字段**省略**（不返回 `null`）。
+`effectiveInterval` 是解析后的实际周期，始终存在。上位机用它决定「多久没更新算过期」，
+不必假设全设备同一个节奏。见 [configuration.md](configuration.md#点位周期)。
 
 「配置了但从没采到」返回 `quality: "not_connected"` 与 0 占位值，不会编一个看起来正常的读数。
 
@@ -258,7 +264,7 @@
 
 列名大小写不敏感，接受 `id`、`name`、`address`/`area`+`offset`、`bit`、`length`、
 `dataType`、`byteOrder`、`unit`、`scale`、`bias`、`deadband`、`deadbandMode`、
-`rangeMin`、`rangeMax`、`writable`、`enabled`、`byteLength`。
+`rangeMin`、`rangeMax`、`interval`、`writable`、`enabled`、`byteLength`。
 
 | 地址写法 | 示例 | 说明 |
 |---|---|---|

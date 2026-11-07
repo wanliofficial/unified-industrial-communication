@@ -338,8 +338,10 @@ public static partial class RestApi
     }
 
     /// <summary>
-    /// confirm=true 时回读一次。窗口取 min(2×设备周期, 2s)：
+    /// confirm=true 时回读一次。窗口取 min(2×点位有效周期, 2s)：
     /// 太短会误判失败，太长会让接口在慢设备上失去意义。
+    /// 用点位周期而不是设备周期：点位周期覆盖之后，快变量等设备周期会白等，
+    /// 慢变量按设备周期等则会误判。
     /// </summary>
     private static async Task<bool> ConfirmAsync(
         NorthboundContext ctx,
@@ -349,7 +351,8 @@ public static partial class RestApi
         CancellationToken ct)
     {
         var actor = ctx.Engine.Find(deviceId);
-        var window = TimeSpan.FromMilliseconds(Math.Min(2000, Math.Max(300, actor?.Device.Interval.TotalMilliseconds * 2 ?? 500)));
+        var cadence = actor is null ? TimeSpan.FromMilliseconds(250) : point.EffectiveInterval(actor.Device);
+        var window = TimeSpan.FromMilliseconds(Math.Min(2000, Math.Max(300, cadence.TotalMilliseconds * 2)));
         var deadline = DateTimeOffset.UtcNow + window;
 
         while (DateTimeOffset.UtcNow < deadline)
@@ -409,7 +412,9 @@ public static partial class RestApi
                 point.Deadband,
                 JsonEnum.ToWire(point.DeadbandMode),
                 point.RangeMin,
-                point.RangeMax);
+                point.RangeMax,
+                point.Interval,
+                point.EffectiveInterval(device));
         }
 
         return new PointDto(
@@ -426,7 +431,9 @@ public static partial class RestApi
             point.Deadband,
             JsonEnum.ToWire(point.DeadbandMode),
             point.RangeMin,
-            point.RangeMax);
+            point.RangeMax,
+            point.Interval,
+            point.EffectiveInterval(device));
     }
 
     private static int ParseInt(string? text, int fallback)
@@ -467,4 +474,6 @@ public sealed record PointDto(
     double? Deadband,
     string DeadbandMode,
     double? RangeMin,
-    double? RangeMax);
+    double? RangeMax,
+    TimeSpan? Interval,
+    TimeSpan EffectiveInterval);

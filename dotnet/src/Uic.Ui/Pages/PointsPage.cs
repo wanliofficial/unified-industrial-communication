@@ -49,6 +49,7 @@ public sealed class PointsPage : IPage, IDisposable
             (Ui.Star(0.9), "值"),
             (Ui.Star(0.8), "类型"),
             (Ui.Star(0.7), "质量"),
+            (Ui.Star(0.6), "周期"),
             (Ui.Star(0.6), "单位"),
             (Ui.Star(1.0), "采集时间"),
             (Ui.Star(0.6), "可写")));
@@ -179,11 +180,20 @@ public sealed class PointsPage : IPage, IDisposable
         label.Children.Add(Ui.Text($"{point.Device}{(point.Name is null ? string.Empty : " · " + point.Name)}",
             10.5, Ui.Faint));
 
+        // 周期列：继承设备周期用灰色，自己覆盖的用正常色；提示里说明来源，
+        // 否则运维看到「500 ms」无法判断这是点位自己的还是设备统一的。
+        var cadence = Ui.Text(UiFormat.Duration(point.EffectiveInterval), 11.5,
+            point.Interval is null ? Ui.Faint : Ui.Ink, mono: true);
+        var cadenceBox = new Border { Child = cadence };
+        ToolTipService.SetToolTip(cadenceBox,
+            point.Interval is null ? "继承设备周期" : $"点位覆盖：{UiFormat.Duration(point.Interval.Value)}");
+
         var row = Ui.Row(
             (Ui.Star(1.5), label),
             (Ui.Star(0.9), Ui.Text(point.Value.Display, 12.5, Ui.Ink, mono: true)),
             (Ui.Star(0.8), Ui.Text(point.Value.Type, 11.5, Ui.Faint, mono: true)),
             (Ui.Star(0.7), Ui.Chip(point.Quality, UiFormat.Color(UiFormat.QualityColor(point.Quality)))),
+            (Ui.Star(0.6), cadenceBox),
             (Ui.Star(0.6), Ui.Text(point.Unit ?? "—", 11.5, Ui.Faint)),
             (Ui.Star(1.0), Ui.Text(UiFormat.Time(point.CollectedAt), 11.5, Ui.Faint, mono: true)),
             (Ui.Star(0.6), Ui.Text(point.Writable ? "是" : "否", 11.5,
