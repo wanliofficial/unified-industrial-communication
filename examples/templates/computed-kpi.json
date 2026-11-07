@@ -1,0 +1,58 @@
+{
+  "id": "computed-kpi",
+  "name": "派生指标（计算点）",
+  "description": "无物理链路的设备：用表达式把上游点位算成成本、均值与布尔判定。",
+  "protocol": "computed",
+  "parameters": [
+    {
+      "name": "index",
+      "type": "string",
+      "required": true
+    },
+    {
+      "name": "source",
+      "type": "string",
+      "required": true,
+      "description": "上游设备 ID"
+    }
+  ],
+  "device": {
+    "id": "kpi-{index}",
+    "name": "派生指标 {index}",
+    "interval": "1s",
+    "enabled": true,
+    "points": [
+      {
+        "id": "cost",
+        "name": "成本",
+        "address": {
+          "kind": "computed",
+          "expr": "{source}:power * {source}:rate"
+        },
+        "dataType": "float64",
+        "unit": "元",
+        "enabled": true
+      },
+      {
+        "id": "avg_power",
+        "name": "功率均值",
+        "address": {
+          "kind": "computed",
+          "expr": "({source}:power + {source}:rate) / 2"
+        },
+        "dataType": "float64",
+        "enabled": true
+      },
+      {
+        "id": "high_load",
+        "name": "高负载",
+        "address": {
+          "kind": "computed",
+          "expr": "{source}:power > 80"
+        },
+        "dataType": "bool",
+        "enabled": true
+      }
+    ]
+  }
+}

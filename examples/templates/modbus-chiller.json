@@ -1,0 +1,143 @@
+{
+  "id": "modbus-chiller",
+  "name": "冷水机组（Modbus）",
+  "description": "供回水温度、压力、负载率与运行/报警状态。",
+  "protocol": "modbus-tcp",
+  "parameters": [
+    {
+      "name": "index",
+      "type": "string",
+      "required": true
+    },
+    {
+      "name": "unitId",
+      "type": "int",
+      "default": 1
+    },
+    {
+      "name": "supplyOffset",
+      "type": "int",
+      "default": 0
+    },
+    {
+      "name": "returnOffset",
+      "type": "int",
+      "default": 1
+    },
+    {
+      "name": "pressureOffset",
+      "type": "int",
+      "default": 2
+    },
+    {
+      "name": "loadOffset",
+      "type": "int",
+      "default": 3
+    },
+    {
+      "name": "runCoil",
+      "type": "int",
+      "default": 0
+    },
+    {
+      "name": "alarmCoil",
+      "type": "int",
+      "default": 1
+    }
+  ],
+  "device": {
+    "id": "chiller-{index}",
+    "name": "冷水机组 {index}",
+    "unitId": "{unitId}",
+    "interval": "5s",
+    "enabled": true,
+    "points": [
+      {
+        "id": "supply_temp",
+        "name": "供水温度",
+        "address": {
+          "kind": "register",
+          "area": "holding",
+          "offset": "{supplyOffset}",
+          "length": 1,
+          "bit": -1
+        },
+        "dataType": "int16",
+        "unit": "°C",
+        "scale": 0.1,
+        "enabled": true
+      },
+      {
+        "id": "return_temp",
+        "name": "回水温度",
+        "address": {
+          "kind": "register",
+          "area": "holding",
+          "offset": "{returnOffset}",
+          "length": 1,
+          "bit": -1
+        },
+        "dataType": "int16",
+        "unit": "°C",
+        "scale": 0.1,
+        "enabled": true
+      },
+      {
+        "id": "pressure",
+        "name": "蒸发压力",
+        "address": {
+          "kind": "register",
+          "area": "holding",
+          "offset": "{pressureOffset}",
+          "length": 1,
+          "bit": -1
+        },
+        "dataType": "uint16",
+        "unit": "bar",
+        "scale": 0.01,
+        "enabled": true
+      },
+      {
+        "id": "load",
+        "name": "负载率",
+        "address": {
+          "kind": "register",
+          "area": "holding",
+          "offset": "{loadOffset}",
+          "length": 1,
+          "bit": -1
+        },
+        "dataType": "uint16",
+        "unit": "%",
+        "scale": 0.1,
+        "enabled": true
+      },
+      {
+        "id": "running",
+        "name": "运行状态",
+        "address": {
+          "kind": "register",
+          "area": "coil",
+          "offset": "{runCoil}",
+          "length": 1,
+          "bit": -1
+        },
+        "dataType": "bool",
+        "enabled": true
+      },
+      {
+        "id": "alarm",
+        "name": "机组报警",
+        "address": {
+          "kind": "register",
+          "area": "coil",
+          "offset": "{alarmCoil}",
+          "length": 1,
+          "bit": -1
+        },
+        "dataType": "bool",
+        "enabled": true
+      }
+    ]
+  }
+}

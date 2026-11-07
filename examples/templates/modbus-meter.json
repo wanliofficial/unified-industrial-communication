@@ -1,0 +1,120 @@
+{
+  "id": "modbus-meter",
+  "name": "三相电表（Modbus）",
+  "description": "常见三相多功能电表：电压/电流/功率/电能，浮点 CDAB。",
+  "protocol": "modbus-tcp",
+  "parameters": [
+    {
+      "name": "index",
+      "type": "string",
+      "required": true,
+      "description": "设备编号，用于生成 ID"
+    },
+    {
+      "name": "unitId",
+      "type": "int",
+      "default": 1,
+      "description": "Modbus 从站地址"
+    },
+    {
+      "name": "voltageOffset",
+      "type": "int",
+      "default": 0,
+      "description": "电压寄存器偏移"
+    },
+    {
+      "name": "currentOffset",
+      "type": "int",
+      "default": 2,
+      "description": "电流寄存器偏移"
+    },
+    {
+      "name": "powerOffset",
+      "type": "int",
+      "default": 4,
+      "description": "有功功率寄存器偏移"
+    },
+    {
+      "name": "energyOffset",
+      "type": "int",
+      "default": 6,
+      "description": "电能寄存器偏移"
+    },
+    {
+      "name": "ratio",
+      "type": "float",
+      "default": 0.1,
+      "description": "电压变比"
+    }
+  ],
+  "device": {
+    "id": "meter-{index}",
+    "name": "三相电表 {index}",
+    "unitId": "{unitId}",
+    "interval": "5s",
+    "enabled": true,
+    "points": [
+      {
+        "id": "voltage",
+        "name": "A 相电压",
+        "address": {
+          "kind": "register",
+          "area": "holding",
+          "offset": "{voltageOffset}",
+          "length": 2,
+          "bit": -1
+        },
+        "dataType": "float32",
+        "unit": "V",
+        "byteOrder": "CDAB",
+        "scale": "{ratio}",
+        "enabled": true
+      },
+      {
+        "id": "current",
+        "name": "A 相电流",
+        "address": {
+          "kind": "register",
+          "area": "holding",
+          "offset": "{currentOffset}",
+          "length": 2,
+          "bit": -1
+        },
+        "dataType": "float32",
+        "unit": "A",
+        "byteOrder": "CDAB",
+        "enabled": true
+      },
+      {
+        "id": "power",
+        "name": "有功功率",
+        "address": {
+          "kind": "register",
+          "area": "holding",
+          "offset": "{powerOffset}",
+          "length": 2,
+          "bit": -1
+        },
+        "dataType": "float32",
+        "unit": "kW",
+        "byteOrder": "CDAB",
+        "enabled": true
+      },
+      {
+        "id": "energy",
+        "name": "正向有功电能",
+        "address": {
+          "kind": "register",
+          "area": "holding",
+          "offset": "{energyOffset}",
+          "length": 2,
+          "bit": -1
+        },
+        "dataType": "float32",
+        "unit": "kWh",
+        "byteOrder": "CDAB",
+        "enabled": true
+      }
+    ]
+  }
+}

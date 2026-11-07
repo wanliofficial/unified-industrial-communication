@@ -1,0 +1,80 @@
+{
+  "id": "opcua-machine",
+  "name": "OPC UA 机床",
+  "description": "按 NodeId 前缀批量生成点位；ns 与路径前缀由参数给出。",
+  "protocol": "opcua",
+  "parameters": [
+    {
+      "name": "index",
+      "type": "string",
+      "required": true
+    },
+    {
+      "name": "namespace",
+      "type": "int",
+      "default": 2
+    },
+    {
+      "name": "prefix",
+      "type": "string",
+      "default": "Machine",
+      "description": "NodeId 字符串前缀"
+    }
+  ],
+  "device": {
+    "id": "cnc-{index}",
+    "name": "机床 {index}",
+    "interval": "1s",
+    "enabled": true,
+    "points": [
+      {
+        "id": "temperature",
+        "name": "主轴温度",
+        "address": {
+          "kind": "symbol",
+          "path": "ns={namespace};s={prefix}.Temperature",
+          "index": -1
+        },
+        "dataType": "float64",
+        "unit": "°C",
+        "enabled": true
+      },
+      {
+        "id": "pressure",
+        "name": "液压压力",
+        "address": {
+          "kind": "symbol",
+          "path": "ns={namespace};s={prefix}.Pressure",
+          "index": -1
+        },
+        "dataType": "float64",
+        "unit": "bar",
+        "enabled": true
+      },
+      {
+        "id": "running",
+        "name": "运行中",
+        "address": {
+          "kind": "symbol",
+          "path": "ns={namespace};s={prefix}.Running",
+          "index": -1
+        },
+        "dataType": "bool",
+        "enabled": true
+      },
+      {
+        "id": "setpoint",
+        "name": "转速给定",
+        "address": {
+          "kind": "symbol",
+          "path": "ns={namespace};s={prefix}.Setpoint",
+          "index": -1
+        },
+        "dataType": "float64",
+        "unit": "rpm",
+        "writable": true,
+        "enabled": true
+      }
+    ]
+  }
+}

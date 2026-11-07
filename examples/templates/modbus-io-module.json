@@ -1,0 +1,83 @@
+{
+  "id": "modbus-io-module",
+  "name": "远程 IO 模块（Modbus）",
+  "description": "数字量输入/输出与一个模拟量通道；DI 用离散输入区，DO 用线圈。",
+  "protocol": "modbus-tcp",
+  "parameters": [
+    {
+      "name": "index",
+      "type": "string",
+      "required": true
+    },
+    {
+      "name": "unitId",
+      "type": "int",
+      "default": 1
+    },
+    {
+      "name": "diBase",
+      "type": "int",
+      "default": 0
+    },
+    {
+      "name": "doBase",
+      "type": "int",
+      "default": 0
+    },
+    {
+      "name": "aiOffset",
+      "type": "int",
+      "default": 0
+    }
+  ],
+  "device": {
+    "id": "io-{index}",
+    "name": "远程 IO {index}",
+    "unitId": "{unitId}",
+    "interval": "500ms",
+    "enabled": true,
+    "points": [
+      {
+        "id": "di0",
+        "name": "数字输入 0",
+        "address": {
+          "kind": "register",
+          "area": "discrete",
+          "offset": "{diBase}",
+          "length": 1,
+          "bit": -1
+        },
+        "dataType": "bool",
+        "enabled": true
+      },
+      {
+        "id": "do0",
+        "name": "数字输出 0",
+        "address": {
+          "kind": "register",
+          "area": "coil",
+          "offset": "{doBase}",
+          "length": 1,
+          "bit": -1
+        },
+        "dataType": "bool",
+        "writable": true,
+        "enabled": true
+      },
+      {
+        "id": "ai0",
+        "name": "模拟输入 0",
+        "address": {
+          "kind": "register",
+          "area": "input",
+          "offset": "{aiOffset}",
+          "length": 1,
+          "bit": -1
+        },
+        "dataType": "uint16",
+        "scale": 0.001,
+        "enabled": true
+      }
+    ]
+  }
+}

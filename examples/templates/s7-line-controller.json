@@ -1,0 +1,76 @@
+{
+  "id": "s7-line-controller",
+  "name": "S7 产线控制器（I/Q/M）",
+  "description": "输入/输出/位存储区三类地址；位地址只影响目标位，不破坏邻位。",
+  "protocol": "s7",
+  "parameters": [
+    {
+      "name": "index",
+      "type": "string",
+      "required": true
+    },
+    {
+      "name": "inputOffset",
+      "type": "int",
+      "default": 0
+    },
+    {
+      "name": "outputOffset",
+      "type": "int",
+      "default": 0
+    },
+    {
+      "name": "memoryOffset",
+      "type": "int",
+      "default": 0
+    }
+  ],
+  "device": {
+    "id": "line-{index}",
+    "name": "产线控制器 {index}",
+    "interval": "500ms",
+    "enabled": true,
+    "points": [
+      {
+        "id": "sensor_ok",
+        "name": "传感器就绪",
+        "address": {
+          "kind": "register",
+          "area": "input",
+          "offset": "{inputOffset}",
+          "length": 1,
+          "bit": 0
+        },
+        "dataType": "bool",
+        "enabled": true
+      },
+      {
+        "id": "valve_cmd",
+        "name": "阀门命令",
+        "address": {
+          "kind": "register",
+          "area": "output",
+          "offset": "{outputOffset}",
+          "length": 1,
+          "bit": 0
+        },
+        "dataType": "bool",
+        "writable": true,
+        "enabled": true
+      },
+      {
+        "id": "cycle_count",
+        "name": "循环计数",
+        "address": {
+          "kind": "register",
+          "area": "merker",
+          "offset": "{memoryOffset}",
+          "length": 2,
+          "bit": -1
+        },
+        "dataType": "uint16",
+        "enabled": true
+      }
+    ]
+  }
+}

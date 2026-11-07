@@ -1,0 +1,67 @@
+{
+  "id": "modbus-flowmeter",
+  "name": "电磁流量计（Modbus）",
+  "description": "瞬时流量与累计流量；累计值用 32 位无符号，注意字节序。",
+  "protocol": "modbus-tcp",
+  "parameters": [
+    {
+      "name": "index",
+      "type": "string",
+      "required": true
+    },
+    {
+      "name": "unitId",
+      "type": "int",
+      "default": 1
+    },
+    {
+      "name": "flowOffset",
+      "type": "int",
+      "default": 0
+    },
+    {
+      "name": "totalOffset",
+      "type": "int",
+      "default": 2
+    }
+  ],
+  "device": {
+    "id": "flow-{index}",
+    "name": "流量计 {index}",
+    "unitId": "{unitId}",
+    "interval": "2s",
+    "enabled": true,
+    "points": [
+      {
+        "id": "flow",
+        "name": "瞬时流量",
+        "address": {
+          "kind": "register",
+          "area": "holding",
+          "offset": "{flowOffset}",
+          "length": 2,
+          "bit": -1
+        },
+        "dataType": "float32",
+        "unit": "m³/h",
+        "byteOrder": "CDAB",
+        "enabled": true
+      },
+      {
+        "id": "total",
+        "name": "累计流量",
+        "address": {
+          "kind": "register",
+          "area": "holding",
+          "offset": "{totalOffset}",
+          "length": 2,
+          "bit": -1
+        },
+        "dataType": "uint32",
+        "unit": "m³",
+        "byteOrder": "CDAB",
+        "enabled": true
+      }
+    ]
+  }
+}

@@ -1,0 +1,59 @@
+{
+  "id": "mqtt-sensor",
+  "name": "MQTT 传感器",
+  "description": "订阅一个主题，按 selector 从 JSON 载荷里取字段。",
+  "protocol": "mqtt",
+  "parameters": [
+    {
+      "name": "index",
+      "type": "string",
+      "required": true
+    },
+    {
+      "name": "topic",
+      "type": "string",
+      "required": true,
+      "description": "订阅主题，如 plant/line1/env"
+    },
+    {
+      "name": "root",
+      "type": "string",
+      "default": "data",
+      "description": "JSON 载荷里的对象名"
+    }
+  ],
+  "device": {
+    "id": "env-{index}",
+    "name": "环境传感器 {index}",
+    "interval": "5s",
+    "enabled": true,
+    "points": [
+      {
+        "id": "temperature",
+        "name": "温度",
+        "address": {
+          "kind": "symbol",
+          "path": "{topic}",
+          "index": -1,
+          "selector": "{root}.temperature"
+        },
+        "dataType": "float32",
+        "unit": "°C",
+        "enabled": true
+      },
+      {
+        "id": "humidity",
+        "name": "湿度",
+        "address": {
+          "kind": "symbol",
+          "path": "{topic}",
+          "index": -1,
+          "selector": "{root}.humidity"
+        },
+        "dataType": "float32",
+        "unit": "%",
+        "enabled": true
+      }
+    ]
+  }
+}

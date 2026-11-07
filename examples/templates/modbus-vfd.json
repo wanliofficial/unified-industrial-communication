@@ -1,0 +1,109 @@
+{
+  "id": "modbus-vfd",
+  "name": "变频器（Modbus）",
+  "description": "启停/频率给定与状态回读；命令与状态分在两个寄存器区。",
+  "protocol": "modbus-tcp",
+  "parameters": [
+    {
+      "name": "index",
+      "type": "string",
+      "required": true
+    },
+    {
+      "name": "unitId",
+      "type": "int",
+      "default": 1
+    },
+    {
+      "name": "cmdCoil",
+      "type": "int",
+      "default": 0,
+      "description": "启停线圈偏移"
+    },
+    {
+      "name": "faultCoil",
+      "type": "int",
+      "default": 1,
+      "description": "故障线圈偏移"
+    },
+    {
+      "name": "cmdOffset",
+      "type": "int",
+      "default": 0,
+      "description": "频率给定寄存器"
+    },
+    {
+      "name": "statusOffset",
+      "type": "int",
+      "default": 1,
+      "description": "频率回读寄存器"
+    }
+  ],
+  "device": {
+    "id": "vfd-{index}",
+    "name": "变频器 {index}",
+    "unitId": "{unitId}",
+    "interval": "1s",
+    "enabled": true,
+    "points": [
+      {
+        "id": "run_cmd",
+        "name": "启停命令",
+        "address": {
+          "kind": "register",
+          "area": "coil",
+          "offset": "{cmdCoil}",
+          "length": 1,
+          "bit": -1
+        },
+        "dataType": "bool",
+        "writable": true,
+        "enabled": true
+      },
+      {
+        "id": "fault",
+        "name": "故障",
+        "address": {
+          "kind": "register",
+          "area": "coil",
+          "offset": "{faultCoil}",
+          "length": 1,
+          "bit": -1
+        },
+        "dataType": "bool",
+        "enabled": true
+      },
+      {
+        "id": "freq_set",
+        "name": "频率给定",
+        "address": {
+          "kind": "register",
+          "area": "holding",
+          "offset": "{cmdOffset}",
+          "length": 1,
+          "bit": -1
+        },
+        "dataType": "uint16",
+        "unit": "Hz",
+        "scale": 0.01,
+        "writable": true,
+        "enabled": true
+      },
+      {
+        "id": "freq_out",
+        "name": "频率回读",
+        "address": {
+          "kind": "register",
+          "area": "holding",
+          "offset": "{statusOffset}",
+          "length": 1,
+          "bit": -1
+        },
+        "dataType": "uint16",
+        "unit": "Hz",
+        "scale": 0.01,
+        "enabled": true
+      }
+    ]
+  }
+}

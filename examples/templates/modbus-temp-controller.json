@@ -1,0 +1,104 @@
+{
+  "id": "modbus-temp-controller",
+  "name": "温控器（Modbus）",
+  "description": "单回路温控：测量值/设定值/加热输出/报警，温度按 0.1℃ 存整数。",
+  "protocol": "modbus-tcp",
+  "parameters": [
+    {
+      "name": "index",
+      "type": "string",
+      "required": true
+    },
+    {
+      "name": "unitId",
+      "type": "int",
+      "default": 1
+    },
+    {
+      "name": "pvOffset",
+      "type": "int",
+      "default": 0
+    },
+    {
+      "name": "spOffset",
+      "type": "int",
+      "default": 1
+    },
+    {
+      "name": "heatCoil",
+      "type": "int",
+      "default": 0
+    },
+    {
+      "name": "alarmCoil",
+      "type": "int",
+      "default": 1
+    }
+  ],
+  "device": {
+    "id": "temp-{index}",
+    "name": "温控器 {index}",
+    "unitId": "{unitId}",
+    "interval": "2s",
+    "enabled": true,
+    "points": [
+      {
+        "id": "pv",
+        "name": "测量温度",
+        "address": {
+          "kind": "register",
+          "area": "holding",
+          "offset": "{pvOffset}",
+          "length": 1,
+          "bit": -1
+        },
+        "dataType": "int16",
+        "unit": "°C",
+        "scale": 0.1,
+        "enabled": true
+      },
+      {
+        "id": "sp",
+        "name": "设定温度",
+        "address": {
+          "kind": "register",
+          "area": "holding",
+          "offset": "{spOffset}",
+          "length": 1,
+          "bit": -1
+        },
+        "dataType": "int16",
+        "unit": "°C",
+        "scale": 0.1,
+        "writable": true,
+        "enabled": true
+      },
+      {
+        "id": "heating",
+        "name": "加热输出",
+        "address": {
+          "kind": "register",
+          "area": "coil",
+          "offset": "{heatCoil}",
+          "length": 1,
+          "bit": -1
+        },
+        "dataType": "bool",
+        "enabled": true
+      },
+      {
+        "id": "alarm",
+        "name": "超温报警",
+        "address": {
+          "kind": "register",
+          "area": "coil",
+          "offset": "{alarmCoil}",
+          "length": 1,
+          "bit": -1
+        },
+        "dataType": "bool",
+        "enabled": true
+      }
+    ]
+  }
+}

@@ -1,0 +1,114 @@
+{
+  "id": "s7-plc",
+  "name": "S7 PLC 数据块",
+  "description": "按 DB 号与起始字节生成一组 S7 点位；字符串必须显式给长度。",
+  "protocol": "s7",
+  "parameters": [
+    {
+      "name": "index",
+      "type": "string",
+      "required": true
+    },
+    {
+      "name": "db",
+      "type": "int",
+      "default": 1,
+      "description": "数据块号"
+    },
+    {
+      "name": "tempOffset",
+      "type": "int",
+      "default": 0
+    },
+    {
+      "name": "countOffset",
+      "type": "int",
+      "default": 4
+    },
+    {
+      "name": "labelOffset",
+      "type": "int",
+      "default": 6
+    },
+    {
+      "name": "labelLength",
+      "type": "int",
+      "default": 8
+    },
+    {
+      "name": "flagByte",
+      "type": "int",
+      "default": 14
+    },
+    {
+      "name": "flagBit",
+      "type": "int",
+      "default": 0
+    }
+  ],
+  "device": {
+    "id": "plc-{index}",
+    "name": "PLC {index}",
+    "interval": "1s",
+    "enabled": true,
+    "points": [
+      {
+        "id": "temperature",
+        "name": "温度",
+        "address": {
+          "kind": "register",
+          "area": "db",
+          "offset": "{tempOffset}",
+          "length": 4,
+          "bit": -1,
+          "db": "{db}"
+        },
+        "dataType": "float32",
+        "unit": "°C",
+        "enabled": true
+      },
+      {
+        "id": "count",
+        "name": "计数",
+        "address": {
+          "kind": "register",
+          "area": "db",
+          "offset": "{countOffset}",
+          "length": 2,
+          "bit": -1,
+          "db": "{db}"
+        },
+        "dataType": "int16",
+        "enabled": true
+      },
+      {
+        "id": "label",
+        "name": "批次号",
+        "address": {
+          "kind": "register",
+          "area": "db",
+          "offset": "{labelOffset}",
+          "length": "{labelLength}",
+          "bit": -1,
+          "db": "{db}"
+        },
+        "dataType": "string",
+        "enabled": true
+      },
+      {
+        "id": "flag",
+        "name": "标志位",
+        "address": {
+          "kind": "register",
+          "area": "db",
+          "offset": "{flagByte}",
+          "length": 1,
+          "bit": "{flagBit}",
+          "db": "{db}"
+        },
+        "dataType": "bool",
+        "enabled": true
+      }
+    ]
+  }
+}

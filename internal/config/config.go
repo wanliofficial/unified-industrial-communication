@@ -1440,11 +1440,19 @@ func pointMap(d model.Device) map[string]string {
 // ---------------------------------------------------------------------------
 
 func atomicWrite(path string, data []byte) error {
+	return WriteFile(path, data, 0o600)
+}
+
+// WriteFile 原子地写入文件：先写同目录临时文件、fsync，再 rename。
+//
+// 配置文件与点表都是「写坏就等于没配」的东西，不能出现半截文件。权限
+// 默认由调用方给定（配置文件习惯用 0600，因为里面可能有凭据明文）。
+func WriteFile(path string, data []byte, perm os.FileMode) error {
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}
-	tmp, err := os.CreateTemp(dir, ".config-*")
+	tmp, err := os.CreateTemp(dir, ".uic-*")
 	if err != nil {
 		return err
 	}
@@ -1455,6 +1463,10 @@ func atomicWrite(path string, data []byte) error {
 		return err
 	}
 	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Chmod(perm); err != nil {
 		tmp.Close()
 		return err
 	}
