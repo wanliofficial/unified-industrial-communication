@@ -5,8 +5,8 @@
 | 项 | 数字 |
 |---|---|
 | 分析的参考方案 | 38 份（PA-01 … PA-38，其中 PA-06 合并了两个完全相同的仓库） |
-| 文档总量 | 55 份 Markdown / 18,298 行（含 3 份 ADR） |
-| 代码总量 | 150 个 Go 文件 / 61,322 行（其中测试 27,278 行） |
+| 文档总量 | 55 份 Markdown / 18,357 行（含 3 份 ADR） |
+| 代码总量 | 155 个 Go 文件 / 63,364 行（其中测试 28,029 行 / 887 个测试函数） |
 | Go 包 | 37 个（1 个入口 + 36 个内部包；35 个有测试） |
 | 第三方依赖 | 0（仅标准库，零 CGO） |
 
@@ -89,11 +89,24 @@ S7（S7comm / ISO-on-TCP）链路：
 ./uic sim -protocol s7 -listen 127.0.0.1:15102 &   # 内置 S7 从站
 ./uic -config examples/s7.json
 curl -s localhost:8085/api/v1/points | jq '.items[] | {point, value, quality}'
+# 块服务（不需要起网关，直接连 PLC/模拟从站）：
+./uic s7blocks -addr 127.0.0.1:15102                 # 七类块数量
+./uic s7blocks -addr 127.0.0.1:15102 -type db        # DB 块号列表
+./uic s7blocks -addr 127.0.0.1:15102 -type db -num 1 # DB1 属性（78 字节块信息）
+./uic s7upload -addr 127.0.0.1:15102 -type db -num 1 -out db1.bin
 ```
 
 示例配置覆盖 7 个点位：DB1 的 REAL/INT16/DINT32/STRING、DB2 的 WORD、
 输入区 IW0、位地址 M0.3。模拟从站每秒改 DB1.DBD0，可用来观察 SSE。
 `-pdu 240|480|960` 可改协商值，用来验证切块（240 时 40 个 float 会被拆成多帧）。
+
+块服务（`uic s7blocks` / `uic s7upload`）刻意不进入采集调度：它用于备份、
+比对与排障，一次可能传几 MB，与周期采集的延迟目标冲突。三条容易写错的协议
+细节都已固化在 `codec/s7` 里：**ACK/ACK_DATA 是 12 字节头**（Job/UserData 是
+10 字节，参数区从 12 而不是 10 开始）；**ListAll 的数据区是 `0A 00 0000`**，
+不是其它查询用的 `FF 09`；**上传的长度是 5 位十进制 ASCII**，分片以 `param[1]`
+判断是否最后一片。上传失败也会补一条 End——不释放 PLC 侧会话，反复重试几次
+就可能把上传会话耗尽。
 
 OPC UA（二进制，SecurityPolicy None / 匿名）：
 
@@ -552,17 +565,17 @@ obs  ← 所有包（不依赖任何内部包）
 | `internal/driver` | 驱动契约（Codec/Transport/Driver）、错误分类、注册表、只读 `Lookup` 注入 | 能力四态；`Conn` 不保证并发安全，由调用方串行；协议错误可用 `Kinded` 自带分类 | 87.0% |
 | `internal/codec/modbus` | Modbus 纯函数编解码（TCP/RTU/ASCII，主站与从站共用） | 无 I/O、无时钟、无可变状态 | 88.5% |
 | `internal/codec/value` | 协议无关值编解码（重排、数值/字符串/BCD） | 与协议无关；`Encode` 对 string/bytes 不猜宽度 | 95.0% |
-| `internal/codec/s7` | S7 纯函数编解码（TPKT/COTP/S7 PDU、长度单位换算） | 请求按字节、响应按位/字节的差异收敛在一处 | 80.3% |
+| `internal/codec/s7` | S7 纯函数编解码（TPKT/COTP/S7 PDU、块目录/属性/上传、长度单位换算） | 请求按字节、响应按位/字节的差异收敛在一处；ACK/ACK_DATA 为 12 字节头、Job/UserData 为 10 字节；ListAll 的数据区是 `0A 00 0000`；块长度是 5 位十进制 ASCII | 85.4% |
 | `internal/codec/opcua` | OPC UA 纯函数编解码（UACP HEL/ACK、安全报文、NodeId、Variant、读/写/浏览 + 订阅/发布/确认） | 分块响应显式报错；数组长度上界必查；BCD 等无对应类型显式报错；未知通知类型跳过而不是判故障 | 86.1%（含 driver/opcua 与 opcuaserver 交叉覆盖） |
 | `internal/transport` | 字节流抽象 + TCP + 串口（termios） | 写满、读满或超时、关闭幂等；协议层 deadline 不得被兜底值覆盖 | 80.2% |
 | `internal/driver/modbus` | Modbus TCP + RTU + ASCII 主站 | 事务号递增；异常码分类；部分失败不吞好样本；同串口事务串行；分帧类型参与端口冲突判定 | 83.3% |
-| `internal/driver/s7` | S7（S7comm）主站 | COTP/Setup 握手不可省；按协商 PDU 与 20 项上限切块；逐项返回码映射质量码 | 79.9% |
+| `internal/driver/s7` | S7（S7comm）主站；块服务走独立一次性 `Session` | COTP/Setup 握手不可省；按协商 PDU 与 20 项上限切块；逐项返回码映射质量码；顶层 ACK 错误直接判协议错；块上传以 `param[1]` 判最后一片，失败也补 End 释放 PLC 会话 | 78.1% |
 | `internal/driver/opcua` | OPC UA 二进制主站（None/None + 匿名）；可选订阅推送 | 三层状态（TCP/通道/会话）分开判断；按 RequestId 过滤迟到响应；节点越界判坏不截断；订阅走独立第二条连接，Read 优先本地表、失效即回退真读 | 76.2% |
 | `internal/driver/mqtt` | MQTT 南向（订阅取数）：把推送型协议适配成拉取契约 | `Read` 无网络交互，只读本地最新值表；质量码只反映新鲜度（good/stale/bad 三档）；一条消息都没有不算断链，安静到一个窗口且 PING 失败才判链 | 77.4% |
 | `internal/driver/computed` | 计算点：表达式驱动，无物理链路 | 同设备依赖在一次 `Read` 内按拓扑序闭合；输入不可用则不计算、质量取最差并指名输入；整数越界判坏不截断；窗口聚合的数据来自只读 `OpenConfig.History`，缺失时显式失败 | 92.7% |
 | `internal/driver/virtual` | 虚拟设备（波形 + 故障注入） | 故障按「第 n 次请求」精确注入一次 | 98.6% |
 | `internal/sim/modbus` | 内置 Modbus TCP 从站 | 复用同一份 codec，避免主从语义漂移 | 87.2% |
-| `internal/sim/s7` | 内置 S7 从站（内存 DB/M/I/Q 区） | 与主站共用 codec/s7；输入区只读；位写保邻位 | 71.9% |
+| `internal/sim/s7` | 内置 S7 从站（内存 DB/M/I/Q 区；块目录/属性/上传） | 与主站共用 codec/s7；输入区只读；位写保邻位；DB 块内容直接从内存区域反向暴露，与读点位看到同一份数据；上传会话按连接隔离，End 后立即失效 | 80.0% |
 | `internal/opcuaserver` | 可复用的 OPC UA 服务端内核（地址空间、订阅/发布、标准节点） | 与主站共用 codec/opcua；未激活会话拒绝读写；Variant 类型必须与节点 DataType 一致；Publish 在独立 goroutine，响应按 RequestId 乱序返回；`NewSimulator` 提供演示地址空间 | 82.5% |
 | `internal/northbound/opcua` | OPC UA 北向：点位表 → 地址空间 | 一点一变量；质量码映射到 `DataValue.Status`；写入过 `Runtime.Write`（设备 actor + 幂等）；配置变更按指纹重建，抢不到端口回退上一份配置 | 82.4% |
 | `internal/sim/mqtt` | 内置 MQTT 3.1.1 Broker，兼 `uic sim -protocol mqtt` 运行时 | 全项目唯一一份 Broker 实现；不做 QoS2/持久会话/TLS；QoS2 授予时降级为 1 | 79.3% |
@@ -583,8 +596,8 @@ obs  ← 所有包（不依赖任何内部包）
 | `internal/northbound/httpapi` | REST + SSE + 认证/授权 + 错误码 | 错误码稳定；响应不泄露凭据；未知角色全拒；401 与 403 在审计里区分；报警/历史查询的未知参数取值必须报错而不是静默忽略 | 83.4% |
 | `internal/mqtt` | MQTT 3.1.1 客户端（北向发布 + 南向订阅共用，纯 Go 零依赖） | 单 goroutine 读 socket；QoS1 必须等到 PUBACK；`Ping` 必须等到 PINGRESP（写成功不算活着）；断线立即失败而非超时 | 70.3% |
 | `internal/mqtt/mqtttest` | 测试封装：`internal/sim/mqtt` 的 `*testing.T` 生命周期 + 等待断言 | 不另写 Broker（两份实现必然长歪）；开关一律走 setup 函数而非直接赋字段 | — |
-| `internal/runtime` | 唯一编排层 + 后端实现 + 看门狗 + 审计埋点 + 窗口缓存 | 启动/关闭顺序（失败逆序收口）；`configuredState` 与 `runtimeState` 分离；协议/传输匹配在装配期校验；只向驱动与报警引擎注入只读 `cache.Get` 与窗口数据源；北向 OPC UA 启停与热重建；凭据表热替换后旧用户立即失效 | 81.2% |
-| `cmd/uic` | 单入口：run / sim / mbread / uaread / check / version | 关闭预算 10 秒；`uaread` 与 `mbread` 是不装第三方客户端即可自证链路的自检工具 | — |
+| `internal/runtime` | 唯一编排层 + 后端实现 + 看门狗 + 审计埋点 + 窗口缓存 | 启动/关闭顺序（失败逆序收口）；`configuredState` 与 `runtimeState` 分离；协议/传输匹配在装配期校验；只向驱动与报警引擎注入只读 `cache.Get` 与窗口数据源；北向 OPC UA 启停与热重建；凭据表热替换后旧用户立即失效 | 81.3% |
+| `cmd/uic` | 单入口：run / sim / mbread / uaread / s7blocks / s7upload / token / check / version | 关闭预算 10 秒；`uaread` 与 `mbread` 是不装第三方客户端即可自证链路的自检工具；块服务放在 CLI 而不是北向 API（动作重、数据大、归操作系统账号管） | — |
 
 ### 9.2 测试与验证命令
 
@@ -620,6 +633,7 @@ go test -coverprofile=c.out ./... && go tool cover -func=c.out | tail -1
 16. internal/history/store.go + query.go 分段追加、整段淘汰、扫描聚合（50 分钟）
 17. internal/opcuaserver/server.go     服务端内核：两阶段写、标准节点、订阅分发（50 分钟）
 18. internal/northbound/opcua/northbound.go 点位表→地址空间、质量映射、写穿透（40 分钟）
+19. internal/codec/s7/block.go + driver/s7/session.go 有状态块服务：三段式上传与会话释放（40 分钟）
 ```
 
 ---
@@ -686,7 +700,8 @@ OPC UA 服务端（同一份点位表的另一个出口）：
 | Modbus 寄存器位写 | ✅ | 布尔点落在保持寄存器且给出 `address.bit`（0..15）时，驱动做「读整字 → 只改目标位 → 写整字」；读失败则不写、缺位号明确拒绝；同设备写入串行（`conn.wmu`），不会覆盖同寄存器的其它位；`coil` 仍走 FC5，`input`/`discrete` 在发帧前拒绝 |
 | Modbus RTU | ✅ | 串口 transport（termios raw、非阻塞 + deadline、tcdrain/tcflush）、3.5 字符帧间静默、按请求推导帧长、半包/CRC 错/unit 错/异常帧分类、同串口多从站共享 fd 并串行化事务 |
 | S7 主站 | ✅ | TPKT/COTP/S7comm 分层；COTP 目的 TSAP 按 rack/slot 计算；Setup 协商 PDU 后按「20 项 / PDU 预算」切块；DB/I/Q/M/C/T 区读写与位访问；逐项返回码分类（越界/缺 DB→地址错、写输入区→权限错）；部分失败保留好样本 |
-| S7 符号表 / 块上传 / 报警 | ❌ | 需要 S7 浏览与报警服务；点位必须手写地址 |
+| S7 块服务（目录 / 属性 / 上传） | ✅ | USER_DATA 组 0x03：列七类块数量、列某类型块号、读单块 78 字节属性；Job 0x1D/0x1E/0x1F 三段式上传（块长度是 5 位十进制 ASCII，分片以 `param[1]` 判最后一片，失败也补 End 释放 PLC 会话）；`uic s7blocks` / `uic s7upload` 可自检；单块上限 16MB |
+| S7 符号表 / 报警订阅 | ❌ | 符号寻址需要 S7 浏览服务，报警需要独立 PDU 通道；点位仍需手写地址 |
 | Modbus TCP 从站 | ✅ | `slaves[]` 存在即启用；四区（holding/input/coil/discrete）映射；跨映射与半值读；写穿透到 `Runtime.Write`；坏质量保留最后值并计入 `uic_slave_degraded_reads_total`；映射变化按指纹重建监听；`uic mbread` 可自检 |
 | Modbus RTU/ASCII 从站 | ✅ | `serial.port` + `serial.framing`（rtu/ascii）；RTU 按功能码推导帧长、推不出来时读到 3.5 字符静默（下限 5ms 对抗 USB 转发延迟）；ASCII 以 `:` 起始、CRLF 结束；非本机单元号静默、广播只写不回、CRC/LRC 错后 `tcflush` 重同步、半帧丢弃；USB 适配器掉线按 1s→2s→…→30s 退避重开；端口与主站通道及其他从站按字面路径互斥（配置期拒绝） |
 | Modbus 诊断与识别（FC8/FC11/FC17/FC43） | ✅ | FC8 子功能 0x0000 回显、0x000A 清计数、0x000B~0x0012 各类计数（TCP 上 CRC/字符层错误恒为 0）；FC11 事件计数器（自身不计数、异常不计数）；FC17 产品代码 + 运行指示 0xFF；FC43/MEI 0x0E 读设备标识（basic/regular/extended 与按对象 id 读取，响应超 253 字节时按 `more`/`nextObjectID` 分页）；身份标识由 `slave.identity` 配置，缺省也保证 basic 三件套非空；版本号取构建信息 |

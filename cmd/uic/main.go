@@ -1,4 +1,4 @@
-// Command uic 是单一可执行入口：run（默认）/ sim / mbread / uaread / version。
+// Command uic 是单一可执行入口：run（默认）/ sim / mbread / uaread / s7blocks / s7upload / token / version。
 //
 //	uic -config config.json            # 前台运行
 //	uic run -config config.json        # 同上
@@ -10,6 +10,8 @@
 //	uic mbread -addr 127.0.0.1:1502    # 不依赖第三方工具的从站读写自检（TCP）
 //	uic mbread -transport rtu -port /dev/ttyUSB0 -unit 1   # 串口从站自检
 //	uic uaread -addr 127.0.0.1:4840 -nodes ns=2;s=site/dev/point  # OPC UA 读写自检
+//	uic s7blocks -addr 127.0.0.1:15102   # S7 块目录（-type db / -num 1 可细看）
+//	uic s7upload -addr 127.0.0.1:15102 -type db -num 1 -out db1.bin  # 块上传备份
 //	uic token -name ops -role operator   # 生成用户凭据（明文 + tokenSha256）
 //
 // 关闭顺序遵循 docs/03-product/02-architecture.md §11.2：
@@ -69,6 +71,10 @@ func main() {
 		mbreadCmd(args)
 	case "uaread":
 		uareadCmd(args)
+	case "s7blocks":
+		s7blocksCmd(args)
+	case "s7upload":
+		s7uploadCmd(args)
 	case "token":
 		tokenCmd(args)
 	case "version", "-v", "--version":
@@ -94,6 +100,8 @@ func usage() {
   uic mbread -transport rtu|ascii -port /dev/ttyUSB0 [-baud 19200] [-parity even]
   uic uaread -addr 127.0.0.1:4840 -nodes ns=2;s=site/dev/point [-type float64]
   uic uaread -addr 127.0.0.1:4840 -nodes ns=2;s=site/dev/setpoint -write 42.5
+  uic s7blocks -addr 127.0.0.1:15102 [-type db [-num 1]] [-json]
+  uic s7upload -addr 127.0.0.1:15102 -type db -num 1 [-out db1.bin|-]
   uic token [-name ops] [-role viewer|operator|admin] [-count N] [-json]
   uic version
 

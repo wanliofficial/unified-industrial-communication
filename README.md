@@ -42,7 +42,20 @@ S7（S7comm / ISO-on-TCP，TCP 102）：
 curl -s localhost:8085/api/v1/points
 #   7 点：DB1 的 REAL/INT16/DINT32/STRING、DB2 WORD、IW0、M0.3
 #   -pdu 240 可验证按协商 PDU 切块
+
+# 块服务（不需要起网关，直接连 PLC 或内置从站）：目录 / 属性 / 上传
+./uic s7blocks -addr 127.0.0.1:15102                  # 七类块数量
+./uic s7blocks -addr 127.0.0.1:15102 -type db         # DB 块号列表
+./uic s7blocks -addr 127.0.0.1:15102 -type db -num 1  # DB1 的 78 字节属性
+./uic s7upload -addr 127.0.0.1:15102 -type db -num 1 -out db1.bin
 ```
+
+块服务刻意不进入采集调度：它用于备份、比对与排障，一次可能传几 MB，与周期采集
+的延迟目标冲突。三条最容易写错的协议细节已经固化在 `codec/s7` 里：**ACK/ACK_DATA
+是 12 字节头**（Job/UserData 是 10 字节，参数区从 12 而不是 10 开始）；**ListAll
+的数据区是 `0A 00 0000`**，不是其它查询用的 `FF 09`；**上传的块长度是 5 位十进制
+ASCII**，分片以 `param[1]` 判断是否最后一片（0 才是最后一片）。上传失败也会补一条
+End：不释放 PLC 侧会话，反复重试就可能把上传会话耗尽。
 
 OPC UA（二进制，SecurityPolicy None / 匿名）：
 
@@ -261,7 +274,7 @@ go test -race -count=1 ./...
 
 | 路径 | 内容 |
 |---|---|
-| `cmd/uic/` | 单入口：`run` / `sim`（Modbus / S7 / OPC UA / MQTT）/ `mbread` / `uaread` / `token` / `-check` / `version` |
+| `cmd/uic/` | 单入口：`run` / `sim`（Modbus / S7 / OPC UA / MQTT）/ `mbread` / `uaread` / `s7blocks` / `s7upload` / `token` / `-check` / `version` |
 | `internal/model` | 通道 / 设备 / 点位 / 地址 / 采样 / 质量码 |
 | `internal/driver` | 驱动契约（Codec / Transport / Driver）、错误分类、注册表、只读 `Lookup` 注入 |
 | `internal/calc` | 零依赖表达式引擎（编译期类型检查、短路求值、引用 `device:point`） |
@@ -269,16 +282,16 @@ go test -race -count=1 ./...
 | `internal/history` | 有界采样日志：NDJSON 分段 / 整段淘汰 / 原始查询与定步长聚合 |
 | `internal/codec/modbus` | Modbus 纯函数编解码（主站与从站共用） |
 | `internal/codec/value` | 协议无关值编解码（重排 / 数值 / 字符串 / BCD） |
-| `internal/codec/s7` | S7 纯函数编解码（TPKT / COTP / S7 PDU） |
+| `internal/codec/s7` | S7 纯函数编解码（TPKT / COTP / S7 PDU / 块目录与块上传） |
 | `internal/codec/opcua` | OPC UA 纯函数编解码（UACP、安全报文、NodeId、Variant、九类服务） |
 | `internal/driver/modbus` | Modbus TCP + RTU + ASCII 主站 |
-| `internal/driver/s7` | S7（S7comm）主站 |
+| `internal/driver/s7` | S7（S7comm）主站；块服务走独立一次性 `Session`（目录 / 属性 / 上传） |
 | `internal/driver/opcua` | OPC UA 主站（None/None + 匿名，三层状态机）；可选订阅推送（独立第二条连接） |
 | `internal/driver/mqtt` | MQTT 南向（订阅取数）：推送适配成拉取，三档新鲜度质量码 |
 | `internal/driver/computed` | 计算点：表达式驱动，同设备依赖在一次 Read 内按拓扑序闭合 |
 | `internal/driver/virtual` | 虚拟设备（波形 + 故障注入） |
 | `internal/sim/modbus` | 内置 Modbus TCP 从站 |
-| `internal/sim/s7` | 内置 S7 从站（内存 DB/M/I/Q 区） |
+| `internal/sim/s7` | 内置 S7 从站（内存 DB/M/I/Q 区；支持块目录 / 属性 / 上传） |
 | `internal/opcuaserver` | 可复用 OPC UA 服务端内核（地址空间 + 订阅/发布 + 标准节点） |
 | `internal/sim/mqtt` | 内置 MQTT 3.1.1 Broker（兼 `uic sim -protocol mqtt` 运行时） |
 | `internal/slave/modbus` | Modbus TCP 从站（把点位映射给外部主站，写穿透到南向） |
