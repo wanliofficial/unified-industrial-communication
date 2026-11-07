@@ -323,7 +323,7 @@ X-Idempotency-Key: 0b6f...
 |---|---|
 | 权限 | 需要 `point.write` 权限；只读点返回 `point.not_writable` |
 | 幂等 | `X-Idempotency-Key` 在 5 分钟内重复提交返回首次结果 |
-| 确认 | `confirm: true` 时网关回读一次，不一致返回 `uncertain` |
+| 确认 | `confirm: true` 时网关回读一次，不一致返回 `uncertain`。比较的是**补齐类型后**的写入值：`value.type` 可省略，由点位 `dataType` 补齐；浮点按 float32/float64 的相对容差比较（写 0.1 读回 0.10000000149 属正常二次舍入），整数、布尔与字符串严格相等 |
 | 批量 | 逐项结果；部分失败返回 200 + 失败项（不用 500） |
 | 审计 | 每次写入记录：谁、何时、点位、旧值、新值、结果 |
 

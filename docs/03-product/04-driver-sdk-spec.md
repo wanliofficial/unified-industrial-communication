@@ -1526,6 +1526,282 @@ curl -H 'Authorization: Bearer dev-token-0123456789' \
 | `driver/enip` | 注册与状态、命令/上下文错位、原子类型、大小写、STRING、bytes 两阶段读、数组 offset、位读/位写保邻位、offset 写保前缀、多服务合包与拆批、MSP 自动退回、错类型/越界位/未知标签、会话失效可重试、Probe 容忍不支持、能力声明 |
 | `sim/enip` | 真实 TCP 回环：注册/注销/坏版本/未知命令、Read/Write Tag 与错误码 0x03/0x05/0x13/0x15、STRING 写、多服务与关闭、非符号路径、`SetTag` 校验、默认标签 |
 
+### 3.10.8 BACnet/IP（对象属性读写，UDP 47808）
+
+楼宇自控与厂务系统里，采温湿度、风机启停、阀门开度这类点位，最常见的接口就是
+BACnet/IP。它与前面几种协议的根本差别在于**寻址模型**：Modbus 是「寄存器偏移」，
+S7 是「区域 + 字节偏移」，CIP 是「标签名」，而 BACnet 是「对象类型 + 实例号 + 属性」。
+
+这决定了三件事：
+
+1. 一个点位不是「一段内存」，而是「某个对象的某个属性」。`analog-input:1` 的
+   `present-value` 与 `units` 是两个独立的读请求，取值语义也不同（浮点 vs 枚举）。
+2. 可写性由对象类型决定，而不是由平台配置决定。同一份点表里，`analog-input` 的
+   `present-value` 永远只读、`analog-value` 的则可写；把它们都当成「可写寄存器」
+   会在运行期收到「写访问被拒绝」。
+3. 一个对象有几十个标准属性，绝大多数业务点位只关心 `present-value`，
+   但「对象名」「工程单位」这类元数据同样值得采——它们让点表在半年后还能被读懂。
+
+本驱动只做两个服务：**ReadProperty（0x0C）** 与 **WriteProperty（0x0F）**。
+边界见 §3.10.8.8。
+
+#### 3.10.8.1 四层封装，每层的长度含义都不同
+
+```
+┌─ BVLC（4 字节）──────────────────────────────────────┐
+│ 类型(1)=0x81  功能(1)  长度(2，只算 NPDU+APDU)          │
+├─ NPDU（3 字节起）────────────────────────────────────┤
+│ 版本(1)=1  控制(1)=0x04  后续可选的目的/源网络信息        │
+├─ APDU───────────────────────────────────────────────┤
+│ 类型(1)  参数...（服务码、invoke ID、对象标识符、属性...）  │
+├─ 应用值（自带标签的类型编码）─────────────────────────────┤
+│ 标签头(1..5) + 负载                                    │
+└──────────────────────────────────────────────────────┘
+```
+
+| 细节 | 正确做法 | 写错的后果 |
+|---|---|---|
+| BVLC 长度 | **只算 NPDU + APDU**，不含 BVLC 自己的 4 字节 | 与绝大多数「长度含头」的协议相反；按含头写会让对端丢弃或粘包 |
+| NPDU 控制字节 | 请求固定 `0x04`（期望应答、无目的端） | 带上「有目的端」却不给地址，报文结构立即非法 |
+| Forwarded-NPDU（0x0B） | 外层多 4 字节转发信息，**跳过**再解析 | 直接按 Original-Unicast 解析会把转发地址当 NPDU 版本 |
+| APDU 首字节 | 高 4 位是类型，低 4 位是标志（分段、更多分段等） | 用整字节做 switch 会把「分段 ComplexACK」当成未知类型 |
+
+`ParseMessage` 负责剥掉 BVLC 与 NPDU，返回 APDU 与 NPDU 控制字节；`ParseACK`
+再把 APDU 拆成 `(kind, service, invokeID, payload)`。所有上层代码只面对
+「应用值字节」，不再关心封装的三种长度字段。
+
+#### 3.10.8.2 事务：8 位 invoke ID 与 UDP 串行化
+
+BACnet/IP 跑在 UDP 上，没有连接、没有请求序号：
+
+- invoke ID 是 **1 字节**（1..255，0 保留给设备主动发起的报文），
+  8 位意味着它必然复用；
+- 同一个套接字上并行挂两个未完成事务时，迟到的应答会张冠李戴，
+  而错误现象是「值偶尔串到别的点位上」——比读不到值难查得多。
+
+因此 `connState.mu` **串行化整条会话**，一个事务完成再发下一个。这不是性能妥协：
+一台设备的采集周期通常是秒级，而一次属性读的往返在局域网内是个位数毫秒，
+串行化的时间成本远低于错配的排查成本。
+
+```go
+apdu := ReadPropertyRequest(invoke, objType, instance, property, index)
+resp := exchange(ctx, apdu, invoke, "read")   // 只接受 invoke 相同的应答
+```
+
+`exchange` 的规则：
+
+| 情况 | 处理 | 理由 |
+|---|---|---|
+| 收到 invoke 不匹配的应答 | 丢弃，继续等 | UDP 上迟到报文是常态，报错会误伤 |
+| 收到无法解析的报文 | 立即报协议错 | 对端在发垃圾，继续等不会变好 |
+| 超时 | 重发，最多 2 次 | UDP 丢包；但重试过多会让一轮采集时延不可控 |
+| 断链 / 协议错 | 不重试，立即上报 | 重试只会让同一错误重复 N 次 |
+| ctx 已取消 | 报超时并结束 | 上层关闭时不该再等满一个超时 |
+
+默认端口 47808，地址省略端口时自动补齐；显式写端口仍然尊重配置（跨 NAT 或调试）。
+UDP 用 connected socket（`DialUDP`），这样内核会过滤掉其它源地址的报文，
+减少一类「第三方设备广播包被当成本设备应答」的干扰。
+
+#### 3.10.8.3 地址语义：对象类型 + 实例 + 属性 + 数组下标
+
+BACnet 的点位必须用 `kind=object` 寻址：
+
+| 字段 | 含义 | 校验 |
+|---|---|---|
+| `address.objectType` | 对象类型名或编号（`analog-input` / `0`） | 必须能解析；错误提示列出全部可选值 |
+| `address.instance` | 对象实例号 | `0..4194302`（22 位） |
+| `address.property` | 属性名或编号（`present-value` / `85`） | 必须能解析 |
+| `address.propIndex` | 数组属性的下标 | `0` 表示不带下标（读整个属性）；`>0` 读该元素 |
+
+**为什么允许写编号**：现场设备文档千差万别，有的只给编号表。让用户为了一个
+属性去查别名，等于把文档工作转嫁给运维。解析时**编号优先于别名**，且只接受
+纯十进制——`-1` 不会被 `normalizeName` 吃掉减号变成 `1`。这类「安静地指向
+另一个对象」的错误，比直接报错危险得多。
+
+对象类型到值语义的映射由 `KindOfObject` 统一：
+
+| 语义 | 对象类型 | present-value 的编码 |
+|---|---|---|
+| 模拟量 | analog-input / analog-output / analog-value / loop | REAL（4 字节浮点） |
+| 二进制量 | binary-input / binary-output / binary-value | ENUMERATED |
+| 多状态量 | multi-state-input / multi-state-value / multi-state-output | UNSIGNED |
+| 字符串 | character-string | CHARACTER STRING |
+
+这张表是**写值时选标签**的依据（§3.10.8.5），也是 CLI 推断 `-dtype` 的依据。
+把它分散到各处写 switch，迟早会出现「驱动按 REAL 写、从站按 ENUMERATED 收」
+的自相矛盾。
+
+#### 3.10.8.4 标签编码：application 与 context 的 LVT 含义不同
+
+BACnet 的类型编码是最容易写错的一处：**同一个 LVT 数值，在两种标签里含义不同**。
+
+| LVT | application 标签 | context 标签 |
+|---|---|---|
+| 0–4 | 负载长度 0..4（内联） | 负载长度 0..4（内联） |
+| 5 | 扩展长度，后续 1 字节 | 扩展长度，后续 1 字节 |
+| 6 | 扩展长度，后续 2 字节 | **opening tag**（无负载） |
+| 7 | 扩展长度，后续 4 字节 | **closing tag**（无负载） |
+
+换句话说：application 标签永远用 LVT 表示长度；context 标签只有 0..5 表示长度，
+6/7 被构造形式占用。把 context 的长度 6 当成「扩展 2 字节」会读出两个字节的垃圾，
+而报文长度又刚好对得上——错误会一路传到值解码才爆出来。
+
+已验证的编码规则：
+
+| 类型 | 编码 | 备注 |
+|---|---|---|
+| BOOLEAN | 标签头 LVT **直接承载值**（0/1） | 没有负载字节；当成「长度」写会多出一个字节 |
+| UNSIGNED / ENUMERATED | 大端，最短字节数 | 0 也必须占 1 字节（LVT=1） |
+| SIGNED | 大端补码，最短字节数 | -128 编码为 `31 80`，不是 `32 80` |
+| REAL | 4 字节 IEEE754 大端 | 长度固定 |
+| DOUBLE | 8 字节 IEEE754 大端 | 长度固定 |
+| OCTET STRING / CHARACTER STRING | 原始字节 | 不自动补结束符；长度即字节数 |
+| BIT STRING | 未使用位数(1) + 位串 | 只用于读，写入不支持 |
+| OBJECT IDENTIFIER | 4 字节：`type<<22 \| instance` | 请求的对象寻址用它 |
+
+`EncodeApplicationValue` / `DecodeApplicationValue` 是纯函数，不认识「服务」，
+只认「类型 + 值」。这样同一套编码既用于请求参数，也用于应答里的属性值，
+以及内置从站的回包——三处不会漂移。
+
+#### 3.10.8.5 写值类型由对象决定，不由平台类型决定
+
+这是 BACnet 写入最常见的失败原因。平台点表里写 `dataType=float32`，
+如果据此发一个 REAL 标签去写 `binary-value` 的 `present-value`，设备会回
+`invalid-data-type`——因为该属性在标准里就是 ENUMERATED。
+
+驱动因此按**属性 + 对象语义**选标签：
+
+| 场景 | 标签 |
+|---|---|
+| `present-value` + 模拟量对象 | REAL |
+| `present-value` + 二进制对象 | ENUMERATED |
+| `present-value` + 多状态对象 | UNSIGNED |
+| `present-value` + 字符串对象 | CHARACTER STRING |
+| 其它属性 + `dataType=bool` | BOOLEAN |
+| 其它属性 + `dataType=string` | CHARACTER STRING |
+| 其它属性 + `dataType=bytes` | OCTET STRING |
+| 其它属性 + `dataType=float64` | DOUBLE |
+| 其它属性 + 其它数值 | REAL |
+
+写请求的参数标签顺序（缺一不可）：
+
+```
+[0] 对象标识符
+[1] 属性标识符
+[2] 数组下标（可选，改了数组元素才带）
+[3] opening → 应用值 → closing
+[4] 优先级 1..16（可选；0 表示不带，按 relinquish-default 处理）
+```
+
+`[3]` 必须是构造形式：它的内容是「自带标签的类型」，塞不进 context 标签的原始
+负载。这也是为什么写请求比读请求多两个字节的 opening/closing。
+
+读应答里的 `[3] propertyValue` 同样用 opening/closing 包裹；但少数老设备
+直接把应用值塞在原始负载里。`ReadPropertyACK` 两种都接受——宽容读、严格写，
+是现场兼容性的基本取舍。
+
+#### 3.10.8.6 错误类 / 错误码 → 质量映射
+
+设备的 Error APDU 带 `class` 与 `code` 两个字节。映射不是「一律 bad」，
+而是尽量还原「这是配置错、权限错，还是链路问题」：
+
+| class | code | 归为 | 质量码 | 典型含义 |
+|---|---|---|---|---|
+| 1（object） | 任意 | `address` | `address_error` | 对象实例不存在 |
+| 2（property） | 32 unknown-property / 42 invalid-array-index / 37 value-out-of-range / 38 invalid-data-type | `address` | `address_error` | 属性名或下标写错、值域不符 |
+| 2（property） | 40 write-access-denied / 27 read-access-denied | `permission` | `bad` | 点位只读或账号无权限 |
+| 3（resources） | 任意 | `disconnected`（可重试） | `comm_error` | 缓冲满、分段不支持 |
+| 4（security） | 任意 | `permission` | `bad` | 安全策略拒绝 |
+| Reject / Abort | 任意 | `protocol` | `bad` | 报文被拒 / 事务中止 |
+
+`resources` 归为可重试的 `disconnected` 而不是 `bad`：设备只是暂时没有缓冲，
+下一轮采集大概率成功，标成坏点会让运维去查一台其实正常的设备。
+
+#### 3.10.8.7 读的宽容与写的严格
+
+读路径对数值类型刻意宽松：同一台设备的 `analog-input` 可能回 REAL，也可能回
+UNSIGNED（老设备或网关转换过）。把配置类型当成「怎么解释数值」而不是「设备必须
+回什么标签」，现场会少一大半「能连上但读不出值」。具体：
+
+| 配置类型 | 接受的应答标签 |
+|---|---|
+| 数值（int/uint/float/BCD） | REAL / DOUBLE / UNSIGNED / SIGNED / ENUMERATED |
+| bool | BOOLEAN / UNSIGNED / ENUMERATED / SIGNED（非零即 true） |
+| string | CHARACTER STRING（其它一律报错） |
+| bytes | OCTET STRING / BIT STRING / CHARACTER STRING |
+
+`bool` 与 `string` 保持严格：把字符串当数字读出来只会产生垃圾值；把 `"2"` 当
+布尔 `true` 会让「阀门关着」显示成「开着」。
+
+写路径相反：类型不对在本地就拒绝，不发报文。理由很实际——发出去的错误请求
+要占用一个采集周期等设备回错，而本地拒绝能立刻告诉用户「这个点位不能这么写」。
+
+#### 3.10.8.8 能力边界（刻意的）
+
+| 不做 | 原因 |
+|---|---|
+| Who-Is / I-Am 广播发现 | 网关只连配置里点名的设备。广播在多网段、多 BBMD 的现场不可控，且发现结果无法固化进配置 |
+| COV 订阅 | 设备主动推的模型与本平台「调度式采集」的语义不同，混进来会让超时、重连、死区三套逻辑互相干扰 |
+| ReadPropertyMultiple（0x0E） | 嵌入式设备的支持率远低于单属性读，且失败时无法定位是哪一个属性出的问题 |
+| 分段请求 / 分段应答 | 需要段窗口与重组；一个点位几十字节，分段只会出现在异常大的属性上 |
+| 优先级数组写入的优先级参数 | 驱动层暂不暴露 `[4]`，避免「写了一直不生效、其实是被更高优先级压住」 |
+| 对象/属性的自动枚举 | 不做 Browse：点表是配置出来的，不是扫出来的 |
+
+因此 `Meta().Capabilities` 里 `MultiRead`、`BitAccess`、`Browse`、`Discovery`、
+`Subscribe` 全部声明 `unsupported`。声明 `supported` 会让 UI 给出「可以批量读」
+的暗示，而实际行为是逐条读——这是最糟的一类不一致。
+
+#### 3.10.8.9 位置与自检
+
+| 内容 | 路径 |
+|---|---|
+| 编解码 | `internal/codec/bacnet`（`BuildMessage`/`ParseMessage`/`ParseACK`/`ReadPropertyRequest`/`WritePropertyRequest`/`ReadPropertyACK`/`BuildComplexACK`/`EncodeApplicationValue`/`DecodeApplicationValue`/`ObjectTypeFromName`/`PropertyFromName`） |
+| 主站驱动 | `internal/driver/bacnet`（`Meta`/`Open`/`Read`/`Write`/`Probe`，内部 `exchange`/`readOne`/`writeOne`/`mapBacnetError`） |
+| 内置从站 | `internal/sim/bacnet`（`NewServer`/`SetAnalog`/`SetAnalogValue`/`SetBinary`/`SetString`/`SetValue`/`Value`/`Objects`） |
+| CLI | `uic bacread -addr 127.0.0.1:47808 -type analog-input -instance 1` |
+| 示例 | `examples/bacnet.json`（7 点位：只读温度/单位/名称、可写设定值/标牌、二进制状态、自增计数） |
+
+内置从站默认对象表：
+
+| 对象 | 属性 | 值 |
+|---|---|---|
+| `analog-input:1` | present-value / object-name / units | 42.5 / `"AI-1"` / 62（摄氏度） |
+| `analog-value:2` | present-value / priority-array | 0（可写）/ 16 级 NULL |
+| `analog-value:3` | present-value | 每秒自增 |
+| `binary-input:1` | present-value | 1（active） |
+| `character-string:1` | present-value | `"PUMP-01"`（可写） |
+| `device:1` | object-name / model-name | `"UIC-SIM"` / `"sim"` |
+
+自检链路（无硬件）：
+
+```
+./uic sim -protocol bacnet -listen 127.0.0.1:47808 &
+./uic bacread -addr 127.0.0.1:47808 -type analog-input -instance 1
+# analog-input:1.present-value = 42.5（good）
+```
+
+`bacread` 不依赖网关即可区分「连不上」「地址写错」「只读」三种失败：
+
+```
+./uic bacread -addr 127.0.0.1:47808 -type analog-value -instance 2 -write 55.5
+./uic bacread -addr 127.0.0.1:47808 -type character-string -instance 1 -write PUMP-02
+./uic bacread -addr 127.0.0.1:47808 -type analog-input -instance 1 -property units
+./uic bacread -addr 127.0.0.1:47808 -type analog-input -instance 9
+# 读取失败: ... read address: analog-input:9.present-value: device error class 1 code 31
+```
+
+测试矩阵（当前覆盖）：
+
+| 层 | 用例 |
+|---|---|
+| `codec/bacnet` | BVLC/NPDU 长度语义、Forwarded-NPDU、标签头六种 LVT、application/context 差异、BOOLEAN 内联、最短字节数、REAL/DOUBLE 金帧、Read/Write 请求金帧、ComplexACK 两种形态、Error/Reject/Abort 解析、参数往返、别名与编号解析 |
+| `driver/bacnet` | 元数据与能力声明、模拟量/字符串/枚举读、类型宽松与严格、未知对象/属性、数组下标与越界、写 REAL/字符串/枚举/布尔、写只读对象、类型不匹配本地拒绝、超时、迟到应答丢弃、重发、ctx 取消、invoke 环绕、错误类映射 |
+| `sim/bacnet` | 真实 UDP 回环：默认对象表、数组下标、未知对象/属性、写权限、写类型收敛、分段拒绝、未知服务、垃圾报文静默丢弃、自增与停止、对象表排序 |
+
+> 跨驱动的读回确认：`runtime` 的 `confirm` 用**补齐类型后的请求值**与读回值比较
+> （`valuesMatch`），浮点按 float32/float64 的相对容差，整数与布尔/字符串严格相等。
+> 早期版本用原始 JSON 值比较，省略 `value.type` 时会把成功写入报成「读回不一致」。
+
 ### 3.11 计算点（`computed`）
 
 这是全项目**唯一没有物理链路**的驱动：点位不从任何设备读取，而是由其他点位的值
@@ -1814,6 +2090,7 @@ type OpError struct {
 | `mc`（MC 3E） | supported | supported | unsupported | unsupported | unsupported | supported | supported |
 | `fins`（FINS/TCP） | supported | supported | unsupported | unsupported | unsupported | supported | supported |
 | `enip`（CIP 显式报文） | supported | supported | unsupported | unsupported | unsupported | supported | supported |
+| `bacnet`（BACnet/IP 对象属性） | supported | supported | unsupported | unsupported | unsupported | unsupported | unsupported |
 | `opcua` | supported | supported | supported ⁴ | unsupported | experimental | supported | unsupported |
 | `mqtt`（南向订阅） | supported | supported | supported ¹ | unsupported | unsupported | supported ² | unsupported |
 | `computed`（计算点） | supported | unsupported ³ | unsupported | unsupported | unsupported | supported | unsupported |

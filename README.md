@@ -319,6 +319,26 @@ EtherNet/IP 只做 **CIP 显式报文 + 符号标签**（Read/Write Tag），不
 实际类型为准；bytes 两阶段读（先学宽度再按区间重读）；一轮多条读走 Multiple Service
 Packet，设备不支持时自动退回逐条请求。
 
+BACnet/IP 对象属性（UDP 47808）：
+
+```bash
+./uic sim -protocol bacnet -listen 127.0.0.1:47808 &   # 内置 BACnet/IP 从站
+./uic -config examples/bacnet.json
+curl -s -H 'Authorization: Bearer dev-token-0123456789' localhost:8090/api/v1/points
+#   7 点：温度 42.5、对象名 "AI-1"、单位 62、设定值可写、二进制状态、
+#         标牌字符串可写、AV-3 每秒自增
+#   自检（不需要网关）：./uic bacread -addr 127.0.0.1:47808 -type analog-input -instance 1
+#   写设定值：./uic bacread -addr 127.0.0.1:47808 -type analog-value -instance 2 -write 55.5
+```
+
+BACnet/IP 只做 ReadProperty（0x0C）/ WriteProperty（0x0F），不做 Who-Is 广播发现、
+不做 COV 订阅、不做批量读、不做分段。点位用 `kind=object` 寻址：`objectType`（名字或编号）、
+`instance`、`property`（`present-value` / `object-name` / `units` 等）、`propIndex`
+（数组下标，0 表示不带）。`present-value` 的编码由对象语义决定（模拟量 REAL、
+二进制 ENUMERATED、多状态 UNSIGNED、字符串 CHARACTER STRING），不是由平台 `dataType`
+决定；可写性同样由对象决定——`analog-input` 的 `present-value` 永远只读。
+UDP 无连接，驱动用 8 位 invoke ID 配对，并把整条会话串行化，迟到应答直接丢弃。
+
 FINS 只做 FINS/TCP；FINS/UDP 与 Host Link 配置期即拒。建链先做节点号协商（命令 0
 → 1），`device.unitId>0` 覆盖目标节点、0 用协商值。`offset` 是**字地址**、`bit` 是
 字内位号（`CIO0.3` → `offset=0, bit=3`）；字访问 2 字节/字，位访问**1 字节/位**；
@@ -345,7 +365,7 @@ go test -race -count=1 ./...
 
 | 路径 | 内容 |
 |---|---|
-| `cmd/uic/` | 单入口：`run` / `sim`（Modbus / S7 / OPC UA / MQTT / MC / FINS / EtherNet-IP）/ `mbread` / `mcread` / `finsread` / `enipread` / `uaread` / `s7blocks` / `s7upload` / `instantiate` / `import` / `token` / `-check` / `version` |
+| `cmd/uic/` | 单入口：`run` / `sim`（Modbus / S7 / OPC UA / MQTT / MC / FINS / EtherNet-IP / BACnet-IP）/ `mbread` / `mcread` / `finsread` / `enipread` / `bacread` / `uaread` / `s7blocks` / `s7upload` / `instantiate` / `import` / `token` / `-check` / `version` |
 | `internal/model` | 通道 / 设备 / 点位 / 地址 / 采样 / 质量码 |
 | `internal/driver` | 驱动契约（Codec / Transport / Driver）、错误分类、注册表、只读 `Lookup` 注入 |
 | `internal/calc` | 零依赖表达式引擎（编译期类型检查、短路求值、引用 `device:point`） |
@@ -358,6 +378,9 @@ go test -race -count=1 ./...
 | `internal/codec/enip` | EtherNet/IP 纯函数编解码（封装头 / CPF / SendRRData / CIP 请求应答 / 符号路径 / Read/Write Tag / 多服务合包 / 类型表） |
 | `internal/driver/enip` | CIP 显式报文主站（标签读写、数组 offset、STRING、bytes 两阶段读、位 RMW、多服务合包与自动退回） |
 | `internal/sim/enip` | EtherNet/IP 内置从站（RegisterSession / Read/Write Tag / 多服务合包 / 默认标签表） |
+| `internal/codec/bacnet` | BACnet/IP 纯函数编解码（BVLC / NPDU / APDU / 标签 / 对象属性名表 / Read-WriteProperty） |
+| `internal/driver/bacnet` | BACnet/IP 主站（对象属性读写、UDP invoke ID 配对、按对象语义选写标签、错误类映射） |
+| `internal/sim/bacnet` | BACnet/IP 内置从站（对象表 / 属性读写 / 数组下标 / 写权限 / 类型收敛） |
 | `internal/template` | 设备模板：参数校验 / 字符串字面量替换 / 实例化后完整校验 |
 | `internal/pointtable` | 点表 CSV：列别名 / 地址表达式 / 按协议推导宽度 / 合并动作 |
 | `internal/alarm` | 报警引擎：五态机 / 滞回 / 延时 / 表达式规则 / 确认 / 订阅 |

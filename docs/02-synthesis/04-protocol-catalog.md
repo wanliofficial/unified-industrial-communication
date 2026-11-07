@@ -287,10 +287,10 @@ IEC 61850、DNP3、SECS/GEM、KNX、CoAP、Mewtocol、Host Link、MTConnect、IE
 
 | 类别 | 例子 | 获取方式 | 法律注意 |
 |---|---|---|---|
-| 公开标准 | Modbus（Modbus.org 免费）、BACnet（ASHRAE 收费）、DNP3（IEEE 收费） | 官方渠道 | 标准文本有版权，**不可复制到代码注释或文档** |
+| 公开标准 | Modbus、BACnet、DNP3 | 官方渠道（部分文本需付费获取） | 标准文本有版权，**不可复制到代码注释或文档** |
 | 事实标准 | S7comm、MC、FINS、Host Link | 逆向/社区文档/厂商手册 | 无官方公开规范；实现本身通常不侵权，但**不可复制他人代码** |
 | 厂商 SDK | FOCAS、部分机器人协议 | 需签 NDA | 分发受限于 SDK 条款 |
-| 开放规范 | OPC UA（公开）、MQTT（OASIS）、Sparkplug（Eclipse） | 官网 | 注意专利声明（OPC UA 有 RAND 承诺） |
+| 开放规范 | OPC UA（公开）、MQTT、Sparkplug | 官网 | 注意各规范的专利声明 |
 | 国标/行标 | DL/T 645、CJ/T 188、GB/T 28181 | 标准出版社 | 标准文本有版权 |
 
 **三条纪律**：
