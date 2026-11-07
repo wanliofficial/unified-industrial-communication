@@ -209,14 +209,20 @@
 ```json
 {
   "results": [
-    { "point": "setpoint", "ok": true,  "quality": "good",     "appliedAt": "2026-11-05T09:15:20.004Z", "error": null },
-    { "point": "enable",   "ok": false, "quality": "disabled", "appliedAt": "2026-11-05T09:15:20.004Z", "error": "point is read-only" }
+    { "point": "setpoint", "ok": true,  "quality": "good",      "appliedAt": "2026-11-05T09:15:20.004Z", "error": null, "verified": true },
+    { "point": "enable",   "ok": false, "quality": "disabled",  "appliedAt": "2026-11-05T09:15:20.004Z", "error": "point is read-only", "verified": null }
   ]
 }
 ```
 
 - 只读点位、类型不匹配、越界在网关层就被拒，不会发到设备上；
 - 写请求在通道内插队到读之前（现场按「立即执行」比「先来后到」更符合直觉）；
+- `confirm: true` 会在同一个通道租约内**立即回读**受影响点位并比较：
+  - 读回一致 → `ok: true`、`verified: true`；
+  - 读回不一致 → `ok: false`、`quality: "uncertain"`、`error` 以 `verify.mismatch` 开头；
+  - 回读本身失败 → `ok: false`，质量码沿用超时/通信错误，`error` 以 `verify.readback_failed` 开头。
+  写入已经下发，所以「不一致」不是「被拒绝」，现场处置是查设备是否保持该值，而不是查配置；
+- 未传 `confirm`（或显式 `false`）不回读：命令寄存器常常「写一下就复位」，强制回读只会制造假故障；
 - 单点与批量都接受 `X-Idempotency-Key`：5 分钟内的相同 key 直接返回首次结果并带
   `X-Idempotent-Replay: true`，客户端超时重试不会写两次。首次响应带
   `X-Idempotent-Replay: false`，两种状态都明确给出，避免调用方靠猜；

@@ -25,6 +25,25 @@ public sealed record DataValue
     public double AsNumber() => Num ?? (Bool == true ? 1d : 0d);
     public bool AsBool() => Bool ?? (Num.HasValue && Math.Abs(Num.Value) > double.Epsilon);
 
+    /// <summary>
+    /// 写后回读的比较口径。浮点按相对误差而不是精确相等：写 1500.0 读回 1499.9999
+    /// 不应判为失败；类型不同则一律不等，避免把 uint16 的 1 当成 bool true。
+    /// </summary>
+    public bool Matches(DataValue other, double tolerance = 1e-6)
+    {
+        if (Type != other.Type) return false;
+        if (Bool.HasValue || other.Bool.HasValue) return Bool == other.Bool;
+
+        if (Num.HasValue && other.Num.HasValue)
+        {
+            var scale = Math.Max(1, Math.Max(Math.Abs(Num.Value), Math.Abs(other.Num.Value)));
+            return Math.Abs(Num.Value - other.Num.Value) <= tolerance * scale;
+        }
+
+        return string.Equals(Text, other.Text, StringComparison.Ordinal);
+    }
+
+
     public override string ToString() => Type switch
     {
         DataType.Bool => Bool?.ToString() ?? "null",

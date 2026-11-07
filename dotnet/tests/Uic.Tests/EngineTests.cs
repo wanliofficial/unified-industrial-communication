@@ -24,6 +24,162 @@ internal static class EngineTests
         tests.Add(new TestCase("engine/deadline_is_retried_as_timeout", DeadlineIsRetriedAsTimeout));
         tests.Add(new TestCase("engine/permanent_failure_is_not_retried", PermanentFailureIsNotRetried));
         tests.Add(new TestCase("engine/retries_are_finite", RetriesAreFinite));
+        tests.Add(new TestCase("engine/write_confirmation_reads_back", WriteConfirmationReadsBack));
+        tests.Add(new TestCase("engine/write_confirmation_detects_mismatch", WriteConfirmationDetectsMismatch));
+        tests.Add(new TestCase("engine/write_without_confirmation_skips_readback", WriteWithoutConfirmationSkipsReadback));
+    }
+
+    /// <summary>
+    /// 可回读的假驱动。<c>LieOnRead</c> 模拟「写命令被接受但设备没保持住」——
+    /// 这恰恰是写后校验要抓的场景。
+    /// </summary>
+    private sealed class ConfirmDriver : IDriver
+    {
+        private readonly Dictionary<string, DataValue> _stored = new(StringComparer.Ordinal);
+
+        public int Reads;
+        public int Writes;
+        public bool LieOnRead;
+
+        public DriverMeta Meta { get; } = new()
+        {
+            Id = "confirm",
+            Name = "回读驱动",
+            Transports = new[] { "none" },
+        };
+
+        public IConn Open(OpenContext context) => new Conn(this);
+
+        private sealed class Conn : IConn
+        {
+            private readonly ConfirmDriver _owner;
+
+            public Conn(ConfirmDriver owner) => _owner = owner;
+
+            public Task ProbeAsync(CancellationToken ct) => Task.CompletedTask;
+
+            public Task<IReadOnlyList<RawSample>> ReadAsync(
+                IReadOnlyList<ReadSpan> spans, CancellationToken ct)
+            {
+                Interlocked.Increment(ref _owner.Reads);
+
+                var samples = spans.SelectMany(s => s.Points).Select(p =>
+                {
+                    if (_owner.LieOnRead)
+                    {
+                        return new RawSample(p.Id, DataValue.Number(p.DataType, 999), Quality.Good, null);
+                    }
+
+                    var value = _owner._stored.TryGetValue(p.Id, out var stored)
+                        ? stored
+                        : DataValue.Number(p.DataType, 1);
+
+                    return new RawSample(p.Id, value, Quality.Good, null);
+                }).ToArray();
+
+                return Task.FromResult<IReadOnlyList<RawSample>>(samples);
+            }
+
+            public Task<IReadOnlyList<WriteResult>> WriteAsync(
+                IReadOnlyList<WriteCommand> commands, CancellationToken ct)
+            {
+                Interlocked.Increment(ref _owner.Writes);
+
+                foreach (var command in commands)
+                {
+                    _owner._stored[command.Point.Id] = command.Value;
+                }
+
+                return Task.FromResult<IReadOnlyList<WriteResult>>(
+                    commands.Select(c => new WriteResult(c.Point.Id, true, Quality.Good, DateTimeOffset.UtcNow))
+                        .ToArray());
+            }
+
+            public ValueTask DisposeAsync() => ValueTask.CompletedTask;
+        }
+    }
+
+    private static Task WriteConfirmationReadsBack(TestContext t)
+    {
+        return RunAsync(async () =>
+        {
+            var driver = new ConfirmDriver();
+            var actor = new DeviceActor(
+                BuildDevice(), BuildChannel(), driver, new PointCache(), new ChannelGate(1),
+                NullLogger.Instance, new SchedulerOptions { Tick = TimeSpan.FromMilliseconds(5) });
+
+            var results = await actor.WriteAsync(
+                new[]
+                {
+                    new WriteCommand(actor.Spans[0].Points[0], DataValue.Number(DataType.UInt16, 7),
+                        Confirm: true),
+                },
+                t.Ct);
+
+            t.Equal(1, results.Count, "one result");
+            t.Ok(results[0].Ok, "the write succeeds");
+            t.Equal(true, results[0].Verified, "confirm=true triggers a readback");
+            t.Equal(1, driver.Writes, "the driver wrote once");
+            t.Equal(1, driver.Reads, "the driver was read back exactly once");
+            t.Equal(null, results[0].Error, "a matching readback has no error");
+
+            await actor.DisposeAsync();
+        });
+    }
+
+    private static Task WriteConfirmationDetectsMismatch(TestContext t)
+    {
+        return RunAsync(async () =>
+        {
+            var driver = new ConfirmDriver { LieOnRead = true };
+            var actor = new DeviceActor(
+                BuildDevice(), BuildChannel(), driver, new PointCache(), new ChannelGate(1),
+                NullLogger.Instance, new SchedulerOptions { Tick = TimeSpan.FromMilliseconds(5) });
+
+            var results = await actor.WriteAsync(
+                new[]
+                {
+                    new WriteCommand(actor.Spans[0].Points[0], DataValue.Number(DataType.UInt16, 7),
+                        Confirm: true),
+                },
+                t.Ct);
+
+            t.Equal(1, results.Count, "one result");
+            t.Ok(!results[0].Ok, "a mismatch is not reported as success");
+            t.Equal(false, results[0].Verified, "the mismatch is explicit");
+            t.Equal(Quality.Uncertain, results[0].Quality,
+                "the command was applied but could not be confirmed");
+            t.Contains(results[0].Error ?? string.Empty, "verify.mismatch",
+                "the error says the readback did not match");
+            t.Contains(results[0].Error ?? string.Empty, "wrote 7", "the expected value is in the error");
+            t.Contains(results[0].Error ?? string.Empty, "read 999", "the actual value is in the error");
+
+            await actor.DisposeAsync();
+        });
+    }
+
+    private static Task WriteWithoutConfirmationSkipsReadback(TestContext t)
+    {
+        return RunAsync(async () =>
+        {
+            var driver = new ConfirmDriver();
+            var actor = new DeviceActor(
+                BuildDevice(), BuildChannel(), driver, new PointCache(), new ChannelGate(1),
+                NullLogger.Instance, new SchedulerOptions { Tick = TimeSpan.FromMilliseconds(5) });
+
+            var results = await actor.WriteAsync(
+                new[]
+                {
+                    new WriteCommand(actor.Spans[0].Points[0], DataValue.Number(DataType.UInt16, 7)),
+                },
+                t.Ct);
+
+            t.Ok(results[0].Ok, "the write succeeds");
+            t.Equal(null, results[0].Verified, "without confirm there is no verification verdict");
+            t.Equal(0, driver.Reads, "the driver is not read back");
+
+            await actor.DisposeAsync();
+        });
     }
 
     /// <summary>一个「记住自己有没有被并发调用」的假驱动。</summary>

@@ -295,12 +295,29 @@ public static partial class RestApi
             if (!outcome.Ok)
             {
                 results.Add(new WriteResultDto(outcome.PointId, false,
-                    JsonEnum.ToWire(outcome.Quality), outcome.AppliedAt, outcome.Error));
+                    JsonEnum.ToWire(outcome.Quality), outcome.AppliedAt, outcome.Error, outcome.Verified));
                 continue;
             }
 
             if (matched.Item.Confirm)
             {
+                // 驱动已做写后回读：有结论就直接用，不再等下一轮采集。
+                if (outcome.Verified is true)
+                {
+                    results.Add(new WriteResultDto(
+                        outcome.PointId, true, "good", outcome.AppliedAt, null, true));
+                    continue;
+                }
+
+                if (outcome.Verified is false)
+                {
+                    results.Add(new WriteResultDto(
+                        outcome.PointId, false, JsonEnum.ToWire(outcome.Quality), outcome.AppliedAt,
+                        outcome.Error, false));
+                    continue;
+                }
+
+                // 兼容没有实现回读的驱动：退回「等缓存出现期望值」的旧路径。
                 var confirmed = await ConfirmAsync(ctx, deviceId, matched.Point, matched.Item.Value, ct)
                     .ConfigureAwait(false);
 
@@ -309,7 +326,8 @@ public static partial class RestApi
                     confirmed,
                     confirmed ? "good" : "uncertain",
                     outcome.AppliedAt,
-                    confirmed ? null : "confirm: readback does not match requested value"));
+                    confirmed ? null : "confirm: readback does not match requested value",
+                    confirmed));
                 continue;
             }
 
@@ -347,18 +365,7 @@ public static partial class RestApi
         return false;
     }
 
-    private static bool ValuesEqual(DataValue a, DataValue b)
-    {
-        if (a.Type != b.Type) return false;
-        if (a.Bool.HasValue || b.Bool.HasValue) return a.Bool == b.Bool;
-        if (a.Num.HasValue && b.Num.HasValue)
-        {
-            // 浮点按相对误差比较：写 1500.0 读回 1499.9999 不应判为失败。
-            var scale = Math.Max(1, Math.Max(Math.Abs(a.Num.Value), Math.Abs(b.Num.Value)));
-            return Math.Abs(a.Num.Value - b.Num.Value) <= 1e-6 * scale;
-        }
-        return string.Equals(a.Text, b.Text, StringComparison.Ordinal);
-    }
+    private static bool ValuesEqual(DataValue a, DataValue b) => a.Matches(b);
 
     // ------------------------------------------------------------------
     // 视图映射

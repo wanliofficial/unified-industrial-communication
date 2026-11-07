@@ -515,7 +515,111 @@ public sealed class DeviceActor : IAsyncDisposable
         using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
         timeout.CancelAfter(_device.Timeout ?? _channel.Timeout);
 
-        return await conn.WriteAsync(commands, timeout.Token).ConfigureAwait(false);
+        var results = await conn.WriteAsync(commands, timeout.Token).ConfigureAwait(false);
+
+        // confirm=true 才回读：写命令本身已经成功，回读是额外的读预算；
+        // 对「闪一下就复位」的命令寄存器强行回读只会制造假故障，
+        // 所以由调用方按点位决定，而不是全局默认打开。
+        var confirmed = commands.Where(c => c.Confirm).ToArray();
+        if (confirmed.Length == 0) return results;
+
+        return await VerifyWriteAsync(conn, confirmed, results, ct, timeout.Token).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// 写后回读。放在同一个通道租约里完成，回读与写入之间不会插进一轮采集，
+    /// 否则读到的是采集循环覆盖后的值，校验就失去了意义。
+    /// </summary>
+    private async Task<IReadOnlyList<WriteResult>> VerifyWriteAsync(
+        IConn conn,
+        IReadOnlyList<WriteCommand> confirmed,
+        IReadOnlyList<WriteResult> results,
+        CancellationToken ct,
+        CancellationToken token)
+    {
+        // 同一个点位在一次批量里出现多次时，以最后一次写入的值为准。
+        var expected = new Dictionary<string, DataValue>(StringComparer.Ordinal);
+        var refs = new List<PointRef>();
+        foreach (var command in confirmed)
+        {
+            expected[command.Point.Id] = command.Value;
+            if (!refs.Any(p => string.Equals(p.Id, command.Point.Id, StringComparison.Ordinal)))
+                refs.Add(command.Point);
+        }
+
+        var verdicts = new Dictionary<string, (bool Ok, Quality Quality, string? Error)>(StringComparer.Ordinal);
+
+        try
+        {
+            var samples = await conn.ReadAsync(ReadPlanner.Plan(refs), token).ConfigureAwait(false);
+            var byId = samples
+                .Where(s => s.Value is not null)
+                .GroupBy(s => s.PointId, StringComparer.Ordinal)
+                .ToDictionary(g => g.Key, g => g.Last(), StringComparer.Ordinal);
+
+            foreach (var point in refs)
+            {
+                var wanted = expected[point.Id];
+
+                if (!byId.TryGetValue(point.Id, out var sample))
+                {
+                    verdicts[point.Id] = (false, Quality.Uncertain,
+                        "verify.no_value: device returned no value");
+                    continue;
+                }
+
+                if (sample.Quality != Quality.Good)
+                {
+                    verdicts[point.Id] = (false, sample.Quality,
+                        $"verify.quality: readback quality is {sample.Quality.ToString().ToLowerInvariant()}");
+                    continue;
+                }
+
+                if (!sample.Value!.Matches(wanted))
+                {
+                    verdicts[point.Id] = (false, Quality.Uncertain,
+                        $"verify.mismatch: wrote {wanted}, read {sample.Value}");
+                    continue;
+                }
+
+                verdicts[point.Id] = (true, Quality.Good, null);
+            }
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            // 写入已经下发，回读失败只能说明「不确定」，不能谎报成写入失败：
+            // 现场处置完全不同——前者查回读链路，后者查写命令。
+            var quality = ex is DriverException driver ? QualityMap.From(driver.Kind) : Quality.Uncertain;
+            foreach (var point in refs)
+            {
+                verdicts[point.Id] = (false, quality, $"verify.readback_failed: {ex.Message}");
+            }
+        }
+
+        var output = new List<WriteResult>(results.Count);
+        foreach (var result in results)
+        {
+            // 写都没成功就没有「回读校验」可言，保留驱动的原始裁决。
+            if (!result.Ok || !verdicts.TryGetValue(result.PointId, out var verdict))
+            {
+                output.Add(result);
+                continue;
+            }
+
+            output.Add(result with
+            {
+                Ok = verdict.Ok,
+                Quality = verdict.Ok ? Quality.Good : verdict.Quality,
+                Error = verdict.Error,
+                Verified = verdict.Ok,
+            });
+        }
+
+        return output;
     }
 
     public async Task<bool> SelfTestAsync(CancellationToken ct)

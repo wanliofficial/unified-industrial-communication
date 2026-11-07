@@ -95,7 +95,13 @@ public sealed record WriteItemDto(string Point, DataValue Value, bool Confirm = 
 
 public sealed record WriteBatchDto(IReadOnlyList<WriteItemDto> Writes);
 
-public sealed record WriteResultDto(string Point, bool Ok, string Quality, DateTimeOffset AppliedAt, string? Error = null);
+public sealed record WriteResultDto(
+    string Point,
+    bool Ok,
+    string Quality,
+    DateTimeOffset AppliedAt,
+    string? Error = null,
+    bool? Verified = null);
 
 public sealed record WriteResponseDto(IReadOnlyList<WriteResultDto> Results);
 

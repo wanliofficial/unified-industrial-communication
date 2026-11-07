@@ -21,7 +21,8 @@ public sealed record WriteResult(
     bool Ok,
     Quality Quality,
     DateTimeOffset AppliedAt,
-    string? Error = null);
+    string? Error = null,
+    bool? Verified = null);
 
 /// <summary>设备运行统计。configuredState 与 runtimeState 必须分开返回。</summary>
 public sealed record DeviceStats(

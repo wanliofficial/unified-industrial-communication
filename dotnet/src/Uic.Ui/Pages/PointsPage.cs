@@ -265,7 +265,9 @@ public sealed class PointsPage : IPage, IDisposable
 
             if (result is { Ok: true })
             {
-                _editResult.Text = $"已写入 · {UiFormat.Time(result.AppliedAt)}";
+                _editResult.Text = result.Verified == true
+                    ? $"已写入并回读校验 · {UiFormat.Time(result.AppliedAt)}"
+                    : $"已写入 · {UiFormat.Time(result.AppliedAt)}";
                 _editResult.Foreground = new SolidColorBrush(Ui.Good);
             }
             else if (result?.Quality == "uncertain")

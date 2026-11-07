@@ -359,7 +359,7 @@ public sealed record DataValueDto(string Type, double? Num, bool? Bool, string? 
 public sealed record WriteResponseDto(WriteResultDto[] Results);
 
 public sealed record WriteResultDto(string Point, bool Ok, string Quality, DateTimeOffset AppliedAt,
-    string? Error);
+    string? Error, bool? Verified = null);
 
 public sealed record LogEntryDto(long Seq, DateTimeOffset At, string Level, string Category,
     string Message, string? Device, string? Exception);
