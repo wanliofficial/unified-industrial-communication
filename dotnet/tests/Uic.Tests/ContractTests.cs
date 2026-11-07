@@ -37,6 +37,7 @@ internal static class ContractTests
         tests.Add(new TestCase("contract/health_and_version_are_public", HealthAndVersionArePublic));
         tests.Add(new TestCase("contract/resource_pressure_degrades_health", ResourcePressureDegradesHealth));
         tests.Add(new TestCase("contract/apply_keeps_redacted_secrets", ApplyKeepsRedactedSecrets));
+        tests.Add(new TestCase("contract/history_query_reads_journal", HistoryQueryReadsJournal));
         tests.Add(new TestCase("contract/api_requires_bearer_token", ApiRequiresBearerToken));
         tests.Add(new TestCase("contract/devices_and_points_are_listed", DevicesAndPointsAreListed));
         tests.Add(new TestCase("contract/drivers_expose_capability_states", DriversExposeCapabilityStates));
@@ -364,6 +365,89 @@ internal static class ContractTests
                 "the token survives the redacted round-trip");
             t.Equal("改名后的设备", current.Devices[0].Name, "the intended edit is applied");
             t.Equal(devices.Length, current.Devices.Count, "no device was added or dropped");
+        });
+    }
+
+    /// <summary>
+    /// 历史查询走真实 journal 文件：采集 → Outbox → journal sink → REST。
+    /// 这条链最容易在「文件路径/刷新间隔」上错位，所以断言的是实际落盘后的结果。
+    /// </summary>
+    private static Task HistoryQueryReadsJournal(TestContext t)
+    {
+        return RunAsync(async () =>
+        {
+            // 固定值不会产生新样本（缓存只在变化时发布），历史用例需要一个会变的波形。
+            var source = BuildConfig();
+            source.Devices[0].Labels["mode"] = "sine";
+
+            var config = WithStorage(source, new StorageOptions
+            {
+                Journal = true,
+                OutboxFlushInterval = TimeSpan.FromMilliseconds(50),
+            });
+
+            await using var host = await Host.StartAsync(t, () => config);
+
+            // 先等到至少 3 条样本，才能验证 limit 与 cursor 真的分页。
+            JsonElement firstPage = default;
+            var deadline = DateTimeOffset.UtcNow.AddSeconds(15);
+
+            while (DateTimeOffset.UtcNow < deadline)
+            {
+                using var poll = await ReadJsonAsync(t, await host.Client.SendAsync(
+                    Get("/api/v1/history?device=v1&point=temp&limit=2"), t.Ct));
+
+                if (poll.RootElement.GetProperty("total").GetInt32() >= 3)
+                {
+                    firstPage = poll.RootElement.Clone();
+                    break;
+                }
+
+                await Task.Delay(100, t.Ct);
+            }
+
+            if (firstPage.ValueKind != JsonValueKind.Object)
+                t.Fail("history stayed empty: journal writing or the query path is broken");
+
+            var items = firstPage.GetProperty("items").EnumerateArray().ToArray();
+            t.Equal(2, items.Length, "limit caps the page size");
+            t.Equal("v1", items[0].GetProperty("device").GetString(), "device filter is applied");
+            t.Equal("temp", items[0].GetProperty("point").GetString(), "point filter is applied");
+            t.Equal("good", items[0].GetProperty("quality").GetString(), "quality survives the journal round-trip");
+            t.Equal("float64", items[0].GetProperty("value").GetProperty("type").GetString(),
+                "the value wire shape is unchanged");
+
+            var cursor = firstPage.GetProperty("nextCursor").GetString();
+            t.Ok(!string.IsNullOrWhiteSpace(cursor), "more samples produce a next cursor");
+
+            using var second = await ReadJsonAsync(t, await host.Client.SendAsync(
+                Get($"/api/v1/history?device=v1&point=temp&limit=2&cursor={Uri.EscapeDataString(cursor!)}"),
+                t.Ct));
+
+            var secondItems = second.RootElement.GetProperty("items").EnumerateArray().ToArray();
+            t.Ok(secondItems.Length > 0, "the cursor returns the next page");
+            t.Ok(secondItems[0].GetProperty("seq").GetUInt64() !=
+                 items[^1].GetProperty("seq").GetUInt64(),
+                "the second page does not repeat the first page");
+
+            // 反序时间范围是调用方错误，必须明确报错，而不是悄悄返回空。
+            var bad = await host.Client.SendAsync(Get(
+                "/api/v1/history?from=2026-11-07T10:00:00Z&to=2026-11-07T09:00:00Z"), t.Ct);
+
+            t.Equal(HttpStatusCode.BadRequest, bad.StatusCode, "a reversed range is rejected");
+
+            using var error = await ReadJsonAsync(t, bad);
+            t.Equal("request.invalid_range",
+                error.RootElement.GetProperty("error").GetProperty("code").GetString(),
+                "the error code names the range problem");
+
+            var badTime = await host.Client.SendAsync(Get("/api/v1/history?from=not-a-time"), t.Ct);
+            t.Equal(HttpStatusCode.BadRequest, badTime.StatusCode, "an unparsable timestamp is rejected");
+
+            using var badTimeError = await ReadJsonAsync(t, badTime);
+            t.Equal("request.invalid_parameter",
+                badTimeError.RootElement.GetProperty("error").GetProperty("code").GetString(),
+                "the error code names the malformed parameter");
         });
     }
 

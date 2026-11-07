@@ -30,6 +30,7 @@ ScheduleTests.Register(tests);
 PlannerTests.Register(tests);
 OutboxTests.Register(tests);
 ConfigStoreTests.Register(tests);
+HistoryTests.Register(tests);
 JsonTests.Register(tests);
 ObsTests.Register(tests);
 LoopbackTests.Register(tests);

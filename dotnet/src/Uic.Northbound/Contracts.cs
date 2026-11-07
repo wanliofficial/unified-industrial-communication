@@ -47,7 +47,8 @@ public sealed record NorthboundContext(
     string Site,
     string GatewayVersion,
     DateTimeOffset StartedAt,
-    IResourceStatusSource? Resources = null);
+    IResourceStatusSource? Resources = null,
+    JournalHistory? History = null);
 
 /// <summary>业务错误。统一由中间件渲染成契约里的 error 信封。</summary>
 public sealed class ApiException : Exception

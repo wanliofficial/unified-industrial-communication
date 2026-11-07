@@ -228,7 +228,8 @@ public sealed class GatewayRuntime : IGatewayControl, IAsyncDisposable
             _config.Site,
             _gatewayVersion,
             _startedAt,
-            _resources);
+            _resources,
+            new JournalHistory(_dataDir));
 
     // ------------------------------------------------------------------
     // IGatewayControl

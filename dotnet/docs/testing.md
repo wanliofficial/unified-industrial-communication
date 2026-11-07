@@ -16,7 +16,7 @@ dotnet run --project tests/Uic.Tests -- --stop-on-fail      # 首个失败即停
 正常输出：
 
 ```
-166 passed, 0 failed, 1 skipped · 52.2s
+173 passed, 0 failed, 1 skipped · 49.1s
 ```
 
 跳过的一条是 OPC UA 验收（要绑端口、生成证书，默认不跑）。
@@ -44,6 +44,7 @@ dotnet run --project tests/Uic.Tests -- --stop-on-fail      # 首个失败即停
 | `pipeline/*` | 10 | 缩放/偏移、整数取整、质量传播、三种死区模式 |
 | `cache/*` | 5 | 序号单调、只在变化时通知、按点位死区判定、移除设备、订阅者故障隔离 |
 | `planner/*` | 8 | 窗口合并、切分上限、区分离、非寄存器寻址 |
+| `history/*` | 6 | journal 历史：时间/身份过滤、每桶降采样、重放去重、缺失文件、坏行跳过、跨读取缓冲区行 |
 | `outbox/*` | 8 | 位点推进、重启重放、批次、分区隔离、三重上限、半行容错 |
 | `config/*` | 15 | 内容寻址、回滚、启动优先级、非法文档、diff、旧配置迁移、复合时长、死区/量程规则、仓库示例可校验、24 类非法配置逐条定位、脱敏占位符还原 |
 | `json/*` | 9 | 时长、枚举、值形状、UTC、往返稳定、前向兼容 |
@@ -56,7 +57,7 @@ dotnet run --project tests/Uic.Tests -- --stop-on-fail      # 首个失败即停
 | `mqtt/*` | 17 | 测试内 broker：CONNECT/SUBSCRIBE 字段、QoS0/1、主题渲染、重连补发、命令去重与权限 |
 | `template/*` | 3 | 50 实例批量生成、参数类型/缺失/未知参数拒绝、未声明占位符拒绝 |
 | `csv/*` | 3 | 地址表达式（参考号/区域偏移/分列）、按 id 合并与冲突行号、死区模式与量程列 |
-| `contract/*` | 15 | 进程内真实 Kestrel 的 REST 契约（含驱动能力、模板、CSV、导入导出、单点幂等、资源降级联动、脱敏配置往返） |
+| `contract/*` | 16 | 进程内真实 Kestrel 的 REST 契约（含驱动能力、模板、CSV、导入导出、单点幂等、资源降级联动、脱敏配置往返、journal 历史查询） |
 | `opcua/*` | 1 | 标准 OPC UA 客户端：浏览、读、写、订阅 |
 
 ## 规范用例 T1–T18 的对应关系

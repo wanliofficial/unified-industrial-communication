@@ -299,7 +299,7 @@ RTU/ASCII 主站按 3.5 个字符时间做帧间静默（9600 bps 约 4 ms；>19
 | 字段 | 默认 | 说明 |
 |---|---|---|
 | `dataDir` | `./data` | 配置版本、队列、证书都在它下面 |
-| `journal` | `false` | 额外的本地 NDJSON 兜底通道 |
+| `journal` | `false` | 额外的本地 NDJSON 兜底通道，同时作为 `/api/v1/history` 的数据源 |
 | `outboxMaxRecords` | `100000` | 队列条数上限 |
 | `outboxMaxBytes` | `268435456` | 队列字节上限（256 MiB） |
 | `outboxTtl` | `24h` | 超过这个时长的记录直接丢弃 |

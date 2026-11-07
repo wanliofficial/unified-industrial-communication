@@ -11,7 +11,7 @@
 它们不是 §6.1「不做」清单里的项，属于真实缺口；逐协议现状、原因与补法见
 [protocol-status.md](protocol-status.md)。
 
-当前测试基线：**166 passed / 0 failed / 1 skipped**（跳过的是需要 `--opcua` 的 OPC UA 端到端用例）。
+当前测试基线：**173 passed / 0 failed / 1 skipped**（跳过的是需要 `--opcua` 的 OPC UA 端到端用例）。
 
 ## 1. 采集（FR-COL）
 
@@ -79,14 +79,14 @@
 
 | 编号 | 需求 | 状态 | 证据 / 说明 |
 |---|---|---|---|
-| FR-NOR-01 | REST：当前值、历史、配置、状态 | 部分实现 | 当前值/配置/状态已实现：`contract/devices_and_points_are_listed`；**历史查询未做**（见 FR-NOR-08） |
+| FR-NOR-01 | REST：当前值、历史、配置、状态 | 已实现 | 当前值/配置/状态：`contract/devices_and_points_are_listed`；历史：`GET /api/v1/history`，证据 `contract/history_query_reads_journal` |
 | FR-NOR-02 | REST：写入点位（需权限，三态结果） | 部分实现 | 三态结果与逐点裁决已实现：`contract/write_returns_per_point_results`；**权限是单一 Bearer Token**，没有 RBAC 细粒度 |
 | FR-NOR-03 | SSE 实时推送（按订阅表达式） | 已实现 | `contract/*` 起真实 Kestrel；按 `device.point` / 通配过滤、质量过滤、心跳、50 路并发上限 |
 | FR-NOR-04 | MQTT 上报（Topic 模板、QoS、保留） | 已实现 | `mqtt/sink_renders_topic_and_injects_schema_version`、`mqtt/publish_qos1_waits_for_puback`、`mqtt/reconnect_republishes_birth_and_state`；`scripts/mqtt-interop.sh` 用真实 broker 验一遍 |
 | FR-NOR-05 | OPC UA 服务端 | 已实现 | `opcua/anonymous_session_read_write_subscribe`（需 `--opcua`） |
 | FR-NOR-06 | Outbox 持久补发（至少一次） | 已实现 | `outbox/advances_only_on_success`、`outbox/replays_after_restart`、`outbox/tolerates_a_torn_last_line`；`mqtt/command_*` 验证重连后的位点 |
 | FR-NOR-07 | 北向多目标并行 | 已实现 | `Outbox` 按 sink 分区，一个分区失败不拖住其他分区：`outbox/partitions_are_independent` |
-| FR-NOR-08 | 历史查询（时间范围/降采样/分页） | 刻意没做（S） | 需要存储层与保留策略。补法：`journal` sink 已把样本落成本地 NDJSON，可先做「按时间扫文件 + 分页」，再换时序库 |
+| FR-NOR-08 | 历史查询（时间范围/降采样/分页） | 部分实现 | `GET /api/v1/history` 从 journal NDJSON 顺序扫描：`from`/`to` 时间范围、`interval` 每点位每桶保留最后一条、`limit`+`cursor` 分页；按 `(device, point, seq)` 去重并跳过坏行。证据 `history/filters_by_time_and_identity`、`history/downsamples_each_point_per_bucket`、`history/dedupes_redelivered_lines`、`history/skips_malformed_lines`、`history/handles_lines_across_read_buffer`、`contract/history_query_reads_journal`。**性能目标未达标**：线性扫描，本机 20 万行全量扫描约 1 s，推算 100 万行超过 2 s；下一步给 journal 写「时间→偏移」索引或换时序库，接口形状不变 |
 | FR-NOR-09 | Sparkplug B | 刻意没做（C） | Wave 2；可作为新的 MQTT sink 接入 |
 | FR-NOR-10 | 数据契约版本（`schemaVersion`） | 已实现 | REST/SSE/MQTT/OPC UA 输出都带 `schemaVersion`；`json/unknown_fields_are_tolerated` 保证前向兼容 |
 
