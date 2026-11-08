@@ -1241,3 +1241,94 @@ func TestValidateHistoryWindows(t *testing.T) {
 		}
 	})
 }
+
+// Sparkplug B 与 json 共用 MQTT 连接，但主题与载荷契约完全不同。这一组
+// 用例钉住「不能靠改名蒙混」的几处：自定义主题、retained、组/节点名里
+// 的分隔符都必须在启动前失败。
+func TestValidateSparkplugNorthbound(t *testing.T) {
+	registerDrivers(t)
+	cases := []struct {
+		name string
+		mod  func(*File)
+		want string
+	}{
+		{"custom topic", func(f *File) {
+			f.Northbound.MQTT = MQTT{
+				Enabled: true, Broker: "broker:1883", Format: MQTTFormatSparkplugB,
+				Topic: "uic/{device}/{point}", GroupID: "g", NodeID: "n",
+			}
+		}, "topic must be empty"},
+		{"retained", func(f *File) {
+			f.Northbound.MQTT = MQTT{
+				Enabled: true, Broker: "broker:1883", Format: MQTTFormatSparkplugB,
+				Retain: true, GroupID: "g", NodeID: "n",
+			}
+		}, "retain must be false"},
+		{"bad format", func(f *File) {
+			f.Northbound.MQTT = MQTT{
+				Enabled: true, Broker: "broker:1883", Format: "sparkplug-c",
+			}
+		}, "only"},
+		{"group separator", func(f *File) {
+			f.Northbound.MQTT = MQTT{
+				Enabled: true, Broker: "broker:1883", Format: MQTTFormatSparkplugB,
+				GroupID: "a/b", NodeID: "n",
+			}
+		}, "must not contain"},
+		{"group empty", func(f *File) {
+			// Normalize 会给默认值，所以绕过它直接调用 validateNorthbound。
+			f.Northbound.MQTT = MQTT{
+				Enabled: true, Broker: "broker:1883", Format: MQTTFormatSparkplugB,
+				GroupID: "", NodeID: "n",
+			}
+		}, "groupId"},
+		{"node wildcard", func(f *File) {
+			f.Northbound.MQTT = MQTT{
+				Enabled: true, Broker: "broker:1883", Format: MQTTFormatSparkplugB,
+				GroupID: "g", NodeID: "n+1",
+			}
+		}, "must not contain"},
+	}
+	for _, c := range cases {
+		f := baseFile()
+		c.mod(f)
+		var err error
+		if c.name == "group empty" {
+			err = f.validateNorthbound()
+		} else {
+			err = f.Validate()
+		}
+		if err == nil {
+			t.Fatalf("%s: expected error", c.name)
+		}
+		if !strings.Contains(err.Error(), c.want) {
+			t.Fatalf("%s: err = %v, want mention of %q", c.name, err, c.want)
+		}
+	}
+}
+
+func TestSparkplugDefaults(t *testing.T) {
+	registerDrivers(t)
+	f := baseFile()
+	f.Site = "plant-a"
+	f.Northbound.MQTT = MQTT{Enabled: true, Broker: "broker:1883", Format: MQTTFormatSparkplugB}
+	if err := f.Validate(); err != nil {
+		t.Fatalf("validate: %v", err)
+	}
+	if f.Northbound.MQTT.Topic != "" {
+		t.Fatalf("sparkplug must not gain a json topic: %q", f.Northbound.MQTT.Topic)
+	}
+	if f.Northbound.MQTT.GroupID != "plant-a" || f.Northbound.MQTT.NodeID != "uic-plant-a" {
+		t.Fatalf("defaults = %+v", f.Northbound.MQTT)
+	}
+
+	// json 仍然是默认格式，并且继续拿默认主题。
+	g := baseFile()
+	g.Northbound.MQTT = MQTT{Enabled: true, Broker: "broker:1883"}
+	if err := g.Validate(); err != nil {
+		t.Fatalf("json validate: %v", err)
+	}
+	if g.Northbound.MQTT.Format != MQTTFormatJSON || g.Northbound.MQTT.Topic == "" {
+		t.Fatalf("json defaults = %+v", g.Northbound.MQTT)
+	}
+}

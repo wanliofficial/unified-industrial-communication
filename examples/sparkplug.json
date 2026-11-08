@@ -1,0 +1,101 @@
+{
+  "schemaVersion": 1,
+  "site": "sparkplug-lab",
+  "server": {
+    "listen": "127.0.0.1:8097",
+    "token": "dev-token-0123456789"
+  },
+  "storage": {
+    "dir": "./data-sparkplug",
+    "journal": false,
+    "outboxMaxRecords": 20000,
+    "outboxTtl": "1h"
+  },
+  "logging": {
+    "level": "info"
+  },
+  "northbound": {
+    "mqtt": {
+      "enabled": true,
+      "format": "sparkplug-b",
+      "broker": "tcp://127.0.0.1:18832",
+      "clientId": "uic-sparkplug-lab",
+      "groupId": "plant-a",
+      "nodeId": "gw-line1",
+      "qos": 1,
+      "retain": false
+    }
+  },
+  "channels": [
+    {
+      "id": "ch-virtual",
+      "protocol": "virtual",
+      "transport": {
+        "kind": "memory"
+      },
+      "concurrency": 4,
+      "timeout": "2s"
+    }
+  ],
+  "devices": [
+    {
+      "id": "line-a",
+      "name": "产线 A（正弦波形）",
+      "channel": "ch-virtual",
+      "interval": "1s",
+      "timeout": "2s",
+      "enabled": true,
+      "points": [
+        {
+          "id": "temperature",
+          "name": "温度",
+          "address": { "kind": "register", "area": "holding", "offset": 0, "length": 2, "bit": -1 },
+          "dataType": "float32",
+          "unit": "℃",
+          "deadband": 0.1,
+          "enabled": true
+        },
+        {
+          "id": "pressure",
+          "name": "压力",
+          "address": { "kind": "register", "area": "holding", "offset": 2, "length": 4, "bit": -1 },
+          "dataType": "float64",
+          "unit": "kPa",
+          "deadband": 0.1,
+          "enabled": true
+        }
+      ],
+      "labels": {
+        "mode": "sine"
+      }
+    },
+    {
+      "id": "line-b",
+      "name": "产线 B（阶跃/常量）",
+      "channel": "ch-virtual",
+      "interval": "2s",
+      "timeout": "2s",
+      "enabled": true,
+      "points": [
+        {
+          "id": "counter",
+          "name": "产量",
+          "address": { "kind": "register", "area": "holding", "offset": 0, "length": 4, "bit": -1 },
+          "dataType": "uint32",
+          "deadband": 0,
+          "enabled": true
+        },
+        {
+          "id": "running",
+          "name": "运行",
+          "address": { "kind": "register", "area": "holding", "offset": 4, "length": 1, "bit": 0 },
+          "dataType": "bool",
+          "enabled": true
+        }
+      ],
+      "labels": {
+        "mode": "const"
+      }
+    }
+  ]
+}

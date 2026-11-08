@@ -243,8 +243,9 @@ MC 3E、FINS、EtherNet/IP + CIP、BACnet/IP、IEC 104、DL/T 645、CJ/T 188、A
 
 > 截至当前实现：MC 3E、FINS、EtherNet/IP + CIP、BACnet/IP、IEC 104、DL/T 645、
 > CJ/T 188、SNMP v1/v2c、ADS/AMS 已落地（各含编解码、主站、内置从站/服务端与自检 CLI）；
-> Sparkplug B 待落地，OPC DA 桥接归入「不做/独立 Windows 桥接进程」（需要 DCOM/COM，
-> 零依赖 Go 不可实现）。645 与 188 都是「表计语义寻址 + 压缩 BCD」，但帧层与字段模型不同：
+> Sparkplug B 作为 MQTT 北向的第二种载荷格式落地（编解码 + 生命周期状态机 + 集成测试）；
+> OPC DA 桥接归入「不做/独立 Windows 桥接进程」（需要 DCOM/COM，零依赖 Go 不可实现）。
+> 645 与 188 都是「表计语义寻址 + 压缩 BCD」，但帧层与字段模型不同：
 > 188 只有一个 `0x68`、数据域不加 `0x33`、地址 7 字节且带仪表类型 `T`，一个 DI 是
 > 一组字段（901F 在水表与热量表上布局不同）。点表因此从 `WidthProtocol` 进一步引入
 > `DIBits`/`DIField`：DI 位数随协议变化，字段偏移只在 188 上允许非 0。
@@ -259,6 +260,12 @@ MC 3E、FINS、EtherNet/IP + CIP、BACnet/IP、IEC 104、DL/T 645、CJ/T 188、A
 > 符号表上传/浏览、跨 AMS 路由发现、多句柄合并读写都不做——它们各自是另一套状态机，
 > 半成品比不做更难排查。TCP 48898 与 AMS NetId/端口是两层，配错时症状完全不同，
 > 因此 `Open` 立即做 `ReadDeviceInfo` 握手，把错误提前到启动期。
+>
+> Sparkplug B 补的是「北向语义」而不是又一个南向协议：它把 MQTT 从「一条采样一条
+> 消息」升级成带生命周期与序号的节点模型。值映射与 JSON 格式共用同一份 Sample 契约，
+> 但 BIRTH/DEATH、序号回绕、bdSeq 与重连重发都要单独处理；因此编解码与状态机拆成
+> 两个包，前者可以脱网做金帧测试，后者可以脱 Broker 做序号测试。DataSet、模板、
+> 别名、报警出口都不做——它们各自是另一套状态机，半成品比不做更难排查。
 
 **Wave 2 的验收**：覆盖汽车零部件（CIP）、3C（MC）、水务（104/645）、楼宇（BACnet）四类典型场景。
 

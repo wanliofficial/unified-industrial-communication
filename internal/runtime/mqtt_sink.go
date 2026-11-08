@@ -268,6 +268,9 @@ func splitKey(key string) (device, point string) {
 	return key, "_"
 }
 
+// setMetrics 注入指标出口。
+func (m *mqttSink) setMetrics(met *obs.Metrics) { m.met = met }
+
 // String 便于日志展示。注意不要打印用户名/密码。
 func (m *mqttSink) String() string {
 	return "mqtt(" + m.topicTemplate + ",qos=" + strconv.Itoa(int(m.qos)) + ")"

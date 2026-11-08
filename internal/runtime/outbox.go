@@ -49,11 +49,18 @@ func (r *Runtime) openSinks(f *config.File) error {
 		}
 	}
 	if f.Northbound.MQTT.Enabled {
-		sink, err := newMQTTSink(f.Northbound.MQTT, f.Site, "uic-"+f.Site)
+		var sink northboundSink
+		var err error
+		switch f.Northbound.MQTT.Format {
+		case config.MQTTFormatSparkplugB:
+			sink, err = newSparkplugSink(f.Northbound.MQTT)
+		default:
+			sink, err = newMQTTSink(f.Northbound.MQTT, f.Site, "uic-"+f.Site)
+		}
 		if err != nil {
 			return fmt.Errorf("runtime: mqtt: %w", err)
 		}
-		sink.met = r.metrics
+		sink.setMetrics(r.metrics)
 		r.mqttSink = sink
 		sinks["mqtt"] = sink.deliver
 	}

@@ -138,7 +138,7 @@ curl -N localhost:8080/api/v1/stream?points=virtual-01/sine
 
 | 类别 | 内容 | 对应场景 |
 |---|---|---|
-| 协议 | MC 3E（已落地）、FINS（已落地）、EtherNet/IP + CIP（已落地）、BACnet/IP（已落地）、IEC 60870-5-104（已落地）、DL/T 645（已落地）、CJ/T 188（已落地）、SNMP v1/v2c（已落地）、ADS/AMS（已落地）、OPC DA 桥接（独立 Windows 桥接进程）、Sparkplug B | 汽车 / 3C / 水务 / 楼宇 |
+| 协议 | MC 3E（已落地）、FINS（已落地）、EtherNet/IP + CIP（已落地）、BACnet/IP（已落地）、IEC 60870-5-104（已落地）、DL/T 645（已落地）、CJ/T 188（已落地）、SNMP v1/v2c（已落地）、ADS/AMS（已落地）、OPC DA 桥接（独立 Windows 桥接进程）、Sparkplug B（已落地） | 汽车 / 3C / 水务 / 楼宇 |
 | 数据 | 有界采样历史库（NDJSON 分段，已落地）+ 降采样 + 保留策略 + 历史查询 API + 窗口聚合（`avg(ref, 5m)`，已落地） | 全部 |
 | 语义 | 单位/量程、计算点、报警判定（阈值/延时/组合） | 全部 |
 | 运维 | RBAC（3 角色）、审计查询/导出、诊断包、网络诊断、远程配置下发 | 无人值守 |
@@ -172,7 +172,7 @@ curl -N localhost:8080/api/v1/stream?points=virtual-01/sine
 | 架构 | 进程外驱动（gRPC）、驱动市场（签名/版本/兼容性）、多实例协调 |
 | 集中管理 | 中心聚合器（只读镜像 + 配置下发 + 批量升级 + 站点分组） |
 | 灰度 | 配置分批下发、观察窗口、自动暂停 |
-| 数据 | 数据契约 v2（双发过渡）、Sparkplug B 完整生命周期 |
+| 数据 | 数据契约 v2（双发过渡）、Sparkplug B 的 DataSet/模板（按客户现场需要） |
 | 运维 | 远程日志拉取、离线升级包、看门狗自愈策略 |
 | 国际化 | 中/英双语、时区、单位制 |
 | 合规 | SBOM、签名发布、等保对照表 |

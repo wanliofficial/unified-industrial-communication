@@ -441,6 +441,27 @@ mosquitto_sub -h 127.0.0.1 -t 'uic/mqtt-lab/#' -v
 把 Broker 停掉再起来，可以看到数据先进 Outbox、恢复后按序补投，以及
 `$birth`/`$state` 被重新发布。
 
+同一个 Broker 也能跑 Sparkplug B：把载荷格式换成 `sparkplug-b`，主题与生命周期
+就交给协议的契约管理：
+
+```bash
+./uic -check -config examples/sparkplug.json
+./uic -config examples/sparkplug.json
+#   任意 Sparkplug B 消费端订阅 spBv1.0/plant-a/#
+#   顺序：STATE(online) → NBIRTH(gw-line1) → DBIRTH(line-a) → DDATA…
+#         → DBIRTH(line-b) → DDATA…
+```
+
+它和 json 格式**互斥**，不是「多带几个字段」：`format: "sparkplug-b"` 时主题由
+`groupId/nodeId/设备名` 拼出，`topic` 必须留空（配了会启动报错），`retain` 必须
+为 false（只有 STATE 用 retained）。NBIRTH 从 0 开始编号，DBIRTH 把设备序号归零；
+重连、NCMD `Node Control/Rebirth`、设备从故障恢复都会重发 BIRTH。质量非 good
+用 `is_null` 表达——把断线前的旧值当新值发出去，比不发更危险。
+
+点位值映射按 Sparkplug DataType 走，`bytes` 用 Bytes (17) + `bytes_value`
+字段保留原始字节（声明成 String 会被 UTF-8 改写）；BCD 按 Double 发。DataSet、模板、别名、
+报警出口都不做：它们各自是另一套状态机，半成品比不做更难排查。
+
 MQTT 南向（订阅别人的数据，方向与上一节相反）：这是全项目**唯一一个推送型**
 协议，驱动必须把「设备主动发」适配成「采集器来拉」。内置 Broker 让这条链路
 同样零外部依赖：
@@ -744,6 +765,7 @@ docs/
 | REST | 配置、查询、写入、命令 | ✅ 完整 |
 | SSE | 实时观察（浏览器/curl 友好） | ✅ 完整 |
 | MQTT | 变化上报 + 设备状态 | ✅ 完整（QoS0/1、retained `$state`/`$birth`、LWT `$death`、断线补投；不支持 QoS2/TLS/WebSocket） |
+| MQTT · Sparkplug B | 与 SCADA/IIoT 平台的标准化生命周期 | ✅ `format: "sparkplug-b"`：NBIRTH/NDEATH/DBIRTH/DDEATH/DDATA、STATE、序号与 bdSeq、NCMD/DCMD Rebirth、重连补 BIRTH；手写 Protobuf，不做 DataSet/模板/别名 |
 | OPC UA | 被 SCADA 集成 | ✅ 服务端地址空间（`Root/Objects/{site}/{device}/{point}`，`ns=2;s=...`）；质量码走 `DataValue.Status`；写入穿透到南向设备；支持订阅推送；None/None + 匿名，不支持证书/历史/方法/事件 |
 
 > 注意方向的对称性：MQTT 与 OPC UA 都**同时出现在南向和北向**，但这是两条独立的链路。
@@ -869,15 +891,17 @@ obs  ← 所有包（不依赖任何内部包）
 | `internal/pipeline` | 缩放、质量判定、死区过滤 | 质量不可用时不参与死区比较 | 92.7% |
 | `internal/cache` | 当前值唯一事实源 + 变更订阅 | 读写都要过这里，不允许模块自留副本 | 96.7% |
 | `internal/outbox` | 持久队列：分区、WAL、确认位点、三重上限 | at-least-once；整批或前缀成功才推进位点 | 77.4% |
-| `internal/config` | 加载、校验、规范化、版本化、回滚 | 幂等 Normalize；原子写；失败自动恢复；北向参数、从站映射、计算点（编译/引用/类型/环/窗口）、报警（条件/引用/类型/窗口）与历史保留策略静态校验 | 83.4% |
+| `internal/config` | 加载、校验、规范化、版本化、回滚 | 幂等 Normalize；原子写；失败自动恢复；北向参数（含 Sparkplug 组/节点名与格式互斥）、从站映射、计算点（编译/引用/类型/环/窗口）、报警（条件/引用/类型/窗口）与历史保留策略静态校验 | 83.9% |
 | `internal/obs` | 指标、结构化日志、日志环形缓冲 | 指标标签必须归一化（不能含原始 URL） | 88.2% |
 | `internal/rbac` | 角色/权限矩阵（纯函数） | 未知角色/未知权限一律拒绝；`viewer ⊆ operator ⊆ admin`；高危命令按动作映射到 `command.danger` | 100% |
 | `internal/auth` | 凭据表：Token → 身份；`Reloadable` 支持热替换 | Token 先 SHA-256 再定长比较；无凭据进入 open 模式而不是造默认口令；拒绝弱口令；枚举永不返回 Token | 96.7% |
 | `internal/audit` | 审计存储：NDJSON 分段 + SHA-256 哈希链 + 查询/校验 | 序号连续；字段边界用「长度:内容」编码；整段淘汰后链仍可校验；尾部半行触发新段 | 80.7% |
 | `internal/northbound/httpapi` | REST + SSE + 认证/授权 + 错误码 | 错误码稳定；响应不泄露凭据；未知角色全拒；401 与 403 在审计里区分；报警/历史查询的未知参数取值必须报错而不是静默忽略 | 83.4% |
-| `internal/mqtt` | MQTT 3.1.1 客户端（北向发布 + 南向订阅共用，纯 Go 零依赖） | 单 goroutine 读 socket；QoS1 必须等到 PUBACK；`Ping` 必须等到 PINGRESP（写成功不算活着）；断线立即失败而非超时 | 70.3% |
+| `internal/codec/sparkplug` | Sparkplug B 载荷的纯函数 Protobuf 编解码（varint/长度前缀/定长、Metric oneof、PropertySet、未知字段跳过） | 无第三方 protobuf 运行时；未知字段按规则跳过（对端升级 schema 不应让解析失败）；oneof 值字段即使为 0/false 也必须显式编码；声明类型与承载字段冲突时报错；PropertySet 是平行数组，键必须排序才能确定性编码 | 86.2% |
+| `internal/sparkplug` | Sparkplug B 生命周期状态机（主题、NBIRTH/NDEATH/DBIRTH/DDEATH/DDATA、序号作用域与回绕、bdSeq、NCMD/DCMD 解析、指标映射） | 节点序号与设备序号独立；DBIRTH 占用 0、下一条从 1 开始；NDEATH 遗嘱在 CONNECT 前就能生成；非 good 质量用 `is_null` + `quality` 属性；bytes 走 `bytes_value`；命令只认 Rebirth | 96.6% |
+| `internal/mqtt` | MQTT 3.1.1 客户端（北向发布 + 南向订阅共用，纯 Go 零依赖） | 单 goroutine 读 socket；QoS1 必须等到 PUBACK；`Ping` 必须等到 PINGRESP（写成功不算活着）；断线立即失败而非超时；`Epoch` 暴露连接代数，供订阅方区分「新会话的第一条消息」 | 70.3% |
 | `internal/mqtt/mqtttest` | 测试封装：`internal/sim/mqtt` 的 `*testing.T` 生命周期 + 等待断言 | 不另写 Broker（两份实现必然长歪）；开关一律走 setup 函数而非直接赋字段 | — |
-| `internal/runtime` | 唯一编排层 + 后端实现 + 看门狗 + 审计埋点 + 窗口缓存 | 启动/关闭顺序（失败逆序收口）；`configuredState` 与 `runtimeState` 分离；协议/传输匹配在装配期校验；只向驱动与报警引擎注入只读 `cache.Get` 与窗口数据源；北向 OPC UA 启停与热重建；凭据表热替换后旧用户立即失效 | 81.4% |
+| `internal/runtime` | 唯一编排层 + 后端实现 + 看门狗 + 审计埋点 + 窗口缓存 | 启动/关闭顺序（失败逆序收口）；`configuredState` 与 `runtimeState` 分离；协议/传输匹配在装配期校验；只向驱动与报警引擎注入只读 `cache.Get` 与窗口数据源；北向 OPC UA 启停与热重建；凭据表热替换后旧用户立即失效；MQTT 北向以 `northboundSink` 接口隔离 json 与 sparkplug-b | 81.1% |
 | `cmd/uic` | 单入口：run / sim / mbread / mcread / finsread / enipread / bacread / uaread / dlt645read / cjt188read / snmpread / adsread / s7blocks / s7upload / instantiate / import / token / check / version | 关闭预算 10 秒；`uaread`、`mbread`、`mcread`、`finsread`、`enipread`、`bacread`、`dlt645read`、`cjt188read`、`snmpread`、`adsread` 是不装第三方客户端即可自证链路的自检工具；块服务放在 CLI 而不是北向 API（动作重、数据大、归操作系统账号管）；模板实例化与点表导入只产出文件，不在运行期动态生成设备 | — |
 
 覆盖率一列是 `go test -cover ./<包>/` 的语句覆盖率（只统计包内测试，不做跨包交叉覆盖），
@@ -893,7 +917,7 @@ go test -race -count=1 ./...                    # 竞态 + 全量测试
 go test -coverprofile=c.out ./... && go tool cover -func=c.out | tail -1
 ```
 
-当前状态：`go build` / `go vet` / `gofmt` 全部干净，`go test -race ./...` 覆盖 68 个包，其中 67 个
+当前状态：`go build` / `go vet` / `gofmt` 全部干净，`go test -race ./...` 覆盖 70 个包，其中 69 个
 有测试文件且全部通过（仅 `internal/mqtt/mqtttest` 是纯测试辅助包，没有自己的测试文件）。
 
 ### 9.3 源码阅读建议顺序

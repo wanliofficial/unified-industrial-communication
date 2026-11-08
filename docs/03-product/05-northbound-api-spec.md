@@ -1218,9 +1218,12 @@ LWT；而 `$birth` 是 retained 的，不补一条 `online=false` 就会让消�
 | `enabled` | 是 | `false` | 关闭时不创建 sink，也不写入 Outbox |
 | `broker` | 启用时必填 | — | `tcp://host:port` 或 `host:port`；`ssl://`/`tls://`/`ws://`/`wss://` 显式拒绝 |
 | `clientId` | 否 | `uic-{site}` | 同一 Broker 上多实例必须显式区分，否则会话互相顶掉 |
-| `topic` | 否 | `uic/{site}/{device}/{point}/value` | 必须含 `{device}` 与 `{point}` |
+| `format` | 否 | `json` | `json` 或 `sparkplug-b`；见 §6.6 |
+| `groupId` | 否 | `site` | 仅 `sparkplug-b`；不得含 `/`、`+`、`#` |
+| `nodeId` | 否 | `uic-{site}` | 仅 `sparkplug-b`；规则同上 |
+| `topic` | 否 | `uic/{site}/{device}/{point}/value` | 必须含 `{device}` 与 `{point}`；`sparkplug-b` 下必须留空 |
 | `qos` | 否 | `1` | 仅 0/1；写 2 直接报错 |
-| `retain` | 否 | `false` | 只作用于 `value`；`$state`/`$birth`/`$death` 恒为 retained |
+| `retain` | 否 | `false` | 只作用于 `value`；`$state`/`$birth`/`$death` 恒为 retained；`sparkplug-b` 下必须为 false |
 | `username` / `password` | 否 | — | 只配 `password` 不配 `username` 会被拒绝（3.1.1 规定） |
 
 `uic -check` 会在启动前做静态校验：缺 `broker`、QoS 越界、模板缺占位符都会
@@ -1259,24 +1262,189 @@ LWT；而 `$birth` 是 retained 的，不补一条 `online=false` 就会让消�
 | QoS2 | 不支持，配置即报错 | 两段握手（PUBREC/PUBREL/PUBCOMP）对北向上报没有实际收益，且实现复杂度高 |
 | TLS（`ssl://`、`tls://`） | 不支持，配置即报错 | 证书加载/轮换/校验是独立的一件事，不能靠「静默当 tcp」蒙混——那会变成「连上了但没加密」 |
 | WebSocket（`ws://`、`wss://`） | 不支持，配置即报错 | 同上；边缘部署直连 Broker 更常见 |
-| 订阅 | 不支持 | 北向是「网关往外发」，订阅语义属于南向 |
+| 订阅（json 格式） | 不支持 | 北向是「网关往外发」，订阅语义属于南向 |
+| 订阅（sparkplug-b） | 仅订阅自身 `NCMD`/`DCMD` | 只用于 Rebirth 命令；不订阅数据主题 |
 | 会话持久化（`CleanSession=false`） | 不支持 | 补发由本地 Outbox 负责，Broker 侧会话只会掩盖真实积压 |
-| Sparkplug B | Wave 2 | 见 §6.6 |
+| Sparkplug B | **已实现** | 见 §6.6 |
 
 显式失败优于静默降级：一个配了 `ssl://` 的现场，宁可启动时报错，也不要让它
 以为自己在加密传输。
 
-### 6.6 Sparkplug B（Wave 2）
+### 6.6 Sparkplug B（`format: "sparkplug-b"`）
 
-| 项 | 映射 |
+> **状态**：已实现（`internal/codec/sparkplug` 编解码、`internal/sparkplug`
+> 生命周期状态机、`internal/runtime/sparkplug_sink.go` MQTT 出口）。
+
+Sparkplug B 不是一个「换一种 JSON 结构」的选项，而是一套**基于主题的生命周期
+契约**：消费方先看到节点出生（NBIRTH），再看到设备出生（DBIRTH），之后才是
+DDATA；每条消息带序号，序号断了消费方就有权丢弃整段数据。所以它被实现为
+MQTT 北向的第二种格式，与 json 格式**互斥**，共用 Broker、凭据与 Outbox。
+
+```json
+{
+  "northbound": {
+    "mqtt": {
+      "enabled": true,
+      "format": "sparkplug-b",
+      "broker": "tcp://192.168.1.10:1883",
+      "clientId": "uic-plant-a",
+      "groupId": "plant-a",
+      "nodeId": "gw-line1",
+      "qos": 1,
+      "retain": false
+    }
+  }
+}
+```
+
+| 字段 | 必填 | 默认 | 说明 |
+|---|---|---|---|
+| `format` | 否 | `json` | `json` 或 `sparkplug-b`；其它值启动即报错 |
+| `groupId` | 否 | `site` | 现场命名空间；不得含 `/`、`+`、`#` |
+| `nodeId` | 否 | `uic-{site}` | 本网关在组内的唯一名；规则同上 |
+| `topic` | 否 | 空 | Sparkplug 下**必须留空**：主题由组/节点/设备拼出，模板会破坏契约 |
+| `retain` | 否 | `false` | Sparkplug 下必须为 `false`：只有 STATE 允许 retained |
+| `qos` | 否 | `1` | 仍然只支持 0/1 |
+
+`clientId` 在 Sparkplug 下缺省取 `nodeId`（不是站点名）：同一站点内两台网关
+配了不同 `nodeId` 却忘了 `clientId` 时，用站点名会让它们的 MQTT 会话互相顶掉，
+而 Sparkplug 恰恰要求每个节点各自独立。
+
+#### 6.6.1 主题与映射
+
+```
+spBv1.0/{group}/NBIRTH/{node}
+spBv1.0/{group}/NDEATH/{node}
+spBv1.0/{group}/DBIRTH/{node}/{device}
+spBv1.0/{group}/DDEATH/{node}/{device}
+spBv1.0/{group}/DDATA/{node}/{device}
+spBv1.0/{group}/NCMD/{node}
+spBv1.0/{group}/DCMD/{node}/{device}
+spBv1.0/{group}/STATE/{node}          # retained JSON，不是 Protobuf
+```
+
+| Sparkplug 概念 | 平台概念 |
 |---|---|
-| Group ID | `site` |
-| Node ID | 网关 ID |
-| Device ID | `device` |
-| Metric Name | `point` |
-| `NBIRTH`/`NDEATH` | 网关生命周期 |
-| `DBIRTH`/`DDEATH` | 设备生命周期 |
-| `DDATA` | 采样值 |
+| Group ID | `site`（或配置 `groupId`） |
+| Node ID | 网关（配置 `nodeId`，缺省 `uic-{site}`） |
+| Device ID | 设备 ID（`sanitizeTopicLevel` 之后） |
+| Metric Name | 点位 ID |
+| Metric Timestamp | `Sample.CollectedAt` |
+| `engUnit` 属性 | `Sample.Unit` |
+| `quality` 属性 | 非 good 时的质量字符串（`stale`/`bad`/`uncertain`…） |
+
+不实现别名（alias）：Metric Name 直接用点位 ID。别名需要一份跨会话稳定的
+编号表，而点位表可以在运行时增删；用名字虽然字节多一点，但永远不会出现
+「编号 7 在两次重启后指向不同点位」这类无法排查的问题。
+
+#### 6.6.2 生命周期与序号
+
+| 时机 | 发出的消息 |
+|---|---|
+| MQTT 连接建立 | STATE `online=true`（retained）→ NBIRTH → 全部已知设备 DBIRTH |
+| 首个点位/新增点位 | 该设备的 DBIRTH（完整点位表）→ DDATA |
+| 常规变化 | DDATA |
+| 设备进入 `faulted`/`disabled` | DDEATH，并忘掉该设备的点位缓存 |
+| 设备恢复采集 | 下一条数据触发新的 DBIRTH → DDATA |
+| 收到 NCMD `Node Control/Rebirth=true` | NBIRTH + 全部 DBIRTH |
+| 收到 DCMD `Device Control/Rebirth=true` | 该设备 DBIRTH |
+| 正常停机 | STATE `online=false` → NDEATH → DISCONNECT |
+
+序号规则：
+
+| 消息 | 作用域 | 规则 |
+|---|---|---|
+| NBIRTH / NDEATH | 节点 | NBIRTH 从 0 开始，之后 +1；255 后回绕到 0 |
+| DBIRTH / DDATA / DDEATH | 每设备独立 | DBIRTH 每次重置为 0，后续 +1 |
+
+`bdSeq` 在进程启动时生成一次，整个会话期间不变：NDEATH 遗嘱在 CONNECT 时就
+已经固定，重连后的 NBIRTH 必须能用同一个值把「生—死」配对。遗嘱消息的 QoS 为
+1、**不 retained**——retained 的 NDEATH 会让新订阅者把一次历史掉线当成当前状态。
+
+**为什么 BIRTH 必须带完整点位表**：DBIRTH 是消费方建立「设备有哪些指标」的
+唯一时机。只带当前这一个点会让设备在出生时就不完整，后续 DDATA 出现新名字时
+再补 BIRTH 又会让序号回退。实现上为每台设备保存「最后一个采样」，点位集合
+变化时重发完整 BIRTH。
+
+**为什么等待重连后要重发 BIRTH**：MQTT 会话是 `CleanSession=true`，Broker
+重启后订阅与 retained 状态都可能丢失。`OnConnect` 回调是异步的，不能保证它
+先于第一条数据执行；因此 sink 用连接代数（`mqtt.Client.Epoch()`）判断「这是
+新会话」，投递路径与回调路径谁先到都只触发一次 BIRTH。
+
+#### 6.6.3 值与质量
+
+| 平台类型 | Sparkplug DataType | 承载字段 |
+|---|---|---|
+| `bool` | Boolean (11) | `boolean_value` |
+| `int16` / `int32` | Int16 / Int32 | `int_value` |
+| `int64` | Int64 | `long_value` |
+| `uint16` / `uint32` | UInt16 / UInt32 | `int_value` |
+| `uint64` | UInt64 | `long_value` |
+| `float32` | Float (9) | `float_value` |
+| `float64` | Double (10) | `double_value` |
+| `string` | String (12) | `string_value` |
+| `bytes` | Bytes (17) | `bytes_value` |
+| `bcd16` / `bcd32` | Double (10) | `double_value` |
+
+两条不太直观的映射：
+
+- **bytes 用 Bytes (17) + `bytes_value`**。不要把它声明成 String：一旦按
+  文本编码，`0x00`/`0xFF` 这类字节会被 UTF-8 改写或截断。枚举与承载字段
+  必须同时正确，只对一半会让消费方读到「类型是 String、内容却是二进制」。
+  属性集（PropertySet）是 keys/values 两组平行数组，不是键值对对象；编码
+  时必须保持下标对应并排序，否则同一指标每次的字节都不同。
+- **BCD 按 Double 发**。平台内 BCD 是数值语义，Sparkplug 没有对应枚举；
+  转成文本反而要求消费方知道这是压缩 BCD。按 double 发是唯一不丢语义的选择。
+
+质量映射：
+
+| 平台质量 | Sparkplug 表达 |
+|---|---|
+| `good` | 正常值 |
+| `stale` / `bad` / `uncertain` | `is_null=true`，另带 `quality` 属性 |
+
+Sparkplug 没有质量位。把断线前的旧值当成新值发出去，比不发更危险——消费方
+会据此做联锁或统计；`is_null` 是协议提供的「这一轮没有可用值」表达。原始
+质量放进属性，保留诊断信息但不影响主值语义。
+
+#### 6.6.4 命令
+
+只实现 Sparkplug 的 Rebirth 命令：
+
+| 主题 | 指标 | 行为 |
+|---|---|---|
+| `NCMD/{node}` | `Node Control/Rebirth = true` | 重发 NBIRTH 与全部 DBIRTH |
+| `DCMD/{node}/{device}` | `Device Control/Rebirth = true` | 重发该设备 DBIRTH |
+
+其余命令（包括 `Rebirth=false`、未知指标、本节点不认识的设备）**静默忽略**。
+这是协议约定：订阅方可以发任意命令，边缘节点只回应自己实现的那几个。命令
+回调运行在 MQTT 读循环里，真正的发布放到独立 goroutine——否则一条慢 Broker
+会卡住 PUBACK 处理，表现为「Broker 明明在线，数据却停了」。
+
+#### 6.6.5 边界
+
+| 能力 | 状态 | 原因 |
+|---|---|---|
+| DataSet / 模板 / 别名 | 不做 | 需要跨会话稳定的编号与模板管理；点位表可变时半成品比不做更难排查 |
+| STATE 之外 retained | 不做，配置即拒绝 | 生命周期消息 retained 会让新订阅者看到没有上下文的历史状态 |
+| 遗嘱 retained | 不做 | 同上：一次历史掉线不能变成当前状态 |
+| 报警出口 | 不做 | Sparkplug 没有报警主题；硬塞进 DDATA 会污染指标空间。需要报警请用 json 格式或 REST/SSE |
+| 自定义主题模板 | 不做，配置即拒绝 | 主题是协议契约的一部分，模板化等于允许配出一个「本地正常、对端收不到」的现场 |
+
+#### 6.6.6 验证
+
+```bash
+./uic sim -protocol mqtt -listen 127.0.0.1:18832 &   # 任意 MQTT 3.1.1 Broker 均可
+./uic -check -config examples/sparkplug.json
+./uic -config examples/sparkplug.json
+#   用任意 Sparkplug B 消费端订阅 spBv1.0/plant-a/#
+#   期望顺序：STATE → NBIRTH → DBIRTH(line-a) → DDATA…
+#             → DBIRTH(line-b) → DDATA…
+```
+
+集成测试 (`internal/runtime/sparkplug_sink_test.go`) 覆盖：BIRTH 顺序、DBIRTH
+完整点位表、DDATA 序号、STATE retained、DDEATH、NCMD 重生、断线后重发 BIRTH、
+停机 STATE offline 与 NDEATH。编解码金帧在 `internal/codec/sparkplug`。
 
 ### 6.7 本地 journal 兜底（`storage.journal`）
 

@@ -142,6 +142,22 @@ mosquitto_sub -h 127.0.0.1 -t 'uic/mqtt-lab/#' -v
 Broker 断开时数据进本地 Outbox（不丢），恢复后自动补投；`$state`/`$birth` 是
 retained 的，消费方连上即可读到当前状态。
 
+把 `format` 换成 `sparkplug-b` 就是 Sparkplug B（同一个 Broker、同一套凭据与
+Outbox，生命周期由协议接管）：
+
+```bash
+./uic -check -config examples/sparkplug.json
+./uic -config examples/sparkplug.json
+#   任意 Sparkplug B 消费端订阅 spBv1.0/plant-a/#
+#   STATE(online) → NBIRTH → DBIRTH(line-a) → DDATA → DBIRTH(line-b) → DDATA
+```
+
+主题由 `groupId/nodeId/设备名` 拼出，所以 `topic` 必须留空、`retain` 必须为
+false（只有 STATE 是 retained）。NBIRTH 从 0 编号、DBIRTH 重置设备序号；重连、
+NCMD `Node Control/Rebirth`、设备故障恢复都会重发 BIRTH。质量非 good 用
+`is_null` 表达，单位走 `engUnit` 属性；`bytes` 用 Bytes 类型 + `bytes_value`
+保留原始字节。DataSet、模板、别名与报警出口不做——半成品比不做更难排查。
+
 MQTT 南向（订阅别人发来的数据，方向相反）：
 
 ```bash
@@ -579,7 +595,9 @@ go test -race -count=1 ./...
 | `internal/audit` | 审计存储：NDJSON 分段 + SHA-256 哈希链 + 查询 / 校验 |
 | `internal/northbound/httpapi` | REST + SSE + 认证授权 + 错误码 |
 | `internal/northbound/opcua` | OPC UA 北向：点位表 → 地址空间，质量码映射，写穿透到南向 |
-| `internal/mqtt` | 自写 MQTT 3.1.1 客户端（北向发布 + 南向订阅共用；QoS0/1、retained、LWT、PING 往返探测） |
+| `internal/codec/sparkplug` | Sparkplug B 载荷的手写 Protobuf 编解码（Metric oneof / PropertySet / 未知字段跳过 / 确定性编码） |
+| `internal/sparkplug` | Sparkplug B 生命周期状态机（主题 / BIRTH 与 DEATH / 序号作用域与回绕 / bdSeq / Rebirth 命令 / 指标映射） |
+| `internal/mqtt` | 自写 MQTT 3.1.1 客户端（北向发布 + 南向订阅共用；QoS0/1、retained、LWT、PING 往返探测、连接代数 `Epoch`） |
 | `internal/mqtt/mqtttest` | 测试封装：`internal/sim/mqtt` 的 `*testing.T` 生命周期 + 等待断言 |
 | `internal/runtime` | 唯一编排层 + 看门狗 + 后端实现（含各 sink 装配） |
 

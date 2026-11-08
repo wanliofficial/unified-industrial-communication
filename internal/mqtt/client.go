@@ -48,6 +48,11 @@ type Client struct {
 	acked     atomic.Uint64
 	recv      atomic.Uint64
 	reconnect atomic.Uint64
+
+	// epoch 每次 CONNECT/CONNACK 成功 +1。订阅方靠它判断「这是一条新会话」，
+	// 从而在发送数据之前先补 BIRTH——OnConnect 是异步的，单靠回调无法保证
+	// 第一次 Publish 发生在回调之后。
+	epoch atomic.Uint64
 }
 
 // Options 是客户端参数。
@@ -191,6 +196,7 @@ func (c *Client) Connect(ctx context.Context) error {
 	_ = conn.SetDeadline(time.Time{})
 	c.conn = conn
 	c.state.Store(2)
+	c.epoch.Add(1)
 
 	// 订阅必须在启动读循环之前完成，且由**当前 goroutine 自己读 socket**：
 	// 两个 goroutine 同时读同一条 TCP 流会把报文切碎，是这类客户端最难
@@ -293,6 +299,12 @@ func (c *Client) dispatchPublish(pkt Packet) {
 		c.opt.OnMessage(p)
 	}
 }
+
+// Epoch 返回当前连接代数：每成功建立一次会话 +1。
+//
+// 订阅型接入需要它来区分「同一条连接上的第 N 条消息」与「重连后的第一条
+// 消息」。后者必须先发 BIRTH，否则消费方会把数据挂在一个未出生的节点上。
+func (c *Client) Epoch() uint64 { return c.epoch.Load() }
 
 // Publish 发布一条消息。QoS0 发完即返回；QoS1 等到 PUBACK 才返回成功。
 //

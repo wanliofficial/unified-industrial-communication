@@ -71,6 +71,20 @@ type Options struct {
 	MetricsPublic bool
 }
 
+// northboundSink 是 MQTT 北向的两种载荷格式共用的接口。
+//
+// json 与 sparkplug-b 共用 Broker 连接、凭据和 Outbox，但生命周期差异
+// 很大：前者一条采样一条消息，后者要先 BIRTH 再 DDATA。把差异关在接口
+// 后面，runtime 只认识「投递 / 状态 / 报警 / 关闭」四件事。
+type northboundSink interface {
+	deliver(ctx context.Context, recs []outbox.Record) (int, error)
+	onState(ev scheduler.StateEvent)
+	onAlarmEvent(ev alarm.Event)
+	seedAlarms(statuses []alarm.Status)
+	setMetrics(m *obs.Metrics)
+	close() error
+}
+
 // Runtime 是装配好的服务实例。
 type Runtime struct {
 	opt     Options
@@ -88,7 +102,7 @@ type Runtime struct {
 	logFile     io.Closer
 	journal     *os.File
 	journalSink *journalSink
-	mqttSink    *mqttSink
+	mqttSink    northboundSink
 	alarms      *alarm.Engine
 	hist        *history.Store
 	histWriter  *historyWriter

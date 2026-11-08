@@ -83,12 +83,31 @@ type Northbound struct {
 	Webhook Webhook `json:"webhook,omitempty"`
 }
 
+// MQTT 北向的载荷格式。
+const (
+	// MQTTFormatJSON 是平台自有契约：一条消息一个采样，主题由模板渲染。
+	// 默认值，也是与 REST/SSE 同构的那一种。
+	MQTTFormatJSON = "json"
+	// MQTTFormatSparkplugB 走 Sparkplug B 的生命周期与 Protobuf 载荷。
+	// 主题由组/节点/设备名拼出来，不再使用 topic 模板。
+	MQTTFormatSparkplugB = "sparkplug-b"
+)
+
 // MQTT 是北向上报的 MQTT 参数。
 type MQTT struct {
 	Enabled  bool   `json:"enabled"`
 	Broker   string `json:"broker,omitempty"`
 	ClientID string `json:"clientId,omitempty"`
 	Topic    string `json:"topic,omitempty"`
+
+	// Format 决定载荷与主题的生成方式：json（默认）或 sparkplug-b。
+	// 两者共用 Broker 连接、凭据与 Outbox，但生命周期完全不同——所以
+	// 它是显式的二选一，而不是「自动识别」。
+	Format string `json:"format,omitempty"`
+	// GroupID / NodeID 只在 sparkplug-b 下生效。Group 是现场的命名空间
+	// （通常就是站点），Node 是这台网关。缺省分别为 site 与 uic-<site>。
+	GroupID string `json:"groupId,omitempty"`
+	NodeID  string `json:"nodeId,omitempty"`
 
 	// QoS 用指针表达三态：缺省（nil）取默认 1，显式 0 表示 QoS0。
 	// 用 int 无法区分「没写」和「写了 0」，而两者的投递语义差别很大：
@@ -294,8 +313,22 @@ func (f *File) Normalize() {
 	for i := range f.Alarms {
 		f.Alarms[i].Normalize()
 	}
-	if f.Northbound.MQTT.Topic == "" {
-		f.Northbound.MQTT.Topic = "uic/{site}/{device}/{point}/value"
+	mq := &f.Northbound.MQTT
+	if mq.Format == "" {
+		mq.Format = MQTTFormatJSON
+	}
+	mq.Format = strings.ToLower(strings.TrimSpace(mq.Format))
+	if mq.Format == MQTTFormatSparkplugB {
+		// Sparkplug 的主题由组/节点/设备名拼成，没有模板可填；默认值
+		// 只在不覆盖用户显式配置的前提下补齐。
+		if mq.GroupID == "" {
+			mq.GroupID = f.Site
+		}
+		if mq.NodeID == "" {
+			mq.NodeID = "uic-" + f.Site
+		}
+	} else if mq.Topic == "" {
+		mq.Topic = "uic/{site}/{device}/{point}/value"
 	}
 	if f.Northbound.Webhook.Timeout <= 0 {
 		f.Northbound.Webhook.Timeout = model.Duration(5 * time.Second)
@@ -840,8 +873,28 @@ func (f *File) validateNorthbound() error {
 		if q := m.EffectiveQoS(); q < 0 || q > 1 {
 			return fmt.Errorf("northbound.mqtt.qos %d: only 0 and 1 are supported by the publisher", q)
 		}
-		if !strings.Contains(m.Topic, "{device}") || !strings.Contains(m.Topic, "{point}") {
-			return fmt.Errorf("northbound.mqtt.topic %q must contain {device} and {point}", m.Topic)
+		switch m.Format {
+		case MQTTFormatJSON, "":
+			if !strings.Contains(m.Topic, "{device}") || !strings.Contains(m.Topic, "{point}") {
+				return fmt.Errorf("northbound.mqtt.topic %q must contain {device} and {point}", m.Topic)
+			}
+		case MQTTFormatSparkplugB:
+			// 主题是协议契约的一部分，不能让模板覆盖：一个「自定义了
+			// topic」的 Sparkplug 配置在本地看着配好了，对端却永远收不到。
+			if strings.TrimSpace(m.Topic) != "" {
+				return errors.New("northbound.mqtt.topic must be empty when format is sparkplug-b: Sparkplug derives topics from groupId/nodeId/device")
+			}
+			if m.Retain {
+				return errors.New("northbound.mqtt.retain must be false when format is sparkplug-b: only the STATE topic is retained")
+			}
+			if err := validateSparkplugLevel("groupId", m.GroupID); err != nil {
+				return err
+			}
+			if err := validateSparkplugLevel("nodeId", m.NodeID); err != nil {
+				return err
+			}
+		default:
+			return fmt.Errorf("northbound.mqtt.format %q: only %q and %q are supported", m.Format, MQTTFormatJSON, MQTTFormatSparkplugB)
 		}
 		// 与运行时共用同一份地址规则：ssl:// 之类的 scheme 必须在这里就失败。
 		if _, err := mqtt.NormalizeAddr(m.Broker); err != nil {
@@ -871,6 +924,25 @@ func (f *File) validateNorthbound() error {
 		}
 		if !strings.EqualFold(o.Policy, "None") {
 			return fmt.Errorf("northbound.opcua.policy %q: only \"None\" is supported", o.Policy)
+		}
+	}
+	return nil
+}
+
+// validateSparkplugLevel 校验 Sparkplug 主题里的一个命名层级。
+//
+// 这一层是 MQTT 主题的一部分，`/`、`+`、`#` 会改变主题结构；空串会让
+// 主题少一段。三者都不会在本机报错，只会在对端「安静地收不到」。
+func validateSparkplugLevel(field, v string) error {
+	if v == "" {
+		return fmt.Errorf("northbound.mqtt.%s required when format is sparkplug-b", field)
+	}
+	if strings.ContainsAny(v, "/+#") {
+		return fmt.Errorf("northbound.mqtt.%s %q must not contain / + #", field, v)
+	}
+	for _, r := range v {
+		if r < 0x20 || r == 0x7F {
+			return fmt.Errorf("northbound.mqtt.%s %q contains control characters", field, v)
 		}
 	}
 	return nil

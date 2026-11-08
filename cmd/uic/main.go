@@ -367,6 +367,9 @@ func checkConfig(path string) int {
 	if f.Northbound.Webhook.Enabled {
 		sinks = append(sinks, "webhook")
 	}
+	if f.Northbound.MQTT.Enabled {
+		sinks = append(sinks, "mqtt")
+	}
 	if f.Storage.Journal {
 		sinks = append(sinks, "journal")
 	}
@@ -374,8 +377,13 @@ func checkConfig(path string) int {
 		sinks = []string{"none（变化事件只进缓存/SSE）"}
 	}
 	fmt.Printf("  outbox      %v\n", sinks)
-	if f.Northbound.MQTT.Enabled {
-		fmt.Printf("  mqtt        %s（qos %d）\n", f.Northbound.MQTT.Broker, f.Northbound.MQTT.EffectiveQoS())
+	if m := f.Northbound.MQTT; m.Enabled {
+		if m.Format == config.MQTTFormatSparkplugB {
+			fmt.Printf("  mqtt        %s（qos %d，sparkplug-b %s/%s）\n",
+				m.Broker, m.EffectiveQoS(), m.GroupID, m.NodeID)
+		} else {
+			fmt.Printf("  mqtt        %s（qos %d，json %s）\n", m.Broker, m.EffectiveQoS(), m.Topic)
+		}
 	}
 	if o := f.Northbound.OPCUA; o.Enabled {
 		exposed, writable := opcuaExposed(f)
