@@ -8,6 +8,7 @@
 //	uic sim -protocol opcua -listen 127.0.0.1:14840 # 内置 OPC UA 服务端
 //	uic sim -protocol mqtt -listen 127.0.0.1:18830  # 内置 MQTT Broker（南向演示）
 //	uic sim -protocol dlt645 -listen 127.0.0.1:14001 # 内置电能表从站（645-2007）
+//	uic sim -protocol snmp -listen 127.0.0.1:16161   # 内置 SNMP v1/v2c 代理（UDP）
 //	uic mbread -addr 127.0.0.1:1502    # 不依赖第三方工具的从站读写自检（TCP）
 //	uic mbread -transport rtu -port /dev/ttyUSB0 -unit 1   # 串口从站自检
 //	uic mcread -addr 127.0.0.1:5000 -area d -offset 100 -qty 2   # MC 3E 自检
@@ -15,6 +16,7 @@
 //	uic enipread -addr 127.0.0.1:44818 -tag DINT_TAG  # EtherNet/IP CIP 自检
 //	uic bacread -addr 127.0.0.1:47808 -type analog-input -instance 1  # BACnet/IP 自检
 //	uic iec104read -addr 127.0.0.1:2404 -ca 1   # IEC 60870-5-104 自检（总召唤 + 上送对象）
+//	uic snmpread -addr 127.0.0.1:16161 -oid 1.3.6.1.2.1.1.1.0   # SNMP v1/v2c 自检
 //	uic uaread -addr 127.0.0.1:4840 -nodes ns=2;s=site/dev/point  # OPC UA 读写自检
 //	uic s7blocks -addr 127.0.0.1:15102   # S7 块目录（-type db / -num 1 可细看）
 //	uic s7upload -addr 127.0.0.1:15102 -type db -num 1 -out db1.bin  # 块上传备份
@@ -60,6 +62,7 @@ import (
 	sim "uic/internal/sim/modbus"
 	simmqtt "uic/internal/sim/mqtt"
 	sims7 "uic/internal/sim/s7"
+	snmpsim "uic/internal/sim/snmp"
 )
 
 // 构建期注入：-ldflags "-X main.version=... -X main.commit=..."
@@ -94,6 +97,8 @@ func main() {
 		dlt645readCmd(args)
 	case "cjt188read":
 		cjt188readCmd(args)
+	case "snmpread":
+		snmpreadCmd(args)
 	case "uaread":
 		uareadCmd(args)
 	case "s7blocks":
@@ -123,7 +128,7 @@ func usage() {
 用法:
   uic [run] -config config.json [-listen :8080] [-token TOKEN]
   uic -check -config config.json
-  uic sim [-listen 127.0.0.1:15020] [-protocol modbus|s7|opcua|mqtt|mc|fins|enip|bacnet|iec104|dlt645|cjt188]
+  uic sim [-listen 127.0.0.1:15020] [-protocol modbus|s7|opcua|mqtt|mc|fins|enip|bacnet|iec104|dlt645|cjt188|snmp]
   uic mbread -addr 127.0.0.1:1502 -unit 1 -area holding -offset 0 -qty 2
   uic mbread -addr 127.0.0.1:1502 -area holding -offset 5 -write 777
   uic mcread -addr 127.0.0.1:5000 -area d -offset 100 -qty 2
@@ -142,6 +147,9 @@ func usage() {
   uic cjt188read -addr 127.0.0.1:14001 -address 00000805000001 -type 10 -di 901F:0,901F:5,901F:10,901F:17
   uic cjt188read -transport serial -port /dev/ttyUSB0 -baud 2400 -address 00000805000001 -probe
   uic cjt188read -addr 127.0.0.1:14001 -address 00000805000001 -di A017 -write close -allow-control
+  uic snmpread -addr 127.0.0.1:16161 -oid 1.3.6.1.2.1.1.1.0,1.3.6.1.2.1.1.5.0 [-raw|-json]
+  uic snmpread -addr 127.0.0.1:16161 -walk 1.3.6.1.2.1.1 -max-walk 16
+  uic snmpread -addr 127.0.0.1:16161 -oid 1.3.6.1.2.1.1.6.0 -set lab-2 -setType string
   uic mbread -transport rtu|ascii -port /dev/ttyUSB0 [-baud 19200] [-parity even]
   uic uaread -addr 127.0.0.1:4840 -nodes ns=2;s=site/dev/point [-type float64]
   uic uaread -addr 127.0.0.1:4840 -nodes ns=2;s=site/dev/setpoint -write 42.5
@@ -447,7 +455,7 @@ func simCmd(args []string) {
 	fs := flag.NewFlagSet("sim", flag.ExitOnError)
 	addr := fs.String("listen", "127.0.0.1:15020", "监听地址")
 	size := fs.Int("size", 1024, "寄存器数量")
-	proto := fs.String("protocol", "modbus", "从站协议：modbus | s7 | opcua | mqtt | mc | fins | enip | bacnet | iec104 | dlt645 | cjt188")
+	proto := fs.String("protocol", "modbus", "从站协议：modbus | s7 | opcua | mqtt | mc | fins | enip | bacnet | iec104 | dlt645 | cjt188 | snmp")
 	pdu := fs.Int("pdu", 480, "S7 协商 PDU 长度（240/480/960）")
 	fs.Parse(args)
 
@@ -482,9 +490,12 @@ func simCmd(args []string) {
 	case "cjt188":
 		simCJT188(*addr)
 		return
+	case "snmp":
+		simSNMP(*addr)
+		return
 	case "modbus":
 	default:
-		fmt.Fprintf(os.Stderr, "未知协议 %q（支持 modbus | s7 | opcua | mqtt | mc | fins | enip | bacnet | iec104 | dlt645 | cjt188）\n", *proto)
+		fmt.Fprintf(os.Stderr, "未知协议 %q（支持 modbus | s7 | opcua | mqtt | mc | fins | enip | bacnet | iec104 | dlt645 | cjt188 | snmp）\n", *proto)
 		os.Exit(2)
 	}
 
@@ -915,6 +926,42 @@ func simCJT188(addr string) {
 	fmt.Println("  可写：A017 阀门（0x55 开 / 0x99 关）  A018 表地址（14 位）")
 	fmt.Println("  注意：只应答本表地址；读地址用 T/地址全 AA；其余 DI 回异常应答")
 	fmt.Println("  Ctrl+C 停止")
+
+	<-ctx.Done()
+	_ = srv.Close()
+	slog.Info("sim_stopped")
+}
+
+// simSNMP 启动内置 SNMP v1/v2c 代理（UDP）。
+//
+// 默认监听 16161 而不是 161：161 是特权端口，非 root 起不来；改成
+// 16161 后，下面的自检命令与 examples/snmp.json 都能在开发机上直接跑。
+// 真实设备的端口由 transport.address 决定，驱动不写死端口。
+//
+// 代理的初始值与 examples/snmp.json 对应：sysDescr/sysUpTime/sysName
+// 只读，sysContact/sysLocation 可写，ifTable 里有两块网卡，ifAdminStatus
+// 可写。community 不匹配时静默丢弃——这条语义与真实代理一致，也正是
+// 「超时先查 community」这条排查建议的依据。
+func simSNMP(addr string) {
+	srv, err := snmpsim.NewServer(addr)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "启动 SNMP 代理失败: %v\n", err)
+		os.Exit(1)
+	}
+	defer func() { _ = srv.Close() }()
+
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	fmt.Printf("snmp v1/v2c agent listening on %s (community %q)\n", srv.Addr(), snmpsim.DefaultCommunity)
+	fmt.Println("  system 组：1.3.6.1.2.1.1.1.0=sysDescr  1.3.6.1.2.1.1.3.0=sysUpTime(TimeTicks)")
+	fmt.Println("            1.3.6.1.2.1.1.5.0=sysName  1.3.6.1.2.1.1.7.0=sysServices(INTEGER 72)")
+	fmt.Println("  可写：    1.3.6.1.2.1.1.4.0=sysContact  1.3.6.1.2.1.1.6.0=sysLocation")
+	fmt.Println("  ifTable： 1.3.6.1.2.1.2.2.1.{1,2,3,4,5,6,7,8,10,16}.{1,2}（两块网卡）")
+	fmt.Println("            其中 .7.{1,2}=ifAdminStatus 可写，其余只读")
+	fmt.Println("  v1 差异： 缺 OID 回 noSuchName（无 per-varbind 异常），SET 错误码映射到 v1 子集")
+	fmt.Println("  Ctrl+C 停止")
+	fmt.Println("  自检：   uic snmpread -addr " + srv.Addr() + " -probe")
 
 	<-ctx.Done()
 	_ = srv.Close()

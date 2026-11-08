@@ -440,6 +440,33 @@ m³ / m³/h / GJ / kW；未知单位代号直接报错，不默认成基准单�
 透传，锁退化为每连接互斥）。两种承载的分帧与命令序列完全相同，所以内置 TCP 从站能
 直接当自检目标。
 
+SNMP v1/v2c（交换机 / UPS / 服务器 / 带网管的仪表，UDP 161）：
+
+```bash
+./uic sim -protocol snmp -listen 127.0.0.1:16161 &   # 内置 SNMP v1/v2c 代理
+./uic -config examples/snmp.json
+curl -s -H 'Authorization: Bearer dev-token-0123456789' localhost:8095/api/v1/points
+#   9 点：sysDescr/UpTime/Name/Services、可写 sysContact/sysLocation、
+#          ifNumber、ifInOctets、ifAdminStatus
+#   自检：./uic snmpread -addr 127.0.0.1:16161 -probe
+#   遍历：./uic snmpread -addr 127.0.0.1:16161 -walk 1.3.6.1.2.1.2.2.1
+#   写：  ./uic snmpread -addr 127.0.0.1:16161 -oid 1.3.6.1.2.1.1.6.0 \
+#           -set lab-2 -setType string
+```
+
+SNMP 是唯一「按对象名寻址」的协议：点位用 `kind=symbol`，`path` 是点分十进制 OID，
+实例号写在 OID 里（标量 `.0`、表项 `.10.1`）。读用一条 GET 带多个 varbind，
+`MultiRead` 声明 `supported`；但一帧受 `maxOids`（默认 32）与 1400 字节编码预算双重
+约束——超 MTU 会被分片，而现场设备/防火墙常直接丢分片。v1 没有 per-varbind 异常，
+批量 GET 遇 `noSuchName` 时驱动逐点重发，否则一个坏 OID 会让同批所有点位都变地址错误。
+
+只做 v1/v2c：v3 的 USM 认证加密是另一套子系统，配置期显式拒绝，不退回 v2c 碰运气。
+写是单 OID SET（不合并 varbind，避免一条只读对象回滚整批）：`uint16/uint32`→Gauge32、
+`int*`→INTEGER、`string/bytes`→OCTET STRING；float/BCD 没有标准线类型，显式拒绝。
+应答同时校验错误码与回显值，设备「接受但改了值」会在写入当场暴露。Counter64 经
+平台 `float64` 承载，超过 2^53 会丢精度；Counter32 会回绕，时间序列侧要做回绕检测。
+团体名按凭据处理（界面掩码），默认 `public` 只是最少配置。
+
 FINS 只做 FINS/TCP；FINS/UDP 与 Host Link 配置期即拒。建链先做节点号协商（命令 0
 → 1），`device.unitId>0` 覆盖目标节点、0 用协商值。`offset` 是**字地址**、`bit` 是
 字内位号（`CIO0.3` → `offset=0, bit=3`）；字访问 2 字节/字，位访问**1 字节/位**；
@@ -466,7 +493,7 @@ go test -race -count=1 ./...
 
 | 路径 | 内容 |
 |---|---|
-| `cmd/uic/` | 单入口：`run` / `sim`（Modbus / S7 / OPC UA / MQTT / MC / FINS / EtherNet-IP / BACnet-IP / IEC 104 / 645 / 188）/ `mbread` / `mcread` / `finsread` / `enipread` / `bacread` / `iec104read` / `dlt645read` / `cjt188read` / `uaread` / `s7blocks` / `s7upload` / `instantiate` / `import` / `token` / `-check` / `version` |
+| `cmd/uic/` | 单入口：`run` / `sim`（Modbus / S7 / OPC UA / MQTT / MC / FINS / EtherNet-IP / BACnet-IP / IEC 104 / 645 / 188 / SNMP）/ `mbread` / `mcread` / `finsread` / `enipread` / `bacread` / `iec104read` / `dlt645read` / `cjt188read` / `snmpread` / `uaread` / `s7blocks` / `s7upload` / `instantiate` / `import` / `token` / `-check` / `version` |
 | `internal/model` | 通道 / 设备 / 点位 / 地址 / 采样 / 质量码 |
 | `internal/driver` | 驱动契约（Codec / Transport / Driver）、错误分类、注册表、只读 `Lookup` 注入 |
 | `internal/calc` | 零依赖表达式引擎（编译期类型检查、短路求值、引用 `device:point`） |
@@ -491,6 +518,9 @@ go test -race -count=1 ./...
 | `internal/codec/cjt188` | 188-2004 纯函数编解码（单 `68` / 7 字节 BCD 地址 / 无 `0x33` / 2 字节 DI / 按表类型分派的字段 schema / 单位代号 / 7 字节时间 / 收帧扫描） |
 | `internal/driver/cjt188` | 188 主站（RS-485 与串口服务器双承载、总线锁、按 DI 缓存字段、阀门/写地址两道闸门、错误分类） |
 | `internal/sim/cjt188` | 188 内置从站（水/热两套 901F / D120..D12B / 读地址 / 阀门写 / 写地址 / 地址过滤） |
+| `internal/codec/snmp` | SNMP v1/v2c 纯函数编解码（BER TLV / 整数最短补码 / OID base-128 / 7 类 PDU / varbind / 异常标记 / error-status 分类） |
+| `internal/driver/snmp` | SNMP v1/v2c 主站（批量 GET / v1 `noSuchName` 退化 / 单 OID SET / 类型映射与回显校验 / request-id 配对 / 自检 `GetRaw`、`Walk`） |
+| `internal/sim/snmp` | SNMP v1/v2c 内置代理（system 组 + 两块网卡 / GET、GETNEXT、GETBULK、SET / community 静默丢弃 / v1 与 v2c 差异 / SET 原子性） |
 | `internal/template` | 设备模板：参数校验 / 字符串字面量替换 / 实例化后完整校验 |
 | `internal/pointtable` | 点表 CSV：列别名 / 地址表达式 / 按协议推导宽度 / 合并动作 |
 | `internal/alarm` | 报警引擎：五态机 / 滞回 / 延时 / 表达式规则 / 确认 / 订阅 |

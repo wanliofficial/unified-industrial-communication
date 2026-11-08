@@ -99,6 +99,14 @@ func PolicyFor(protocol string) AddressPolicy {
 		}
 	case "opcua":
 		return AddressPolicy{AllowSymbol: true}
+	case "snmp":
+		// SNMP 的地址就是一个点分十进制 OID。没有区域、没有偏移、没有
+		// 数组下标（实例号写在 OID 里），也没有 MQTT 那种载荷字段选择器。
+		//
+		// 不在这一层校验 OID 的数值约束（首弧 0..2 等）：那是协议事实，
+		// 由驱动/AST 校验能给出更准确的信息；点表层只负责拒绝把它写成
+		// 寄存器或对象地址。
+		return AddressPolicy{AllowSymbol: true}
 	case "mqtt":
 		return AddressPolicy{AllowSymbol: true, AllowSelector: true}
 	case "computed":

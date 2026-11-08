@@ -46,6 +46,7 @@ import (
 	mqttdriver "uic/internal/driver/mqtt"
 	opcuadriver "uic/internal/driver/opcua"
 	"uic/internal/driver/s7"
+	snmpdrv "uic/internal/driver/snmp"
 	"uic/internal/driver/virtual"
 	"uic/internal/history"
 	"uic/internal/model"
@@ -147,6 +148,7 @@ func RegisterBuiltins() error {
 			iec104.New(),
 			dlt645drv.New(),
 			cjt188drv.New(),
+			snmpdrv.New(),
 		} {
 			if err := driver.Register(d); err != nil {
 				registerErr = err

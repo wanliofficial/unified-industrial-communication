@@ -34,10 +34,10 @@ cmd/ + internal/            可运行的最小骨架（不是伪代码，能采�
 
 ### 1.2 它不是什么
 
-- 不是协议库大杂烩。当前实现了 15 个驱动（Modbus TCP / RTU / ASCII 主站、S7、OPC UA、MQTT 南向订阅、
-  MC 3E、FINS、EtherNet/IP CIP、BACnet/IP、IEC 60870-5-104、DL/T 645、CJ/T 188、计算点、virtual），外加
-  Modbus 从站（TCP / RTU / ASCII）、十个内置模拟从站/Broker（Modbus TCP、S7、MC 3E、FINS、CIP、BACnet/IP、
-  IEC 104、DL/T 645、CJ/T 188、MQTT）与一个内置 OPC UA 服务端、一个零依赖报警引擎与一个有界历史采样日志；其余协议在
+- 不是协议库大杂烩。当前实现了 16 个驱动（Modbus TCP / RTU / ASCII 主站、S7、OPC UA、MQTT 南向订阅、
+  MC 3E、FINS、EtherNet/IP CIP、BACnet/IP、IEC 60870-5-104、DL/T 645、CJ/T 188、SNMP v1/v2c、计算点、virtual），外加
+  Modbus 从站（TCP / RTU / ASCII）、十一个内置模拟从站/Broker（Modbus TCP、S7、MC 3E、FINS、CIP、BACnet/IP、
+  IEC 104、DL/T 645、CJ/T 188、SNMP v1/v2c、MQTT）与一个内置 OPC UA 服务端、一个零依赖报警引擎与一个有界历史采样日志；其余协议在
   `04-protocol-catalog.md` 里按工作量排了三波，没有假装已经支持。
   注意 MQTT 出现了两次且**互不相干**：北向是「网关把数据发出去」（sink），南向是「网关订阅别人发来的数据」（driver）。
 - 不是组态软件。不做画面、不做报表、不做自研时序库——理由见 `02-synthesis/01-capability-matrix.md` §6.4。
@@ -298,6 +298,34 @@ m³ / m³/h / GJ / kW；未知单位代号直接报错，不默认成基准单�
 （`A018`，`allow-write` + 完整 14 位）；写地址成功后驱动自动切到新地址，配置仍需
 人工同步。188 的 `AA` 只属于读地址命令，因此表地址不支持缩位——带通配的读数据会
 变成一次多表广播。
+
+SNMP v1/v2c（交换机 / UPS / 服务器 / 带网管的仪表，UDP 161）：
+
+```bash
+./uic sim -protocol snmp -listen 127.0.0.1:16161 &   # 内置 SNMP v1/v2c 代理
+./uic -config examples/snmp.json
+curl -s -H 'Authorization: Bearer dev-token-0123456789' localhost:8095/api/v1/points
+#   9 点：sysDescr/UpTime/Name/Services、可写 sysContact/sysLocation、
+#          ifNumber、ifInOctets、ifAdminStatus
+#   自检（不需要网关）：./uic snmpread -addr 127.0.0.1:16161 -probe
+#   遍历子树：./uic snmpread -addr 127.0.0.1:16161 -walk 1.3.6.1.2.1.2.2.1
+#   写 sysLocation：./uic snmpread -addr 127.0.0.1:16161 \
+#       -oid 1.3.6.1.2.1.1.6.0 -set lab-2 -setType string
+```
+
+SNMP 是唯一「按对象名寻址」的协议：点位的 `address.kind` 是 `symbol`，`path` 是点分十进制
+OID，实例号写在 OID 里（标量 `.0`、表项 `.10.1`）。读用一条 GET 带多个 varbind，
+`MultiRead` 声明 `supported`；但一帧受 `maxOids`（默认 32）与 1400 字节编码预算双重约束——
+超过 MTU 的报文会被分片，而现场大量设备与防火墙直接丢分片，症状是「OID 少时能读、点表
+一多就超时」。v1 没有 per-varbind 异常，批量 GET 遇 `noSuchName` 时驱动逐点重发，否则一个
+坏 OID 会让同批所有点位变成地址错误。
+
+只做 v1/v2c：v3 的 USM 认证加密是另一套子系统，配置期显式拒绝，**不退回 v2c 碰运气**。
+写是单 OID SET（不合并多 varbind，避免一条只读对象回滚整批），`uint16/uint32` 上线为
+Gauge32、`int*` 为 INTEGER、`string/bytes` 为 OCTET STRING；float/BCD 显式拒绝（没有标准
+线类型，私有编码互不兼容）。应答同时校验错误码与回显值——设备「接受但按自己的解释改了值」
+会在写入当场暴露。Counter64 经平台 `float64` 承载，超过 2^53 会丢精度；Counter32 会回绕，
+时间序列侧要做回绕检测。团体名按凭据处理（界面掩码），默认 `public` 只是最少配置。
 
 OPC UA（二进制，SecurityPolicy None / 匿名）：
 
@@ -775,7 +803,7 @@ obs  ← 所有包（不依赖任何内部包）
 | `internal/history` | 有界采样日志：NDJSON 分段、整段淘汰、原始查询、定步长聚合与窗口摘要 | 一条记录不跨段；永远保留至少一段；末尾半行触发新段；查询升序、桶对齐、桶质量取最差；非数值点位不产出 `min/max/avg`；`WindowStats` 只统计 good 的数值样本，空窗口返回 `Count=0` 而非错误 | 84% |
 | `internal/calc` | 零依赖表达式引擎（编译期类型检查、短路求值、历史窗口聚合） | 无 `eval`；引用是 `device:point`；除零/NaN/Inf/溢出都报错而不是降级；窗口只允许 1s..24h，且只在第二个参数是时长时生效；窗口引用不进 `Refs()` | 92.7% |
 | `internal/template` | 设备模板：参数校验、字符串字面量替换、实例化后完整校验 | 占位符只替换字符串字面量且不做算术；整字面量是占位符时 int/float/bool 落成 JSON 数字/布尔；未知字段/参数/占位符与键里的占位符一律报错；必填缺失一次列全 | 92.5% |
-| `internal/pointtable` | 点表 CSV：列别名、地址表达式、按协议推导宽度、合并动作 | 列名大小写/空格/下划线不敏感；未知列报错；行错误带行号列名并聚合；重复 ID 是错误、重复地址是警告；`length` 先于地址解析；`#selector` 只允许 MQTT；默认拒绝静默覆盖 | 89.5% |
+| `internal/pointtable` | 点表 CSV：列别名、地址表达式、按协议推导宽度、合并动作 | 列名大小写/空格/下划线不敏感；未知列报错；行错误带行号列名并聚合；重复 ID 是错误、重复地址是警告；`length` 先于地址解析；`#selector` 只允许 MQTT；SNMP 只允许 OID；默认拒绝静默覆盖 | 89.7% |
 | `internal/codec/mc` | 三菱 MC 3E 纯函数编解码（帧头/设备码表/位打包/结束码/24 位设备号） | 无 I/O、无时钟、无可变状态；起始设备号 3 字节小端；位软元件按位打包（首点 bit0）；`Lookup`/`ByCode` 大小写不敏感；结束代码表 `0xC052/53/54/56`→地址错 | 86.5% |
 | `internal/driver/mc` | MC 3E 主站驱动（字/位读写、字软元件 bool 的 RMW、字序归一化、结束码分类） | 只做 3E 二进制帧 + TCP；字软元件 bool 必须显式 `address.bit`，驱动读整字→改位→写整字不清零邻位；字序归一化后按 `byteOrder` 解码默认 CDAB；结束码映射质量码 | 56.9% |
 | `internal/sim/mc` | MC 3E 内置从站（内存字/位表、按区读写、越界/未知设备结束码） | 一问一答；未配置编号读返回 0、写落表；越界返回 0xC054；设备码反查 | 89.8% |
@@ -797,6 +825,9 @@ obs  ← 所有包（不依赖任何内部包）
 | `internal/codec/cjt188` | 188-2004 纯函数编解码（单 `68` 定界/地址 BCD 低字节先传/无 `0x33`/校验和/2 字节 DI/按表类型分派的字段 schema/压缩 BCD/7 字节时间/单位代号/收帧扫描） | 无 I/O、无时钟、无可变状态；前导不计入长度与校验和，CS 从 `0x68` 到 DATA 末；帧总长恒为 `13+L`；901F 水/气/其他与热量表两套布局（19/43 字节），D120..D12B 为 5 字节；字段 offset 是 DI 数据域内字节偏移；单位是显式字节并统一到 m³/m³/h/GJ/kW，未知代号报错；时间 7 字节、年份 2000..2099，日期本地校验；读地址报文标识固定字面量 `81 0A` | 64.5% |
 | `internal/driver/cjt188` | 188 主站（serial/tcp 双承载、总线锁、探针 0x03、按 DI 缓存字段、阀门/写地址两道闸门、错误分类） | 同一 DI 的多个字段在一次 Read 内复用一次事务，跨 DI 不合并、`MultiRead` 声明 unsupported；resolved 字段必须与 schema 宽度一致；应答地址/DI/SER/长度四项校验；链路级故障后本轮剩余点快速失败；表地址取 `labels.address`（完整 14 位，含 AA 通配即拒绝）、类型取 `labels.type`；写阀门需 `allow-control`，写地址需 `allow-write` 且成功后自动切到新地址；其余 DI 写本地拒绝；不提供广播 | 77.6% |
 | `internal/sim/cjt188` | 188 内置从站（TCP + `ServeStream`、水/热两套 901F、D120..D12B、读地址、阀门写、写地址、时钟刷新、地址过滤） | 与主站共用 codec/schema；地址不匹配静默；读地址应答用实际地址而非回显全 `AA`；时间与状态字每次读都从内部时钟/阀门状态现场生成；写地址后新地址可读、旧地址静默；未知命令回异常应答而不是让主站等超时；`Close` 幂等 | 88.2% |
+| `internal/codec/snmp` | SNMP v1/v2c 纯函数编解码（BER TLV / 整数最短补码 / OID base-128 / 7 类 PDU / varbind / 异常标记 / error-status 分类） | 无 I/O、无时钟、无可变状态；长度短/长形式必须按内容长度选；无符号值最高位为 1 必须补前导 `00`；OID 首两弧合并、`2.39.1`→`77 01`；异常标记只允许出现在应答，请求里出现即拒绝；v1 Trap PDU 识别后显式拒绝 | 69.3% |
+| `internal/driver/snmp` | SNMP v1/v2c 主站（批量 GET、v1 `noSuchName` 退化、单 OID SET、类型映射与回显校验、错误分类、request-id 配对、自检 `GetRaw`/`Walk`） | 只做 v1/v2c；通道必须是 UDP，地址省略端口补 161；读按 `maxOids` 与 1400 字节双预算分批，顺序不变；v1 批量 `noSuchName` 逐点重发；写不合并 varbind，逐点错误隔离；只接受与请求 request-id 相同的 Response；float/BCD 与 >2^32-1 的无符号写本地拒绝；地址错误不进入整轮 `firstErr` | 70.3% |
+| `internal/sim/snmp` | SNMP v1/v2c 内置代理（system 组 + 两块网卡、GET/GETNEXT/GETBULK/SET、community 静默丢弃、v1/v2 差异、SET 原子性） | 与主站共用 codec/snmp；community 不匹配不回任何报文（不做口令预言机）；v1 缺 OID 回 `noSuchName` 带 `error-index`，v2c 回 `noSuchObject`；SET 先全量校验再落地；`sysUpTime` 固定值（测试要稳定）；`Close` 幂等 | 90.6% |
 | `internal/driver/link` | 表计协议的承载层：串口与串口服务器（TCP 透传）统一成一条带总线锁的链路 | 锁覆盖「排空 → 发送 → 收完帧」整段；TCP 上 Drain 退化为读掉残留字节（分帧同步仍由 codec 扫描兜底）；`host` 省略端口时补默认端口；参数错误 `ErrUnsupported`、打开/连接失败 `ErrDisconnected`；`Drain` 必须早于 `SetDeadline` | 91.2% |
 
 | `internal/planner` | 点位 → 批量读请求（ReadSpan） | 协议无关；按连续性/上限合并；按 `area:db` 分组；计算点合成单个 `expr` span（漏组会表现为全坏且无日志） | 92.6% |
@@ -813,7 +844,7 @@ obs  ← 所有包（不依赖任何内部包）
 | `internal/mqtt` | MQTT 3.1.1 客户端（北向发布 + 南向订阅共用，纯 Go 零依赖） | 单 goroutine 读 socket；QoS1 必须等到 PUBACK；`Ping` 必须等到 PINGRESP（写成功不算活着）；断线立即失败而非超时 | 70.3% |
 | `internal/mqtt/mqtttest` | 测试封装：`internal/sim/mqtt` 的 `*testing.T` 生命周期 + 等待断言 | 不另写 Broker（两份实现必然长歪）；开关一律走 setup 函数而非直接赋字段 | — |
 | `internal/runtime` | 唯一编排层 + 后端实现 + 看门狗 + 审计埋点 + 窗口缓存 | 启动/关闭顺序（失败逆序收口）；`configuredState` 与 `runtimeState` 分离；协议/传输匹配在装配期校验；只向驱动与报警引擎注入只读 `cache.Get` 与窗口数据源；北向 OPC UA 启停与热重建；凭据表热替换后旧用户立即失效 | 81.4% |
-| `cmd/uic` | 单入口：run / sim / mbread / mcread / finsread / enipread / bacread / uaread / dlt645read / cjt188read / s7blocks / s7upload / instantiate / import / token / check / version | 关闭预算 10 秒；`uaread`、`mbread`、`mcread`、`finsread`、`enipread`、`bacread`、`dlt645read`、`cjt188read` 是不装第三方客户端即可自证链路的自检工具；块服务放在 CLI 而不是北向 API（动作重、数据大、归操作系统账号管）；模板实例化与点表导入只产出文件，不在运行期动态生成设备 | — |
+| `cmd/uic` | 单入口：run / sim / mbread / mcread / finsread / enipread / bacread / uaread / dlt645read / cjt188read / snmpread / s7blocks / s7upload / instantiate / import / token / check / version | 关闭预算 10 秒；`uaread`、`mbread`、`mcread`、`finsread`、`enipread`、`bacread`、`dlt645read`、`cjt188read`、`snmpread` 是不装第三方客户端即可自证链路的自检工具；块服务放在 CLI 而不是北向 API（动作重、数据大、归操作系统账号管）；模板实例化与点表导入只产出文件，不在运行期动态生成设备 | — |
 
 覆盖率一列是 `go test -cover ./<包>/` 的语句覆盖率（只统计包内测试，不做跨包交叉覆盖），
 随测试增删会有 1% 级的漂移；要看当前值请按 §9.2 的命令重跑。
@@ -828,7 +859,7 @@ go test -race -count=1 ./...                    # 竞态 + 全量测试
 go test -coverprofile=c.out ./... && go tool cover -func=c.out | tail -1
 ```
 
-当前状态：`go build` / `go vet` / `gofmt` 全部干净，`go test -race ./...` 覆盖 62 个包，其中 61 个
+当前状态：`go build` / `go vet` / `gofmt` 全部干净，`go test -race ./...` 覆盖 65 个包，其中 64 个
 有测试文件且全部通过（仅 `internal/mqtt/mqtttest` 是纯测试辅助包，没有自己的测试文件）。
 
 ### 9.3 源码阅读建议顺序
@@ -858,6 +889,7 @@ go test -coverprofile=c.out ./... && go tool cover -func=c.out | tail -1
 22. internal/codec/mc + driver/mc + sim/mc 三菱 MC 3E 三层：帧、RMW 位写、内置从站（60 分钟）
 23. internal/codec/fins + driver/fins + sim/fins 欧姆龙 FINS 三层：套娃封装、节点协商、一位一字节（70 分钟）
 24. internal/codec/enip + driver/enip + sim/enip EtherNet/IP 三层：三层封装、标签寻址、多服务合包（80 分钟）
+25. internal/codec/snmp + driver/snmp + sim/snmp SNMP 三层：BER、OID 编码、双预算分批、v1 退化（80 分钟）
 ```
 
 ---

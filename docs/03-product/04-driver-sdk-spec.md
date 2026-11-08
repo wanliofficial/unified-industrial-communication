@@ -2886,6 +2886,411 @@ curl -s -H 'Authorization: Bearer dev-token-0123456789' localhost:8094/api/v1/po
 | 点表/规划 | 4 位 DI、字段偏移允许非 0、8 位 DI 与全 `FFFF` 拒绝、bool 拒绝、`WidthProtocol` 策略、不同 DI 不合并 |
 | `cmd/uic` | 类型解析、`DI[:offset[:length]]`、偏移越界/长度不符/未收录 DI、历史 DI、status 走 `uint16`、阀门值 open/close、写 DI 只认 A017/A018、传输方式按参数推断 |
 
+### 3.10.12 SNMP v1/v2c（UDP 161）
+
+这是全仓库唯一「按对象名寻址」的协议：地址不是寄存器号，也不是符号表里的变量名，
+而是一串点分十进制 OID。它同时带来了三件别处没有的事：
+
+- **协议自带错误语义。** Modbus 用异常码、S7 用返回码，但都没有 SNMP 这么细：
+  `noSuchName`、`wrongType`、`notWritable`、`noAccess` 各自指向「点表错」「类型错」
+  「权限错」三类完全不同的处置；
+- **v1 与 v2c 不是「版本号不同」而已。** v1 没有 per-varbind 异常，一个坏 OID 会让
+  整批返回 `noSuchName`，其余 OID 的值也一起丢失；
+- **报文跑在 UDP 上。** 没有连接、没有序号确认，只能靠 request-id 配对；超过 MTU
+  的报文会被分片，而现场大量设备与防火墙直接丢分片。
+
+这三件事决定了本节的三个核心设计：**只做 v1/v2c**（§3.10.12.1）、**读按字节预算
+分批**（§3.10.12.5）、**v1 的 `noSuchName` 逐点重发**（§3.10.12.6）。
+
+#### 3.10.12.1 只做 v1/v2c，v3 在配置期拒绝
+
+| 能力 | v1 | v2c | v3 |
+|---|---|---|---|
+| 基本 GET / SET | ✓ | ✓ | ✓ |
+| 批量 GET（一帧多 varbind） | ✓ | ✓ | ✓ |
+| GetBulk（一次取多行） | ✗ | ✓ | ✓ |
+| per-varbind 异常标记 | ✗ | ✓ | ✓ |
+| 64 位计数器 | ✗ | ✓ | ✓ |
+| 扩展错误码（`wrongType` 等） | ✗（只有 0..5） | ✓ | ✓ |
+| 认证 / 加密 | ✗ | ✗ | ✓（USM） |
+| 团体名（community） | ✓ 明文 | ✓ 明文 | ✗ |
+
+v3 不做，不是「优先级低」，而是它需要另一套完整的子系统：引擎发现、时间同步窗口、
+认证与加密密钥的本地化、密钥轮换。把它塞进现有驱动，要么做成半成品（只支持
+`noAuthNoPriv`，安全上等价于 v2c 却让人以为已经加密），要么把连接层改成一个带状态
+的 USM 会话机。两者都会让「配置一份 SNMP 设备」这件事的复杂度翻倍。
+
+因此 `ParseVersion` 只接受 `1` 与 `2c`，遇到 `3` / `3h` / `v3` 直接报
+`unsupported`，并在错误信息里写明「v3/USM 未实现」。**不退回 v2c 碰运气**——用
+v2c 的报文去连一个只开 v3 的代理，得到的是超时；现场会把它误判成「网络不通」，
+而真正的原因是版本配错。
+
+团体名按凭据对待：`labels.community` 在配置表单里是 `password` 类型（界面掩码），
+默认值 `public` 只是「第一次接通最少配置」，不是安全默认。文档与失败提示都要求
+现场显式确认它。
+
+#### 3.10.12.2 报文结构：三层 TLV
+
+一条 SNMP 报文是一个 BER 编码的 `SEQUENCE`：
+
+```
+Message ::= SEQUENCE {
+    version    INTEGER      -- 0 = v1, 1 = v2c
+    community  OCTET STRING -- 团体名，明文
+    pdu        CHOICE { ... }
+}
+```
+
+PDU 的标签直接编码在第一个字节里：
+
+| 标签 | PDU | 方向 | 本实现 |
+|---|---|---|---|
+| `A0` | GetRequest | 请求 | ✓ |
+| `A1` | GetNextRequest | 请求 | ✓（仅自检遍历） |
+| `A2` | Response | 应答 | ✓ |
+| `A3` | SetRequest | 请求 | ✓（单 varbind） |
+| `A4` | Trap（v1） | 通知 | 识别后**显式拒绝解析**（不接收 Trap） |
+| `A5` | GetBulkRequest | 请求 | 仅内置代理实现；主站不用 |
+| `A6`/`A7`/`A8` | Inform / Trap（v2）/ Report | 通知 | 不接收 |
+
+请求与应答的 PDU 头都是三个 `INTEGER`：`request-id`、`error-status`、`error-index`；
+`GetBulk` 把后两个换成 `non-repeaters` 与 `max-repetitions`。varbind 列表是一个
+`SEQUENCE OF SEQUENCE { OID, value }`。
+
+三条 BER 细节必须按协议写，否则报文「看起来对、设备就是不回」：
+
+1. **长度字段的短/长形式。** 内容 ≤127 字节用一个字节；再长要用 `81 xx` / `82 xx xx`。
+   把 130 字节的内容写成单字节 `0x82`，解析方会把它读成一个长度 130 的短形式，
+   然后从错误的位置开始找下一个 TLV。
+2. **整数是最短二补码。** `127` 是 `7F`，`128` 必须补前导零写成 `00 80`；负数是
+   二补码，`-1` 是 `FF`。少写这个前导零，`128` 会被读成 `-128`。
+3. **无符号类型同样需要前导零。** Gauge32 / Counter32 / TimeTicks 在线上仍是
+   「有符号 INTEGER 的写法」，最高位为 1 时必须补 `00`；`0x80000000` 编码成
+   `00 80 00 00 00`，否则对端读出来是负数。这条错误的表现是「计数器突然变成
+   负几十亿」，而不是解析失败。
+
+v2c 读 `1.3.6.1.2.1.1.1.0` 的金帧（request-id `0x01020304`，community `public`），
+在测试里逐字节钉住：
+
+```
+30 29
+  02 01 01
+  04 06 70 75 62 6c 69 63
+  a0 1c
+    02 04 01 02 03 04
+    02 01 00
+    02 01 00
+    30 0e
+      30 0c
+        06 08 2b 06 01 02 01 01 01 00
+        05 00
+```
+
+注意 varbind 的值是 `NULL`（`05 00`）：GET 请求只带「要读哪个对象」，不带值。
+
+#### 3.10.12.3 OID 与地址
+
+OID 的每个子标识符用 base-128 变长编码，**最高位为 1 表示还有后续字节**。前两弧
+合并成 `40 × 第一弧 + 第二弧`：
+
+```
+1.3.6.1.2.1.1.1.0  →  2b 06 01 02 01 01 01 00
+2.39.1             →  77 01        （40×2+39 = 119 = 0x77）
+```
+
+第二行是最容易写错的地方：`119` 的 base-128 编码就是单字节 `0x77`，不是 `0x4F`
+（`0x4F` 是 79，对应 `1.39`）。首弧大于 2 的写法在标准里不合法，但现场确实存在；
+解析器按「2.(值-80)」宽松接受，**编码器只产生合法值**。
+
+点表里一个 SNMP 点位长这样：
+
+```json
+{
+  "id": "sys-descr",
+  "address": { "kind": "symbol", "path": "1.3.6.1.2.1.1.1.0" },
+  "dataType": "string"
+}
+```
+
+- `path` 必须是点分十进制，**实例号写在 OID 里**（标量的 `.0`、表项的 `.10.1`）。
+- `index`（`[3]` 这种数组下标）本地拒绝：SNMP 的「第几行」本身就是 OID 的最后几弧，
+  两套下标同时存在会让「`...10[1]` 到底指 `.10.1` 还是 `.1.10`」无法回答。
+- `selector`（MQTT 的 `#field`）本地拒绝：SNMP 没有载荷字段这个概念。
+- 点表导入用的是 `pointtable.PolicyFor("snmp")` → 只允许 symbol；写成 `holding:100`
+  或 `analogInput:1.presentValue` 在导入期就报错，不会等到连上设备才失败。
+
+#### 3.10.12.4 类型系统：线类型由设备决定
+
+同一张表里，不同列可以是完全不同的线类型：`ifDescr` 是 OCTET STRING、`ifType` 是
+INTEGER、`ifSpeed` 是 Gauge32、`ifInOctets` 是 Counter32、`ifHCInOctets` 是
+Counter64、`sysUpTime` 是 TimeTicks。**点表的 `dataType` 只决定「按什么读」，不能
+决定「线上是什么」。**
+
+| 线类型（标签） | 含义 | 读成平台类型 |
+|---|---|---|
+| `02` INTEGER | 有符号 32 位 | int16 / int32 / int64 / uint* / bool（仅 0/1） |
+| `41` Counter32 | 无符号 32 位，单调递增、会回绕 | uint32 / uint64 / int* / bool（仅 0/1） |
+| `42` Gauge32 | 无符号 32 位，可增可减 | 同上 |
+| `43` TimeTicks | 无符号 32 位，单位 10ms | 同上（不做单位换算） |
+| `44` Opaque | 厂商自定义字节 | string / bytes |
+| `46` Counter64 | 无符号 64 位 | uint64 / int* |
+| `04` OCTET STRING | 字节串 | string / bytes |
+| `05` NULL | 无值 | 数值型报错 |
+| `06` OBJECT IDENTIFIER | OID | string |
+| `40` IpAddress | 4 字节地址 | string |
+| `80`/`81`/`82` | noSuchObject / noSuchInstance / endOfMibView | 地址错误 |
+
+两条硬规则：
+
+1. **数值点位收到 OCTET STRING 必须报错，不能硬转 0。** 现场最常见的错法是「拿
+   `sysDescr` 的 OID 配了一个 `uint16`」，或者把 MAC 地址列当成流量。错误信息直接
+   提示「把 dataType 改成 string/bytes」。
+2. **bool 只接受 0/1。** 收到 `2` 或 `72` 时报协议错误，而不是 `!= 0` 一律为真。
+   `ifAdminStatus` 的 `2` 是 down、`3` 是 testing，硬转成 bool 会把「testing」
+   显示成「up」。
+
+**Counter64 的精度边界**：平台的数值通道是 `float64`，尾数 53 位。超过 `2^53` 的
+Counter64 经转换会丢低位。这不是实现疏漏，而是数值模型决定的；文档明确写出，
+提醒调用方不要把大计数器当精确值做差值。Counter32 会在 `2^32` 回绕，时间序列侧
+必须按「回绕检测」处理，驱动不做猜测性补偿。
+
+#### 3.10.12.5 读：一条 GET 带多个 varbind，按双预算分批
+
+`Read` 把所有 span 里的点位摊平，解析 OID，然后分批发 GET。分批受两个上限约束：
+
+| 约束 | 默认 | 可调 | 目的 |
+|---|---|---|---|
+| 单帧 OID 个数 | 32 | `options=maxOids=1..128` | 防御性上限，避免一帧塞几百个 |
+| 单帧编码字节 | 1400 | 固定 | 覆盖 1500 MTU，避免 IP 分片被中间设备丢弃 |
+
+字节预算是**按 OID 编码长度的保守上界**估算的（每子标识符 5 字节 + TLV 头），
+不是按字符串长度。一个 30 弧的 OID 字符串只有 60 多个字符，编码后加上长度前缀接近
+160 字节；按字符数估会低估一半以上。
+
+为什么字节预算比个数上限更重要：现场症状是「OID 少的时候能读，点表一多就超时」。
+设备其实回了，只是应答被分片，防火墙或负载均衡丢了后续分片。把请求控制在 1400
+字节以内，响应通常也在同一个量级。真实编码长度在测试里复核：每条发出的请求都会
+重新编码一次并断言 ≤1400。
+
+批内逐点解码，每条校验三件事：
+
+1. 应答 varbind 的 OID 与请求一致（防止代理乱序或回错对象）；
+2. 值是异常标记时归为 `address`（v2c 的 `noSuchObject` / `noSuchInstance`）；
+3. 线类型能被点表 `dataType` 接受（§3.10.12.4）。
+
+链路级失败（超时、断链）会让**本轮剩余批次全部快速失败**，不再逐批等超时；地址级
+错误只标记该点，不影响其它点位的质量码，也不进入 `Read` 的汇总错误。
+
+`Meta().Capabilities.MultiRead` 声明 `supported`——这里的「多读」是协议真实支持的
+「一条 GET 带多个 varbind」，与 645/188 的「一次只能问一个数据标识」相反。
+
+#### 3.10.12.6 v1 的 `noSuchName` 必须逐点重发
+
+v1 没有 per-varbind 异常。批量 GET 里只要有一个 OID 不存在，代理返回
+`error-status = noSuchName`、`error-index = 第几个`，但**其余 OID 的值也一起不返回**。
+
+如果驱动把整批都标成地址错误，现场会看到「同一批点位昨天还好，今天全红」——实际上
+只是其中一个 OID 写错了。因此 v1 收到 `noSuchName` 后：
+
+```
+批量 GET（N 个 OID） → noSuchName
+  ├─ 单点 GET OID[0] → 值 / 地址错误
+  ├─ 单点 GET OID[1] → 值 / 地址错误
+  └─ ...
+```
+
+逐点重发把「哪一个不存在」与「其余的值」重新分开。代价是 N 次额外事务，但只在
+「v1 + 批内有坏 OID」这条路径上发生；正常批次仍然是一条 GET。v2c 不需要这条路径：
+异常标记就在对应 varbind 的值位置上。
+
+`Probe` 也利用这一点：读 `sysDescr.0`（system 组的第一项，所有代理都必须实现），
+**收到任何应答都算链路通**，包括 `noSuchObject`。它证明报文到达、community 被接受、
+代理回了结构正确的应答；真正失败只有「没有任何报文」或「报文结构错」。超时提示
+直接写排查顺序：community → 版本 → 地址/端口 → 视图 ACL。
+
+#### 3.10.12.7 写：单 OID SET，类型映射与回显校验
+
+`Write` 对每个点位发一条 SET，**不把多个点位合并进一条 SET**。理由不是协议不支持
+（SET 支持多 varbind 且原子），而是失败语义：一条 SET 里第二个 varbind 只读，整条
+都会被拒，第一个也不生效；把互不相关的点位捆在一起，会让「写 A 成功、写 B 失败」
+这种现场最常见的部分成功变成「全失败」，排查时无法定位。逐点发，每个点位拿到自己
+的错误码。
+
+平台类型到线类型的映射：
+
+| 平台 `dataType` | 线类型 | 说明 |
+|---|---|---|
+| `bool` | INTEGER | `true` → 1，`false` → 0 |
+| `int16` / `int32` / `int64` | INTEGER | 范围检查；小数直接拒绝 |
+| `uint16` / `uint32` | Gauge32 | 无符号的可写类型 |
+| `uint64` | Gauge32 | 仅 ≤ `2^32-1`；更大的值没有标准可写类型 |
+| `string` | OCTET STRING | UTF-8 原样 |
+| `bytes` | OCTET STRING | 不做 UTF-8 规范化 |
+| `float32` / `float64` | — | 显式拒绝：没有标准浮点类型 |
+| `bcd16` / `bcd32` | — | 显式拒绝：没有 BCD 类型 |
+
+浮点之所以拒绝而不是「按私有编码猜一个」：各厂商把浮点塞进 OCTET STRING 的字节序、
+长度、是否带指数位都不一样。猜错的结果是设备接受了一个错误的值，比写入被拒更难
+发现。OID 与 IpAddress 两种线类型没有对应的平台 `dataType`，因此只读不写。
+
+应答校验两步：
+
+1. `error-status` 必须为 0；否则按 §3.10.12.8 分类；
+2. 应答必须回显被写的 OID **与值**。回显值不一致时报 `protocol`——这能把「设备
+   接受了请求但按自己的解释改了值」（例如把 1 收敛成 100）当场暴露，而不是等下
+   一轮采集才发现值不对。
+
+#### 3.10.12.8 错误分类：error-status 与异常标记
+
+分类决定「要不要重试、要不要熔断、质量码是什么」。SNMP 的错误码比其它协议多，
+必须逐个映射，不能一律 `protocol`：
+
+| error-status | 分类 | 可重试 | 说明 |
+|---|---|---|---|
+| `tooBig` | protocol | ✓ | 响应太大；下一轮应减小批量 |
+| `genErr` | protocol | ✓ | 代理内部错误，值得再试一次 |
+| `commitFailed` / `undoFailed` | protocol | ✓ | SET 的两阶段提交失败 |
+| `noSuchName` | address | ✗ | 对象不存在（v1 的批量语义见 §3.10.12.6） |
+| `badValue` / `wrongType` / `wrongLength` | address | ✗ | 值/类型与对象定义不符 |
+| `wrongEncoding` / `wrongValue` | address | ✗ | 编码或取值不在允许集合内 |
+| `inconsistentValue` / `inconsistentName` | address | ✗ | 依赖对象状态，当前值不允许 |
+| `readOnly` / `notWritable` | permission | ✗ | 对象只读 |
+| `noAccess` / `noCreation` | permission | ✗ | 视图不允许 / 不允许创建行 |
+| `authorizationError` | permission | ✗ | 代理拒绝该操作 |
+| `resourceUnavailable` | permission | ✓ | 资源暂时不足 |
+
+异常标记（v2c）全部归 `address`：`noSuchObject`、`noSuchInstance`、
+`endOfMibView` 都表示「这个 OID 在这台设备上不存在」，是点表问题，不是链路问题。
+把它们归成 `protocol` 会让一台设备因为一个坏 OID 被熔断。
+
+分类结果直接影响质量码：`timeout` → `timeout`、`address` → `address_error`、
+`disconnected` → `comm_error`、其余 → `bad`。
+
+#### 3.10.12.9 UDP 事务：request-id、重试与陈旧应答
+
+UDP 没有连接，请求与应答靠 `request-id` 配对。驱动把整条会话串行化（`mu`），原因
+与 BACnet 相同：一个套接字上同时挂两个未完成事务时，迟到的应答会张冠李戴。
+
+| 情况 | 处置 |
+|---|---|
+| 收到 request-id 不匹配的 Response | 丢弃，继续等当前事务 |
+| 收到 Trap / 其它 PDU | 丢弃（不接收 Trap） |
+| 超时 | 重发，最多 `retries` 次（默认 2，可配 0..10） |
+| 非超时错误（协议/断链） | 立即上报，不重发 |
+| 重试耗尽 | `timeout`，提示检查 community 与视图 ACL |
+
+「陈旧应答」不是理论问题：上一轮超时后，代理可能在一秒后才把应答发出来；下一轮
+请求刚好用了新的 request-id，如果驱动不校验，就会把上一轮的值当成这一轮的。
+`request-id` 从 1 开始递增、回绕时跳过 0，保证同一连接上不会复用尚未过期的编号。
+
+单次事务的截止时间取「通道超时」与「context deadline」的较早者。`Close` 只关闭
+套接字；重连由上层调度按 `disconnected` 处理，驱动不内置重连循环——那会让「设备
+真的离线」与「驱动在不停重试」这两种状态无法区分。
+
+#### 3.10.12.10 能力边界（刻意的）
+
+| 不做 | 原因 |
+|---|---|
+| v3 / USM | 另一套认证加密与密钥管理；配置期显式拒绝，不退回 v2c |
+| Trap 接收 | 轮询主站的采集语义与「设备主动推」不同；v1 Trap 结构特殊，解析层直接拒绝 |
+| MIB 编译 / 名字解析 | 需要一整套 MIB 文件与解析器；点表只认数字 OID |
+| GetBulk 作为生产读 | 语义是「按字典序连续取」，与点表的「明确 OID」相反；只在自检遍历里用 GETNEXT |
+| 多 varbind SET | 失败会整条回滚；逐点写才能给出逐点错误 |
+| 自动发现对象 | 没有「列举设备对象」这种服务；OID 必须来自手册/点表 |
+| 浮点 / BCD 写 | 没有标准线类型，私有编码互不兼容 |
+| 位寻址 | 位操作没有标准语义；数值整体读出后由上层解释 |
+
+`Meta().Capabilities` 里 `Subscribe`、`Browse`、`Discovery`、`BitAccess`、
+`StructTypes` 全部 `unsupported`，`Read`、`Write`、`MultiRead` 为 `supported`。
+
+#### 3.10.12.11 位置与自检
+
+| 内容 | 路径 |
+|---|---|
+| 编解码 | `internal/codec/snmp`（`Parse`/`Build`/`GetRequest`/`GetNextRequest`/`SetRequest`/`GetBulkRequest`/`ParseOID`/`OID.Compare`/`OID.HasPrefix`/`ParseVersion`/`ParseOIDList`/`ErrorStatus.Kind`） |
+| 主站驱动 | `internal/driver/snmp`（`Meta`/`Open`/`Probe`/`Read`/`Write`，自检用 `GetRaw`/`Walk`；内部 `parseOptions`/`readBatch`/`readOneByOne`/`decodeValue`/`encodeWriteValue`/`statusError`/`exchange`） |
+| 内置代理 | `internal/sim/snmp`（`NewServer`/`NewServerWithOptions`/`Addr`/`Get`/`Set`/`SetWritable`/`Requests`/`Writes`/`Close`） |
+| CLI | `uic snmpread`（`-probe`/`-oid`/`-walk`/`-max-walk`/`-set`/`-setType`/`-retries`/`-raw`/`-json`） |
+| 示例 | `examples/snmp.json`（9 点位：sysDescr/UpTime/Name/Services、可写 sysContact/sysLocation、ifNumber、ifInOctets、ifAdminStatus） |
+
+内置代理默认 community `public`，预置：
+
+| OID | 含义 | 值 | 可写 |
+|---|---|---|---|
+| `1.3.6.1.2.1.1.1.0` | sysDescr | `UIC SNMP agent (simulated)` | ✗ |
+| `1.3.6.1.2.1.1.2.0` | sysObjectID | `1.3.6.1.4.1.99999.1` | ✗ |
+| `1.3.6.1.2.1.1.3.0` | sysUpTime | TimeTicks `123456`（固定值，不随墙钟增长） | ✗ |
+| `1.3.6.1.2.1.1.4.0` | sysContact | `ops@example.invalid` | ✓ |
+| `1.3.6.1.2.1.1.5.0` | sysName | `uic-sim` | ✓ |
+| `1.3.6.1.2.1.1.6.0` | sysLocation | `lab` | ✓ |
+| `1.3.6.1.2.1.1.7.0` | sysServices | INTEGER `72` | ✗ |
+| `1.3.6.1.2.1.2.1.0` | ifNumber | INTEGER `2` | ✗ |
+| `1.3.6.1.2.1.2.2.1.{1,2,3,4,5,6,8,10,16}.{1,2}` | ifTable 各列 | 两块网卡 | ✗ |
+| `1.3.6.1.2.1.2.2.1.7.{1,2}` | ifAdminStatus | INTEGER `1` | ✓ |
+
+sysUpTime 故意不随墙钟增长：测试需要一个稳定的值，会自己变的计数器会让断言变成
+`sleep` 赌运气。真实设备当然会增长；这一差异只影响「演示时看到固定的 123456」，
+不影响任何报文语义。
+
+community 不匹配时**静默丢弃**，不回 `authorizationError`——真实代理就是这样，
+避免成为团体名探测的预言机；这也让「超时 → 先查 community」这条排查建议可以在
+仿真设备上复现。v1 与 v2c 的差异在代理里同样保留：缺 OID 时 v1 回 `noSuchName`
+（带 `error-index`），v2c 在对应 varbind 回 `noSuchObject`；SET 的只读/类型错误
+分别映射到 v1 的 `readOnly`/`badValue` 与 v2c 的 `notWritable`/`wrongType`。
+SET 是原子的：先全部校验，再统一落地。
+
+自检链路（无硬件，UDP 回环）：
+
+```bash
+./uic sim -protocol snmp -listen 127.0.0.1:16161 &
+./uic snmpread -addr 127.0.0.1:16161 -probe
+# 链路正常: 127.0.0.1:16161 版本 2c（GET sysDescr.0 收到应答）
+
+./uic snmpread -addr 127.0.0.1:16161 -raw
+# OID                 类型          值                     质量
+# 1.3.6.1.2.1.1.1.0   OCTET STRING  UIC SNMP agent (…)     good
+# 1.3.6.1.2.1.1.3.0   TimeTicks     123456                 good
+# 1.3.6.1.2.1.1.5.0   OCTET STRING  uic-sim                good
+# 1.3.6.1.2.1.1.6.0   OCTET STRING  lab                    good
+
+./uic snmpread -addr 127.0.0.1:16161 -walk 1.3.6.1.2.1.2.2.1 -max-walk 12
+./uic snmpread -addr 127.0.0.1:16161 -version 1 -oid 1.3.6.1.2.1.1.1.0,1.3.6.1.2.1.1.99.0
+./uic snmpread -addr 127.0.0.1:16161 -oid 1.3.6.1.2.1.1.6.0 -set lab-2 -setType string
+```
+
+`-walk` 从子树前缀做 GETNEXT：v1 在表尾按 `noSuchName` 正常结束，v2c 按
+`endOfMibView` 结束；代理返回不前进的 OID 时报协议错误并停止，避免死循环。
+`-raw` 显示线类型与十六进制原始字节——MAC 地址、Opaque 这类值必须看原始字节，
+按字符串打印会把不可打印字节变成问号。
+
+示例配置带上网关跑真实采集：
+
+```bash
+./uic -config examples/snmp.json
+curl -s -H 'Authorization: Bearer dev-token-0123456789' localhost:8095/api/v1/points
+curl -s -X POST -H 'Authorization: Bearer dev-token-0123456789' \
+  -H 'Content-Type: application/json' \
+  -d '{"value":{"type":"string","text":"building-7"}}' \
+  localhost:8095/api/v1/points/switch01/sys-location/write
+```
+
+写接口返回 `quality: uncertain` 是预期：写入已确认（设备回显一致），但缓存里的值要等
+下一轮采集才刷新；把它标成 `good` 会让人以为「读到的新值就是刚写的值」。
+
+排查顺序内建在失败提示里：**community（读写口令是否分开）→ 版本（v1 代理不认 v2c
+报文）→ 地址/端口（是否被 ACL 限制）→ 视图是否允许该子树 → OID 是否少写/多写实例号**。
+前四步用 `-probe` 与 `-oid` 就能分开，最后一步用 `-walk` 看设备上真实的 OID 长什么样。
+
+测试矩阵（当前覆盖）：
+
+| 层 | 用例 |
+|---|---|
+| `codec/snmp` | GET/应答金帧、INTEGER 最短编码与负数、无符号前导零（`0x80000000`）、OID base-128（`2.39.1`→`77 01`）、OID 排序与前缀、非法 OID、版本解析（v3 拒绝）、异常标记只允许出现在应答、GetBulk 线格式、错误码分类、字符串/字节值、截断错误可识别 |
+| `driver/snmp` | 五种线类型解码、MultiRead 一条 GET、按 maxOids 与字节预算分批（顺序不变、每条 ≤1400 字节）、v1 `noSuchName` 逐点重发、写类型映射与回显校验、类型/范围拒绝不发包、9 种 error-status 分类、SET 回显被收敛、Probe 接受异常标记/超时提示、request-id 陈旧应答丢弃、链路失败停止后续批次、坏地址与线类型不符、Counter64 精度边界、`GetRaw`/`Walk`（子树边界、max、v1 表尾） |
+| `sim/snmp` | 真实 UDP 回环：GET 与计数器、错 community 静默、v1/v2c 缺 OID 差异、GETNEXT 遍历与表尾、GETBULK 三行递增、SET 可写与回读、只读/类型错/不存在、SET 原子性、坏报文与非请求丢弃、`Set`/`SetWritable`/`Close` 幂等 |
+| 点表/规划 | `PolicyFor("snmp")` 只允许 symbol、selector/寄存器/对象地址在导入期拒绝、`examples/snmp.json` 通过 `-check`（16 个驱动） |
+| `cmd/uic` | `-set` 值解析（bool/int/uint/string/bytes、进制、越界、float/BCD 拒绝）、`snmpRow` 的 raw/error 显示 |
+
 ### 3.11 计算点（`computed`）
 
 这是全项目**唯一没有物理链路**的驱动：点位不从任何设备读取，而是由其他点位的值
@@ -3178,6 +3583,7 @@ type OpError struct {
 | `iec104`（IEC 60870-5-104 主站） | supported | supported | supported ⁵ | unsupported | unsupported | supported ⁶ | unsupported |
 | `dlt645`（多功能电能表 645-2007） | supported | supported | unsupported | unsupported | unsupported | unsupported ⁷ | unsupported |
 | `cjt188`（户用计量仪表 188-2004） | supported | supported | unsupported | unsupported | unsupported | unsupported ⁸ | unsupported |
+| `snmp`（v1/v2c 对象读写） | supported | supported | unsupported | unsupported | unsupported | supported ⁹ | unsupported |
 | `opcua` | supported | supported | supported ⁴ | unsupported | experimental | supported | unsupported |
 | `mqtt`（南向订阅） | supported | supported | supported ¹ | unsupported | unsupported | supported ² | unsupported |
 | `computed`（计算点） | supported | unsupported ³ | unsupported | unsupported | unsupported | supported | unsupported |
@@ -3213,6 +3619,11 @@ type OpError struct {
 > （例如 901F 的当前流量/结算日流量/时间/状态只发一帧）。跨 DI 仍然不合并；把
 > `MultiRead` 声明为 `supported` 会让调度层误以为任意多点位都只付一次事务成本
 > （见 §3.10.11.7）。
+>
+> ⁹ SNMP 的 `MultiRead` 是**协议真实支持**的「一条 GET 带多个 varbind」，与 645/188
+> 的逐点串行相反。但一帧仍受两个上限约束：`options.maxOids`（默认 32）与 1400 字节
+> 的编码预算（避免 IP 分片被中间设备丢弃）。因此「一次多读」不等于「任意多点位都只
+> 付一次事务」——点位多时会被切成多条 GET（见 §3.10.12.5）。
 
 ---
 

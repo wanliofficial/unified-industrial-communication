@@ -103,6 +103,9 @@ func TestAddressPolicyStatic(t *testing.T) {
 	if p := PolicyFor("opcua"); p.AllowRegister || !p.AllowSymbol {
 		t.Fatalf("opcua = %+v", p)
 	}
+	if p := PolicyFor("snmp"); p.AllowRegister || !p.AllowSymbol || p.AllowSelector {
+		t.Fatalf("snmp = %+v", p)
+	}
 	if p := PolicyFor("weird"); !p.AllowRegister || !p.AllowSymbol || p.Width != WidthExplicit {
 		t.Fatalf("unknown = %+v", p)
 	}
@@ -265,5 +268,29 @@ func TestPolicyForCJT188(t *testing.T) {
 	}
 	if _, err := ParseAddress("901F:0", model.TypeFloat64, "modbus-tcp"); err == nil {
 		t.Fatal("modbus must reject DI-style addresses")
+	}
+}
+
+func TestParseAddressSNMP(t *testing.T) {
+	a, err := ParseAddress("1.3.6.1.2.1.1.1.0", model.TypeString, "snmp")
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if a.Kind != model.AddressSymbol || a.Path != "1.3.6.1.2.1.1.1.0" {
+		t.Fatalf("address = %+v", a)
+	}
+	if a.Selector != "" || a.Index > 0 {
+		t.Fatalf("snmp address must not gain selector/index: %+v", a)
+	}
+
+	// 寄存器/对象/文件写法都必须在导入时被拦下：SNMP 只有 OID 一种地址。
+	for _, expr := range []string{"holding:100", "analogInput:1.presentValue", "file:1/0:5"} {
+		if _, err := ParseAddress(expr, model.TypeUint16, "snmp"); err == nil {
+			t.Fatalf("%q must be rejected for snmp", expr)
+		}
+	}
+	// selector 是 MQTT 的载荷字段语法，SNMP 没有这个位置。
+	if _, err := ParseAddress("1.3.6.1.2.1.1.1.0#x", model.TypeString, "snmp"); err == nil {
+		t.Fatal("selector must be rejected for snmp")
 	}
 }
