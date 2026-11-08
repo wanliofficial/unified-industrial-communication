@@ -43,11 +43,145 @@ internal static class Program
             case "check":
                 return await CheckAsync(cli).ConfigureAwait(false);
 
+            case "secret":
+                return Secret(cli);
+
             case "sim":
                 return await RunAsync(cli, simulate: true).ConfigureAwait(false);
 
             default:
                 return await RunAsync(cli, simulate: false).ConfigureAwait(false);
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // 凭据工具
+    // ------------------------------------------------------------------
+
+    /// <summary>
+    /// <c>uic secret</c>：生成密封密钥、把明文封成 <c>enc:v1:</c> 密文。
+    ///
+    /// 刻意不提供「打印明文」的反向命令：能打印一次，就会有人把它贴进工单与聊天记录。
+    /// 需要验证密文能否解开时用 <c>uic check</c>。
+    /// </summary>
+    private static int Secret(CliOptions cli)
+    {
+        switch (cli.SecretAction)
+        {
+            case "keygen":
+                return SecretKeygen(cli);
+
+            case "seal":
+                return SecretSeal(cli);
+
+            default:
+                Console.Error.WriteLine("uic secret needs an action: keygen | seal");
+                Console.Error.WriteLine();
+                Console.Error.WriteLine(CliOptions.Usage);
+                return 64;
+        }
+    }
+
+    private static int SecretKeygen(CliOptions cli)
+    {
+        var text = Secrets.EncodeKey(Secrets.GenerateKey());
+
+        if (cli.OutPath is null)
+        {
+            Console.WriteLine(text);
+            Console.Error.WriteLine(
+                $"save this to a file only the owner can read, then export {Secrets.KeyFileVariable}=<file>");
+            return 0;
+        }
+
+        var full = Path.GetFullPath(cli.OutPath);
+        var dir = Path.GetDirectoryName(full);
+        if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
+
+        File.WriteAllText(full, text + "\n");
+        RestrictPermissions(full);
+
+        Console.WriteLine($"key written to {full}");
+        Console.WriteLine($"export {Secrets.KeyFileVariable}={full}");
+        return 0;
+    }
+
+    private static int SecretSeal(CliOptions cli)
+    {
+        var lookup = cli.KeyFile is null
+            ? SecretLookup.Default
+            : new SecretLookup
+            {
+                KeyText = () => File.Exists(cli.KeyFile) ? File.ReadAllText(cli.KeyFile) : null,
+            };
+
+        if (!Secrets.TryParseKey(lookup.KeyText(), out var key, out var keyError))
+        {
+            Console.Error.WriteLine(keyError);
+            return 2;
+        }
+
+        var plaintext = Console.IsInputRedirected ? Console.In.ReadToEnd() : ReadSecretFromConsole();
+
+        // 行尾换行是 shell 与编辑器的副产物，不属于口令本身。
+        plaintext = plaintext.TrimEnd('\r', '\n');
+
+        if (plaintext.Length == 0)
+        {
+            Console.Error.WriteLine("no secret on stdin; pipe the value in or type it");
+            return 64;
+        }
+
+        Console.WriteLine(Secrets.Seal(plaintext, key));
+        return 0;
+    }
+
+    /// <summary>交互式输入不回显：口令出现在终端回滚缓冲区里同样是泄露。</summary>
+    private static string ReadSecretFromConsole()
+    {
+        Console.Error.Write("secret value: ");
+        var buffer = new System.Text.StringBuilder();
+
+        while (true)
+        {
+            var key = Console.ReadKey(intercept: true);
+
+            if (key.Key == ConsoleKey.Enter) break;
+            if (key.Key == ConsoleKey.Backspace)
+            {
+                if (buffer.Length > 0) buffer.Length--;
+                continue;
+            }
+
+            if (!char.IsControl(key.KeyChar)) buffer.Append(key.KeyChar);
+        }
+
+        Console.Error.WriteLine();
+        return buffer.ToString();
+    }
+
+    private static void RestrictPermissions(string path)
+    {
+        if (OperatingSystem.IsWindows()) return;
+
+        const UnixFileMode ownerOnly = UnixFileMode.UserRead | UnixFileMode.UserWrite;
+
+        try
+        {
+            File.SetUnixFileMode(path, ownerOnly);
+
+            // 有些文件系统（exFAT、部分 FUSE/NTFS 挂载）根本不记录权限位。
+            // 这时静默成功等于谎报：密钥文件实际对所有用户可读。
+            if (File.GetUnixFileMode(path) != ownerOnly)
+            {
+                Console.Error.WriteLine(
+                    $"warning: {path} does not keep unix permissions (filesystem ignores them); " +
+                    "move the key to a filesystem that does, or mount it as a container secret");
+            }
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or PlatformNotSupportedException)
+        {
+            Console.Error.WriteLine($"warning: could not restrict permissions on {path}: {ex.Message}");
         }
     }
 
@@ -75,10 +209,26 @@ internal static class Program
             var json = await File.ReadAllTextAsync(path).ConfigureAwait(false);
             var doc = ConfigStore.Parse(json, path);
 
+            // 凭据引用要真的解析得出来。语法、环境变量、密钥文件任一不对，
+            // 这里就失败——部署前的静态检查必须比启动更早发现问题。
+            var secretProblems = Secrets.Validate(doc);
+            if (secretProblems.Count > 0)
+            {
+                Console.Error.WriteLine($"invalid: {path}");
+                Console.Error.WriteLine($"  credentials are not usable ({secretProblems.Count} problem(s))");
+                foreach (var problem in secretProblems)
+                    Console.Error.WriteLine($"    {problem}");
+
+                return 2;
+            }
+
             Console.WriteLine($"ok: {path}");
             Console.WriteLine($"  site: {doc.Site}");
             Console.WriteLine($"  channels: {doc.Channels.Count}, devices: {doc.Devices.Count}, " +
                               $"points: {doc.Devices.Sum(d => d.Points.Count)}");
+
+            foreach (var line in Secrets.Describe(doc))
+                Console.WriteLine($"  secret {line}");
 
             var northbound = new List<string>();
             if (doc.Northbound.Rest.Enabled) northbound.Add($"rest({doc.Northbound.Rest.Listen})");
@@ -225,6 +375,15 @@ internal static class Program
                 loggerFactory,
                 ring).ConfigureAwait(false);
         }
+        catch (ConfigException ex)
+        {
+            // 配置类失败是「运维改一下就能好」的错误，不该以 1（未预期异常）退出：
+            // 部署脚本靠退出码区分「配置非法」与「进程崩溃」。
+            Console.Error.WriteLine("invalid configuration:");
+            Console.Error.WriteLine(ex.ToDetailedString());
+            if (simulator is not null) await simulator.DisposeAsync().ConfigureAwait(false);
+            return 2;
+        }
         catch (Exception ex)
         {
             log.LogCritical(ex, "gateway failed to start");
@@ -235,13 +394,8 @@ internal static class Program
         var rest = runtime.CurrentConfig.Northbound.Rest;
         if (!string.IsNullOrWhiteSpace(cli.Listen))
         {
-            rest = new RestOptions
-            {
-                Enabled = rest.Enabled,
-                Listen = cli.Listen,
-                Token = rest.Token,
-                StaticRoot = rest.StaticRoot,
-            };
+            // RestOptions 是 record：克隆一份只改监听地址，新增字段不会被漏拷。
+            rest = rest with { Listen = cli.Listen };
         }
 
         var app = builder.Build();

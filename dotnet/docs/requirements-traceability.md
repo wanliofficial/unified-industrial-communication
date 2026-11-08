@@ -11,7 +11,7 @@
 它们不是 §6.1「不做」清单里的项，属于真实缺口；逐协议现状、原因与补法见
 [protocol-status.md](protocol-status.md)。
 
-当前测试基线：**199 passed / 0 failed / 1 skipped**（跳过的是需要 `--opcua` 的 OPC UA 端到端用例）。
+当前测试基线：**209 passed / 0 failed / 1 skipped**（跳过的是需要 `--opcua` 的 OPC UA 端到端用例）。
 
 ## 1. 采集（FR-COL）
 
@@ -102,7 +102,7 @@
 | FR-OPS-06 | 健康检查三级（live/ready/business） | 已实现 | `/healthz`、`/readyz`、`/api/v1/health`；`contract/health_and_version_are_public` |
 | FR-OPS-07 | 诊断包（脱敏配置 + 日志 + 指标 + 版本） | 已实现 | `GET /api/v1/diagnostics/bundle` 与命令 `diag.bundle` 共用 `DiagnosticsBundle.Build`；`mqtt/command_diag_bundle_is_whitelisted` |
 | FR-OPS-08 | 远程命令白名单 | 已实现 | `contract/*` 与 `mqtt/command_unknown_action_returns_error`、`mqtt/command_privileged_action_is_forbidden`；REST/MQTT 共用 `CommandExecutor` |
-| FR-OPS-09 | 凭据加密存储 | 刻意没做（M） | 配置里的 token/口令是明文。**这是 PRD 安全红线之一**，见文末 |
+| FR-OPS-09 | 凭据加密存储 | 已实现 | 凭据字段（`northbound.rest.token` / `northbound.mqtt.password`）只接受引用：`${env:NAME}`、`${file:PATH}`、`enc:v1:...`（AES-256-GCM，密钥来自 `UIC_SECRET_KEY` / `UIC_SECRET_KEY_FILE`）。明文在 `uic check`、启动、`config/validate`、`config/apply` 四处被拒并指出字段路径；落盘版本、diff、导出、诊断包与 `GET /api/v1/config` 只有引用或 `***`。`uic secret keygen|seal` 提供密钥与密封；`secret/*`（9 条）与 `contract/plaintext_credentials_are_rejected` 覆盖解析失败硬失败、篡改拒绝与明文拒绝 |
 | FR-OPS-10 | TLS（API 与北向） | 刻意没做（M） | 由反向代理 / stunnel 终结；本仓库只监听明文端口 |
 | FR-OPS-11 | 日志（结构化、分级、轮转） | 已实现 | 控制台 + 内存环形缓冲 + 可选 JSON 行文件日志：字段 `ts/level/category/msg/device/exception`，按 `logging.file.maxBytes` 轮转、保留 `retain` 份；支持热更新开关：`logs/json_line_fields_are_complete`、`logs/file_rotates_without_losing_lines`、`logs/retention_prunes_old_archives`、`logs/reconfigure_stops_writing` |
 
@@ -138,35 +138,36 @@
 | 掉电配置完整性 | 100% | 已实现（机制） | 临时文件 + `Flush(flushToDisk: true)` + `File.Move(overwrite)` |
 | 故障注入矩阵 12 类 | 全通过 | 部分实现 | 连接拒绝/中断/超时/半包/错 CRC/异常码/部分响应/慢响应/Broker 断线都有用例；磁盘满、时钟跳变、进程假死属环境级，未自动化 |
 | 安全：认证默认开启 | — | 不满足 | 未配置 token 时明确告警但不阻断（本机调试场景） |
-| 安全：配置文件无明文口令 | 红线 | 不满足 | 见 FR-OPS-09 |
+| 安全：配置文件无明文口令 | 红线 | 满足 | 凭据字段只接受 `${env:}` / `${file:}` / `enc:v1:`，`check`、启动、`config/validate`、`config/apply` 四处拒绝明文；`secret/*`（9 条）与 `contract/plaintext_credentials_are_rejected` |
 | 安全：未认证即可写点位 | 红线 | 满足（配置了 token 时） | 写端点走鉴权中间件；不配 token 时等同于开放 |
 | 安全：诊断包含凭据 | 红线 | 满足 | `Redact` 把 `token`/`password`/`secret` 替换为 `***`，`contract/config_is_redacted` 验证 |
-| 安全：脱敏配置回写不降级凭据 | — | 满足 | `apply`/`import` 把同路径的 `***` 还原成当前值，显式空串仍表示清空；`config/redacted_secrets_are_restored`、`contract/apply_keeps_redacted_secrets` |
+| 安全：脱敏配置回写不降级凭据 | — | 满足 | `apply`/`import` 把同路径的 `***` 还原成**当前引用**（不是明文），显式空串仍表示清空；`config/redacted_secrets_are_restored`、`contract/apply_keeps_redacted_secrets` |
 | 可观测：日志字段 | `ts/level/msg/device/...` | 已实现 | 环形缓冲与 JSON 行文件共用同一套字段：`ts/level/category/msg/device/exception`；`logs/json_line_fields_are_complete` |
 | 兼容：配置向后兼容 ≥2 大版本 | 自动迁移 | 已实现（现有 v0 形状） | `ConfigMigrations` 覆盖 7 条 v0 规则（server.listen/token、storage.dir、mqtt.broker、channels[].concurrency、channels[].transport 对象、serial.stopBits、devices[].channel）；`config/migrates_v0_legacy_shapes` 逐项断言迁移结果，`config/migration_is_explicit_and_versioned` 验证升级项回显与「更新版本拒绝启动」。仓库只有 v1，尚不存在第二个历史主版本可测 |
 | 兼容：浏览器最近 2 个版本 | Chrome/Edge/Firefox | 已实现 | `scripts/wasm-smoke.sh` 在 Playwright 里各跑一遍：Chromium（同一引擎覆盖 Chrome/Edge，首屏约 14 s）与 Firefox（Gecko，约 34 s），两条都走完「首屏 + 新建一台设备」并被断言；Safari/WebKit 未装，用 `--browser webkit` 可补跑 |
 | 可维护：单文件 ≤600 行 | — | 已实现 | 新增端点都拆成 `RestApi.*.cs` partial |
 | 可维护：依赖数量 ≤10 | 直接依赖 | 已实现 | 生产 4 个（日志抽象、串口、OPC UA Server/Configuration）+ ASP.NET Core 框架引用；测试 1 个 |
-| 构建/测试时间 | ≤60 s / ≤120 s | 已实现 | 全量构建约 20 s，测试约 53 s（199 条） |
+| 构建/测试时间 | ≤60 s / ≤120 s | 已实现 | 全量构建约 20 s；测试空载约 76 s（209 条），机器有其它负载时量到 119 s，仍在门槛内 |
 
 ## 9. 与 PRD 安全红线的差距
 
-PRD `06-nfr.md` §4 列了五条红线，首版**有意**只满足其中三条：
+PRD `06-nfr.md` §4 列了五条红线。凭据落盘这一条在本版补齐后，剩下的是「认证是否
+默认开启」：
 
 | 红线 | 首版 | 怎么补 |
 |---|---|---|
 | 存在默认口令 | **没有账号体系，因此也没有默认口令**（形式上满足，实质上是把问题推给了「必须配 token」） | 引入账号库时同时引入首次改密流程 |
-| 配置文件含明文口令 | **不满足**：`northbound.rest.token` 与 MQTT 口令是明文 | 配置字段标记为 `secret`，写入前用 AES-GCM 加密，密钥来自环境变量或系统密钥环 |
+| 配置文件含明文口令 | **满足**：`token`/`password` 只接受引用，明文在检查、启动与两条配置写入路径上都被拒 | — |
 | 未认证即可写点位 | 配了 token 就满足；不配则公开（启动告警） | 把「无 token」从告警改成拒绝启动，或仅允许 `127.0.0.1` 绑定 |
 | 依赖含 GPL/AGPL | 满足 | — |
 | 诊断包含凭据 | 满足 | — |
 
-这份差距是**首版范围的取舍**，不是实现疏漏：PRD §6.1 把账号、RBAC、TLS 都放在了「不做」里。
-把这三条补上之后，FR-OPS-02/03/04/09/10 才能从「刻意没做」转为「已实现」。
+剩下的差距是**首版范围的取舍**，不是实现疏漏：PRD §6.1 把账号、RBAC、TLS 都放在了
+「不做」里。把认证与账号补上之后，FR-OPS-02/03/04/10 才能从「刻意没做」转为「已实现」。
 
 ## 10. 怎么用这份表
 
-- 评审时按行看「状态」列，不要按「需求优先级」看：`M` 里也有刻意没做的（FR-OPS-02/09/10），`S`/`C` 里也有已实现的；
+- 评审时按行看「状态」列，不要按「需求优先级」看：`M` 里也有刻意没做的（FR-OPS-02/10），`S`/`C` 里也有已实现的；
 - 要复现某条证据：`dotnet run --project tests/Uic.Tests -- --filter <用例名>`；
 - 要补某条：先看「补法」，再看 [implementation-notes.md](implementation-notes.md) 的扩展点章节；
 - 新增 FR 或改变状态时，**同一提交里**更新这份表与 `testing.md` 的用例计数。

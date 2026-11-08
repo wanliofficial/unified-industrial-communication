@@ -37,7 +37,7 @@ public sealed class NorthboundOptions
     public OpcUaOptions OpcUa { get; init; } = new();
 }
 
-public sealed class RestOptions
+public sealed record RestOptions
 {
     public bool Enabled { get; init; } = true;
     public string Listen { get; init; } = "0.0.0.0:8080";
@@ -49,7 +49,7 @@ public sealed class RestOptions
     public string? StaticRoot { get; init; }
 }
 
-public sealed class MqttOptions
+public sealed record MqttOptions
 {
     public bool Enabled { get; init; }
     public string Host { get; init; } = "127.0.0.1";

@@ -32,6 +32,15 @@ internal static class ContractTests
 {
     private const string Token = "contract-token";
 
+    /// <summary>
+    /// 配置里的凭据只能是引用。用例把一个真实值放进环境变量，
+    /// 这样走的是与生产完全相同的解析路径（而不是在内存里塞明文绕过校验）。
+    /// </summary>
+    public const string TokenVariable = "UIC_CONTRACT_TOKEN";
+
+    /// <summary>配置里保存的凭据引用；明文只通过环境变量注入。</summary>
+    private static readonly string TokenRef = "${env:" + TokenVariable + "}";
+
     public static void Register(List<TestCase> tests)
     {
         tests.Add(new TestCase("contract/health_and_version_are_public", HealthAndVersionArePublic));
@@ -44,6 +53,7 @@ internal static class ContractTests
         tests.Add(new TestCase("contract/unknown_device_returns_error_envelope", UnknownDeviceReturnsEnvelope));
         tests.Add(new TestCase("contract/config_is_redacted", ConfigIsRedacted));
         tests.Add(new TestCase("contract/config_validate_reports_problems", ConfigValidateReportsProblems));
+        tests.Add(new TestCase("contract/plaintext_credentials_are_rejected", PlaintextCredentialsAreRejected));
         tests.Add(new TestCase("contract/write_returns_per_point_results", WriteReturnsPerPointResults));
         tests.Add(new TestCase("contract/single_point_write_is_idempotent", SinglePointWriteIsIdempotent));
         tests.Add(new TestCase("contract/template_instantiates_and_applies_devices", TemplateInstantiatesAndApplies));
@@ -79,6 +89,10 @@ internal static class ContractTests
 
         public static async Task<Host> StartAsync(TestContext t, Func<ConfigDocument>? config = null)
         {
+            // 配置里只有 ${env:UIC_CONTRACT_TOKEN}，真实值放进程环境：
+            // 与现场「环境注入」走同一条解析路径，也让用例无法绕过明文校验。
+            Environment.SetEnvironmentVariable(TokenVariable, Token);
+
             var ring = new RingBufferLogProvider(128);
             var logs = LoggerFactory.Create(builder =>
             {
@@ -189,7 +203,7 @@ internal static class ContractTests
                 // 真实绑定由 Kestrel 的 UseUrls("...:0") 决定；这个字段只是配置里的声明，
                 // 校验器不接受 0 号端口，所以填一个合法值。
                 Listen = "127.0.0.1:18080",
-                Token = Token,
+                Token = TokenRef,
             },
         },
         Storage = new StorageOptions
@@ -364,8 +378,10 @@ internal static class ContractTests
             t.Equal(true, root.GetProperty("applied").GetBoolean(), "the config is applied");
 
             var current = host.Runtime.CurrentConfig;
-            t.Equal(Token, current.Northbound.Rest.Token,
-                "the token survives the redacted round-trip");
+            t.Equal(TokenRef, current.Northbound.Rest.Token,
+                "the reference survives the redacted round-trip (the file keeps no plaintext)");
+            t.Equal(Token, host.Runtime.CreateNorthboundContext().Rest.Token,
+                "the reference still resolves to the real token");
             t.Equal("改名后的设备", current.Devices[0].Name, "the intended edit is applied");
             t.Equal(devices.Length, current.Devices.Count, "no device was added or dropped");
         });
@@ -705,9 +721,15 @@ internal static class ContractTests
             // 差异接口会展示字段值；轮换令牌后，前后值都不能是明文。
             var from = root.GetProperty("version").GetString()!;
             var edited = JsonNode.Parse(config.GetRawText())!.AsObject();
-            edited["northbound"]!["rest"]!["token"] = "rotated-token";
+            edited["northbound"]!["rest"]!["token"] = "${env:UIC_CONTRACT_ROTATED_TOKEN}";
 
-            await host.Client.SendAsync(Post("/api/v1/config/apply", edited.ToJsonString()), t.Ct);
+            Environment.SetEnvironmentVariable("UIC_CONTRACT_ROTATED_TOKEN", "rotated-token");
+
+            using var rotated = await ReadJsonAsync(t, await host.Client.SendAsync(
+                Post("/api/v1/config/apply", edited.ToJsonString()), t.Ct));
+            t.Equal(true, rotated.RootElement.GetProperty("applied").GetBoolean(), "the rotated reference applies");
+            t.Ok(!rotated.RootElement.GetRawText().Contains("rotated-token", StringComparison.Ordinal),
+                "the response never contains the plaintext token");
 
             using var diff = await ReadJsonAsync(t, await host.Client.SendAsync(
                 Get($"/api/v1/config/diff?from={from}"), t.Ct));
@@ -759,6 +781,49 @@ internal static class ContractTests
             // 语法错误走的是另一条路径（JSON 解析），必须是 422 而不是 500。
             var broken = await host.Client.SendAsync(Post("/api/v1/config/validate", "{ nope"), t.Ct);
             t.Equal((HttpStatusCode)422, broken.StatusCode, "malformed JSON is an unprocessable entity");
+        });
+    }
+
+    /// <summary>
+    /// 明文凭据在 apply 与 validate 两处都要被拒（FR-OPS-09 的红线在 API 上同样成立）。
+    /// 422 + 带字段路径的问题清单，调用方才知道该改哪个字段。
+    /// </summary>
+    private static Task PlaintextCredentialsAreRejected(TestContext t)
+    {
+        return RunAsync(async () =>
+        {
+            await using var host = await Host.StartAsync(t);
+
+            using var plaintext = JsonDocument.Parse(JsonDefaults.ToJson(BuildConfig()));
+            var edited = JsonNode.Parse(plaintext.RootElement.GetRawText())!.AsObject();
+            edited["northbound"]!["rest"]!["token"] = "hunter2";
+
+            var body = "{\"config\": " + edited.ToJsonString() + "}";
+
+            using (var validated = await ReadJsonAsync(t,
+                       await host.Client.SendAsync(Post("/api/v1/config/validate", body), t.Ct)))
+            {
+                t.Equal(false, validated.RootElement.GetProperty("valid").GetBoolean(),
+                    "validate refuses a plaintext token");
+                t.Ok(validated.RootElement.GetProperty("problems").EnumerateArray()
+                        .Any(p => p.GetString()!.Contains("northbound.rest.token", StringComparison.Ordinal)),
+                    "the problem names the credential field");
+            }
+
+            var applied = await host.Client.SendAsync(Post("/api/v1/config/apply", body), t.Ct);
+            t.Equal((HttpStatusCode)422, applied.StatusCode, "apply refuses it before touching the runtime");
+
+            using var error = JsonDocument.Parse(await applied.Content.ReadAsStringAsync(t.Ct));
+            t.Equal("config.invalid", error.RootElement.GetProperty("error").GetProperty("code").GetString(),
+                "the error uses the config envelope");
+            t.Ok(error.RootElement.GetProperty("error").GetProperty("details").EnumerateArray()
+                    .Any(d => d.GetProperty("path").GetString() == "northbound.rest.token"),
+                "the error points at the token field");
+
+            // 失败的 apply 不能留下任何副作用：设备与令牌都还是原来的。
+            t.Equal("${env:" + TokenVariable + "}",
+                host.Runtime.CurrentConfig.Northbound.Rest.Token,
+                "the stored configuration is unchanged");
         });
     }
 
@@ -1175,10 +1240,12 @@ internal static class ContractTests
 
             await WaitForPointAsync(host, "console-1", "value", t);
 
-            // 脱敏占位符必须被换回真实令牌：否则下一次重启就用 "***" 当凭据。
+            // 脱敏占位符必须被换回原来的引用：否则下一次重启就把 "***" 当凭据了。
             // GET /config 永远会再脱敏一次，所以直接看生效的配置对象。
-            t.Equal(Token, host.Runtime.CurrentConfig.Northbound.Rest.Token,
-                "the redacted placeholder is restored before the config is stored");
+            t.Equal(TokenRef, host.Runtime.CurrentConfig.Northbound.Rest.Token,
+                "the redacted placeholder is restored to the reference before the config is stored");
+            t.Equal(Token, host.Runtime.CreateNorthboundContext().Rest.Token,
+                "the effective token is still the resolved value");
             t.Ok(host.Runtime.CurrentConfig.Devices.Any(d => d.Id == "console-1"),
                 "the new device is part of the effective configuration");
         });

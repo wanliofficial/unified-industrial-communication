@@ -70,15 +70,15 @@ internal sealed class TestContext
             throw new CheckFailedException($"{what}: '{needle}' not found in <{Shorten(haystack)}>");
     }
 
-    public void Throws<TException>(Action action, string what) where TException : Exception
+    public TException Throws<TException>(Action action, string what) where TException : Exception
     {
         try
         {
             action();
         }
-        catch (TException)
+        catch (TException expected)
         {
-            return;
+            return expected;
         }
         catch (Exception ex)
         {
@@ -89,15 +89,15 @@ internal sealed class TestContext
         throw new CheckFailedException($"{what}: expected {typeof(TException).Name}, nothing was thrown");
     }
 
-    public async Task ThrowsAsync<TException>(Func<Task> action, string what) where TException : Exception
+    public async Task<TException> ThrowsAsync<TException>(Func<Task> action, string what) where TException : Exception
     {
         try
         {
             await action().ConfigureAwait(false);
         }
-        catch (TException)
+        catch (TException expected)
         {
-            return;
+            return expected;
         }
         catch (Exception ex)
         {

@@ -9,10 +9,13 @@ namespace Uic.Host;
 public sealed record CliOptions
 {
     public string Command { get; init; } = "run";
+    public string? SecretAction { get; init; }
     public string? ConfigPath { get; init; }
     public string? DataDir { get; init; }
     public string? Listen { get; init; }
     public string? WebRoot { get; init; }
+    public string? OutPath { get; init; }
+    public string? KeyFile { get; init; }
     public int SimPort { get; init; } = 15020;
     public bool Verbose { get; init; }
 
@@ -23,6 +26,8 @@ public sealed record CliOptions
           uic run   [--config <file>] [--data <dir>] [--listen <host:port>] [--web <dir>] [-v]
           uic sim   [--port <modbus-port>] [--data <dir>] [--listen <host:port>] [-v]
           uic check [--config <file>]
+          uic secret keygen [--out <file>]          # 生成 32 字节密封密钥（0600）
+          uic secret seal [--key-file <file>]       # 从 stdin 读明文，输出 enc:v1:...
           uic version
 
         选项:
@@ -31,6 +36,8 @@ public sealed record CliOptions
           --listen <addr>   覆盖 northbound.rest.listen
           --web <dir>       覆盖前端静态资源目录
           --port <n>        sim 模式内置 Modbus 从站端口，默认 15020
+          --out <file>      keygen 的密钥输出路径；缺省时打印到 stdout
+          --key-file <file> seal 使用的密钥文件（缺省读 UIC_SECRET_KEY / UIC_SECRET_KEY_FILE）
           -v, --verbose     以 Debug 级别输出日志
           -h, --help        显示本帮助
 
@@ -43,10 +50,13 @@ public sealed record CliOptions
     public static CliOptions Parse(string[] args)
     {
         var command = "run";
+        string? secretAction = null;
         string? config = null;
         string? data = null;
         string? listen = null;
         string? web = null;
+        string? outPath = null;
+        string? keyFile = null;
         var port = 15020;
         var verbose = false;
 
@@ -62,6 +72,14 @@ public sealed record CliOptions
 
                 case "-check" or "check":
                     command = "check";
+                    break;
+
+                case "secret":
+                    command = "secret";
+                    break;
+
+                case "keygen" or "seal":
+                    secretAction = arg;
                     break;
 
                 case "run" or "sim" or "version":
@@ -88,6 +106,14 @@ public sealed record CliOptions
                     web = Next(args, ref i, arg);
                     break;
 
+                case "--out":
+                    outPath = Next(args, ref i, arg);
+                    break;
+
+                case "--key-file":
+                    keyFile = Next(args, ref i, arg);
+                    break;
+
                 case "--port":
                     port = int.TryParse(Next(args, ref i, arg), out var p) ? p : port;
                     break;
@@ -97,6 +123,8 @@ public sealed record CliOptions
                     else if (arg.StartsWith("--data=", StringComparison.Ordinal)) data = arg["--data=".Length..];
                     else if (arg.StartsWith("--listen=", StringComparison.Ordinal)) listen = arg["--listen=".Length..];
                     else if (arg.StartsWith("--web=", StringComparison.Ordinal)) web = arg["--web=".Length..];
+                    else if (arg.StartsWith("--out=", StringComparison.Ordinal)) outPath = arg["--out=".Length..];
+                    else if (arg.StartsWith("--key-file=", StringComparison.Ordinal)) keyFile = arg["--key-file=".Length..];
                     else if (arg.StartsWith("--port=", StringComparison.Ordinal))
                         port = int.TryParse(arg["--port=".Length..], out var p2) ? p2 : port;
 
@@ -111,10 +139,13 @@ public sealed record CliOptions
         return new CliOptions
         {
             Command = command,
+            SecretAction = secretAction,
             ConfigPath = config,
             DataDir = data,
             Listen = listen,
             WebRoot = web,
+            OutPath = outPath,
+            KeyFile = keyFile,
             SimPort = port,
             Verbose = verbose,
         };

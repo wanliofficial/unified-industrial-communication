@@ -33,14 +33,23 @@ public static partial class RestApi
         {
             var (text, _) = await ReadConfigTextAsync(http, ct).ConfigureAwait(false);
 
-            // 这里刻意不抛异常：校验的产出就是「问题清单」，包括 JSON 语法错误。
-            var parsed = ConfigStore.TryParse(text, "request", out _, out var problems);
+            // 与 apply 走同一条还原路径：客户端提交的通常是 GET /config 读到的脱敏文档，
+            // 不还原的话 "***" 会被当成明文凭据，校验结果与真正的 apply 对不上。
+            var restored = RedactedSecrets.Restore(text, ctx.Control.CurrentConfig);
 
-            var valid = parsed && problems.Count == 0;
+            // 这里刻意不抛异常：校验的产出就是「问题清单」，包括 JSON 语法错误。
+            var parsed = ConfigStore.TryParse(restored, "request", out var doc, out var problems);
+
+            var all = problems.ToList();
+
+            // 凭据引用必须真的能解析：语法对、但环境变量没注入，apply 一样会失败。
+            if (parsed && doc is not null) all.AddRange(Secrets.Validate(doc));
+
+            var valid = parsed && all.Count == 0;
 
             return Results.Json(new ValidateResponseDto(
                 valid,
-                problems.Select(p => p.ToString()).ToArray()), ApiJson.Options);
+                all.Select(p => p.ToString()).ToArray()), ApiJson.Options);
         });
 
         app.MapPost("/api/v1/config/apply", async (HttpContext http, CancellationToken ct) =>

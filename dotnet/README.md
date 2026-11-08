@@ -74,6 +74,8 @@ scripts/wasm-smoke.sh --browser firefox   # 换引擎（默认 chromium）
 uic run   [--config <file>] [--data <dir>] [--listen <host:port>] [--web <dir>] [-v]
 uic sim   [--port <modbus-port>] [--data <dir>] [--listen <host:port>] [-v]
 uic check [--config <file>]
+uic secret keygen [--out <file>]          # 生成 32 字节密封密钥（仅属主可读）
+uic secret seal [--key-file <file>]       # 从 stdin 读明文，输出 enc:v1:...
 uic version
 ```
 
@@ -91,7 +93,33 @@ invalid: /etc/uic/gateway.json
   - site: must match ^[a-z][a-z0-9-]{1,31}$
   - devices[d1].channelId: channel 'missing' not found
   - devices[d1].points: at least one point is required
+  - northbound.rest.token: plaintext credentials are not allowed; use ${env:NAME}, ...
 ```
+
+## 凭据
+
+配置里的 `northbound.rest.token` 与 `northbound.mqtt.password` 不接受明文，
+只接受三种写法之一：
+
+```jsonc
+{ "token": "${env:UIC_REST_TOKEN}" }              // 环境变量（compose / systemd / K8s）
+{ "token": "${file:/run/secrets/rest_token}" }    // 文件（Docker secret 的挂载方式）
+{ "token": "enc:v1:AQID..." }                     // AES-256-GCM 密文
+```
+
+```bash
+export UIC_REST_TOKEN='...'
+uic secret keygen --out /etc/uic/secret.key      # 0600；文件系统不记录权限时会告警
+uic check --config gateway.json                  # 逐项打印引用来源，确认都解析得出来
+```
+
+密钥从 `UIC_SECRET_KEY`（base64/hex）或 `UIC_SECRET_KEY_FILE` 读取。引用解析
+失败——环境变量没注入、密钥不对、密文被改过——启动与 `check` 都直接失败：
+令牌取不到时静默退化成空串等于关闭鉴权，那是最坏的一种失败。落盘、diff、导出
+与 `GET /api/v1/config` 里只有引用（读接口一律显示 `***`），明文只在进程内存里。
+
+旧配置里的明文令牌仍能被**读**（迁移用），但 `check`、启动与 `config/apply` 都会
+拒绝它并指出字段路径；先用 `uic secret seal` 加密或改成环境变量引用即可。
 
 ## 测试
 
@@ -105,7 +133,7 @@ dotnet run --project tests/Uic.Tests -- --opcua             # 额外跑 OPC UA �
 dotnet run --project tests/Uic.Tests -- --stop-on-fail
 ```
 
-正常情况下输出 `199 passed, 0 failed, 1 skipped`（跳过的是默认不启用的 OPC UA 用例）。
+正常情况下输出 `209 passed, 0 failed, 1 skipped`（跳过的是默认不启用的 OPC UA 用例）。
 黄金帧测试默认从仓库的 `testdata/golden/` 读取，可用 `UIC_TESTDATA` 指向别的目录。
 
 串口用例（T15–T18）会用 libc 开一对伪终端，在 Linux 上默认执行，其它平台报 `skip`；

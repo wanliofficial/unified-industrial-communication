@@ -50,6 +50,10 @@
   持久化上报队列（分区分位点、三重上限）；设备状态机 + 熔断 + 探活恢复；
   点位级采集周期（`point.interval` 覆盖设备周期，按周期分桶合并读取）；
   `retries` 重试（只重试临时性失败，重试前断开避免迟到帧；地址错不参与熔断）；指标 + 环形日志 + 可选 JSON 行文件日志（按大小轮转） + 诊断包。
+- **凭据**：配置里不落明文。`northbound.rest.token` / `northbound.mqtt.password`
+  只能是 `${env:NAME}`、`${file:PATH}` 或 `enc:v1:...`（AES-256-GCM，密钥来自
+  `UIC_SECRET_KEY` / `UIC_SECRET_KEY_FILE`）；`uic secret keygen|seal` 负责生成密钥与密封。
+  解析失败一律硬失败（空令牌等于关闭鉴权），明文只存在进程内存。
 - **控制台**：Uno WASM 六个页面（设备 / 驱动 / 点位 / 监控 / 日志 / 配置）；
   设备页可新建通道 + 设备（含首个点位），提交走 `config/validate` → `config/apply`。
 - **验收**：黄金帧 20 份（含 4 份数组帧）；T1–T18 全部有对应用例，其中 T15–T18 跑在 libc 开出来的
@@ -77,7 +81,7 @@
 | S7comm 主站、OPC UA 客户端、MQTT 南向取数 | **这三项在 PRD 里是 M 级要求，本版本没做**（不是 §6.1 的不做项）；驱动边界已收窄到 `IDriver`/`IConn`，补一个协议不需要动调度与北向 | 按 [protocol-status.md](protocol-status.md) 的五步接入，并补黄金帧 |
 | 账号体系与 RBAC 细粒度权限 | PRD §6.1 明确列为不做；首版只有单个 Bearer Token，「谁能做什么」由部署侧网络隔离兜底 | 引入用户库 + 角色表，在中间件里把 `require: 权限名` 落到每个端点；命令白名单同样按角色过滤 |
 | 审计日志的持久化与查询 | 命令与配置变更只进环形日志，重启即清空；审计需要「不可否认」的落盘存储与查询接口 | 把命令执行点与 `ApplyConfigAsync` 的入口写到追加文件或外部库，再补 `GET /api/v1/audit` |
-| TLS 终结与凭据加密 | REST/MQTT 都是明文，`northbound.rest.token` 与 MQTT 口令在配置里也是明文；证书轮换是独立运维负担 | 由反向代理 / stunnel 终结 TLS；配置侧引入 `secret` 字段并做 KMS 或本地密钥加密 |
+| TLS 终结 | REST/MQTT 都是明文端口，证书轮换也是独立运维负担 | 由反向代理 / stunnel 终结 TLS；确需内置时在 Kestrel 绑 `https`，`MqttClient` 接 `SslStream` |
 | 报警引擎与专用时序库 | 报警需要独立的状态机（阈值、抑制、确认）；专用时序库需要保留策略与索引，塞进采集进程会把边缘设备压垮 | 历史查询已先用 journal NDJSON 做了「时间范围 + 降采样 + 分页」的轻量实现（FR-NOR-08）；报警与更高数据量的保留策略仍按 PRD 路线图 Wave 2 单独立项 |
 | 计算点 / 订阅型协议（COV、事件、通知） | 计算点依赖「输入质量传播」的产品定义；订阅型协议在 Wave 2 | `Pipeline` 已留出质量传播点；驱动侧 `Capabilities.Subscribe` 已是四态声明，接入时按 `RuntimeDependent` 逐步放开 |
 | Sparkplug B、进程外驱动 | PRD §6.1 明确列为不做；进程外驱动需要稳定的 IPC 契约与进程生命周期管理 | Sparkplug 可作为一个 MQTT sink；进程外驱动按 `IDriver` 的进程内形状定义 IPC 协议后再拆 |

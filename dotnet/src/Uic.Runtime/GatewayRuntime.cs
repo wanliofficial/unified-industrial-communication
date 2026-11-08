@@ -68,6 +68,13 @@ public sealed class GatewayRuntime : IGatewayControl, IAsyncDisposable
     private JournalSink? _journal;
     private UicOpcUaServer? _opcUa;
     private ConfigDocument _config;
+
+    /// <summary>
+    /// 配置里的凭据只在内存中以明文存在。配置文档本身（落盘、diff、导出）始终带
+    /// 引用（<c>${env:...}</c> / <c>enc:v1:...</c>），明文只出现在这里。
+    /// </summary>
+    private ResolvedSecrets _secrets;
+
     private bool _historySuspended;
     private int _disposed;
 
@@ -89,6 +96,11 @@ public sealed class GatewayRuntime : IGatewayControl, IAsyncDisposable
         _fileLog = fileLog;
         _store = store;
         _config = config;
+
+        // 凭据解析放在任何线程启动之前：环境变量没注入、密钥不对，就直接起不来，
+        // 而不是带着一个空令牌开始对外服务（空令牌等于关闭鉴权）。
+        _secrets = Secrets.Resolve(config);
+
         _log = logs.CreateLogger("uic.runtime");
         _metrics = new MetricsRegistry();
 
@@ -224,7 +236,9 @@ public sealed class GatewayRuntime : IGatewayControl, IAsyncDisposable
             _metrics,
             _ring,
             this,
-            restOverride ?? _config.Northbound.Rest,
+            // 覆盖只用于命令行的监听地址；令牌永远来自解析后的配置，
+            // 避免「--listen 覆盖」顺手把凭据也覆盖成未解析的引用。
+            (restOverride ?? _config.Northbound.Rest) with { Token = _secrets.RestToken },
             _config.Site,
             _gatewayVersion,
             _startedAt,
@@ -239,6 +253,10 @@ public sealed class GatewayRuntime : IGatewayControl, IAsyncDisposable
     {
         ModelValidator.ThrowIfInvalid(doc);
 
+        // 凭据在任何副作用发生之前解析：环境变量没注入、密钥不对，本次 apply 直接失败，
+        // 设备不会先重启一轮再告诉我们配置存不下。
+        var secrets = Secrets.Resolve(doc);
+
         await _applyGate.WaitAsync(ct).ConfigureAwait(false);
         try
         {
@@ -249,6 +267,7 @@ public sealed class GatewayRuntime : IGatewayControl, IAsyncDisposable
             var result = await _engine.ApplyAsync(doc).ConfigureAwait(false);
             var version = _store.Commit(doc, comment);
             _config = doc;
+            _secrets = secrets;
 
             if (before.Site != doc.Site)
             {
@@ -444,14 +463,18 @@ public sealed class GatewayRuntime : IGatewayControl, IAsyncDisposable
 
             if (mqtt.Enabled)
             {
-                var sink = new MqttSink(mqtt, config.Site, _logs.CreateLogger("uic.mqtt"));
+                // 只把解析后的口令交给客户端：MqttOptions 是 record，克隆一份即可，
+                // 配置文档本身保持不变（作业日志与导出里仍然是引用）。
+                var resolved = mqtt with { Password = _secrets.MqttPassword };
+
+                var sink = new MqttSink(resolved, config.Site, _logs.CreateLogger("uic.mqtt"));
 
                 MqttCommandSink? commands = null;
                 if (mqtt.Commands)
                 {
                     // 构造时登记订阅，因此必须在 sink.Start() 之前创建。
                     commands = new MqttCommandSink(
-                        sink.Client, mqtt, config.Site, this,
+                        sink.Client, resolved, config.Site, this,
                         _logs.CreateLogger("uic.mqtt.commands"));
                 }
 

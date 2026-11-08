@@ -54,7 +54,7 @@
     }
   ],
   "northbound": {
-    "rest": { "enabled": true, "listen": "0.0.0.0:8080", "token": "换成你的令牌" },
+    "rest": { "enabled": true, "listen": "0.0.0.0:8080", "token": "${env:UIC_REST_TOKEN}" },
     "mqtt": {
       "enabled": true,
       "host": "127.0.0.1",
@@ -294,7 +294,7 @@ RTU/ASCII 主站按 3.5 个字符时间做帧间静默（9600 bps 约 4 ms；>19
 |---|---|---|
 | `enabled` | `true` | |
 | `listen` | `0.0.0.0:8080` | `host:port`，端口 1..65535 |
-| `token` | 空 | Bearer 令牌；为空表示不鉴权（启动时会告警） |
+| `token` | 空 | Bearer 令牌；只能是凭据引用，见 [凭据](#凭据)。为空表示不鉴权（启动时会告警） |
 | `staticRoot` | 空 | 前端静态目录；为空时用宿主目录下的 `wwwroot` |
 
 ### `mqtt`
@@ -317,6 +317,48 @@ RTU/ASCII 主站按 3.5 个字符时间做帧间静默（9600 bps 约 4 ms；>19
 
 主题模板必须含 `{device}` 与 `{point}`，且以 `topicPrefix` 开头或含 `{site}` ——
 否则同一套主题可能把两个站点的数据混在一起。
+
+## 凭据
+
+`northbound.rest.token` 与 `northbound.mqtt.password` 是凭据字段。配置文件里
+**不允许出现明文**：启动、`uic check`、`config/validate` 与 `config/apply`
+都会拒绝，并指出具体字段路径。
+
+### 三种写法
+
+| 写法 | 例 | 取值来源 | 适用 |
+|---|---|---|---|
+| 环境变量 | `${env:UIC_REST_TOKEN}` | 进程环境 | compose / systemd `EnvironmentFile` / K8s `env` |
+| 文件 | `${file:/run/secrets/rest_token}` | 文件内容（去掉行尾换行） | Docker secret、K8s `secret` 挂载 |
+| 密文 | `enc:v1:AQID...` | AES-256-GCM，密钥见下 | 配置要能整体拷走、但不想让凭据以明文躺在文件里 |
+
+```bash
+export UIC_REST_TOKEN='...'          # 方式一
+uic check --config gateway.json      # 会打印每项引用的来源，确认都解析得出来
+
+uic secret keygen --out /etc/uic/secret.key   # 方式三：32 字节密钥，尽力设为 0600
+export UIC_SECRET_KEY_FILE=/etc/uic/secret.key
+printf '%s' '...' | uic secret seal  # 输出 enc:v1:...，把它填进配置
+```
+
+`uic secret keygen` 不带 `--out` 时打印到 stdout，便于
+`uic secret keygen > key.b64`。密钥也可以直接放在 `UIC_SECRET_KEY` 里
+（base64 或 hex，32 字节）。文件系统不记录权限位时（exFAT、部分 NTFS/FUSE
+挂载）keygen 会明确告警，而不是假装设成了 0600。
+
+### 解析失败必须硬失败
+
+环境变量拼错、密钥文件没挂上、密文被改动，都直接失败并说明原因。
+**不要**退回空串：空令牌等于关闭鉴权，那是最坏的一种「看起来正常」。
+
+### 明文只在内存里
+
+落盘的配置版本、`config/diff`、`config/export`、诊断包与 `GET /api/v1/config`
+里只有引用（读接口统一显示 `***`）；解析出的明文只存在进程内存中，`GET /api/v1/config`
+返回的 `***` 在提交时会被还原成原来的引用，而不是明文。
+
+旧配置里的明文令牌仍能被**读**（为了迁移），但任何一条生效路径都会拒绝它。
+迁移方式：改成 `${env:...}` / `${file:...}`，或用 `uic secret seal` 加密。
 
 命令主题与结果主题同样以 `topicPrefix` 开头或含 `{site}`。`commands` 默认关闭：
 这一版 MQTT 只有匿名明文，开启前请确认 Broker 侧已经做了网络隔离或 ACL。
@@ -489,10 +531,14 @@ data/
 原样保留、只是被忽略，等它们变成正式功能时再读，避免「升级即丢数据」。
 （`logging` 已是正式段落，不再属于这一类。）
 
+`server.token` 迁移成引用之前的明文令牌仍能读进来（迁移不能凭空造一个环境变量），
+但 `check`、启动与 apply 都会拒绝它，见 [凭据](#凭据)。
+
 ## 校验
 
 `uic check` 与 `POST /api/v1/config/validate` 走的是同一份校验器（`ModelValidator`），
-所以「控制台能存、重启起不来」不会发生。
+所以「控制台能存、重启起不来」不会发生。凭据引用由 `Secrets.Validate` 另外检查
+（环境变量是否存在、文件是否可读、密文能否解开），同样是两边一致。
 
 ```bash
 dotnet run --project src/Uic.Host -- check --config ./gateway.json
@@ -506,3 +552,14 @@ invalid: ./gateway.json
 ```
 
 一次列全所有问题，而不是遇到第一条就退出。
+
+成功时会额外打印每个凭据字段的来源（`environment variable X` / `file Y` /
+`sealed (enc:v1)` / `not set`），便于确认「配置里写的是哪个变量、它到底有没有注入」：
+
+```
+ok: ./gateway.json
+  site: demo-site
+  channels: 1, devices: 1, points: 2
+  secret northbound.rest.token: environment variable UIC_REST_TOKEN
+  secret northbound.mqtt.password: not set
+```
