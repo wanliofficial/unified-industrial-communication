@@ -52,6 +52,7 @@ internal static class ContractTests
         tests.Add(new TestCase("contract/config_import_migrates_legacy_shape", ConfigImportMigratesLegacy));
         tests.Add(new TestCase("contract/points_expose_effective_interval", PointsExposeEffectiveInterval));
         tests.Add(new TestCase("contract/points_expose_array_count_and_values", PointsExposeArrayCount));
+        tests.Add(new TestCase("contract/console_device_creation_flow", ConsoleDeviceCreationFlow));
     }
 
     // ------------------------------------------------------------------
@@ -1106,6 +1107,80 @@ internal static class ContractTests
                 config.GetProperty("northbound").GetProperty("mqtt").GetProperty("port").GetInt32(),
                 "the broker URL is split into port");
             t.Ok(!config.TryGetProperty("server", out _), "the legacy section is removed");
+        });
+    }
+
+    /// <summary>
+    /// 控制台「新建设备」的完整链路：读脱敏配置 → 追加通道与设备 → 校验 → 应用。
+    ///
+    /// 这里刻意按页面真实的调用顺序走 HTTP，而不是直接调用 <c>ApplyConfigAsync</c>：
+    /// 页面拼的是 JSON 文本，任何一处字段名或形状的偏差都只会在这一步暴露。
+    /// </summary>
+    private static Task ConsoleDeviceCreationFlow(TestContext t)
+    {
+        return RunAsync(async () =>
+        {
+            await using var host = await Host.StartAsync(t);
+
+            using var current = await ReadJsonAsync(t,
+                await host.Client.SendAsync(Get("/api/v1/config"), t.Ct));
+
+            // 页面拿到的就是这份脱敏配置：口令是 "***"。
+            var root = JsonNode.Parse(current.RootElement.GetProperty("config").GetRawText())!.AsObject();
+            t.Equal("***", root["northbound"]?["rest"]?["token"]?.ToString(), "the token is redacted");
+
+            t.Ok(ConfigDraft.AddChannel(root,
+                ConfigDraft.NewChannel("console-bus", null, "virtual")) is null,
+                "the console appends a channel");
+
+            t.Ok(ConfigDraft.AddDevice(root,
+                ConfigDraft.NewDevice("console-1", "控制台建的设备", "console-bus",
+                    TimeSpan.FromSeconds(1), 1,
+                    ConfigDraft.NewRegisterPoint("value", "值", "float64", "holding", 0))) is null,
+                "the console appends a device");
+
+            var text = root.ToJsonString(JsonDefaults.Indented);
+
+            using (var validation = await ReadJsonAsync(t,
+                       await host.Client.SendAsync(Post("/api/v1/config/validate", text), t.Ct)))
+            {
+                t.Equal(true, validation.RootElement.GetProperty("valid").GetBoolean(),
+                    "the drafted configuration validates: " +
+                    string.Join("; ", validation.RootElement.GetProperty("problems")
+                        .EnumerateArray().Select(p => p.GetString())));
+            }
+
+            var applied = await host.Client.SendAsync(Post("/api/v1/config/apply", text), t.Ct);
+            t.Equal(HttpStatusCode.OK, applied.StatusCode, "the drafted configuration applies");
+
+            using (var outcome = await ReadJsonAsync(t, applied))
+            {
+                t.Equal(true, outcome.RootElement.GetProperty("applied").GetBoolean(), "the config is applied");
+                t.Equal(1, outcome.RootElement.GetProperty("changed").GetProperty("devicesAdded").GetInt32(),
+                    "the device is reported as added");
+                t.Ok(outcome.RootElement.GetProperty("version").GetString()!.StartsWith('v'),
+                    "a new version is committed");
+            }
+
+            // 设备真的起来了：列表里能看到它，点位也能读到值。
+            using (var devices = await ReadJsonAsync(t,
+                       await host.Client.SendAsync(Get("/api/v1/devices"), t.Ct)))
+            {
+                var created = devices.RootElement.GetProperty("items").EnumerateArray()
+                    .SingleOrDefault(d => d.GetProperty("id").GetString() == "console-1");
+
+                t.Ok(created.ValueKind == JsonValueKind.Object, "the new device is listed");
+                t.Equal("console-bus", created.GetProperty("channel").GetString(), "it sits on the new channel");
+            }
+
+            await WaitForPointAsync(host, "console-1", "value", t);
+
+            // 脱敏占位符必须被换回真实令牌：否则下一次重启就用 "***" 当凭据。
+            // GET /config 永远会再脱敏一次，所以直接看生效的配置对象。
+            t.Equal(Token, host.Runtime.CurrentConfig.Northbound.Rest.Token,
+                "the redacted placeholder is restored before the config is stored");
+            t.Ok(host.Runtime.CurrentConfig.Devices.Any(d => d.Id == "console-1"),
+                "the new device is part of the effective configuration");
         });
     }
 

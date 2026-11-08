@@ -31,6 +31,7 @@ internal static class ConfigFeatureTests
         tests.Add(new TestCase("config/composite_durations_parse", CompositeDurationsParse));
         tests.Add(new TestCase("config/redacted_secrets_are_restored", RedactedSecretsAreRestored));
         tests.Add(new TestCase("config/repository_examples_validate", RepositoryExamplesValidate));
+        tests.Add(new TestCase("config/console_draft_builds_a_valid_document", ConsoleDraftBuildsValidDocument));
     }
 
     private static DeviceTemplate Template(string json)
@@ -546,6 +547,67 @@ internal static class ConfigFeatureTests
             t.Ok(parsed && problems.Count == 0 && document is not null,
                 $"{Path.GetFileName(file)} validates ({string.Join("; ", problems)})");
         }
+
+        return Task.CompletedTask;
+    }
+
+    /// <summary>
+    /// 控制台「新建设备」拼出来的配置必须是网关认得的配置。
+    ///
+    /// 页面在裁剪后的 WASM 里跑，既不能用 <c>ConfigStore</c> 也不能预演一次解析，
+    /// 所以这段拼装逻辑放在域层、由这里用真的解析器过一遍：如果字段名或时长写法漂了，
+    /// 现场表现会是「点创建就 422」，而不是编译错误。
+    /// </summary>
+    private static Task ConsoleDraftBuildsValidDocument(TestContext t)
+    {
+        var root = JsonNode.Parse(JsonDefaults.ToJson(DemoConfig.Build())) as JsonObject;
+        t.Ok(root is not null, "the demo configuration serializes to an object");
+
+        var channel = ConfigDraft.NewChannel("modbus-tcp-2", "二号链路", "modbus-tcp", "127.0.0.1", 15021);
+        t.Ok(ConfigDraft.AddChannel(root!, channel) is null, "a new channel is appended");
+
+        var device = ConfigDraft.NewDevice(
+            "meter-2", "电表 2", "modbus-tcp-2", TimeSpan.FromMilliseconds(500), 3,
+            ConfigDraft.NewRegisterPoint("voltage", "电压", "float32", "holding", 20));
+
+        t.Ok(ConfigDraft.AddDevice(root!, device) is null, "the device references the new channel");
+
+        // 真正的断言：页面拼出来的 JSON 交给网关自己的解析器仍然合法。
+        var document = ConfigStore.Parse(root!.ToJsonString(JsonDefaults.Indented), "console-draft");
+
+        var added = document.Devices.SingleOrDefault(d => d.Id == "meter-2");
+        t.Ok(added is not null, "the new device survives the round trip");
+        t.Equal(TimeSpan.FromMilliseconds(500), added!.Interval, "the duration keeps its value");
+        t.Equal(3, added.UnitId, "the unit id is kept");
+        t.Equal(1, added.Points.Count, "the first point is present");
+        t.Equal(DataType.Float32, added.Points[0].DataType, "the data type is parsed");
+        t.Equal("holding", added.Points[0].Address.Area, "the area is kept");
+        t.Equal(20, added.Points[0].Address.Offset, "the offset is kept");
+
+        var created = document.Channels.SingleOrDefault(c => c.Id == "modbus-tcp-2");
+        t.Ok(created is not null, "the channel is created");
+        t.Equal("tcp", created!.Transport, "the transport follows the protocol");
+
+        // 重名与悬空引用在这里就说清楚，而不是等网关回 422。
+        t.Contains(ConfigDraft.AddDevice(root, device) ?? string.Empty, "已存在",
+            "a duplicate device id is rejected");
+        t.Contains(
+            ConfigDraft.AddDevice(root, ConfigDraft.NewDevice(
+                "meter-3", null, "missing-bus", TimeSpan.FromSeconds(1), 1,
+                ConfigDraft.NewRegisterPoint("p", null, "uint16", "holding", 0))) ?? string.Empty,
+            "不存在", "an unknown channel is rejected");
+
+        var serial = ConfigDraft.NewChannel("rtu-1", null, "modbus-rtu", serialPort: "/dev/ttyS0", baud: 19200);
+        t.Equal("serial", serial["transport"]?.ToString(), "RTU uses the serial transport");
+        t.Equal("19200", serial["serial"]?["baud"]?.ToString(), "the baud rate is written");
+
+        t.Equal("none", ConfigDraft.NewChannel("v-1", null, "virtual")["transport"]?.ToString(),
+            "virtual needs no transport");
+
+        t.Equal("500ms", ConfigDraft.FormatDuration(TimeSpan.FromMilliseconds(500)),
+            "sub-second durations stay readable");
+        t.Equal("2m", ConfigDraft.FormatDuration(TimeSpan.FromMinutes(2)),
+            "minutes use the short form");
 
         return Task.CompletedTask;
     }

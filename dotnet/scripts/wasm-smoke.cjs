@@ -1,4 +1,5 @@
-// WASM 控制台的浏览器冒烟：真打开页面、真跑 WASM、真等 REST 数据。
+// WASM 控制台的浏览器冒烟：真打开页面、真跑 WASM、真等 REST 数据，
+// 再在设备页里真的建一台设备（校验 → 应用 → 列表刷新）。
 //
 // 为什么不用 curl 代替：curl 只能证明「静态文件发得出去」。
 // 裁剪后的 WASM 最容易出问题的地方恰恰在运行时——源生成序列化没覆盖到的类型、
@@ -75,7 +76,12 @@ async function main() {
       canvases: document.querySelectorAll('canvas').length,
     }));
 
-    return { page, pageErrors, consoleErrors, failedRequests, badResponses, bootMs, state };
+    // 第二层：真的在控制台里建一台设备。
+    // 首屏只证明「读得到」；表单证明「写得进」——它跨过 validate、apply、配置版本、
+    // 设备重启与列表刷新，是首开流程里唯一无法用 curl 代替的部分。
+    const form = await exerciseDeviceForm(page);
+
+    return { page, pageErrors, consoleErrors, failedRequests, badResponses, bootMs, state, form };
   };
 
   // 本机同时挂着 tailscale / docker / VPN 时，Chromium 会收到网络接口变化事件，
@@ -92,7 +98,7 @@ async function main() {
     run = await attempt();
   }
 
-  const { page, pageErrors, consoleErrors, failedRequests, badResponses, bootMs, state } = run;
+  const { page, pageErrors, consoleErrors, failedRequests, badResponses, bootMs, state, form } = run;
 
   const checks = [];
   const ok = (cond, what) => checks.push({ cond: !!cond, what });
@@ -101,6 +107,7 @@ async function main() {
   ok(state.text.includes('设备') && state.text.includes('点位') && state.text.includes('监视')
     && state.text.includes('日志') && state.text.includes('配置'), '五个导航项都渲染出来');
   ok(/设备\s+\d+\/\d+\s+采集/.test(state.text), '健康状态行显示采集进度（REST /api/v1/health 已生效）');
+  ok(form.ok, `设备页的新建设备表单走完校验与应用${form.ok ? `（${form.deviceId}）` : '：' + form.message}`);
   ok(pageErrors.length === 0, `没有未捕获的页面异常${pageErrors.length ? '：' + pageErrors[0] : ''}`);
   ok(failedRequests.length === 0, `没有失败的请求${failedRequests.length ? '：' + failedRequests[0] : ''}`);
   ok(badResponses.length === 0, `没有 4xx/5xx 响应${badResponses.length ? '：' + badResponses[0] : ''}`);
@@ -129,6 +136,76 @@ async function main() {
 
   await browser.close();
   return failed === 0 ? 0 : 1;
+}
+
+/**
+ * 在设备页里真的建一台设备。
+ *
+ * Uno 把 TextBox 渲染成 <textarea>，`PlaceholderText` 是画上去的文字而不是 DOM 属性，
+ * 所以只能按 DOM 顺序取框：0 是列表上方的搜索框，1 起是表单里当前可见的字段
+ * （默认「＋ 新建通道 + modbus-tcp」，即 通道 ID、主机、端口、设备 ID、名称、
+ * 采集周期、从站地址、点位 ID、点位名称、偏移）。串口字段在 tcp 协议下不渲染，
+ * 正好不在序号里 —— 换协议会改变序号，所以这里固定用默认协议。
+ *
+ * 主机填 127.0.0.1:502：本机没有从站，设备起来后会是 faulted。这条检查验的是
+ * 「写得进」（validate → apply → 版本 → 列表刷新），不是「连得上」。
+ */
+async function exerciseDeviceForm(page) {
+  const suffix = Date.now().toString(36);
+  const deviceId = `console-${suffix}`;
+  const deviceName = `控制台建的设备 ${suffix}`;
+
+  try {
+    await page.getByText('新建设备', { exact: true }).first().click();
+
+    await page.waitForFunction(
+      () => document.body.innerText.includes('首个点位 ID'),
+      null,
+      { timeout: 30000 },
+    );
+
+    // 展开表单时会异步拉一次 /api/v1/config 来填通道下拉；重建下拉会打乱手上的引用，
+    // 给它一点时间稳定下来再开始填。
+    await page.waitForTimeout(500);
+
+    const fill = async (index, value) => {
+      const box = page.locator('textarea').nth(index);
+      await box.click();
+      await box.fill(value);
+
+      // 写错框时宁可在这里失败：后面的 422 只会说「字段非法」，看不出是填错了位置。
+      const actual = await box.inputValue();
+      if (actual !== value) throw new Error(`第 ${index} 个输入框写入失败（得到 "${actual}"）`);
+    };
+
+    await fill(1, `console-bus-${suffix}`);
+    await fill(2, '127.0.0.1');
+    await fill(4, deviceId);
+    await fill(5, deviceName);
+    await fill(8, 'value');
+    await fill(9, '值');
+    await fill(10, '0');
+
+    await page.getByText('创建', { exact: true }).first().click();
+
+    await page.waitForFunction(
+      (id) => document.body.innerText.includes(`已创建设备 ${id}`),
+      deviceId,
+      { timeout: 60000 },
+    );
+
+    // 创建成功后表单会清空设备字段、再刷一次列表。名字只可能出现在列表行上，
+    // 等它出现就等于等到了那次刷新，避免与 RefreshAsync 抢跑。
+    await page.waitForFunction(
+      (name) => document.body.innerText.includes(name),
+      deviceName,
+      { timeout: 60000 },
+    );
+
+    return { ok: true, deviceId, message: '' };
+  } catch (err) {
+    return { ok: false, deviceId, message: err.message };
+  }
 }
 
 main()

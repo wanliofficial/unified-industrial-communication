@@ -11,7 +11,7 @@
 它们不是 §6.1「不做」清单里的项，属于真实缺口；逐协议现状、原因与补法见
 [protocol-status.md](protocol-status.md)。
 
-当前测试基线：**197 passed / 0 failed / 1 skipped**（跳过的是需要 `--opcua` 的 OPC UA 端到端用例）。
+当前测试基线：**199 passed / 0 failed / 1 skipped**（跳过的是需要 `--opcua` 的 OPC UA 端到端用例）。
 
 ## 1. 采集（FR-COL）
 
@@ -94,7 +94,7 @@
 
 | 编号 | 需求 | 状态 | 证据 / 说明 |
 |---|---|---|---|
-| FR-OPS-01 | Web 控制台（登录、设备、点位、监视、日志、配置） | 部分实现 | 六个页面都在（Uno WASM，含驱动能力页），`scripts/wasm-smoke.sh` 在 Playwright 里真跑首屏与 REST 调用；**没有「新建通道/设备」表单**，配置改动仍走配置页或 REST |
+| FR-OPS-01 | Web 控制台（登录、设备、点位、监视、日志、配置） | 部分实现 | 六个页面都在（Uno WASM，含驱动能力页），`scripts/wasm-smoke.sh` 在 Playwright 里真跑首屏与 REST 调用；设备页内置「新建设备」表单（可同时新建通道：tcp 填 host/port，serial 填 port/baud，virtual 无传输参数），提交走「读脱敏配置 → 追加通道/设备 → `config/validate` → `config/apply`」，与配置页同一条版本链，`config/console_draft_builds_a_valid_document` 与 `contract/console_device_creation_flow` 覆盖拼装与端到端提交。表单只建**首个**点位，继续加点位仍走 CSV 导入或配置页；令牌登录属 FR-OPS-02 |
 | FR-OPS-02 | 认证（本地账号 + 会话 Token，首次强制改密） | 刻意没做（M） | 首版只有配置里的单个 Bearer Token，没有账号库。这是与 PRD 差距最大的一条，见文末「红线」 |
 | FR-OPS-03 | RBAC（页面级 + 操作级，≥3 角色） | 刻意没做（S） | 依赖 FR-OPS-02；命令白名单是硬编码能力边界，不是角色 |
 | FR-OPS-04 | 审计日志（可查询、可导出） | 刻意没做（S） | 命令与配置变更只进环形日志，重启即清空；审计需要落盘与查询接口 |
@@ -147,7 +147,7 @@
 | 兼容：浏览器最近 2 个版本 | Chrome/Edge/Firefox | 已验证 Chrome | `scripts/wasm-smoke.sh` 用 Playwright Chromium；其余浏览器未跑 |
 | 可维护：单文件 ≤600 行 | — | 已实现 | 新增端点都拆成 `RestApi.*.cs` partial |
 | 可维护：依赖数量 ≤10 | 直接依赖 | 已实现 | 生产 4 个（日志抽象、串口、OPC UA Server/Configuration）+ ASP.NET Core 框架引用；测试 1 个 |
-| 构建/测试时间 | ≤60 s / ≤120 s | 已实现 | 全量构建约 20 s，测试约 55 s（197 条） |
+| 构建/测试时间 | ≤60 s / ≤120 s | 已实现 | 全量构建约 20 s，测试约 53 s（199 条） |
 
 ## 9. 与 PRD 安全红线的差距
 

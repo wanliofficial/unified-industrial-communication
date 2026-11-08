@@ -48,6 +48,9 @@ dotnet run --project src/Uic.Host -- run --web /tmp/uic-ui/wwwroot
 
 浏览器打开 `http://127.0.0.1:8080/`。六个页面分别是设备、驱动、点位、监控、日志、配置，
 全部只通过 REST 与 SSE 通信——前端不认识任何驱动实现，也不持有第二份状态。
+设备页的「新建设备」可以同时新建一条通道并挂上第一台设备（首个点位），提交走
+`config/validate` → `config/apply`，与配置页共用同一条版本与回滚链；继续加点位仍走
+CSV 导入或配置页。
 配置了 `northbound.rest.token` 时，首屏会先要求输入令牌（存在浏览器本地）。
 
 > 发布必须显式指定 `-f net10.0-browserwasm`：项目是单目标 WASM 工程，
@@ -60,8 +63,9 @@ scripts/wasm-smoke.sh              # 发布 + curl 检查 + Playwright 真跑一
 scripts/wasm-smoke.sh --no-browser # 只做静态层
 ```
 
-浏览器层会等 WASM 启动、等设备列表从 REST 渲染出来，并断言没有未捕获异常、
-失败请求或 4xx/5xx —— 裁剪后的运行时问题只有这样才看得见。
+浏览器层会等 WASM 启动、等设备列表从 REST 渲染出来，再在设备页真填一次「新建设备」
+表单并等它出现在列表里，同时断言没有未捕获异常、失败请求或 4xx/5xx ——
+裁剪后的运行时问题只有这样才看得见。
 
 ## 命令行
 
@@ -100,7 +104,7 @@ dotnet run --project tests/Uic.Tests -- --opcua             # 额外跑 OPC UA �
 dotnet run --project tests/Uic.Tests -- --stop-on-fail
 ```
 
-正常情况下输出 `197 passed, 0 failed, 1 skipped`（跳过的是默认不启用的 OPC UA 用例）。
+正常情况下输出 `199 passed, 0 failed, 1 skipped`（跳过的是默认不启用的 OPC UA 用例）。
 黄金帧测试默认从仓库的 `testdata/golden/` 读取，可用 `UIC_TESTDATA` 指向别的目录。
 
 串口用例（T15–T18）会用 libc 开一对伪终端，在 Linux 上默认执行，其它平台报 `skip`；

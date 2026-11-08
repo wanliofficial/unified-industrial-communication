@@ -50,13 +50,15 @@
   持久化上报队列（分区分位点、三重上限）；设备状态机 + 熔断 + 探活恢复；
   点位级采集周期（`point.interval` 覆盖设备周期，按周期分桶合并读取）；
   `retries` 重试（只重试临时性失败，重试前断开避免迟到帧；地址错不参与熔断）；指标 + 环形日志 + 可选 JSON 行文件日志（按大小轮转） + 诊断包。
-- **控制台**：Uno WASM 六个页面（设备 / 驱动 / 点位 / 监控 / 日志 / 配置）。
+- **控制台**：Uno WASM 六个页面（设备 / 驱动 / 点位 / 监控 / 日志 / 配置）；
+  设备页可新建通道 + 设备（含首个点位），提交走 `config/validate` → `config/apply`。
 - **验收**：黄金帧 20 份（含 4 份数组帧）；T1–T18 全部有对应用例，其中 T15–T18 跑在 libc 开出来的
   真实伪终端上；MQTT 先在测试内按规范独立实现的最小 broker 上做协议级验收（发布、
   订阅、入站 PUBACK、下行命令去重与权限），再用官方 mosquitto 容器跑一次互操作
   （`scripts/mqtt-interop.sh`：上线、重启重连、命令请求/结果、kill -9 后由 broker
   代发遗嘱）；WASM 控制台用 `scripts/wasm-smoke.sh` 发布后
-  在 Playwright 里真跑一遍（`index.html` / 引导脚本 / SPA 回退 / REST 首屏）。
+  在 Playwright 里真跑一遍（`index.html` / 引导脚本 / SPA 回退 / REST 首屏 / 在设备页
+  真填表新建一台设备并等它出现在列表里）。
   见 [testing.md](testing.md)。
 
 ### 刻意没做
