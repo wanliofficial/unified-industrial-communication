@@ -188,6 +188,14 @@ public static partial class ModelValidator
             storage.ResourceCheckInterval > TimeSpan.FromHours(1))
             Add("storage.resourceCheckInterval", "must be 1s..1h");
 
+        var audit = storage.Audit;
+        if (audit.MaxBytes < 1024)
+            Add("storage.audit.maxBytes", "must be >= 1024 bytes");
+        if (audit.Retain < 1 || audit.Retain > 1000)
+            Add("storage.audit.retain", "must be 1..1000");
+        if (string.IsNullOrWhiteSpace(audit.Directory))
+            Add("storage.audit.directory", "required");
+
         var file = doc.Logging.File;
 
         // 即使当前 disabled 也校验：配置里留一个错值，等现场打开时就变成启动失败，

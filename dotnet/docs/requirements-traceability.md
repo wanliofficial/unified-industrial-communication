@@ -11,7 +11,7 @@
 它们不是 §6.1「不做」清单里的项，属于真实缺口；逐协议现状、原因与补法见
 [protocol-status.md](protocol-status.md)。
 
-当前测试基线：**209 passed / 0 failed / 1 skipped**（跳过的是需要 `--opcua` 的 OPC UA 端到端用例）。
+当前测试基线：**219 passed / 0 failed / 1 skipped**（跳过的是需要 `--opcua` 的 OPC UA 端到端用例）。
 
 ## 1. 采集（FR-COL）
 
@@ -97,7 +97,7 @@
 | FR-OPS-01 | Web 控制台（登录、设备、点位、监视、日志、配置） | 部分实现 | 六个页面都在（Uno WASM，含驱动能力页），`scripts/wasm-smoke.sh` 在 Playwright 里真跑首屏与 REST 调用；设备页内置「新建设备」表单（可同时新建通道：tcp 填 host/port，serial 填 port/baud，virtual 无传输参数），提交走「读脱敏配置 → 追加通道/设备 → `config/validate` → `config/apply`」，与配置页同一条版本链，`config/console_draft_builds_a_valid_document` 与 `contract/console_device_creation_flow` 覆盖拼装与端到端提交。表单只建**首个**点位，继续加点位仍走 CSV 导入或配置页；令牌登录属 FR-OPS-02 |
 | FR-OPS-02 | 认证（本地账号 + 会话 Token，首次强制改密） | 刻意没做（M） | 首版只有配置里的单个 Bearer Token，没有账号库。这是与 PRD 差距最大的一条，见文末「红线」 |
 | FR-OPS-03 | RBAC（页面级 + 操作级，≥3 角色） | 刻意没做（S） | 依赖 FR-OPS-02；命令白名单是硬编码能力边界，不是角色 |
-| FR-OPS-04 | 审计日志（可查询、可导出） | 刻意没做（S） | 命令与配置变更只进环形日志，重启即清空；审计需要落盘与查询接口 |
+| FR-OPS-04 | 审计日志（可查询、可导出） | 已实现 | 追加写 NDJSON（`storage.audit`，默认 `data/audit/audit-yyyyMMdd-HHmmss-fff.ndjson`），按天 + 按大小切分，按份数保留，逐条 `Flush(flushToDisk: true)`；重启后从文件末尾恢复序号，`seq` 单调。记录 `config.apply` / `config.rollback` / `config.import` / `config.points_import` / `config.template_instantiate` / `config.export`（仅 `redact=false`）/ `point.write`（逐条，含旧值与新值）/ REST 与 MQTT 命令 / `auth.failed`（按来源 IP 30 秒去重）/ `audit.export`。`GET /api/v1/audit` 按时间、动作、身份、结果、目标过滤并分页（最新在前），`GET /api/v1/audit/export` 导出同条件的 NDJSON 附件。写失败只告警 + `uic_audit_write_failures`，不阻断业务。证据：`audit/*`（7 条）与 `contract/audit_records_write_and_config`、`contract/audit_export_is_ndjson`、`contract/audit_denies_are_recorded` |
 | FR-OPS-05 | 指标（Prometheus 文本格式） | 已实现 | `GET /api/v1/metrics`；设备状态、样本发布、Outbox、OPC UA、看门狗都有序列；`/api/v1/health` 汇总 |
 | FR-OPS-06 | 健康检查三级（live/ready/business） | 已实现 | `/healthz`、`/readyz`、`/api/v1/health`；`contract/health_and_version_are_public` |
 | FR-OPS-07 | 诊断包（脱敏配置 + 日志 + 指标 + 版本） | 已实现 | `GET /api/v1/diagnostics/bundle` 与命令 `diag.bundle` 共用 `DiagnosticsBundle.Build`；`mqtt/command_diag_bundle_is_whitelisted` |
@@ -143,11 +143,12 @@
 | 安全：诊断包含凭据 | 红线 | 满足 | `Redact` 把 `token`/`password`/`secret` 替换为 `***`，`contract/config_is_redacted` 验证 |
 | 安全：脱敏配置回写不降级凭据 | — | 满足 | `apply`/`import` 把同路径的 `***` 还原成**当前引用**（不是明文），显式空串仍表示清空；`config/redacted_secrets_are_restored`、`contract/apply_keeps_redacted_secrets` |
 | 可观测：日志字段 | `ts/level/msg/device/...` | 已实现 | 环形缓冲与 JSON 行文件共用同一套字段：`ts/level/category/msg/device/exception`；`logs/json_line_fields_are_complete` |
+| 可观测：审计可追溯 | 查询 + 导出 | 已实现 | 配置变更、写入、命令与认证失败都落 NDJSON，重启不清空；`audit/*`（7 条）与 `contract/audit_*`（3 条） |
 | 兼容：配置向后兼容 ≥2 大版本 | 自动迁移 | 已实现（现有 v0 形状） | `ConfigMigrations` 覆盖 7 条 v0 规则（server.listen/token、storage.dir、mqtt.broker、channels[].concurrency、channels[].transport 对象、serial.stopBits、devices[].channel）；`config/migrates_v0_legacy_shapes` 逐项断言迁移结果，`config/migration_is_explicit_and_versioned` 验证升级项回显与「更新版本拒绝启动」。仓库只有 v1，尚不存在第二个历史主版本可测 |
 | 兼容：浏览器最近 2 个版本 | Chrome/Edge/Firefox | 已实现 | `scripts/wasm-smoke.sh` 在 Playwright 里各跑一遍：Chromium（同一引擎覆盖 Chrome/Edge，首屏约 14 s）与 Firefox（Gecko，约 34 s），两条都走完「首屏 + 新建一台设备」并被断言；Safari/WebKit 未装，用 `--browser webkit` 可补跑 |
 | 可维护：单文件 ≤600 行 | — | 已实现 | 新增端点都拆成 `RestApi.*.cs` partial |
 | 可维护：依赖数量 ≤10 | 直接依赖 | 已实现 | 生产 4 个（日志抽象、串口、OPC UA Server/Configuration）+ ASP.NET Core 框架引用；测试 1 个 |
-| 构建/测试时间 | ≤60 s / ≤120 s | 已实现 | 全量构建约 20 s；测试空载约 76 s（209 条），机器有其它负载时量到 119 s，仍在门槛内 |
+| 构建/测试时间 | ≤60 s / ≤120 s | 已实现 | 全量构建约 20 s；测试空载约 66 s（219 条），机器有其它负载时量到 119 s，仍在门槛内 |
 
 ## 9. 与 PRD 安全红线的差距
 
@@ -163,7 +164,8 @@ PRD `06-nfr.md` §4 列了五条红线。凭据落盘这一条在本版补齐后
 | 诊断包含凭据 | 满足 | — |
 
 剩下的差距是**首版范围的取舍**，不是实现疏漏：PRD §6.1 把账号、RBAC、TLS 都放在了
-「不做」里。把认证与账号补上之后，FR-OPS-02/03/04/10 才能从「刻意没做」转为「已实现」。
+「不做」里。审计（FR-OPS-04）已在本版补齐并落盘；把认证与账号补上之后，
+FR-OPS-02/03/10 才能从「刻意没做」转为「已实现」。
 
 ## 10. 怎么用这份表
 

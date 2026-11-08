@@ -8,6 +8,8 @@
 
 - **断网不丢数据** —— 每个北向通道独立分区、独立确认位点，磁盘队列三重上限（条数 / 字节 / TTL）；
 - **配置改坏能退回** —— 配置即制品：内容寻址、只增不改、可 diff、可回滚；
+- **谁改了什么查得到** —— 配置变更、点位写入、远程命令与认证失败都落审计 NDJSON，
+  可按时间 / 动作 / 身份查询与导出，重启不清空；
 - **设备坏了能看出为什么坏** —— 质量码贯穿采集、缓存、北向全链路，错误原因一路带到 UI；
 - **一个二进制能拷到盒子上跑** —— 只依赖框架自带的库，发布产物自包含。
 
@@ -121,6 +123,28 @@ uic check --config gateway.json                  # 逐项打印引用来源，�
 旧配置里的明文令牌仍能被**读**（迁移用），但 `check`、启动与 `config/apply` 都会
 拒绝它并指出字段路径；先用 `uic secret seal` 加密或改成环境变量引用即可。
 
+## 审计
+
+审计是「谁在什么时候改了什么」的落盘记录，和会轮转、会丢的日志分开：
+
+```bash
+curl -s -H "Authorization: Bearer $TOKEN" \
+  'localhost:8080/api/v1/audit?action=point.write&from=2026-11-08T00:00:00Z' | jq
+
+curl -s -H "Authorization: Bearer $TOKEN" \
+  'localhost:8080/api/v1/audit/export?action=config.apply' -o audit.ndjson
+```
+
+记录覆盖配置生效 / 回滚 / 导入 / 模板实例化、未脱敏导出、逐条点位写入（含旧值与新值）、
+REST 与 MQTT 命令、401 认证失败，以及审计自身的导出动作。文件写在
+`storage.audit.directory`（默认 `data/audit/`，一行一条 NDJSON），按天与按大小切分，
+保留最近 `retain` 份；每条立即 flush，进程被杀也只丢最后半行，重启后序号继续递增。
+
+写审计失败不会让业务失败：只告警并把指标 `uic_audit_write_failures` 置为非零——
+审计不可用本身要能被看见，而不是伪装成成功。字段与查询参数见
+[docs/northbound-api.md](docs/northbound-api.md#审计)，配置见
+[docs/configuration.md](docs/configuration.md#审计)。
+
 ## 测试
 
 测试是一个自包含控制台运行器，不引 xUnit、不引 Test SDK —— 离网构建机也能直接跑：
@@ -133,7 +157,7 @@ dotnet run --project tests/Uic.Tests -- --opcua             # 额外跑 OPC UA �
 dotnet run --project tests/Uic.Tests -- --stop-on-fail
 ```
 
-正常情况下输出 `209 passed, 0 failed, 1 skipped`（跳过的是默认不启用的 OPC UA 用例）。
+正常情况下输出 `219 passed, 0 failed, 1 skipped`（跳过的是默认不启用的 OPC UA 用例）。
 黄金帧测试默认从仓库的 `testdata/golden/` 读取，可用 `UIC_TESTDATA` 指向别的目录。
 
 串口用例（T15–T18）会用 libc 开一对伪终端，在 Linux 上默认执行，其它平台报 `skip`；

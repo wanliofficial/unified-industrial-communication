@@ -4,6 +4,7 @@ using System.Text.Json;
 using System.Text.Json.Nodes;
 using Microsoft.Extensions.Logging;
 using Uic.Domain;
+using Uic.Obs;
 
 namespace Uic.Northbound;
 
@@ -41,6 +42,7 @@ public sealed class MqttCommandSink : IAsyncDisposable
     private readonly IGatewayControl _control;
     private readonly ILogger _log;
     private readonly string _site;
+    private readonly AuditLog? _audit;
     private readonly Func<MqttClient, MqttMessage, CancellationToken, Task> _handler;
     private readonly ConcurrentDictionary<string, CacheEntry> _cache = new(StringComparer.Ordinal);
     private int _sweep;
@@ -62,12 +64,14 @@ public sealed class MqttCommandSink : IAsyncDisposable
         MqttOptions options,
         string site,
         IGatewayControl control,
-        ILogger log)
+        ILogger log,
+        AuditLog? audit = null)
     {
         _client = client;
         _control = control;
         _log = log;
         _site = site;
+        _audit = audit;
 
         Topic = MqttSink.Render(NonEmpty(options.CommandTopic, $"{options.TopicPrefix}/{{site}}/$command"),
             options, site);
@@ -180,14 +184,30 @@ public sealed class MqttCommandSink : IAsyncDisposable
                 .ExecuteAsync(_control, request, CommandScope.Standard, timeout.Token)
                 .ConfigureAwait(false);
 
+            // MQTT 这一版没有账号，actor 与 REST 无令牌时一样记 anonymous，由 source 区分通道；
+            // 命令参数里可能有设备名，详情原样记下，方便回答「这条命令当时到底发了什么」。
+            _audit?.Write(
+                request.Action,
+                response.Ok ? "ok" : "failed",
+                actor: "anonymous",
+                source: "mqtt",
+                target: id,
+                detail: new { id, response.Detail, request.Params });
+
             return new CommandResult(id, request.Action, response.Ok, response.Detail, null, null, at);
         }
         catch (ApiException ex)
         {
+            _audit?.Write(request.Action, "failed", "anonymous", "mqtt", target: id,
+                detail: new { id, error = ex.Code, ex.Message, request.Params });
+
             return new CommandResult(id, request.Action, false, null, ex.Code, ex.Message, at);
         }
         catch (KeyNotFoundException ex)
         {
+            _audit?.Write(request.Action, "failed", "anonymous", "mqtt", target: id,
+                detail: new { id, error = "request.not_found", ex.Message, request.Params });
+
             return new CommandResult(id, request.Action, false, null,
                 "request.not_found", ex.Message, at);
         }
@@ -197,11 +217,17 @@ public sealed class MqttCommandSink : IAsyncDisposable
         }
         catch (OperationCanceledException)
         {
+            _audit?.Write(request.Action, "failed", "anonymous", "mqtt", target: id,
+                detail: new { id, error = "command.timeout", request.Params });
+
             return new CommandResult(id, request.Action, false, null,
                 "command.timeout", $"command did not finish within {ExecutionTimeout.TotalSeconds:0}s", at);
         }
         catch (Exception ex)
         {
+            _audit?.Write(request.Action, "failed", "anonymous", "mqtt", target: id,
+                detail: new { id, error = "command.failed", ex.Message, request.Params });
+
             return new CommandResult(id, request.Action, false, null,
                 "command.failed", ex.Message, at);
         }

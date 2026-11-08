@@ -76,8 +76,19 @@ public static partial class RestApi
             var candidate = current.WithDevices(
                 current.Devices.Select(d => d.Id == device ? updatedDevice : d).ToArray());
 
-            var outcome = await ctx.Control.ApplyConfigAsync(candidate,
-                comment ?? $"imported {result.Points.Count} point(s) into '{device}'", ct).ConfigureAwait(false);
+            var outcome = await AuditedAsync(
+                ctx, http, "config.points_import",
+                _ => device,
+                o => new
+                {
+                    o.Version,
+                    added = result.Added,
+                    updated = result.Updated,
+                    total = merged.Count,
+                },
+                () => ctx.Control.ApplyConfigAsync(candidate,
+                    comment ?? $"imported {result.Points.Count} point(s) into '{device}'", ct))
+                .ConfigureAwait(false);
 
             return Results.Json(new PointsImportResponseDto(
                 target.Id, true, true, outcome.Version,
@@ -94,6 +105,13 @@ public static partial class RestApi
             var node = redact
                 ? Redact(config)
                 : JsonNode.Parse(JsonSerializer.Serialize(config, JsonDefaults.Options));
+
+            // 导出未脱敏配置会把凭据引用（以及站点结构）带出机器，必须留痕。
+            if (!redact)
+            {
+                WriteAudit(ctx, http, "config.export", "ok", target: "config",
+                    detail: new { redacted = false, version = ctx.Control.ConfigVersion });
+            }
 
             http.Response.Headers.ContentDisposition =
                 $"attachment; filename=\"uic-config-{DateTimeOffset.UtcNow:yyyyMMdd-HHmmss}.json\"";
@@ -130,8 +148,12 @@ public static partial class RestApi
                     ApiJson.Options);
             }
 
-            var outcome = await ctx.Control.ApplyConfigAsync(document,
-                comment ?? "imported configuration", ct).ConfigureAwait(false);
+            var outcome = await AuditedAsync(
+                ctx, http, "config.import",
+                o => o.Version,
+                o => new { migrations = migration.Applied, o.RestartedDevices, o.DurationMs },
+                () => ctx.Control.ApplyConfigAsync(document,
+                    comment ?? "imported configuration", ct)).ConfigureAwait(false);
 
             return Results.Json(new ConfigImportResponseDto(
                 true, true, outcome.Version, migration.Applied, migration.Root,

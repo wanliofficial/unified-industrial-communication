@@ -135,8 +135,12 @@ public static partial class RestApi
             }
 
             var candidate = current.WithDevices(current.Devices.Concat(devices).ToArray());
-            var outcome = await ctx.Control.ApplyConfigAsync(candidate,
-                request.Comment ?? $"instantiated {devices.Count} device(s) from template '{template.Id}'", ct)
+            var outcome = await AuditedAsync(
+                ctx, http, "config.template_instantiate",
+                o => o.Version,
+                o => new { template = template.Id, devices = devices.Select(d => d.Id).ToArray(), o.DurationMs },
+                () => ctx.Control.ApplyConfigAsync(candidate,
+                    request.Comment ?? $"instantiated {devices.Count} device(s) from template '{template.Id}'", ct))
                 .ConfigureAwait(false);
 
             return Results.Json(new InstantiateResponseDto(

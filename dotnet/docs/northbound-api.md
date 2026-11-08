@@ -400,6 +400,78 @@
   保留策略跟随 journal 文件生命周期，暂不自动清理。数据量再上一个量级应换时序库，
   接口形状不需要变。
 
+### 审计
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| GET | `/api/v1/audit` | 按条件查询审计记录，最新在前 |
+| GET | `/api/v1/audit/export` | 同样条件导出 NDJSON 附件 |
+
+查询参数（两个端点一致）：
+
+| 参数 | 默认 | 说明 |
+|---|---|---|
+| `from` / `to` | `to - 24h` / 现在 | ISO-8601；带偏移自动转 UTC，不带偏移按 UTC 解释 |
+| `action` | 全部 | 动作名，精确匹配（如 `config.apply`、`point.write`） |
+| `actor` | 全部 | 执行者：这一版是 `anonymous`（没配令牌）或 `bearer`（配了令牌） |
+| `result` | 全部 | `ok` / `failed` / `denied` |
+| `target` | 全部 | 目标：`device/point`、配置版本、被拒的路径等 |
+| `limit` | 查询 100 / 导出 5000 | 查询上限 1000，导出上限 100000 |
+| `cursor` | — | 上一页响应里的 `nextCursor` |
+
+响应与列表端点一致：
+
+```json
+{
+  "items": [
+    {
+      "seq": 42,
+      "at": "2026-11-08T14:38:16.123Z",
+      "action": "point.write",
+      "result": "failed",
+      "actor": "bearer",
+      "source": "rest",
+      "remote": "127.0.0.1",
+      "requestId": "req-e2e28d3f4f30444e",
+      "target": "plc-01/temp",
+      "detail": {
+        "device": "plc-01", "point": "temp",
+        "value": { "type": "float64", "num": 77.5 },
+        "oldValue": { "type": "float64", "num": 76.9 },
+        "confirm": true, "quality": "uncertain",
+        "error": "verify.mismatch: wrote 77.5, read 76.9", "verified": false
+      }
+    }
+  ],
+  "nextCursor": "MQ==",
+  "total": 128
+}
+```
+
+记录的内容：
+
+- `config.apply` / `config.rollback` / `config.import` / `config.points_import` /
+  `config.template_instantiate`（成功与失败都记，`target` 是提交后的版本）；
+- `config.export` 只在 `?redact=false` 时记：导出未脱敏配置会把凭据引用带出机器；
+- `point.write` 逐条记录（批量写产生多条），带 `oldValue`、`newValue`、质量与失败原因；
+- REST 命令与 MQTT 下行命令各自记录（`source` 分别是 `rest` / `mqtt`）；
+- `auth.failed`：401 也会留痕，`actor` 固定为 `anonymous`，同一来源 IP 30 秒内去重
+  ——审计回答「谁在被拒绝」，不是把扫描器的每个请求都写成一条磁盘记录；
+- `audit.export`：导出动作本身也记一条，谁在什么时候把审计拿走和内容同等重要。
+
+行为约定：
+
+- 存储是 `storage.audit.directory` 下的 NDJSON（默认 `data/audit/`），一行一条，可直接
+  `jq` / `grep`；按天与按大小（`maxBytes`）切分，最多保留 `retain` 份。
+- 每条写入后立即 flush 到磁盘；进程被 `kill -9` 时最后半行会在查询时跳过，不影响其它记录。
+- 重启后 `seq` 从最新文件的最后一条继续，不会回退；旧记录仍可查询。
+- 审计写失败（磁盘满、权限错）**不阻断**业务：口头告警一次，指标
+  `uic_audit_write_failures` 非零，审计进入降级直到进程重启。
+- 这一版没有账号体系，`actor` 只有 `anonymous` / `bearer`；FR-OPS-02 落地后换成账号 id，
+  记录形状不变。
+- 查询是全量扫描文件后过滤（按文件名日期先做一次粗筛），适合「最近几天」的量级；
+  需要长期归档时应把文件转到外部存储。
+
 ### 配置
 
 | 方法 | 路径 | 说明 |

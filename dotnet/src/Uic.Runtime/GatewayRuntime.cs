@@ -50,6 +50,7 @@ public sealed class GatewayRuntime : IGatewayControl, IAsyncDisposable
     private readonly SampleFanout _fanout;
     private readonly DeviceStateWatcher _watcher;
     private readonly ResourceMonitor _resources;
+    private readonly AuditLog _audit;
     private readonly string _dataDir;
     private readonly string _gatewayVersion;
     private readonly DateTimeOffset _startedAt = DateTimeOffset.UtcNow;
@@ -107,6 +108,9 @@ public sealed class GatewayRuntime : IGatewayControl, IAsyncDisposable
         _engine = new Scheduler(drivers, new PointCache(), logs, schedulerOptions);
         _engine.Start(config);
 
+        // 审计随数据目录走，默认开启：它是「谁改了什么」的唯一落盘记录。
+        _audit = new AuditLog(dataDir, config.Storage.Audit);
+
         var storage = config.Storage;
         _outbox = new OutboxQueue(dataDir, new OutboxOptions
         {
@@ -148,6 +152,7 @@ public sealed class GatewayRuntime : IGatewayControl, IAsyncDisposable
     public OutboxQueue Outbox => _outbox;
     public MetricsRegistry Metrics => _metrics;
     public RingBufferLogProvider Logs => _ring;
+    public AuditLog Audit => _audit;
     public DateTimeOffset StartedAt => _startedAt;
     public LogLevelSwitch Level { get; private init; } = new();
 
@@ -243,7 +248,8 @@ public sealed class GatewayRuntime : IGatewayControl, IAsyncDisposable
             _gatewayVersion,
             _startedAt,
             _resources,
-            new JournalHistory(_dataDir));
+            new JournalHistory(_dataDir),
+            _audit);
 
     // ------------------------------------------------------------------
     // IGatewayControl
@@ -283,6 +289,10 @@ public sealed class GatewayRuntime : IGatewayControl, IAsyncDisposable
                 _log.LogInformation("file logging {State}",
                     doc.Logging.File.Enabled ? $"-> {_fileLog?.ActivePath}" : "disabled");
             }
+
+            // 审计设置同样在线生效；关掉审计不会删除已有文件。
+            if (!SameJson(before.Storage.Audit, doc.Storage.Audit))
+                _audit.Configure(doc.Storage.Audit);
 
             ConfigureSinks(doc, before);
             _fanout.SetTargets(Targets(doc));
@@ -475,7 +485,7 @@ public sealed class GatewayRuntime : IGatewayControl, IAsyncDisposable
                     // 构造时登记订阅，因此必须在 sink.Start() 之前创建。
                     commands = new MqttCommandSink(
                         sink.Client, resolved, config.Site, this,
-                        _logs.CreateLogger("uic.mqtt.commands"));
+                        _logs.CreateLogger("uic.mqtt.commands"), _audit);
                 }
 
                 _outbox.RegisterSink(sink);
@@ -543,6 +553,9 @@ public sealed class GatewayRuntime : IGatewayControl, IAsyncDisposable
         _metrics.Gauge("uic_resources_degraded",
             () => _resources.Status.Degraded ? 1 : 0,
             "1 when disk or memory is below the configured watermark");
+        _metrics.Gauge("uic_audit_write_failures",
+            () => _audit.WriteFailures,
+            "audit records that could not be written (non-zero means auditing is degraded)");
     }
 
     public async ValueTask DisposeAsync()
@@ -597,6 +610,7 @@ public sealed class GatewayRuntime : IGatewayControl, IAsyncDisposable
 
         await _outbox.DisposeAsync().ConfigureAwait(false);
         await _engine.DisposeAsync().ConfigureAwait(false);
+        _audit.Dispose();
         _applyGate.Dispose();
     }
 }

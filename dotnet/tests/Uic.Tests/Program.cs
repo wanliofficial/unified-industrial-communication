@@ -33,6 +33,7 @@ ConfigStoreTests.Register(tests);
 HistoryTests.Register(tests);
 JsonTests.Register(tests);
 ObsTests.Register(tests);
+AuditTests.Register(tests);
 LoopbackTests.Register(tests);
 SerialTests.Register(tests);
 MqttTests.Register(tests);

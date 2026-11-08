@@ -59,7 +59,15 @@ public static partial class RestApi
             var before = ctx.Control.CurrentConfig;
             var started = Stopwatch.GetTimestamp();
 
-            var outcome = await ctx.Control.ApplyConfigAsync(doc, comment, ct).ConfigureAwait(false);
+            var outcome = await AuditedAsync(
+                ctx, http, "config.apply",
+                o => o.Version,
+                o =>
+                {
+                    var changes = CountChanges(before, doc);
+                    return new { comment, changes, o.RestartedDevices, o.DurationMs };
+                },
+                () => ctx.Control.ApplyConfigAsync(doc, comment, ct)).ConfigureAwait(false);
 
             var counts = CountChanges(before, doc);
             var durationMs = (long)Stopwatch.GetElapsedTime(started).TotalMilliseconds;
@@ -128,7 +136,11 @@ public static partial class RestApi
                 throw ApiException.BadRequest("request.confirm_required",
                     "rollback requires \"confirm\": true");
 
-            var outcome = await ctx.Control.RollbackAsync(request.Version, ct).ConfigureAwait(false);
+            var outcome = await AuditedAsync(
+                ctx, http, "config.rollback",
+                o => o.Version,
+                o => new { requested = request.Version, o.DurationMs, o.RestartedDevices },
+                () => ctx.Control.RollbackAsync(request.Version, ct)).ConfigureAwait(false);
 
             return Results.Json(new ApplyResponseDto(
                 outcome.Version,
@@ -144,8 +156,11 @@ public static partial class RestApi
             var request = ReadJson<CommandRequestDto>(body)
                           ?? throw ApiException.BadRequest("request.invalid", "body is required");
 
-            var response = await CommandExecutor
-                .ExecuteAsync(ctx.Control, request, CommandScope.All, ct)
+            var response = await AuditedAsync(
+                ctx, http, request.Action,
+                _ => null,
+                r => new { r.Ok, r.Detail, request.Params, confirm = request.Confirm },
+                () => CommandExecutor.ExecuteAsync(ctx.Control, request, CommandScope.All, ct))
                 .ConfigureAwait(false);
 
             return Results.Json(response, ApiJson.Options);

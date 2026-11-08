@@ -42,6 +42,7 @@ public static partial class RestApi
             {
                 if (!Authorize(http, ctx))
                 {
+                    AuditAuthFailure(http, ctx);
                     http.Response.Headers["WWW-Authenticate"] = "Bearer";
                     throw ApiException.Unauthorized();
                 }
@@ -100,6 +101,7 @@ public static partial class RestApi
 
         MapDevices(app, ctx);
         MapHistory(app, ctx);
+        MapAudit(app, ctx);
         MapDrivers(app, ctx);
         MapConfig(app, ctx);
         MapTemplates(app, ctx);

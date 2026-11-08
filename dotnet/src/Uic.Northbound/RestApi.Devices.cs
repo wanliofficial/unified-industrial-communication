@@ -141,7 +141,7 @@ public static partial class RestApi
         var key = http.Request.Headers["X-Idempotency-Key"].FirstOrDefault();
         if (string.IsNullOrWhiteSpace(key))
         {
-            var response = await ExecuteWritesAsync(ctx, device, items, ct).ConfigureAwait(false);
+            var response = await ExecuteWritesAsync(http, ctx, device, items, ct).ConfigureAwait(false);
             return Results.Json(response, ApiJson.Options);
         }
 
@@ -155,7 +155,7 @@ public static partial class RestApi
             return Results.Content(cached.Body, "application/json; charset=utf-8");
         }
 
-        var fresh = await ExecuteWritesAsync(ctx, device, items, ct).ConfigureAwait(false);
+        var fresh = await ExecuteWritesAsync(http, ctx, device, items, ct).ConfigureAwait(false);
         var body = JsonSerializer.Serialize(fresh, ApiJson.Options);
         Idempotency[cacheKey] = new IdempotentResponse(body, now);
 
@@ -226,6 +226,63 @@ public static partial class RestApi
     }
 
     private static async Task<WriteResponseDto> ExecuteWritesAsync(
+        HttpContext http,
+        NorthboundContext ctx,
+        string deviceId,
+        IReadOnlyList<WriteItemDto> items,
+        CancellationToken ct)
+    {
+        // 旧值必须在写之前取：写入后缓存立刻变成新值，事后回读只能得到「旧值=新值」。
+        var before = new Dictionary<string, DataValue?>(StringComparer.Ordinal);
+        foreach (var item in items)
+            before[item.Point] = ctx.Engine.Cache.Get(deviceId, item.Point)?.Value;
+
+        // 请求级失败（设备不存在、配置未就绪）不会产生逐条结果，但同样是「有人试图写」。
+        // 这类记录往往比成功记录更能解释现场问题，不能因为异常路径就跳过。
+        WriteResponseDto response;
+        try
+        {
+            response = await ExecuteWritesCoreAsync(ctx, deviceId, items, ct).ConfigureAwait(false);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            WriteAudit(ctx, http, "point.write", "failed", target: deviceId,
+                detail: new
+                {
+                    device = deviceId,
+                    points = items.Select(i => i.Point).ToArray(),
+                    error = ex.Message,
+                });
+
+            throw;
+        }
+
+        // 逐条留痕：写入是不可逆动作，「谁在什么时候把哪个点位改成了什么」必须能回放。
+        // 被拒绝的写入（点位不存在 / 不可写）也记，它们往往是配置错误的第一现场。
+        foreach (var result in response.Results)
+        {
+            var item = items.FirstOrDefault(i => string.Equals(i.Point, result.Point, StringComparison.Ordinal));
+            before.TryGetValue(result.Point, out var old);
+
+            WriteAudit(ctx, http, "point.write", result.Ok ? "ok" : "failed",
+                target: $"{deviceId}/{result.Point}",
+                detail: new
+                {
+                    device = deviceId,
+                    point = result.Point,
+                    value = item?.Value,
+                    oldValue = old,
+                    confirm = item?.Confirm ?? false,
+                    result.Quality,
+                    result.Error,
+                    result.Verified,
+                });
+        }
+
+        return response;
+    }
+
+    private static async Task<WriteResponseDto> ExecuteWritesCoreAsync(
         NorthboundContext ctx,
         string deviceId,
         IReadOnlyList<WriteItemDto> items,

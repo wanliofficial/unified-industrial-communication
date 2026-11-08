@@ -63,6 +63,9 @@ internal static class ContractTests
         tests.Add(new TestCase("contract/points_expose_effective_interval", PointsExposeEffectiveInterval));
         tests.Add(new TestCase("contract/points_expose_array_count_and_values", PointsExposeArrayCount));
         tests.Add(new TestCase("contract/console_device_creation_flow", ConsoleDeviceCreationFlow));
+        tests.Add(new TestCase("contract/audit_records_write_and_config", AuditRecordsWriteAndConfig));
+        tests.Add(new TestCase("contract/audit_export_is_ndjson", AuditExportIsNdjson));
+        tests.Add(new TestCase("contract/audit_denies_are_recorded", AuditDeniesAreRecorded));
     }
 
     // ------------------------------------------------------------------
@@ -1248,6 +1251,205 @@ internal static class ContractTests
                 "the effective token is still the resolved value");
             t.Ok(host.Runtime.CurrentConfig.Devices.Any(d => d.Id == "console-1"),
                 "the new device is part of the effective configuration");
+        });
+    }
+
+    /// <summary>
+    /// 审计的主链路：一次点位写入 + 一次配置生效，都要能在 /audit 里按动作查回来，
+    /// 并且带上能追到人的字段（actor / source / remote / requestId）。
+    ///
+    /// 断言走真实 HTTP：审计是在中间件与处理器里写的，只测 <see cref="Uic.Obs.AuditLog"/>
+    /// 会漏掉「端点忘了记」这类最常见的问题。
+    /// </summary>
+    private static Task AuditRecordsWriteAndConfig(TestContext t)
+    {
+        return RunAsync(async () =>
+        {
+            await using var host = await Host.StartAsync(t);
+            await WaitForPointAsync(host, "v1", "temp", t);
+
+            const string body = """
+                                { "value": { "type": "float64", "num": 77.5 }, "confirm": true }
+                                """;
+
+            var write = await host.Client.SendAsync(Post("/api/v1/points/v1/temp/write", body), t.Ct);
+            t.Equal(HttpStatusCode.OK, write.StatusCode, "the write is accepted");
+
+            var writeRequestId = write.Headers.GetValues("X-Request-Id").Single();
+
+            // 改一处设备名再提交，验证 config.apply 同样留痕。
+            using var read = await ReadJsonAsync(t,
+                await host.Client.SendAsync(Get("/api/v1/config"), t.Ct));
+
+            var edited = JsonNode.Parse(read.RootElement.GetProperty("config").GetRawText())!.AsObject();
+            edited["devices"]![0]!["name"] = "审计用例改名";
+
+            var apply = await host.Client.SendAsync(
+                Post("/api/v1/config/apply", edited.ToJsonString()), t.Ct);
+            t.Equal(HttpStatusCode.OK, apply.StatusCode, "the config applies");
+
+            // 请求级失败的写入（设备不存在）同样要留痕：它往往是一次配置错误的现场。
+            var rejected = await host.Client.SendAsync(
+                Post("/api/v1/points/nope/temp/write", body), t.Ct);
+            t.Equal(HttpStatusCode.NotFound, rejected.StatusCode, "writing to an unknown device is rejected");
+
+            string version;
+            using (var applied = await ReadJsonAsync(t, apply))
+                version = applied.RootElement.GetProperty("version").GetString()!;
+
+            using var audit = await ReadJsonAsync(t,
+                await host.Client.SendAsync(Get("/api/v1/audit?limit=100"), t.Ct));
+
+            var root = audit.RootElement;
+            t.Ok(root.GetProperty("total").GetInt32() >= 2, "both actions are recorded");
+
+            var entries = root.GetProperty("items").EnumerateArray()
+                .Select(e => e.Clone()).ToArray();
+
+            var pointWrite = entries.SingleOrDefault(e =>
+                e.GetProperty("action").GetString() == "point.write" &&
+                e.GetProperty("target").GetString() == "v1/temp");
+
+            t.Ok(pointWrite.ValueKind == JsonValueKind.Object, "the point write is audited");
+            t.Equal("ok", pointWrite.GetProperty("result").GetString(), "a successful write is recorded as ok");
+            t.Equal("bearer", pointWrite.GetProperty("actor").GetString(), "the actor is the token holder");
+            t.Equal("rest", pointWrite.GetProperty("source").GetString(), "the source says where the action came from");
+            t.Equal("v1/temp", pointWrite.GetProperty("target").GetString(), "the target names the point");
+            t.Equal(writeRequestId, pointWrite.GetProperty("requestId").GetString(),
+                "the audit row is linked to the request id in the response");
+
+            var remote = pointWrite.GetProperty("remote").GetString();
+            t.Ok(remote is not null && remote.Contains("127.0.0.1"), $"the remote address is recorded, got {remote}");
+
+            // 写入的审计要能回放「从什么改成了什么」——这是它区别于日志的核心。
+            var detail = pointWrite.GetProperty("detail");
+            t.Equal("float64", detail.GetProperty("value").GetProperty("type").GetString(),
+                "the written value is recorded with its type");
+            t.Close(77.5, detail.GetProperty("value").GetProperty("num").GetDouble(), 1e-9,
+                "the written value is recorded");
+            t.Ok(detail.TryGetProperty("oldValue", out var oldValue) &&
+                 oldValue.ValueKind == JsonValueKind.Object,
+                "the previous value is captured before the write");
+            t.Equal(true, detail.GetProperty("confirm").GetBoolean(), "the confirm flag is recorded");
+
+            // 走向不存在设备的写入没有逐条结果，但请求级失败也要留痕。
+            var requestFailure = entries.Single(e =>
+                e.GetProperty("action").GetString() == "point.write" &&
+                e.GetProperty("target").GetString() == "nope");
+
+            t.Equal("failed", requestFailure.GetProperty("result").GetString(),
+                "a write that failed before reaching any point is recorded as failed");
+            t.Equal("temp", requestFailure.GetProperty("detail").GetProperty("points")[0].GetString(),
+                "the audit names the points the caller tried to write");
+
+            var configApply = entries.SingleOrDefault(e =>
+                e.GetProperty("action").GetString() == "config.apply");
+
+            t.Ok(configApply.ValueKind == JsonValueKind.Object, "the config apply is audited");
+            t.Equal("ok", configApply.GetProperty("result").GetString(), "the apply succeeded");
+            t.Equal(version, configApply.GetProperty("target").GetString(),
+                "the audit names the version that was committed");
+            t.Ok(configApply.GetProperty("detail").TryGetProperty("changes", out _),
+                "the applied diff is recorded");
+        });
+    }
+
+    /// <summary>
+    /// 导出的契约：NDJSON 附件（一行一条），且导出动作本身也要留下一条审计。
+    ///
+    /// 只实现查询而不记录导出，等于允许把审计悄悄搬走——那正是审计要防的事。
+    /// </summary>
+    private static Task AuditExportIsNdjson(TestContext t)
+    {
+        return RunAsync(async () =>
+        {
+            await using var host = await Host.StartAsync(t);
+            await WaitForPointAsync(host, "v1", "temp", t);
+
+            const string body = """
+                                { "value": { "type": "float64", "num": 66.5 } }
+                                """;
+
+            var write = await host.Client.SendAsync(Post("/api/v1/points/v1/temp/write", body), t.Ct);
+            t.Equal(HttpStatusCode.OK, write.StatusCode, "the write is accepted");
+
+            var export = await host.Client.SendAsync(
+                Get("/api/v1/audit/export?action=point.write"), t.Ct);
+            t.Equal(HttpStatusCode.OK, export.StatusCode, "the export is served");
+
+            t.Equal("application/x-ndjson", export.Content.Headers.ContentType?.MediaType,
+                "the export is served as NDJSON");
+
+            var disposition = export.Content.Headers.ContentDisposition;
+            t.Ok(disposition is not null && disposition.DispositionType == "attachment",
+                "the export is an attachment");
+            t.Ok(disposition?.FileName?.Trim('"').EndsWith(".ndjson") == true,
+                $"the file name ends with .ndjson, got {disposition?.FileName}");
+
+            var text = await export.Content.ReadAsStringAsync(t.Ct);
+            var lines = text.Split('\n', StringSplitOptions.RemoveEmptyEntries);
+
+            t.Ok(lines.Length >= 1, "the export contains at least the write we just did");
+
+            foreach (var line in lines)
+            {
+                using var parsed = JsonDocument.Parse(line);
+                t.Equal("point.write", parsed.RootElement.GetProperty("action").GetString(),
+                    "every exported line matches the filter");
+            }
+
+            // 导出本身要留痕：审计文件离开机器这件事和内容同等重要。
+            using var exported = await ReadJsonAsync(t,
+                await host.Client.SendAsync(Get("/api/v1/audit?action=audit.export"), t.Ct));
+
+            t.Equal(1, exported.RootElement.GetProperty("total").GetInt32(),
+                "the export itself is recorded");
+        });
+    }
+
+    /// <summary>
+    /// 被拒绝的请求要留痕，但同源 IP 的连续 401 不能在 30 秒内刷满磁盘。
+    ///
+    /// 审计在这里回答的是「谁在被拒绝」，不是「对方试了多少次」——次数由指标去数。
+    /// </summary>
+    private static Task AuditDeniesAreRecorded(TestContext t)
+    {
+        // 去重窗口是进程级静态状态；前面的用例可能已经打过 401。
+        RestApi.ResetAuthFailureThrottleForTests();
+
+        return RunAsync(async () =>
+        {
+            await using var host = await Host.StartAsync(t);
+
+            var denied = await host.Client.SendAsync(Get("/api/v1/devices", auth: false), t.Ct);
+            t.Equal(HttpStatusCode.Unauthorized, denied.StatusCode, "the anonymous request is rejected");
+
+            // 紧接着再来一次：同一 IP 在窗口内，不应产生第二条。
+            var again = await host.Client.SendAsync(Get("/api/v1/devices", auth: false), t.Ct);
+            t.Equal(HttpStatusCode.Unauthorized, again.StatusCode, "the repeat is rejected too");
+
+            using var audit = await ReadJsonAsync(t,
+                await host.Client.SendAsync(Get("/api/v1/audit?action=auth.failed"), t.Ct));
+
+            var root = audit.RootElement;
+            t.Equal(1, root.GetProperty("total").GetInt32(),
+                "repeated denials from one address are deduplicated within the window");
+
+            var entry = root.GetProperty("items")[0];
+            t.Equal("denied", entry.GetProperty("result").GetString(), "a denial is recorded as denied");
+            t.Equal("anonymous", entry.GetProperty("actor").GetString(),
+                "there is no trustworthy actor before authentication");
+            t.Equal("/api/v1/devices", entry.GetProperty("target").GetString(),
+                "the denied path is recorded");
+
+            var detail = entry.GetProperty("detail");
+            t.Equal("GET", detail.GetProperty("method").GetString(), "the method is recorded");
+            t.Equal(false, detail.GetProperty("hasToken").GetBoolean(),
+                "the record says the caller did not present a token");
+
+            // 不能把令牌本身写进审计。
+            t.Ok(!entry.GetRawText().Contains(Token, StringComparison.Ordinal),
+                "the audit record never contains the credential");
         });
     }
 

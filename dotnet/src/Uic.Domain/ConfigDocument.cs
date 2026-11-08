@@ -104,6 +104,8 @@ public sealed class StorageOptions
     /// <summary>本地 journal 兜底（NDJSON）。不是北向协议，默认关闭。</summary>
     public bool Journal { get; init; }
 
+    public AuditOptions Audit { get; init; } = new();
+
     public int OutboxMaxRecords { get; init; } = 100_000;
     public long OutboxMaxBytes { get; init; } = 256L * 1024 * 1024;
     public TimeSpan OutboxTtl { get; init; } = TimeSpan.FromHours(24);
@@ -125,6 +127,27 @@ public sealed class StorageOptions
 
     /// <summary>资源水位检查间隔。1 秒 .. 1 小时。</summary>
     public TimeSpan ResourceCheckInterval { get; init; } = TimeSpan.FromSeconds(10);
+}
+
+/// <summary>
+/// 审计日志落盘设置。
+///
+/// 与文件日志不同，审计默认**开启**：文件日志是排障辅助，缺了只是不方便；
+/// 审计是「配置是谁改的、写操作是谁下的」的唯一答案，默认关闭等于没有。
+/// 目录跟着数据目录走，随配置版本一起搬机器。
+/// </summary>
+public sealed class AuditOptions
+{
+    public bool Enabled { get; init; } = true;
+
+    /// <summary>单个文件的上限。写满后开新文件，不会把一条记录切成两半。</summary>
+    public long MaxBytes { get; init; } = 8L * 1024 * 1024;
+
+    /// <summary>最多保留几个文件（含当前文件）。审计是有成本的记忆，必须设上限。</summary>
+    public int Retain { get; init; } = 6;
+
+    /// <summary>相对数据目录的子目录；也接受绝对路径。</summary>
+    public string Directory { get; init; } = "audit";
 }
 
 /// <summary>日志配置。默认不落盘：边缘设备磁盘小，没显式配置就不该悄悄写文件。</summary>

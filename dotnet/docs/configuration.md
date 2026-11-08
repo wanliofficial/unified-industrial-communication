@@ -396,8 +396,40 @@ printf '%s' '...' | uic secret seal  # 输出 enc:v1:...，把它填进配置
 | `resumeFreeBytes` | `0` | 恢复到该值以上才解除降级；`0` = 取 `minFreeBytes` 的两倍 |
 | `maxMemoryBytes` | `0` | 进程工作集超过该值进入降级；`0` = 不检查 |
 | `resourceCheckInterval` | `10s` | 资源水位检查间隔，`1s .. 1h` |
+| `audit.enabled` | `true` | 审计落盘开关。默认开启：审计是「谁改了什么」的唯一答案，默认关闭等于没有 |
+| `audit.maxBytes` | `8388608` | 单个审计文件的上限（≥1024）；写满后开新文件 |
+| `audit.retain` | `6` | 最多保留几份（含当前文件），范围 `1..1000` |
+| `audit.directory` | `audit` | 相对 `dataDir` 的子目录；也接受绝对路径 |
 
 超限时丢最旧的并计数，`/api/v1/health` 与指标里都能看到丢弃数。
+
+### 审计
+
+审计与文件日志是两件事：日志会按级别过滤、会轮转、会丢；审计是事后追责的落盘记录，
+默认开启且每条写入后立即 flush。文件按天与按大小切分（一天内写满就换新文件），
+按 `retain` 只保留最近几份，最旧的文件先删——保留策略只删旧文件，绝不会删正在写的那个。
+
+```json
+{
+  "storage": {
+    "dataDir": "/var/lib/uic",
+    "audit": {
+      "enabled": true,
+      "maxBytes": 8388608,
+      "retain": 6,
+      "directory": "audit"
+    }
+  }
+}
+```
+
+- 目录随 `dataDir` 走，相对路径按 `dataDir` 解析；`enabled: false` 时只保留内存里的序号，
+  不写盘、不创建目录，已有文件不会被删除。
+- 配置可以热更新：改目录 / 上限 / 开关后立即生效，不必重启进程。改动审计设置的那一次
+  `config.apply` 本身会记在新的目录里。
+- 写失败（磁盘满、权限错）只告警一次并把指标 `uic_audit_write_failures` 置为非零，
+  业务继续：用观测问题制造一次写入失败或配置回滚失败，代价更大。
+- 查询与导出见 [northbound-api.md](northbound-api.md#审计)。
 
 ### 资源水位降级
 
