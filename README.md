@@ -372,6 +372,43 @@ IEC 104 与其它协议的根本差别是**数据由从站推上来**：建链�
 传送原因、时标），初次接陌生设备时先看清「它送什么」再写点表。双点的 0/3 中间态
 原样显示成「不确定 (3)」，不硬转成布尔。
 
+DL/T 645-2007 多功能电能表（RS-485 / 串口服务器）：
+
+```bash
+./uic sim -protocol dlt645 -listen 127.0.0.1:14001 &   # 内置电能表从站（表地址 000000000042）
+./uic -config examples/dlt645.json
+curl -s -H 'Authorization: Bearer dev-token-0123456789' localhost:8093/api/v1/points
+#   13 点：电能 123456.78 kWh、三相电压/电流、总有功、功率因数、频率、
+#          最大需量、时钟（可写）、状态字、电压数据块（bytes）、
+#          第 1 结算日（MMDDhhmm，可写）
+#   自检（不需要网关）：./uic dlt645read -addr 127.0.0.1:14001 -address 42 -di 00000000,02010100
+#   只验物理层：./uic dlt645read -port /dev/ttyUSB0 -baud 2400 -address 0042 -probe
+#   写时钟：./uic dlt645read -addr 127.0.0.1:14001 -address 42 -di 04000101 -write "2026-11-07 12:00:00"
+```
+
+645 的地址是**数据标识（DI）**而不是寄存器偏移：`address.area` 写 8 位十六进制
+（手册顺序 `DI3DI2DI1DI0`，如 `02010100` = A 相电压），`offset` 恒为 0，`length`
+通常省略——宽度（电压 2 字节、电流 3 字节、电能 4 字节）是数据项的固有属性，由 DI 表
+决定。点表层为此引入 `WidthProtocol`（宽度由协议定义，不由 `dataType` 推导）：
+不在点表里复制一张 DI 表，也不让「长度与类型宽度不符」的告警在表计协议上刷屏。
+数据块（DI 含 `FF`）只按 `bytes` 交付——把 15 个 4 字节项的串联硬解成 `float64`，
+会给出一个看起来像读数、实际是前 8 字节的假值。
+
+协议一次请求只能带一个 DI，所以驱动**逐点串行**、不做合并读：`MultiRead` 诚实地声明
+`unsupported`。一轮采集的耗时等于「点数 × 单次事务」，300 个点位挂在 2400bps 总线上
+要几十秒——这个事实必须让配点表的人看见，而不是被驱动藏起来。读到链路级故障（超时/
+断开）后本轮剩余点快速失败，不再逐点等超时。数据块超长时驱动在同一次 `Read` 内跟完
+后续帧（`0x12`，SEQ 1..255，上限 64 帧）：截断的电能读数会以「少了几位」的形式入账，
+看不出任何异常。
+
+写命令有四道闸门：`options` 含 `allow-write`（普通写）、`allow-control`（拉合闸/清零）、
+DI 表标注可写、设备密码。它们是「与」关系——一个能读的驱动不应该顺手能把闸拉了。
+广播校时/广播冻结连入口都不提供：一条配错的广播会同时改掉总线上所有表的时间。
+
+承载支持 `serial`（真实 RS-485，走共享串口层的总线级互斥）与 `tcp`（串口服务器/DTU
+透传，锁退化为每连接互斥）。两种承载的分帧与命令序列完全相同，所以内置 TCP 从站能
+直接当自检目标。
+
 FINS 只做 FINS/TCP；FINS/UDP 与 Host Link 配置期即拒。建链先做节点号协商（命令 0
 → 1），`device.unitId>0` 覆盖目标节点、0 用协商值。`offset` 是**字地址**、`bit` 是
 字内位号（`CIO0.3` → `offset=0, bit=3`）；字访问 2 字节/字，位访问**1 字节/位**；
@@ -398,7 +435,7 @@ go test -race -count=1 ./...
 
 | 路径 | 内容 |
 |---|---|
-| `cmd/uic/` | 单入口：`run` / `sim`（Modbus / S7 / OPC UA / MQTT / MC / FINS / EtherNet-IP / BACnet-IP / IEC 104）/ `mbread` / `mcread` / `finsread` / `enipread` / `bacread` / `iec104read` / `uaread` / `s7blocks` / `s7upload` / `instantiate` / `import` / `token` / `-check` / `version` |
+| `cmd/uic/` | 单入口：`run` / `sim`（Modbus / S7 / OPC UA / MQTT / MC / FINS / EtherNet-IP / BACnet-IP / IEC 104 / 645）/ `mbread` / `mcread` / `finsread` / `enipread` / `bacread` / `iec104read` / `dlt645read` / `uaread` / `s7blocks` / `s7upload` / `instantiate` / `import` / `token` / `-check` / `version` |
 | `internal/model` | 通道 / 设备 / 点位 / 地址 / 采样 / 质量码 |
 | `internal/driver` | 驱动契约（Codec / Transport / Driver）、错误分类、注册表、只读 `Lookup` 注入 |
 | `internal/calc` | 零依赖表达式引擎（编译期类型检查、短路求值、引用 `device:point`） |
@@ -417,6 +454,9 @@ go test -race -count=1 ./...
 | `internal/codec/iec104` | IEC 60870-5-104 纯函数编解码（APCI 三种帧型 / ASDU / 元素宽度 / CP56Time2a / 品质位 / 命令构造 / 类型与原因名表） |
 | `internal/driver/iec104` | IEC 104 主站（STARTDT 建链、站总召唤、电能量召唤、最新值表、五种命令、否定确认分类、旁路表） |
 | `internal/sim/iec104` | IEC 104 内置从站（对象表 / STARTDT 门控 / 召唤快照 / 命令三段式 / 突发上送） |
+| `internal/codec/dlt645` | 645-2007 纯函数编解码（帧/校验和 / 数据标识 DI 表 / 压缩 BCD 与小数位 / 时间与地址 / 收帧扫描 / 后续帧序号） |
+| `internal/driver/dlt645` | 645 主站（RS-485 与串口服务器双承载、总线锁、逐点读 + 后续帧、写权限四道闸门、错误分类） |
+| `internal/sim/dlt645` | 645 内置从站（按标准宽度回数据 / 地址过滤 / 后续帧拆分 / 写权限与密码 / 广播校时静默生效 / 拉合闸） |
 | `internal/template` | 设备模板：参数校验 / 字符串字面量替换 / 实例化后完整校验 |
 | `internal/pointtable` | 点表 CSV：列别名 / 地址表达式 / 按协议推导宽度 / 合并动作 |
 | `internal/alarm` | 报警引擎：五态机 / 滞回 / 延时 / 表达式规则 / 确认 / 订阅 |

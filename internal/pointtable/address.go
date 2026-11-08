@@ -35,6 +35,14 @@ const (
 	WidthRegisters
 	// WidthBytes 是 S7 语义：DB1.DBD0 的 length 是 4。
 	WidthBytes
+	// WidthProtocol 表示宽度由协议层按数据项定义决定，地址里可以省略。
+	//
+	// 与 WidthExplicit 的区别不是「谁更宽松」，而是**长度的归属**：Modbus/S7
+	// 的地址只表达位置，宽度是调用方的选择（同一个 holding:0 可以读成 2 个
+	// 寄存器也可以读成 4 个）；而按数据标识寻址的协议里，宽度是数据项的
+	// 固有属性，多写一个字节就取不到这个数据项。所以这里允许省略，由驱动
+	// 按协议定义填——驱动也会在应答长度不符时报错，那是这一层做不到的事。
+	WidthProtocol
 )
 
 // AddressPolicy 描述某协议接受的地址形态。
@@ -51,6 +59,12 @@ type AddressPolicy struct {
 	// AllowSelector 表示符号地址可以带 `#selector`（MQTT 载荷字段）。
 	// 其他协议带 selector 多半是把 MQTT 主题贴错了列，应当在导入时拦下。
 	AllowSelector bool
+	// AllowDI 表示寄存器地址的第一段是「数据标识」而不是区域名：
+	// 8 位十六进制 DI（DL/T 645 这类按数据项寻址的协议）。
+	//
+	// 单独一个开关而不是把它塞进 RegisterAreas：DI 是无限集合
+	// （0x00000000..0xFFFFFFFF），没法穷举成白名单。
+	AllowDI bool
 }
 
 var (
@@ -87,6 +101,16 @@ func PolicyFor(protocol string) AddressPolicy {
 			Width: WidthBytes, AllowRegister: true, AllowSymbol: true,
 			AllowComputed: true, AllowSelector: true,
 		}
+	case "dlt645":
+		// 数据标识型寻址：`<DI>:0[:length]`，DI 是手册顺序的 8 位十六进制。
+		// offset 恒为 0（协议没有偏移概念），长度由 DI 表推导；只有数据块
+		// （DI 含 FF）必须显式给长度，因为它的宽度由请求决定。
+		//
+		// Width 用 WidthProtocol：点表这一层不复制 DI 表，也不 import
+		// 协议 codec；宽度由驱动按数据项定义决定（那里报错能说出数据项
+		// 名字，比「长度不对」有用得多）。数据块仍然必须显式给长度，
+		// 因为它的宽度本来就由请求决定。
+		return AddressPolicy{Width: WidthProtocol, AllowRegister: true, AllowDI: true}
 	}
 	// 未知协议：不拦地址种类（驱动可能在外部注册），但 length 必须显式，
 	// 避免用一个猜出来的宽度去读真实设备。
@@ -137,6 +161,12 @@ func ParseAddressWithLength(expr string, dt model.DataType, protocol string, len
 			return model.Address{}, fmt.Errorf("length is only valid for register addresses")
 		}
 		return parseFileAddress(expr)
+	}
+
+	// DI 型寻址的语法与 register 同形（`DI:offset:length`），因此必须先
+	// 拦在前面：否则 `db1:0` 之类会落进 parseRegister 被当成 S7 数据块。
+	if pol.AllowDI {
+		return parseDIAddress(expr, dt, pol, length)
 	}
 
 	if area, db, rest, ok := splitRegisterPrefix(expr); ok {
@@ -297,6 +327,77 @@ func parseRegister(area string, db int, rest string, dt model.DataType, pol Addr
 	return a, nil
 }
 
+// parseDIAddress 解析「数据标识型」寄存器地址：`DI[:offset[:length]]`。
+//
+// 三种写法都接受，且都产出同一个结构化地址：
+//
+//	02010100          A 相电压（宽度由数据项定义决定）
+//	02010100:0        offset 显式写 0（有的点表模板省不掉这一列）
+//	0201FF00:0:20     电压数据块，显式给出期望长度
+//
+// offset 只能是 0：数据标识寻址没有「在数据项内部偏移」的概念，写别的
+// 值一定是从寄存器型协议抄过来没改，越早报错越好。
+func parseDIAddress(expr string, dt model.DataType, pol AddressPolicy, hint int) (model.Address, error) {
+	parts := strings.Split(expr, ":")
+	if len(parts) > 3 {
+		return model.Address{}, fmt.Errorf("DI address has too many fields: %q (want DI[:offset[:length]])", expr)
+	}
+	di := strings.ToUpper(strings.TrimSpace(parts[0]))
+	if len(di) != 8 {
+		return model.Address{}, fmt.Errorf("DI %q must be 8 hex digits (DI3DI2DI1DI0)", di)
+	}
+	for _, r := range di {
+		if !(r >= '0' && r <= '9' || r >= 'A' && r <= 'F') {
+			return model.Address{}, fmt.Errorf("DI %q contains non-hex character %q", di, r)
+		}
+	}
+	if di == "FFFFFFFF" {
+		// 全 FF 既不是合法数据项，也不是任何标准数据块；它通常来自
+		// 「地址还没填」的模板。
+		return model.Address{}, fmt.Errorf("DI %q is not a valid data identifier", di)
+	}
+
+	if len(parts) >= 2 {
+		off := strings.TrimSpace(parts[1])
+		if off != "" {
+			n, err := strconv.Atoi(off)
+			if err != nil || n != 0 {
+				return model.Address{}, fmt.Errorf("DI address offset must be 0, got %q", off)
+			}
+		}
+	}
+	length := 0
+	if len(parts) == 3 {
+		n, err := strconv.Atoi(strings.TrimSpace(parts[2]))
+		if err != nil || n <= 0 {
+			return model.Address{}, fmt.Errorf("length %q is not a positive integer", parts[2])
+		}
+		if hint > 0 && hint != n {
+			return model.Address{}, fmt.Errorf("length is given twice with different values (%d in address, %d in length column)", n, hint)
+		}
+		length = n
+	} else if hint > 0 {
+		length = hint
+	}
+	if length > 125 {
+		// 这是模型的统一上限（Span 合并、北向展示都按它假设）。数据块
+		// 常超过它——那种情况省略 length，宽度由应答决定。
+		return model.Address{}, fmt.Errorf("length %d must be <= 125 (omit it for large data blocks)", length)
+	}
+	if dt == model.TypeBool {
+		return model.Address{}, fmt.Errorf("protocol does not support bit addressing; read the status word as uint16")
+	}
+	if pol.Width != WidthProtocol && length == 0 {
+		return model.Address{}, fmt.Errorf("length is required for %s (protocol width is unknown)", dt)
+	}
+
+	a := model.Address{Kind: model.AddressRegister, Area: di, Offset: 0, Length: length, Bit: -1}
+	if err := a.Validate(); err != nil {
+		return model.Address{}, err
+	}
+	return a, nil
+}
+
 func deriveLength(area string, dt model.DataType, mode WidthMode) (int, error) {
 	if area == "coil" || area == "discrete" {
 		return 1, nil
@@ -309,6 +410,9 @@ func deriveLength(area string, dt model.DataType, mode WidthMode) (int, error) {
 	}
 	if mode == WidthExplicit {
 		return 0, fmt.Errorf("length is required for %s (protocol width is unknown)", dt)
+	}
+	if mode == WidthProtocol {
+		return 0, fmt.Errorf("width of %s is defined by the protocol, not by the data type", dt)
 	}
 	width := dt.Bytes()
 	if width <= 0 {

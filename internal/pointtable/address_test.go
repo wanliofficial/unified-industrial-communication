@@ -107,3 +107,86 @@ func TestAddressPolicyStatic(t *testing.T) {
 		t.Fatalf("unknown = %+v", p)
 	}
 }
+
+// DL/T 645 这类协议按「数据标识」寻址：地址里没有区域名，第一段就是 8 位
+// 十六进制的 DI，也没有真正的偏移概念。这一组用例钉住它的三种写法与
+// 各种应当被拦住的错法。
+func TestParseAddressDI(t *testing.T) {
+	cases := []struct {
+		name string
+		expr string
+		dt   model.DataType
+		hint int
+		want string
+	}{
+		{"bare DI", "02010100", model.TypeFloat64, 0, "02010100:0:0"},
+		{"lowercase DI", "0201ff00", model.TypeBytes, 0, "0201FF00:0:0"},
+		{"explicit zero offset", "02010100:0", model.TypeFloat64, 0, "02010100:0:0"},
+		{"block with length", "0201FF00:0:20", model.TypeBytes, 0, "0201FF00:0:20"},
+		{"length column", "0201FF00", model.TypeBytes, 12, "0201FF00:0:12"},
+		{"energy family", "00000000", model.TypeFloat64, 0, "00000000:0:0"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			a, err := ParseAddressWithLength(tc.expr, tc.dt, "dlt645", tc.hint)
+			if err != nil {
+				t.Fatalf("parse: %v", err)
+			}
+			if got := a.Canonical(); got != tc.want {
+				t.Fatalf("canonical = %q, want %q", got, tc.want)
+			}
+			if a.Offset != 0 {
+				t.Fatalf("offset = %d, want 0", a.Offset)
+			}
+		})
+	}
+}
+
+func TestParseAddressDIRejects(t *testing.T) {
+	cases := []struct {
+		name string
+		expr string
+		dt   model.DataType
+		hint int
+		want string
+	}{
+		{"short DI", "020101", model.TypeFloat64, 0, "8 hex digits"},
+		{"non hex", "0201010G", model.TypeFloat64, 0, "non-hex"},
+		{"non zero offset", "02010100:4", model.TypeFloat64, 0, "must be 0"},
+		{"too many fields", "02010100:0:2:9", model.TypeFloat64, 0, "too many"},
+		{"bad length", "02010100:0:0", model.TypeFloat64, 0, "positive"},
+		{"all FF", "FFFFFFFF", model.TypeFloat64, 0, "not a valid data identifier"},
+		{"bool point", "04000402", model.TypeBool, 0, "bit addressing"},
+		{"length conflict", "0201FF00:0:8", model.TypeBytes, 12, "given twice"},
+		{"length too big", "0201FF00:0:126", model.TypeBytes, 0, "<= 125"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := ParseAddressWithLength(tc.expr, tc.dt, "dlt645", tc.hint)
+			if err == nil {
+				t.Fatal("must fail")
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("error = %v, want substring %q", err, tc.want)
+			}
+		})
+	}
+}
+
+// DI 策略必须拦住「拿别的协议的地址去喂 645」和「把 645 的 DI 喂给别的
+// 协议」两个方向，否则现场会得到「能启动但每个点都读不到」。
+func TestPolicyForDI(t *testing.T) {
+	p := PolicyFor("dlt645")
+	if !p.AllowRegister || !p.AllowDI || p.Width != WidthProtocol {
+		t.Fatalf("dlt645 = %+v", p)
+	}
+	if p.AllowSymbol || p.AllowObject || p.AllowFile || p.AllowComputed || p.AllowSelector {
+		t.Fatalf("dlt645 accepts non-DI kinds: %+v", p)
+	}
+	if _, err := ParseAddress("holding:0:2", model.TypeUint16, "dlt645"); err == nil {
+		t.Fatal("dlt645 must reject Modbus-style area names")
+	}
+	if _, err := ParseAddress("02010100", model.TypeFloat64, "modbus-tcp"); err == nil {
+		t.Fatal("modbus must reject DI-style addresses")
+	}
+}

@@ -7,6 +7,7 @@
 //	uic sim -protocol s7 -listen 127.0.0.1:15102   # 内置 S7 从站
 //	uic sim -protocol opcua -listen 127.0.0.1:14840 # 内置 OPC UA 服务端
 //	uic sim -protocol mqtt -listen 127.0.0.1:18830  # 内置 MQTT Broker（南向演示）
+//	uic sim -protocol dlt645 -listen 127.0.0.1:14001 # 内置电能表从站（645-2007）
 //	uic mbread -addr 127.0.0.1:1502    # 不依赖第三方工具的从站读写自检（TCP）
 //	uic mbread -transport rtu -port /dev/ttyUSB0 -unit 1   # 串口从站自检
 //	uic mcread -addr 127.0.0.1:5000 -area d -offset 100 -qty 2   # MC 3E 自检
@@ -50,6 +51,7 @@ import (
 	"uic/internal/opcuaserver"
 	uicruntime "uic/internal/runtime"
 	bacnetsim "uic/internal/sim/bacnet"
+	dlt645sim "uic/internal/sim/dlt645"
 	enipsim "uic/internal/sim/enip"
 	finsim "uic/internal/sim/fins"
 	iec104sim "uic/internal/sim/iec104"
@@ -87,6 +89,8 @@ func main() {
 		bacreadCmd(args)
 	case "iec104read":
 		iec104readCmd(args)
+	case "dlt645read":
+		dlt645readCmd(args)
 	case "uaread":
 		uareadCmd(args)
 	case "s7blocks":
@@ -116,7 +120,7 @@ func usage() {
 用法:
   uic [run] -config config.json [-listen :8080] [-token TOKEN]
   uic -check -config config.json
-  uic sim [-listen 127.0.0.1:15020] [-protocol modbus|s7|opcua|mqtt|mc|fins|enip|bacnet|iec104]
+  uic sim [-listen 127.0.0.1:15020] [-protocol modbus|s7|opcua|mqtt|mc|fins|enip|bacnet|iec104|dlt645]
   uic mbread -addr 127.0.0.1:1502 -unit 1 -area holding -offset 0 -qty 2
   uic mbread -addr 127.0.0.1:1502 -area holding -offset 5 -write 777
   uic mcread -addr 127.0.0.1:5000 -area d -offset 100 -qty 2
@@ -129,6 +133,9 @@ func usage() {
   uic bacread -addr 127.0.0.1:47808 -type analog-value -instance 2 -write 55.5
   uic iec104read -addr 127.0.0.1:2404 -ca 1 [-ioa 1001,1002] [-json]
   uic iec104read -addr 127.0.0.1:2404 -area single-command -cmd-ioa 4001 -write on
+  uic dlt645read -addr 127.0.0.1:14001 -address 000000000042 -di 00000000,02010100
+  uic dlt645read -transport serial -port /dev/ttyUSB0 -baud 2400 -address 0042 -probe
+  uic dlt645read -addr 127.0.0.1:14001 -address 42 -di 04000101 -write 20261107120000
   uic mbread -transport rtu|ascii -port /dev/ttyUSB0 [-baud 19200] [-parity even]
   uic uaread -addr 127.0.0.1:4840 -nodes ns=2;s=site/dev/point [-type float64]
   uic uaread -addr 127.0.0.1:4840 -nodes ns=2;s=site/dev/setpoint -write 42.5
@@ -434,7 +441,7 @@ func simCmd(args []string) {
 	fs := flag.NewFlagSet("sim", flag.ExitOnError)
 	addr := fs.String("listen", "127.0.0.1:15020", "监听地址")
 	size := fs.Int("size", 1024, "寄存器数量")
-	proto := fs.String("protocol", "modbus", "从站协议：modbus | s7 | opcua | mqtt | mc | fins | enip | bacnet | iec104")
+	proto := fs.String("protocol", "modbus", "从站协议：modbus | s7 | opcua | mqtt | mc | fins | enip | bacnet | iec104 | dlt645")
 	pdu := fs.Int("pdu", 480, "S7 协商 PDU 长度（240/480/960）")
 	fs.Parse(args)
 
@@ -463,9 +470,12 @@ func simCmd(args []string) {
 	case "iec104":
 		simIEC104(*addr)
 		return
+	case "dlt645":
+		simDLT645(*addr)
+		return
 	case "modbus":
 	default:
-		fmt.Fprintf(os.Stderr, "未知协议 %q（支持 modbus | s7 | opcua | mqtt | mc | fins | enip | bacnet | iec104）\n", *proto)
+		fmt.Fprintf(os.Stderr, "未知协议 %q（支持 modbus | s7 | opcua | mqtt | mc | fins | enip | bacnet | iec104 | dlt645）\n", *proto)
 		os.Exit(2)
 	}
 
@@ -826,6 +836,41 @@ func simIEC104(addr string) {
 	fmt.Println("            1005=-3.5(带时标)  2001=on  2002=off  2003=double 2(可遥控)")
 	fmt.Println("            2004=double 1  3001=1000(累计量，每秒自增)")
 	fmt.Println("  控制方向：4001=单点  4002=短浮点设定值  4003=标度化设定值（可写）")
+	fmt.Println("  Ctrl+C 停止")
+
+	<-ctx.Done()
+	_ = srv.Close()
+	slog.Info("sim_stopped")
+}
+
+// simDLT645 启动内置电能表从站（DL/T 645-2007）。
+//
+// 用 TCP 而不是串口，是因为自检的目的在于验证「主站的帧、DI、时序」是否
+// 正确，而不是验证 USB 转 485 的驱动装没装。现场把串口服务器当透传用时
+// 走的也是同一条字节流，因此这里的行为与真表一致：地址不匹配静默、数据
+// 项只读、超长数据块分帧、广播命令执行但不应答。
+//
+// 初始值与 examples/dlt645.json 一一对应：先起这个从站，再跑
+// `./uic -config examples/dlt645.json`，就能看到点位被正常采集。
+func simDLT645(addr string) {
+	srv, err := dlt645sim.NewServer(addr)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "启动 DL/T 645 从站失败: %v\n", err)
+		os.Exit(1)
+	}
+	defer func() { _ = srv.Close() }()
+
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	fmt.Printf("dl/t 645-2007 meter slave listening on %s (表地址 %s)\n", srv.Addr(), srv.Address())
+	fmt.Println("  电能量：00000000=123456.78 组合有功总电能  00010000=123456.78 正向有功总电能")
+	fmt.Println("         00020000=0 反向有功总电能  00030000=43.21 组合无功1总电能")
+	fmt.Println("  瞬时量：02010100=220.0V A 相  02020100=5.123A A 相  02030000=1.2345kW 总有功")
+	fmt.Println("         02060000=0.985 功率因数  02800002=50.00Hz 频率")
+	fmt.Println("  需量：  01010000=12.3456kW（11-07 12:00）")
+	fmt.Println("  可写：  04000101 日期时间（密码 P0..P2 全 0）  04000401 通信地址  04000B01 第 1 结算日")
+	fmt.Println("  注意：  只应答本表地址；广播校时应答静默但生效；地址不匹配时静默")
 	fmt.Println("  Ctrl+C 停止")
 
 	<-ctx.Done()

@@ -1,0 +1,153 @@
+{
+  "schemaVersion": 1,
+  "site": "dlt645-lab",
+  "server": {
+    "listen": "127.0.0.1:8093",
+    "token": "dev-token-0123456789"
+  },
+  "storage": {
+    "dir": "./data-dlt645",
+    "journal": true,
+    "outboxMaxRecords": 5000,
+    "outboxTtl": "10m"
+  },
+  "logging": {
+    "level": "info"
+  },
+  "northbound": {
+    "webhook": {
+      "enabled": false,
+      "url": "http://127.0.0.1:9999/ingest",
+      "timeout": "3s"
+    }
+  },
+  "channels": [
+    {
+      "id": "ch-dlt645",
+      "protocol": "dlt645",
+      "transport": {
+        "kind": "tcp",
+        "address": "127.0.0.1:14001"
+      },
+      "concurrency": 1,
+      "timeout": "5s"
+    }
+  ],
+  "devices": [
+    {
+      "id": "meter01",
+      "name": "一号电表（内置 645 从站，表地址 000000000042）",
+      "channel": "ch-dlt645",
+      "interval": "1s",
+      "timeout": "3s",
+      "enabled": true,
+      "labels": {
+        "address": "000000000042",
+        "options": "allow-write,preamble=4,gap=20ms"
+      },
+      "points": [
+        {
+          "id": "energy-total",
+          "name": "组合有功总电能（00000000）",
+          "address": { "kind": "register", "area": "00000000", "offset": 0, "bit": -1 },
+          "dataType": "float64",
+          "unit": "kWh",
+          "enabled": true
+        },
+        {
+          "id": "energy-forward",
+          "name": "正向有功总电能（00010000）",
+          "address": { "kind": "register", "area": "00010000", "offset": 0, "bit": -1 },
+          "dataType": "float64",
+          "unit": "kWh",
+          "enabled": true
+        },
+        {
+          "id": "voltage-a",
+          "name": "A 相电压（02010100）",
+          "address": { "kind": "register", "area": "02010100", "offset": 0, "bit": -1 },
+          "dataType": "float64",
+          "unit": "V",
+          "enabled": true
+        },
+        {
+          "id": "voltage-b",
+          "name": "B 相电压（02010200）",
+          "address": { "kind": "register", "area": "02010200", "offset": 0, "bit": -1 },
+          "dataType": "float64",
+          "unit": "V",
+          "enabled": true
+        },
+        {
+          "id": "current-a",
+          "name": "A 相电流（02020100）",
+          "address": { "kind": "register", "area": "02020100", "offset": 0, "bit": -1 },
+          "dataType": "float64",
+          "unit": "A",
+          "enabled": true
+        },
+        {
+          "id": "power-total",
+          "name": "瞬时总有功功率（02030000）",
+          "address": { "kind": "register", "area": "02030000", "offset": 0, "bit": -1 },
+          "dataType": "float64",
+          "unit": "kW",
+          "enabled": true
+        },
+        {
+          "id": "pf-a",
+          "name": "A 相功率因数（02060000）",
+          "address": { "kind": "register", "area": "02060000", "offset": 0, "bit": -1 },
+          "dataType": "float64",
+          "enabled": true
+        },
+        {
+          "id": "frequency",
+          "name": "电网频率（02800002）",
+          "address": { "kind": "register", "area": "02800002", "offset": 0, "bit": -1 },
+          "dataType": "float64",
+          "unit": "Hz",
+          "enabled": true
+        },
+        {
+          "id": "demand",
+          "name": "正向有功总最大需量（01010000，只交付需量值）",
+          "address": { "kind": "register", "area": "01010000", "offset": 0, "bit": -1 },
+          "dataType": "float64",
+          "unit": "kW",
+          "enabled": true
+        },
+        {
+          "id": "clock",
+          "name": "日期及时间（04000101，可写）",
+          "address": { "kind": "register", "area": "04000101", "offset": 0, "bit": -1 },
+          "dataType": "float64",
+          "writable": true,
+          "enabled": true
+        },
+        {
+          "id": "status",
+          "name": "电表运行状态字 1（04000402）",
+          "address": { "kind": "register", "area": "04000402", "offset": 0, "bit": -1 },
+          "dataType": "uint16",
+          "enabled": true
+        },
+        {
+          "id": "voltage-block",
+          "name": "电压数据块（0201FF00，三相共 6 字节，按 bytes 交付）",
+          "address": { "kind": "register", "area": "0201FF00", "offset": 0, "length": 6, "bit": -1 },
+          "dataType": "bytes",
+          "enabled": true
+        },
+        {
+          "id": "settlement-date",
+          "name": "第 1 结算日（04000B01，4 字节 MMDDhhmm，可写）",
+          "address": { "kind": "register", "area": "04000B01", "offset": 0, "bit": -1 },
+          "dataType": "float64",
+          "writable": true,
+          "enabled": true
+        }
+      ]
+    }
+  ]
+}

@@ -138,7 +138,7 @@ curl -N localhost:8080/api/v1/stream?points=virtual-01/sine
 
 | 类别 | 内容 | 对应场景 |
 |---|---|---|
-| 协议 | MC 3E（已落地）、FINS（已落地）、EtherNet/IP + CIP（已落地）、BACnet/IP（已落地）、IEC 60870-5-104（已落地）、DL/T 645、CJ/T 188、ADS、OPC DA 桥接、Sparkplug B、SNMP | 汽车 / 3C / 水务 / 楼宇 |
+| 协议 | MC 3E（已落地）、FINS（已落地）、EtherNet/IP + CIP（已落地）、BACnet/IP（已落地）、IEC 60870-5-104（已落地）、DL/T 645（已落地）、CJ/T 188、ADS、OPC DA 桥接、Sparkplug B、SNMP | 汽车 / 3C / 水务 / 楼宇 |
 | 数据 | 有界采样历史库（NDJSON 分段，已落地）+ 降采样 + 保留策略 + 历史查询 API + 窗口聚合（`avg(ref, 5m)`，已落地） | 全部 |
 | 语义 | 单位/量程、计算点、报警判定（阈值/延时/组合） | 全部 |
 | 运维 | RBAC（3 角色）、审计查询/导出、诊断包、网络诊断、远程配置下发 | 无人值守 |

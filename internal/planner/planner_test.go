@@ -200,3 +200,45 @@ func TestBuildSeparatesDataBlocks(t *testing.T) {
 		}
 	}
 }
+
+// 按数据标识寻址的协议（如 645）里，area 就是 DI，offset 恒为 0。规划层
+// 不需要知道这件事，但必须保证「不同 DI 不会被合并进同一个 span」——否则
+// 驱动会收到一个看起来连续、实际毫无意义的地址区间。
+//
+// 这里的判据是 area 不同就分组；顺带固定住「同一个 DI 的两个点位落在同一
+// span」这个行为（驱动会逐点读，span 只是一个分组容器）。
+func TestBuildSeparatesByDataIdentifier(t *testing.T) {
+	mk := func(id, di string, length int) model.Point {
+		return pt(id, model.AddressRegister, di, 0, length, model.TypeFloat64)
+	}
+	dev := model.Device{ID: "d", ChannelID: "c", Enabled: true, Points: []model.Point{
+		mk("volt", "02010100", 0),
+		mk("curr", "02020100", 0),
+		mk("energy", "00000000", 0),
+		mk("power-raw", "02030000", 0),
+		mk("power-scaled", "02030000", 0),
+	}}
+	spans, st := Build(dev, Options{})
+	if st.Points != 5 {
+		t.Fatalf("points = %d", st.Points)
+	}
+	if len(spans) != 4 {
+		t.Fatalf("spans = %d, want 4 (one per DI): %+v", len(spans), spans)
+	}
+	byDI := map[string]int{}
+	for _, s := range spans {
+		di := s.Points[0].Address.Area
+		byDI[di] += len(s.Points)
+		for _, p := range s.Points {
+			if p.Address.Area != di {
+				t.Fatalf("span %s mixes DI %s and %s", s.ID, di, p.Address.Area)
+			}
+			if p.Address.Offset != 0 {
+				t.Fatalf("DI point %s has offset %d", p.ID, p.Address.Offset)
+			}
+		}
+	}
+	if byDI["02030000"] != 2 {
+		t.Fatalf("same-DI points = %d, want 2", byDI["02030000"])
+	}
+}

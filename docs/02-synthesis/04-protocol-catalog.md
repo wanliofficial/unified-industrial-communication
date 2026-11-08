@@ -241,6 +241,11 @@
 
 MC 3E、FINS、EtherNet/IP + CIP、BACnet/IP、IEC 104、DL/T 645、CJ/T 188、ADS、OPC DA 桥接、Sparkplug B、SNMP。
 
+> 截至当前实现：MC 3E、FINS、EtherNet/IP + CIP、BACnet/IP、IEC 104、DL/T 645 已落地
+> （各含编解码、主站、内置从站/服务端与自检 CLI）；CJ/T 188、ADS、Sparkplug B、SNMP
+> 待落地。DL/T 645 的地址模型（数据标识 DI）与点表 `WidthProtocol` 是后续 CJ/T 188
+> 的直接参照——两者都是「表计语义寻址 + 压缩 BCD」，差异集中在帧头与表号。
+
 **Wave 2 的验收**：覆盖汽车零部件（CIP）、3C（MC）、水务（104/645）、楼宇（BACnet）四类典型场景。
 
 ### Wave 3（第二年）

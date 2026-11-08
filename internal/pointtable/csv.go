@@ -213,7 +213,10 @@ func ParseCSV(r io.Reader, protocol string) (*Result, error) {
 		} else {
 			seenAddr[canon] = point.ID
 		}
-		if pol := PolicyFor(protocol); pol.Width != WidthExplicit && point.DataType.IsNumeric() {
+		// 只对「宽度由 DataType 推导」的协议比对：explicit/protocol 两种
+		// 模式下 address.Length 与类型宽度本来就没有可比性，硬比会制造
+		// 一堆无意义的告警。
+		if pol := PolicyFor(protocol); (pol.Width == WidthRegisters || pol.Width == WidthBytes) && point.DataType.IsNumeric() {
 			if want, err := deriveLength("holding", point.DataType, pol.Width); err == nil && want != point.Address.Length {
 				// 只对寄存器地址提示：符号/对象地址的 Length 没有协议含义
 				// （模型里它恒为 0），拿类型宽度去比只会制造噪音。
