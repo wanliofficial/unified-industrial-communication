@@ -403,6 +403,37 @@ curl -s -H 'Authorization: Bearer dev-token-0123456789' localhost:8093/api/v1/po
 
 写命令有四道闸门：`options` 含 `allow-write`（普通写）、`allow-control`（拉合闸/清零）、
 DI 表标注可写、设备密码。它们是「与」关系——一个能读的驱动不应该顺手能把闸拉了。
+
+CJ/T 188-2004 户用计量仪表（冷水/热水/燃气/热量表，RS-485 / 串口服务器）：
+
+```bash
+./uic sim -protocol cjt188 -listen 127.0.0.1:14001 &   # 内置冷水表从站（表地址 00000805000001）
+./uic -config examples/cjt188.json
+curl -s -H 'Authorization: Bearer dev-token-0123456789' localhost:8094/api/v1/points
+#   8 点：当前累积流量 1234.56 m³、结算日流量、实时时间、状态字、
+#          上 1 月/上 12 月结算日流量、阀门与表地址（后两个是写命令，默认不采集）
+#   自检（不需要网关）：./uic cjt188read -addr 127.0.0.1:14001 \
+#       -address 00000805000001 -type 10 -di 901F:0,901F:5,901F:10,901F:17
+#   只验物理层：./uic cjt188read -port /dev/ttyUSB0 -baud 2400 -address 00000805000001 -probe
+#   写阀门：./uic cjt188read -addr 127.0.0.1:14001 -address 00000805000001 \
+#       -di A017 -write close -allow-control
+```
+
+188 与 645 都是「数据标识」寻址，但帧层完全不同：只有一个 `0x68`、数据域**不加
+`0x33`**、DI 只有 2 字节（`area` 写 4 位十六进制，如 `901F`），**一个 DI 是一组
+字段**。因此 `offset` 在这里是「DI 数据域内的字节偏移」而不是恒 0：水表 `901F`
+的 0/5/10/17 分别是当前累积流量、结算日累积流量、实时时间、状态；热量表同一
+`901F` 的布局完全不同（0/5/10/15/20/25/28/31/34/41），由 `labels.type`（10 水 /
+20 热 / 30 气 / 40 其他）决定用哪套 schema。类型配错的症状是「读到了但量纲不对」，
+所以驱动不猜类型、也不做跨 DI 合并。
+
+一个 DI 内的多字段在一次 `Read` 里复用一次事务（四个字段只发一帧），跨 DI 仍然逐点
+串行，`MultiRead` 诚实声明 `unsupported`。单位是数据域里的显式字节，解码后统一到
+m³ / m³/h / GJ / kW；未知单位代号直接报错，不默认成基准单位（否则 L 与 m³ 的
+1000 倍偏差会被静默掉）。写入口只有阀门（`A017`，`allow-control`）与表地址
+（`A018`，`allow-write` + 完整 14 位）；写地址成功后驱动自动切到新地址，配置仍需
+人工同步。188 的 `AA` 只属于读地址命令，因此表地址不支持缩位——带通配的读数据会
+变成一次多表广播。
 广播校时/广播冻结连入口都不提供：一条配错的广播会同时改掉总线上所有表的时间。
 
 承载支持 `serial`（真实 RS-485，走共享串口层的总线级互斥）与 `tcp`（串口服务器/DTU
@@ -435,7 +466,7 @@ go test -race -count=1 ./...
 
 | 路径 | 内容 |
 |---|---|
-| `cmd/uic/` | 单入口：`run` / `sim`（Modbus / S7 / OPC UA / MQTT / MC / FINS / EtherNet-IP / BACnet-IP / IEC 104 / 645）/ `mbread` / `mcread` / `finsread` / `enipread` / `bacread` / `iec104read` / `dlt645read` / `uaread` / `s7blocks` / `s7upload` / `instantiate` / `import` / `token` / `-check` / `version` |
+| `cmd/uic/` | 单入口：`run` / `sim`（Modbus / S7 / OPC UA / MQTT / MC / FINS / EtherNet-IP / BACnet-IP / IEC 104 / 645 / 188）/ `mbread` / `mcread` / `finsread` / `enipread` / `bacread` / `iec104read` / `dlt645read` / `cjt188read` / `uaread` / `s7blocks` / `s7upload` / `instantiate` / `import` / `token` / `-check` / `version` |
 | `internal/model` | 通道 / 设备 / 点位 / 地址 / 采样 / 质量码 |
 | `internal/driver` | 驱动契约（Codec / Transport / Driver）、错误分类、注册表、只读 `Lookup` 注入 |
 | `internal/calc` | 零依赖表达式引擎（编译期类型检查、短路求值、引用 `device:point`） |
@@ -457,6 +488,9 @@ go test -race -count=1 ./...
 | `internal/codec/dlt645` | 645-2007 纯函数编解码（帧/校验和 / 数据标识 DI 表 / 压缩 BCD 与小数位 / 时间与地址 / 收帧扫描 / 后续帧序号） |
 | `internal/driver/dlt645` | 645 主站（RS-485 与串口服务器双承载、总线锁、逐点读 + 后续帧、写权限四道闸门、错误分类） |
 | `internal/sim/dlt645` | 645 内置从站（按标准宽度回数据 / 地址过滤 / 后续帧拆分 / 写权限与密码 / 广播校时静默生效 / 拉合闸） |
+| `internal/codec/cjt188` | 188-2004 纯函数编解码（单 `68` / 7 字节 BCD 地址 / 无 `0x33` / 2 字节 DI / 按表类型分派的字段 schema / 单位代号 / 7 字节时间 / 收帧扫描） |
+| `internal/driver/cjt188` | 188 主站（RS-485 与串口服务器双承载、总线锁、按 DI 缓存字段、阀门/写地址两道闸门、错误分类） |
+| `internal/sim/cjt188` | 188 内置从站（水/热两套 901F / D120..D12B / 读地址 / 阀门写 / 写地址 / 地址过滤） |
 | `internal/template` | 设备模板：参数校验 / 字符串字面量替换 / 实例化后完整校验 |
 | `internal/pointtable` | 点表 CSV：列别名 / 地址表达式 / 按协议推导宽度 / 合并动作 |
 | `internal/alarm` | 报警引擎：五态机 / 滞回 / 延时 / 表达式规则 / 确认 / 订阅 |

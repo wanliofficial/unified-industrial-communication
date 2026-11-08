@@ -59,12 +59,19 @@ type AddressPolicy struct {
 	// AllowSelector 表示符号地址可以带 `#selector`（MQTT 载荷字段）。
 	// 其他协议带 selector 多半是把 MQTT 主题贴错了列，应当在导入时拦下。
 	AllowSelector bool
-	// AllowDI 表示寄存器地址的第一段是「数据标识」而不是区域名：
-	// 8 位十六进制 DI（DL/T 645 这类按数据项寻址的协议）。
+	// DIBits 表示寄存器地址的第一段是「数据标识」而不是区域名：
+	// 4（CJ/T 188）或 8（DL/T 645）位十六进制；0 表示不是 DI 型寻址。
 	//
-	// 单独一个开关而不是把它塞进 RegisterAreas：DI 是无限集合
-	// （0x00000000..0xFFFFFFFF），没法穷举成白名单。
-	AllowDI bool
+	// 单独一个字段而不是把它塞进 RegisterAreas：DI 是无限集合，
+	// 没法穷举成白名单。位数是协议事实，不做成「几个都行」——多一位少
+	// 一位都指向另一个数据项，宽松解析只会让人查很久。
+	DIBits int
+	// DIField 表示 DI 后面允许写「字段偏移」而不是只允许 0。
+	//
+	// DL/T 645 的一个 DI 就是一个值，offset 只能为 0；CJ/T 188 的一个 DI
+	// 是一组字段的容器（901F 里同时有累积流量、结算日流量、时间、状态），
+	// 只能按字段定位。两种语义不能共用一个开关。
+	DIField bool
 }
 
 var (
@@ -110,7 +117,15 @@ func PolicyFor(protocol string) AddressPolicy {
 		// 协议 codec；宽度由驱动按数据项定义决定（那里报错能说出数据项
 		// 名字，比「长度不对」有用得多）。数据块仍然必须显式给长度，
 		// 因为它的宽度本来就由请求决定。
-		return AddressPolicy{Width: WidthProtocol, AllowRegister: true, AllowDI: true}
+		return AddressPolicy{Width: WidthProtocol, AllowRegister: true, DIBits: 8}
+	case "cjt188":
+		// 数据标识型寻址，但 DI 只有 2 字节（手册顺序的 4 位十六进制），
+		// 且一个 DI 承载多个字段：`<DI>:<fieldOffset>[:length]`。
+		//
+		// 字段偏移是「DI 数据域内的字节偏移」，不是寄存器偏移。让它出现在
+		// offset 位置而不是另造语法，是为了让点表、规划层、北向的地址展示
+		// 保持同一种形状；字段含义由驱动按 (DI, 表类型) 的 schema 解析。
+		return AddressPolicy{Width: WidthProtocol, AllowRegister: true, DIBits: 4, DIField: true}
 	}
 	// 未知协议：不拦地址种类（驱动可能在外部注册），但 length 必须显式，
 	// 避免用一个猜出来的宽度去读真实设备。
@@ -165,7 +180,7 @@ func ParseAddressWithLength(expr string, dt model.DataType, protocol string, len
 
 	// DI 型寻址的语法与 register 同形（`DI:offset:length`），因此必须先
 	// 拦在前面：否则 `db1:0` 之类会落进 parseRegister 被当成 S7 数据块。
-	if pol.AllowDI {
+	if pol.DIBits > 0 {
 		return parseDIAddress(expr, dt, pol, length)
 	}
 
@@ -335,35 +350,42 @@ func parseRegister(area string, db int, rest string, dt model.DataType, pol Addr
 //	02010100:0        offset 显式写 0（有的点表模板省不掉这一列）
 //	0201FF00:0:20     电压数据块，显式给出期望长度
 //
-// offset 只能是 0：数据标识寻址没有「在数据项内部偏移」的概念，写别的
-// 值一定是从寄存器型协议抄过来没改，越早报错越好。
+// offset 的含义由 AddressPolicy.DIField 决定：645 的一个 DI 就是一个值，
+// offset 只能是 0；188 的一个 DI 是一组字段，offset 是数据域内的字节偏移。
 func parseDIAddress(expr string, dt model.DataType, pol AddressPolicy, hint int) (model.Address, error) {
 	parts := strings.Split(expr, ":")
 	if len(parts) > 3 {
 		return model.Address{}, fmt.Errorf("DI address has too many fields: %q (want DI[:offset[:length]])", expr)
 	}
 	di := strings.ToUpper(strings.TrimSpace(parts[0]))
-	if len(di) != 8 {
-		return model.Address{}, fmt.Errorf("DI %q must be 8 hex digits (DI3DI2DI1DI0)", di)
+	if len(di) != pol.DIBits {
+		return model.Address{}, fmt.Errorf("DI %q must be %d hex digits", di, pol.DIBits)
 	}
 	for _, r := range di {
 		if !(r >= '0' && r <= '9' || r >= 'A' && r <= 'F') {
 			return model.Address{}, fmt.Errorf("DI %q contains non-hex character %q", di, r)
 		}
 	}
-	if di == "FFFFFFFF" {
+	if di == strings.Repeat("F", pol.DIBits) {
 		// 全 FF 既不是合法数据项，也不是任何标准数据块；它通常来自
-		// 「地址还没填」的模板。
+		// 「地址还没填」的模板。位数随协议变化（645 是 8 位，188 是 4 位）。
 		return model.Address{}, fmt.Errorf("DI %q is not a valid data identifier", di)
 	}
 
+	offset := 0
 	if len(parts) >= 2 {
 		off := strings.TrimSpace(parts[1])
 		if off != "" {
 			n, err := strconv.Atoi(off)
-			if err != nil || n != 0 {
+			if err != nil || n < 0 {
+				return model.Address{}, fmt.Errorf("DI address offset %q is not a non-negative integer", off)
+			}
+			if !pol.DIField && n != 0 {
+				// 645 的一个 DI 就是一个值：写别的偏移一定是把寄存器型
+				// 协议的地址抄过来了。
 				return model.Address{}, fmt.Errorf("DI address offset must be 0, got %q", off)
 			}
+			offset = n
 		}
 	}
 	length := 0
@@ -391,7 +413,7 @@ func parseDIAddress(expr string, dt model.DataType, pol AddressPolicy, hint int)
 		return model.Address{}, fmt.Errorf("length is required for %s (protocol width is unknown)", dt)
 	}
 
-	a := model.Address{Kind: model.AddressRegister, Area: di, Offset: 0, Length: length, Bit: -1}
+	a := model.Address{Kind: model.AddressRegister, Area: di, Offset: offset, Length: length, Bit: -1}
 	if err := a.Validate(); err != nil {
 		return model.Address{}, err
 	}

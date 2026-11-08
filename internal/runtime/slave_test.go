@@ -40,7 +40,10 @@ func (c *mbClient) roundTrip(unit byte, pdu []byte) []byte {
 	if _, err := c.conn.Write(frame); err != nil {
 		c.t.Fatalf("write: %v", err)
 	}
-	_ = c.conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	// 5s 与从站的 WriteTimeout 默认值对齐：写请求要穿透到设备 actor、
+	// 再同步写一条审计记录，磁盘在整套测试并发跑时可能排队几秒。2s 会在
+	// 机器繁忙时稳定失败，测到的是磁盘调度而不是转发语义。
+	_ = c.conn.SetReadDeadline(time.Now().Add(5 * time.Second))
 	head := make([]byte, 7)
 	if _, err := io.ReadFull(c.conn, head); err != nil {
 		c.t.Fatalf("read head: %v", err)

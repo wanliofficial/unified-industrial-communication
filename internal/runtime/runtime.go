@@ -35,6 +35,7 @@ import (
 	"uic/internal/config"
 	"uic/internal/driver"
 	bacnetdrv "uic/internal/driver/bacnet"
+	cjt188drv "uic/internal/driver/cjt188"
 	"uic/internal/driver/computed"
 	dlt645drv "uic/internal/driver/dlt645"
 	enipdrv "uic/internal/driver/enip"
@@ -145,6 +146,7 @@ func RegisterBuiltins() error {
 			bacnetdrv.New(),
 			iec104.New(),
 			dlt645drv.New(),
+			cjt188drv.New(),
 		} {
 			if err := driver.Register(d); err != nil {
 				registerErr = err

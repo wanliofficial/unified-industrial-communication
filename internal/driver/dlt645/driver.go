@@ -26,15 +26,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"net"
 	"strings"
 	"sync"
 	"time"
 
 	"uic/internal/codec/dlt645"
 	"uic/internal/driver"
+	"uic/internal/driver/link"
 	"uic/internal/model"
-	"uic/internal/transport"
 	"uic/internal/transport/serialport"
 )
 
@@ -136,19 +135,6 @@ func (d *Driver) Meta() driver.Meta {
 	}
 }
 
-// link 是驱动需要的链路能力：字节流 + 截止时间 + 清空缓冲 + 总线锁。
-//
-// 抽象成接口而不是直接用 *serialport.Ref，是为了同时支持「串口服务器」
-// （RS-485 转以太网，现场极常见）：它的字节序与串口完全一致，只是没有
-// 物理总线锁——锁退化成每连接一把互斥量。
-type link interface {
-	transport.Stream
-	SetDeadline(t time.Time) error
-	Drain() error
-	Lock()
-	Unlock()
-}
-
 // Open 建链。支持两种承载：
 //
 //   - serial：真实 RS-485，走 serialport 共享同一物理端口；
@@ -164,38 +150,13 @@ func (d *Driver) Open(ctx context.Context, cfg driver.OpenConfig) (driver.Conn, 
 	opt := parseOptions(cfg.Device)
 	t := cfg.Channel.Transport
 
-	var l link
-	switch t.Kind {
-	case "serial":
-		sc := transport.SerialFromTransport(t.Port, t.Baud, t.DataBits, t.Parity, t.StopBits)
-		if err := sc.Validate(); err != nil {
-			return nil, driver.E(driver.ErrUnsupported, "open", cfg.Device.ID, err.Error(), false, err)
-		}
-		ref, aerr := serialport.Acquire("dlt645", sc, d.serial)
-		if aerr != nil {
-			// 打开串口失败通常是「设备被拔了/权限不对/参数被占用」，属可重试。
-			return nil, driver.E(driver.ErrDisconnected, "open", cfg.Device.ID,
-				fmt.Sprintf("open serial %s failed", sc.Port), true, aerr)
-		}
-		l = ref
-	case "tcp":
-		addrStr := strings.TrimSpace(t.Address)
-		if addrStr == "" {
-			return nil, driver.E(driver.ErrUnsupported, "open", cfg.Device.ID,
-				"transport.address required (host[:port])", false, nil)
-		}
-		if _, _, err := net.SplitHostPort(addrStr); err != nil && !strings.Contains(addrStr, ":") {
-			addrStr = net.JoinHostPort(addrStr, defaultTCPPort)
-		}
-		st, derr := transport.DialTCP(ctx, addrStr, cfg.Channel.EffectiveTimeout())
-		if derr != nil {
-			return nil, driver.E(driver.ErrDisconnected, "dial", cfg.Device.ID,
-				fmt.Sprintf("connect %s failed", addrStr), true, derr)
-		}
-		l = &tcpLink{st: st}
-	default:
-		return nil, driver.E(driver.ErrUnsupported, "open", cfg.Device.ID,
-			fmt.Sprintf("dlt645 requires serial or tcp transport, got %q", t.Kind), false, nil)
+	l, err := link.Open(ctx, link.Options{
+		Proto:       "dlt645",
+		DefaultPort: defaultTCPPort,
+		Opener:      d.serial,
+	}, t, cfg.Channel.EffectiveTimeout(), cfg.Device.ID)
+	if err != nil {
+		return nil, err
 	}
 
 	return &conn{
@@ -206,42 +167,6 @@ func (d *Driver) Open(ctx context.Context, cfg driver.OpenConfig) (driver.Conn, 
 		devID:   cfg.Device.ID,
 		timeout: cfg.Device.Timeout.Duration(),
 	}, nil
-}
-
-// tcpLink 给串口服务器套上总线锁与 Drain 语义。
-//
-// Drain 在 TCP 上做不了「清空内核缓冲」；能做的只是把已到达的残留字节
-// 读掉。这个区别值得写清楚：串口服务器上偶发的「读到上一轮应答」只能
-// 靠帧同步（codec.Reader 的扫描）兜底，而不是靠 tcflush。
-type tcpLink struct {
-	st transport.Stream
-	mu sync.Mutex
-}
-
-func (t *tcpLink) Write(p []byte) error           { return t.st.Write(p) }
-func (t *tcpLink) ReadFull(n int) ([]byte, error) { return t.st.ReadFull(n) }
-func (t *tcpLink) Close() error                   { return t.st.Close() }
-func (t *tcpLink) Lock()                          { t.mu.Lock() }
-func (t *tcpLink) Unlock()                        { t.mu.Unlock() }
-
-func (t *tcpLink) SetDeadline(dl time.Time) error {
-	if s, ok := t.st.(transport.DeadlineSetter); ok {
-		return s.SetDeadline(dl)
-	}
-	return nil
-}
-
-// Drain 是一次「尽力而为」的排空：把 1 毫秒内能读到的字节丢掉。
-func (t *tcpLink) Drain() error {
-	if s, ok := t.st.(transport.DeadlineSetter); ok {
-		_ = s.SetDeadline(time.Now().Add(time.Millisecond))
-	}
-	for i := 0; i < 64; i++ {
-		if _, err := t.st.ReadFull(1); err != nil {
-			break
-		}
-	}
-	return nil
 }
 
 // addressOf 从设备标签里取表地址。
@@ -350,7 +275,7 @@ func parseHexBytes(s string) ([]byte, error) {
 
 type conn struct {
 	cfg     driver.OpenConfig
-	link    link
+	link    link.Link
 	addr    [dlt645.AddrLen]byte
 	opt     Options
 	devID   string

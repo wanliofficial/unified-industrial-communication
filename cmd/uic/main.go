@@ -51,6 +51,7 @@ import (
 	"uic/internal/opcuaserver"
 	uicruntime "uic/internal/runtime"
 	bacnetsim "uic/internal/sim/bacnet"
+	cjt188sim "uic/internal/sim/cjt188"
 	dlt645sim "uic/internal/sim/dlt645"
 	enipsim "uic/internal/sim/enip"
 	finsim "uic/internal/sim/fins"
@@ -91,6 +92,8 @@ func main() {
 		iec104readCmd(args)
 	case "dlt645read":
 		dlt645readCmd(args)
+	case "cjt188read":
+		cjt188readCmd(args)
 	case "uaread":
 		uareadCmd(args)
 	case "s7blocks":
@@ -120,7 +123,7 @@ func usage() {
 用法:
   uic [run] -config config.json [-listen :8080] [-token TOKEN]
   uic -check -config config.json
-  uic sim [-listen 127.0.0.1:15020] [-protocol modbus|s7|opcua|mqtt|mc|fins|enip|bacnet|iec104|dlt645]
+  uic sim [-listen 127.0.0.1:15020] [-protocol modbus|s7|opcua|mqtt|mc|fins|enip|bacnet|iec104|dlt645|cjt188]
   uic mbread -addr 127.0.0.1:1502 -unit 1 -area holding -offset 0 -qty 2
   uic mbread -addr 127.0.0.1:1502 -area holding -offset 5 -write 777
   uic mcread -addr 127.0.0.1:5000 -area d -offset 100 -qty 2
@@ -136,6 +139,9 @@ func usage() {
   uic dlt645read -addr 127.0.0.1:14001 -address 000000000042 -di 00000000,02010100
   uic dlt645read -transport serial -port /dev/ttyUSB0 -baud 2400 -address 0042 -probe
   uic dlt645read -addr 127.0.0.1:14001 -address 42 -di 04000101 -write 20261107120000
+  uic cjt188read -addr 127.0.0.1:14001 -address 00000805000001 -type 10 -di 901F:0,901F:5,901F:10,901F:17
+  uic cjt188read -transport serial -port /dev/ttyUSB0 -baud 2400 -address 00000805000001 -probe
+  uic cjt188read -addr 127.0.0.1:14001 -address 00000805000001 -di A017 -write close -allow-control
   uic mbread -transport rtu|ascii -port /dev/ttyUSB0 [-baud 19200] [-parity even]
   uic uaread -addr 127.0.0.1:4840 -nodes ns=2;s=site/dev/point [-type float64]
   uic uaread -addr 127.0.0.1:4840 -nodes ns=2;s=site/dev/setpoint -write 42.5
@@ -441,7 +447,7 @@ func simCmd(args []string) {
 	fs := flag.NewFlagSet("sim", flag.ExitOnError)
 	addr := fs.String("listen", "127.0.0.1:15020", "监听地址")
 	size := fs.Int("size", 1024, "寄存器数量")
-	proto := fs.String("protocol", "modbus", "从站协议：modbus | s7 | opcua | mqtt | mc | fins | enip | bacnet | iec104 | dlt645")
+	proto := fs.String("protocol", "modbus", "从站协议：modbus | s7 | opcua | mqtt | mc | fins | enip | bacnet | iec104 | dlt645 | cjt188")
 	pdu := fs.Int("pdu", 480, "S7 协商 PDU 长度（240/480/960）")
 	fs.Parse(args)
 
@@ -473,9 +479,12 @@ func simCmd(args []string) {
 	case "dlt645":
 		simDLT645(*addr)
 		return
+	case "cjt188":
+		simCJT188(*addr)
+		return
 	case "modbus":
 	default:
-		fmt.Fprintf(os.Stderr, "未知协议 %q（支持 modbus | s7 | opcua | mqtt | mc | fins | enip | bacnet | iec104 | dlt645）\n", *proto)
+		fmt.Fprintf(os.Stderr, "未知协议 %q（支持 modbus | s7 | opcua | mqtt | mc | fins | enip | bacnet | iec104 | dlt645 | cjt188）\n", *proto)
 		os.Exit(2)
 	}
 
@@ -871,6 +880,40 @@ func simDLT645(addr string) {
 	fmt.Println("  需量：  01010000=12.3456kW（11-07 12:00）")
 	fmt.Println("  可写：  04000101 日期时间（密码 P0..P2 全 0）  04000401 通信地址  04000B01 第 1 结算日")
 	fmt.Println("  注意：  只应答本表地址；广播校时应答静默但生效；地址不匹配时静默")
+	fmt.Println("  Ctrl+C 停止")
+
+	<-ctx.Done()
+	_ = srv.Close()
+	slog.Info("sim_stopped")
+}
+
+// simCJT188 启动内置户用计量仪表从站（CJ/T 188-2004 水表）。
+//
+// 用 TCP 而不是串口：自检要验证的是「主站的帧、DI、字段偏移」是否正确，
+// 而不是 USB 转 485 装没装。现场把串口服务器当透传用时走的也是同一条
+// 字节流，因此从站行为与真表一致：地址不匹配静默、仪表类型决定 901F 的
+// 字段布局、阀门与表地址可写、其余 DI 回异常应答。
+//
+// 初始值与 examples/cjt188.json 一一对应：先起这个从站，再跑
+// `./uic -config examples/cjt188.json`，就能看到点位被正常采集。
+func simCJT188(addr string) {
+	srv, err := cjt188sim.NewServer(addr)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "启动 CJ/T 188 从站失败: %v\n", err)
+		os.Exit(1)
+	}
+	defer func() { _ = srv.Close() }()
+
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	fmt.Printf("cjt/t 188-2004 meter slave listening on %s (表地址 %s, 类型 %02X)\n",
+		srv.Addr(), srv.Address(), srv.Type())
+	fmt.Println("  901F:0=1234.56 m³ 当前累积流量  901F:5=1200.00 m³ 结算日累积流量")
+	fmt.Println("  901F:10=实时时间（随从站时钟）  901F:17=状态字（随阀门状态）")
+	fmt.Println("  D120..D12B=上 1..12 月结算日量（1200-n*10 m³）")
+	fmt.Println("  可写：A017 阀门（0x55 开 / 0x99 关）  A018 表地址（14 位）")
+	fmt.Println("  注意：只应答本表地址；读地址用 T/地址全 AA；其余 DI 回异常应答")
 	fmt.Println("  Ctrl+C 停止")
 
 	<-ctx.Done()

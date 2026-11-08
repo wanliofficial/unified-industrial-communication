@@ -241,10 +241,12 @@
 
 MC 3E、FINS、EtherNet/IP + CIP、BACnet/IP、IEC 104、DL/T 645、CJ/T 188、ADS、OPC DA 桥接、Sparkplug B、SNMP。
 
-> 截至当前实现：MC 3E、FINS、EtherNet/IP + CIP、BACnet/IP、IEC 104、DL/T 645 已落地
-> （各含编解码、主站、内置从站/服务端与自检 CLI）；CJ/T 188、ADS、Sparkplug B、SNMP
-> 待落地。DL/T 645 的地址模型（数据标识 DI）与点表 `WidthProtocol` 是后续 CJ/T 188
-> 的直接参照——两者都是「表计语义寻址 + 压缩 BCD」，差异集中在帧头与表号。
+> 截至当前实现：MC 3E、FINS、EtherNet/IP + CIP、BACnet/IP、IEC 104、DL/T 645、
+> CJ/T 188 已落地（各含编解码、主站、内置从站/服务端与自检 CLI）；ADS、Sparkplug B、
+> SNMP 待落地。645 与 188 都是「表计语义寻址 + 压缩 BCD」，但帧层与字段模型不同：
+> 188 只有一个 `0x68`、数据域不加 `0x33`、地址 7 字节且带仪表类型 `T`，一个 DI 是
+> 一组字段（901F 在水表与热量表上布局不同）。点表因此从 `WidthProtocol` 进一步引入
+> `DIBits`/`DIField`：DI 位数随协议变化，字段偏移只在 188 上允许非 0。
 
 **Wave 2 的验收**：覆盖汽车零部件（CIP）、3C（MC）、水务（104/645）、楼宇（BACnet）四类典型场景。
 

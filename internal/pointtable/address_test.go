@@ -177,7 +177,7 @@ func TestParseAddressDIRejects(t *testing.T) {
 // 协议」两个方向，否则现场会得到「能启动但每个点都读不到」。
 func TestPolicyForDI(t *testing.T) {
 	p := PolicyFor("dlt645")
-	if !p.AllowRegister || !p.AllowDI || p.Width != WidthProtocol {
+	if !p.AllowRegister || p.DIBits != 8 || p.Width != WidthProtocol {
 		t.Fatalf("dlt645 = %+v", p)
 	}
 	if p.AllowSymbol || p.AllowObject || p.AllowFile || p.AllowComputed || p.AllowSelector {
@@ -187,6 +187,83 @@ func TestPolicyForDI(t *testing.T) {
 		t.Fatal("dlt645 must reject Modbus-style area names")
 	}
 	if _, err := ParseAddress("02010100", model.TypeFloat64, "modbus-tcp"); err == nil {
+		t.Fatal("modbus must reject DI-style addresses")
+	}
+}
+
+// CJ/T 188 的 DI 只有 2 字节，而一个 DI 是一组字段：offset 是数据域内的
+// 字节偏移，必须允许非 0；这与 645「一个 DI 一个值、offset 恒 0」相反。
+func TestParseAddressCJT188(t *testing.T) {
+	cases := []struct {
+		name   string
+		expr   string
+		dt     model.DataType
+		hint   int
+		want   string
+		offset int
+	}{
+		{"volume", "901F:0", model.TypeFloat64, 0, "901F:0:0", 0},
+		{"settlement", "901F:5", model.TypeFloat64, 0, "901F:5:0", 5},
+		{"bare DI defaults to 0", "901F", model.TypeFloat64, 0, "901F:0:0", 0},
+		{"time", "901F:10", model.TypeFloat64, 0, "901F:10:0", 10},
+		{"status", "901F:17", model.TypeUint16, 0, "901F:17:0", 17},
+		{"historical", "d12b:0", model.TypeFloat64, 0, "D12B:0:0", 0},
+		{"explicit length", "901F:0:5", model.TypeFloat64, 0, "901F:0:5", 0},
+		{"length column", "901F:0", model.TypeFloat64, 5, "901F:0:5", 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			a, err := ParseAddressWithLength(tc.expr, tc.dt, "cjt188", tc.hint)
+			if err != nil {
+				t.Fatalf("parse: %v", err)
+			}
+			if got := a.Canonical(); got != tc.want {
+				t.Fatalf("canonical = %q, want %q", got, tc.want)
+			}
+			if a.Offset != tc.offset {
+				t.Fatalf("offset = %d, want %d", a.Offset, tc.offset)
+			}
+		})
+	}
+
+	bad := []struct {
+		name string
+		expr string
+		dt   model.DataType
+		want string
+	}{
+		{"8-digit DI", "9901F", model.TypeFloat64, "4 hex digits"},
+		{"645 DI", "02010100", model.TypeFloat64, "4 hex digits"},
+		{"all FF", "FFFF", model.TypeFloat64, "not a valid data identifier"},
+		{"non hex", "90G1", model.TypeFloat64, "non-hex"},
+		{"negative offset", "901F:-1", model.TypeFloat64, "non-negative"},
+		{"bool", "901F:17", model.TypeBool, "bit addressing"},
+	}
+	for _, tc := range bad {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := ParseAddress(tc.expr, tc.dt, "cjt188")
+			if err == nil {
+				t.Fatal("must fail")
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("error = %v, want substring %q", err, tc.want)
+			}
+		})
+	}
+}
+
+func TestPolicyForCJT188(t *testing.T) {
+	p := PolicyFor("cjt188")
+	if !p.AllowRegister || p.DIBits != 4 || !p.DIField || p.Width != WidthProtocol {
+		t.Fatalf("cjt188 = %+v", p)
+	}
+	if p.AllowSymbol || p.AllowObject || p.AllowFile || p.AllowComputed || p.AllowSelector {
+		t.Fatalf("cjt188 accepts non-DI kinds: %+v", p)
+	}
+	if _, err := ParseAddress("holding:0:2", model.TypeUint16, "cjt188"); err == nil {
+		t.Fatal("cjt188 must reject Modbus-style area names")
+	}
+	if _, err := ParseAddress("901F:0", model.TypeFloat64, "modbus-tcp"); err == nil {
 		t.Fatal("modbus must reject DI-style addresses")
 	}
 }

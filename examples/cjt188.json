@@ -1,0 +1,115 @@
+{
+  "schemaVersion": 1,
+  "site": "cjt188-lab",
+  "server": {
+    "listen": "127.0.0.1:8094",
+    "token": "dev-token-0123456789"
+  },
+  "storage": {
+    "dir": "./data-cjt188",
+    "journal": true,
+    "outboxMaxRecords": 5000,
+    "outboxTtl": "10m"
+  },
+  "logging": {
+    "level": "info"
+  },
+  "northbound": {
+    "webhook": {
+      "enabled": false,
+      "url": "http://127.0.0.1:9999/ingest",
+      "timeout": "3s"
+    }
+  },
+  "channels": [
+    {
+      "id": "ch-cjt188",
+      "protocol": "cjt188",
+      "transport": {
+        "kind": "tcp",
+        "address": "127.0.0.1:14001"
+      },
+      "concurrency": 1,
+      "timeout": "5s"
+    }
+  ],
+  "devices": [
+    {
+      "id": "water01",
+      "name": "一号冷水水表（内置 188 从站，表地址 00000805000001）",
+      "channel": "ch-cjt188",
+      "interval": "1s",
+      "timeout": "3s",
+      "enabled": true,
+      "labels": {
+        "address": "00000805000001",
+        "type": "10",
+        "options": "allow-write,allow-control,preamble=2,gap=20ms"
+      },
+      "points": [
+        {
+          "id": "volume-current",
+          "name": "当前累积流量（901F:0）",
+          "address": { "kind": "register", "area": "901F", "offset": 0, "bit": -1 },
+          "dataType": "float64",
+          "unit": "m³",
+          "enabled": true
+        },
+        {
+          "id": "volume-settlement",
+          "name": "结算日累积流量（901F:5）",
+          "address": { "kind": "register", "area": "901F", "offset": 5, "bit": -1 },
+          "dataType": "float64",
+          "unit": "m³",
+          "enabled": true
+        },
+        {
+          "id": "clock",
+          "name": "实时时间（901F:10，YYYYMMDDhhmmss）",
+          "address": { "kind": "register", "area": "901F", "offset": 10, "bit": -1 },
+          "dataType": "float64",
+          "enabled": true
+        },
+        {
+          "id": "status",
+          "name": "状态字（901F:17，D0/D1 阀门状态、D2 电池欠压）",
+          "address": { "kind": "register", "area": "901F", "offset": 17, "bit": -1 },
+          "dataType": "uint16",
+          "enabled": true
+        },
+        {
+          "id": "volume-last-month",
+          "name": "上 1 月结算日累积流量（D120:0）",
+          "address": { "kind": "register", "area": "D120", "offset": 0, "bit": -1 },
+          "dataType": "float64",
+          "unit": "m³",
+          "enabled": true
+        },
+        {
+          "id": "volume-year-ago",
+          "name": "上 12 月结算日累积流量（D12B:0）",
+          "address": { "kind": "register", "area": "D12B", "offset": 0, "bit": -1 },
+          "dataType": "float64",
+          "unit": "m³",
+          "enabled": true
+        },
+        {
+          "id": "valve",
+          "name": "阀门（A017，写 1 开 / 0 关；开关在 labels.options 的 allow-control，属于写命令，默认不采集）",
+          "address": { "kind": "register", "area": "A017", "offset": 0, "bit": -1 },
+          "dataType": "uint16",
+          "writable": true,
+          "enabled": false
+        },
+        {
+          "id": "meter-address",
+          "name": "表地址（A018，写 14 位十进制新地址；开关在 labels.options 的 allow-write，属于写命令，默认不采集）",
+          "address": { "kind": "register", "area": "A018", "offset": 0, "bit": -1 },
+          "dataType": "string",
+          "writable": true,
+          "enabled": false
+        }
+      ]
+    }
+  ]
+}
