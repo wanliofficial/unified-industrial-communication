@@ -14,6 +14,7 @@
 #   scripts/wasm-smoke.sh --keep         # 保留发布产物、日志、截图
 #   scripts/wasm-smoke.sh --web <dir>    # 复用已有发布目录，跳过 dotnet publish
 #   scripts/wasm-smoke.sh --no-browser   # 只做静态层（没装 playwright 的机器）
+#   scripts/wasm-smoke.sh --browser firefox   # 换浏览器（默认 chromium）
 #
 # 依赖：dotnet 10、curl；运行层额外需要 playwright（全局安装即可，脚本自己找 NODE_PATH）。
 #
@@ -23,12 +24,14 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 KEEP=0
 WEB=""
 BROWSER=1
+BROWSER_NAME="chromium"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --keep) KEEP=1 ;;
     --no-browser) BROWSER=0 ;;
     --web) WEB="${2:?--web 需要一个目录}"; shift ;;
+    --browser) BROWSER_NAME="${2:?--browser 需要一个名字}"; shift ;;
     *) echo "未知参数：$1" >&2; exit 64 ;;
   esac
   shift
@@ -134,9 +137,10 @@ if [[ $BROWSER -eq 0 ]]; then
   exit 0
 fi
 
-log "运行层（Playwright）"
+log "运行层（Playwright · $BROWSER_NAME）"
 NODE_PATH="$(npm root -g 2>/dev/null || true)"
 export NODE_PATH
+export UIC_SMOKE_BROWSER="$BROWSER_NAME"
 
 set +e
 node "$ROOT/scripts/wasm-smoke.cjs" "$BASE/" "$TMP/screen.png"
@@ -144,8 +148,8 @@ rc=$?
 set -e
 
 case "$rc" in
-  0) ok "浏览器里 WASM 启动完成，设备列表来自 REST" ;;
-  2) warn "本机没有 playwright，运行层跳过；静态层已通过" ;;
+  0) ok "浏览器里 WASM 启动完成，设备列表来自 REST（$BROWSER_NAME）" ;;
+  2) warn "本机没有 playwright 或没有 $BROWSER_NAME，运行层跳过；静态层已通过" ;;
   *) die "浏览器冒烟失败（退出码 $rc）" ;;
 esac
 

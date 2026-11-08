@@ -57,9 +57,10 @@
   订阅、入站 PUBACK、下行命令去重与权限），再用官方 mosquitto 容器跑一次互操作
   （`scripts/mqtt-interop.sh`：上线、重启重连、命令请求/结果、kill -9 后由 broker
   代发遗嘱）；WASM 控制台用 `scripts/wasm-smoke.sh` 发布后
-  在 Playwright 里真跑一遍（`index.html` / 引导脚本 / SPA 回退 / REST 首屏 / 在设备页
-  真填表新建一台设备并等它出现在列表里）；容量与写延迟由 `scripts/capacity-bench.sh`
-  起真宿主按 PRD 档位（200 设备 / 10,000 点）量出来，不从代码推断。
+  在 Playwright 里真跑一遍（Chromium 与 Firefox 各一遍：`index.html` / 引导脚本 /
+  SPA 回退 / REST 首屏 / 在设备页真填表新建一台设备并等它出现在列表里）；容量与写延迟
+  由 `scripts/capacity-bench.sh` 起真宿主按 PRD 档位（200 设备 / 10,000 点）量出来，
+  不从代码推断。
   见 [testing.md](testing.md)。
 
 ### 刻意没做

@@ -254,7 +254,7 @@ WebApplication.CreateBuilder → UseUrls("http://127.0.0.1:0")
 
 1. **静态层**（curl）：`/` 返回启动页、引导脚本可下载、`/api/v1/health` 同源可用、
    深链接回退到 `index.html`、缺失的框架资源返回 404（不能被 SPA 回退吞成 HTML）；
-2. **运行层**（Playwright + Chromium）：真开页面，等 WASM 启动，等设备列表从 REST
+2. **运行层**（Playwright）：真开页面，等 WASM 启动，等设备列表从 REST
    渲染出来；再在设备页点「新建设备」，填一张表（新建通道 + 一台设备 + 首个点位）并提交，
    等页面报「已创建设备」且列表里出现它；同时断言没有未捕获异常、失败请求、4xx/5xx，
    启动遮罩在挂载后移除。
@@ -266,10 +266,19 @@ WebApplication.CreateBuilder → UseUrls("http://127.0.0.1:0")
 
 运行层是重点：裁剪后的 WASM 最容易坏在运行时（源生成序列化漏类型、启动脚本与
 `index.html` 的结构约定、同源地址解析写死端口），这些 curl 全看不出来。本机实测
-首次启动约 12 s。
+首次启动 Chromium 约 14 s、Firefox 约 34 s。
 
-没装 playwright 时运行层报 `skip`，静态层仍会执行并给出结论；`--no-browser` 可以
-显式只跑静态层，`--web <dir>` 复用已有发布目录，`--keep` 保留发布产物、日志与截图。
+浏览器用 `--browser` 换（默认 `chromium`，也可 `firefox`；装了 webkit 同理）。
+Uno WASM 的坑有一半是引擎相关的——同一份产物在 Gecko 上可能因为启动脚本或渲染层
+差异而失败，只验一个引擎等于只验一种命：
+
+```bash
+scripts/wasm-smoke.sh --browser firefox
+```
+
+没装 playwright（或没装对应浏览器）时运行层报 `skip`，静态层仍会执行并给出结论；
+`--no-browser` 可以显式只跑静态层，`--web <dir>` 复用已有发布目录，
+`--keep` 保留发布产物、日志与截图。
 
 ## 历史查询性能基准
 
@@ -349,7 +358,7 @@ journal、outbox、MQTT 都按默认关闭——它们各自的成本由 `histor
 |---|---|---|
 | MQTT 只与 mosquitto 互操作过 | 认证、ACL、TLS、其它 broker 的差异未覆盖（客户端本身只做匿名明文）；命令通道同样依赖 Broker 侧隔离 | 接入现场时用目标 broker 重跑 `scripts/mqtt-interop.sh`，并单独验 TLS 终结方案与命令主题的 ACL |
 | MQTT 命令去重只在进程内 | 幂等窗口 5 分钟、重启即清空；没有持久审计台账 | 需要跨重启幂等时用 REST 的 `X-Idempotency-Key`，或把命令记录落到外部存储 |
-| WASM 控制台只在 Chromium 上验过 | 未覆盖 Firefox / Safari、移动端与真实触屏 | 上线前在目标浏览器各跑一次同一套检查（换 Playwright 的 browser 参数） |
+| WASM 控制台只验过 Chromium 与 Firefox | Safari / WebKit、移动端与真实触屏未覆盖 | 上线前在目标浏览器各跑一次同一套检查：`scripts/wasm-smoke.sh --browser <name>`（装了 webkit 后可直接跑） |
 | 真实硬件 | 全部用例都跑在内置从站 / 虚拟设备 / 伪终端上 | 现场接入时先用 `uic check` 与 `/api/v1/commands` 的 `device.selftest` |
 | 模板只支持 string/int/bool 三种参数 | 「按站点切换整段点位」这类复杂参数化做不到 | 这是刻意的：更强的模板等于一门配置语言，先把三种类型用透 |
 | CSV 导入一次只写一台设备 | 上千台设备的批量开通需要逐台调用 | 调用方循环；若需要「一个 CSV 覆盖多设备」，在文件里加 `device` 列再扩展 `PointCsv` |

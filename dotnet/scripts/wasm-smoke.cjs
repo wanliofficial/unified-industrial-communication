@@ -6,7 +6,8 @@
 // 启动脚本与 index.html 的结构约定、同源 REST 地址解析。这些只有真浏览器能暴露。
 //
 // 用法：NODE_PATH="$(npm root -g)" node scripts/wasm-smoke.cjs <url> [screenshot.png]
-// 退出码：0 通过，1 失败，2 环境不具备（未安装 playwright）。
+//       UIC_SMOKE_BROWSER=firefox ...             # 换浏览器（默认 chromium）
+// 退出码：0 通过，1 失败，2 环境不具备（未安装 playwright 或该浏览器）。
 'use strict';
 
 const path = require('path');
@@ -19,18 +20,30 @@ async function main() {
     return 1;
   }
 
-  let chromium;
+  // Uno WASM 的问题常常是引擎相关的（WASM 启动脚本、Blazor 引导、渲染层差异），
+  // 只验一个浏览器等于只验一种命。默认 Chromium，可用环境变量换 Firefox。
+  const name = process.env.UIC_SMOKE_BROWSER || 'chromium';
+
+  let playwright;
+  let engine;
   try {
-    ({ chromium } = require('playwright'));
+    playwright = require('playwright');
+    engine = playwright[name];
   } catch {
     console.log('  skip 未找到 playwright（npm i -D playwright 或全局安装后设 NODE_PATH）');
     return 2;
   }
 
-  const browser = await chromium.launch({
+  if (!engine) {
+    console.log(`  skip playwright 没有名为 ${name} 的浏览器（可用：chromium / firefox / webkit）`);
+    return 2;
+  }
+
+  const browser = await engine.launch({
     headless: true,
     // 容器里没有 user namespace 时 chromium 起不来；这只是本机验收，不涉及权限边界。
-    args: ['--no-sandbox'],
+    // Firefox 不认识这个参数，只对 chromium 传。
+    ...(name === 'chromium' ? { args: ['--no-sandbox'] } : {}),
   });
 
   // 一次完整尝试：打开页面、等 WASM 把 REST 数据渲染出来、收集全程的异常与失败请求。

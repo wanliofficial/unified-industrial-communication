@@ -61,11 +61,12 @@ CSV 导入或配置页。
 ```bash
 scripts/wasm-smoke.sh              # 发布 + curl 检查 + Playwright 真跑一遍
 scripts/wasm-smoke.sh --no-browser # 只做静态层
+scripts/wasm-smoke.sh --browser firefox   # 换引擎（默认 chromium）
 ```
 
 浏览器层会等 WASM 启动、等设备列表从 REST 渲染出来，再在设备页真填一次「新建设备」
 表单并等它出现在列表里，同时断言没有未捕获异常、失败请求或 4xx/5xx ——
-裁剪后的运行时问题只有这样才看得见。
+裁剪后的运行时问题只有这样才看得见。Chromium 与 Firefox 各跑过一遍。
 
 ## 命令行
 
