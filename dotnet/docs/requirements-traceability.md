@@ -147,7 +147,7 @@
 | 兼容：浏览器最近 2 个版本 | Chrome/Edge/Firefox | 已验证 Chrome | `scripts/wasm-smoke.sh` 用 Playwright Chromium；其余浏览器未跑 |
 | 可维护：单文件 ≤600 行 | — | 已实现 | 新增端点都拆成 `RestApi.*.cs` partial |
 | 可维护：依赖数量 ≤10 | 直接依赖 | 已实现 | 生产 4 个（日志抽象、串口、OPC UA Server/Configuration）+ ASP.NET Core 框架引用；测试 1 个 |
-| 构建/测试时间 | ≤60 s / ≤120 s | 已实现 | 全量构建约 20 s，测试约 32 s |
+| 构建/测试时间 | ≤60 s / ≤120 s | 已实现 | 全量构建约 20 s，测试约 55 s（197 条） |
 
 ## 9. 与 PRD 安全红线的差距
 
