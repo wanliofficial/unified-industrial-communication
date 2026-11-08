@@ -606,6 +606,9 @@ func TestCanonicalCoversEveryKind(t *testing.T) {
 		{Address{Kind: AddressSymbol, Path: "DB1.DBW0", Index: -1}, "DB1.DBW0"},
 		{Address{Kind: AddressSymbol, Path: "array", Index: 4}, "array[4]"},
 		{Address{Kind: AddressSymbol, Path: "device0", Index: -1, Selector: "temp"}, "device0#temp"},
+		// ADS 的 STRING/bytes 宽度由点表给出：长度必须进入 canonical，
+		// 否则 `NAME:80` 与 `NAME:81` 会被当成同一个缓存键。
+		{Address{Kind: AddressSymbol, Path: "MAIN.sRecipe", Index: -1, Length: 81}, "MAIN.sRecipe:81"},
 		{Address{Kind: AddressObject, ObjectType: "binary_input", Instance: 2, Property: "present_value", PropIndex: -1}, "binary_input:2.present_value"},
 		{Address{Kind: AddressObject, ObjectType: "analog_input", Instance: 2, Property: "priority_array", PropIndex: 3}, "analog_input:2.priority_array[3]"},
 		{Address{Kind: AddressFile, FileID: 3, RecordID: 5, Offset: 7}, "file:3/5:7"},

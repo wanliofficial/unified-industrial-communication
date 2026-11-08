@@ -467,6 +467,30 @@ SNMP 是唯一「按对象名寻址」的协议：点位用 `kind=symbol`，`pat
 平台 `float64` 承载，超过 2^53 会丢精度；Counter32 会回绕，时间序列侧要做回绕检测。
 团体名按凭据处理（界面掩码），默认 `public` 只是最少配置。
 
+ADS/AMS（PLC 运行时，TCP 48898）：
+
+```bash
+./uic sim -protocol ads -listen 127.0.0.1:48898 &   # 内置 ADS/AMS 服务端
+./uic -config examples/ads.json
+curl -s -H 'Authorization: Bearer dev-token-0123456789' localhost:8096/api/v1/points
+#   9 点：nCounter/fTemperature/bEnable/sRecipe/arr[2]（只读）、
+#          setpoint/fSpeed/run/name（可写）
+#   自检：./uic adsread -addr 127.0.0.1:48898 -probe
+#   读：  ./uic adsread -addr 127.0.0.1:48898 \
+#           -symbol MAIN.nCounter:int16,MAIN.sRecipe:string:81
+#   写：  ./uic adsread -addr 127.0.0.1:48898 -symbol MAIN.nSetpoint:int16 -set 750
+```
+
+ADS 是唯一「地址就是 PLC 工程变量名、且一次取值要两次往返」的协议：先按名字取句柄
+（`ReadWrite` + `0xF003`），再用句柄读值（`Read` + `0xF005`）。句柄属于会话，PLC 重启后
+全部失效；驱动遇 `invalid offset` 清缓存重解析一次，第二次仍失败就按点位报错。地址
+`kind=symbol`，数组下标写在名字里（`MAIN.arr[2]`）；string/bytes 的宽度由点表给出
+（`NAME:81` 或 length 列）。全线小端，写前做类型/范围检查。
+
+TCP 48898 与 AMS 端口是两层：`labels.netid` 是 6 段 NetId，`labels.port` 是 851/801；
+`Open` 立即做 `ReadDeviceInfo` 握手。只做 AMS/TCP 符号读写：通知订阅、符号表浏览、跨
+AMS 路由发现、多句柄合并读写都显式 `unsupported`，不做半成品。
+
 FINS 只做 FINS/TCP；FINS/UDP 与 Host Link 配置期即拒。建链先做节点号协商（命令 0
 → 1），`device.unitId>0` 覆盖目标节点、0 用协商值。`offset` 是**字地址**、`bit` 是
 字内位号（`CIO0.3` → `offset=0, bit=3`）；字访问 2 字节/字，位访问**1 字节/位**；
@@ -493,7 +517,7 @@ go test -race -count=1 ./...
 
 | 路径 | 内容 |
 |---|---|
-| `cmd/uic/` | 单入口：`run` / `sim`（Modbus / S7 / OPC UA / MQTT / MC / FINS / EtherNet-IP / BACnet-IP / IEC 104 / 645 / 188 / SNMP）/ `mbread` / `mcread` / `finsread` / `enipread` / `bacread` / `iec104read` / `dlt645read` / `cjt188read` / `snmpread` / `uaread` / `s7blocks` / `s7upload` / `instantiate` / `import` / `token` / `-check` / `version` |
+| `cmd/uic/` | 单入口：`run` / `sim`（Modbus / S7 / OPC UA / MQTT / MC / FINS / EtherNet-IP / BACnet-IP / IEC 104 / 645 / 188 / SNMP / ADS）/ `mbread` / `mcread` / `finsread` / `enipread` / `bacread` / `iec104read` / `dlt645read` / `cjt188read` / `snmpread` / `adsread` / `uaread` / `s7blocks` / `s7upload` / `instantiate` / `import` / `token` / `-check` / `version` |
 | `internal/model` | 通道 / 设备 / 点位 / 地址 / 采样 / 质量码 |
 | `internal/driver` | 驱动契约（Codec / Transport / Driver）、错误分类、注册表、只读 `Lookup` 注入 |
 | `internal/calc` | 零依赖表达式引擎（编译期类型检查、短路求值、引用 `device:point`） |
@@ -521,6 +545,9 @@ go test -race -count=1 ./...
 | `internal/codec/snmp` | SNMP v1/v2c 纯函数编解码（BER TLV / 整数最短补码 / OID base-128 / 7 类 PDU / varbind / 异常标记 / error-status 分类） |
 | `internal/driver/snmp` | SNMP v1/v2c 主站（批量 GET / v1 `noSuchName` 退化 / 单 OID SET / 类型映射与回显校验 / request-id 配对 / 自检 `GetRaw`、`Walk`） |
 | `internal/sim/snmp` | SNMP v1/v2c 内置代理（system 组 + 两块网卡 / GET、GETNEXT、GETBULK、SET / community 静默丢弃 / v1 与 v2c 差异 / SET 原子性） |
+| `internal/codec/ads` | ADS/AMS 纯函数编解码（6 字节 AMS/TCP 头 / 32 字节 AMS 头 / 7 类命令 / 两层长度一致性 / NetId 解析 / 错误码分类） |
+| `internal/driver/ads` | ADS/AMS 主站（符号名→句柄→值 / 句柄缓存与失效重解析 / 逐点事务 / 类型范围检查 / AMS 与 ADS 错误分类 / 自检 `DeviceInfo`、`DeviceState`、`WriteControl`） |
+| `internal/sim/ads` | ADS/AMS 内置服务端（默认变量表 / 按名分配句柄 / 只读标记 / 宽度校验 / 状态控制 / 句柄失效模拟） |
 | `internal/template` | 设备模板：参数校验 / 字符串字面量替换 / 实例化后完整校验 |
 | `internal/pointtable` | 点表 CSV：列别名 / 地址表达式 / 按协议推导宽度 / 合并动作 |
 | `internal/alarm` | 报警引擎：五态机 / 滞回 / 延时 / 表达式规则 / 确认 / 订阅 |

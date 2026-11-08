@@ -3288,8 +3288,324 @@ curl -s -X POST -H 'Authorization: Bearer dev-token-0123456789' \
 | `codec/snmp` | GET/应答金帧、INTEGER 最短编码与负数、无符号前导零（`0x80000000`）、OID base-128（`2.39.1`→`77 01`）、OID 排序与前缀、非法 OID、版本解析（v3 拒绝）、异常标记只允许出现在应答、GetBulk 线格式、错误码分类、字符串/字节值、截断错误可识别 |
 | `driver/snmp` | 五种线类型解码、MultiRead 一条 GET、按 maxOids 与字节预算分批（顺序不变、每条 ≤1400 字节）、v1 `noSuchName` 逐点重发、写类型映射与回显校验、类型/范围拒绝不发包、9 种 error-status 分类、SET 回显被收敛、Probe 接受异常标记/超时提示、request-id 陈旧应答丢弃、链路失败停止后续批次、坏地址与线类型不符、Counter64 精度边界、`GetRaw`/`Walk`（子树边界、max、v1 表尾） |
 | `sim/snmp` | 真实 UDP 回环：GET 与计数器、错 community 静默、v1/v2c 缺 OID 差异、GETNEXT 遍历与表尾、GETBULK 三行递增、SET 可写与回读、只读/类型错/不存在、SET 原子性、坏报文与非请求丢弃、`Set`/`SetWritable`/`Close` 幂等 |
-| 点表/规划 | `PolicyFor("snmp")` 只允许 symbol、selector/寄存器/对象地址在导入期拒绝、`examples/snmp.json` 通过 `-check`（16 个驱动） |
+| 点表/规划 | `PolicyFor("snmp")` 只允许 symbol、selector/寄存器/对象地址在导入期拒绝、`examples/snmp.json` 通过 `-check`（17 个驱动） |
 | `cmd/uic` | `-set` 值解析（bool/int/uint/string/bytes、进制、越界、float/BCD 拒绝）、`snmpRow` 的 raw/error 显示 |
+
+### 3.10.13 ADS/AMS（TCP 48898）
+
+这是全仓库唯一「地址就是 PLC 工程里的变量名、且访问分两步」的驱动。它与前面所有
+协议的区别不只是报文格式：
+
+- **地址不是位置，而是符号。** Modbus 的 `holding:100` 是「第 100 个寄存器」，
+  S7 的 `db1:0` 是「DB1 的第 0 个字节」；ADS 的 `MAIN.nCounter` 是 PLC 工程里
+  声明的一个变量，宽度与类型由声明决定。写错名字得到的是 `symbol not found`，
+  写错宽度得到的是 `invalid size`——两者都不是「读到一个错值」，而是明确拒绝。
+- **一次取值要两次往返。** 先把变量名换成句柄（`ReadWrite` + `IG=0xF003`），
+  再用句柄读值（`Read` + `IG=0xF005`）。句柄属于会话，PLC 重启后全部失效。
+- **寻址层在 IP 之上还有一层 AMS。** `labels.netid` 是 6 段点分十进制的 AMS
+  NetId，`labels.port` 是 AMS 端口（851/801），TCP 端口固定 48898。TCP 能连上
+  只证明 48898 在监听，NetId/端口错要到第一条命令才会暴露。
+- **全线小端。** 长度、错误码、句柄、数值都是 little-endian；把大端字节直接喂进来，
+  设备不会报错，只会给出一个不同的数。
+
+因此本节的三个核心设计是：**只做 AMS/TCP 上的符号读写**（§3.10.13.1）、
+**句柄缓存 + 失效重解析一次**（§3.10.13.4）、**逐点事务，不合并多句柄**（§3.10.13.5）。
+
+#### 3.10.13.1 范围：AMS/TCP 主站，不做通知与浏览
+
+| 能力 | 本驱动 | 说明 |
+|---|---|---|
+| 按符号名读 | ✓ | `ReadWrite(0xF003)` 取句柄 → `Read(0xF005)` |
+| 按符号名写 | ✓ | 取句柄 → `Write(0xF005)`；写前做类型/范围校验 |
+| 设备信息 | ✓ | `ReadDeviceInfo`，`Open` 时用作握手 |
+| 运行时状态 | ✓ | `ReadState` / `WriteControl`（Run/Stop/Reset） |
+| 通知订阅 | ✗ | `AddDeviceNotification` 的句柄生命周期、失效重注册与流式采样是另一套模型 |
+| 符号表浏览 | ✗ | 符号表上传格式随运行时版本变化；现场点位本来就来自变量表 |
+| 跨 AMS 路由发现 | ✗ | 路由是设备侧配置；驱动只按给定 NetId 直连 |
+| 一次多句柄读写 | ✗ | 失败无法逐点归因，且不同运行时的合包语义有差异 |
+| 位变量 / 结构体类型 | ✗ | 位在符号层不单独暴露；结构体按字节数组或逐成员声明 |
+
+`Meta().Capabilities` 里 `Read`、`Write` 为 `supported`，`Subscribe`、`Browse`、
+`Discovery`、`MultiRead`、`BitAccess`、`StructTypes` 全部 `unsupported`。
+
+`MultiRead` 声明 `unsupported` 是刻意的：ADS 的 `ReadWrite` 可以带多个句柄，
+但一次失败就不知道是哪个变量、哪一类错误；逐点事务换来的是「哪个点位错、错在
+哪一类」。这和 645/188 的「协议只能一次一个 DI」不同，是主动放弃的优化，不是
+协议限制。
+
+#### 3.10.13.2 寻址：变量名就是地址
+
+点表里的地址写法：
+
+```text
+MAIN.nCounter                 标量
+MAIN.arr[2]                   数组元素（下标属于名字）
+MAIN.sRecipe:81               STRING(80)，显式长度 81（含结尾 NUL）
+MAIN.arrBytes:4               BYTE[4]
+```
+
+规则：
+
+- `address.kind` 必须是 `symbol`，`path` 是 PLC 符号表里的完整路径；结构体成员
+  逐级写全（`MAIN.stStatus.bReady`）。
+- **数组下标写在名字里**。`Model.Address.Index` 是平台给 MQTT/OPC UA 一类协议准备
+  的二级下标；ADS 的变量名本身就是 `MAIN.arr[2]`，拆成 `path=MAIN.arr, index=2`
+  再拼回去会让「`[0]` 与未配置」在 JSON 里无法区分。因此
+  `pointtable.PolicyFor("ads")` 使用 `SymbolIndexInPath`，解析时保留下标；
+  `Address.Index > 0` 由驱动直接报 `address` 错误。
+- **string/bytes 的宽度由点表给出**。PLC 变量的宽度是符号的属性，驱动猜不出来：
+  STRING(80) 占 81 字节，BYTE[4] 占 4 字节。写法有两种：地址里 `NAME:81`，或
+  CSV 的 length 列；两者同时给且不一致时在导入期报错。省略时用
+  `options.strlen`（默认 81）。
+- `selector`（MQTT 的 `#field`）在导入期拒绝：ADS 没有「载荷里的字段」这个概念。
+- 写成 `holding:100` 这类寄存器地址同样在导入期拒绝；绕过导入直接构造
+  `AddressRegister` 时，驱动在发报文前报 `address`。
+
+对应 `AddressPolicy`：
+
+```go
+PolicyFor("ads") = AddressPolicy{
+    AllowSymbol:       true,
+    AllowSymbolLength: true,   // NAME:81 或 length 列
+    SymbolIndexInPath: true,   // MAIN.arr[2] 的 [2] 属于 path
+}
+```
+
+#### 3.10.13.3 线格式：6 字节 TCP 头 + 32 字节 AMS 头 + ADS 载荷
+
+```text
+AMS/TCP 头（6）
+  reserved uint16 = 0
+  length   uint32 = len(AMS 头 + 载荷)
+
+AMS 头（32）
+  target NetId(6) + target port(2)
+  source NetId(6) + source port(2)
+  command(2) + flags(2)
+  length(4)        仅载荷长度
+  error(4)         AMS 层错误码，0 = 正常
+  invoke(4)        请求/应答配对号
+
+ADS 载荷
+  Read          IG(4) offset(4) length(4)
+  Read 应答     result(4) length(4) data
+  Write         IG(4) offset(4) length(4) data
+  Write 应答    result(4)
+  ReadWrite     IG(4) offset(4) readLen(4) writeLen(4) data
+  ReadWrite 应答 同 Read
+  ReadDeviceInfo 应答 result(4) major(1) minor(1) version(2) name(16, NUL 填充)
+  ReadState    应答 result(4) adsState(2) deviceState(2)
+  WriteControl 请求 adsState(2) deviceState(2) length(4) data；应答 result(4)
+```
+
+命令号：1 `ReadDeviceInfo`、2 `Read`、3 `Write`、4 `ReadState`、5 `WriteControl`、
+6 `AddDeviceNotification`、7 `DeleteDeviceNotification`、8 `DeviceNotification`、
+9 `ReadWrite`。本驱动只发送 1/2/3/4/5/9；收到 8 时静默丢弃（同一 NetId 的其它
+客户端可能仍有历史订阅），6/7 从不发送。
+
+长度有两层且必须一致：TCP 头的 length 是「AMS 头 + 载荷」，AMS 头的 length 只是
+「载荷」。少写一层会让对端把载荷开头当成下一条报文的长度。解析层对三层长度、
+TCP reserved、载荷长度逐项校验；任一不符都归类为 `protocol`，不尝试「尽量解析」。
+
+flags 的最低位是应答位（请求 0、应答 1），`0x0004` 表示载荷是 ADS 命令。所有请求
+都带 ADS 位；应答必须同时带应答位与 ADS 位，且 command 与 invoke 都与请求一致。
+invoke 由驱动递增分配，0 保留为「未分配」，回绕时跳到 1。
+
+#### 3.10.13.4 两步访问：变量名 → 句柄 → 值
+
+按名字取句柄：
+
+```text
+ReadWrite(IG=0xF003, offset=0, readLen=4, writeLen=len(name)+1, data=name+"\0")
+→ result(4) length(4)=4 data=handle(4, 小端)
+```
+
+变量名必须以 NUL 结尾。少了这个字节，PLC 会把符号表里相邻的内存当成名字的一部分，
+得到的可能是 `symbol not found`，也可能是另一个变量——后者更危险。
+
+按句柄读写：
+
+```text
+Read (IG=0xF005, offset=handle, length=n)          → result length data
+Write(IG=0xF005, offset=handle, length=n, data)    → result
+```
+
+释放句柄用 `Write(IG=0xF006, offset=0, length=4, data=handle)`。驱动**不在
+`Close` 时批量释放**：句柄属于会话，TCP 断开后由运行时回收；对端已经不可达时，
+每个 Release 都要等一次超时，会把退出时间拖长一个数量级。
+
+句柄按变量名缓存在连接内。读或写返回 `invalid offset (0x0703)` / `invalid group
+(0x0702)` 时，视为「PLC 重启导致句柄失效」：清掉该条目、重新按名字解析一次，再
+重试原操作。**只重试一次**——第二次还失败就是变量本身的问题，继续重试只会把
+「PLC 一直重启」变成「驱动一直转圈」。`invalid size` 不触发重解析：那是长度配错，
+重新取句柄不会让它变好。
+
+#### 3.10.13.5 类型与字节序：小端、宽度由声明决定
+
+| 平台类型 | 线上宽度 | 说明 |
+|---|---|---|
+| `bool` | 1 | PLC 的 BOOL 在符号层占 1 字节；只接受 0/1，其它值报协议错 |
+| `int16` / `uint16` | 2 | 小端补码 |
+| `int32` / `uint32` | 4 | 小端 |
+| `int64` / `uint64` | 8 | 小端 |
+| `float32` | 4 | IEEE-754，小端 |
+| `float64` | 8 | IEEE-754，小端 |
+| `string` | 点表长度或 `strlen` | 写入时右侧补 NUL；字符串刚好占满整段时拒绝（没有结尾 NUL） |
+| `bytes` | 点表长度或 `strlen` | 写入时右侧补 0；允许刚好占满 |
+| `bcd16` / `bcd32` | — | ADS 没有 BCD 线类型，读写在发报文前报 `unsupported` |
+
+数值用 `codec/value` 的 `Encode`/`Decode` 配合 `model.OrderDCBA`：`DCBA` 表示
+「整体倒序」，对一个纯小端数值等价于不做字内交换。把这段逻辑放在统一的 value 层，
+是为了保证 ADS 与 Modbus/S7 对同一个字节串的解释只在字节序上不同，而不是各写一份
+符号扩展。
+
+写入前做范围检查（`checkRange`）：`70000` 写进 INT16 会被强制转换静默变成 `4464`，
+写入「成功」了，但设备上的值已经不是调用方给的值。这类错误比写入失败更难发现，
+必须在发报文之前拦下。整型的非整数值（`1.5`）同样拒绝。
+
+#### 3.10.13.6 错误分类：AMS 与 ADS 两套码
+
+AMS 头里的 error 表示「报文没有被目标处理」；ADS 载荷里的 result 表示「命令执行
+结果」。两套码数值范围不重叠，共用一套分类：
+
+| 范围 | 例子 | 分类 | 重试 |
+|---|---|---|---|
+| AMS 0x0001..0x0018 | `0x0004` mailbox full、`0x0006` target port not found、`0x0007` target machine not found、`0x0016` AMS timeout | 资源/超时类 → `protocol`/`disconnected`/`timeout`；端口/NetId → `address` | 只重试临时性错误 |
+| ADS 0x0700..0x072F | `0x0702` invalid group、`0x0703` invalid offset、`0x0704` invalid access、`0x0705` invalid size、`0x0710` symbol not found | 地址/权限/不支持/协议 | 不重试 |
+| 其它 | 未知码 | `protocol`，保留原值 | 不重试 |
+
+最常踩的几个码直接在错误信息里给了排查动作：
+
+| 码 | 含义 | 提示 |
+|---|---|---|
+| `0x0006` | target port not found | 检查 `labels.port`（851 第一个运行时 / 801 第二个）与 PLC 是否在运行 |
+| `0x0007` | target machine not found | AMS 路由找不到目标 NetId，检查 `labels.netid` 与设备侧路由 |
+| `0x0702` / `0x0703` | invalid group / offset | 句柄失效（PLC 重启）或 IndexGroup 不被支持 |
+| `0x0704` | invalid access | 符号在 PLC 侧不可写（需要 VAR_GLOBAL 且允许读写） |
+| `0x0705` | invalid size | 读长度与变量宽度不符：STRING 用 `options.strlen`，bytes 用点位 length |
+| `0x0710` | symbol not found | 符号名区分大小写；数组写 `NAME[0]`；结构体成员逐级写全 |
+
+错误分三类处置：地址/权限/不支持只影响当前点位，不进入整轮 `firstErr`，也不熔断
+设备；超时/断链/协议错会停止本轮剩余点位（链路已经不可继续）。这条区分让「一个
+变量名写错」不会把整台 PLC 标红。
+
+#### 3.10.13.7 标签与握手
+
+| 标签 | 必填 | 默认 | 说明 |
+|---|---|---|---|
+| `netid` | ✓ | — | 目标 AMS NetId，6 段 0..255 点分十进制 |
+| `port` | | 851 | 目标 AMS 端口；851/801 是两个 PLC 运行时 |
+| `localnetid` | | `127.0.0.1.1.1` | 本地 AMS NetId；设备做了白名单/路由时必须匹配 |
+| `localport` | | 32905 | 本地 AMS 端口；只需本机唯一 |
+| `options` | | `retries=1,strlen=81` | `retries=0..10`；`strlen=1..65535` |
+
+`transport.kind` 必须是 `tcp`，`transport.address` 是 `host:port`（省略端口按
+48898）。TCP 端口不是 AMS 端口：把 851 填进 `transport.address` 会连到一个没有
+监听的位置；把 48898 填进 `labels.port` 会得到 `target port not found`。配置表单
+把两者分成两个字段，就是为了让这个区别在界面上可见。
+
+`Open` 在 TCP 连接建立后立即做一次 `ReadDeviceInfo` 握手。握手不是可选的：TCP
+能连上只说明 48898 在监听，NetId/AMS 端口配错要等到第一次读才会暴露。把失败提前
+到启动期，运维第一时间看到的是「target port not found」而不是一条条红色的点位。
+握手超时的错误信息会同时提示检查 `transport.address`、`labels.netid`、
+`labels.port` 与 AMS 路由。
+
+#### 3.10.13.8 能力边界（刻意的）
+
+| 不做 | 原因 |
+|---|---|
+| 通知订阅 | 句柄生命周期、失效重注册、流式采样是另一套模型；采集侧是拉取语义 |
+| 符号表上传 / 浏览 | 格式随运行时版本变化；现场点位来自变量表，不需要驱动再发现一次 |
+| 跨 AMS 路由发现 | 路由是设备侧配置；驱动只按给定 NetId 直连 |
+| 多句柄合并读写 | 失败无法逐点归因；逐点事务换来准确的错误定位 |
+| 写后回读校验 | ADS 的 Write 应答只有 result，没有回显；回读是额外一次事务，由上层决定 |
+| BCD / 位寻址 / 结构体自动展开 | 没有对应线类型或符号层语义；用 uint/bytes/逐成员声明表达 |
+| OPC DA 桥接 | 需要 DCOM/COM，零依赖 Go 不可实现；应作为独立的 Windows 桥接进程，不在本驱动范围内 |
+
+#### 3.10.13.9 位置与自检
+
+| 内容 | 路径 |
+|---|---|
+| 编解码 | `internal/codec/ads`（`NetID.ParseNetID`、`Frame.Encode/Decode`、`FrameLen`、`Peer` 的 7 类请求构造、`ParseRead/ParseWrite/ParseReadWrite/ParseReadDeviceInfo/ParseReadState/ParseWriteControl`、`Code.Kind/Temporary`） |
+| 主站驱动 | `internal/driver/ads`（`Meta`/`Open`/`Probe`/`Read`/`Write`，自检用 `DeviceInfo`/`DeviceState`/`WriteControl`；内部 `parseOptions`/`exchange`/`readFrame`/`handleLocked`/`checkRange`） |
+| 内置服务端 | `internal/sim/ads`（`NewServer`/`NewServerWithOptions`/`Addr`/`NetID`/`Port`/`Get`/`SetValue`/`SetWritable`/`Variables`/`InvalidateHandles`/`Requests`/`Writes`/`Close`） |
+| CLI | `uic adsread`（`-probe`/`-info`/`-state`/`-control`/`-allow-control`/`-symbol`/`-type`/`-strlen`/`-set`/`-setType`/`-netid`/`-port`/`-local-netid`/`-local-port`/`-retries`/`-json`/`-timeout`） |
+| 示例 | `examples/ads.json`（9 点位：INT16/REAL/LREAL/BOOL/STRING/数组元素，其中 speed/setpoint/run/name/arr[2] 可写） |
+
+内置服务端默认 NetId `127.0.0.1.1.1`、AMS 端口 851、状态 Run，预置：
+
+| 符号 | 类型 | 初值 | 可写 |
+|---|---|---|---|
+| `MAIN.nCounter` | INT16 | 1234 | ✗ |
+| `MAIN.nSetpoint` | INT16 | 500 | ✓ |
+| `MAIN.fTemperature` | REAL | 23.5 | ✗ |
+| `MAIN.fSpeed` | LREAL | 1450.75 | ✓ |
+| `MAIN.bEnable` | BOOL | 1 | ✗ |
+| `MAIN.bRun` | BOOL | 0 | ✓ |
+| `MAIN.sRecipe` | STRING(80) | `batch-42` | ✗ |
+| `MAIN.sName` | STRING(80) | `uic-sim` | ✓ |
+| `MAIN.arr[0..3]` | INT16 | 10 / 20 / 30 / 40 | 仅 `[2]` 可写 |
+| `MAIN.arrBytes` | BYTE[4] | `01 02 03 04` | ✗ |
+
+变量表是扁平的，每个数组元素单独占一个符号名（与真实符号表一致）。句柄全局编号
+而不是按连接隔离：测试要能一调用就让所有句柄失效，模拟 PLC 重启；真实设备重启后
+旧句柄同样全部失效，按句柄读写返回 `invalid offset`。代理不实现符号表上传与通知
+订阅，未知 IndexGroup 一律回 `invalid group`。
+
+自检链路（无硬件，TCP 回环）：
+
+```bash
+./uic sim -protocol ads -listen 127.0.0.1:48898 &
+./uic adsread -addr 127.0.0.1:48898 -probe
+# 链路正常: 127.0.0.1:48898（NetId 127.0.0.1.1.1，AMS 端口 851，ReadDeviceInfo 收到应答）
+
+./uic adsread -addr 127.0.0.1:48898 -info
+./uic adsread -addr 127.0.0.1:48898 -state
+./uic adsread -addr 127.0.0.1:48898   -symbol MAIN.nCounter:int16,MAIN.fTemperature:float32,MAIN.sRecipe:string:81
+# 符号            类型      值          质量
+# MAIN.nCounter   int16     1234        good
+# MAIN.fTemperature float32 23.5        good
+# MAIN.sRecipe    string    batch-42    good
+
+./uic adsread -addr 127.0.0.1:48898 -symbol MAIN.nSetpoint:int16 -set 750
+./uic adsread -addr 127.0.0.1:48898 -symbol MAIN.sName:string:81 -set line-2
+./uic adsread -addr 127.0.0.1:48898 -control stop -allow-control
+```
+
+`-symbol` 的写法是 `NAME[:type[:length]]`，逗号分隔；类型省略时用 `-type`，
+长度省略时 string/bytes 用 `-strlen`。同一个 PLC 里不同变量本来就有不同类型，
+按符号逐个声明比「一刀切 -type」更接近现场。读/写失败时命令的退出码为 1，脚本
+可以直接判断「有没有坏点」，不需要解析表格。
+
+示例配置带上网关跑真实采集：
+
+```bash
+./uic -config examples/ads.json
+curl -s -H 'Authorization: Bearer dev-token-0123456789' localhost:8096/api/v1/points?device=plc01
+curl -s -X POST -H 'Authorization: Bearer dev-token-0123456789' \
+  -H 'Content-Type: application/json' \
+  -d '{"value":{"type":"int16","num":640}}' \
+  localhost:8096/api/v1/points/plc01/setpoint/write
+```
+
+写接口返回 `quality: uncertain` 是预期：写入已确认（ADS 的 Write 应答只有
+result，没有回显），但缓存里的值要等下一轮采集才刷新；把它标成 `good` 会让人以为
+「读到的新值就是刚写的值」。
+
+排查顺序内建在失败提示里：**TCP 48898 是否可达 → `labels.netid` 是否与 PLC 配置
+一致 → `labels.port`（851/801）→ PLC 运行时是否在运行 → 符号名与宽度是否与声明
+一致**。`-probe` 能分开前四层，`-info`/`-state` 能确认握手之后设备是否正常，
+`-symbol` 的单点错误能定位最后一层。
+
+测试矩阵（当前覆盖）：
+
+| 层 | 用例 |
+|---|---|
+| `codec/ads` | AMS/TCP 与 AMS 头金帧（HandleByName `MAIN.nCounter`）、两层长度一致性、reserved 非零拒绝、NetID 解析（6 段/0..255/非法）、7 类请求构造、Read/Write/ReadWrite/DeviceInfo/State/Control 应答解析、错误码分类与临时性、Command/State 字符串 |
+| `driver/ads` | 真实 TCP 回环：9 种类型读写、数组与字符串、地址/权限/宽度错误逐点隔离、坏 NetId/端口、握手超时、Close 幂等、句柄失效重解析（读与写）、类型范围/小数/BCD/字符串 NUL 拒绝、脚本化服务端：临时 AMS 错误重试、通知帧与陈旧 invoke 丢弃、畸形帧、句柄 0/短句柄、设备信息/状态/控制的 AMS 错误与短载荷、ctx 超时、拨号失败 |
+| `sim/ads` | 真实 TCP 回环：默认变量表、GET/PUT 夹具、句柄分配/释放/失效、只读与宽度校验、数组仅 `[2]` 可写、字符串/浮点、错误 NetId/端口、未知命令、通知不应答、畸形载荷、坏帧断链后仍可服务、Close 幂等 |
+| 点表/规划 | `PolicyFor("ads")` 只允许 symbol、`NAME:81` 与 length 列、`MAIN.arr[2]` 保留在 path、寄存器/selector 在导入期拒绝、`examples/ads.json` 通过 `-check`（17 个驱动） |
+| `cmd/uic` | `-symbol` 声明解析（类型/长度/错误写法）、`-set` 值解析（bool/int/uint/float/string/bytes、进制、越界、BCD 拒绝）、`-control` 映射、行显示与错误质量 |
 
 ### 3.11 计算点（`computed`）
 
@@ -3584,6 +3900,7 @@ type OpError struct {
 | `dlt645`（多功能电能表 645-2007） | supported | supported | unsupported | unsupported | unsupported | unsupported ⁷ | unsupported |
 | `cjt188`（户用计量仪表 188-2004） | supported | supported | unsupported | unsupported | unsupported | unsupported ⁸ | unsupported |
 | `snmp`（v1/v2c 对象读写） | supported | supported | unsupported | unsupported | unsupported | supported ⁹ | unsupported |
+| `ads`（AMS/TCP 符号读写） | supported | supported | unsupported | unsupported | unsupported | unsupported ¹⁰ | unsupported |
 | `opcua` | supported | supported | supported ⁴ | unsupported | experimental | supported | unsupported |
 | `mqtt`（南向订阅） | supported | supported | supported ¹ | unsupported | unsupported | supported ² | unsupported |
 | `computed`（计算点） | supported | unsupported ³ | unsupported | unsupported | unsupported | supported | unsupported |
@@ -3624,6 +3941,10 @@ type OpError struct {
 > 的逐点串行相反。但一帧仍受两个上限约束：`options.maxOids`（默认 32）与 1400 字节
 > 的编码预算（避免 IP 分片被中间设备丢弃）。因此「一次多读」不等于「任意多点位都只
 > 付一次事务」——点位多时会被切成多条 GET（见 §3.10.12.5）。
+>
+> ¹⁰ ADS 的 `MultiRead` 声明 `unsupported` 是**主动放弃**：`ReadWrite` 可以带多个
+> 句柄，但一次失败无法逐点归因；逐点事务换来「哪个变量、哪一类错误」。这与 645/188
+> 的「协议只能一次一个 DI」不同（见 §3.10.13.1）。
 
 ---
 

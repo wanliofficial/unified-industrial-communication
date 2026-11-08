@@ -34,10 +34,10 @@ cmd/ + internal/            可运行的最小骨架（不是伪代码，能采�
 
 ### 1.2 它不是什么
 
-- 不是协议库大杂烩。当前实现了 16 个驱动（Modbus TCP / RTU / ASCII 主站、S7、OPC UA、MQTT 南向订阅、
-  MC 3E、FINS、EtherNet/IP CIP、BACnet/IP、IEC 60870-5-104、DL/T 645、CJ/T 188、SNMP v1/v2c、计算点、virtual），外加
-  Modbus 从站（TCP / RTU / ASCII）、十一个内置模拟从站/Broker（Modbus TCP、S7、MC 3E、FINS、CIP、BACnet/IP、
-  IEC 104、DL/T 645、CJ/T 188、SNMP v1/v2c、MQTT）与一个内置 OPC UA 服务端、一个零依赖报警引擎与一个有界历史采样日志；其余协议在
+- 不是协议库大杂烩。当前实现了 17 个驱动（Modbus TCP / RTU / ASCII 主站、S7、OPC UA、MQTT 南向订阅、
+  MC 3E、FINS、EtherNet/IP CIP、BACnet/IP、IEC 60870-5-104、DL/T 645、CJ/T 188、SNMP v1/v2c、ADS/AMS、计算点、virtual），外加
+  Modbus 从站（TCP / RTU / ASCII）、十二个内置模拟从站/Broker（Modbus TCP、S7、MC 3E、FINS、CIP、BACnet/IP、
+  IEC 104、DL/T 645、CJ/T 188、SNMP v1/v2c、ADS/AMS、MQTT）与一个内置 OPC UA 服务端、一个零依赖报警引擎与一个有界历史采样日志；其余协议在
   `04-protocol-catalog.md` 里按工作量排了三波，没有假装已经支持。
   注意 MQTT 出现了两次且**互不相干**：北向是「网关把数据发出去」（sink），南向是「网关订阅别人发来的数据」（driver）。
 - 不是组态软件。不做画面、不做报表、不做自研时序库——理由见 `02-synthesis/01-capability-matrix.md` §6.4。
@@ -326,6 +326,37 @@ Gauge32、`int*` 为 INTEGER、`string/bytes` 为 OCTET STRING；float/BCD 显�
 线类型，私有编码互不兼容）。应答同时校验错误码与回显值——设备「接受但按自己的解释改了值」
 会在写入当场暴露。Counter64 经平台 `float64` 承载，超过 2^53 会丢精度；Counter32 会回绕，
 时间序列侧要做回绕检测。团体名按凭据处理（界面掩码），默认 `public` 只是最少配置。
+
+ADS/AMS（PLC 运行时，TCP 48898）：
+
+```bash
+./uic sim -protocol ads -listen 127.0.0.1:48898 &   # 内置 ADS/AMS 服务端
+./uic -config examples/ads.json
+curl -s -H 'Authorization: Bearer dev-token-0123456789' localhost:8096/api/v1/points
+#   9 点：nCounter/fTemperature/bEnable/sRecipe/arr[2]（只读）、
+#          setpoint/fSpeed/run/name（可写）
+#   自检：./uic adsread -addr 127.0.0.1:48898 -probe
+#   读点位：./uic adsread -addr 127.0.0.1:48898 \
+#       -symbol MAIN.nCounter:int16,MAIN.sRecipe:string:81,MAIN.arr[2]:int16
+#   写点位：./uic adsread -addr 127.0.0.1:48898 -symbol MAIN.nSetpoint:int16 -set 750
+#   状态：  ./uic adsread -addr 127.0.0.1:48898 -state
+```
+
+ADS 是唯一「地址就是 PLC 工程变量名、且一次取值要两次往返」的协议：先把变量名换成句柄
+（`ReadWrite` + IndexGroup `0xF003`），再用句柄读值（`Read` + `0xF005`）。句柄属于会话，
+PLC 重启后全部失效；驱动遇到 `invalid offset` 时清掉缓存、重新解析一次，第二次仍失败就
+按点位报错——继续重试只会把「PLC 一直重启」变成「驱动一直转圈」。
+
+地址 `kind=symbol`，`path` 就是符号名；数组下标写在名字里（`MAIN.arr[2]`），不拆成平台
+的 `index` 字段。string/bytes 的宽度由点表给出（`NAME:81` 或 length 列），因为 PLC 变量
+的宽度是符号属性，驱动猜不出来。全线小端；写前做类型/范围检查，`70000` 写 INT16 会在
+发报文之前被拒绝，而不是变成 `4464`。
+
+TCP 48898 与 AMS 端口是两层：`labels.netid` 是 6 段 NetId，`labels.port` 是 851/801。
+`Open` 立即做一次 `ReadDeviceInfo` 握手，把 NetId/端口配错从「一堆红点」提前到启动期的
+一句 `target machine not found`。只做 AMS/TCP 上的符号读写：通知订阅、符号表浏览、跨
+AMS 路由发现、多句柄合并读写都显式声明 `unsupported`——它们各自是另一套模型，半成品
+比不做更难排查。
 
 OPC UA（二进制，SecurityPolicy None / 匿名）：
 
@@ -828,6 +859,9 @@ obs  ← 所有包（不依赖任何内部包）
 | `internal/codec/snmp` | SNMP v1/v2c 纯函数编解码（BER TLV / 整数最短补码 / OID base-128 / 7 类 PDU / varbind / 异常标记 / error-status 分类） | 无 I/O、无时钟、无可变状态；长度短/长形式必须按内容长度选；无符号值最高位为 1 必须补前导 `00`；OID 首两弧合并、`2.39.1`→`77 01`；异常标记只允许出现在应答，请求里出现即拒绝；v1 Trap PDU 识别后显式拒绝 | 69.3% |
 | `internal/driver/snmp` | SNMP v1/v2c 主站（批量 GET、v1 `noSuchName` 退化、单 OID SET、类型映射与回显校验、错误分类、request-id 配对、自检 `GetRaw`/`Walk`） | 只做 v1/v2c；通道必须是 UDP，地址省略端口补 161；读按 `maxOids` 与 1400 字节双预算分批，顺序不变；v1 批量 `noSuchName` 逐点重发；写不合并 varbind，逐点错误隔离；只接受与请求 request-id 相同的 Response；float/BCD 与 >2^32-1 的无符号写本地拒绝；地址错误不进入整轮 `firstErr` | 70.3% |
 | `internal/sim/snmp` | SNMP v1/v2c 内置代理（system 组 + 两块网卡、GET/GETNEXT/GETBULK/SET、community 静默丢弃、v1/v2 差异、SET 原子性） | 与主站共用 codec/snmp；community 不匹配不回任何报文（不做口令预言机）；v1 缺 OID 回 `noSuchName` 带 `error-index`，v2c 回 `noSuchObject`；SET 先全量校验再落地；`sysUpTime` 固定值（测试要稳定）；`Close` 幂等 | 90.6% |
+| `internal/codec/ads` | ADS/AMS 纯函数编解码（6 字节 AMS/TCP 头、32 字节 AMS 头、7 类命令、两层长度一致性、NetId 解析、错误码分类） | 无 I/O、无时钟、无可变状态；TCP 长度含 AMS 头、AMS 长度只含载荷，少写一层会让对端把载荷开头当长度；flags 低位是应答位、`0x0004` 是 ADS 位；invoke 0 保留；错误码分 AMS 与 ADS 两段，只有临时性错误可重试 | 86.7% |
+| `internal/driver/ads` | ADS/AMS 主站（符号名→句柄→值、句柄缓存与失效重解析、逐点事务、类型范围检查、AMS/ADS 错误分类、自检 `DeviceInfo`/`DeviceState`/`WriteControl`） | 地址必须是 `symbol`，`index>0` 直接报地址错；读写在返回 `invalid offset/group` 时只重解析一次；写前拒绝越界/小数/BCD，字符串刚好占满整段也拒绝；只重试超时与临时性协议错，断链与地址/权限错不重试 | 92.8% |
+| `internal/sim/ads` | ADS/AMS 内置服务端（默认变量表、按名分配句柄、只读标记、宽度校验、状态控制、句柄失效模拟） | 与主站共用 codec/ads；变量表扁平、每个数组元素单独占一个符号名（与真实符号表一致）；句柄全局编号以便一次调用让所有句柄失效；未知 IndexGroup 一律 `invalid group`，通知帧不应答 | 96.9% |
 | `internal/driver/link` | 表计协议的承载层：串口与串口服务器（TCP 透传）统一成一条带总线锁的链路 | 锁覆盖「排空 → 发送 → 收完帧」整段；TCP 上 Drain 退化为读掉残留字节（分帧同步仍由 codec 扫描兜底）；`host` 省略端口时补默认端口；参数错误 `ErrUnsupported`、打开/连接失败 `ErrDisconnected`；`Drain` 必须早于 `SetDeadline` | 91.2% |
 
 | `internal/planner` | 点位 → 批量读请求（ReadSpan） | 协议无关；按连续性/上限合并；按 `area:db` 分组；计算点合成单个 `expr` span（漏组会表现为全坏且无日志） | 92.6% |
@@ -844,7 +878,7 @@ obs  ← 所有包（不依赖任何内部包）
 | `internal/mqtt` | MQTT 3.1.1 客户端（北向发布 + 南向订阅共用，纯 Go 零依赖） | 单 goroutine 读 socket；QoS1 必须等到 PUBACK；`Ping` 必须等到 PINGRESP（写成功不算活着）；断线立即失败而非超时 | 70.3% |
 | `internal/mqtt/mqtttest` | 测试封装：`internal/sim/mqtt` 的 `*testing.T` 生命周期 + 等待断言 | 不另写 Broker（两份实现必然长歪）；开关一律走 setup 函数而非直接赋字段 | — |
 | `internal/runtime` | 唯一编排层 + 后端实现 + 看门狗 + 审计埋点 + 窗口缓存 | 启动/关闭顺序（失败逆序收口）；`configuredState` 与 `runtimeState` 分离；协议/传输匹配在装配期校验；只向驱动与报警引擎注入只读 `cache.Get` 与窗口数据源；北向 OPC UA 启停与热重建；凭据表热替换后旧用户立即失效 | 81.4% |
-| `cmd/uic` | 单入口：run / sim / mbread / mcread / finsread / enipread / bacread / uaread / dlt645read / cjt188read / snmpread / s7blocks / s7upload / instantiate / import / token / check / version | 关闭预算 10 秒；`uaread`、`mbread`、`mcread`、`finsread`、`enipread`、`bacread`、`dlt645read`、`cjt188read`、`snmpread` 是不装第三方客户端即可自证链路的自检工具；块服务放在 CLI 而不是北向 API（动作重、数据大、归操作系统账号管）；模板实例化与点表导入只产出文件，不在运行期动态生成设备 | — |
+| `cmd/uic` | 单入口：run / sim / mbread / mcread / finsread / enipread / bacread / uaread / dlt645read / cjt188read / snmpread / adsread / s7blocks / s7upload / instantiate / import / token / check / version | 关闭预算 10 秒；`uaread`、`mbread`、`mcread`、`finsread`、`enipread`、`bacread`、`dlt645read`、`cjt188read`、`snmpread`、`adsread` 是不装第三方客户端即可自证链路的自检工具；块服务放在 CLI 而不是北向 API（动作重、数据大、归操作系统账号管）；模板实例化与点表导入只产出文件，不在运行期动态生成设备 | — |
 
 覆盖率一列是 `go test -cover ./<包>/` 的语句覆盖率（只统计包内测试，不做跨包交叉覆盖），
 随测试增删会有 1% 级的漂移；要看当前值请按 §9.2 的命令重跑。
@@ -859,7 +893,7 @@ go test -race -count=1 ./...                    # 竞态 + 全量测试
 go test -coverprofile=c.out ./... && go tool cover -func=c.out | tail -1
 ```
 
-当前状态：`go build` / `go vet` / `gofmt` 全部干净，`go test -race ./...` 覆盖 65 个包，其中 64 个
+当前状态：`go build` / `go vet` / `gofmt` 全部干净，`go test -race ./...` 覆盖 68 个包，其中 67 个
 有测试文件且全部通过（仅 `internal/mqtt/mqtttest` 是纯测试辅助包，没有自己的测试文件）。
 
 ### 9.3 源码阅读建议顺序

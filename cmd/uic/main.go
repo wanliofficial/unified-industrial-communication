@@ -9,6 +9,7 @@
 //	uic sim -protocol mqtt -listen 127.0.0.1:18830  # 内置 MQTT Broker（南向演示）
 //	uic sim -protocol dlt645 -listen 127.0.0.1:14001 # 内置电能表从站（645-2007）
 //	uic sim -protocol snmp -listen 127.0.0.1:16161   # 内置 SNMP v1/v2c 代理（UDP）
+//	uic sim -protocol ads -listen 127.0.0.1:48898    # 内置 ADS/AMS 服务端（TCP）
 //	uic mbread -addr 127.0.0.1:1502    # 不依赖第三方工具的从站读写自检（TCP）
 //	uic mbread -transport rtu -port /dev/ttyUSB0 -unit 1   # 串口从站自检
 //	uic mcread -addr 127.0.0.1:5000 -area d -offset 100 -qty 2   # MC 3E 自检
@@ -17,6 +18,7 @@
 //	uic bacread -addr 127.0.0.1:47808 -type analog-input -instance 1  # BACnet/IP 自检
 //	uic iec104read -addr 127.0.0.1:2404 -ca 1   # IEC 60870-5-104 自检（总召唤 + 上送对象）
 //	uic snmpread -addr 127.0.0.1:16161 -oid 1.3.6.1.2.1.1.1.0   # SNMP v1/v2c 自检
+//	uic adsread -addr 127.0.0.1:48898 -probe   # ADS/AMS 自检（设备信息握手）
 //	uic uaread -addr 127.0.0.1:4840 -nodes ns=2;s=site/dev/point  # OPC UA 读写自检
 //	uic s7blocks -addr 127.0.0.1:15102   # S7 块目录（-type db / -num 1 可细看）
 //	uic s7upload -addr 127.0.0.1:15102 -type db -num 1 -out db1.bin  # 块上传备份
@@ -52,6 +54,7 @@ import (
 	"uic/internal/model"
 	"uic/internal/opcuaserver"
 	uicruntime "uic/internal/runtime"
+	adssim "uic/internal/sim/ads"
 	bacnetsim "uic/internal/sim/bacnet"
 	cjt188sim "uic/internal/sim/cjt188"
 	dlt645sim "uic/internal/sim/dlt645"
@@ -99,6 +102,8 @@ func main() {
 		cjt188readCmd(args)
 	case "snmpread":
 		snmpreadCmd(args)
+	case "adsread":
+		adsreadCmd(args)
 	case "uaread":
 		uareadCmd(args)
 	case "s7blocks":
@@ -128,7 +133,7 @@ func usage() {
 用法:
   uic [run] -config config.json [-listen :8080] [-token TOKEN]
   uic -check -config config.json
-  uic sim [-listen 127.0.0.1:15020] [-protocol modbus|s7|opcua|mqtt|mc|fins|enip|bacnet|iec104|dlt645|cjt188|snmp]
+  uic sim [-listen 127.0.0.1:15020] [-protocol modbus|s7|opcua|mqtt|mc|fins|enip|bacnet|iec104|dlt645|cjt188|snmp|ads]
   uic mbread -addr 127.0.0.1:1502 -unit 1 -area holding -offset 0 -qty 2
   uic mbread -addr 127.0.0.1:1502 -area holding -offset 5 -write 777
   uic mcread -addr 127.0.0.1:5000 -area d -offset 100 -qty 2
@@ -150,6 +155,11 @@ func usage() {
   uic snmpread -addr 127.0.0.1:16161 -oid 1.3.6.1.2.1.1.1.0,1.3.6.1.2.1.1.5.0 [-raw|-json]
   uic snmpread -addr 127.0.0.1:16161 -walk 1.3.6.1.2.1.1 -max-walk 16
   uic snmpread -addr 127.0.0.1:16161 -oid 1.3.6.1.2.1.1.6.0 -set lab-2 -setType string
+  uic adsread -addr 127.0.0.1:48898 -probe [-netid 192.168.1.10.1.1] [-port 851]
+  uic adsread -addr 127.0.0.1:48898 -symbol MAIN.nCounter:int16,MAIN.sRecipe:string:81 [-json]
+  uic adsread -addr 127.0.0.1:48898 -symbol MAIN.nSetpoint:int16 -set 750
+  uic adsread -addr 127.0.0.1:48898 -state
+  uic adsread -addr 127.0.0.1:48898 -control run -allow-control
   uic mbread -transport rtu|ascii -port /dev/ttyUSB0 [-baud 19200] [-parity even]
   uic uaread -addr 127.0.0.1:4840 -nodes ns=2;s=site/dev/point [-type float64]
   uic uaread -addr 127.0.0.1:4840 -nodes ns=2;s=site/dev/setpoint -write 42.5
@@ -455,7 +465,7 @@ func simCmd(args []string) {
 	fs := flag.NewFlagSet("sim", flag.ExitOnError)
 	addr := fs.String("listen", "127.0.0.1:15020", "监听地址")
 	size := fs.Int("size", 1024, "寄存器数量")
-	proto := fs.String("protocol", "modbus", "从站协议：modbus | s7 | opcua | mqtt | mc | fins | enip | bacnet | iec104 | dlt645 | cjt188 | snmp")
+	proto := fs.String("protocol", "modbus", "从站协议：modbus | s7 | opcua | mqtt | mc | fins | enip | bacnet | iec104 | dlt645 | cjt188 | snmp | ads")
 	pdu := fs.Int("pdu", 480, "S7 协商 PDU 长度（240/480/960）")
 	fs.Parse(args)
 
@@ -493,9 +503,12 @@ func simCmd(args []string) {
 	case "snmp":
 		simSNMP(*addr)
 		return
+	case "ads":
+		simADS(*addr)
+		return
 	case "modbus":
 	default:
-		fmt.Fprintf(os.Stderr, "未知协议 %q（支持 modbus | s7 | opcua | mqtt | mc | fins | enip | bacnet | iec104 | dlt645 | cjt188 | snmp）\n", *proto)
+		fmt.Fprintf(os.Stderr, "未知协议 %q（支持 modbus | s7 | opcua | mqtt | mc | fins | enip | bacnet | iec104 | dlt645 | cjt188 | snmp | ads）\n", *proto)
 		os.Exit(2)
 	}
 
@@ -962,6 +975,41 @@ func simSNMP(addr string) {
 	fmt.Println("  v1 差异： 缺 OID 回 noSuchName（无 per-varbind 异常），SET 错误码映射到 v1 子集")
 	fmt.Println("  Ctrl+C 停止")
 	fmt.Println("  自检：   uic snmpread -addr " + srv.Addr() + " -probe")
+
+	<-ctx.Done()
+	_ = srv.Close()
+	slog.Info("sim_stopped")
+}
+
+// simADS 启动内置 ADS/AMS 服务端（TCP）。
+//
+// 默认监听 48898（AMS/TCP 的标准端口），NetId 用 127.0.0.1.1.1、AMS 端口
+// 851——与 examples/ads.json、adsread 的默认值一致。变量表见
+// internal/sim/ads.loadDefaults：INT16/REAL/LREAL/BOOL/STRING/数组各一份，
+// 其中 nSetpoint / fSpeed / bRun / sName / arr[2] 可写。
+//
+// 仿真端不实现符号表上传与通知订阅（本驱动也不做），未知 IndexGroup 一律
+// 回 invalid group；但句柄、只读标记、长度校验与错误码都与真实设备一致。
+func simADS(addr string) {
+	srv, err := adssim.NewServer(addr)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "启动 ADS 服务端失败: %v\n", err)
+		os.Exit(1)
+	}
+	defer func() { _ = srv.Close() }()
+
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	fmt.Printf("ads/ams server listening on %s (NetId %s, AMS port %d)\n", srv.Addr(), srv.NetID(), srv.Port())
+	fmt.Println("  可读：MAIN.nCounter INT16=1234  MAIN.fTemperature REAL=23.5  MAIN.bEnable BOOL=1")
+	fmt.Println("        MAIN.sRecipe STRING(80)=\"batch-42\"  MAIN.arr[0..3] INT16=10/20/30/40")
+	fmt.Println("  可写：MAIN.nSetpoint INT16=500  MAIN.fSpeed LREAL=1450.75  MAIN.bRun BOOL=0")
+	fmt.Println("        MAIN.sName STRING(80)=\"uic-sim\"  MAIN.arr[2]（其余数组元素只读）")
+	fmt.Println("  句柄：按变量名分配，PLC 重启（本仿真里是 InvalidateHandles）后失效")
+	fmt.Println("  Ctrl+C 停止")
+	fmt.Println("  自检：   uic adsread -addr " + srv.Addr() + " -probe")
+	fmt.Println("  读点位： uic adsread -addr " + srv.Addr() + " -symbol MAIN.nCounter:int16,MAIN.sRecipe:string:81")
 
 	<-ctx.Done()
 	_ = srv.Close()

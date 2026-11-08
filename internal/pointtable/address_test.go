@@ -106,6 +106,9 @@ func TestAddressPolicyStatic(t *testing.T) {
 	if p := PolicyFor("snmp"); p.AllowRegister || !p.AllowSymbol || p.AllowSelector {
 		t.Fatalf("snmp = %+v", p)
 	}
+	if p := PolicyFor("ads"); !p.AllowSymbol || !p.AllowSymbolLength || !p.SymbolIndexInPath || p.AllowSelector {
+		t.Fatalf("ads = %+v", p)
+	}
 	if p := PolicyFor("weird"); !p.AllowRegister || !p.AllowSymbol || p.Width != WidthExplicit {
 		t.Fatalf("unknown = %+v", p)
 	}
@@ -292,5 +295,55 @@ func TestParseAddressSNMP(t *testing.T) {
 	// selector 是 MQTT 的载荷字段语法，SNMP 没有这个位置。
 	if _, err := ParseAddress("1.3.6.1.2.1.1.1.0#x", model.TypeString, "snmp"); err == nil {
 		t.Fatal("selector must be rejected for snmp")
+	}
+}
+
+func TestParseAddressADS(t *testing.T) {
+	// 数组下标属于符号名：拆成 Address.Index 再拼回去会让 `[0]` 与
+	// 「未配置」在 JSON 里无法区分。
+	a, err := ParseAddress("MAIN.arr[2]", model.TypeInt16, "ads")
+	if err != nil {
+		t.Fatalf("array: %v", err)
+	}
+	if a.Kind != model.AddressSymbol || a.Path != "MAIN.arr[2]" || a.Index != -1 {
+		t.Fatalf("array address = %+v", a)
+	}
+	if got := a.Canonical(); got != "MAIN.arr[2]" {
+		t.Fatalf("array canonical = %q", got)
+	}
+
+	// STRING/bytes 的宽度由点表给出：地址里的 `:81` 与 length 列等价。
+	for _, tc := range []struct {
+		expr   string
+		length int
+	}{{"MAIN.sRecipe:81", 0}, {"MAIN.sRecipe", 81}} {
+		a, err := ParseAddressWithLength(tc.expr, model.TypeString, "ads", tc.length)
+		if err != nil {
+			t.Fatalf("%q: %v", tc.expr, err)
+		}
+		if a.Length != 81 || a.Path != "MAIN.sRecipe" {
+			t.Fatalf("%q = %+v", tc.expr, a)
+		}
+		if got := a.Canonical(); got != "MAIN.sRecipe:81" {
+			t.Fatalf("%q canonical = %q", tc.expr, got)
+		}
+	}
+
+	// 两处长度不一致必须在导入期报错，而不是随便选一个。
+	if _, err := ParseAddressWithLength("MAIN.sRecipe:81", model.TypeString, "ads", 80); err == nil ||
+		!strings.Contains(err.Error(), "given twice") {
+		t.Fatalf("conflicting length: %v", err)
+	}
+
+	// 寄存器/对象/selector 都必须在导入期拒绝：ADS 只有符号地址。
+	for _, expr := range []string{"holding:100", "analogInput:1.presentValue", "MAIN.x#field"} {
+		if _, err := ParseAddress(expr, model.TypeUint16, "ads"); err == nil {
+			t.Fatalf("%q must be rejected for ads", expr)
+		}
+	}
+
+	// 其它符号协议不接受显式长度：OPC UA 的宽度来自服务端类型。
+	if _, err := ParseAddressWithLength("ns=2;s=Plant.Temp", model.TypeString, "opcua", 81); err == nil {
+		t.Fatal("opcua must reject explicit symbol length")
 	}
 }

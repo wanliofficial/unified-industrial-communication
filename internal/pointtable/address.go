@@ -66,6 +66,15 @@ type AddressPolicy struct {
 	// 没法穷举成白名单。位数是协议事实，不做成「几个都行」——多一位少
 	// 一位都指向另一个数据项，宽松解析只会让人查很久。
 	DIBits int
+	// AllowSymbolLength 表示符号地址可以带长度：`NAME:81` 或点表的
+	// length 列。它只对「值的宽度必须由点表给出」的符号协议有意义
+	// （ADS 的 STRING/bytes 变量），寄存器型协议的 length 另有语义。
+	AllowSymbolLength bool
+	// SymbolIndexInPath 表示数组下标属于符号名本身（`MAIN.arr[2]`），
+	// 而不是拆成 Address.Index。ADS 的变量名就是带下标的完整路径；
+	// 拆开再拼回去会让「[0] 与未配置」变得无法区分。
+	SymbolIndexInPath bool
+
 	// DIField 表示 DI 后面允许写「字段偏移」而不是只允许 0。
 	//
 	// DL/T 645 的一个 DI 就是一个值，offset 只能为 0；CJ/T 188 的一个 DI
@@ -99,6 +108,14 @@ func PolicyFor(protocol string) AddressPolicy {
 		}
 	case "opcua":
 		return AddressPolicy{AllowSymbol: true}
+	case "ads":
+		// ADS 的地址就是 PLC 符号名：`MAIN.nCounter`、`MAIN.arr[2]`、
+		// 结构体逐级写全。下标属于名字本身（见 SymbolIndexInPath）；
+		// STRING/bytes 的宽度必须由点表给出，所以允许 `NAME:81`
+		// 或 length 列——PLC 变量的宽度是符号的属性，猜不出来。
+		return AddressPolicy{
+			AllowSymbol: true, AllowSymbolLength: true, SymbolIndexInPath: true,
+		}
 	case "snmp":
 		// SNMP 的地址就是一个点分十进制 OID。没有区域、没有偏移、没有
 		// 数组下标（实例号写在 OID 里），也没有 MQTT 那种载荷字段选择器。
@@ -219,7 +236,20 @@ func ParseAddressWithLength(expr string, dt model.DataType, protocol string, len
 	if !pol.AllowSymbol {
 		return model.Address{}, fmt.Errorf("protocol %q does not accept symbol addresses (got %q)", protocol, expr)
 	}
-	a, err := parseSymbolAddress(expr)
+	// 符号地址的显式长度：`NAME:81`。只在协议允许时切分；否则冒号
+	// 属于符号名（虽然极少见），不能擅自截断。
+	if pol.AllowSymbolLength {
+		if i := strings.LastIndexByte(expr, ':'); i > 0 {
+			if n, err := strconv.Atoi(strings.TrimSpace(expr[i+1:])); err == nil && n > 0 {
+				if length > 0 && length != n {
+					return model.Address{}, fmt.Errorf(
+						"length is given twice with different values (%d in address, %d in length column)", n, length)
+				}
+				expr, length = expr[:i], n
+			}
+		}
+	}
+	a, err := parseSymbolAddress(expr, pol.SymbolIndexInPath)
 	if err != nil {
 		return model.Address{}, err
 	}
@@ -227,7 +257,13 @@ func ParseAddressWithLength(expr string, dt model.DataType, protocol string, len
 		return model.Address{}, fmt.Errorf("protocol %q does not accept selector addresses (got %q)", protocol, expr)
 	}
 	if length > 0 {
-		return model.Address{}, fmt.Errorf("length is only valid for register addresses")
+		if !pol.AllowSymbolLength {
+			return model.Address{}, fmt.Errorf("length is only valid for register addresses")
+		}
+		if length > 65535 {
+			return model.Address{}, fmt.Errorf("length %d exceeds 65535", length)
+		}
+		a.Length = length
 	}
 	return a, nil
 }
@@ -460,7 +496,7 @@ func deriveLength(area string, dt model.DataType, mode WidthMode) (int, error) {
 	return width, nil
 }
 
-func parseSymbolAddress(expr string) (model.Address, error) {
+func parseSymbolAddress(expr string, keepIndexInPath bool) (model.Address, error) {
 	path, selector := expr, ""
 	if i := strings.IndexByte(expr, '#'); i >= 0 {
 		path, selector = expr[:i], expr[i+1:]
@@ -472,7 +508,7 @@ func parseSymbolAddress(expr string) (model.Address, error) {
 		}
 	}
 	index := -1
-	if strings.HasSuffix(path, "]") {
+	if !keepIndexInPath && strings.HasSuffix(path, "]") {
 		if i := strings.LastIndexByte(path, '['); i >= 0 {
 			n, err := strconv.Atoi(path[i+1 : len(path)-1])
 			if err != nil || n < 0 {

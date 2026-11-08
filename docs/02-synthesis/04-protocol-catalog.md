@@ -242,8 +242,9 @@
 MC 3E、FINS、EtherNet/IP + CIP、BACnet/IP、IEC 104、DL/T 645、CJ/T 188、ADS、OPC DA 桥接、Sparkplug B、SNMP。
 
 > 截至当前实现：MC 3E、FINS、EtherNet/IP + CIP、BACnet/IP、IEC 104、DL/T 645、
-> CJ/T 188、SNMP v1/v2c 已落地（各含编解码、主站、内置从站/服务端与自检 CLI）；
-> ADS 与 Sparkplug B 待落地。645 与 188 都是「表计语义寻址 + 压缩 BCD」，但帧层与字段模型不同：
+> CJ/T 188、SNMP v1/v2c、ADS/AMS 已落地（各含编解码、主站、内置从站/服务端与自检 CLI）；
+> Sparkplug B 待落地，OPC DA 桥接归入「不做/独立 Windows 桥接进程」（需要 DCOM/COM，
+> 零依赖 Go 不可实现）。645 与 188 都是「表计语义寻址 + 压缩 BCD」，但帧层与字段模型不同：
 > 188 只有一个 `0x68`、数据域不加 `0x33`、地址 7 字节且带仪表类型 `T`，一个 DI 是
 > 一组字段（901F 在水表与热量表上布局不同）。点表因此从 `WidthProtocol` 进一步引入
 > `DIBits`/`DIField`：DI 位数随协议变化，字段偏移只在 188 上允许非 0。
@@ -252,6 +253,12 @@ MC 3E、FINS、EtherNet/IP + CIP、BACnet/IP、IEC 104、DL/T 645、CJ/T 188、A
 > error-status / 异常标记。v3 的 USM 不做（配置期显式拒绝，不退回 v2c）；Trap 不做
 > （轮询主站的采集语义与设备主动推不同）；Walk 只作为自检接口，生产点表必须写明确
 > OID。一个坏 OID 在 v1 下会毁掉整批返回值，因此驱动对 `noSuchName` 逐点重发。
+>
+> ADS 补的是「PLC 工程变量」这一层：地址不是寄存器号而是符号名，一次取值要先按名字
+> 取句柄再按句柄读值，句柄随 PLC 重启失效。只做 AMS/TCP 上的符号读写；通知订阅、
+> 符号表上传/浏览、跨 AMS 路由发现、多句柄合并读写都不做——它们各自是另一套状态机，
+> 半成品比不做更难排查。TCP 48898 与 AMS NetId/端口是两层，配错时症状完全不同，
+> 因此 `Open` 立即做 `ReadDeviceInfo` 握手，把错误提前到启动期。
 
 **Wave 2 的验收**：覆盖汽车零部件（CIP）、3C（MC）、水务（104/645）、楼宇（BACnet）四类典型场景。
 

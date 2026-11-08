@@ -1,0 +1,125 @@
+{
+  "schemaVersion": 1,
+  "site": "ads-lab",
+  "server": {
+    "listen": "127.0.0.1:8096",
+    "token": "dev-token-0123456789"
+  },
+  "storage": {
+    "dir": "./data-ads",
+    "journal": true,
+    "outboxMaxRecords": 5000,
+    "outboxTtl": "10m"
+  },
+  "logging": {
+    "level": "info"
+  },
+  "northbound": {
+    "webhook": {
+      "enabled": false,
+      "url": "http://127.0.0.1:9999/ingest",
+      "timeout": "3s"
+    }
+  },
+  "channels": [
+    {
+      "id": "ch-ads",
+      "protocol": "ads",
+      "transport": {
+        "kind": "tcp",
+        "address": "127.0.0.1:48898"
+      },
+      "concurrency": 1,
+      "timeout": "3s"
+    }
+  ],
+  "devices": [
+    {
+      "id": "plc01",
+      "name": "PLC 运行时（内置 ADS/AMS 服务端）",
+      "channel": "ch-ads",
+      "interval": "1s",
+      "timeout": "2s",
+      "enabled": true,
+      "labels": {
+        "netid": "127.0.0.1.1.1",
+        "port": "851",
+        "localnetid": "127.0.0.1.1.1",
+        "localport": "32905",
+        "options": "retries=1,strlen=81"
+      },
+      "points": [
+        {
+          "id": "counter",
+          "name": "计数器（INT16，只读）",
+          "address": { "kind": "symbol", "path": "MAIN.nCounter" },
+          "dataType": "int16",
+          "enabled": true
+        },
+        {
+          "id": "temperature",
+          "name": "温度（REAL/float32，只读）",
+          "address": { "kind": "symbol", "path": "MAIN.fTemperature" },
+          "dataType": "float32",
+          "unit": "°C",
+          "enabled": true
+        },
+        {
+          "id": "speed",
+          "name": "转速（LREAL/float64，可写）",
+          "address": { "kind": "symbol", "path": "MAIN.fSpeed" },
+          "dataType": "float64",
+          "unit": "rpm",
+          "writable": true,
+          "enabled": true
+        },
+        {
+          "id": "setpoint",
+          "name": "设定值（INT16，可写）",
+          "address": { "kind": "symbol", "path": "MAIN.nSetpoint" },
+          "dataType": "int16",
+          "writable": true,
+          "enabled": true
+        },
+        {
+          "id": "enable",
+          "name": "使能（BOOL，只读）",
+          "address": { "kind": "symbol", "path": "MAIN.bEnable" },
+          "dataType": "bool",
+          "enabled": true
+        },
+        {
+          "id": "run",
+          "name": "运行（BOOL，可写）",
+          "address": { "kind": "symbol", "path": "MAIN.bRun" },
+          "dataType": "bool",
+          "writable": true,
+          "enabled": true
+        },
+        {
+          "id": "recipe",
+          "name": "配方号（STRING(80)，只读，长度 81 含结尾 NUL）",
+          "address": { "kind": "symbol", "path": "MAIN.sRecipe", "length": 81 },
+          "dataType": "string",
+          "enabled": true
+        },
+        {
+          "id": "name",
+          "name": "设备名（STRING(80)，可写）",
+          "address": { "kind": "symbol", "path": "MAIN.sName", "length": 81 },
+          "dataType": "string",
+          "writable": true,
+          "enabled": true
+        },
+        {
+          "id": "arr-2",
+          "name": "数组元素 MAIN.arr[2]（INT16，可写；下标写在符号名里）",
+          "address": { "kind": "symbol", "path": "MAIN.arr[2]" },
+          "dataType": "int16",
+          "writable": true,
+          "enabled": true
+        }
+      ]
+    }
+  ]
+}

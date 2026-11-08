@@ -248,6 +248,9 @@ func (a Address) Validate() error {
 		if a.Index < -1 {
 			return errors.New("address.index: must be >= -1")
 		}
+		if a.Length < 0 {
+			return errors.New("address.length: must be >= 0")
+		}
 		if a.Selector != "" && !selectorRe.MatchString(a.Selector) {
 			return errors.New("address.selector: must not contain spaces/control chars")
 		}
@@ -313,7 +316,12 @@ func (a Address) Canonical() string {
 		if a.Selector != "" {
 			// 用 `#` 分隔：主题里不会出现 `#`（MQTT 通配符在点位的
 			// path 侧被禁止），因此不会与合法主题产生歧义。
-			return base + "#" + a.Selector
+			base += "#" + a.Selector
+		}
+		// Length 只对「宽度由点表给出」的符号协议有意义（ADS 的
+		// STRING/bytes）；输出成 `NAME:81` 才能与导入语法往返。
+		if a.Length > 0 {
+			base += ":" + strconv.Itoa(a.Length)
 		}
 		return base
 	case AddressObject:

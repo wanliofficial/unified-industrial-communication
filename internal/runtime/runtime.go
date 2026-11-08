@@ -34,6 +34,7 @@ import (
 	"uic/internal/cache"
 	"uic/internal/config"
 	"uic/internal/driver"
+	adsdrv "uic/internal/driver/ads"
 	bacnetdrv "uic/internal/driver/bacnet"
 	cjt188drv "uic/internal/driver/cjt188"
 	"uic/internal/driver/computed"
@@ -149,6 +150,7 @@ func RegisterBuiltins() error {
 			dlt645drv.New(),
 			cjt188drv.New(),
 			snmpdrv.New(),
+			adsdrv.New(),
 		} {
 			if err := driver.Register(d); err != nil {
 				registerErr = err
