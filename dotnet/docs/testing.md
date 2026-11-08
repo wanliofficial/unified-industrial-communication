@@ -16,7 +16,7 @@ dotnet run --project tests/Uic.Tests -- --stop-on-fail      # 首个失败即停
 正常输出：
 
 ```
-181 passed, 0 failed, 1 skipped · 46.1s
+197 passed, 0 failed, 1 skipped · 51.4s
 ```
 
 跳过的一条是 OPC UA 验收（要绑端口、生成证书，默认不跑）。
@@ -39,25 +39,25 @@ dotnet run --project tests/Uic.Tests -- --stop-on-fail      # 首个失败即停
 
 | 分组 | 数量 | 覆盖 |
 |---|---|---|
-| `golden/*` | 16 | 字节级：请求与响应完全匹配（T14） |
-| `codec/*` | 13 | 校验和、字节序、BCD、时间值、窗口、异常码、分帧容错 |
-| `pipeline/*` | 10 | 缩放/偏移、整数取整、质量传播、三种死区模式 |
+| `golden/*` | 20 | 字节级：请求与响应完全匹配（T14），含 4 份数组黄金帧（float32 数组、uint16 数组、批量写数组、逐元素字节序） |
+| `codec/*` | 17 | 校验和、字节序、BCD、时间值、窗口、异常码、分帧容错、数组逐元素字节序与元素个数校验 |
+| `pipeline/*` | 12 | 缩放/偏移、整数取整、质量传播、三种死区模式、数组逐元素缩放与「取最大变化」死区 |
 | `cache/*` | 5 | 序号单调、只在变化时通知、按点位死区判定、移除设备、订阅者故障隔离 |
 | `planner/*` | 8 | 窗口合并、切分上限、区分离、非寄存器寻址 |
 | `history/*` | 9 | journal 历史：时间/身份过滤、每桶降采样、重放去重、缺失文件、坏行跳过、跨读取缓冲区行、跨缓冲区胜出行回读、转义名回退、非法日历日期跳过 |
 | `outbox/*` | 8 | 位点推进、重启重放、批次、分区隔离、三重上限、半行容错 |
-| `config/*` | 15 | 内容寻址、回滚、启动优先级、非法文档、diff、旧配置迁移、复合时长、死区/量程规则、仓库示例可校验、25 类非法配置逐条定位、脱敏占位符还原 |
-| `json/*` | 9 | 时长、枚举、值形状、UTC、往返稳定、前向兼容 |
+| `config/*` | 16 | 内容寻址、回滚、启动优先级、非法文档、diff、旧配置迁移、复合时长、死区/量程规则、数组维度规则（类型/125 寄存器上限）、仓库示例可校验、25 类非法配置逐条定位、脱敏占位符还原 |
+| `json/*` | 11 | 时长、枚举、值形状、数组值形状、`count` 往返、UTC、往返稳定、前向兼容 |
 | `logs/*` | 7 | JSON 行字段、轮转不丢行、归档裁剪、默认关闭、热更新开关、非法配置拒绝、环形缓冲顺序与过滤 |
 | `resources/*` | 5 | 磁盘/内存进入与恢复回差、探针不可读不误报、降级时文件日志暂停、非法水位配置拒绝 |
-| `engine/*` | 12 | 同连接永不并发、状态机与代次、临时失败重试、坏质量整批重试、deadline 超时重试、确定性错误不重试、重试次数有限、写后回读一致/不一致/不开启、点位周期覆盖设备周期、快慢桶失败互不牵连 |
+| `engine/*` | 13 | 同连接永不并发、状态机与代次、临时失败重试、坏质量整批重试、deadline 超时重试、确定性错误不重试、重试次数有限、写后回读一致/不一致/不开启、数组写入形状校验、点位周期覆盖设备周期、快慢桶失败互不牵连 |
 | `schedule/*` | 4 | 启动相位均匀铺开、单调时间换算与到期边界、调度器实际分配相位、相位按设备内最快点位周期 |
 | `loopback/*` | 12 | 主站 ↔ 内置从站的真实链路 |
 | `serial/*` | 7 | 真实伪终端上的 RTU / ASCII、半双工、帧间静默、deadline、关闭打断读 |
 | `mqtt/*` | 17 | 测试内 broker：CONNECT/SUBSCRIBE 字段、QoS0/1、主题渲染、重连补发、命令去重与权限 |
 | `template/*` | 3 | 50 实例批量生成、参数类型/缺失/未知参数拒绝、未声明占位符拒绝 |
-| `csv/*` | 4 | 地址表达式（参考号/区域偏移/分列）、按 id 合并与冲突行号、死区模式与量程列、点位周期列 |
-| `contract/*` | 17 | 进程内真实 Kestrel 的 REST 契约（含驱动能力、模板、CSV、导入导出、单点幂等、资源降级联动、脱敏配置往返、journal 历史查询、点位有效周期） |
+| `csv/*` | 5 | 地址表达式（参考号/区域偏移/分列）、按 id 合并与冲突行号、死区模式与量程列、点位周期列、数组元素个数列 |
+| `contract/*` | 18 | 进程内真实 Kestrel 的 REST 契约（含驱动能力、模板、CSV、导入导出、单点幂等、资源降级联动、脱敏配置往返、journal 历史查询、点位有效周期、数组元素个数与值形态） |
 | `opcua/*` | 1 | 标准 OPC UA 客户端：浏览、读、写、订阅 |
 
 ## 规范用例 T1–T18 的对应关系
@@ -77,7 +77,7 @@ dotnet run --project tests/Uic.Tests -- --stop-on-fail      # 首个失败即停
 | T11 | 并发保护 | `engine/conn_is_never_called_concurrently` | 用会计数的假驱动，读写都不许重叠 |
 | T12 | 半包响应 | `loopback/fragmented_response_is_reassembled`、`codec/framing_rejects_corruption` | 响应分三片、带间隔到达 |
 | T13 | 异常码映射 | `codec/exception_codes_map_to_kinds` | 01/02/03/04/06/11 全覆盖 |
-| T14 | 金报文 | `golden/*`（16 份） | TCP / RTU / ASCII 三种封装 |
+| T14 | 金报文 | `golden/*`（20 份） | TCP / RTU / ASCII 三种封装 |
 | T15 | 半双工并发 | `serial/half_duplex_does_not_cross_responses` | 两台从站共用一条 pty：值不许串，响应未发出前总线上不许出现新请求 |
 | T16 | 沉默从站 | `loopback/silent_slave_times_out`、`serial/silent_slave_times_out` | TCP 与串口各一条，都是 300 ms 超时且不挂死 |
 | T17 | 串口 deadline | `serial/read_returns_near_deadline` | 返回时间落在 deadline 附近，既不是瞬间返回也不是 N 倍 |
@@ -133,13 +133,14 @@ posix_openpt → grantpt → unlockpt → ptsname
 | `error` | 否 | 期望抛出的错误分类：`timeout`/`connection`/`protocol`/`address`/`permission`/`unsupported` |
 | `expect[].offset` | 否 | 绝对地址偏移；缺省按前一个点位的宽度顺延 |
 | `expect[].length` | 否 | `string`/`bytes` 的寄存器数 |
+| `expect[].array` | 否 | 数组期望值；写了它就是数组点位，寄存器数按 `元素数 × 类型宽度` 推导 |
 | `expect[].quality` | 否 | 期望质量码，默认 `good` |
 
 `request` 与 `response` 是**整帧**：TCP 含 MBAP 头，RTU 含 CRC，ASCII 含 `:` 前缀与 `\r\n` 后缀。
 测试会做三件事：编码出请求字节并与 `request` 逐字节比较、解码 `response` 并与 `expect` 比较、
 再验证解码结果的类型与质量码。
 
-### 现有 16 份
+### 现有 20 份
 
 | 文件 | 覆盖 |
 |---|---|
@@ -150,12 +151,16 @@ posix_openpt → grantpt → unlockpt → ptsname
 | `read_discrete_inputs_3` | 离散输入，起始地址非 0 |
 | `read_holding_float32_abcd` | 32 位大端 |
 | `read_holding_float32_cdab` | 32 位字交换（现场最常见的非标准排布） |
+| `read_holding_float32_array` | 2 元素 `float32` 数组，4 个寄存器 |
+| `read_holding_float32_array_cdab` | 同一数组按 `cdab`：**逐元素**字交换，元素顺序不变 |
+| `read_holding_uint16_array` | 3 元素 `uint16` 数组 |
 | `read_holding_uint32` | 32 位无符号整数 |
 | `read_holding_bcd16` | BCD 编码（电表常用） |
 | `read_exception_illegal_address` | 异常响应 `0x83 0x02` → `address_error` |
 | `write_single_register` | FC06 |
 | `write_single_coil_on` | FC05，`0xFF00` |
 | `write_multiple_regs_float32` | FC16，写两个寄存器 |
+| `write_multiple_regs_uint16_array` | FC16，一次写 3 个元素的 `uint16` 数组 |
 | `write_exception_illegal_value` | 写异常 `0x86 0x03` → `protocol` |
 | `rtu_read_holding_2_regs` | RTU 封装 + CRC |
 | `ascii_read_holding_2_regs` | ASCII 封装 + LRC |

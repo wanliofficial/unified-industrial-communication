@@ -6,6 +6,10 @@ namespace Uic.Domain;
 /// <summary>
 /// 一次读写的值。数值统一放 <see cref="Num"/>（超过 2^53 的整数用 <see cref="Text"/>），
 /// 布尔与字符串各占一个字段，不做隐式混用。
+///
+/// 数组点位的值放在 <see cref="Array"/> 里，<see cref="Type"/> 仍然是**元素类型**：
+/// 这样「元素是什么类型」与「有几个元素」是两个正交维度，不需要为一个浮点数组
+/// 新造一个 <c>float32array</c> 类型名，读取方也不必维护「类型名 × 维度」的组合表。
 /// </summary>
 [JsonConverter(typeof(DataValueConverter))]
 public sealed record DataValue
@@ -15,11 +19,23 @@ public sealed record DataValue
     public bool? Bool { get; init; }
     public string? Text { get; init; }
 
+    /// <summary>数组元素；为 null 表示标量。只有固定宽度的数值元素支持数组。</summary>
+    public IReadOnlyList<double>? Array { get; init; }
+
     public static DataValue Number(DataType type, double value) => new() { Type = type, Num = value };
     public static DataValue Boolean(bool value) => new() { Type = DataType.Bool, Bool = value };
     public static DataValue String(string value) => new() { Type = DataType.String, Text = value };
     public static DataValue Bytes(ReadOnlySpan<byte> value) =>
         new() { Type = DataType.Bytes, Text = Convert.ToBase64String(value) };
+
+    /// <summary>数组值。元素类型与点位声明的 <c>dataType</c> 一致。</summary>
+    public static DataValue Numbers(DataType elementType, IReadOnlyList<double> values) =>
+        new() { Type = elementType, Array = values };
+
+    public bool IsArray => Array is not null;
+
+    /// <summary>元素个数：标量为 1，数组为元素数。</summary>
+    public int Count => Array?.Count ?? 1;
 
     /// <summary>
     /// 时间值统一存成 ISO-8601 UTC 文本（毫秒精度）。用文本而不是 double：
@@ -47,35 +63,71 @@ public sealed record DataValue
             out value);
     }
 
-    public bool IsNumeric => Num.HasValue;
+    /// <summary>
+    /// 是否可参与数值运算（缩放、死区）。数组也算：它的元素是数值，
+    /// 只是「有几个」不同——若这里判 false，数组会被当成非数值走整体相等比较，
+    /// 死区就彻底失效了。
+    /// </summary>
+    public bool IsNumeric => Array is not null || Num.HasValue;
     public double AsNumber() => Num ?? (Bool == true ? 1d : 0d);
     public bool AsBool() => Bool ?? (Num.HasValue && Math.Abs(Num.Value) > double.Epsilon);
 
     /// <summary>
+    /// 第 <paramref name="index"/> 个元素。标量只有下标 0。
+    ///
+    /// 刻意不提供 <c>AsNumbers()</c> 返回集合：采集热路径上每个样本都做一次
+    /// 「标量 → 单元素列表」的分配毫无意义，调用方按「Count + NumberAt」遍历即可。
+    /// </summary>
+    public double NumberAt(int index) => Array is null ? AsNumber() : Array[index];
+
+    /// <summary>
     /// 写后回读的比较口径。浮点按相对误差而不是精确相等：写 1500.0 读回 1499.9999
     /// 不应判为失败；类型不同则一律不等，避免把 uint16 的 1 当成 bool true。
+    /// 数组逐元素比较，元素个数不同直接不等——少写一个寄存器不该算「写成功」。
     /// </summary>
     public bool Matches(DataValue other, double tolerance = 1e-6)
     {
         if (Type != other.Type) return false;
+
+        if (Array is not null || other.Array is not null)
+        {
+            if (Array is null || other.Array is null) return false;
+            if (Array.Count != other.Array.Count) return false;
+
+            for (var i = 0; i < Array.Count; i++)
+            {
+                if (!SameNumber(Array[i], other.Array[i], tolerance)) return false;
+            }
+
+            return true;
+        }
+
         if (Bool.HasValue || other.Bool.HasValue) return Bool == other.Bool;
 
         if (Num.HasValue && other.Num.HasValue)
-        {
-            var scale = Math.Max(1, Math.Max(Math.Abs(Num.Value), Math.Abs(other.Num.Value)));
-            return Math.Abs(Num.Value - other.Num.Value) <= tolerance * scale;
-        }
+            return SameNumber(Num.Value, other.Num.Value, tolerance);
 
         return string.Equals(Text, other.Text, StringComparison.Ordinal);
     }
 
-
-    public override string ToString() => Type switch
+    private static bool SameNumber(double a, double b, double tolerance)
     {
-        DataType.Bool => Bool?.ToString() ?? "null",
-        DataType.String or DataType.Bytes or DataType.DateTime => Text ?? "null",
-        _ => Num?.ToString("R", System.Globalization.CultureInfo.InvariantCulture) ?? "null",
-    };
+        // NaN 只能等于自身，否则「坏值」会被死区当成「没变化」永远不上报。
+        if (double.IsNaN(a) || double.IsNaN(b)) return double.IsNaN(a) && double.IsNaN(b);
+
+        var scale = Math.Max(1, Math.Max(Math.Abs(a), Math.Abs(b)));
+        return Math.Abs(a - b) <= tolerance * scale;
+    }
+
+    public override string ToString() => Array is null
+        ? Type switch
+        {
+            DataType.Bool => Bool?.ToString() ?? "null",
+            DataType.String or DataType.Bytes or DataType.DateTime => Text ?? "null",
+            _ => Num?.ToString("R", System.Globalization.CultureInfo.InvariantCulture) ?? "null",
+        }
+        : "[" + string.Join(",", Array.Select(v =>
+            v.ToString("R", System.Globalization.CultureInfo.InvariantCulture))) + "]";
 }
 
 /// <summary>
@@ -93,6 +145,24 @@ public sealed class DataValueConverter : JsonConverter<DataValue>
         if (root.TryGetProperty("type", out var t) && t.ValueKind == JsonValueKind.String)
         {
             type = JsonEnum.ParseDataType(t.GetString()!);
+        }
+
+        if (root.TryGetProperty("array", out var arr) && arr.ValueKind == JsonValueKind.Array)
+        {
+            var values = new List<double>(arr.GetArrayLength());
+            foreach (var item in arr.EnumerateArray())
+            {
+                if (item.ValueKind != JsonValueKind.Number)
+                {
+                    // 数组里混进 null 或字符串说明生产方有 bug；宁可整体不解析，
+                    // 也不要悄悄少一个元素——元素个数是数组语义的一部分。
+                    throw new JsonException("array element must be a number");
+                }
+
+                values.Add(item.GetDouble());
+            }
+
+            return DataValue.Numbers(type, values);
         }
 
         if (root.TryGetProperty("bool", out var b) && b.ValueKind is JsonValueKind.True or JsonValueKind.False)
@@ -126,9 +196,21 @@ public sealed class DataValueConverter : JsonConverter<DataValue>
     {
         writer.WriteStartObject();
         writer.WriteString("type", JsonEnum.ToWire(value.Type));
-        if (value.Num.HasValue) writer.WriteNumber("num", value.Num.Value);
-        if (value.Bool.HasValue) writer.WriteBoolean("bool", value.Bool.Value);
-        if (value.Text is not null) writer.WriteString("text", value.Text);
+
+        // 数组只写 array，不写 num：两个字段同时出现会让消费方要决定「以谁为准」。
+        if (value.Array is { } array)
+        {
+            writer.WriteStartArray("array");
+            foreach (var item in array) writer.WriteNumberValue(item);
+            writer.WriteEndArray();
+        }
+        else
+        {
+            if (value.Num.HasValue) writer.WriteNumber("num", value.Num.Value);
+            if (value.Bool.HasValue) writer.WriteBoolean("bool", value.Bool.Value);
+            if (value.Text is not null) writer.WriteString("text", value.Text);
+        }
+
         writer.WriteEndObject();
     }
 }

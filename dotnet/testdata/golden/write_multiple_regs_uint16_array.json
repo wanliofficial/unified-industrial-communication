@@ -1,0 +1,10 @@
+{
+  "name": "write_multiple_regs_uint16_array",
+  "kind": "write",
+  "area": "holding",
+  "request": "0005 0000 000D 01 10 0010 0003 06 000A 000B 000C",
+  "response": "0005 0000 0006 01 10 0010 0003",
+  "expect": [
+    { "point": "batch", "type": "uint16", "array": [10, 11, 12] }
+  ]
+}

@@ -168,24 +168,45 @@ internal sealed class VirtualConn : IConn
 
     private DataValue Sample(PointRef p, double t)
     {
-        var phase = p.Address.Offset * 0.1;
+        if (!p.IsArray)
+        {
+            var single = Wave(p, t, 0);
+            return p.DataType switch
+            {
+                DataType.Bool => DataValue.Boolean(single > _baseline),
+                DataType.String => DataValue.String($"dev-{_device.Id}-{p.Id}"),
+                // 时间型点位给当前时刻：让北向消费者能直接看到「最近一次采集时间」这类值。
+                DataType.DateTime => DataValue.DateTime(DateTimeOffset.UtcNow),
+                DataType.Float32 or DataType.Float64 => DataValue.Number(p.DataType, single),
+                _ => DataValue.Number(p.DataType, Math.Round(single)),
+            };
+        }
 
-        var raw = _mode switch
+        var values = new double[p.Elements];
+        for (var i = 0; i < values.Length; i++)
+        {
+            values[i] = p.DataType is DataType.Float32 or DataType.Float64
+                ? Wave(p, t, i)
+                : Math.Round(Wave(p, t, i));
+        }
+
+        return DataValue.Numbers(p.DataType, values);
+    }
+
+    /// <summary>
+    /// 第 <paramref name="index"/> 个元素的波形值。数组的每个元素多走 1/10 个周期的相位差：
+    /// 全部元素完全同步的话，看不出「数组被展开渲染」还是「只取了第一个元素」。
+    /// </summary>
+    private double Wave(PointRef p, double t, int index)
+    {
+        var phase = p.Address.Offset * 0.1 + index * 0.1;
+
+        return _mode switch
         {
             Waveform.Sine => _baseline + _amplitude * Math.Sin(2 * Math.PI * t / _period + phase),
             Waveform.Ramp => _baseline + _amplitude * (((t / _period) + phase) % 1.0),
             Waveform.Random => _baseline + _amplitude * Random.Shared.NextDouble(),
             _ => _baseline,
-        };
-
-        return p.DataType switch
-        {
-            DataType.Bool => DataValue.Boolean(raw > _baseline),
-            DataType.Float32 or DataType.Float64 => DataValue.Number(p.DataType, raw),
-            DataType.String => DataValue.String($"dev-{_device.Id}-{p.Id}"),
-            // 时间型点位给当前时刻：让北向消费者能直接看到「最近一次采集时间」这类值。
-            DataType.DateTime => DataValue.DateTime(DateTimeOffset.UtcNow),
-            _ => DataValue.Number(p.DataType, Math.Round(raw)),
         };
     }
 

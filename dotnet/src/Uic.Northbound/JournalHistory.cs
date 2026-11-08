@@ -558,7 +558,7 @@ public sealed class JournalHistory
             error);
     }
 
-    /// <summary>值对象只有 type/num/bool/text 四个有效字段，手写解析比 JsonDocument 少一次分配。</summary>
+    /// <summary>值对象只有 type/num/bool/text/array 五个有效字段，手写解析比 JsonDocument 少一次分配。</summary>
     private static DataValue ParseValue(ReadOnlySpan<byte> utf8)
     {
         var reader = new Utf8JsonReader(utf8, isFinalBlock: true, state: default);
@@ -569,6 +569,7 @@ public sealed class JournalHistory
         double? num = null;
         bool? boolean = null;
         string? text = null;
+        List<double>? array = null;
 
         while (reader.Read())
         {
@@ -585,11 +586,22 @@ public sealed class JournalHistory
                 boolean = reader.GetBoolean();
             else if (name.SequenceEqual("text"u8))
                 text = reader.GetString();
+            else if (name.SequenceEqual("array"u8) && reader.TokenType == JsonTokenType.StartArray)
+            {
+                // 历史里的数组值必须能读回来：否则「查得到但值是空的」，
+                // 比查不到更难排查。
+                array = new List<double>();
+                while (reader.Read() && reader.TokenType != JsonTokenType.EndArray)
+                {
+                    if (reader.TokenType == JsonTokenType.Number) array.Add(reader.GetDouble());
+                    else reader.Skip();
+                }
+            }
             else
                 reader.Skip();
         }
 
-        return new DataValue { Type = type, Num = num, Bool = boolean, Text = text };
+        return new DataValue { Type = type, Num = num, Bool = boolean, Text = text, Array = array };
     }
 
     /// <summary>

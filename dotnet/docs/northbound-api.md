@@ -191,13 +191,37 @@
   "rangeMin": 0,
   "rangeMax": 100,
   "interval": "500ms",
-  "effectiveInterval": "500ms"
+  "effectiveInterval": "500ms",
+  "count": 0
 }
 ```
 
 `deadband` / `deadbandMode` / `rangeMin` / `rangeMax` 原样来自点位配置：上位机既能显示量程，
 也能用同一套规则自行过滤，不必猜网关用的阈值。取值范围见
 [configuration.md](configuration.md#死区)。
+
+`count` 是数组点位的元素个数，`0` 表示标量。它与 `value` 里的 `type` 正交：
+`type` 说明「元素是什么类型」，`count` 说明「有几个元素」。
+标量点位的 `value` 形态完全不变（`{"type":"uint16","num":2201}`），
+数组点位的值放在 `array` 里：
+
+```json
+{
+  "device": "line-a",
+  "point": "profile",
+  "value": { "type": "float32", "array": [1.5, -2.25, 0.125, 8.75] },
+  "quality": "good",
+  "count": 4,
+  "collectedAt": "2026-11-05T09:14:02.113Z",
+  "seq": 813,
+  "writable": true
+}
+```
+
+数组值只写 `array`，不写 `num`：两个值字段同时出现会让消费方要自己决定「以谁为准」，
+两侧实现一旦不同就是静默错值。数组元素个数由数组长度表达，
+`count` 与 `array` 长度在正常采集下始终一致；写入请按 `count` 给足元素
+（见 [configuration.md](configuration.md#数组点位)）。
 
 `interval` 是点位自己的周期；继承设备周期时该字段**省略**（不返回 `null`）。
 `effectiveInterval` 是解析后的实际周期，始终存在。上位机用它决定「多久没更新算过期」，
@@ -211,6 +235,12 @@
 
 ```json
 { "value": { "type": "float64", "num": 77.5 }, "confirm": true }
+```
+
+数组点位按 `count` 给足元素，元素个数不符直接拒绝而不是静默补齐：
+
+```json
+{ "value": { "type": "float32", "array": [1.5, -2.25, 0.125, 8.75] }, "confirm": true }
 ```
 
 批量写法（`{device}/write`）：

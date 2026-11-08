@@ -43,36 +43,84 @@ public static class ValueCodec
     }
 
     public static DataValue Decode(ReadOnlySpan<byte> raw, DataType type, ByteOrder order)
-    {
-        var buf = raw.ToArray();
-        Normalize(buf, order);
+        => Decode(raw, type, order, 1);
 
-        return type switch
+    /// <summary>
+    /// 解码。<paramref name="count"/> &gt; 1 时把字节按元素宽度切成定长数组。
+    ///
+    /// 每个元素单独套一次 <see cref="Normalize"/>：现场设备对「一组 float32」通常
+    /// 是逐元素交换字内字节，而不是把整段字节整体反转——后者会把相邻元素搅在一起，
+    /// 得到的数值仍然「像正常读数」，比直接报错更难发现。
+    /// </summary>
+    public static DataValue Decode(ReadOnlySpan<byte> raw, DataType type, ByteOrder order, int count)
+    {
+        var elements = Math.Max(1, count);
+
+        if (elements == 1)
         {
-            DataType.Bool => DataValue.Boolean(buf.Any(b => b != 0)),
-            DataType.Int16 => DataValue.Number(type, BinaryPrimitives.ReadInt16BigEndian(buf)),
-            DataType.UInt16 => DataValue.Number(type, BinaryPrimitives.ReadUInt16BigEndian(buf)),
-            DataType.Int32 => DataValue.Number(type, BinaryPrimitives.ReadInt32BigEndian(buf)),
-            DataType.UInt32 => DataValue.Number(type, BinaryPrimitives.ReadUInt32BigEndian(buf)),
-            DataType.Int64 => DataValue.Number(type, BinaryPrimitives.ReadInt64BigEndian(buf)),
-            DataType.UInt64 => DataValue.Number(type, BinaryPrimitives.ReadUInt64BigEndian(buf)),
-            DataType.Float32 => DataValue.Number(type, BinaryPrimitives.ReadSingleBigEndian(buf)),
-            DataType.Float64 => DataValue.Number(type, BinaryPrimitives.ReadDoubleBigEndian(buf)),
-            DataType.Bcd16 => DataValue.Number(type, DecodeBcd(buf.AsSpan(0, 2))),
-            DataType.Bcd32 => DataValue.Number(type, DecodeBcd(buf.AsSpan(0, 4))),
-            DataType.String => DataValue.String(
-                System.Text.Encoding.ASCII.GetString(buf).TrimEnd('\0', ' ')),
-            DataType.Bytes => DataValue.Bytes(buf),
-            // 现场常见的「时间寄存器」是 4 个寄存器里的 int64 Unix 毫秒（UTC）。
-            DataType.DateTime => DataValue.DateTime(
-                DateTimeOffset.FromUnixTimeMilliseconds(BinaryPrimitives.ReadInt64BigEndian(buf))),
-            _ => throw new NotSupportedException($"type {type} is not decodable"),
-        };
+            var single = raw.ToArray();
+            Normalize(single, order);
+            return DecodeElement(single, type);
+        }
+
+        if (!type.SupportsArray())
+            throw new NotSupportedException($"type {type} cannot be decoded as an array");
+
+        var unitBytes = ElementBytes(type);
+        if (raw.Length < unitBytes * elements)
+            throw new FormatException(
+                $"array needs {unitBytes * elements} bytes, got {raw.Length}");
+
+        var values = new double[elements];
+        for (var i = 0; i < elements; i++)
+        {
+            var slice = raw.Slice(i * unitBytes, unitBytes).ToArray();
+            Normalize(slice, order);
+            values[i] = DecodeElement(slice, type).AsNumber();
+        }
+
+        return DataValue.Numbers(type, values);
     }
 
-    /// <summary>把值编码成 <paramref name="registers"/> 个寄存器（偶数长度）的线上字节。</summary>
+    /// <summary>单个元素的线上字节宽度。</summary>
+    private static int ElementBytes(DataType type) => type switch
+    {
+        DataType.Bool or DataType.Int16 or DataType.UInt16 or DataType.Bcd16 => 2,
+        DataType.Int32 or DataType.UInt32 or DataType.Float32 or DataType.Bcd32 => 4,
+        DataType.Int64 or DataType.UInt64 or DataType.Float64 or DataType.DateTime => 8,
+        _ => throw new NotSupportedException($"type {type} has no fixed element width"),
+    };
+
+    private static DataValue DecodeElement(byte[] buf, DataType type) => type switch
+    {
+        DataType.Bool => DataValue.Boolean(buf.Any(b => b != 0)),
+        DataType.Int16 => DataValue.Number(type, BinaryPrimitives.ReadInt16BigEndian(buf)),
+        DataType.UInt16 => DataValue.Number(type, BinaryPrimitives.ReadUInt16BigEndian(buf)),
+        DataType.Int32 => DataValue.Number(type, BinaryPrimitives.ReadInt32BigEndian(buf)),
+        DataType.UInt32 => DataValue.Number(type, BinaryPrimitives.ReadUInt32BigEndian(buf)),
+        DataType.Int64 => DataValue.Number(type, BinaryPrimitives.ReadInt64BigEndian(buf)),
+        DataType.UInt64 => DataValue.Number(type, BinaryPrimitives.ReadUInt64BigEndian(buf)),
+        DataType.Float32 => DataValue.Number(type, BinaryPrimitives.ReadSingleBigEndian(buf)),
+        DataType.Float64 => DataValue.Number(type, BinaryPrimitives.ReadDoubleBigEndian(buf)),
+        DataType.Bcd16 => DataValue.Number(type, DecodeBcd(buf.AsSpan(0, 2))),
+        DataType.Bcd32 => DataValue.Number(type, DecodeBcd(buf.AsSpan(0, 4))),
+        DataType.String => DataValue.String(
+            System.Text.Encoding.ASCII.GetString(buf).TrimEnd('\0', ' ')),
+        DataType.Bytes => DataValue.Bytes(buf),
+        // 现场常见的「时间寄存器」是 4 个寄存器里的 int64 Unix 毫秒（UTC）。
+        DataType.DateTime => DataValue.DateTime(
+            DateTimeOffset.FromUnixTimeMilliseconds(BinaryPrimitives.ReadInt64BigEndian(buf))),
+        _ => throw new NotSupportedException($"type {type} is not decodable"),
+    };
+
+    /// <summary>
+    /// 把值编码成 <paramref name="registers"/> 个寄存器（偶数长度）的线上字节。
+    /// 值的 <see cref="DataValue.Array"/> 非空时按数组编码，每个元素各自套一次字节序变换。
+    /// </summary>
     public static byte[] Encode(DataValue value, DataType type, ByteOrder order, int registers)
     {
+        if (value.Array is { } array) return EncodeArray(array, type, order, registers);
+
         var n = type switch
         {
             DataType.Bool => 2,
@@ -81,7 +129,42 @@ public static class ValueCodec
         };
 
         var buf = new byte[n];
+        EncodeElement(buf, value, type);
 
+        // 编码方向要逆变换：Normalize 把线上顺序转成大端，这里把大端转回线上顺序。
+        Normalize(buf, order);
+        return buf;
+    }
+
+    private static byte[] EncodeArray(
+        IReadOnlyList<double> values, DataType type, ByteOrder order, int registers)
+    {
+        if (!type.SupportsArray())
+            throw new NotSupportedException($"type {type} cannot be encoded as an array");
+
+        var unit = ElementBytes(type);
+        var n = values.Count * unit;
+
+        // 请求里的元素个数必须与点位声明的寄存器数一致。不一致就报错：
+        // 按任意一方补齐都会写出「多一个 0 或少一个值」的帧，回读时才发现。
+        if (registers > 0 && registers * 2 != n)
+            throw new FormatException(
+                $"array of {values.Count} x {type} needs {n / 2} registers, got {registers}");
+
+        var buf = new byte[n];
+        for (var i = 0; i < values.Count; i++)
+        {
+            var slice = buf.AsSpan(i * unit, unit);
+            EncodeElement(slice, DataValue.Number(type, values[i]), type);
+            Normalize(slice, order);
+        }
+
+        return buf;
+    }
+
+    /// <summary>把单个元素写进 <paramref name="buf"/>（大端，尚未套字节序变换）。</summary>
+    private static void EncodeElement(Span<byte> buf, DataValue value, DataType type)
+    {
         switch (type)
         {
             case DataType.Bool:
@@ -112,18 +195,18 @@ public static class ValueCodec
                 BinaryPrimitives.WriteDoubleBigEndian(buf, value.AsNumber());
                 break;
             case DataType.Bcd16:
-                EncodeBcd(buf.AsSpan(0, 2), (long)value.AsNumber());
+                EncodeBcd(buf[..2], (long)value.AsNumber());
                 break;
             case DataType.Bcd32:
-                EncodeBcd(buf.AsSpan(0, 4), (long)value.AsNumber());
+                EncodeBcd(buf[..4], (long)value.AsNumber());
                 break;
             case DataType.String:
                 var bytes = System.Text.Encoding.ASCII.GetBytes(value.Text ?? string.Empty);
-                Array.Copy(bytes, buf, Math.Min(bytes.Length, buf.Length));
+                bytes.AsSpan(0, Math.Min(bytes.Length, buf.Length)).CopyTo(buf);
                 break;
             case DataType.Bytes:
                 var raw = Convert.FromBase64String(value.Text ?? string.Empty);
-                Array.Copy(raw, buf, Math.Min(raw.Length, buf.Length));
+                raw.AsSpan(0, Math.Min(raw.Length, buf.Length)).CopyTo(buf);
                 break;
             case DataType.DateTime:
                 // 写不出去的时间宁可报错也不写 0：0 是 1970-01-01，
@@ -135,10 +218,6 @@ public static class ValueCodec
             default:
                 throw new NotSupportedException($"type {type} is not encodable");
         }
-
-        // 编码方向要逆变换：Normalize 把线上顺序转成大端，这里把大端转回线上顺序。
-        Normalize(buf, order);
-        return buf;
     }
 
     private static double DecodeBcd(ReadOnlySpan<byte> raw)

@@ -191,7 +191,9 @@ public sealed class PointsPage : IPage, IDisposable
         var row = Ui.Row(
             (Ui.Star(1.5), label),
             (Ui.Star(0.9), Ui.Text(point.Value.Display, 12.5, Ui.Ink, mono: true)),
-            (Ui.Star(0.8), Ui.Text(point.Value.Type, 11.5, Ui.Faint, mono: true)),
+            (Ui.Star(0.8), Ui.Text(point.Count > 1
+                ? $"{point.Value.Type} × {point.Count}"
+                : point.Value.Type, 11.5, Ui.Faint, mono: true)),
             (Ui.Star(0.7), Ui.Chip(point.Quality, UiFormat.Color(UiFormat.QualityColor(point.Quality)))),
             (Ui.Star(0.6), cadenceBox),
             (Ui.Star(0.6), Ui.Text(point.Unit ?? "—", 11.5, Ui.Faint)),
@@ -235,7 +237,7 @@ public sealed class PointsPage : IPage, IDisposable
         _editTarget.Text = $"{point.Device} / {point.Point}";
         _editTarget.Foreground = new SolidColorBrush(Ui.Ink);
         _editHint.Text = point.Writable
-            ? $"类型 {point.Value.Type}，当前值 {point.Value.Display}{(point.Unit is null ? string.Empty : " " + point.Unit)}。"
+            ? $"类型 {point.Value.Type}{(point.Count > 1 ? $" × {point.Count}（逗号分隔）" : string.Empty)}，当前值 {point.Value.Display}{(point.Unit is null ? string.Empty : " " + point.Unit)}。"
             : "该点位不可写（只读地址或未开启写入）。";
 
         _writeButton.IsEnabled = point.Writable;
@@ -255,7 +257,7 @@ public sealed class PointsPage : IPage, IDisposable
             return;
         }
 
-        if (!TryBuildValue(_selected.Value.Type, raw, out var value, out var error))
+        if (!TryBuildValue(_selected.Value.Type, raw, out var value, out var error, _selected.Count))
         {
             _editResult.Text = error;
             _editResult.Foreground = new SolidColorBrush(Ui.Bad);
@@ -310,8 +312,44 @@ public sealed class PointsPage : IPage, IDisposable
     /// <summary>
     /// 按点位类型解析输入。不写「宽松解析后截断」：现场把 300 填进 uint8 点位，
     /// 静默变成 44 比直接报错危险得多。
+    ///
+    /// 数组点位用逗号分隔（也接受空格），元素个数必须与配置一致：
+    /// 少一个元素就等于少写一个寄存器，回读时才发现会白跑一整轮。
     /// </summary>
-    private static bool TryBuildValue(string type, string raw, out DataValueDto value, out string error)
+    private static bool TryBuildValue(
+        string type, string raw, out DataValueDto value, out string error, int count = 0)
+    {
+        value = new DataValueDto(type, null, null, null);
+        error = string.Empty;
+
+        if (count <= 1) return TryBuildScalar(type, raw, out value, out error);
+
+        var tokens = raw.Split(new[] { ',', ' ', ';', '\t' }, StringSplitOptions.RemoveEmptyEntries);
+
+        if (tokens.Length != count)
+        {
+            error = $"数组点位需要 {count} 个元素，当前填了 {tokens.Length} 个（用逗号分隔）。";
+            return false;
+        }
+
+        var values = new double[count];
+        for (var i = 0; i < count; i++)
+        {
+            if (!TryBuildScalar(type, tokens[i], out var element, out var elementError))
+            {
+                error = $"第 {i + 1} 个元素：{elementError}";
+                return false;
+            }
+
+            values[i] = element.Num ?? 0;
+        }
+
+        value = new DataValueDto(type, null, null, null, values);
+        return true;
+    }
+
+    private static bool TryBuildScalar(
+        string type, string raw, out DataValueDto value, out string error)
     {
         value = new DataValueDto(type, null, null, null);
         error = string.Empty;

@@ -51,6 +51,7 @@ internal static class ContractTests
         tests.Add(new TestCase("contract/config_export_import_round_trip", ConfigExportImportRoundTrip));
         tests.Add(new TestCase("contract/config_import_migrates_legacy_shape", ConfigImportMigratesLegacy));
         tests.Add(new TestCase("contract/points_expose_effective_interval", PointsExposeEffectiveInterval));
+        tests.Add(new TestCase("contract/points_expose_array_count_and_values", PointsExposeArrayCount));
     }
 
     // ------------------------------------------------------------------
@@ -548,6 +549,48 @@ internal static class ContractTests
                 "an inherited interval is omitted rather than sent as null");
             t.Equal("200ms", flag.GetProperty("effectiveInterval").GetString(),
                 "the inherited cadence is the device interval");
+        });
+    }
+
+    /// <summary>
+    /// 数组点位在北向契约里要同时暴露两件事：<c>count</c>（期望维度）与
+    /// <c>value.array</c>（实际值）。只给其中一个都不够用：
+    /// 上位机要靠 count 预分配列，靠 array 渲染；空值点位（未采集到）只有 count 可依。
+    /// </summary>
+    private static Task PointsExposeArrayCount(TestContext t)
+    {
+        return RunAsync(async () =>
+        {
+            var node = JsonNode.Parse(JsonDefaults.ToJson(BuildConfig()))!.AsObject();
+            node["devices"]![0]!["points"]![0]!.AsObject()["count"] = 3;
+            var source = ConfigStore.Parse(node.ToJsonString());
+
+            await using var host = await Host.StartAsync(t, () => source);
+
+            var point = await WaitForPointAsync(host, "v1", "temp", t);
+
+            t.Equal(3, point.GetProperty("count").GetInt32(), "count is exposed on the wire");
+
+            var array = point.GetProperty("value").GetProperty("array");
+            t.Equal(3, array.GetArrayLength(), "the value carries one number per element");
+
+            // 断言的波形各元素相同，所以这里应全部等于 baseline=42。
+            for (var i = 0; i < array.GetArrayLength(); i++)
+            {
+                t.Close(42, array[i].GetDouble(), 1e-9, $"element {i}");
+            }
+
+            t.Ok(!point.GetProperty("value").TryGetProperty("num", out _),
+                "an array value does not also carry num");
+
+            // 标量点位的线上形态不受影响：不出现 count/array 的额外字段。
+            using var scalar = await ReadJsonAsync(
+                t, await host.Client.SendAsync(Get("/api/v1/points/v1/flag"), t.Ct));
+
+            t.Equal(0, scalar.RootElement.GetProperty("count").GetInt32(),
+                "a scalar point reports count 0");
+            t.Ok(!scalar.RootElement.GetProperty("value").TryGetProperty("array", out _),
+                "a scalar value carries no array field");
         });
     }
 

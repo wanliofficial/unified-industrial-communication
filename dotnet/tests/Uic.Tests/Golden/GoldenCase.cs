@@ -47,6 +47,12 @@ internal sealed class GoldenExpect
     public bool? Bool { get; init; }
     public string? Text { get; init; }
 
+    /// <summary>
+    /// 数组期望值。写了这个字段就表示该点位是数组：<see cref="Count"/> 由长度推导，
+    /// 不必在夹具里再填一遍（填两处迟早不一致）。
+    /// </summary>
+    public double[]? Array { get; init; }
+
     /// <summary>占用寄存器数；仅 string / bytes 这类无固定宽度的类型需要。</summary>
     public int? Length { get; init; }
 

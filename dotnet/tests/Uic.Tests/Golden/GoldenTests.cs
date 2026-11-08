@@ -69,7 +69,10 @@ internal static class GoldenTests
         {
             var type = JsonEnum.ParseDataType(e.Type);
             var at = e.Offset ?? cursor;
-            var length = isBits ? 1 : Math.Max(1, e.Length ?? type.Registers());
+            var elements = e.Array?.Length ?? 0;
+            var length = isBits
+                ? 1
+                : Math.Max(1, e.Length ?? type.Registers() * Math.Max(1, elements));
 
             if (isBits) t.Equal(DataType.Bool, type, $"{e.Point}: bit areas only carry bool values");
 
@@ -78,7 +81,8 @@ internal static class GoldenTests
                 Address.Register(area, at, isBits ? 0 : length),
                 type,
                 order,
-                length));
+                length,
+                elements));
 
             cursor = at + (isBits ? 1 : length);
         }
@@ -125,10 +129,13 @@ internal static class GoldenTests
         var e = g.Expect[0];
         var type = JsonEnum.ParseDataType(e.Type);
         var isBitWrite = requestPdu[0] is ModbusConstants.FcWriteSingleCoil or ModbusConstants.FcWriteMultipleCoils;
+        var elements = e.Array?.Length ?? 0;
 
         var area = g.Area ?? (isBitWrite ? "coil" : "holding");
         var offset = BinaryPrimitives.ReadUInt16BigEndian(requestPdu.AsSpan(1));
-        var length = isBitWrite ? 1 : Math.Max(1, e.Length ?? type.Registers());
+        var length = isBitWrite
+            ? 1
+            : Math.Max(1, e.Length ?? type.Registers() * Math.Max(1, elements));
 
         if (isBitWrite) t.Equal(DataType.Bool, type, "coil writes require a bool point");
 
@@ -137,7 +144,8 @@ internal static class GoldenTests
             Address.Register(area, offset, isBitWrite ? 0 : length),
             type,
             order,
-            length);
+            length,
+            elements);
 
         var command = new WriteCommand(point, ToDataValue(e, type));
 
@@ -261,6 +269,7 @@ internal static class GoldenTests
     {
         DataType.Bool => DataValue.Boolean(e.Bool ?? false),
         DataType.String or DataType.Bytes => DataValue.String(e.Text ?? string.Empty),
+        _ when e.Array is { Length: > 0 } items => DataValue.Numbers(type, items),
         _ => DataValue.Number(type, e.Num ?? 0),
     };
 
@@ -281,6 +290,22 @@ internal static class GoldenTests
 
         var type = JsonEnum.ParseDataType(e.Type);
         t.Equal(type, sample.Value!.Type, $"{e.Point}: value type");
+
+        if (e.Array is { Length: > 0 } expectedArray)
+        {
+            var actual = sample.Value.Array;
+            t.Ok(actual is not null, $"{e.Point}: value is an array");
+            t.Equal(expectedArray.Length, actual!.Count, $"{e.Point}: element count");
+
+            for (var i = 0; i < expectedArray.Length && i < actual.Count; i++)
+            {
+                t.Close(expectedArray[i], actual[i], 1e-6, $"{e.Point}[{i}]: element value");
+            }
+
+            return;
+        }
+
+        t.Ok(!sample.Value.IsArray, $"{e.Point}: scalar expectation, array value");
 
         switch (type)
         {

@@ -1,0 +1,9 @@
+{
+  "name": "read_holding_float32_array_cdab",
+  "byteOrder": "cdab",
+  "request": "0007 0000 0006 01 03 0010 0004",
+  "response": "0007 0000 000B 01 03 08 0000 3FC0 0000 C010",
+  "expect": [
+    { "point": "profile", "type": "float32", "array": [1.5, -2.25] }
+  ]
+}

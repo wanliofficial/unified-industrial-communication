@@ -27,6 +27,7 @@ internal static class EngineTests
         tests.Add(new TestCase("engine/write_confirmation_reads_back", WriteConfirmationReadsBack));
         tests.Add(new TestCase("engine/write_confirmation_detects_mismatch", WriteConfirmationDetectsMismatch));
         tests.Add(new TestCase("engine/write_without_confirmation_skips_readback", WriteWithoutConfirmationSkipsReadback));
+        tests.Add(new TestCase("engine/array_write_shape_is_validated_before_the_device", ArrayWriteShapeIsValidated));
         tests.Add(new TestCase("engine/point_interval_overrides_device_period", PointIntervalOverridesDevicePeriod));
         tests.Add(new TestCase("engine/point_interval_failure_is_scoped_to_due_bucket", PointIntervalFailureIsScoped));
     }
@@ -179,6 +180,108 @@ internal static class EngineTests
             t.Ok(results[0].Ok, "the write succeeds");
             t.Equal(null, results[0].Verified, "without confirm there is no verification verdict");
             t.Equal(0, driver.Reads, "the driver is not read back");
+
+            await actor.DisposeAsync();
+        });
+    }
+
+    /// <summary>
+    /// 数组写入的形状校验必须发生在建链之前。
+    ///
+    /// 现场最容易出的事故是「少填一个元素」：如果放任它下到驱动，Modbus 会写偏半段
+    /// 寄存器，而回读只比较前几个元素，接口仍然报「写成功」。这类错误必须在引擎层
+    /// 一次拦掉，不能寄希望于每个驱动各自「顺手」检查。
+    /// </summary>
+    private static Task ArrayWriteShapeIsValidated(TestContext t)
+    {
+        return RunAsync(async () =>
+        {
+            var driver = new ConfirmDriver();
+            var device = new Device
+            {
+                Id = "dev-1",
+                ChannelId = "ch-1",
+                Interval = TimeSpan.FromMilliseconds(10),
+                Points = new List<Point>
+                {
+                    new()
+                    {
+                        Id = "batch",
+                        Address = Address.Register("holding", 0, 3),
+                        DataType = DataType.UInt16,
+                        Count = 3,
+                    },
+                },
+            };
+
+            var actor = new DeviceActor(
+                device, BuildChannel(), driver, new PointCache(), new ChannelGate(1),
+                NullLogger.Instance, new SchedulerOptions { Tick = TimeSpan.FromMilliseconds(5) });
+
+            var point = actor.Spans[0].Points[0];
+            t.Equal(3, point.Elements, "the point exposes its element count to the driver layer");
+
+            var results = await actor.WriteAsync(
+                new[]
+                {
+                    new WriteCommand(point, DataValue.Numbers(DataType.UInt16, new double[] { 1, 2 })),
+                },
+                t.Ct);
+
+            t.Equal(1, results.Count, "the rejected write still gets a result");
+            t.Ok(!results[0].Ok, "a short array is rejected");
+            t.Contains(results[0].Error ?? string.Empty, "needs 3 elements",
+                "the error states the expected element count");
+            t.Equal(0, driver.Writes, "the driver is never asked to write a malformed value");
+
+            // 标量点位收到数组同样拒绝：允许「单元素数组」会让线上出现两种等价写法。
+            var scalar = await actor.WriteAsync(
+                new[]
+                {
+                    new WriteCommand(point, DataValue.Number(DataType.UInt16, 1)),
+                },
+                t.Ct);
+
+            t.Ok(!scalar[0].Ok, "an array point rejects a scalar value");
+            t.Contains(scalar[0].Error ?? string.Empty, "value.shape", "the error names the shape problem");
+
+            // 形状正确时必须放行，且结果按请求顺序对齐。
+            var ok = await actor.WriteAsync(
+                new[]
+                {
+                    new WriteCommand(point, DataValue.Numbers(DataType.UInt16, new double[] { 1, 2, 3 })),
+                },
+                t.Ct);
+
+            t.Ok(ok[0].Ok, "a well-formed array is written");
+            t.Equal(1, driver.Writes, "only the well-formed write reached the driver");
+
+            // 混合批量：被拒项留在原位，后面的成功项不整体前移。
+            var mixed = await actor.WriteAsync(
+                new[]
+                {
+                    new WriteCommand(point, DataValue.Numbers(DataType.UInt16, new double[] { 1, 2 })),
+                    new WriteCommand(point, DataValue.Numbers(DataType.UInt16, new double[] { 4, 5, 6 })),
+                },
+                t.Ct);
+
+            t.Equal(2, mixed.Count, "one result per command");
+            t.Ok(!mixed[0].Ok, "the first (short) command is rejected");
+            t.Ok(mixed[1].Ok, "the second (valid) command succeeds");
+            t.Equal("batch", mixed[1].PointId, "results keep the request order");
+
+            // 同一点位在一次批量里出现两次是合法的（以最后一次写入为准）。
+            // 合并结果时必须仍返回两条，而不是因为 id 重复整批失败。
+            var duplicate = await actor.WriteAsync(
+                new[]
+                {
+                    new WriteCommand(point, DataValue.Numbers(DataType.UInt16, new double[] { 7, 8, 9 })),
+                    new WriteCommand(point, DataValue.Numbers(DataType.UInt16, new double[] { 4, 5, 6 })),
+                },
+                t.Ct);
+
+            t.Equal(2, duplicate.Count, "a repeated point still yields one result per command");
+            t.Ok(duplicate.All(r => r.Ok), "both writes to the same point succeed");
 
             await actor.DisposeAsync();
         });

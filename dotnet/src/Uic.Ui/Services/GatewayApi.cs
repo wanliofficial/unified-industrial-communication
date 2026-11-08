@@ -348,21 +348,41 @@ public sealed record PointDto(string Device, string Point, string? Name, DataVal
     // 点位周期：Interval 只在覆盖设备周期时出现；EffectiveInterval 始终有值，
     // 操作员据此判断「这个点位多久没更新算过期」，不必去翻设备配置。
     [property: JsonConverter(typeof(DurationConverter))] TimeSpan? Interval = null,
-    [property: JsonConverter(typeof(DurationConverter))] TimeSpan EffectiveInterval = default);
+    [property: JsonConverter(typeof(DurationConverter))] TimeSpan EffectiveInterval = default,
+    // 数组点位元素个数；0 表示标量。
+    int Count = 0);
 
-public sealed record DataValueDto(string Type, double? Num, bool? Bool, string? Text)
+public sealed record DataValueDto(string Type, double? Num, bool? Bool, string? Text,
+    double[]? Array = null)
 {
     [JsonIgnore]
-    public string Display => Type switch
+    public bool IsArray => Array is { Length: > 0 };
+
+    [JsonIgnore]
+    public string Display
     {
-        "bool" => Bool == true ? "true" : Bool == false ? "false" : "—",
-        "string" or "bytes" or "datetime" => Text ?? "—",
-        _ => Num is { } n
-            ? Math.Abs(n - Math.Round(n)) < 1e-9
-                ? n.ToString("0", System.Globalization.CultureInfo.InvariantCulture)
-                : n.ToString("0.###", System.Globalization.CultureInfo.InvariantCulture)
-            : "—",
-    };
+        get
+        {
+            // 数组在控制台里横向展开，不折叠成「Array」：操作员要一眼看到每个元素，
+            // 而不是先点开再确认「哪一位跳了」。
+            if (Array is { Length: > 0 } items)
+            {
+                return "[" + string.Join(", ", items.Select(Format)) + "]";
+            }
+
+            return Type switch
+            {
+                "bool" => Bool == true ? "true" : Bool == false ? "false" : "—",
+                "string" or "bytes" or "datetime" => Text ?? "—",
+                _ => Num is { } n ? Format(n) : "—",
+            };
+        }
+    }
+
+    private static string Format(double n)
+        => Math.Abs(n - Math.Round(n)) < 1e-9
+            ? n.ToString("0", System.Globalization.CultureInfo.InvariantCulture)
+            : n.ToString("0.###", System.Globalization.CultureInfo.InvariantCulture);
 }
 
 public sealed record WriteResponseDto(WriteResultDto[] Results);

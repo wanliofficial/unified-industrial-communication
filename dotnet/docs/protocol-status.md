@@ -66,6 +66,7 @@
 | 异常码 | 01/02/03/04 映射到质量码与错误文本，不把异常响应当成功 |
 | 字节序 | ABCD / CDAB / BADC / DCBA，点位级可覆盖设备级 |
 | 数据类型 | bool、有/无符号 16/32/64、float32/64、string、BCD16/32、bytes、datetime（4 寄存器 int64 Unix 毫秒 UTC） |
+| 数组 | 定宽数值类型可配 `count`（元素个数）成定长数组；逐元素套字节序与缩放，单点位上限 125 寄存器 |
 | TCP | MBAP + 事务号校验；事务号不匹配直接丢弃（防止把上一次超时的迟到响应当成新结果） |
 | RTU | CRC16；帧边界按功能码/字节数推导；发送前清空输入缓冲；3.5 字符帧间静默；同一串口半双工串行 |
 | ASCII | `:` 起始、LRC 校验、CRLF 结束 |
@@ -78,7 +79,7 @@
 同一根 RS-485 上多台从站交替发请求时也共享这段静默；超时后同样重新计时，
 避免迟到响应撞进下一次事务。帧边界仍由长度字段/功能码与 CRC 判定。
 
-测试证据：`golden/*`（8 份 Modbus 黄金帧）、`codec/*`、`planner/*` 八条、
+测试证据：`golden/*`（20 份 Modbus 黄金帧，含 4 份数组帧）、`codec/*`、`planner/*` 八条、
 `serial/rtu_golden_frame_over_pty`、`serial/ascii_golden_frame_over_pty`、
 `serial/half_duplex_does_not_cross_responses`、`serial/rtu_waits_between_frames`、`loopback/*`。
 

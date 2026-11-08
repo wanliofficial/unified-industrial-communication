@@ -26,6 +26,10 @@ internal static class CodecTests
         tests.Add(new TestCase("codec/decode_rejects_inconsistent_frames", DecodeRejectsInconsistentFrames));
         tests.Add(new TestCase("codec/framing_rejects_corruption", FramingRejectsCorruption));
         tests.Add(new TestCase("codec/read_limits", ReadLimits));
+        tests.Add(new TestCase("codec/array_roundtrip_per_element_byte_order", ArrayRoundtripPerElementByteOrder));
+        tests.Add(new TestCase("codec/array_encode_rejects_wrong_element_count", ArrayEncodeRejectsWrongElementCount));
+        tests.Add(new TestCase("codec/array_decode_requires_enough_bytes", ArrayDecodeRequiresEnoughBytes));
+        tests.Add(new TestCase("codec/array_rejects_non_numeric_element_types", ArrayRejectsNonNumericTypes));
     }
 
     private static Task Crc16(TestContext t)
@@ -342,6 +346,101 @@ internal static class CodecTests
         };
 
         t.Equal("01000007D0", Hex(codec.EncodeRead(bits)), "2000-bit read request");
+
+        return Task.CompletedTask;
+    }
+
+    /// <summary>
+    /// 数组编解码：每个元素单独套一次字节序变换。
+    ///
+    /// 这条用例的重点不是「能往返」，而是「元素边界不能被字节序搅乱」：
+    /// 如果实现把整段字节整体反转（DCBA 的朴素做法），两个 float 会互相交换高低字，
+    /// 解出来的值仍然「像正常读数」，比直接报错更难发现。
+    /// </summary>
+    private static Task ArrayRoundtripPerElementByteOrder(TestContext t)
+    {
+        var values = new[] { 1.5, -2.25, 0.125 };
+
+        foreach (var order in Enum.GetValues<ByteOrder>())
+        {
+            var value = DataValue.Numbers(DataType.Float32, values);
+            var raw = ValueCodec.Encode(value, DataType.Float32, order, 2 * values.Length);
+            var decoded = ValueCodec.Decode(raw, DataType.Float32, order, values.Length);
+
+            t.Ok(decoded.IsArray, $"{order}: decoded value is an array");
+            t.Equal(values.Length, decoded.Count, $"{order}: element count");
+
+            for (var i = 0; i < values.Length; i++)
+            {
+                t.Close(values[i], decoded.NumberAt(i), 1e-6, $"{order}: element {i}");
+            }
+        }
+
+        // ABCD 的线上字节必须是逐元素的大端拼接，与手工计算一致。
+        t.Equal("3FC00000C01000003E000000", Hex(ValueCodec.Encode(
+            DataValue.Numbers(DataType.Float32, values), DataType.Float32, ByteOrder.ABCD, 6)),
+            "ABCD array bytes");
+
+        // CDAB 只交换每个元素内部的两个字，元素顺序不变。
+        t.Equal("00003FC00000C01000003E00", Hex(ValueCodec.Encode(
+            DataValue.Numbers(DataType.Float32, values), DataType.Float32, ByteOrder.CDAB, 6)),
+            "CDAB array bytes are swapped per element");
+
+        // uint16 数组占 3 个寄存器，读窗口按元素个数算。
+        var words = DataValue.Numbers(DataType.UInt16, new double[] { 10, 11, 12 });
+        t.Equal("000A000B000C", Hex(ValueCodec.Encode(words, DataType.UInt16, ByteOrder.ABCD, 3)),
+            "uint16 array bytes");
+
+        return Task.CompletedTask;
+    }
+
+    private static Task ArrayEncodeRejectsWrongElementCount(TestContext t)
+    {
+        // 少一个元素就是少写一个寄存器：静默补齐会写成「3 个值 + 1 个 0」，
+        // 回读时才发现，现场很难判断是写入错了还是设备截断了。
+        t.Throws<FormatException>(
+            () => ValueCodec.Encode(
+                DataValue.Numbers(DataType.UInt16, new double[] { 1, 2 }),
+                DataType.UInt16, ByteOrder.ABCD, registers: 3),
+            "element count does not match the declared registers");
+
+        return Task.CompletedTask;
+    }
+
+    private static Task ArrayDecodeRequiresEnoughBytes(TestContext t)
+    {
+        t.Throws<FormatException>(
+            () => ValueCodec.Decode(Convert.FromHexString("000A000B"), DataType.UInt16, ByteOrder.ABCD, 3),
+            "truncated array payload");
+
+        return Task.CompletedTask;
+    }
+
+    private static Task ArrayRejectsNonNumericTypes(TestContext t)
+    {
+        // bool 按位寻址、string/bytes 靠显式长度、datetime 的线上值不是数字：
+        // 它们都没有「定宽元素」这个概念，不允许当数组。
+        foreach (var type in new[]
+                 {
+                     DataType.Bool, DataType.String, DataType.Bytes, DataType.DateTime,
+                 })
+        {
+            t.Ok(!type.SupportsArray(), $"{type} is not an array element type");
+
+            t.Throws<NotSupportedException>(
+                () => ValueCodec.Decode(new byte[16], type, ByteOrder.ABCD, 2),
+                $"{type}: array decode is rejected");
+        }
+
+        foreach (var type in new[]
+                 {
+                     DataType.Int16, DataType.UInt16, DataType.Int32, DataType.UInt32,
+                     DataType.Int64, DataType.UInt64, DataType.Float32, DataType.Float64,
+                     DataType.Bcd16, DataType.Bcd32,
+                 })
+        {
+            t.Ok(type.SupportsArray(), $"{type} supports arrays");
+        }
 
         return Task.CompletedTask;
     }

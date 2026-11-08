@@ -1,0 +1,8 @@
+{
+  "name": "read_holding_uint16_array",
+  "request": "0004 0000 0006 01 03 0010 0003",
+  "response": "0004 0000 0009 01 03 06 000A 000B 000C",
+  "expect": [
+    { "point": "batch", "type": "uint16", "array": [10, 11, 12] }
+  ]
+}

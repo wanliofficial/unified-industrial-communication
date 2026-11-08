@@ -22,7 +22,7 @@ public sealed record PointCsvResult(
 /// 而**不支持**公式或脚本——导入器只做数据搬运，不做计算。
 ///
 /// 列名大小写不敏感，接受常见别名：
-/// <c>id, name, address, area, offset, bit, length, dataType, byteOrder, unit,
+/// <c>id, name, address, area, offset, bit, length, count, dataType, byteOrder, unit,
 /// scale, bias, deadband, deadbandMode, rangeMin, rangeMax, interval, writable, enabled, byteLength</c>。
 /// </summary>
 public static class PointCsv
@@ -151,6 +151,7 @@ public static class PointCsv
             var deadband = ParseNullableDouble(Field("deadband"), line, "deadband", problems);
             var registerLength = ParseInt(Field("length") ?? Field("registerLength"), 0, line, "length", problems);
             var byteLength = ParseInt(Field("byteLength") ?? Field("bytes"), 0, line, "byteLength", problems);
+            var arrayCount = ParseInt(Field("count"), 0, line, "count", problems);
             var writable = ParseBool(Field("writable"), true, line, "writable", problems);
             var enabled = ParseBool(Field("enabled"), true, line, "enabled", problems);
 
@@ -194,6 +195,7 @@ public static class PointCsv
                 Writable = writable,
                 Enabled = enabled,
                 Length = byteLength,
+                Count = arrayCount,
             };
 
             // 与启动时的校验共用一套规则：能导入的配置必须能启动。

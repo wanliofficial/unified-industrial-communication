@@ -94,16 +94,23 @@ public sealed record PointRef(
     Address Address,
     DataType DataType,
     ByteOrder ByteOrder,
-    int Length)
+    int Length,
+    int Count = 0)
 {
     public static PointRef Of(Device device, Point point) => new(
         point.Id,
         point.Address,
         point.DataType,
         point.ByteOrder ?? device.ByteOrder,
-        point.Length > 0 ? Math.Max(1, (point.Length + 1) / 2) : point.RegisterCount());
+        point.Length > 0 ? Math.Max(1, (point.Length + 1) / 2) : point.RegisterCount(),
+        point.Count);
 
     public int ByteLength => Length * 2;
+
+    /// <summary>元素个数：0 或 1 表示标量。</summary>
+    public int Elements => Count > 1 ? Count : 1;
+
+    public bool IsArray => Count > 1;
 }
 
 /// <summary>驱动层写入命令。与 API 层的写入请求分开，避免协议细节泄漏到接口层。</summary>

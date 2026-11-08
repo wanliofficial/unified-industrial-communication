@@ -253,8 +253,20 @@ public static partial class ModelValidator
             if (p.Length > 1024) Add($"{pp}.length", "must be <= 1024");
         }
 
+        // 数组维度。上限 125 个寄存器是 Modbus 单次读的硬限制：
+        // 一个点位的数组再大也读不回来，必须拆成多个点位。
+        if (p.Count < 0) Add($"{pp}.count", "must be >= 0");
+        if (p.Count > 1)
+        {
+            if (!p.DataType.SupportsArray())
+                Add($"{pp}.count", $"type {p.DataType} cannot be an array; only numeric types support count > 1");
+
+            if (p.RegisterCount() > 125)
+                Add($"{pp}.count", $"array needs {p.RegisterCount()} registers, the limit is 125");
+        }
+
         // 寄存器长度必须与数据类型匹配，否则批量窗口会算错。
-        var expected = p.DataType.Registers();
+        var expected = p.RegisterCount();
         if (p.Address.Kind == AddressKind.Register && p.DataType is not (DataType.String or DataType.Bytes))
         {
             if (p.Address.Length > 0 && p.Address.Length < expected)

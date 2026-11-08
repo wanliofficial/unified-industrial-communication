@@ -11,7 +11,7 @@
 它们不是 §6.1「不做」清单里的项，属于真实缺口；逐协议现状、原因与补法见
 [protocol-status.md](protocol-status.md)。
 
-当前测试基线：**181 passed / 0 failed / 1 skipped**（跳过的是需要 `--opcua` 的 OPC UA 端到端用例）。
+当前测试基线：**197 passed / 0 failed / 1 skipped**（跳过的是需要 `--opcua` 的 OPC UA 端到端用例）。
 
 ## 1. 采集（FR-COL）
 
@@ -27,7 +27,7 @@
 | FR-COL-08 | 驱动能力四态声明 | 已实现 | `GET /api/v1/drivers` 暴露 `Capabilities`；控制台「驱动」页渲染八项四态徽标、设备页显示读写/订阅/浏览四项；`contract/drivers_expose_capability_states` 锁住四态线上名字 |
 | FR-COL-09 | 批量读规划（合并 / 非法跨越拒绝） | 已实现 | `planner/*` 八条：相邻合并、跨空洞不合并、按寄存器与位上限切分、按区域分离、每点恰好覆盖一次 |
 | FR-COL-10 | 每点位独立采集周期 | 已实现 | `Point.interval` 覆盖设备周期（空/0 表示继承，非 0 时 100ms..24h）；`DeviceActor` 按有效周期分桶，每轮只读到期的桶并合并成一次串行读取，快慢变量互不拖累。证据 `engine/point_interval_overrides_device_period`（1s 设备 + 100ms 点位）、`engine/point_interval_failure_is_scoped_to_due_bucket`、`csv/imports_point_interval`、`schedule/phase_follows_fastest_point`、`contract/points_expose_effective_interval`；看门狗阈值取设备内最慢周期，启动相位取最快周期，点位 DTO 暴露 `interval` 与 `effectiveInterval` |
-| FR-COL-11 | 写入（单点/多点），写后校验与超时 | 已实现 | 单点/多点、逐点裁决、超时三态（`ok`/`disabled`/`timeout`）已实现：`contract/write_returns_per_point_results`。`confirm: true` 在同一个通道租约内立即回读并比较，结果带 `verified`；不一致返回 `ok=false` + `uncertain` + `verify.mismatch`：`engine/write_confirmation_reads_back`、`engine/write_confirmation_detects_mismatch`、`engine/write_without_confirmation_skips_readback` |
+| FR-COL-11 | 写入（单点/多点），写后校验与超时 | 已实现 | 单点/多点、逐点裁决、超时三态（`ok`/`disabled`/`timeout`）已实现：`contract/write_returns_per_point_results`。`confirm: true` 在同一个通道租约内立即回读并比较，结果带 `verified`；不一致返回 `ok=false` + `uncertain` + `verify.mismatch`：`engine/write_confirmation_reads_back`、`engine/write_confirmation_detects_mismatch`、`engine/write_without_confirmation_skips_readback`。数组点位的元素个数在**建链前**校验，不符直接拒绝而不是交给驱动：`engine/array_write_shape_is_validated_before_the_device` |
 | FR-COL-12 | 订阅型协议（COV/事件/通知） | 刻意没做（C） | 路线图 Wave 2；`Capabilities.Subscribe` 已有四态占位 |
 
 ## 2. 数据模型与配置（FR-CFG）
@@ -35,7 +35,7 @@
 | 编号 | 需求 | 状态 | 证据 / 说明 |
 |---|---|---|---|
 | FR-CFG-01 | 四类寻址统一模型 | 部分实现 | `Address` 已含 register/symbol/object/file 四类字段与校验；**只有 register 有驱动实现**，其余三类是扩展点 |
-| FR-CFG-02 | 数据类型系统（≥8 类，含数组） | 部分实现 | 13 种标量类型（bool/int/uint 16/32/64/float 32/64/string/BCD16/BCD32/bytes/datetime）；datetime 固定 4 寄存器 int64 Unix 毫秒 UTC，北向用 ISO-8601 UTC 文本：`codec/datetime_is_unix_milliseconds`、`json/datavalue_wire_shape_is_stable`、`opcua/anonymous_session_read_write_subscribe`。**数组未做** |
+| FR-CFG-02 | 数据类型系统（≥8 类，含数组） | 已实现 | 13 种标量类型（bool/int/uint 16/32/64/float 32/64/string/BCD16/BCD32/bytes/datetime）；datetime 固定 4 寄存器 int64 Unix 毫秒 UTC，北向用 ISO-8601 UTC 文本：`codec/datetime_is_unix_milliseconds`、`json/datavalue_wire_shape_is_stable`、`opcua/anonymous_session_read_write_subscribe`。数组用「元素类型 + 元素个数」正交表达（`dataType` + `count`），只允许定宽数值类型，逐元素套字节序、逐元素缩放、死区取最大变化：`codec/array_roundtrip_per_element_byte_order`、`codec/array_encode_rejects_wrong_element_count`、`codec/array_rejects_non_numeric_element_types`、`json/datavalue_array_shape`、`json/config_point_count_roundtrip`、`pipeline/array_scales_element_wise`、`pipeline/deadband_array_uses_largest_change`、`config/array_count_rules`、`csv/imports_array_count`、`contract/points_expose_array_count_and_values`，另 4 份数组黄金帧 |
 | FR-CFG-03 | 字节序 ABCD/CDAB/BADC/DCBA | 已实现 | `codec/byte_order_encodes_as_expected`、`codec/byte_order_roundtrip`、`json/enums_are_lowercase_wire_names` |
 | FR-CFG-04 | 设备模板 + 参数化实例化（≥50 实例） | 已实现 | `template/instantiate_fifty_devices`（50 个实例逐个断言）、`contract/template_instantiates_and_applies_devices`、`template/rejects_bad_parameters`、`template/store_rejects_unknown_placeholder` |
 | FR-CFG-05 | 点表 CSV 导入（地址表达式 + 命名规则） | 已实现 | `csv/address_expressions`、`csv/import_merges_and_reports_conflicts`、`contract/points_csv_import_previews_and_applies`；支持 `40001` / `holding:100` / 分列三种写法 |
@@ -115,7 +115,7 @@
 | FR-SDK-03 | 驱动契约语义化版本 | 已实现 | `DriverRegistry.Register` 校验 `DriverSdk.Version`，不匹配抛出并说明原因 |
 | FR-SDK-04 | 虚拟设备（按协议实现从站） | 已实现 | `Uic.Host/Simulator.cs` 起 Modbus TCP 从站；`loopback/*` 全链路 |
 | FR-SDK-05 | 故障注入（丢包/延迟/错帧/异常码/连接重置） | 已实现 | `Uic.Driver.Virtual` 的五类故障；`loopback/probe_times_out`、`loopback/silent_slave_times_out` |
-| FR-SDK-06 | 金报文测试套件 | 已实现 | `testdata/golden/*.json` 16 份，`golden/*` 逐字节比对（TCP/RTU/ASCII） |
+| FR-SDK-06 | 金报文测试套件 | 已实现 | `testdata/golden/*.json` 20 份，`golden/*` 逐字节比对（TCP/RTU/ASCII），含 4 份数组帧（读、写、逐元素字节序） |
 | FR-SDK-07 | 一致性测试套件（连接/超时/重连/并发/取消） | 已实现 | T1–T18 全部有对应用例，映射表见 [testing.md](testing.md)；单个驱动跑完约 30 s |
 | FR-SDK-08 | 进程外驱动（gRPC） | 刻意没做（C） | Wave 3；需要先有稳定的 IPC 契约与进程生命周期管理 |
 

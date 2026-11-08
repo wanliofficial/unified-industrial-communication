@@ -207,7 +207,7 @@ public sealed class ModbusCodec
 
             try
             {
-                var v = ValueCodec.Decode(data.Slice(off, n), p.DataType, p.ByteOrder);
+                var v = ValueCodec.Decode(data.Slice(off, n), p.DataType, p.ByteOrder, p.Elements);
                 result.Add(new RawSample(p.Id, v, Quality.Good, null));
             }
             catch (Exception ex)

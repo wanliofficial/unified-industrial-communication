@@ -414,7 +414,8 @@ public static partial class RestApi
                 point.RangeMin,
                 point.RangeMax,
                 point.Interval,
-                point.EffectiveInterval(device));
+                point.EffectiveInterval(device),
+                point.Count);
         }
 
         return new PointDto(
@@ -433,7 +434,8 @@ public static partial class RestApi
             point.RangeMin,
             point.RangeMax,
             point.Interval,
-            point.EffectiveInterval(device));
+            point.EffectiveInterval(device),
+            point.Count);
     }
 
     private static int ParseInt(string? text, int fallback)
@@ -476,4 +478,7 @@ public sealed record PointDto(
     double? RangeMin,
     double? RangeMax,
     TimeSpan? Interval,
-    TimeSpan EffectiveInterval);
+    TimeSpan EffectiveInterval,
+    // 数组点位的元素个数；0 表示标量。北向消费者靠它渲染「N 个元素」，
+    // 空值点位（Value 是占位值）也能据此知道期望维度。
+    int Count = 0);

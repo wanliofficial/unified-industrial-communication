@@ -21,6 +21,8 @@ internal static class JsonTests
         tests.Add(new TestCase("json/enums_are_lowercase_wire_names", EnumsAreLowercaseWireNames));
         tests.Add(new TestCase("json/datavalue_roundtrip", DataValueRoundtrip));
         tests.Add(new TestCase("json/datavalue_wire_shape_is_stable", DataValueWireShape));
+        tests.Add(new TestCase("json/datavalue_array_shape", DataValueArrayShape));
+        tests.Add(new TestCase("json/config_point_count_roundtrip", ConfigPointCountRoundtrip));
         tests.Add(new TestCase("json/timestamps_are_utc_with_z", TimestampsAreUtcWithZ));
         tests.Add(new TestCase("json/config_roundtrip_is_lossless", ConfigRoundtripIsLossless));
         tests.Add(new TestCase("json/unknown_fields_are_tolerated", UnknownFieldsAreTolerated));
@@ -172,6 +174,89 @@ internal static class JsonTests
 
         var back = JsonSerializer.Deserialize<DateTimeOffset>(json, JsonDefaults.Options);
         t.Equal(local.UtcDateTime, back.UtcDateTime, "the instant is preserved");
+
+        return Task.CompletedTask;
+    }
+
+    /// <summary>
+    /// 数组值的线上形态：<c>{"type":"float32","array":[...]}</c>。
+    ///
+    /// 元素类型仍是 <c>type</c>，元素个数由数组长度表达——不为浮点数组新造
+    /// <c>float32array</c> 这类类型名，消费方就不必维护「类型名 × 维度」的组合表。
+    /// 同时必须只有一个值字段：<c>num</c> 与 <c>array</c> 并存会让消费方
+    /// 必须自行决定「以谁为准」，两侧实现一旦不同就会出现静默错值。
+    /// </summary>
+    private static Task DataValueArrayShape(TestContext t)
+    {
+        var value = DataValue.Numbers(DataType.Float32, new double[] { 1.5, -2.25 });
+
+        var json = JsonSerializer.Serialize(value, JsonDefaults.Options);
+        t.Equal("{\"type\":\"float32\",\"array\":[1.5,-2.25]}", json, "array shape");
+
+        var back = JsonSerializer.Deserialize<DataValue>(json, JsonDefaults.Options)!;
+        t.Equal(DataType.Float32, back.Type, "type is the element type");
+        t.Ok(back.IsArray, "the value round-trips as an array");
+        t.Equal(2, back.Count, "element count");
+        t.Close(1.5, back.NumberAt(0), 1e-9, "first element");
+        t.Close(-2.25, back.NumberAt(1), 1e-9, "second element");
+
+        // 标量的线上形态完全不变：旧消费者不需要任何改动。
+        t.Equal("{\"type\":\"float32\",\"num\":1.5}",
+            JsonSerializer.Serialize(DataValue.Number(DataType.Float32, 1.5), JsonDefaults.Options),
+            "scalars keep their original shape");
+
+        // 数组里混进 null / 字符串说明生产方有 bug，宁可整体不解析也不要少一个元素：
+        // 元素个数是数组语义的一部分，悄悄丢一个只会让后面的元素错位。
+        t.Throws<JsonException>(
+            () => JsonSerializer.Deserialize<DataValue>(
+                "{\"type\":\"float32\",\"array\":[1.5,null]}", JsonDefaults.Options),
+            "non-numeric array element is rejected");
+
+        // 数组值参与写后回读比较：元素个数不同直接不等。
+        var shorter = DataValue.Numbers(DataType.Float32, new double[] { 1.5 });
+        t.Ok(value.Matches(value), "identical arrays match");
+        t.Ok(!value.Matches(shorter), "different element counts do not match");
+
+        return Task.CompletedTask;
+    }
+
+    /// <summary>
+    /// <c>count</c> 是点位配置里的字段：0/1 表示标量，&gt;1 表示定宽数组。
+    /// 它必须能无损往返，并且推导出的寄存器窗口要按元素个数放大。
+    /// </summary>
+    private static Task ConfigPointCountRoundtrip(TestContext t)
+    {
+        var node = JsonNode.Parse(JsonDefaults.ToJson(DemoConfig.Build()))!.AsObject();
+        var point = node["devices"]![0]!["points"]![0]!.AsObject();
+        point["dataType"] = "float32";
+        point["count"] = 4;
+        // 地址窗口必须同时放大：校验会拒绝「count 说 8 个寄存器、地址只给 2 个」的配置。
+        point["address"]!["length"] = 8;
+
+        var parsed = ConfigStore.Parse(node.ToJsonString(), "count.json");
+        var round = parsed.Devices[0].Points[0];
+
+        t.Equal(4, round.Count, "count round-trips");
+        t.Ok(round.IsArray, "count > 1 marks the point as an array");
+        // float32 × 4 = 8 个寄存器：规划层按这个窗口一次读回整段数组。
+        t.Equal(8, round.RegisterCount(), "the register window scales with the element count");
+
+        // 只有定宽数值类型能成数组：string 的长度靠 length 声明，datetime 的线上值不是数字。
+        var bad = JsonNode.Parse(JsonDefaults.ToJson(DemoConfig.Build()))!.AsObject();
+        var badPoint = bad["devices"]![0]!["points"]![0]!.AsObject();
+        badPoint["dataType"] = "string";
+        badPoint["length"] = 8;
+        badPoint["count"] = 4;
+
+        try
+        {
+            ConfigStore.Parse(bad.ToJsonString(), "count-bad.json");
+            t.Fail("a string array should be rejected");
+        }
+        catch (ConfigException ex)
+        {
+            t.Contains(string.Join("; ", ex.Problems), "count", "the problem names the count field");
+        }
 
         return Task.CompletedTask;
     }

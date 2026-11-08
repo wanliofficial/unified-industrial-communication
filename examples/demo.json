@@ -101,6 +101,21 @@
           "enabled": true
         },
         {
+          "id": "profile",
+          "name": "四段温度曲线（数组）",
+          "address": {
+            "kind": "register",
+            "area": "holding",
+            "offset": 30,
+            "length": 8,
+            "bit": -1
+          },
+          "dataType": "float32",
+          "count": 4,
+          "unit": "℃",
+          "enabled": true
+        },
+        {
           "id": "alarm",
           "name": "报警字",
           "address": {

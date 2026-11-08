@@ -24,6 +24,8 @@ internal static class PipelineTests
         tests.Add(new TestCase("pipeline/deadband_compares_non_numeric_by_equality", DeadbandComparesNonNumeric));
         tests.Add(new TestCase("pipeline/deadband_percent_uses_range_span", DeadbandPercentUsesRangeSpan));
         tests.Add(new TestCase("pipeline/deadband_rate_uses_elapsed_time", DeadbandRateUsesElapsedTime));
+        tests.Add(new TestCase("pipeline/array_scales_element_wise", ArrayScalesElementWise));
+        tests.Add(new TestCase("pipeline/deadband_array_uses_largest_change", DeadbandArrayUsesLargestChange));
         tests.Add(new TestCase("cache/publish_configured_applies_point_rule", CachePublishConfiguredAppliesRule));
         tests.Add(new TestCase("cache/publish_sequence_is_monotonic", CacheSequenceIsMonotonic));
         tests.Add(new TestCase("cache/publish_notifies_only_on_change", CacheNotifiesOnlyOnChange));
@@ -48,7 +50,8 @@ internal static class PipelineTests
         string? unit = null,
         DeadbandMode deadbandMode = DeadbandMode.Absolute,
         double? rangeMin = null,
-        double? rangeMax = null) => new()
+        double? rangeMax = null,
+        int count = 0) => new()
     {
         Id = id,
         Address = Address.Register("holding", 0),
@@ -60,6 +63,7 @@ internal static class PipelineTests
         RangeMin = rangeMin,
         RangeMax = rangeMax,
         Unit = unit,
+        Count = count,
     };
 
     private static Task ScaleAndOffset(TestContext t)
@@ -226,6 +230,91 @@ internal static class PipelineTests
 
         return Task.CompletedTask;
     }
+
+    /// <summary>
+    /// 数组点位的缩放逐元素进行：每个元素各自乘 scale 再落回整数/浮点。
+    /// 如果只缩第一个元素（把数组当标量处理的典型退化），其余元素会以原始工程量出现，
+    /// 趋势图上看起来仍然「合理」，只有对着设备本地显示才能发现差了一个系数。
+    /// </summary>
+    private static Task ArrayScalesElementWise(TestContext t)
+    {
+        var integer = Point("batch", DataType.UInt16, scale: 0.5, count: 3);
+        var raw = new RawSample(integer.Id,
+            DataValue.Numbers(DataType.UInt16, new double[] { 7, 9, 11 }), Quality.Good, null);
+
+        var sample = Pipeline.Process(Device(integer), integer, raw, 1, DateTimeOffset.UtcNow);
+
+        t.Ok(sample.Value.IsArray, "the scaled value stays an array");
+        t.Equal(3, sample.Value.Count, "element count is preserved");
+        // 3.5→4、4.5→5（四舍五入远离零）、5.5→6
+        t.Close(4, sample.Value.NumberAt(0), 1e-9, "element 0 is scaled and rounded");
+        t.Close(5, sample.Value.NumberAt(1), 1e-9, "element 1 is scaled and rounded");
+        t.Close(6, sample.Value.NumberAt(2), 1e-9, "element 2 is scaled and rounded");
+
+        var floating = Point("profile", DataType.Float64, scale: 2, offset: -1, count: 2);
+        var floatRaw = new RawSample(floating.Id,
+            DataValue.Numbers(DataType.Float64, new double[] { 1.5, -0.25 }), Quality.Good, null);
+
+        var floats = Pipeline.Process(Device(floating), floating, floatRaw, 2, DateTimeOffset.UtcNow);
+
+        // 1.5*2-1 = 2；-0.25*2-1 = -1.5，浮点元素不做取整。
+        t.Close(2, floats.Value.NumberAt(0), 1e-9, "float element 0");
+        t.Close(-1.5, floats.Value.NumberAt(1), 1e-9, "float element 1 keeps its fraction");
+
+        // 无缩放时数组原样透传，不做任何逐元素拷贝以外的加工。
+        var plain = Point("plain", DataType.UInt16, count: 2);
+        var untouched = Pipeline.Process(Device(plain), plain,
+            new RawSample(plain.Id, DataValue.Numbers(DataType.UInt16, new double[] { 3, 4 }),
+                Quality.Good, null), 3, DateTimeOffset.UtcNow);
+
+        t.Close(3, untouched.Value.NumberAt(0), 1e-9, "unscaled element 0");
+        t.Close(4, untouched.Value.NumberAt(1), 1e-9, "unscaled element 1");
+
+        return Task.CompletedTask;
+    }
+
+    /// <summary>
+    /// 数组死区按「逐元素比、取最大变化」判定。
+    ///
+    /// 用最大而不是平均值是刻意的：平均值会把「一个通道跳变、其余不动」稀释成没变化，
+    /// 而那正是最该被看到的情况。这条用例同时锁住反向：所有元素都在阈值内时不上报。
+    /// </summary>
+    private static Task DeadbandArrayUsesLargestChange(TestContext t)
+    {
+        var point = Point("batch", DataType.UInt16, deadband: 1, count: 3);
+
+        var previous = SampleArray(new double[] { 10, 10, 10 }, 1);
+        var noisy = SampleArray(new double[] { 10.4, 10.4, 10.4 }, 2);
+
+        t.Ok(!Pipeline.ExceedsDeadband(previous, noisy, point),
+            "all elements inside the threshold do not report");
+
+        // 只有第三个元素跳了 1.5，平均变化只有 0.5——按平均值会被吞掉。
+        var oneJump = SampleArray(new double[] { 10, 10, 11.5 }, 3);
+        t.Ok(Pipeline.ExceedsDeadband(previous, oneJump, point),
+            "a single element crossing the threshold reports");
+
+        // 元素个数都变了说明读取窗口已经不对，必须上报而不是比较。
+        var wrongLength = SampleArray(new double[] { 10, 10 }, 4);
+        t.Ok(Pipeline.ExceedsDeadband(previous, wrongLength, point),
+            "a changed element count always reports");
+
+        // 标量与数组互相比同样视为变化：类型/维度变化本身就是事件。
+        t.Ok(Pipeline.ExceedsDeadband(previous, SampleOf(10, Quality.Good), point),
+            "scalar vs array always reports");
+
+        // 关闭死区（null）时数组按内容比较，相同内容不上报。
+        t.Ok(!Pipeline.ExceedsDeadband(previous, SampleArray(new double[] { 10, 10, 10 }, 5), deadband: null),
+            "identical arrays do not report without a deadband");
+        t.Ok(Pipeline.ExceedsDeadband(previous, noisy, deadband: null),
+            "any element change reports without a deadband");
+
+        return Task.CompletedTask;
+    }
+
+    private static Sample SampleArray(double[] values, ulong seq) => new(
+        "d", "p", DataValue.Numbers(DataType.UInt16, values), Quality.Good, null, null,
+        DateTimeOffset.UtcNow, seq);
 
     private static Task CachePublishConfiguredAppliesRule(TestContext t)
     {

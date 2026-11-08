@@ -40,6 +40,9 @@ public sealed class UicNodeManager : CustomNodeManager2
         public required DomainType Type { get; init; }
         public required Uic.Driver.PointRef Ref { get; init; }
         public required BaseDataVariableState Node { get; init; }
+
+        /// <summary>数组点位在地址空间里是 OneDimension 变量，标量是 Scalar。</summary>
+        public bool IsArray => Ref.IsArray;
     }
 
     private sealed class DeviceBinding
@@ -285,7 +288,10 @@ public sealed class UicNodeManager : CustomNodeManager2
                 DisplayName = new LocalizedText(point.Name ?? point.Id),
                 Description = point.Unit is null ? null : new LocalizedText($"unit: {point.Unit}"),
                 DataType = MapDataType(point.DataType),
-                ValueRank = ValueRanks.Scalar,
+                // 数组点位的 ValueRank 必须是 OneDimension：客户端据此把节点渲染成数组，
+                // 而不是把第一个元素当成整个值（标量节点收到数组会报 BadTypeMismatch）。
+                ValueRank = point.IsArray ? ValueRanks.OneDimension : ValueRanks.Scalar,
+                ArrayDimensions = point.IsArray ? new[] { (uint)point.Count } : null,
                 AccessLevel = (byte)(point.Writable && _allowWrite
                     ? AccessLevels.CurrentRead | AccessLevels.CurrentWrite
                     : AccessLevels.CurrentRead),
@@ -305,7 +311,7 @@ public sealed class UicNodeManager : CustomNodeManager2
             {
                 try
                 {
-                    pointNode.Value = ToClr(existing.Value, point.DataType);
+                    pointNode.Value = ToClr(existing.Value, point.DataType, point.IsArray);
                     pointNode.StatusCode = MapQuality(existing.Quality);
                     pointNode.Timestamp = (existing.DeviceTime ?? existing.CollectedAt).UtcDateTime;
                 }
@@ -412,7 +418,7 @@ public sealed class UicNodeManager : CustomNodeManager2
             {
                 try
                 {
-                    value = ToClr(sample.Value, binding.Type);
+                    value = ToClr(sample.Value, binding.Type, binding.IsArray);
                 }
                 catch (Exception ex)
                 {
@@ -423,7 +429,7 @@ public sealed class UicNodeManager : CustomNodeManager2
                 }
             }
 
-            var changed = !Equals(node.Value, value) ||
+            var changed = !ValueEquals(node.Value, value) ||
                           node.StatusCode != status ||
                           Math.Abs((node.Timestamp - timestamp).TotalMilliseconds) >= 1;
 
@@ -437,6 +443,29 @@ public sealed class UicNodeManager : CustomNodeManager2
 
             UpdateDeviceQuality(sample.DeviceId);
         }
+    }
+
+    /// <summary>
+    /// 缓存值与节点值的比较。数组不能用 <see cref="object.Equals(object?, object?)"/>：
+    /// 那比的是引用，每个新数组都不相等，会让数组点位每轮都触发一次变更通知。
+    /// </summary>
+    private static bool ValueEquals(object? a, object? b)
+    {
+        if (ReferenceEquals(a, b)) return true;
+        if (a is null || b is null) return false;
+
+        if (a is System.Array left && b is System.Array right)
+        {
+            if (left.Length != right.Length) return false;
+            for (var i = 0; i < left.Length; i++)
+            {
+                if (!Equals(left.GetValue(i), right.GetValue(i))) return false;
+            }
+
+            return true;
+        }
+
+        return Equals(a, b);
     }
 
     private void UpdateDeviceQuality(string deviceId)
@@ -536,7 +565,7 @@ public sealed class UicNodeManager : CustomNodeManager2
         DomainValue value;
         try
         {
-            value = FromClr(raw, binding.Type);
+            value = FromClr(raw, binding.Type, binding.IsArray);
         }
         catch (Exception ex)
         {
@@ -618,7 +647,31 @@ public sealed class UicNodeManager : CustomNodeManager2
         _ => StatusCodes.BadWaitingForInitialData,
     };
 
-    private static object ToClr(DomainValue value, DomainType type) => type switch
+    /// <summary>
+    /// 领域值 → OPC UA 原生值。数组点位必须给出数组：OPC UA 的数组变量不会
+    /// 替我们把标量扩成单元素数组，类型不对就直接 BadTypeMismatch。
+    /// </summary>
+    private static object ToClr(DomainValue value, DomainType type, bool isArray)
+    {
+        if (!isArray) return ToScalarClr(value, type);
+
+        var elements = value.Array ?? new[] { value.AsNumber() };
+
+        return type switch
+        {
+            DomainType.Int16 => elements.Select(v => (short)v).ToArray(),
+            DomainType.UInt16 or DomainType.Bcd16 => elements.Select(v => (ushort)v).ToArray(),
+            DomainType.Int32 => elements.Select(v => (int)v).ToArray(),
+            DomainType.UInt32 or DomainType.Bcd32 => elements.Select(v => (uint)v).ToArray(),
+            DomainType.Int64 => elements.Select(v => (long)v).ToArray(),
+            DomainType.UInt64 => elements.Select(v => (ulong)v).ToArray(),
+            DomainType.Float32 => elements.Select(v => (float)v).ToArray(),
+            DomainType.Float64 => elements.ToArray(),
+            _ => throw new InvalidCastException($"type {type} cannot be an OPC UA array"),
+        };
+    }
+
+    private static object ToScalarClr(DomainValue value, DomainType type) => type switch
     {
         DomainType.Bool => value.Bool ?? value.AsBool(),
         DomainType.Int16 => (short)value.AsNumber(),
@@ -640,8 +693,27 @@ public sealed class UicNodeManager : CustomNodeManager2
         _ => value.Text is not null ? DomainValue.String(value.Text) : DomainValue.Number(type, value.AsNumber()),
     };
 
-    private static DomainValue FromClr(object raw, DomainType type)
+    private static DomainValue FromClr(object raw, DomainType type, bool isArray)
     {
+        if (isArray)
+        {
+            if (raw is not System.Array array || array.Length == 0)
+            {
+                throw new InvalidCastException(
+                    $"expected a non-empty array, got {raw.GetType().Name}");
+            }
+
+            // 逐元素走标量路径：范围校验（Checked）与类型转换都在那儿，
+            // 数组入口不必再抄一遍，也就不会出现「标量拒绝、数组放行」的漏洞。
+            var values = new double[array.Length];
+            for (var i = 0; i < array.Length; i++)
+            {
+                values[i] = FromClr(array.GetValue(i)!, type, isArray: false).AsNumber();
+            }
+
+            return DomainValue.Numbers(type, values);
+        }
+
         if (type == DomainType.Bool)
         {
             return raw is bool b

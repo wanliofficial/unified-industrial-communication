@@ -103,4 +103,11 @@ public static class DataTypeExtensions
         DataType.Bcd16 or DataType.Bcd32 => true,
         _ => false,
     };
+
+    /// <summary>
+    /// 能否组成数组。只放行定宽数值类型：它们每个元素占同样的寄存器数，
+    /// 解码时按固定步长切分即可。string/bytes 的长度靠点位字段自行声明，
+    /// datetime 的线上值不是 double，硬塞进 <c>array</c> 会丢语义。
+    /// </summary>
+    public static bool SupportsArray(this DataType t) => t.IsNumeric();
 }

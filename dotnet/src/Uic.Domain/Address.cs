@@ -289,10 +289,23 @@ public sealed class Point
     /// <summary>string/bytes 类型的显式长度（字节）；其余类型可留 0。</summary>
     public int Length { get; init; }
 
+    /// <summary>
+    /// 数组元素个数。0 或 1 表示标量，&gt;1 表示定长数组。
+    ///
+    /// 用「元素个数」而不是「占用寄存器数」表达维度：后者随数据类型变化
+    /// （uint16 是 1 个寄存器、float64 是 4 个），写点表的人得先自己乘一遍，
+    /// 乘错就会读偏整段数据。元素个数是现场唯一不用换算就能核对的值。
+    /// </summary>
+    public int Count { get; init; }
+
+    public bool IsArray => Count > 1;
+
     /// <summary>该点位实际占用的寄存器数，规划与编解码共用。</summary>
-    public int RegisterCount() => DataType switch
+    public int RegisterCount()
     {
-        DataType.String or DataType.Bytes => Math.Max(1, (Length + 1) / 2),
-        _ => Math.Max(1, DataType.Registers()),
-    };
+        if (DataType is DataType.String or DataType.Bytes) return Math.Max(1, (Length + 1) / 2);
+
+        var elements = Count > 1 ? Count : 1;
+        return Math.Max(1, DataType.Registers() * elements);
+    }
 }

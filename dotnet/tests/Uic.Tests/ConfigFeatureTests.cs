@@ -23,7 +23,9 @@ internal static class ConfigFeatureTests
         tests.Add(new TestCase("csv/import_merges_and_reports_conflicts", ImportMergesAndReportsConflicts));
         tests.Add(new TestCase("csv/imports_deadband_mode_and_range", ImportDeadbandModeAndRange));
         tests.Add(new TestCase("csv/imports_point_interval", ImportPointInterval));
+        tests.Add(new TestCase("csv/imports_array_count", ImportArrayCount));
         tests.Add(new TestCase("config/deadband_and_range_rules", DeadbandAndRangeRules));
+        tests.Add(new TestCase("config/array_count_rules", ArrayCountRules));
         tests.Add(new TestCase("config/migration_is_explicit_and_versioned", MigrationIsExplicitAndVersioned));
         tests.Add(new TestCase("config/migrates_v0_legacy_shapes", MigratesLegacyShapes));
         tests.Add(new TestCase("config/composite_durations_parse", CompositeDurationsParse));
@@ -316,6 +318,125 @@ internal static class ConfigFeatureTests
 
     private const string TestPointAddress =
         "\"address\": { \"kind\": \"register\", \"area\": \"holding\", \"offset\": 0 }";
+
+    /// <summary>
+    /// 数组维度的配置规则。
+    ///
+    /// 三条都必须拒绝：非数值元素类型（bool 按位、string 靠 length、datetime 线上不是数字）、
+    /// 超过 125 个寄存器（Modbus 单次读的硬限制，读不回来的配置不该被接受）、
+    /// 负的元素个数（没有语义，只能是填错）。
+    /// </summary>
+    private static Task ArrayCountRules(TestContext t)
+    {
+        static string Document(string point) => """
+            {
+              "schemaVersion": 1,
+              "site": "arrays",
+              "channels": [{ "id": "ch", "protocol": "virtual", "transport": "none" }],
+              "devices": [{
+                "id": "d1", "channelId": "ch", "interval": "1s",
+                "points": [ { POINT } ]
+              }]
+            }
+            """.Replace("POINT", point);
+
+        static string PointJson(string extra) => $"\"id\": \"p\", {TestPointAddress}{extra}";
+
+        void Expect(string point, string path, string message)
+        {
+            try
+            {
+                ConfigStore.Parse(Document(point), "inline.json");
+                t.Fail($"{message}: invalid point was accepted");
+            }
+            catch (ConfigException ex)
+            {
+                t.Contains(string.Join("; ", ex.Problems), path, message);
+            }
+        }
+
+        // 标量点位的默认 count 是 0：不填不需要任何额外字段。
+        var scalar = ConfigStore.Parse(
+            Document(PointJson(", \"dataType\": \"float32\"")), "inline.json");
+        t.Equal(0, scalar.Devices[0].Points[0].Count, "count defaults to 0 (scalar)");
+
+        // 合法的 float32 × 4 数组：8 个寄存器，在读窗口上限之内。
+        var array = ConfigStore.Parse(
+            Document(PointJson(", \"dataType\": \"float32\", \"count\": 4")), "inline.json");
+        var point = array.Devices[0].Points[0];
+        t.Equal(4, point.Count, "count round-trips");
+        t.Equal(8, point.RegisterCount(), "float32 x 4 occupies 8 registers");
+
+        // uint16 数组按元素个数线性放大，与元素宽度无关地保持「一个元素一份」的语义。
+        var words = ConfigStore.Parse(
+            Document(PointJson(", \"dataType\": \"uint16\", \"count\": 3")), "inline.json");
+        t.Equal(3, words.Devices[0].Points[0].RegisterCount(), "uint16 x 3 occupies 3 registers");
+
+        // 125 是上限本身，允许；126 必须拒绝。
+        ConfigStore.Parse(
+            Document(PointJson(", \"dataType\": \"uint16\", \"count\": 125")), "inline.json");
+
+        Expect(PointJson(", \"dataType\": \"uint16\", \"count\": 126"),
+            "count", "an array beyond 125 registers is rejected");
+
+        // float32 的每个元素占 2 个寄存器，所以 63 个元素已经 126 个寄存器。
+        Expect(PointJson(", \"dataType\": \"float32\", \"count\": 63"),
+            "count", "the register limit accounts for the element width");
+
+        Expect(PointJson(", \"dataType\": \"string\", \"length\": 8, \"count\": 4"),
+            "count", "string cannot be an array");
+        Expect(PointJson(", \"dataType\": \"bool\", \"count\": 4"),
+            "count", "bool cannot be an array");
+        Expect(PointJson(", \"dataType\": \"datetime\", \"count\": 2"),
+            "count", "datetime cannot be an array");
+        Expect(PointJson(", \"dataType\": \"uint16\", \"count\": -1"),
+            "count", "a negative count is rejected");
+
+        return Task.CompletedTask;
+    }
+
+    /// <summary>
+    /// CSV 的 <c>count</c> 列：现场点表在 Excel 里，数组维度必须能跟着点表一起导入，
+    /// 否则每个数组点位都要手工改 JSON。
+    /// </summary>
+    private static Task ImportArrayCount(TestContext t)
+    {
+        var csv = """
+                  id,address,dataType,count
+                  profile,holding:0,float32,4
+                  batch,holding:8,uint16,3
+                  plain,holding:11,uint16,
+                  """;
+
+        var result = PointCsv.Import(csv, Array.Empty<Point>(), "d1");
+        t.Ok(result.Ok, $"the csv is valid: {string.Join("; ", result.Problems)}");
+
+        t.Equal(4, result.Points.Single(p => p.Id == "profile").Count, "count is parsed");
+        t.Equal(8, result.Points.Single(p => p.Id == "profile").RegisterCount(),
+            "the register window scales with the element count");
+        t.Equal(3, result.Points.Single(p => p.Id == "batch").Count, "a second array is parsed");
+        t.Equal(0, result.Points.Single(p => p.Id == "plain").Count,
+            "an empty cell means a scalar point");
+
+        // 导入器与启动校验共用一套规则：能导入的配置必须能启动。
+        var tooBig = PointCsv.Import("""
+                                     id,address,dataType,count
+                                     huge,holding:0,uint16,126
+                                     """, Array.Empty<Point>(), "d1");
+
+        t.Ok(!tooBig.Ok, "an over-wide array is rejected at import time");
+        t.Contains(string.Join("; ", tooBig.Problems), "count", "the problem names the count field");
+
+        var garbage = PointCsv.Import("""
+                                      id,address,dataType,count
+                                      bad,holding:0,uint16,many
+                                      """, Array.Empty<Point>(), "d1");
+
+        t.Ok(!garbage.Ok, "a non-numeric count is rejected");
+        t.Contains(string.Join("; ", garbage.Problems), "line 2", "the problem points at the row");
+
+        return Task.CompletedTask;
+    }
 
     /// <summary>
     /// 量程与死区组合的静态规则。写错的死区不会报错、只会让数据看起来「一直没变化」，

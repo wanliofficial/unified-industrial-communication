@@ -599,22 +599,100 @@ public sealed class DeviceActor : IAsyncDisposable
 
     public async Task<IReadOnlyList<WriteResult>> WriteAsync(IReadOnlyList<WriteCommand> commands, CancellationToken ct)
     {
+        if (commands.Count == 0) return Array.Empty<WriteResult>();
+
+        // 值形状先校验，再建链。元素个数与点位声明不一致属于请求错误，
+        // 既不该占用通道预算，也不能寄希望于驱动「顺手」报错——
+        // 进程内的虚拟驱动不会报，真设备则可能写偏半段寄存器，
+        // 而回读只比较前几个元素，看起来仍然「写成功」。
+        var accepted = new List<WriteCommand>(commands.Count);
+        var results = new WriteResult?[commands.Count];
+
+        for (var i = 0; i < commands.Count; i++)
+        {
+            var command = commands[i];
+            var expected = command.Point.Elements;
+
+            if (expected > 1)
+            {
+                if (command.Value.Array is not { } array)
+                {
+                    results[i] = Rejected(command.Point.Id,
+                        $"value.shape: '{command.Point.Id}' is an array of {expected} elements, got a scalar");
+                    continue;
+                }
+
+                if (array.Count != expected)
+                {
+                    results[i] = Rejected(command.Point.Id,
+                        $"value.shape: '{command.Point.Id}' needs {expected} elements, got {array.Count}");
+                    continue;
+                }
+            }
+            else if (command.Value.Array is not null)
+            {
+                // 标量点位只接受标量值：允许「单元素数组」会得到两种等价的线上写法，
+                // 回读比较与上层展示都得多写一条分支。
+                results[i] = Rejected(command.Point.Id,
+                    $"value.shape: '{command.Point.Id}' is a scalar point, got an array");
+                continue;
+            }
+
+            accepted.Add(command);
+        }
+
+        if (accepted.Count == 0)
+            return results.Select(r => r!).ToArray();
+
         var conn = await EnsureConnAsync(ct).ConfigureAwait(false);
 
         using var lease = await _gate.EnterWriteAsync(ct).ConfigureAwait(false);
         using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
         timeout.CancelAfter(_device.Timeout ?? _channel.Timeout);
 
-        var results = await conn.WriteAsync(commands, timeout.Token).ConfigureAwait(false);
+        var written = await conn.WriteAsync(accepted, timeout.Token).ConfigureAwait(false);
 
         // confirm=true 才回读：写命令本身已经成功，回读是额外的读预算；
         // 对「闪一下就复位」的命令寄存器强行回读只会制造假故障，
         // 所以由调用方按点位决定，而不是全局默认打开。
-        var confirmed = commands.Where(c => c.Confirm).ToArray();
-        if (confirmed.Length == 0) return results;
+        var confirmed = accepted.Where(c => c.Confirm).ToArray();
 
-        return await VerifyWriteAsync(conn, confirmed, results, ct, timeout.Token).ConfigureAwait(false);
+        if (confirmed.Length > 0)
+            written = await VerifyWriteAsync(conn, confirmed, written, ct, timeout.Token).ConfigureAwait(false);
+
+        // 按请求顺序把驱动结果填回被拒项留下的空位：调用方按下标对齐，不能因为
+        // 「中间有一条形状错误」就把后面的结果整体前移。
+        //
+        // 同一个点位在一次批量里出现多次是合法的（以最后一次写入为准），
+        // 所以按 id 排队而不是直接建字典——字典遇到重复键会抛异常，
+        // 把一个「值形状错误」升级成整批 500。
+        var pending = written
+            .GroupBy(r => r.PointId, StringComparer.Ordinal)
+            .ToDictionary(g => g.Key, g => new Queue<WriteResult>(g), StringComparer.Ordinal);
+
+        var merged = new List<WriteResult>(commands.Count);
+        var cursor = 0;
+
+        foreach (var slot in results)
+        {
+            if (slot is not null)
+            {
+                merged.Add(slot);
+                continue;
+            }
+
+            var id = accepted[cursor++].Point.Id;
+            merged.Add(pending.TryGetValue(id, out var queue) && queue.Count > 0
+                ? queue.Dequeue()
+                : new WriteResult(id, false, Quality.Bad, DateTimeOffset.UtcNow,
+                    "write.driver_returned_nothing"));
+        }
+
+        return merged;
     }
+
+    private static WriteResult Rejected(string pointId, string error)
+        => new(pointId, false, Quality.Bad, DateTimeOffset.UtcNow, error);
 
     /// <summary>
     /// 写后回读。放在同一个通道租约里完成，回读与写入之间不会插进一轮采集，

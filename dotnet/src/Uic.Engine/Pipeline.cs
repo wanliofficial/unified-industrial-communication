@@ -29,16 +29,30 @@ public static class Pipeline
 
         if (value.Type.IsNumeric() && (point.Scale != 1 || point.Offset != 0))
         {
-            var scaled = value.AsNumber() * point.Scale + point.Offset;
-            value = point.DataType switch
-            {
-                DataType.Float32 or DataType.Float64 => DataValue.Number(point.DataType, scaled),
-                _ => DataValue.Number(point.DataType, Math.Round(scaled)),
-            };
+            // 缩放后的类型是**点位声明的类型**，不是原始线上类型：
+            // 现场常见「uint16 原始码 × 0.1 = 工程量浮点」，结果必须按 float 报出去。
+            value = value.Array is { } array
+                ? DataValue.Numbers(point.DataType, array.Select(v => Scale(point, v)).ToArray())
+                : DataValue.Number(point.DataType, Scale(point, value.AsNumber()));
         }
 
         return new Sample(device.Id, raw.PointId, value, Quality.Good, point.Unit,
             raw.DeviceTime, now, seq);
+    }
+
+    /// <summary>
+    /// 缩放：整型点位按四舍五入落回整数，浮点保留小数。
+    ///
+    /// 显式用 <see cref="MidpointRounding.AwayFromZero"/>：.NET 默认的银行家舍入会把
+    /// 4.5 变成 4、5.5 变成 6，与现场「四舍五入」的直觉不一致，
+    /// 而这类差异在趋势图上表现为「偶尔差 1 个刻度」，几乎不可能被追查出来。
+    /// </summary>
+    private static double Scale(Point point, double raw)
+    {
+        var scaled = raw * point.Scale + point.Offset;
+        return point.DataType is DataType.Float32 or DataType.Float64
+            ? scaled
+            : Math.Round(scaled, MidpointRounding.AwayFromZero);
     }
 
     /// <summary>死区判定。返回 true 表示「变化超过阈值，应当上报」。</summary>
@@ -71,21 +85,58 @@ public static class Pipeline
         if (!previous.Value.IsNumeric || !next.Value.IsNumeric)
             return !SameValue(previous.Value, next.Value);
 
-        var delta = Math.Abs(next.Value.AsNumber() - previous.Value.AsNumber());
+        // 数组按「元素逐个比、取最大变化」判定：任何一个元素越过阈值就上报。
+        // 用最大变化而不是平均值，是因为平均值会把「一个通道跳变、其余不变」
+        // 稀释成没变化——那正是最该被看到的情况。
+        double delta;
+        if (previous.Value.IsArray || next.Value.IsArray)
+        {
+            if (!previous.Value.IsArray || !next.Value.IsArray ||
+                previous.Value.Count != next.Value.Count)
+            {
+                return true;
+            }
 
-        return mode switch
+            delta = 0;
+            for (var i = 0; i < previous.Value.Count; i++)
+            {
+                delta = Math.Max(delta,
+                    Math.Abs(next.Value.NumberAt(i) - previous.Value.NumberAt(i)));
+            }
+        }
+        else
+        {
+            delta = Math.Abs(next.Value.AsNumber() - previous.Value.AsNumber());
+        }
+
+        return Exceeds(delta, deadband.Value, mode, rangeMin, rangeMax, previous, next);
+    }
+
+    /// <summary>三种死区模式的统一判定。数组与标量共用，避免两套阈值语义。</summary>
+    private static bool Exceeds(
+        double delta,
+        double deadband,
+        DeadbandMode mode,
+        double? rangeMin,
+        double? rangeMax,
+        Sample previous,
+        Sample next)
+    {
+        switch (mode)
         {
             // 百分比死区按量程归一：这样同一个「5%」在 0–100 和 0–10 的量程上
             // 含义一致，点表抄来抄去也不会变成另一种灵敏度。
-            DeadbandMode.Percent when rangeMin is { } min && rangeMax is { } max && max > min
-                => delta > (max - min) * deadband.Value / 100.0,
+            case DeadbandMode.Percent when rangeMin is { } min && rangeMax is { } max && max > min:
+                return delta > (max - min) * deadband / 100.0;
 
             // 变化率：Δ/Δt 与阈值比较。时间窗来自两个样本的采集时刻，
             // 不做滑动平均——那属于计算点，不属于死区。
-            DeadbandMode.Rate => ExceedsRate(previous, next, delta, deadband.Value),
+            case DeadbandMode.Rate:
+                return ExceedsRate(previous, next, delta, deadband);
 
-            _ => delta > deadband.Value,
-        };
+            default:
+                return delta > deadband;
+        }
     }
 
     private static bool ExceedsRate(Sample previous, Sample next, double delta, double perSecond)
@@ -102,6 +153,23 @@ public static class Pipeline
     private static bool SameValue(DataValue a, DataValue b)
     {
         if (a.Type != b.Type) return false;
+
+        if (a.Array is not null || b.Array is not null)
+        {
+            if (a.Array is null || b.Array is null || a.Array.Count != b.Array.Count) return false;
+
+            for (var i = 0; i < a.Array.Count; i++)
+            {
+                if (Math.Abs(a.Array[i] - b.Array[i]) >
+                    double.Epsilon * Math.Max(1, Math.Abs(a.Array[i])))
+                {
+                    return false;
+                }
+            }
+
+            return true;
+        }
+
         if (a.Num.HasValue || b.Num.HasValue)
         {
             if (!a.Num.HasValue || !b.Num.HasValue) return false;
