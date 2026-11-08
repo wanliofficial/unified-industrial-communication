@@ -143,7 +143,7 @@ src/
   Uic.Host/           宿主进程与命令行
   Uic.Ui/             Uno WASM 控制台
 tests/Uic.Tests/      自包含测试运行器与全部用例
-scripts/              外部依赖的验收脚本（mosquitto 互操作、WASM 浏览器冒烟）
+scripts/              外部依赖的验收脚本（容量基准、历史查询基准、mosquitto 互操作、WASM 浏览器冒烟）
 testdata/golden/      黄金帧（请求字节 / 响应字节 / 期望值）
 docs/                 架构、配置、北向契约、测试矩阵、实现说明
 ```

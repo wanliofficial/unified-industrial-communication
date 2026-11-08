@@ -125,9 +125,9 @@
 
 | 类别 | 目标 | 状态 | 说明 |
 |---|---|---|---|
-| 容量 | 200 设备 / 10,000 点 | 未测量 | 需要批量实例化 + 压测脚本；模板实例化已能一次生成 50 台，可作为压测起点 |
+| 容量 | 200 设备 / 10,000 点 | 已实现 | `scripts/capacity-bench.sh` 起真宿主：200 设备 × 50 点（周期 1s）全部转 `good` 用时 1.5 s，200/200 collecting，稳态读 ~203 次/s（≈ 10,160 点/s），CPU ≈ 1 核，RSS ≈ 261 MB。数字来自虚拟设备（无链路 I/O、sink 默认关闭），现场需按实际链路重跑 |
 | 采集周期下限 | 100 ms | 已实现 | 点位 `interval` 只接受 `0`（继承）或 `100ms..24h`，低于 100 ms 直接拒绝；设备级 `interval` 下限仍是 10 ms（命令行/自测需要更快轮询），见 `config/rejects_twenty_invalid_shapes`、`csv/imports_point_interval` |
-| 写命令 P95 ≤ 300 ms | 读满载下 | 未测量 | `ChannelGate` 的写优先是机制保证，但没有基准测试数据 |
+| 写命令 P95 ≤ 300 ms | 读满载下 | 已实现 | 同一负载下按 5 次/秒发 100 次单点写：P50 2.1 / P95 5.8 / P99 12.1 ms；`--confirm`（写后回读）P95 2.4 ms。写优先由 `ChannelGate` 保证，见 `scripts/capacity-bench.sh`（REST 写配额 10 次/秒的上限另计） |
 | 配置应用 ≤ 2 s | 改 1 台设备 | 已实现 | `contract/template_instantiates_and_applies_devices` 每次 apply 约 100–300 ms（含真实 Kestrel） |
 | 配置回滚 ≤ 30 s | 全量 | 已实现 | `config/rollback_adds_a_version` 亚秒级 |
 | 断网补发 24h 无空洞 | — | 已实现（机制） | `outbox/replays_after_restart` 验证位点与重放；24h 时长需要浸泡测试 |
