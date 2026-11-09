@@ -140,7 +140,7 @@
 
 | 协议 | 角色 | 传输 | 寻址 | 提及 | 最佳参照 | 难度 | 优先级 | 关键坑 |
 |---|---|---|---|---|---|---|---|---|
-| **SECS/GEM（HSMS）** | B | TCP | 数据项（SVID/VID/CEID） | 4 | PA-31（唯一有真实测试） | 5 | P2 | 会话状态机复杂（Select/Deselect/Linktest）；SECS-II 消息字典；事件与报警模型 |
+| **SECS/GEM（HSMS）** | B | TCP | 数据项（SVID/VID/CEID） | 4 | PA-31（唯一有真实测试） | 5 | P2 | 会话状态机复杂（Select/Deselect/Linktest）；SECS-II 消息字典；事件与报警模型；本仓库已落地 HSMS 通信层（Select/Deselect/Linktest/消息分帧），GEM300 语义只做最薄一层 |
 | **Euromap 63/77** | C | 文件/OPC UA | 文件/节点 | 1 | — | 4 | X | 注塑机行业；63 是文件接口，77 是 OPC UA 伴生规范 |
 | **Toledo（称重）** | C | 串口/TCP | 寄存器/字符串 | 1 | — | 2 | P2 | 多种帧格式；连续输出模式 |
 
@@ -266,14 +266,37 @@ MC 3E、FINS、EtherNet/IP + CIP、BACnet/IP、IEC 104、DL/T 645、CJ/T 188、A
 > 但 BIRTH/DEATH、序号回绕、bdSeq 与重连重发都要单独处理；因此编解码与状态机拆成
 > 两个包，前者可以脱网做金帧测试，后者可以脱 Broker 做序号测试。DataSet、模板、
 > 别名、报警出口都不做——它们各自是另一套状态机，半成品比不做更难排查。
+>
+> **CoAP**（编解码 + 主站 + 内置服务端 + `uic coapread` + `examples/coap.json`）补的是
+> 「受限设备 / IoT」这一层：没有寄存器、没有对象索引，数据模型就是 URI 资源；载荷是
+> 文本或 JSON，由 `Content-Format` 声明，驱动按声明解码而不是猜。它真正的难点不在发
+> 一个 GET，而在三处：**报文标识（MID）与事务标识（Token）要分开**——ACK/RST 看 MID、
+> 业务响应看 Token，混用会在分离响应下丢掉真正的响应；**选项 delta 是相对值且扩展字节
+> 先 delta 后 length**，写反会让解析器从下一个选项开始读垃圾；**收到空 ACK 后只能等分离
+> 响应、不能重发**，否则服务端会把同一动作执行两次。此外首个请求默认不带 Block2 由服务端
+> 决定块大小、`4.02` 时退回一次；UDP 重传窗口必须不越过设备级 `timeout`，否则一轮采集会被
+> 拖成点位数 × 超时。不做 DTLS、Observe 订阅、Block1 分块发送、CBOR——`Subscribe` 在能力
+> 声明里诚实标为 unsupported，一次性 GET 不伪装成推送。
 
 **Wave 2 的验收**：覆盖汽车零部件（CIP）、3C（MC）、水务（104/645）、楼宇（BACnet）四类典型场景。
 
-### Wave 3（第二年）
+### Wave 3（第二年，7 个协议）
 
-IEC 61850、DNP3、SECS/GEM、KNX、CoAP、Mewtocol、Host Link、MTConnect、IEC 101、MS/TP。
+IEC 61850、SECS/GEM、KNX、Mewtocol、Host Link、MTConnect、IEC 101。
 
-> 截至当前实现：DNP3 与 CoAP 已落地。
+> DNP3 与 CoAP 已在此前落地（见 §6 末尾的「截至当前实现」），本波补齐其余。
+
+| 协议 | 角色/传输 | 为什么值得做 | 最小可行版本 |
+|---|---|---|---|
+| **IEC 61850（MMS）** | 客户端 / TCP 102 | 变电站自动化的事实标准；逻辑设备/逻辑节点/数据对象的层次模型是唯一能表达「一台 IED 上有哪几个保护」的寻址方式 | MMS 会话（Initiate/Terminate）+ 读/写已知引用（`LD0LLN0.$MX$...`），不做 SCL 解析、Report、GOOSE、SV |
+| **SECS/GEM（HSMS）** | 设备/主机 / TCP 5000 | 半导体设备与工厂的通信主干；PA-31 是 38 份分析里唯一带真实测试的协议 | HSMS 通信层 + SECS-II 数据项编解码 + 少量 SxFy 消息，不做 GEM300 全部场景 |
+| **KNXnet/IP** | 客户端 / UDP 3670 | 楼宇自控第一大总线；组地址模型（GA vs PA）是它的核心 | TUNNELING 请求 + 组地址读写，不做 routing / device management / 安全 |
+| **Mewtocol** | 主站 / TCP 2400 或串口 | 松下 PLC 的事实协议；帧极简单但异常码是日文风格文本 | TCP 主站 + 读/写寄存器 + 错误码映射，不做串口与自动登录 |
+| **Host Link** | 主站 / 串口（RS-232/422/485） | 欧姆龙/三菱 PLC 的经典串口协议；串口层是已有共享资源 | 复用共享串口层 + FINS/MEWTOKEN 帧，不做串口时序优化 |
+| **MTConnect** | 客户端 / HTTP | 机床数据采集的事实标准；纯 REST + XML，无二进制编解码 | HTTP GET 取 `probe`/`current`/`sample`，XML 解析，不做资产/事件完整模型 |
+| **IEC 60870-5-101** | 主站 / 串口 | 104 的串口版；同一套 ASDU 复用已有编解码 | 复用 iec104 的 ASDU 编解码 + FT1.2 帧 + 共享串口层，不做平衡式传输 |
+
+> 截至当前实现：DNP3、CoAP、SECS/GEM 通信层已落地。
 >
 > **DNP3**（编解码 + 主站 + 内置从站 + `uic dnp3read` + `examples/dnp3.json`）：只做
 > TCP 主站、类 0 总召唤、类 1/2/3 事件轮询、CROB 与组 41 直接控制、未请求响应的接收
