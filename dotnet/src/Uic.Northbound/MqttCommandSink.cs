@@ -15,8 +15,9 @@ namespace Uic.Northbound;
 /// 每条命令都回一条结果到 <c>.../$command/result</c>，失败也回——
 /// 只回成功的通道会让操作员分不清「没执行」和「执行了但结果丢了」。
 ///
-/// 安全边界：这一版 MQTT 只有匿名明文，因此只放行不会改变整份配置、
-/// 不会丢数据的动作（重启/自检/冲刷/日志级别）；回滚与丢弃必须走 REST。
+/// 安全边界：这一版 MQTT 命令没有用户身份（TLS 只保护链路），因此只放行
+/// 不会改变整份配置、不会丢数据的动作（重启/自检/冲刷/日志级别）；
+/// 回滚与丢弃必须走 REST。
 ///
 /// 幂等：发布方必须带 <c>id</c>（或 <c>idempotencyKey</c>）。同一 id 在 5 分钟
 /// 窗口内重复到达时不再执行，直接重放首次结果并标 <c>replayed:true</c>。
@@ -28,7 +29,7 @@ public sealed class MqttCommandSink : IAsyncDisposable
 
     private static readonly TimeSpan ExecutionTimeout = TimeSpan.FromSeconds(20);
 
-    /// <summary>在匿名明文通道上允许执行的动作。集合外的动作会得到 command.forbidden。</summary>
+    /// <summary>在没有用户身份的 MQTT 通道上允许执行的动作。集合外的动作会得到 command.forbidden。</summary>
     public static IReadOnlyList<string> AllowedActions { get; } = new[]
     {
         "driver.restart",

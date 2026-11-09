@@ -184,10 +184,12 @@ internal static class SecretTests
             },
         });
 
-        t.Equal(2, lines.Count, "both credential fields are described");
+        t.Equal(3, lines.Count, "all credential fields are described, including the TLS PFX password");
         t.Contains(lines[0], "northbound.rest.token: environment variable " + EnvName,
             "an environment reference is described without its value");
         t.Contains(lines[1], "northbound.mqtt.password: sealed", "a sealed value is described as sealed");
+        t.Contains(lines[2], "northbound.rest.tls.certificatePassword: not set",
+            "an unset TLS password is still listed, so operators can see the field exists");
 
         foreach (var line in lines)
         {

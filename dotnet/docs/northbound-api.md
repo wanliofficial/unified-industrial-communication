@@ -40,6 +40,36 @@ Authorization: Bearer <token>
 登录失败按来源 IP 计 **5 次/分钟**，超限锁定 60 秒并返回 `429 request.rate_limited`；
 锁定按 IP 而不是按账号，避免有人用错误口令把管理员锁在门外。
 
+### 传输与 TLS
+
+默认监听明文 HTTP。配置 `northbound.rest.tls.enabled = true` 后，同一个
+`rest.listen` 端口改成 HTTPS（`https://` 由宿主自动补上），证书来自
+`certificateFile` / `certificatePassword` / `keyFile`：
+
+```json
+{
+  "rest": {
+    "listen": "0.0.0.0:8443",
+    "tls": {
+      "enabled": true,
+      "certificateFile": "security/gateway.pfx",
+      "certificatePassword": "${env:UIC_TLS_PFX_PASSWORD}"
+    }
+  }
+}
+```
+
+- 证书是**服务端证书**，不校验客户端证书（没有 mTLS）；
+- 只能填文件路径，不接受凭据引用；相对路径按 `storage.dataDir` 解析；
+- 证书缺失、读不出来或口令不对，启动按「配置非法」退出（退出码 2）；
+- REST 的证书与监听地址变更需要重启：它们属于 Kestrel 的启动参数，`config/apply`
+  只会在日志里告警，不会悄悄换证；
+- 继续由反向代理 / stunnel 终结 TLS 也支持：保持 `tls.enabled = false` 即可。
+
+控制台与 REST/SSE 同源，因此打开内置 HTTPS 后不需要改前端地址，也不会出现混合内容。
+MQTT 的 TLS 是独立开关（`northbound.mqtt.tls`），语义见
+[configuration.md](configuration.md#mqtttls)。
+
 ### 账号与权限
 
 | 方法 | 路径 | 所需权限 | 说明 |
@@ -716,8 +746,10 @@ Authorization: Bearer <token>
   QoS0 发完即返回（丢一条不会卡住位点），因此对可靠性有要求的现场必须用 QoS1；
 - 连接空闲时按 keepalive 的一半发 PINGREQ：只声明 keepalive 而不发心跳，
   broker 会在 1.5×keepalive 后单方面断开，表现为「没有数据时定时重连」；
-- 不走 TLS 与 WebSocket：需要加密时在链路上用 stunnel / 反向代理终结 TLS，
-  再连本机明文端口。配置校验阶段会拒绝 `qos=2`，避免「以为支持其实没有」。
+- TLS 是独立开关（`northbound.mqtt.tls`）：打开后校验 Broker 证书链与主机名，
+  自签 Broker 用 `caFile` 指定信任根；`insecureSkipVerify` 只用于联调，启动会告警。
+  不内置 WebSocket，也不校验客户端证书；配置校验阶段会拒绝 `qos=2`，
+  避免「以为支持其实没有」。
 
 ### 下行命令（可选）
 
@@ -757,7 +789,8 @@ Broker 重启或 ACL 变更后不需要人工重启网关。订阅被 Broker 拒
 
 - 允许的动作：`driver.restart`、`device.selftest`、`outbox.flush`、`log.level`、`diag.bundle`；
 - `config.rollback` 与 `outbox.drop` 固定返回 `command.forbidden`：这一版 MQTT
-  只有匿名明文，切换整份配置与丢弃队列必须留在可挂 Bearer Token 的 REST 上；
+  命令没有用户身份（TLS 只保护链路），切换整份配置与丢弃队列必须留在可挂
+  Bearer Token 的 REST 上；
 - 同一 `id` 在 **5 分钟窗口**内重复到达时不再执行，直接重放首次结果并标
   `replayed:true`。重连与人工重投都可能造成重复；
 - 入站 QoS1 在入队后立即回 PUBACK，执行在独立 worker 上串行进行，不会堵住

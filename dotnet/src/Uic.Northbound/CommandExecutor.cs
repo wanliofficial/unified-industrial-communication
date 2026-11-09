@@ -2,7 +2,8 @@ namespace Uic.Northbound;
 
 /// <summary>
 /// 命令通道的能力边界。REST 在本机监听、可挂 Bearer Token；MQTT 这一版
-/// 只有匿名明文，所以不能让同一个请求在两条通道上拥有同等权限。
+/// 没有用户身份（TLS 只保护链路，不认证发布者），所以不能让同一个请求
+/// 在两条通道上拥有同等权限。
 /// </summary>
 [Flags]
 public enum CommandScope

@@ -20,6 +20,11 @@ public static partial class ModelValidator
     public static bool IsValidItemId(string? id)
         => !string.IsNullOrWhiteSpace(id) && ItemRe().IsMatch(id);
 
+    private static bool IsReference(string? value)
+        => value is not null &&
+           (value.StartsWith("${", StringComparison.Ordinal) ||
+            value.StartsWith("enc:", StringComparison.Ordinal));
+
     public static IReadOnlyList<ValidationProblem> Validate(ConfigDocument doc)
     {
         var problems = new List<ValidationProblem>();
@@ -169,7 +174,26 @@ public static partial class ModelValidator
                 if (!int.TryParse(portText, out var restPort) || restPort is < 1 or > 65535)
                     Add("northbound.rest.listen", "port must be 1..65535");
             }
+
+            if (rest.Tls.Enabled && string.IsNullOrWhiteSpace(rest.Tls.CertificateFile))
+                Add("northbound.rest.tls.certificateFile", "required when TLS is enabled");
+
+            // 证书与私钥是文件路径，不是凭据：写成 ${env:...} 只会在装载时得到一条
+            // 不存在的路径，提前拒绝比启动失败更好定位。
+            if (IsReference(rest.Tls.CertificateFile))
+                Add("northbound.rest.tls.certificateFile",
+                    "must be a file path, not a credential reference");
+            if (IsReference(rest.Tls.KeyFile))
+                Add("northbound.rest.tls.keyFile",
+                    "must be a file path, not a credential reference");
         }
+
+        var mqttTls = doc.Northbound.Mqtt.Tls;
+        if (mqttTls.Enabled && IsReference(mqttTls.CaFile))
+            Add("northbound.mqtt.tls.caFile",
+                "must be a file path, not a credential reference");
+        if (mqttTls.InsecureSkipVerify && !mqttTls.Enabled)
+            Add("northbound.mqtt.tls.insecureSkipVerify", "requires tls.enabled");
 
         var storage = doc.Storage;
         if (storage.MinFreeBytes < 0)

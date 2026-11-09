@@ -119,7 +119,7 @@ validate/apply/versions/diff/rollback/export/import、模板 CRUD 与批量实�
 | 主题 | 前缀 + `{site}` + `{device}` + `{point}` 模板；`$birth`/`$state`/`$death` 固定后缀 |
 | 重连 | 固定退避（≥500 ms，可配）；重连后重发 `$birth` 与全部 `$state`，并重订阅 |
 | 下行命令 | 请求/结果双主题，按 `id` 做 5 分钟进程内幂等；只放行 `driver.restart`、`device.selftest`、`outbox.flush`、`log.level`、`diag.bundle` |
-| 传输 | 明文 TCP；TLS/WebSocket 未内置 |
+| 传输 | 明文 TCP 或 TLS（`northbound.mqtt.tls`，校验服务端证书链与主机名，支持自定义 CA）；WebSocket 未内置 |
 
 「MQTT 南向订阅取数」（FR-COL-06）没有实现：北向 MQTT 的连接是「发出去 + 收命令」，
 南向需要另一套点位映射、生命周期与质量传播，不能复用同一个客户端实例。

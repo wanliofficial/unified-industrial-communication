@@ -41,6 +41,7 @@ MqttTests.Register(tests);
 MqttCommandTests.Register(tests);
 ConfigFeatureTests.Register(tests);
 SecretTests.Register(tests);
+TlsTests.Register(tests);
 ContractTests.Register(tests);
 OpcUaTests.Register(tests);
 

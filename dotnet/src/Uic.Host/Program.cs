@@ -1,3 +1,4 @@
+using System.Security.Cryptography.X509Certificates;
 using Microsoft.AspNetCore.StaticFiles;
 using Microsoft.Extensions.Logging;
 using Uic.Config;
@@ -306,8 +307,20 @@ internal static class Program
                 Console.WriteLine($"  secret {line}");
 
             var northbound = new List<string>();
-            if (doc.Northbound.Rest.Enabled) northbound.Add($"rest({doc.Northbound.Rest.Listen})");
-            if (doc.Northbound.Mqtt.Enabled) northbound.Add($"mqtt({doc.Northbound.Mqtt.Host}:{doc.Northbound.Mqtt.Port})");
+            // 协议前缀写出来：check 的输出是部署评审的依据，
+            // 「监听 8443」和「监听 8443 且真的是 HTTPS」是两件事。
+            if (doc.Northbound.Rest.Enabled)
+            {
+                var scheme = doc.Northbound.Rest.Tls.Enabled ? "https" : "http";
+                northbound.Add($"rest({scheme}://{doc.Northbound.Rest.Listen})");
+            }
+
+            if (doc.Northbound.Mqtt.Enabled)
+            {
+                var transport = doc.Northbound.Mqtt.Tls.Enabled ? "mqtts" : "mqtt";
+                northbound.Add($"{transport}({doc.Northbound.Mqtt.Host}:{doc.Northbound.Mqtt.Port})");
+            }
+
             if (doc.Northbound.OpcUa.Enabled) northbound.Add($"opcua({doc.Northbound.OpcUa.Endpoint})");
             Console.WriteLine($"  northbound: {(northbound.Count == 0 ? "none" : string.Join(", ", northbound))}");
 
@@ -418,9 +431,8 @@ internal static class Program
             return logLevel >= minimum;
         });
 
-        builder.WebHost.UseUrls(listen.StartsWith("http", StringComparison.OrdinalIgnoreCase)
-            ? listen
-            : $"http://{listen}");
+        // 监听地址要等运行时读出配置（并应用 --listen 覆盖）后才定，
+        // 因此 UseUrls 与证书都放到后面，这里只做准备。
 
         var drivers = new DriverRegistry();
         drivers.Register(ModbusMasterDriver.Tcp(), ModbusMasterDriver.Rtu(), ModbusMasterDriver.Ascii());
@@ -473,6 +485,31 @@ internal static class Program
             rest = rest with { Listen = cli.Listen };
         }
 
+        // TLS 证书必须在 Build 之前交给 Kestrel：它属于监听配置，不是请求管道。
+        var scheme = "http";
+        if (rest.Tls.Enabled)
+        {
+            X509Certificate2 certificate;
+            try
+            {
+                certificate = Tls.LoadServerCertificate(rest, dataDir, runtime.SecretValues);
+            }
+            catch (ConfigException ex)
+            {
+                Console.Error.WriteLine("invalid TLS configuration:");
+                Console.Error.WriteLine(ex.ToDetailedString());
+                return 2;
+            }
+
+            builder.WebHost.ConfigureKestrel(options =>
+                options.ConfigureHttpsDefaults(https => https.ServerCertificate = certificate));
+            scheme = "https";
+        }
+
+        builder.WebHost.UseUrls(listen.StartsWith("http", StringComparison.OrdinalIgnoreCase)
+            ? listen
+            : $"{scheme}://{listen}");
+
         var app = builder.Build();
 
         app.UseNorthbound(runtime.CreateNorthboundContext(rest));
@@ -515,7 +552,7 @@ internal static class Program
                 "text/plain; charset=utf-8"));
         }
 
-        PrintBanner(log, listen, dataDir, runtime, hasWeb ? webRoot : null, simulate, cli.SimPort);
+        PrintBanner(log, scheme, listen, dataDir, runtime, hasWeb ? webRoot : null, simulate, cli.SimPort);
 
         try
         {
@@ -535,6 +572,7 @@ internal static class Program
 
     private static void PrintBanner(
         ILogger log,
+        string scheme,
         string listen,
         string dataDir,
         GatewayRuntime runtime,
@@ -547,8 +585,8 @@ internal static class Program
         log.LogInformation("uic {Version} starting: site={Site} config={Config} data={DataDir}",
             GatewayVersion, config.Site, runtime.ConfigVersion, Path.GetFullPath(dataDir));
 
-        log.LogInformation("listening on http://{Listen}  (UI: {Ui})",
-            listen, webRoot ?? "not bundled");
+        log.LogInformation("listening on {Scheme}://{Listen}  (UI: {Ui})",
+            scheme, listen, webRoot ?? "not bundled");
 
         if (simulate)
         {

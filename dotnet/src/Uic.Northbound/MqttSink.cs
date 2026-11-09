@@ -22,12 +22,12 @@ public sealed class MqttSink : IOutboxSink, IAsyncDisposable
     private readonly ILogger _log;
     private readonly ConcurrentDictionary<string, string> _lastStates = new(StringComparer.Ordinal);
 
-    public MqttSink(MqttOptions options, string site, ILogger log)
+    public MqttSink(MqttOptions options, string site, ILogger log, string? dataDir = null)
     {
         _options = options;
         _site = site;
         _log = log;
-        _client = new MqttClient(options, site, log);
+        _client = new MqttClient(options, site, log, dataDir);
         _client.OnConnected = OnConnectedAsync;
     }
 

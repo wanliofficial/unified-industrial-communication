@@ -16,11 +16,13 @@ dotnet run --project tests/Uic.Tests -- --stop-on-fail      # 首个失败即停
 正常输出：
 
 ```
-233 passed, 0 failed, 1 skipped · 114.2s
+239 passed, 0 failed, 1 skipped · 112.7s
 ```
 
 耗时随机器负载波动较大：219 条时在同一台机器上空载量到 65.5 s，233 条在同时跑着
-发布/容器时量到 114.2 s。NFR 的门槛是 120 s，压测用例与 PBKDF2 派生是主要开销。
+发布/容器时量到 114.2 s；239 条时空载量到 112.7 s，而机器有 20+ 后台负载时量到 1471 s。
+NFR 的门槛是 120 s，压测用例、PBKDF2 派生与 TLS 握手是主要开销——**这个门槛只在空载机器上有意义**，
+比对数字前先看 `uptime`。TLS 用例全部用进程内生成的自签证书跑真实握手，不依赖系统信任库，也不联网。
 
 跳过的一条是 OPC UA 验收（要绑端口、生成证书，默认不跑）。
 串口用例会自己开伪终端，Linux 上默认执行；其它平台报 `skip`，不算通过也不算失败。
@@ -57,11 +59,12 @@ dotnet run --project tests/Uic.Tests -- --stop-on-fail      # 首个失败即停
 | `schedule/*` | 4 | 启动相位均匀铺开、单调时间换算与到期边界、调度器实际分配相位、相位按设备内最快点位周期 |
 | `loopback/*` | 12 | 主站 ↔ 内置从站的真实链路 |
 | `serial/*` | 7 | 真实伪终端上的 RTU / ASCII、半双工、帧间静默、deadline、关闭打断读 |
-| `mqtt/*` | 17 | 测试内 broker：CONNECT/SUBSCRIBE 字段、QoS0/1、主题渲染、重连补发、命令去重与权限 |
+| `mqtt/*` | 19 | 测试内 broker：CONNECT/SUBSCRIBE 字段、QoS0/1、主题渲染、重连补发、命令去重与权限、TLS 发布与不可信 CA 拒绝 |
 | `template/*` | 3 | 50 实例批量生成、参数类型/缺失/未知参数拒绝、未声明占位符拒绝 |
 | `csv/*` | 5 | 地址表达式（参考号/区域偏移/分列）、按 id 合并与冲突行号、死区模式与量程列、点位周期列、数组元素个数列 |
-| `contract/*` | 28 | 进程内真实 Kestrel 的 REST 契约（含驱动能力、模板、CSV、导入导出、单点幂等、资源降级联动、脱敏配置往返、明文凭据被拒、journal 历史查询、审计写入/导出/拒绝留痕、点位有效周期、数组元素个数与值形态、控制台新建设备的完整链路；认证的 5 条见 `contract/auth_*`） |
+| `contract/*` | 29 | 进程内真实 Kestrel 的 REST 契约（含驱动能力、模板、CSV、导入导出、单点幂等、资源降级联动、脱敏配置往返、明文凭据被拒、journal 历史查询、审计写入/导出/拒绝留痕、点位有效周期、数组元素个数与值形态、HTTPS 监听、控制台新建设备的完整链路；认证的 5 条见 `contract/auth_*`） |
 | `secret/*` | 9 | 凭据引用：环境变量 / 密钥文件解析、缺失变量硬失败（不能静默变成空令牌）、明文被拒、空值合法、`enc:v1` 封解与篡改拒绝、未知方案与版本、摘要不泄露明文 |
+| `tls/*` | 3 | 证书必填且可读、PFX 口令必须是引用、`insecureSkipVerify` 依赖 `tls.enabled`；证书/CA 不接受凭据引用 |
 | `audit/*` | 7 | 审计落盘：按动作/结果/身份查询、重启后序号单调且旧记录可查、按大小轮转与保留只删旧文件、禁用时不写盘、断电半行跳过、按文件名日期跳过无关归档、分页最新在前 |
 | `auth/*` | 9 | 本地账号：PBKDF2 加盐且文件无明文、首次启动只建一次 admin、改密清除强制标记并删初始口令文件、会话 12 小时过期、5 次失败/分钟锁定与按 IP 隔离、角色权限矩阵、停用账号立即失效、最后一个管理员不可停用/降级、口令策略 |
 | `opcua/*` | 1 | 标准 OPC UA 客户端：浏览、读、写、订阅 |
@@ -287,6 +290,28 @@ scripts/wasm-smoke.sh --browser firefox
 `--no-browser` 可以显式只跑静态层，`--web <dir>` 复用已有发布目录，
 `--keep` 保留发布产物、日志与截图。
 
+## TLS 外部验收
+
+自包含用例里的 HTTPS 是进程内 Kestrel + 钉死证书的客户端，证明不了「真实的
+`curl` 也认」。`scripts/tls-smoke.sh` 换成真进程与真工具：
+
+1. `openssl` 现生成自签证书（`CA:TRUE` + SAN），导出 PFX，口令只放环境变量；
+2. `uic check` 只看配置就报出 `rest(https://...)`、`mqtts(...)` 与口令来源；
+3. 真宿主起 HTTPS：`curl --cacert` 通过校验、错误 CA 被拒、同端口明文 HTTP 连不上、
+   `openssl s_client` 看到 `CN=localhost`；
+4. 失败路径逐个确认退出码 2 且端口没被占用：证书路径为空、文件不存在、
+   PFX 口令不对；明文口令在 `uic check` 阶段就被拒；
+5. 全流程不联网、不依赖 docker，装了 `openssl` + `curl` 就能跑。
+
+```bash
+scripts/tls-smoke.sh          # 跑一遍并清理
+scripts/tls-smoke.sh --keep   # 保留证书与 host.log 便于排查
+```
+
+MQTT 的 TLS 客户端只有进程内用例（`mqtt/tls_publishes_over_custom_ca`、
+`mqtt/tls_rejects_untrusted_broker`），与真实 Broker 的 TLS 互操作仍未覆盖，
+接入现场时用目标 Broker 的 CA 再验一次（见「已知未覆盖」）。
+
 ## 历史查询性能基准
 
 `scripts/history-bench.sh` 生成指定行数的 journal 并对四类查询各取 3 次最快值：
@@ -363,7 +388,7 @@ journal、outbox、MQTT 都按默认关闭——它们各自的成本由 `histor
 
 | 缺口 | 影响 | 建议 |
 |---|---|---|
-| MQTT 只与 mosquitto 互操作过 | 认证、ACL、TLS、其它 broker 的差异未覆盖（客户端本身只做匿名明文）；命令通道同样依赖 Broker 侧隔离 | 接入现场时用目标 broker 重跑 `scripts/mqtt-interop.sh`，并单独验 TLS 终结方案与命令主题的 ACL |
+| MQTT 只与 mosquitto 互操作过 | 用户认证、ACL 与其它 broker 的差异未覆盖（TLS 只有自签证书的进程内用例，没有与真实 Broker 的 TLS 互操作）；命令通道同样依赖 Broker 侧隔离 | 接入现场时用目标 broker 重跑 `scripts/mqtt-interop.sh`，用现场 CA 再跑一次 TLS 连接，并验命令主题的 ACL |
 | MQTT 命令去重只在进程内 | 幂等窗口 5 分钟、重启即清空；命令本身已落审计，但幂等状态不跨重启 | 需要跨重启幂等时用 REST 的 `X-Idempotency-Key`，或把幂等台账落到外部存储 |
 | WASM 控制台只验过 Chromium 与 Firefox | Safari / WebKit、移动端与真实触屏未覆盖；冒烟脚本已覆盖「登录 → 强制改密 → 首屏 → 新建设备」，但只验证 admin 一个角色 | 上线前在目标浏览器各跑一次同一套检查：`scripts/wasm-smoke.sh --browser <name>`（装了 webkit 后可直接跑） |
 | 真实硬件 | 全部用例都跑在内置从站 / 虚拟设备 / 伪终端上 | 现场接入时先用 `uic check` 与 `/api/v1/commands` 的 `device.selftest` |

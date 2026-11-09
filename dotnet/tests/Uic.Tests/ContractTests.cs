@@ -2,6 +2,7 @@ using System.Diagnostics;
 using System.Net;
 using System.Net.Http.Headers;
 using System.Net.Http.Json;
+using System.Security.Cryptography.X509Certificates;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
@@ -77,7 +78,7 @@ internal static class ContractTests
     // 夹具
     // ------------------------------------------------------------------
 
-    private sealed class Host : IAsyncDisposable
+    internal sealed class Host : IAsyncDisposable
     {
         private readonly WebApplication _app;
         private readonly GatewayRuntime _runtime;
@@ -95,7 +96,10 @@ internal static class ContractTests
 
         public GatewayRuntime Runtime => _runtime;
 
-        public static async Task<Host> StartAsync(TestContext t, Func<ConfigDocument>? config = null)
+        public static async Task<Host> StartAsync(
+            TestContext t,
+            Func<ConfigDocument>? config = null,
+            bool tls = false)
         {
             // 配置里只有 ${env:UIC_CONTRACT_TOKEN}，真实值放进程环境：
             // 与现场「环境注入」走同一条解析路径，也让用例无法绕过明文校验。
@@ -108,6 +112,47 @@ internal static class ContractTests
                 builder.AddProvider(ring);
                 builder.SetMinimumLevel(LogLevel.Warning);
             });
+
+            // TLS 用例需要配置里先有证书路径，而证书又要写进临时目录：
+            // 先在宿主里生成，再把它注入调用方给出的配置。
+            X509Certificate2? certificate = null;
+            if (tls)
+            {
+                certificate = TestCertificates.Create();
+                var certPath = TestCertificates.WritePfx(t.TempDir, certificate);
+                var inner = config ?? BuildConfig;
+
+                config = () =>
+                {
+                    var doc = inner();
+
+                    // ConfigDocument 是可变类而不是 record：逐字段复制，
+                    // 只替换 Northbound.Rest.Tls，其余部分原样保留。
+                    return new ConfigDocument
+                    {
+                        SchemaVersion = doc.SchemaVersion,
+                        Site = doc.Site,
+                        Description = doc.Description,
+                        Channels = doc.Channels,
+                        Devices = doc.Devices,
+                        Northbound = new NorthboundOptions
+                        {
+                            Rest = doc.Northbound.Rest with
+                            {
+                                Tls = new RestTlsOptions
+                                {
+                                    Enabled = true,
+                                    CertificateFile = certPath,
+                                },
+                            },
+                            Mqtt = doc.Northbound.Mqtt,
+                            OpcUa = doc.Northbound.OpcUa,
+                        },
+                        Storage = doc.Storage,
+                        Logging = doc.Logging,
+                    };
+                };
+            }
 
             var options = new RuntimeOptions
             {
@@ -124,7 +169,20 @@ internal static class ContractTests
             });
 
             builder.Logging.ClearProviders();
-            builder.WebHost.UseUrls("http://127.0.0.1:0");
+
+            if (tls)
+            {
+                var rest = runtime.CurrentConfig.Northbound.Rest;
+                var serverCertificate = Tls.LoadServerCertificate(rest, t.TempDir, runtime.SecretValues);
+
+                builder.WebHost.ConfigureKestrel(kestrel =>
+                    kestrel.ConfigureHttpsDefaults(https => https.ServerCertificate = serverCertificate));
+                builder.WebHost.UseUrls("https://127.0.0.1:0");
+            }
+            else
+            {
+                builder.WebHost.UseUrls("http://127.0.0.1:0");
+            }
 
             var app = builder.Build();
             app.UseNorthbound(runtime.CreateNorthboundContext());
@@ -135,9 +193,18 @@ internal static class ContractTests
                 .Features.Get<IServerAddressesFeature>()!
                 .Addresses.First();
 
-            var client = new HttpClient { BaseAddress = new Uri(address), Timeout = TimeSpan.FromSeconds(10) };
+            var http = tls
+                ? new HttpClient(new HttpClientHandler
+                {
+                    // 钉住这张自签证书：既验证 HTTPS 真的起来，又不依赖系统信任库。
+                    ServerCertificateCustomValidationCallback = (_, presented, _, _) =>
+                        presented is not null &&
+                        presented.GetCertHashString() == certificate!.GetCertHashString(),
+                })
+                { BaseAddress = new Uri(address), Timeout = TimeSpan.FromSeconds(10) }
+                : new HttpClient { BaseAddress = new Uri(address), Timeout = TimeSpan.FromSeconds(10) };
 
-            return new Host(app, runtime, logs, client);
+            return new Host(app, runtime, logs, http);
         }
 
         public async ValueTask DisposeAsync()
@@ -150,7 +217,7 @@ internal static class ContractTests
         }
     }
 
-    private static DriverRegistry Drivers()
+    internal static DriverRegistry Drivers()
     {
         var registry = new DriverRegistry();
         registry.Register(ModbusMasterDriver.Tcp(), ModbusMasterDriver.Rtu(), ModbusMasterDriver.Ascii());

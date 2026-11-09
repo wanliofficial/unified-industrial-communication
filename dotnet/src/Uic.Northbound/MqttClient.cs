@@ -1,6 +1,9 @@
 using System.Buffers;
 using System.Collections.Concurrent;
+using System.Net.Security;
 using System.Net.Sockets;
+using System.Security.Authentication;
+using System.Security.Cryptography.X509Certificates;
 using System.Text;
 using System.Threading.Channels;
 using Microsoft.Extensions.Logging;
@@ -16,10 +19,13 @@ public sealed record MqttMessage(string Topic, byte Qos, bool Retain, byte[] Pay
 ///
 /// 为什么自己写：边缘部署要求单文件、无额外依赖，且我们只需要
 /// CONNECT / PUBLISH(QoS0/1) / SUBSCRIBE / PINGREQ / DISCONNECT 几个报文。
-/// 引入完整 MQTT 库会带来 TLS、WebSocket、持久会话等我们用不到的路径，
+/// 引入完整 MQTT 库会带来 WebSocket、持久会话等我们用不到的路径，
 /// 那些路径一旦被配置误开，反而变成「以为加密了其实没有」的风险点。
+/// TLS 用 <see cref="SslStream"/> 在流这一层包起来，几十行就能做完，
+/// 因此不构成引入第三方库的理由。
 ///
-/// 明确不支持：QoS2、TLS、WebSocket、持久会话。配置校验阶段直接拒绝。
+/// 明确不支持：QoS2、WebSocket、持久会话。TLS 只做服务端证书校验（含自定义 CA），
+/// 不做客户端证书；MQTT 报文层与明文路径完全相同，加密只发生在流这一层。
 ///
 /// 订阅必须在 <see cref="Start"/> 之前登记：一次连接握手结束后统一发 SUBSCRIBE，
 /// 并在每次重连后自动重发；运行中动态改订阅不在这一版的能力范围内。
@@ -49,8 +55,11 @@ public sealed class MqttClient : IAsyncDisposable
             new UnboundedChannelOptions { SingleReader = true });
     private readonly object _connLock = new();
 
+    private readonly string _dataDir;
+
     private TcpClient? _client;
-    private NetworkStream? _stream;
+    private Stream? _stream;
+    private X509Certificate2Collection? _customRoots;
     private Task? _loop;
     private Task? _inboundWorker;
     private int _packetId;
@@ -59,11 +68,21 @@ public sealed class MqttClient : IAsyncDisposable
     private int _started;
     private int _disposed;
 
-    public MqttClient(MqttOptions options, string site, ILogger log)
+    public MqttClient(MqttOptions options, string site, ILogger log, string? dataDir = null)
     {
         _options = options;
         _site = site;
         _log = log;
+        _dataDir = dataDir ?? Environment.CurrentDirectory;
+
+        // 告警放在构造时而不是第一次握手里：Broker 连不上时也要在启动日志里
+        // 留下「这次部署没有认证对端」的证据，否则 TLS 看起来一直是开着的。
+        if (options.Tls.Enabled && options.Tls.InsecureSkipVerify)
+        {
+            _log.LogWarning(
+                "mqtt TLS is accepting any certificate (insecureSkipVerify); " +
+                "traffic is encrypted but the broker is not authenticated");
+        }
     }
 
     public bool IsConnected => _connected;
@@ -187,14 +206,14 @@ public sealed class MqttClient : IAsyncDisposable
     private async Task ConnectAsync(CancellationToken ct)
     {
         var client = new TcpClient { NoDelay = true };
+        Stream stream;
 
         using (var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct))
         {
-            timeout.CancelAfter(TimeSpan.FromSeconds(5));
+            timeout.CancelAfter(TimeSpan.FromSeconds(10));
             await client.ConnectAsync(_options.Host, _options.Port, timeout.Token).ConfigureAwait(false);
+            stream = await OpenStreamAsync(client, timeout.Token).ConfigureAwait(false);
         }
-
-        var stream = client.GetStream();
 
         lock (_connLock)
         {
@@ -621,9 +640,73 @@ public sealed class MqttClient : IAsyncDisposable
         }
     }
 
+    /// <summary>
+    /// 建立网络流。TLS 在这一层包起来，上层读循环仍按字节流工作——
+    /// MQTT 的报文格式不因为 TLS 改变，加密只影响「字节怎么出去」。
+    /// </summary>
+    private async Task<Stream> OpenStreamAsync(TcpClient client, CancellationToken ct)
+    {
+        var network = (Stream)client.GetStream();
+        if (!_options.Tls.Enabled) return network;
+
+        var ssl = new SslStream(network, leaveInnerStreamOpen: false, ValidateServerCertificate);
+
+        try
+        {
+            await ssl.AuthenticateAsClientAsync(new SslClientAuthenticationOptions
+            {
+                TargetHost = _options.Host,
+                EnabledSslProtocols = SslProtocols.Tls12 | SslProtocols.Tls13,
+                CertificateRevocationCheckMode = X509RevocationMode.NoCheck,
+            }, ct).ConfigureAwait(false);
+
+            return ssl;
+        }
+        catch
+        {
+            ssl.Dispose();
+            throw;
+        }
+    }
+
+    private bool ValidateServerCertificate(
+        object sender,
+        X509Certificate? certificate,
+        X509Chain? chain,
+        SslPolicyErrors errors)
+    {
+        if (_options.Tls.InsecureSkipVerify) return true;
+
+        if (errors == SslPolicyErrors.None) return true;
+
+        // 自签 Broker：系统信任库当然不认，用配置里的 CA 重建一次链。
+        // 主机名校验不清除，避免「链对了但连错了机器」。
+        if ((errors & SslPolicyErrors.RemoteCertificateChainErrors) != 0 && certificate is not null)
+        {
+            _customRoots ??= Tls.LoadCustomRoots(_options.Tls.CaFile, _dataDir);
+
+            if (_customRoots.Count > 0)
+            {
+                using var leaf = new X509Certificate2(certificate);
+                using var custom = new X509Chain();
+
+                custom.ChainPolicy.TrustMode = X509ChainTrustMode.CustomRootTrust;
+                custom.ChainPolicy.CustomTrustStore.AddRange(_customRoots);
+                custom.ChainPolicy.RevocationMode = X509RevocationMode.NoCheck;
+
+                if (custom.Build(leaf)) errors &= ~SslPolicyErrors.RemoteCertificateChainErrors;
+            }
+        }
+
+        if (errors == SslPolicyErrors.None) return true;
+
+        _log.LogWarning("mqtt TLS handshake rejected the broker certificate: {Errors}", errors);
+        return false;
+    }
+
     private async Task CloseAsync()
     {
-        NetworkStream? stream;
+        Stream? stream;
         TcpClient? client;
 
         lock (_connLock)

@@ -11,7 +11,7 @@
 它们不是 §6.1「不做」清单里的项，属于真实缺口；逐协议现状、原因与补法见
 [protocol-status.md](protocol-status.md)。
 
-当前测试基线：**233 passed / 0 failed / 1 skipped**（跳过的是需要 `--opcua` 的 OPC UA 端到端用例）。
+当前测试基线：**239 passed / 0 failed / 1 skipped**（跳过的是需要 `--opcua` 的 OPC UA 端到端用例）。
 
 ## 1. 采集（FR-COL）
 
@@ -103,7 +103,7 @@
 | FR-OPS-07 | 诊断包（脱敏配置 + 日志 + 指标 + 版本） | 已实现 | `GET /api/v1/diagnostics/bundle` 与命令 `diag.bundle` 共用 `DiagnosticsBundle.Build`；`mqtt/command_diag_bundle_is_whitelisted` |
 | FR-OPS-08 | 远程命令白名单 | 已实现 | `contract/*` 与 `mqtt/command_unknown_action_returns_error`、`mqtt/command_privileged_action_is_forbidden`；REST/MQTT 共用 `CommandExecutor` |
 | FR-OPS-09 | 凭据加密存储 | 已实现 | 凭据字段（`northbound.rest.token` / `northbound.mqtt.password`）只接受引用：`${env:NAME}`、`${file:PATH}`、`enc:v1:...`（AES-256-GCM，密钥来自 `UIC_SECRET_KEY` / `UIC_SECRET_KEY_FILE`）。明文在 `uic check`、启动、`config/validate`、`config/apply` 四处被拒并指出字段路径；落盘版本、diff、导出、诊断包与 `GET /api/v1/config` 只有引用或 `***`。`uic secret keygen|seal` 提供密钥与密封；`secret/*`（9 条）与 `contract/plaintext_credentials_are_rejected` 覆盖解析失败硬失败、篡改拒绝与明文拒绝 |
-| FR-OPS-10 | TLS（API 与北向） | 刻意没做（M） | 由反向代理 / stunnel 终结；本仓库只监听明文端口 |
+| FR-OPS-10 | TLS（API 与北向） | 已实现 | REST：`northbound.rest.tls` 打开后 Kestrel 按 HTTPS 监听，证书支持 PFX（`certificateFile` + `certificatePassword`）与 PEM（`certificateFile` + `keyFile`），口令仍是凭据引用；装载失败按配置非法退出（码 2）。MQTT：`northbound.mqtt.tls` 用 `SslStream` 包裹连接，校验服务端证书链与主机名，自签 Broker 通过 `caFile` 走 `CustomRootTrust`，`insecureSkipVerify` 只能联调且启动告警。REST 的证书/监听变更需重启（热更新只告警），MQTT 的 TLS/CA 变更在 `config/apply` 重建客户端后生效。证据：`tls/*`（3 条配置与装载）、`contract/tls_rest_serves_https`、`mqtt/tls_publishes_over_custom_ca`、`mqtt/tls_rejects_untrusted_broker` |
 | FR-OPS-11 | 日志（结构化、分级、轮转） | 已实现 | 控制台 + 内存环形缓冲 + 可选 JSON 行文件日志：字段 `ts/level/category/msg/device/exception`，按 `logging.file.maxBytes` 轮转、保留 `retain` 份；支持热更新开关：`logs/json_line_fields_are_complete`、`logs/file_rotates_without_losing_lines`、`logs/retention_prunes_old_archives`、`logs/reconfigure_stops_writing` |
 
 ## 7. 驱动开发与测试（FR-SDK）
@@ -148,12 +148,12 @@
 | 兼容：浏览器最近 2 个版本 | Chrome/Edge/Firefox | 已实现 | `scripts/wasm-smoke.sh` 在 Playwright 里各跑一遍：Chromium（同一引擎覆盖 Chrome/Edge，首屏约 12 s）与 Firefox（Gecko，约 38 s），两条都走完「登录 → 强制改密 → 首屏 + 新建一台设备」并被断言；Safari/WebKit 未装，用 `--browser webkit` 可补跑 |
 | 可维护：单文件 ≤600 行 | — | 已实现 | 新增端点都拆成 `RestApi.*.cs` partial |
 | 可维护：依赖数量 ≤10 | 直接依赖 | 已实现 | 生产 4 个（日志抽象、串口、OPC UA Server/Configuration）+ ASP.NET Core 框架引用；测试 1 个 |
-| 构建/测试时间 | ≤60 s / ≤120 s | 已实现 | 全量构建约 20 s；219 条时空载 65.5 s，新增认证用例后为 233 条；机器有其它负载时量到 114.2 s，仍在 120 s 门槛内 |
+| 构建/测试时间 | ≤60 s / ≤120 s | 已实现 | 全量构建约 20 s；219 条时空载 65.5 s，233 条时量到 114.2 s，新增 TLS 用例后 239 条空载 112.7 s，仍在 120 s 门槛内（机器有 20+ 后台负载时会量到 1471 s，那不是这份代码的耗时） |
 
 ## 9. 与 PRD 安全红线的差距
 
-PRD `06-nfr.md` §4 列了五条红线。凭据落盘（FR-OPS-09）与认证/RBAC（FR-OPS-02/03）
-补齐后，这一节只剩 TLS 一项仍在范围之外：
+PRD `06-nfr.md` §4 列了五条红线，本版全部满足。TLS（FR-OPS-10）不在五条红线里，
+但作为「网关直接对外」的部署前提也一并补齐：
 
 | 红线 | 首版 | 说明 |
 |---|---|---|
@@ -163,13 +163,14 @@ PRD `06-nfr.md` §4 列了五条红线。凭据落盘（FR-OPS-09）与认证/RB
 | 依赖含 GPL/AGPL | 满足 | — |
 | 诊断包含凭据 | 满足 | — |
 
-剩下的差距是**首版范围的取舍**：TLS（FR-OPS-10）仍由反向代理 / stunnel 终结，
-本仓库只监听明文端口。审计（FR-OPS-04）、认证（FR-OPS-02）与 RBAC（FR-OPS-03）
-均已在本版补齐并落盘。
+安全面上没有刻意留白的项：认证（FR-OPS-02/03）、审计（FR-OPS-04）、凭据落盘
+（FR-OPS-09）与 TLS（FR-OPS-10）都已在本版实现。剩下的差距是**协议范围的取舍**
+（S7、OPC UA 客户端、MQTT 南向，见 §3 与 §6）与依赖环境的三类故障注入（见
+[testing.md](testing.md)），不是安全红线。
 
 ## 10. 怎么用这份表
 
-- 评审时按行看「状态」列，不要按「需求优先级」看：`M` 里仍有刻意没做的（FR-OPS-10 TLS），`S`/`C` 里也有已实现的；
+- 评审时按行看「状态」列，不要按「需求优先级」看：`M` 里的 TLS 已在本版补齐，`S`/`C` 里也有已实现的；
 - 要复现某条证据：`dotnet run --project tests/Uic.Tests -- --filter <用例名>`；
 - 要补某条：先看「补法」，再看 [implementation-notes.md](implementation-notes.md) 的扩展点章节；
 - 新增 FR 或改变状态时，**同一提交里**更新这份表与 `testing.md` 的用例计数。

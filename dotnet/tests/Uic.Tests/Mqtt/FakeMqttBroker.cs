@@ -1,5 +1,8 @@
 using System.Net;
+using System.Net.Security;
 using System.Net.Sockets;
+using System.Security.Authentication;
+using System.Security.Cryptography.X509Certificates;
 using System.Text;
 
 namespace Uic.Tests;
@@ -11,8 +14,8 @@ namespace Uic.Tests;
 /// 这样才能把「客户端编码错了」和「测试也照着错」区分开。
 ///
 /// 覆盖 CONNECT / SUBSCRIBE / SUBACK / PUBLISH(QoS0/1) / PUBACK /
-/// PINGREQ / PINGRESP / DISCONNECT，不支持 TLS 与持久会话 ——
-/// 客户端本来也不做这些。
+/// PINGREQ / PINGRESP / DISCONNECT；传入证书时整条连接走 TLS
+/// （握手在测试里完成，报文层与明文路径完全相同）。不支持持久会话。
 /// </summary>
 internal sealed class FakeMqttBroker : IAsyncDisposable
 {
@@ -33,12 +36,13 @@ internal sealed class FakeMqttBroker : IAsyncDisposable
 
     private sealed class Connection
     {
-        public Connection(NetworkStream stream) => Stream = stream;
+        public Connection(Stream stream) => Stream = stream;
 
-        public NetworkStream Stream { get; }
+        public Stream Stream { get; }
         public SemaphoreSlim WriteLock { get; } = new(1, 1);
     }
 
+    private readonly X509Certificate2? _certificate;
     private readonly TcpListener _listener;
     private readonly CancellationTokenSource _cts = new();
     private readonly Task _accept;
@@ -54,8 +58,9 @@ internal sealed class FakeMqttBroker : IAsyncDisposable
     private int _pings;
     private int _nextPacketId;
 
-    public FakeMqttBroker()
+    public FakeMqttBroker(X509Certificate2? certificate = null)
     {
+        _certificate = certificate;
         _listener = new TcpListener(IPAddress.Loopback, 0);
         _listener.Start();
         Port = ((IPEndPoint)_listener.LocalEndpoint).Port;
@@ -132,7 +137,22 @@ internal sealed class FakeMqttBroker : IAsyncDisposable
 
         try
         {
-            await using var stream = client.GetStream();
+            Stream stream = client.GetStream();
+
+            if (_certificate is not null)
+            {
+                var ssl = new SslStream(stream, leaveInnerStreamOpen: false);
+                await ssl.AuthenticateAsServerAsync(new SslServerAuthenticationOptions
+                {
+                    ServerCertificate = _certificate,
+                    EnabledSslProtocols = SslProtocols.Tls12 | SslProtocols.Tls13,
+                    ClientCertificateRequired = false,
+                }, ct).ConfigureAwait(false);
+
+                stream = ssl;
+            }
+
+            await using var owned = stream;
             conn = new Connection(stream);
 
             var (header, payload) = await ReadPacketAsync(stream, ct).ConfigureAwait(false);
@@ -350,7 +370,7 @@ internal sealed class FakeMqttBroker : IAsyncDisposable
         return all;
     }
 
-    private static async Task<(byte Header, byte[] Payload)> ReadPacketAsync(NetworkStream stream, CancellationToken ct)
+    private static async Task<(byte Header, byte[] Payload)> ReadPacketAsync(Stream stream, CancellationToken ct)
     {
         var one = new byte[1];
         await stream.ReadExactlyAsync(one, ct).ConfigureAwait(false);
@@ -373,7 +393,7 @@ internal sealed class FakeMqttBroker : IAsyncDisposable
         return (header, payload);
     }
 
-    private static async Task WritePacketAsync(NetworkStream stream, byte header, byte[] body, CancellationToken ct)
+    private static async Task WritePacketAsync(Stream stream, byte header, byte[] body, CancellationToken ct)
     {
         var packet = new List<byte>(body.Length + 5) { header };
 

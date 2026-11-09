@@ -296,6 +296,7 @@ RTU/ASCII 主站按 3.5 个字符时间做帧间静默（9600 bps 约 4 ms；>19
 | `listen` | `0.0.0.0:8080` | `host:port`，端口 1..65535 |
 | `token` | 空 | 静态 API Token（给运维脚本用，全权限、不过期）；只能是凭据引用，见 [凭据](#凭据)。为空只表示「不提供静态令牌」——本地账号始终必需，不存在匿名访问 |
 | `staticRoot` | 空 | 前端静态目录；为空时用宿主目录下的 `wwwroot` |
+| `tls` | `{ "enabled": false }` | 内置 HTTPS，见 [`rest.tls`](#resttls) |
 
 ### `mqtt`
 
@@ -314,15 +315,63 @@ RTU/ASCII 主站按 3.5 个字符时间做帧间静默（9600 bps 约 4 ms；>19
 | `commands` | `false` | 打开下行命令通道（订阅 `commandTopic`） |
 | `commandTopic` | `{prefix}/{site}/$command` | 不能含 `{device}` / `{point}` |
 | `commandResultTopic` | `{prefix}/{site}/$command/result` | 必须与 `commandTopic` 不同 |
+| `tls` | `{ "enabled": false }` | 客户端 TLS，见 [`mqtt.tls`](#mqtttls) |
 
 主题模板必须含 `{device}` 与 `{point}`，且以 `topicPrefix` 开头或含 `{site}` ——
 否则同一套主题可能把两个站点的数据混在一起。
 
+### `rest.tls`
+
+| 字段 | 默认 | 说明 |
+|---|---|---|
+| `enabled` | `false` | 打开后 Kestrel 按 HTTPS 监听；端口仍取 `rest.listen` |
+| `certificateFile` | 空 | **必填**。PFX/P12，或含证书（与可选私钥）的 PEM |
+| `certificatePassword` | 空 | PFX 口令；只能是凭据引用，见 [凭据](#凭据) |
+| `keyFile` | 空 | PEM 私钥文件；证书自带私钥（PFX、或证书与私钥在同一个 PEM）时留空 |
+
+- 路径是**文件路径**，不是凭据：写成 `${env:...}` / `enc:v1:` 会被校验拒绝。
+  相对路径按 `storage.dataDir` 解析，与账号、审计、outbox 的基准一致；
+- 证书在启动时装载，读不出来按「配置非法」退出（退出码 2），不会带着明文端口继续跑；
+- 证书与监听地址的变更需要**重启**：它们属于 Kestrel 的启动参数，`config/apply` 只会
+  在日志里明确告警「REST 的 TLS 设置没有生效」；
+- 只做服务端证书，不做 mTLS（不校验客户端证书）。需要双向认证时在前置代理上做。
+
+```json
+{
+  "rest": {
+    "enabled": true,
+    "listen": "0.0.0.0:8443",
+    "tls": {
+      "enabled": true,
+      "certificateFile": "security/gateway.pfx",
+      "certificatePassword": "${env:UIC_TLS_PFX_PASSWORD}"
+    }
+  }
+}
+```
+
+### `mqtt.tls`
+
+| 字段 | 默认 | 说明 |
+|---|---|---|
+| `enabled` | `false` | 打开后整条连接走 TLS（通常接 Broker 的 8883） |
+| `caFile` | 空 | 自定义信任根（PEM）；为空时用系统信任库。自签 Broker 必须在这里给出 CA |
+| `insecureSkipVerify` | `false` | 跳过证书链与主机名校验；**只能联调**，且要求 `enabled: true` |
+
+- 校验服务端证书链与主机名；`caFile` 通过自定义信任根（`CustomRootTrust`）参与链构建，
+  不会因为「用了自签证书」就顺手关掉主机名校验；
+- `insecureSkipVerify: true` 启动时在日志里明确告警一次：流量加密了，但对端没有被认证；
+- CA 与开关的变更在 `config/apply` 时重建客户端并重连后生效（不需要重启进程）；
+- 只做服务端认证，不做客户端证书；MQTT 命令这一版没有用户身份，TLS 只保护链路。
+
 ## 凭据
 
-`northbound.rest.token` 与 `northbound.mqtt.password` 是凭据字段。配置文件里
-**不允许出现明文**：启动、`uic check`、`config/validate` 与 `config/apply`
-都会拒绝，并指出具体字段路径。
+凭据字段有三个：`northbound.rest.token`、`northbound.mqtt.password` 与
+`northbound.rest.tls.certificatePassword`。配置文件里**不允许出现明文**：
+启动、`uic check`、`config/validate` 与 `config/apply` 都会拒绝，并指出具体字段路径。
+
+证书文件与 CA 文件**不是**凭据，它们是文件路径：不要写成 `${env:...}`，否则校验会
+以「must be a file path」拒绝。路径可以相对 `storage.dataDir`。
 
 ### 三种写法
 
@@ -362,8 +411,9 @@ printf '%s' '...' | uic secret seal  # 输出 enc:v1:...，把它填进配置
 迁移方式：改成 `${env:...}` / `${file:...}`，或用 `uic secret seal` 加密。
 
 命令主题与结果主题同样以 `topicPrefix` 开头或含 `{site}`。`commands` 默认关闭：
-这一版 MQTT 只有匿名明文，开启前请确认 Broker 侧已经做了网络隔离或 ACL。
-即便打开，`config.rollback` 与 `outbox.drop` 也会被拒绝，只能走 REST。
+这一版 MQTT 命令没有用户身份（TLS 只保护链路，不认证发布者），开启前请确认
+Broker 侧已经做了网络隔离或 ACL。即便打开，`config.rollback` 与 `outbox.drop`
+也会被拒绝，只能走 REST。
 契约见 [northbound-api.md](northbound-api.md#下行命令可选)。
 
 ### `opcUa`
@@ -624,4 +674,10 @@ ok: ./gateway.json
   channels: 1, devices: 1, points: 2
   secret northbound.rest.token: environment variable UIC_REST_TOKEN
   secret northbound.mqtt.password: not set
+  secret northbound.rest.tls.certificatePassword: not set
+  northbound: rest(https://0.0.0.0:8443), mqtts(broker.local:8883)
 ```
+
+最后一行把**实际监听方案**写出来：`rest(...)` 带 `http://` 或 `https://`，
+`mqtt(...)` 与 `mqtts(...)` 区分是否走 TLS。部署评审看的是这一行，
+而不是「配了 8443 端口」这种猜测。

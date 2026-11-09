@@ -159,6 +159,11 @@ public sealed class GatewayRuntime : IGatewayControl, IAsyncDisposable
     public RingBufferLogProvider Logs => _ring;
     public AuditLog Audit => _audit;
     public AuthService Auth => _auth;
+
+    /// <summary>解析后的凭据。只在装配监听/客户端时读取，不会出现在任何响应里。</summary>
+    public ResolvedSecrets SecretValues => _secrets;
+
+    public string DataDir => _dataDir;
     public DateTimeOffset StartedAt => _startedAt;
     public LogLevelSwitch Level { get; private init; } = new();
 
@@ -287,6 +292,14 @@ public sealed class GatewayRuntime : IGatewayControl, IAsyncDisposable
                 _log.LogWarning(
                     "site changed from '{Old}' to '{New}'; northbound topics and API metadata keep the old value until restart",
                     before.Site, doc.Site);
+            }
+
+            // REST 的监听方案（http/https）与证书在进程启动时交给 Kestrel，
+            // 热更新改不了它；这里必须说出来，否则运维会以为证书已经换了。
+            if (!SameJson(before.Northbound.Rest.Tls, doc.Northbound.Rest.Tls))
+            {
+                _log.LogWarning(
+                    "rest.tls changed; the listener keeps its startup scheme and certificate until restart");
             }
 
             // 日志落盘设置可以在线切换；其它北向监听地址仍然要求重启。
@@ -484,7 +497,11 @@ public sealed class GatewayRuntime : IGatewayControl, IAsyncDisposable
                 // 配置文档本身保持不变（作业日志与导出里仍然是引用）。
                 var resolved = mqtt with { Password = _secrets.MqttPassword };
 
-                var sink = new MqttSink(resolved, config.Site, _logs.CreateLogger("uic.mqtt"));
+                // CA 读不出来是配置问题：在装配阶段就失败，而不是让重连线程
+                // 每 2 秒往日志里写一次握手错误。
+                if (resolved.Tls.Enabled) _ = Tls.LoadCustomRoots(resolved.Tls.CaFile, _dataDir);
+
+                var sink = new MqttSink(resolved, config.Site, _logs.CreateLogger("uic.mqtt"), _dataDir);
 
                 MqttCommandSink? commands = null;
                 if (mqtt.Commands)

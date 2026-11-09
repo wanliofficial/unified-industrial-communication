@@ -6,7 +6,10 @@ using Uic.Domain;
 namespace Uic.Config;
 
 /// <summary>解析后的凭据。只有真正需要明文的地方（鉴权、MQTT 握手）才用得到它。</summary>
-public sealed record ResolvedSecrets(string? RestToken, string? MqttPassword)
+public sealed record ResolvedSecrets(
+    string? RestToken,
+    string? MqttPassword,
+    string? RestCertificatePassword = null)
 {
     public static readonly ResolvedSecrets Empty = new(null, null);
 }
@@ -100,7 +103,9 @@ public static partial class Secrets
 
         return new ResolvedSecrets(
             ResolveValue(doc.Northbound.Rest.Token, "northbound.rest.token", lookup),
-            ResolveValue(doc.Northbound.Mqtt.Password, "northbound.mqtt.password", lookup));
+            ResolveValue(doc.Northbound.Mqtt.Password, "northbound.mqtt.password", lookup),
+            ResolveValue(doc.Northbound.Rest.Tls.CertificatePassword,
+                "northbound.rest.tls.certificatePassword", lookup));
     }
 
     /// <summary>只做校验，返回问题清单（配置校验端点与 <c>uic check</c> 用）。</summary>
@@ -112,6 +117,28 @@ public static partial class Secrets
 
         Check("northbound.rest.token", doc.Northbound.Rest.Token, problems, lookup);
         Check("northbound.mqtt.password", doc.Northbound.Mqtt.Password, problems, lookup);
+        Check("northbound.rest.tls.certificatePassword",
+            doc.Northbound.Rest.Tls.CertificatePassword, problems, lookup);
+
+        // 证书与 CA 不是凭据，是文件路径：只检查「能不能读到」，不要求写成引用。
+        // 相对路径按数据目录解析，与运行时保持一致。
+        var baseDir = doc.Storage.DataDir;
+        var restTls = doc.Northbound.Rest.Tls;
+
+        if (restTls.Enabled)
+        {
+            CheckFile("northbound.rest.tls.certificateFile", restTls.CertificateFile,
+                required: true, problems, lookup, baseDir);
+            CheckFile("northbound.rest.tls.keyFile", restTls.KeyFile,
+                required: false, problems, lookup, baseDir);
+        }
+
+        var mqttTls = doc.Northbound.Mqtt.Tls;
+        if (mqttTls.Enabled)
+        {
+            CheckFile("northbound.mqtt.tls.caFile", mqttTls.CaFile,
+                required: false, problems, lookup, baseDir);
+        }
 
         return problems;
     }
@@ -141,6 +168,7 @@ public static partial class Secrets
 
         Add("northbound.rest.token", doc.Northbound.Rest.Token);
         Add("northbound.mqtt.password", doc.Northbound.Mqtt.Password);
+        Add("northbound.rest.tls.certificatePassword", doc.Northbound.Rest.Tls.CertificatePassword);
 
         return lines;
     }
@@ -352,6 +380,29 @@ public static partial class Secrets
         problems.Add(new ValidationProblem(path,
             "plaintext credentials are not allowed; use ${env:NAME}, ${file:PATH} or enc:v1:... " +
             "(see `uic secret seal`)"));
+    }
+
+    /// <summary>配置文件路径：绝对路径原样使用，相对路径按数据目录解析（与运行时一致）。</summary>
+    public static string ResolvePath(string path, string dataDir)
+        => Path.IsPathRooted(path) ? path : Path.Combine(dataDir, path);
+
+    private static void CheckFile(
+        string path,
+        string? value,
+        bool required,
+        List<ValidationProblem> problems,
+        SecretLookup lookup,
+        string dataDir)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            if (required) problems.Add(new ValidationProblem(path, "required when TLS is enabled"));
+            return;
+        }
+
+        var full = ResolvePath(value, dataDir);
+        if (lookup.ReadFile(full) is null)
+            problems.Add(new ValidationProblem(path, $"file '{full}' is missing or unreadable"));
     }
 
     private static string? ResolveValue(string? value, string path, SecretLookup lookup)

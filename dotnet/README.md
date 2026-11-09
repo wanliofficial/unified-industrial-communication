@@ -135,6 +135,52 @@ uic check --config gateway.json                  # 逐项打印引用来源，�
 旧配置里的明文令牌仍能被**读**（迁移用），但 `check`、启动与 `config/apply` 都会
 拒绝它并指出字段路径；先用 `uic secret seal` 加密或改成环境变量引用即可。
 
+## TLS
+
+网关可以直接终结 TLS，也可以继续把它交给反向代理 / stunnel。两种都支持，选一种即可：
+
+```jsonc
+{
+  "rest": {
+    "listen": "0.0.0.0:8443",
+    "tls": {
+      "enabled": true,
+      "certificateFile": "security/gateway.pfx",
+      "certificatePassword": "${env:UIC_TLS_PFX_PASSWORD}"
+    }
+  },
+  "mqtt": {
+    "enabled": true,
+    "host": "broker.local",
+    "port": 8883,
+    "tls": { "enabled": true, "caFile": "security/broker-ca.pem" }
+  }
+}
+```
+
+- `rest.tls`：Kestrel 直接在 `rest.listen` 端口上监听 HTTPS；证书支持 PFX
+  （`certificateFile` + `certificatePassword`）与 PEM（`certificateFile` + `keyFile`）。
+  证书路径是文件路径，相对路径按 `storage.dataDir` 解析；PFX 口令仍是凭据引用。
+- `mqtt.tls`：客户端用 `SslStream` 校验服务端证书链与主机名；自签 Broker 把 CA
+  写成 PEM 放进 `caFile`。`insecureSkipVerify` 只用于联调，启动会告警。
+- 证书缺失、读不出来或口令不对，`uic check` 与启动都直接失败；启动按配置非法
+  退出（退出码 2），不会退回明文端口。
+- 证书与监听地址的变更需要重启，不走配置热更新。
+
+自签证书联调（生产请用内部 CA 签发，并在客户端侧用同一 CA 校验）：
+
+```bash
+openssl req -x509 -newkey rsa:2048 -nodes -days 825 \
+  -keyout gateway.key -out gateway.crt \
+  -subj "/CN=gateway.local" \
+  -addext "subjectAltName=DNS:gateway.local,IP:192.168.1.10"
+openssl pkcs12 -export -inkey gateway.key -in gateway.crt -out gateway.pfx
+
+ls -l gateway.pfx            # 放进 storage.dataDir（默认 ./data）下的 security/
+export UIC_TLS_PFX_PASSWORD='...'
+uic check --config gateway.json
+```
+
 ## 审计
 
 审计是「谁在什么时候改了什么」的落盘记录，和会轮转、会丢的日志分开：
@@ -170,7 +216,7 @@ dotnet run --project tests/Uic.Tests -- --opcua             # 额外跑 OPC UA �
 dotnet run --project tests/Uic.Tests -- --stop-on-fail
 ```
 
-正常情况下输出 `233 passed, 0 failed, 1 skipped`（跳过的是默认不启用的 OPC UA 用例）。
+正常情况下输出 `239 passed, 0 failed, 1 skipped`（跳过的是默认不启用的 OPC UA 用例）。
 黄金帧测试默认从仓库的 `testdata/golden/` 读取，可用 `UIC_TESTDATA` 指向别的目录。
 
 串口用例（T15–T18）会用 libc 开一对伪终端，在 Linux 上默认执行，其它平台报 `skip`；

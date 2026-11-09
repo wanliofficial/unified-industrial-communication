@@ -42,11 +42,31 @@ public sealed record RestOptions
     public bool Enabled { get; init; } = true;
     public string Listen { get; init; } = "0.0.0.0:8080";
 
-    /// <summary>Bearer Token。为空表示不启用认证（仅限本机调试，启动时会告警）。</summary>
+    /// <summary>
+    /// 静态 API Token（给运维脚本用，全权限、不过期）。为空只表示「不提供静态令牌」：
+    /// 本地账号始终必需，不存在匿名访问。
+    /// </summary>
     public string? Token { get; init; }
 
     /// <summary>静态前端资源目录；为空时由宿主内嵌资源提供。</summary>
     public string? StaticRoot { get; init; }
+
+    /// <summary>HTTPS。默认关闭：现场通常由反向代理终结 TLS，内置只服务「网关直接对外」的部署。</summary>
+    public RestTlsOptions Tls { get; init; } = new();
+}
+
+public sealed record RestTlsOptions
+{
+    public bool Enabled { get; init; }
+
+    /// <summary>PFX/P12 或 PEM 证书。相对路径按 <c>storage.dataDir</c> 解析。</summary>
+    public string? CertificateFile { get; init; }
+
+    /// <summary>PFX 口令。与其它凭据一样只接受引用（<c>${env:}</c> / <c>${file:}</c> / <c>enc:v1:</c>）。</summary>
+    public string? CertificatePassword { get; init; }
+
+    /// <summary>PEM 私钥文件；证书本身已含私钥（PFX）时留空。相对路径按 <c>storage.dataDir</c> 解析。</summary>
+    public string? KeyFile { get; init; }
 }
 
 public sealed record MqttOptions
@@ -69,8 +89,8 @@ public sealed record MqttOptions
     public bool PublishedSnapshotOnStart { get; init; } = true;
 
     /// <summary>
-    /// 是否开放下行命令（订阅 CommandTopic）。默认关闭：明文匿名通道上的
-    /// 写操作必须由部署方显式打开。
+    /// 是否开放下行命令（订阅 CommandTopic）。默认关闭：匿名通道上的写操作
+    /// 必须由部署方显式打开（TLS 只保护链路，不认证发布者）。
     /// </summary>
     public bool Commands { get; init; }
 
@@ -79,6 +99,23 @@ public sealed record MqttOptions
 
     /// <summary>命令结果主题模板。默认 {prefix}/{site}/$command/result。</summary>
     public string CommandResultTopic { get; init; } = "{prefix}/{site}/$command/result";
+
+    /// <summary>TLS。默认关闭；打开后 1883 端口不再可用，必须给 Broker 配证书。</summary>
+    public MqttTlsOptions Tls { get; init; } = new();
+}
+
+public sealed record MqttTlsOptions
+{
+    public bool Enabled { get; init; }
+
+    /// <summary>自定义 CA（PEM）。为空时用系统信任库；自签 Broker 必须在这里给出证书。</summary>
+    public string? CaFile { get; init; }
+
+    /// <summary>
+    /// 跳过证书链与主机名校验。只用于「临时连一台自签 Broker 做联调」，
+    /// 打开时启动日志会明确告警——它把 TLS 降级成加密但不认证对端。
+    /// </summary>
+    public bool InsecureSkipVerify { get; init; }
 }
 
 public sealed class OpcUaOptions

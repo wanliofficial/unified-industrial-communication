@@ -58,6 +58,9 @@
   `Flush(flushToDisk: true)`；记录配置变更、逐条写入（旧值 + 新值）、REST/MQTT 命令、
   登录/登出/改密/越权、账号变更与审计导出；`GET /api/v1/audit` 查询、`/api/v1/audit/export` 导出。
   写失败只告警并暴露指标，不阻断业务（`AuditLog` 在 `Uic.Obs`，选项在 `Uic.Domain`）。
+- **TLS**：REST 可在 Kestrel 上直接监听 HTTPS（PFX / PEM，PFX 口令只接受引用）；
+  MQTT 客户端用 `SslStream` 包裹，校验服务端证书链与主机名，自签 Broker 通过
+  `northbound.mqtt.tls.caFile` 走自定义信任根。证书与监听地址的变更需要重启。
 - **账号与权限**：本地账号库 `data/security/users.json`（PBKDF2-SHA256 / 210k 迭代 /
   每账号随机盐 / 原子替换写盘）；首次启动生成随机 `admin` 口令并强制改密；会话 Token
   内存保存 12 小时；四个内置角色（`admin` / `operator` / `viewer` / `auditor`）与九项权限，
@@ -84,11 +87,10 @@
 | OPC UA 签名/加密 | 证书生命周期（签发、轮换、吊销、信任列表）是独立的运维负担 | 配置里已显式拒绝非 `None`，加实现时同步放开校验 |
 | OPC UA 用户认证 | 没有用户后端，匿名读 + 可选匿名写足够覆盖调试场景 | 接 `IUserIdentityValidator` |
 | MQTT QoS2 | 现场 QoS1 + 持久化队列已经够用，QoS2 的握手复杂度不划算 | 在 `MqttClient` 里加 PUBREL 状态机 |
-| MQTT TLS / WebSocket | 证书轮换与代理终结是部署问题，客户端只做明文发布 | 用 stunnel / 反向代理终结 TLS；确需内置时在 `MqttClient` 上接 `SslStream` |
-| MQTT 命令的 ACL 与跨重启幂等 | 这一版只有匿名明文，幂等窗口在进程内，重启即清空；命令本身已进审计 | 在 Broker 侧做主题 ACL 与 TLS；需要跨重启幂等时把幂等台账落到外部存储 |
+| MQTT WebSocket | 现场 Broker 走原生 TCP；浏览器不直连 MQTT，控制台只走 REST/SSE | 在 `MqttClient` 的连接建立处换成 WebSocket 传输 |
+| MQTT 命令的 ACL 与跨重启幂等 | MQTT 命令这一版没有用户身份（TLS 只保护链路，不认证发布者），幂等窗口在进程内，重启即清空；命令本身已进审计 | 在 Broker 侧做主题 ACL；需要跨重启幂等时把幂等台账落到外部存储 |
 | 多协议（S7 / OPC DA / IEC 104 …） | 首版把一条链路的每一层都做透，比铺开十个半成品有用 | 见下「扩展点」 |
 | S7comm 主站、OPC UA 客户端、MQTT 南向取数 | **这三项在 PRD 里是 M 级要求，本版本没做**（不是 §6.1 的不做项）；驱动边界已收窄到 `IDriver`/`IConn`，补一个协议不需要动调度与北向 | 按 [protocol-status.md](protocol-status.md) 的五步接入，并补黄金帧 |
-| TLS 终结 | REST/MQTT 都是明文端口，证书轮换也是独立运维负担 | 由反向代理 / stunnel 终结 TLS；确需内置时在 Kestrel 绑 `https`，`MqttClient` 接 `SslStream` |
 | 报警引擎与专用时序库 | 报警需要独立的状态机（阈值、抑制、确认）；专用时序库需要保留策略与索引，塞进采集进程会把边缘设备压垮 | 历史查询已先用 journal NDJSON 做了「时间范围 + 降采样 + 分页」的轻量实现（FR-NOR-08）；报警与更高数据量的保留策略仍按 PRD 路线图 Wave 2 单独立项 |
 | 计算点 / 订阅型协议（COV、事件、通知） | 计算点依赖「输入质量传播」的产品定义；订阅型协议在 Wave 2 | `Pipeline` 已留出质量传播点；驱动侧 `Capabilities.Subscribe` 已是四态声明，接入时按 `RuntimeDependent` 逐步放开 |
 | Sparkplug B、进程外驱动 | PRD §6.1 明确列为不做；进程外驱动需要稳定的 IPC 契约与进程生命周期管理 | Sparkplug 可作为一个 MQTT sink；进程外驱动按 `IDriver` 的进程内形状定义 IPC 协议后再拆 |
