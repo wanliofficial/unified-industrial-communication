@@ -3288,7 +3288,7 @@ curl -s -X POST -H 'Authorization: Bearer dev-token-0123456789' \
 | `codec/snmp` | GET/应答金帧、INTEGER 最短编码与负数、无符号前导零（`0x80000000`）、OID base-128（`2.39.1`→`77 01`）、OID 排序与前缀、非法 OID、版本解析（v3 拒绝）、异常标记只允许出现在应答、GetBulk 线格式、错误码分类、字符串/字节值、截断错误可识别 |
 | `driver/snmp` | 五种线类型解码、MultiRead 一条 GET、按 maxOids 与字节预算分批（顺序不变、每条 ≤1400 字节）、v1 `noSuchName` 逐点重发、写类型映射与回显校验、类型/范围拒绝不发包、9 种 error-status 分类、SET 回显被收敛、Probe 接受异常标记/超时提示、request-id 陈旧应答丢弃、链路失败停止后续批次、坏地址与线类型不符、Counter64 精度边界、`GetRaw`/`Walk`（子树边界、max、v1 表尾） |
 | `sim/snmp` | 真实 UDP 回环：GET 与计数器、错 community 静默、v1/v2c 缺 OID 差异、GETNEXT 遍历与表尾、GETBULK 三行递增、SET 可写与回读、只读/类型错/不存在、SET 原子性、坏报文与非请求丢弃、`Set`/`SetWritable`/`Close` 幂等 |
-| 点表/规划 | `PolicyFor("snmp")` 只允许 symbol、selector/寄存器/对象地址在导入期拒绝、`examples/snmp.json` 通过 `-check`（18 个驱动） |
+| 点表/规划 | `PolicyFor("snmp")` 只允许 symbol、selector/寄存器/对象地址在导入期拒绝、`examples/snmp.json` 通过 `-check`（19 个驱动） |
 | `cmd/uic` | `-set` 值解析（bool/int/uint/string/bytes、进制、越界、float/BCD 拒绝）、`snmpRow` 的 raw/error 显示 |
 
 ### 3.10.13 ADS/AMS（TCP 48898）
@@ -3604,7 +3604,7 @@ result，没有回显），但缓存里的值要等下一轮采集才刷新；�
 | `codec/ads` | AMS/TCP 与 AMS 头金帧（HandleByName `MAIN.nCounter`）、两层长度一致性、reserved 非零拒绝、NetID 解析（6 段/0..255/非法）、7 类请求构造、Read/Write/ReadWrite/DeviceInfo/State/Control 应答解析、错误码分类与临时性、Command/State 字符串 |
 | `driver/ads` | 真实 TCP 回环：9 种类型读写、数组与字符串、地址/权限/宽度错误逐点隔离、坏 NetId/端口、握手超时、Close 幂等、句柄失效重解析（读与写）、类型范围/小数/BCD/字符串 NUL 拒绝、脚本化服务端：临时 AMS 错误重试、通知帧与陈旧 invoke 丢弃、畸形帧、句柄 0/短句柄、设备信息/状态/控制的 AMS 错误与短载荷、ctx 超时、拨号失败 |
 | `sim/ads` | 真实 TCP 回环：默认变量表、GET/PUT 夹具、句柄分配/释放/失效、只读与宽度校验、数组仅 `[2]` 可写、字符串/浮点、错误 NetId/端口、未知命令、通知不应答、畸形载荷、坏帧断链后仍可服务、Close 幂等 |
-| 点表/规划 | `PolicyFor("ads")` 只允许 symbol、`NAME:81` 与 length 列、`MAIN.arr[2]` 保留在 path、寄存器/selector 在导入期拒绝、`examples/ads.json` 通过 `-check`（18 个驱动） |
+| 点表/规划 | `PolicyFor("ads")` 只允许 symbol、`NAME:81` 与 length 列、`MAIN.arr[2]` 保留在 path、寄存器/selector 在导入期拒绝、`examples/ads.json` 通过 `-check`（19 个驱动） |
 | `cmd/uic` | `-symbol` 声明解析（类型/长度/错误写法）、`-set` 值解析（bool/int/uint/float/string/bytes、进制、越界、BCD 拒绝）、`-control` 映射、行显示与错误质量 |
 
 ### 3.10.14 DNP3（IEEE 1815：三层链路 + 类轮询 + 直接控制，TCP 20000）
@@ -3965,6 +3965,375 @@ curl -s -X POST -H 'Authorization: Bearer dev-token-0123456789' \
 | `driver/dnp3` | 真实 TCP 回环：复位 + 总召唤 + 静态值、双点中间态 uncertain、事件轮询与主站应用层确认（inflight 清零）、质量映射三态、CROB 写/读回、模拟量写、只读区拒绝、未知输出索引被从站拒绝、`Probe`、`Close` 后读失败、配置校验（地址范围/主从相同/轮询参数/传输/区/类型）、无 ACK 超时有限、并发 Read 与后台轮询（`-race`） |
 | `sim/dnp3` | 静态编码 → 主站解析的往返自洽（15 个对象逐一比对），专门抓「编码少一个字节 / 解析多读一个字节」的错位 |
 | `cmd/uic` | `-probe`/`-index`/`-raw`/`-json`、`-binary`/`-analog` 解析与错误写法、`-master`/`-unit` 范围与相同地址拒绝、行显示 |
+
+### 3.10.15 CoAP（UDP 资源模型：GET/PUT/POST + 分块接收 + 资源发现，端口 5683）
+
+CoAP 与前面所有协议都不同：它没有「寄存器地址」，也没有「对象索引」，它的数据模型
+是 **URI 资源**。一个点位就是一个路径（`/sensors/temp`），或者一个路径加一个字段
+（`/sensors/env` + `temperature`）。这带来两个直接后果：第一，点表评审时要问的不是
+「偏移量对不对」，而是「这个 URI 在设备上真的存在吗」；第二，`Read` 无法批量，因为
+每个点位都是一次独立的 HTTP 式请求。
+
+本节的写法与 DNP3 那节一致：先讲边界，再讲线格式里真正会踩的坑，最后讲读、写、
+错误分类与自检。CoAP 看起来简单（四个字节的头 + 文本载荷），但它的**选项编码、
+分块续读与分离响应**三处都能让实现「连得上、读得到第一条、然后偶发超时」。
+
+#### 3.10.15.1 范围：只做明文 UDP 主站
+
+| 做 | 不做 | 原因 |
+|---|---|---|
+| UDP 明文 CoAP | DTLS（加密传输） | DTLS 需要证书/预共享密钥、握手状态机与重放窗口，是一个独立子系统；本平台的安全边界放在北向与网络分段，而不是在每个南向驱动里各做一套 |
+| GET / PUT / POST | DELETE、FETCH、iPATCH | 网关的语义是「采集 + 下发」，删除资源与部分更新属于配置工具的动作，不该由采集进程发起 |
+| Block2 分块**接收** | Block1 分块**发送** | 读取大 JSON 文档是常态；写入超过单包大小的资源需要服务端配合的分块确认，现场极少见，做半套比不做更危险 |
+| `/.well-known/core` 资源发现 | Observe 订阅 | 订阅要长期维护观察关系、通知序号与重连后的重新注册；用周期 GET 已能满足采集，订阅留给后续独立实现 |
+| Content-Format：text/plain、application/json、application/octet-stream | CBOR、SenML 等其它格式 | 前三种覆盖了现场绝大多数设备；其它格式先明确报「不支持」，不猜结构 |
+| 单播 | 组播发现、CoAP over TCP | 组播发现需要网络侧配合与去重策略；本平台面向点对点采集 |
+
+能力声明必须与实现一致：`Subscribe` 与 `Browse` 都声明为不支持。把 Observe 标成
+「支持」而实际只做一次性 GET，会让上层以为推送可用，然后在「为什么值不更新」上
+浪费一整天。
+
+#### 3.10.15.2 报文头只有四个字节，但有两套标识
+
+```
+ 0                   1                   2                   3
++-------+-------+-------+-------+-------+-------+-------+-------+
+| Ver   | Type  |  TKL  |      Code     |            MID            |
++-------+-------+-------+-------+-------+-------+-------+-------+
+|                       Token (TKL 字节，0..8)                      |
++---------------------------------------------------------------+
+|                         Options ...                           |
++---------------------------------------------------------------+
+| 0xFF (仅当有载荷) |                  Payload                   |
++---------------------------------------------------------------+
+```
+
+- `Ver` 固定 1；`TKL` 是 Token 长度，0..8，超过 8 直接判为畸形；
+- `Type`：CON=0（需要 ACK）、NON=1（不需要 ACK）、ACK=2（确认一条 CON）、RST=3（拒绝）；
+- `Code`：请求 `0.01` GET、`0.02` POST、`0.03` PUT、`0.04` DELETE；响应 `2.01` 创建、
+  `2.04` 变更、`2.05` 内容；错误 `4.00` 请求错误、`4.02` 坏选项、`4.03` 禁止、
+  `4.04` 不存在、`4.05` 方法不允许、`4.06` 不可接受、`4.12` 前置条件失败、
+  `4.13` 实体过大、`4.15` 不支持的格式；服务端侧 `5.00`、`5.03`；
+- `MID` 是**报文**标识（16 位，用于 ACK/RST 与去重），`Token` 是**事务**标识（用于把
+  响应配给请求）。两者不是一回事：ACK 必须回显请求的 MID，但响应可以带新的 MID
+  （分离响应）仍然用同一个 Token。
+
+把 MID 当事务 ID，会在「空 ACK + 分离响应」的场景下把真正的响应当成迟到包丢掉；
+把 Token 当报文 ID，则无法正确回 ACK。本实现的规则是：**ACK/RST 看 MID，业务响应
+看 Token**。
+
+#### 3.10.15.3 选项编码：delta 与 length 的扩展字节顺序
+
+选项区是 CoAP 最容易写错的地方。每个选项头一个字节：
+
+```
+ 高 4 位：delta（选项号相对前一个选项号的差值）
+ 低 4 位：length（选项值长度）
+```
+
+`0..12` 直接表示；`13` 表示「后面再跟 1 字节，实际值 = 13 + 该字节」；`14` 表示
+「后面再跟 2 字节（大端），实际值 = 269 + 该值」；`15` 是保留值，出现在 delta 位置
+表示「载荷标记」（`0xFF`），出现在 length 位置是畸形。
+
+两个坑：
+
+1. **扩展字节的顺序是先 delta 后 length。** 当两者都需要扩展时，先写 delta 的扩展
+   字节，再写 length 的扩展字节，最后才是选项值。反过来写会让解析器从第二个选项
+   开始读垃圾——而垃圾往往还能解析成一个「看起来合法」的选项号，所以不会立刻报错。
+2. **delta 是相对值，不是绝对选项号。** 重复的 Uri-Path 选项 delta 为 0，这是合法
+   且常见的（路径有多段）。把 delta 当绝对值会让 `/sensors/temp` 的第二段解析成
+   某个完全不同的选项。
+
+本仓库的编解码测试对每个分支都钉了金字节，包括「delta 需要 1 字节扩展」「delta 需要
+2 字节扩展」「length 需要 2 字节扩展」「两者同时扩展」与「重复选项 delta=0」。
+
+#### 3.10.15.4 三种「收到」：ACK、RST 与分离响应
+
+一次 CON 请求的正常路径是「请求 → ACK 搭载响应」。但 CoAP 允许服务端先回一条
+**空 ACK**（证明请求已被接受、别重发），过一会儿再用一条新的 CON 把真正的响应发回来。
+这就是分离响应（separate response）。
+
+| 收到的报文 | 含义 | 驱动动作 |
+|---|---|---|
+| ACK + MID 匹配 + 空 Code | 请求已接受，响应稍后到 | 停止重传，延长等待窗口，继续读 |
+| ACK + MID 匹配 + 2.xx/4.xx/5.xx | 搭载响应 | 校验 Token 后返回 |
+| CON + Token 匹配 + 响应码 | 分离响应 | 回一条空 ACK，然后返回 |
+| RST + MID 匹配 | 对端拒绝 | 立即失败，归类 `protocol`，不重试同一请求 |
+| CON + Token 不匹配 | 与本次事务无关（迟到响应或通知） | 回 RST 让对方停止重传，**继续等自己的响应** |
+| 解析失败 | 垃圾报文 | 计数后跳过，不影响当前事务 |
+
+最后两条是稳定性关键。UDP 上「上一次超时后迟到的响应」很常见；如果把它当成当前
+响应，或者因为它解析失败就让整次读失败，采集会在弱网下随机抖动。驱动为此维护一个
+`BadDatagrams` 计数，测试可以直接断言「坏包被跳过而不是让请求失败」。
+
+#### 3.10.15.5 地址语义：`path` 是资源，`selector` 是字段
+
+点位用 `kind=symbol` 寻址：
+
+| 字段 | 含义 |
+|---|---|
+| `address.path` | 资源路径，例如 `/sensors/env`；省略前导斜杠会被补上 |
+| `address.selector` | 响应为 JSON 时取哪个字段，支持 `a.b` 与 `a[0]`；留空表示整个文档 |
+| `address.length` | `bytes`/`string` 的接收上限（字节），0 表示不限制 |
+
+路径里不允许出现 `?query`：查询串会让「同一路径不同参数」变成两个资源，而平台的点位
+模型没有参数维度。需要查询参数的设备应在网关外侧做适配，而不是把参数塞进路径。
+
+同一个 `path + selector` 可以挂多个点位（例如同一份 JSON 文档里的温度与状态），驱动
+按点位逐次 GET——它**不做响应缓存**：同一轮采集里两个点位读同一个路径，就会发两次
+请求。这是刻意的取舍：缓存会引入「两份数据谁更新」的问题，而 CoAP 资源通常是几百
+字节，多一次往返的代价远小于一次脏读。
+
+#### 3.10.15.6 Content-Format：按声明解码，不猜
+
+`Content-Format`（选项号 12）是一个整数：
+
+| 值 | 媒体类型 | 本实现的处理 |
+|---|---|---|
+| 0 | `text/plain` | 按点位类型走文本规则（与 MQTT 共用同一套「文本 → 平台值」解析） |
+| 40 | `application/link-format` | 只用于资源发现 |
+| 42 | `application/octet-stream` | `bytes` 原样收；`string` 按字面字节转字符串；数值类型明确报错 |
+| 50 | `application/json` | 按 `selector` 取字段，再按点位类型解码 |
+| 60 | `application/cbor` | 明确报「不支持」，不尝试猜结构 |
+
+缺省（响应里没有 Content-Format）按 `text/plain` 处理，这是现场最常见的写法。
+
+「按声明解码」不是一句口号。一个 `Content-Format=50` 的响应里出现 `"42"` 是 JSON
+**字符串**，不是数字；按文本解析会把引号一起变成 `string` 点位的值。反过来，一个
+没有 Content-Format 的 `{"a":1}` 会按文本处理，`string` 点位拿到的是整段原文——这
+也是正确行为，因为设备没有声明它是 JSON。
+
+JSON 的标量规则集中在 `internal/codec/textval`，MQTT 与 CoAP 共用：布尔接受
+`true/false/on/off/1/0`（大小写不敏感），数值接受十进制与科学计数法，字符串接受
+JSON 字符串或裸文本。把这条规则复制两份，迟早会出现「同样的 `"on"` 在 MQTT 里是
+`true`、在 CoAP 里报错」的分裂。
+
+#### 3.10.15.7 Block2：由服务端决定分块，客户端只续读
+
+大于单包容量的资源用 Block2 选项分块。选项值是一个 32 位整数：
+
+```
+NUM << 4 | M << 3 | SZX
+```
+
+`NUM` 是块号，`M=1` 表示后面还有块，`SZX` 决定块大小 `1 << (SZX + 4)`（16..1024）。
+注意 `SZX` 不是块大小本身，而是它的对数下标；把 `SZX=2` 当成 2 字节会让续读永远
+对不上偏移。
+
+本实现的策略：
+
+1. **首个请求默认不带 Block2**，让服务端决定是否分块、用什么块大小。对「不支持
+   Block2」的极简服务端最友好。
+2. 响应里出现 Block2 且 `M=1` 时，按服务端给出的块号与大小继续取；每块的偏移必须
+   等于已收字节数，否则报「块乱序」而不是把数据拼错。
+3. 设备标签 `blockSize` 可以指定首块就请求的大小（16..1024 的 2 的幂）。用于「服务端
+   默认块太大、设备 MTU 撑不住」的场景。
+4. 若服务端对带 Block2 的请求回 `4.02`（坏选项），驱动**退回不带 Block2 再取一次**，
+   而不是把 `4.02` 当成资源不存在。这条降级路径有专门的测试与内置服务端的
+   `DisableBlock2` 模式。
+5. 重组上限 8 MiB 与块数上限同时存在：即使每块只有 16 字节，也不会无限循环。
+
+拼装完成后，驱动把 Block2 选项从「首条响应」里剥掉再交给解码器——保留它会让上层
+以为这是一条未完成的分块响应。
+
+#### 3.10.15.8 重传：指数退避，且必须尊重设备级超时
+
+UDP 没有连接，丢包只能靠重传。设备标签：
+
+| 标签 | 默认 | 范围 | 说明 |
+|---|---|---|---|
+| `ackTimeout` | `2s` | 100ms..30s，且必须 ≤ `device.timeout` | 首次等待 ACK 的时长 |
+| `maxRetransmit` | `4` | 0..8 | 重传次数；0 表示只发一次 |
+| `blockSize` | `0` | 0 或 16/32/…/1024 | 首选块大小，0 表示跟随服务端 |
+
+第 `n` 次重传的等待窗口是 `ackTimeout * 2^n`，并同时受 `ctx` 截止时间约束：
+
+- **不受 ctx 约束的重传会把一轮采集拖成 N 倍超时。** 设备级 `timeout` 是整轮采集的
+  预算，越过它只会让剩余点位全部变成 `context done`。
+- **收到空 ACK 后不再重传。** 请求已被接受，重发只会让服务端执行两次。此时只延长
+  等待窗口等分离响应；窗口用 `ackTimeout` 而不是翻倍值，避免一次分离响应把整轮采集
+  拖死。
+- **ctx 已取消时一个字节都不发。** 这不是优化，而是语义：上层明确不要这次采集了，
+  驱动不应该再产生网络流量。测试直接断言「取消后写次数为 0」。
+
+#### 3.10.15.9 写：PUT 是替换整个资源，JSON 只发子树
+
+写方法由设备标签 `writeMethod` 决定：`put`（默认）或 `post`。绝大多数执行器用 PUT；
+POST 用于「提交/触发」型资源，它不幂等，重发会产生两次动作——这也是驱动在重传上
+必须谨慎的原因。
+
+载荷格式由 `contentFormat` 决定：
+
+| 格式 | 请求 Content-Format | 语义 |
+|---|---|---|
+| `text` | 0 | 值的文本表示，例如 `42`、`true`、`manual` |
+| `json` | 50 | JSON 标量；带 `selector` 时包成 `{"a":{"b":值}}` |
+| `octets` | 42 | `bytes`/`string` 点位的字面字节 |
+
+JSON 写入的语义必须说清楚：**PUT 是替换整个资源，不是合并。** 带 `selector` 时驱动
+只发送 `{selector: value}` 这一棵子树，因此点位的 `selector` 应当与设备资源的字段
+粒度一致；资源是多字段文档时，应把 `selector` 留空并让点位对应整个文档。
+
+驱动刻意**不做「先读回来再合并」**：那会在一次写里偷偷插入一次读，失败模式
+（读成功、写失败、读到旧值）远比现在复杂，而且会掩盖「设备要求整文档替换」这个
+事实。
+
+**数组下标写入显式拒绝。** `selector` 里出现 `[` 或 `]` 时直接返回
+`unsupported`：PUT 会替换整个数组，而我们只知道一个下标，发送 `{"values":[1]}` 会
+把其余元素抹掉。与其替用户猜「其余元素怎么办」，不如让他配置整个数组资源。
+
+写成功后返回 `good`，而不是 `uncertain`：响应码 `2.xx` 就是「服务端已接受」的证据。
+这与 DNP3 的直接控制回显同理；IEC 104 标 `uncertain` 是因为突发上送可能比确认更早
+到达，CoAP 没有这条通路。网关的通用写入路径仍会在 `confirm=false` 时统一标
+`uncertain`，那是运行时层的行为，与驱动无关。
+
+#### 3.10.15.10 读：逐点串行，链路失败后短路
+
+`Read` 对每个点位发一次 GET，串行执行。CoAP 没有「批量读」的标准手段：
+
+- 每个资源一个 URI，没有「读一段地址」的请求；
+- 即使多个点位指向同一个路径，驱动也不做响应缓存（见 3.10.15.5）。
+
+串行而不是并发，是因为一个 `conn` 只有一条 UDP 套接字与一套 MID/Token 计数器，
+并发读需要额外的配对表与锁；而现场单设备的点位通常只有几十个，一次往返 10ms
+量级，串行的总时长仍在采集周期内。并发读的测试只验证「多个 goroutine 调用 `Read`
+不会数据竞争」，内部仍然由一把锁排队。
+
+链路级失败（超时、断开）后，**剩余点位直接标同一个错误并结束**，不再逐个等超时。
+这一条在多点位设备上非常关键：否则一个掉线的设备会让一轮采集变成「点位数 ×
+超时」。地址级失败（`4.04`、类型不匹配）只影响当前点位，后面的点位继续读。
+
+#### 3.10.15.11 发现与探测：两件不同的事
+
+| 动作 | 请求 | 判据 | 用途 |
+|---|---|---|---|
+| `Probe` | `GET /.well-known/core` + Accept: link-format | 2.xx / 3.xx / 4.xx 都算存活，只有 5.xx 失败 | 判断「链路是否活着」 |
+| `Discover` | 同上，但解析响应 | 必须是合法 link-format | 列出设备发布了哪些资源 |
+
+`Probe` 把 4.xx 也算存活，是因为「这个端点不支持资源发现」恰恰证明它是一个活着的
+CoAP 端点。只认 2.xx 会让大量不实现发现的老设备永远显示「离线」。5.xx 是服务端自己
+出错，重试才有意义，所以算失败。
+
+`Discover` 返回 `[{path, params}]`，其中 `params` 是 link-format 的属性（`rt` 资源
+类型、`ct` Content-Format、`if` 接口等）。初次接一台陌生设备时先跑
+`coapread -discover`，看清资源清单再写点表——这比拿一份猜出来的 URI 表去试要快
+得多，也避免把「路径写错」误判成「设备没数据」。
+
+#### 3.10.15.12 错误分类
+
+| 现象 | `ErrorKind` | 可重试 | 是否计入熔断 |
+|---|---|---|---|
+| 拨号失败、UDP 读写失败、链路被丢弃 | `disconnected` | 是 | 是 |
+| 超时（含重传耗尽）、ctx 取消 | `timeout` | 是 | 是 |
+| 对端 RST | `protocol` | 否（同请求重发无意义） | 否 |
+| `4.04` 不存在 | `address` | 否 | **否** |
+| `4.03` 禁止、`4.01` 未认证 | `permission` | 否 | 否 |
+| `4.02` 坏选项、`4.05` 方法不允许、`4.06` 不可接受、`4.15` 格式不支持 | `unsupported` | 否 | 否 |
+| `4.00` 请求错误、`4.12` 前置条件失败、`4.13` 实体过大 | `protocol` | 否 | 否 |
+| `5.00`、`5.03` | `protocol` | **是** | 是 |
+| 配置错误（传输不是 UDP、标签非法、地址非法、类型不支持） | `unsupported` / `address` | 否 | — |
+| 解码失败（JSON 非法、字段缺失、类型不匹配、长度超限） | `internal`（点位级） | 否 | 否 |
+
+`4.04` 不计入熔断是刻意的：配置里写错一个路径，不应该让整台设备被判死。`5.xx`
+计入熔断，因为它是服务端持续不可用，继续打只会加重问题。
+
+#### 3.10.15.13 能力边界（刻意的）
+
+| 不做 | 理由 |
+|---|---|
+| DTLS | 证书/密钥管理 + 握手状态机 + 防重放窗口，独立子系统 |
+| Observe 订阅 | 需要长期维护观察关系、通知序号与重连后重新注册 |
+| Block1 分块发送 | 需要服务端配合的逐块确认；现场写入极少超过单包，半套实现比不做更危险 |
+| CBOR / SenML | 结构复杂，先明确报「不支持」，不猜 |
+| DELETE / FETCH / iPATCH | 配置工具动作，不属于采集进程 |
+| 组播发现 | 需要网络侧配合与去重策略 |
+| 响应缓存 | 引入「两份数据谁更新」的问题，多一次往返可接受 |
+| JSON 读-改-写 | 隐藏的读会带来更复杂的失败模式，且掩盖「整文档替换」语义 |
+
+#### 3.10.15.14 位置与自检
+
+| 内容 | 路径 |
+|---|---|
+| 编解码 | `internal/codec/coap`（`Encode`/`Decode`、选项 delta/length、`EncodeUint`/`DecodeUint`、`EncodeBlock`/`DecodeBlock`、`SplitURI`、`ParseLinkFormat`） |
+| 主站驱动 | `internal/driver/coap`（`Meta`/`Open`/`Probe`/`Read`/`Write`/`Discover`；内部 `roundTrip`/`get`/`decodeValue`/`encodeWritePayload`/`jsonWritePayload`/`pathOptions`；诊断 `BadDatagrams`） |
+| 共享解码 | `internal/codec/textval`（文本/JSON 标量 → 平台值；MQTT 与 CoAP 共用） |
+| 内置服务端 | `internal/sim/coap`（`NewServer`/`NewServerWithOptions`/`Addr`/`SetValue`/`Value`/`Resources`/`Requests`/`Writes`/`BlockGets`/`BadPackets`/`SeparateAcked`/`Close`） |
+| CLI | `uic coapread`（`-addr`/`-path`/`-selector`/`-type`/`-timeout`/`-block`/`-probe`/`-discover`/`-write`/`-payload`/`-method`/`-content-format`/`-json`/`-raw`） |
+| 示例 | `examples/coap.json`（3 台设备 12 点位，REST 8099，服务端 5683） |
+
+内置服务端的默认资源与示例配置一一对应：
+
+| 路径 | 格式 | 初值 | 方法 | 行为 |
+|---|---|---|---|---|
+| `/sensors/temp` | text/plain | `21.5` | GET | 静态 |
+| `/sensors/humidity` | text/plain | `45.0` | GET | 静态 |
+| `/sensors/env` | application/json | `{"temperature":21.5,"humidity":45.0,"pressure":1013.25,"ok":true}` | GET | 可配合 `selector` |
+| `/actuator/valve` | text/plain | `false` | GET/PUT | 布尔执行器 |
+| `/actuator/setpoint` | text/plain | `0` | GET/PUT | 数值设定值 |
+| `/actuator/trigger` | text/plain | `false` | GET/POST | POST 触发（不幂等） |
+| `/config` | application/json | `{"mode":"auto","threshold":10}` | GET/PUT | JSON 配置文档 |
+| `/blob` | application/octet-stream | `00 01 02 ff` | GET | 二进制资源 |
+| `/large` | text/plain | 3000 字节 | GET | Block2 分块（默认 128 字节/块） |
+| `/separate` | text/plain | `7.5` | GET | 空 ACK + 分离响应 |
+| `/reset` | text/plain | `x` | GET | 回 RST |
+| `/.well-known/core` | application/link-format | 资源清单 | GET | 发现入口（不列出自己） |
+
+服务端的 MID 去重是这套自检最重要的一条性质：同一个客户端用同一个 MID 重发 CON 时，
+服务端**重发同一条响应，不重新执行**。写请求不幂等，没有这条缓存，「客户端以为丢了、
+补发一次」就会变成「阀门动作了两次」。测试用 PUT 两次同 MID、断言写计数只加一。
+
+自检链路（无硬件，UDP 回环）：
+
+```bash
+./uic sim -protocol coap -listen 127.0.0.1:5683 &
+./uic coapread -addr 127.0.0.1:5683 -probe
+# 链路正常: 127.0.0.1:5683（/.well-known/core 有响应）
+
+./uic coapread -addr 127.0.0.1:5683 -discover
+# 设备 127.0.0.1:5683 发布 11 个资源
+# 路径                            资源类型              格式
+# /sensors/temp                   temperature           0
+# /sensors/env                    environment           50
+# ...
+
+./uic coapread -addr 127.0.0.1:5683 -path /sensors/temp
+# /sensors/temp = 21.5（good）
+
+./uic coapread -addr 127.0.0.1:5683 -path /sensors/env -selector temperature
+# /sensors/env = 21.5（good）
+
+./uic coapread -addr 127.0.0.1:5683 -path /actuator/setpoint -write 42
+# OK   PUT /actuator/setpoint
+
+./uic coapread -addr 127.0.0.1:5683 -path /config -selector mode \
+  -type string -content-format json -write manual
+# OK   PUT /config
+```
+
+示例配置带上网关跑真实采集：
+
+```bash
+./uic -config examples/coap.json
+curl -s -H 'Authorization: Bearer dev-token-0123456789' localhost:8099/api/v1/points
+curl -s -X POST -H 'Authorization: Bearer dev-token-0123456789' \
+  -H 'Content-Type: application/json' \
+  -d '{"value":{"type":"float64","num":55.5}}' \
+  localhost:8099/api/v1/points/coap-sensors/setpoint/write
+```
+
+写接口默认返回 `quality: uncertain`（运行时在 `confirm=false` 时统一把乐观更新标为
+uncertain，等下一轮采集确认）；加 `"confirm":true` 时会立刻回读一次，读到一致值就
+转 `good`。这与 IEC 104 / DNP3 的写入语义保持一致。
+
+测试矩阵（当前覆盖）：
+
+| 层 | 用例 |
+|---|---|
+| `codec/coap` | 头字段与 TKL 边界、Token 8 字节、选项 delta/length 的 0..12/13/14 扩展与两种同时扩展、重复 Uri-Path（delta=0）、`15` 保留值拒绝、uint 编解码边界、Block2 `NUM/M/SZX` 往返与非法 SZX、URI 拆分（有无 scheme/端口/查询）、link-format 解析（带引号属性、空清单、缺 `>`） |
+| `codec/textval` | 文本/JSON 标量 → bool/各宽度整数/浮点/字符串/bytes、`on/off`、科学计数法、越界、`a.b` 与 `a[0]` selector、非整数方括号按字段名处理、整文档紧凑化 |
+| `driver/coap` | 真实 UDP 回环：纯文本/布尔/JSON selector/整文档/octets 读、Block2 3000 字节重组、服务端不认 Block2 时降级、分离响应 + 回 ACK、RST 分类、`4.04` 地址错误不计熔断、混合成功与失败、PUT/POST/JSON 子树/octets 写入与回读、数组下标拒绝、只读资源拒绝、`Probe`/`Discover`、超时重传次数（`maxRetransmit` 0/2）、ctx 取消零发送、坏包跳过、无关 CON 回 RST、读错误后重连、`Close` 幂等、并发 Read、配置校验表、标签默认值与别名 |
+| `sim/coap` | CON/NON 响应类型与 MID 规则、同 MID 去重（写不重复执行）、Block2 多块与越界 `4.02`、`4.04`/`4.05`、Block1 `4.02`、空载荷 `4.00`、发现清单自洽（自动续块、不列自己、`rt`/`ct` 正确）、分离响应 + ACK、RST、畸形计数、块大小参数与非法回落 |
+| `cmd/uic` | `-discover`/`-probe`/读/写/`-json`/`-raw` 的显示、`-type` 与 `-block` 校验、`-content-format` 归一化、文本值解析 |
 
 ### 3.11 计算点（`computed`）
 

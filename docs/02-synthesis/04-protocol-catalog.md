@@ -150,7 +150,7 @@
 |---|---|---|---|---|---|---|---|---|
 | **MQTT 3.1.1/5.0** | C/V/B | TCP/TLS/WS | Topic | 27 | PA-06、PA-08 | 2 | **P0** | QoS 1/2 语义、会话保持、遗嘱消息、主题通配符、5.0 属性 |
 | **Sparkplug B** | C | MQTT | Topic + Protobuf | 3 | PA-06、PA-08 | 3 | P1 | 生命周期（NBIRTH/NDEATH/DBIRTH/DDATA）；状态管理；序列号与重生 |
-| **CoAP** | C/S | UDP/DTLS | URI 路径 | 4 | PA-06 | 3 | P2 | 分块传输、观察（Observe）、确认/非确认消息 |
+| **CoAP** | C/S | UDP/DTLS | URI 路径 | 4 | PA-06 | 3 | P2 | 分块传输、观察（Observe）、确认/非确认消息；本仓库已实现明文 UDP 主站 + GET/PUT/POST + Block2 接收 + 资源发现，Observe/DTLS/Block1 发送不做 |
 | **SNMP v1/v2c/v3** | M | UDP | OID | 2 | PA-06、PA-34 | 2 | P2 | v1 无 per-varbind 异常（批量 `noSuchName` 需逐点重发）；v3 的 USM 认证加密；表遍历（Walk）；OID 语义需 MIB |
 | **HTTP/REST** | C/V | TCP/TLS | URL + JSON | 12 | PA-06、PA-34、PA-37 | 1 | **P0** | 幂等性、分页、限流、鉴权、错误码规范 |
 | **Roblox/Redfish（BMC）** | C | HTTPS | 资源路径 | 1 | PA-08 | 2 | X | 服务器带外管理，非工业现场 |
@@ -273,13 +273,23 @@ MC 3E、FINS、EtherNet/IP + CIP、BACnet/IP、IEC 104、DL/T 645、CJ/T 188、A
 
 IEC 61850、DNP3、SECS/GEM、KNX、CoAP、Mewtocol、Host Link、MTConnect、IEC 101、MS/TP。
 
-> 截至当前实现：DNP3 已落地（编解码 + 主站 + 内置从站 + `uic dnp3read` +
-> `examples/dnp3.json`）。只做 TCP 主站、类 0 总召唤、类 1/2/3 事件轮询、CROB 与
-> 组 41 直接控制、未请求响应的接收与确认；不做串口、安全认证、文件传输、时间同步
-> 写路径、SBO 两段式控制。三层协议最难的不是字段编码，而是**三种确认不能漏**：
-> 链路 ACK、传输分片重组、应用层 CON。漏掉应用层确认会让从站事件缓冲区被重发撑爆，
-> 现场表现为「跑了几小时后全是旧值」。另外两个线格式陷阱——双点静态量是 2 位/点、
-> 静态变体 2 只有「状态+品质」字节而没有独立位图——都已用往返自洽测试钉死。
+> 截至当前实现：DNP3 与 CoAP 已落地。
+>
+> **DNP3**（编解码 + 主站 + 内置从站 + `uic dnp3read` + `examples/dnp3.json`）：只做
+> TCP 主站、类 0 总召唤、类 1/2/3 事件轮询、CROB 与组 41 直接控制、未请求响应的接收
+> 与确认；不做串口、安全认证、文件传输、时间同步写路径、SBO 两段式控制。三层协议最
+> 难的不是字段编码，而是**三种确认不能漏**：链路 ACK、传输分片重组、应用层 CON。
+> 漏掉应用层确认会让从站事件缓冲区被重发撑爆，现场表现为「跑了几小时后全是旧值」。
+> 另外两个线格式陷阱——双点静态量是 2 位/点、静态变体 2 只有「状态+品质」字节而没有
+> 独立位图——都已用往返自洽测试钉死。
+>
+> **CoAP**（编解码 + 主站 + 内置服务端 + `uic coapread` + `examples/coap.json`）：只做
+> 明文 UDP 主站、GET/PUT/POST、Block2 分块接收、`/.well-known/core` 资源发现；不做
+> DTLS、Observe 订阅、Block1 分块发送、CBOR。它的难点不在「发一个 GET」，而在
+> **报文标识与事务标识要分开**（ACK/RST 看 MID、业务响应看 Token）、**选项 delta 是
+> 相对值且扩展字节先 delta 后 length**、以及**收到空 ACK 后只能等分离响应、不能重发**。
+> Block2 的首请求默认不带选项，由服务端决定块大小；服务端回 `4.02` 时退回一次。
+> JSON 写入只发 selector 子树，不做隐藏的读-改-写。
 
 **明确不做**：PROFINET IO、PROFIBUS、CANopen、CC-Link、FOCAS、DALI、LonWorks、DDS、EtherCAT、HART、GB/T 28181、Euromap、Matter、LoRaWAN、OCPP、Redfish。
 

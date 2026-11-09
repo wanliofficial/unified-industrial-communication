@@ -168,7 +168,7 @@ curl -N localhost:8080/api/v1/stream?points=virtual-01/sine
 
 | 类别 | 内容 |
 |---|---|
-| 协议 | IEC 61850、DNP3（已落地，主站 + 内置从站 + `dnp3read` + 示例）、SECS/GEM、KNX、CoAP、Mewtocol、Host Link、MTConnect、IEC 101、BACnet MS/TP |
+| 协议 | IEC 61850、DNP3（已落地，主站 + 内置从站 + `dnp3read` + 示例）、SECS/GEM、KNX、CoAP（已落地，主站 + 内置服务端 + `coapread` + 示例）、Mewtocol、Host Link、MTConnect、IEC 101、BACnet MS/TP |
 | 架构 | 进程外驱动（gRPC）、驱动市场（签名/版本/兼容性）、多实例协调 |
 | 集中管理 | 中心聚合器（只读镜像 + 配置下发 + 批量升级 + 站点分组） |
 | 灰度 | 配置分批下发、观察窗口、自动暂停 |

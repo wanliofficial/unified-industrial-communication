@@ -450,7 +450,7 @@ BACnet、IEC 104、DL/T 645、MC、FINS、EtherNet/IP；OPC DA 桥接；Sparkplu
 
 ### 6.3 P2（第二年）
 
-IEC 61850、DNP3（已落地，主站 + 内置从站 + `dnp3read` + 示例）、SECS/GEM、KNX/CoAP/SNMP；脚本沙箱；边缘规则 DSL；离线升级；多站点集中管理；国际化；灰度下发。
+IEC 61850、DNP3（已落地，主站 + 内置从站 + `dnp3read` + 示例）、SECS/GEM、KNX、CoAP（已落地，主站 + 内置服务端 + `coapread` + 示例）、SNMP；脚本沙箱；边缘规则 DSL；离线升级；多站点集中管理；国际化；灰度下发。
 
 ### 6.4 明确不做（X）
 

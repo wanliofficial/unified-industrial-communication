@@ -430,6 +430,45 @@ false、2（合）→ true、0/3（中间态/不确定）→ false + uncertain�
 （组、变体、原始品质位、时标），初次接陌生设备时先看清「它到底送哪些对象」，再写点表。
 带 `-raw` 时把组/变体与原始 flags 一起打出来，便于和生产方对账。
 
+CoAP（UDP 资源模型，端口 5683）：
+
+```bash
+./uic sim -protocol coap -listen 127.0.0.1:5683 &   # 内置 CoAP 服务端
+./uic -config examples/coap.json
+curl -s -H 'Authorization: Bearer dev-token-0123456789' localhost:8099/api/v1/points
+#   12 点：纯文本温度/湿度、JSON 文档字段（temperature/ok）、
+#          可 PUT 的阀门与设定值、POST 触发器、bytes 资源、
+#          3000 字节大资源（Block2 续读）、分离响应资源
+#   自检（不需要网关）：./uic coapread -addr 127.0.0.1:5683 -discover
+#   只验链路：./uic coapread -addr 127.0.0.1:5683 -probe
+#   写设定值：./uic coapread -addr 127.0.0.1:5683 -path /actuator/setpoint -write 42
+#   写 JSON 字段：./uic coapread -addr 127.0.0.1:5683 -path /config \
+#                   -selector mode -type string -content-format json -write manual
+```
+
+CoAP 的数据模型是 **URI 资源**，不是寄存器：点位用 `kind=symbol` 寻址，`path` 是资源
+路径（`/sensors/env`），`selector` 是 JSON 文档里的字段（`temperature`、`a.b`、
+`a[0]`），`address.length` 限制 `string`/`bytes` 的接收字节数。同一个路径可以挂多个
+点位（读不同字段），驱动按点位逐次 GET，不做响应缓存。
+
+读取按响应里的 `Content-Format` 解码，不猜：`text/plain` 走与 MQTT 共用的文本规则，
+`application/json` 按 selector 取字段后再按点位类型解码，`application/octet-stream`
+只交给 `bytes`/`string`，CBOR 等其它格式明确报「不支持」。没有 `Content-Format`
+时按纯文本处理。大资源用 Block2 分块：首个请求默认不带选项、由服务端决定块大小，
+驱动按偏移逐块续读并校验「块号 × 块大小 == 已收字节数」；服务端对 Block2 回 `4.02`
+时退回不带选项再取一次。重组上限 8 MiB，块数也有上限。
+
+重传是 CoAP 的稳定性核心：`ackTimeout`（默认 2s）逐次翻倍，`maxRetransmit`（默认 4，
+0 表示只发一次），且等待窗口永远不越过设备级 `timeout`。收到空 ACK 表示「请求已接受、
+别重发」，此时只等分离响应；分离响应若是 CON 则回空 ACK。与本事务无关的 CON（迟到
+响应或通知）回 RST 让对方停止重传，垃圾报文只计数不失败。
+
+写入用 PUT（默认）或 POST：PUT 是**替换整个资源**，带 `selector` 时只发
+`{selector: value}` 这棵子树；驱动刻意不做隐藏的读-改-写，数组下标写入直接拒绝
+（否则会把其余元素抹成 null）。载荷格式由 `contentFormat` 选 text/json/octets，
+`text` 与 `octets` 的宽度规则与读取一致。不做 DTLS、不做 Observe 订阅、不做 Block1
+分块发送——能力声明里 `Subscribe` 是 `unsupported`，不把「一次性 GET」伪装成推送。
+
 DL/T 645-2007 多功能电能表（RS-485 / 串口服务器）：
 
 ```bash
@@ -575,7 +614,7 @@ go test -race -count=1 ./...
 
 | 路径 | 内容 |
 |---|---|
-| `cmd/uic/` | 单入口：`run` / `sim`（Modbus / S7 / OPC UA / MQTT / MC / FINS / EtherNet-IP / BACnet-IP / IEC 104 / DNP3 / 645 / 188 / SNMP / ADS）/ `mbread` / `mcread` / `finsread` / `enipread` / `bacread` / `iec104read` / `dnp3read` / `dlt645read` / `cjt188read` / `snmpread` / `adsread` / `uaread` / `s7blocks` / `s7upload` / `instantiate` / `import` / `token` / `-check` / `version` |
+| `cmd/uic/` | 单入口：`run` / `sim`（Modbus / S7 / OPC UA / MQTT / MC / FINS / EtherNet-IP / BACnet-IP / IEC 104 / DNP3 / CoAP / 645 / 188 / SNMP / ADS）/ `mbread` / `mcread` / `finsread` / `enipread` / `bacread` / `iec104read` / `dnp3read` / `coapread` / `dlt645read` / `cjt188read` / `snmpread` / `adsread` / `uaread` / `s7blocks` / `s7upload` / `instantiate` / `import` / `token` / `-check` / `version` |
 | `internal/model` | 通道 / 设备 / 点位 / 地址 / 采样 / 质量码 |
 | `internal/driver` | 驱动契约（Codec / Transport / Driver）、错误分类、注册表、只读 `Lookup` 注入 |
 | `internal/calc` | 零依赖表达式引擎（编译期类型检查、短路求值、引用 `device:point`） |
@@ -597,6 +636,10 @@ go test -race -count=1 ./...
 | `internal/codec/dnp3` | DNP3 纯函数编解码（链路帧与 CRC / 流式收帧 / 传输分片重组 / 应用层请求响应 / 对象解析 / 请求头 / CROB 与组 41 构造） |
 | `internal/driver/dnp3` | DNP3 主站（复位链路 + TEST_LINK、类 0/1/2/3 轮询、未请求响应、应用层确认、CROB 与模拟量直接控制、旁路表） |
 | `internal/sim/dnp3` | DNP3 内置从站（链路 ACK / 类 0 静态快照 / 三类事件队列与 inflight / CROB 与组 41 直接控制回显） |
+| `internal/codec/coap` | CoAP 纯函数编解码（4 字节头 / 选项 delta-len 扩展 / uint 与 Block 编解码 / URI 拆分 / link-format 解析） |
+| `internal/codec/textval` | 文本/JSON 标量 → 平台值（MQTT 与 CoAP 共用的类型规则；selector 取字段） |
+| `internal/driver/coap` | CoAP 主站（GET/PUT/POST、Block2 续读与降级、分离响应、指数重传、资源发现、坏包跳过） |
+| `internal/sim/coap` | CoAP 内置服务端（CON/NON / MID 去重 / Block2 / 分离响应 / RST / link-format 发现） |
 | `internal/codec/dlt645` | 645-2007 纯函数编解码（帧/校验和 / 数据标识 DI 表 / 压缩 BCD 与小数位 / 时间与地址 / 收帧扫描 / 后续帧序号） |
 | `internal/driver/dlt645` | 645 主站（RS-485 与串口服务器双承载、总线锁、逐点读 + 后续帧、写权限四道闸门、错误分类） |
 | `internal/sim/dlt645` | 645 内置从站（按标准宽度回数据 / 地址过滤 / 后续帧拆分 / 写权限与密码 / 广播校时静默生效 / 拉合闸） |

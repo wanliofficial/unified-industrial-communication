@@ -22,13 +22,12 @@ package mqtt
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	"uic/internal/codec/textval"
 	"uic/internal/driver"
 	"uic/internal/model"
 	"uic/internal/mqtt"
@@ -522,187 +521,21 @@ func (c *conn) Close() error {
 // 判断依据是「selector 是否为空」而不是「载荷像不像 JSON」：一个纯文本
 // 载荷恰好是 `123`，按 JSON 解析会得到数字，按文本解析会得到 "123"，
 // 两者对 string 点位的结果不同。由配置显式决定，比猜更可靠。
+//
+// 具体的类型规则在 codec/textval（CoAP 也用它），这里只负责选对入口。
 func decodePayload(payload []byte, ps *pointState) (model.Value, error) {
 	raw := payload
 	if ps.selector != "" {
-		v, err := selectJSON(payload, ps.selector)
+		v, err := textval.Select(payload, ps.selector)
 		if err != nil {
 			return model.Value{}, err
 		}
 		raw = v
 	}
-	return decodeScalar(raw, ps.dataType)
-}
-
-// selectJSON 按点分路径取 JSON 字段，支持 `a.b` 与 `a[0]`。
-func selectJSON(payload []byte, selector string) ([]byte, error) {
-	var doc any
-	dec := json.NewDecoder(strings.NewReader(string(payload)))
-	dec.UseNumber()
-	if err := dec.Decode(&doc); err != nil {
-		return nil, fmt.Errorf("payload is not valid JSON: %w", err)
-	}
-
-	cur := doc
-	for _, seg := range splitSelector(selector) {
-		// 先按键名下钻，再按下标取元素。`values[0]` 必须两步都做：
-		// 只做下标会把「文档本身」当成数组，于是报出一个很奇怪的类型错。
-		if seg.name != "" {
-			obj, ok := cur.(map[string]any)
-			if !ok {
-				return nil, fmt.Errorf("selector %q: %q is not an object", selector, seg.name)
-			}
-			next, ok := obj[seg.name]
-			if !ok {
-				return nil, fmt.Errorf("selector %q: field %q not found", selector, seg.name)
-			}
-			cur = next
-		}
-		if seg.index != nil {
-			arr, ok := cur.([]any)
-			if !ok {
-				return nil, fmt.Errorf("selector %q: %q is not an array", selector, seg.name)
-			}
-			i := *seg.index
-			if i < 0 || i >= len(arr) {
-				return nil, fmt.Errorf("selector %q: index %d out of range (%d)", selector, i, len(arr))
-			}
-			cur = arr[i]
-		}
-	}
-
-	switch v := cur.(type) {
-	case nil:
-		return nil, fmt.Errorf("selector %q: value is null", selector)
-	case string:
-		return []byte(v), nil
-	case bool:
-		return []byte(strconv.FormatBool(v)), nil
-	case json.Number:
-		return []byte(v.String()), nil
-	default:
-		// 对象/数组作为叶子值：按紧凑 JSON 返回，由字符串类型接收。
-		b, err := json.Marshal(v)
-		if err != nil {
-			return nil, err
-		}
-		return b, nil
-	}
-}
-
-type selSeg struct {
-	name  string
-	index *int
-}
-
-// splitSelector 把 "a.b[0].c" 拆成 [{a} {b,0} {c}]。
-func splitSelector(s string) []selSeg {
-	var out []selSeg
-	for _, part := range strings.Split(s, ".") {
-		if part == "" {
-			continue
-		}
-		name := part
-		var idx *int
-		if i := strings.IndexByte(part, '['); i >= 0 && strings.HasSuffix(part, "]") {
-			name = part[:i]
-			if n, err := strconv.Atoi(part[i+1 : len(part)-1]); err == nil {
-				idx = &n
-			}
-		}
-		if name == "" && idx == nil {
-			continue
-		}
-		out = append(out, selSeg{name: name, index: idx})
-	}
-	return out
-}
-
-// decodeScalar 把一段文本转成目标类型的平台值。
-func decodeScalar(raw []byte, dt model.DataType) (model.Value, error) {
-	s := strings.TrimSpace(string(raw))
-	if s == "" {
-		return model.Value{}, fmt.Errorf("empty payload")
-	}
-	switch dt {
-	case model.TypeBool:
-		switch strings.ToLower(s) {
-		case "true", "1", "on", "yes":
-			return model.BoolValue(true), nil
-		case "false", "0", "off", "no":
-			return model.BoolValue(false), nil
-		}
-		return model.Value{}, fmt.Errorf("cannot parse %q as bool", s)
-	case model.TypeString:
-		return model.TextValue(model.TypeString, s), nil
-	case "":
-		// 未声明类型时按内容猜：整数 → int64，小数 → float64，其余 → string。
-		return guessValue(s)
-	}
-	n, err := strconv.ParseFloat(s, 64)
-	if err != nil {
-		return model.Value{}, fmt.Errorf("cannot parse %q as %s", s, dt)
-	}
-	// 越界判错而不是截断：与 OPC UA 侧保持同一条纪律。
-	if err := checkRange(dt, n); err != nil {
-		return model.Value{}, err
-	}
-	return model.NumValue(dt, n), nil
-}
-
-// guessValue 在没有声明类型时按内容推断。
-func guessValue(s string) (model.Value, error) {
-	if i, err := strconv.ParseInt(s, 10, 64); err == nil {
-		return model.NumValue(model.TypeInt64, float64(i)), nil
-	}
-	if f, err := strconv.ParseFloat(s, 64); err == nil {
-		return model.NumValue(model.TypeFloat64, f), nil
-	}
-	return model.TextValue(model.TypeString, s), nil
-}
-
-// checkRange 校验数值能否被目标类型无损承载。
-func checkRange(dt model.DataType, n float64) error {
-	bad := func(lo, hi float64) error {
-		if n < lo || n > hi {
-			return fmt.Errorf("value %g out of range for %s", n, dt)
-		}
-		return nil
-	}
-	switch dt {
-	case model.TypeInt16:
-		return bad(-32768, 32767)
-	case model.TypeUint16, model.TypeBCD16:
-		return bad(0, 65535)
-	case model.TypeInt32:
-		return bad(-2147483648, 2147483647)
-	case model.TypeUint32, model.TypeBCD32:
-		return bad(0, 4294967295)
-	case model.TypeFloat32:
-		return bad(-3.4028234663852886e38, 3.4028234663852886e38)
-	}
-	return nil
+	return textval.Decode(raw, ps.dataType)
 }
 
 // encodePayload 把平台值编成发布载荷。
 func encodePayload(v model.Value, dt model.DataType) ([]byte, error) {
-	t := dt
-	if t == "" {
-		t = v.Type
-	}
-	switch t {
-	case model.TypeBool:
-		return []byte(strconv.FormatBool(v.Bool)), nil
-	case model.TypeString:
-		return []byte(v.Text), nil
-	}
-	n, ok := v.AsFloat()
-	if !ok {
-		return nil, fmt.Errorf("cannot encode %s value as %s", v.Type, t)
-	}
-	if t == model.TypeFloat32 || t == model.TypeFloat64 {
-		return []byte(strconv.FormatFloat(n, 'g', -1, 64)), nil
-	}
-	// 整数：不要输出 `42.000000`，很多设备侧的解析器不接受。
-	return []byte(strconv.FormatInt(int64(n), 10)), nil
+	return textval.Encode(v, dt)
 }

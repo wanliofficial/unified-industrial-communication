@@ -18,6 +18,8 @@
 //	uic bacread -addr 127.0.0.1:47808 -type analog-input -instance 1  # BACnet/IP 自检
 //	uic iec104read -addr 127.0.0.1:2404 -ca 1   # IEC 60870-5-104 自检（总召唤 + 上送对象）
 //	uic dnp3read -addr 127.0.0.1:20000 -probe   # DNP3 自检（链路复位 + 总召唤 + 对象清单）
+//	uic coapread -addr 127.0.0.1:5683 -discover # CoAP 自检（资源发现 / 读写）
+//	uic sim -protocol coap -listen 127.0.0.1:5683  # 内置 CoAP 服务端（UDP）
 //	uic snmpread -addr 127.0.0.1:16161 -oid 1.3.6.1.2.1.1.1.0   # SNMP v1/v2c 自检
 //	uic adsread -addr 127.0.0.1:48898 -probe   # ADS/AMS 自检（设备信息握手）
 //	uic uaread -addr 127.0.0.1:4840 -nodes ns=2;s=site/dev/point  # OPC UA 读写自检
@@ -58,6 +60,7 @@ import (
 	adssim "uic/internal/sim/ads"
 	bacnetsim "uic/internal/sim/bacnet"
 	cjt188sim "uic/internal/sim/cjt188"
+	coapsim "uic/internal/sim/coap"
 	dlt645sim "uic/internal/sim/dlt645"
 	dnp3sim "uic/internal/sim/dnp3"
 	enipsim "uic/internal/sim/enip"
@@ -100,6 +103,8 @@ func main() {
 		iec104readCmd(args)
 	case "dnp3read":
 		dnp3readCmd(args)
+	case "coapread":
+		coapreadCmd(args)
 	case "dlt645read":
 		dlt645readCmd(args)
 	case "cjt188read":
@@ -137,7 +142,7 @@ func usage() {
 用法:
   uic [run] -config config.json [-listen :8080] [-token TOKEN]
   uic -check -config config.json
-  uic sim [-listen 127.0.0.1:15020] [-protocol modbus|s7|opcua|mqtt|mc|fins|enip|bacnet|iec104|dnp3|dlt645|cjt188|snmp|ads]
+  uic sim [-listen 127.0.0.1:15020] [-protocol modbus|s7|opcua|mqtt|mc|fins|enip|bacnet|iec104|dnp3|coap|dlt645|cjt188|snmp|ads]
   uic mbread -addr 127.0.0.1:1502 -unit 1 -area holding -offset 0 -qty 2
   uic mbread -addr 127.0.0.1:1502 -area holding -offset 5 -write 777
   uic mcread -addr 127.0.0.1:5000 -area d -offset 100 -qty 2
@@ -152,6 +157,11 @@ func usage() {
   uic iec104read -addr 127.0.0.1:2404 -area single-command -cmd-ioa 4001 -write on
   uic dnp3read -addr 127.0.0.1:20000 [-index 0,1] [-json] [-raw]
   uic dnp3read -addr 127.0.0.1:20000 -binary 0=on -analog 0=12.5
+  uic coapread -addr 127.0.0.1:5683 -path /sensors/temp [-type float64] [-json]
+  uic coapread -addr 127.0.0.1:5683 -path /sensors/env -selector temperature
+  uic coapread -addr 127.0.0.1:5683 -discover
+  uic coapread -addr 127.0.0.1:5683 -path /actuator/setpoint -write 42
+  uic coapread -addr 127.0.0.1:5683 -path /config -selector mode -write manual -content-format json
   uic dlt645read -addr 127.0.0.1:14001 -address 000000000042 -di 00000000,02010100
   uic dlt645read -transport serial -port /dev/ttyUSB0 -baud 2400 -address 0042 -probe
   uic dlt645read -addr 127.0.0.1:14001 -address 42 -di 04000101 -write 20261107120000
@@ -479,7 +489,7 @@ func simCmd(args []string) {
 	fs := flag.NewFlagSet("sim", flag.ExitOnError)
 	addr := fs.String("listen", "127.0.0.1:15020", "监听地址")
 	size := fs.Int("size", 1024, "寄存器数量")
-	proto := fs.String("protocol", "modbus", "从站协议：modbus | s7 | opcua | mqtt | mc | fins | enip | bacnet | iec104 | dlt645 | cjt188 | snmp | ads")
+	proto := fs.String("protocol", "modbus", "从站协议：modbus | s7 | opcua | mqtt | mc | fins | enip | bacnet | iec104 | dnp3 | coap | dlt645 | cjt188 | snmp | ads")
 	pdu := fs.Int("pdu", 480, "S7 协商 PDU 长度（240/480/960）")
 	fs.Parse(args)
 
@@ -511,6 +521,9 @@ func simCmd(args []string) {
 	case "dnp3":
 		simDNP3(*addr)
 		return
+	case "coap":
+		simCoAP(*addr)
+		return
 	case "dlt645":
 		simDLT645(*addr)
 		return
@@ -525,7 +538,7 @@ func simCmd(args []string) {
 		return
 	case "modbus":
 	default:
-		fmt.Fprintf(os.Stderr, "未知协议 %q（支持 modbus | s7 | opcua | mqtt | mc | fins | enip | bacnet | iec104 | dnp3 | dlt645 | cjt188 | snmp | ads）\n", *proto)
+		fmt.Fprintf(os.Stderr, "未知协议 %q（支持 modbus | s7 | opcua | mqtt | mc | fins | enip | bacnet | iec104 | dnp3 | coap | dlt645 | cjt188 | snmp | ads）\n", *proto)
 		os.Exit(2)
 	}
 
@@ -918,6 +931,39 @@ func simDNP3(addr string) {
 	fmt.Println("  analog-input:    [0]=42.5 [1]=7.25 [2]=-3.5 [3]=1234（类2）")
 	fmt.Println("  analog-output:   [0]=0（可组 41 直接控制）")
 	fmt.Printf("  自检：   uic dnp3read -addr %s\n", srv.Addr())
+	fmt.Println("  Ctrl+C 停止")
+
+	<-ctx.Done()
+	slog.Info("sim_stopped")
+}
+
+// simCoAP 启动内置 CoAP 服务端（明文 UDP 5683）。
+//
+// 初始值与 examples/coap.json 一一对应：先起这个服务端，再跑
+// `./uic -config examples/coap.json`，就能看到 text/JSON/selector/bytes
+// 与可写资源都被正常采集。`/large` 有 3000 字节，用来观察 Block2 续读；
+// `/separate` 先回空 ACK 再发分离响应；`/reset` 用来观察 RST 分类。
+func simCoAP(addr string) {
+	srv, err := coapsim.NewServer(addr)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "启动 CoAP 服务端失败: %v\n", err)
+		os.Exit(1)
+	}
+	defer func() { _ = srv.Close() }()
+
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	fmt.Printf("coap server listening on %s\n", srv.Addr())
+	fmt.Println("  /sensors/temp=21.5  /sensors/humidity=45.0（text/plain）")
+	fmt.Println("  /sensors/env={\"temperature\":21.5,...}（application/json，可用 selector）")
+	fmt.Println("  /actuator/valve=false  /actuator/setpoint=0（可 PUT）")
+	fmt.Println("  /actuator/trigger=false（可 POST）  /config={...}（可 PUT，JSON）")
+	fmt.Println("  /blob=0x000102ff（application/octet-stream）")
+	fmt.Println("  /large=3000 字节（Block2，块大小 128）  /separate（空 ACK + 分离响应）")
+	fmt.Println("  /reset（回 RST）  /.well-known/core（资源发现）")
+	fmt.Printf("  自检：   uic coapread -addr %s -discover\n", srv.Addr())
+	fmt.Printf("           uic coapread -addr %s -path /actuator/setpoint -write 42\n", srv.Addr())
 	fmt.Println("  Ctrl+C 停止")
 
 	<-ctx.Done()

@@ -1,0 +1,215 @@
+{
+  "schemaVersion": 1,
+  "site": "coap-lab",
+  "server": {
+    "listen": "127.0.0.1:8099",
+    "token": "dev-token-0123456789"
+  },
+  "storage": {
+    "dir": "./data-coap",
+    "journal": true,
+    "outboxMaxRecords": 5000,
+    "outboxTtl": "10m"
+  },
+  "logging": {
+    "level": "info"
+  },
+  "northbound": {
+    "webhook": {
+      "enabled": false,
+      "url": "http://127.0.0.1:9999/ingest",
+      "timeout": "3s"
+    }
+  },
+  "channels": [
+    {
+      "id": "ch-coap",
+      "protocol": "coap",
+      "transport": {
+        "kind": "udp",
+        "address": "127.0.0.1:5683"
+      },
+      "concurrency": 1,
+      "timeout": "5s"
+    }
+  ],
+  "devices": [
+    {
+      "id": "coap-sensors",
+      "name": "内置 CoAP 服务端（传感器，text/plain）",
+      "channel": "ch-coap",
+      "interval": "2s",
+      "timeout": "5s",
+      "enabled": true,
+      "labels": {
+        "contentFormat": "text",
+        "writeMethod": "put",
+        "ackTimeout": "2s",
+        "maxRetransmit": "4"
+      },
+      "points": [
+        {
+          "id": "temp",
+          "name": "温度（纯文本 21.5）",
+          "address": {
+            "kind": "symbol",
+            "path": "/sensors/temp"
+          },
+          "dataType": "float64",
+          "unit": "degC",
+          "enabled": true
+        },
+        {
+          "id": "humidity",
+          "name": "湿度（纯文本 45.0）",
+          "address": {
+            "kind": "symbol",
+            "path": "/sensors/humidity"
+          },
+          "dataType": "float32",
+          "unit": "%RH",
+          "enabled": true
+        },
+        {
+          "id": "env-temp",
+          "name": "环境温度（JSON 字段 temperature）",
+          "address": {
+            "kind": "symbol",
+            "path": "/sensors/env",
+            "selector": "temperature"
+          },
+          "dataType": "float64",
+          "unit": "degC",
+          "enabled": true
+        },
+        {
+          "id": "env-ok",
+          "name": "环境状态（JSON 字段 ok）",
+          "address": {
+            "kind": "symbol",
+            "path": "/sensors/env",
+            "selector": "ok"
+          },
+          "dataType": "bool",
+          "enabled": true
+        },
+        {
+          "id": "valve",
+          "name": "阀门开关（可 PUT）",
+          "address": {
+            "kind": "symbol",
+            "path": "/actuator/valve"
+          },
+          "dataType": "bool",
+          "writable": true,
+          "enabled": true
+        },
+        {
+          "id": "setpoint",
+          "name": "温度设定值（可 PUT）",
+          "address": {
+            "kind": "symbol",
+            "path": "/actuator/setpoint"
+          },
+          "dataType": "float64",
+          "unit": "degC",
+          "writable": true,
+          "enabled": true
+        },
+        {
+          "id": "blob",
+          "name": "二进制资源（application/octet-stream）",
+          "address": {
+            "kind": "symbol",
+            "path": "/blob"
+          },
+          "dataType": "bytes",
+          "enabled": true
+        },
+        {
+          "id": "large",
+          "name": "大资源（3000 字节，走 Block2 续读）",
+          "address": {
+            "kind": "symbol",
+            "path": "/large"
+          },
+          "dataType": "string",
+          "enabled": true
+        },
+        {
+          "id": "separate",
+          "name": "分离响应资源（空 ACK 后单独回复）",
+          "address": {
+            "kind": "symbol",
+            "path": "/separate"
+          },
+          "dataType": "float64",
+          "enabled": true
+        }
+      ]
+    },
+    {
+      "id": "coap-config",
+      "name": "内置 CoAP 服务端（配置，application/json）",
+      "channel": "ch-coap",
+      "interval": "5s",
+      "timeout": "5s",
+      "enabled": true,
+      "labels": {
+        "contentFormat": "json",
+        "writeMethod": "put"
+      },
+      "points": [
+        {
+          "id": "mode",
+          "name": "运行模式（JSON 字段 mode，可写）",
+          "address": {
+            "kind": "symbol",
+            "path": "/config",
+            "selector": "mode"
+          },
+          "dataType": "string",
+          "writable": true,
+          "enabled": true
+        },
+        {
+          "id": "threshold",
+          "name": "报警阈值（JSON 字段 threshold，可写）",
+          "address": {
+            "kind": "symbol",
+            "path": "/config",
+            "selector": "threshold"
+          },
+          "dataType": "float64",
+          "writable": true,
+          "enabled": true
+        }
+      ]
+    },
+    {
+      "id": "coap-trigger",
+      "name": "内置 CoAP 服务端（触发器，POST）",
+      "channel": "ch-coap",
+      "interval": "5s",
+      "timeout": "5s",
+      "enabled": true,
+      "labels": {
+        "contentFormat": "text",
+        "writeMethod": "post"
+      },
+      "points": [
+        {
+          "id": "trigger",
+          "name": "触发动作（POST，不幂等）",
+          "address": {
+            "kind": "symbol",
+            "path": "/actuator/trigger"
+          },
+          "dataType": "bool",
+          "writable": true,
+          "enabled": true
+        }
+      ]
+    }
+  ]
+}
