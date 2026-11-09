@@ -10,6 +10,7 @@ using Microsoft.AspNetCore.Http;
 using Uic.Config;
 using Uic.Domain;
 using Uic.Driver;
+using Uic.Northbound.Security;
 
 namespace Uic.Northbound;
 
@@ -27,7 +28,7 @@ public static partial class RestApi
                 version = ctx.Control.ConfigVersion,
                 config = Redact(config),
             }, ApiJson.Options);
-        });
+        }).RequirePermission(Permissions.ConfigRead);
 
         app.MapPost("/api/v1/config/validate", async (HttpContext http, CancellationToken ct) =>
         {
@@ -50,7 +51,7 @@ public static partial class RestApi
             return Results.Json(new ValidateResponseDto(
                 valid,
                 all.Select(p => p.ToString()).ToArray()), ApiJson.Options);
-        });
+        }).RequirePermission(Permissions.ConfigRead);
 
         app.MapPost("/api/v1/config/apply", async (HttpContext http, CancellationToken ct) =>
         {
@@ -78,7 +79,7 @@ public static partial class RestApi
                 counts,
                 outcome.RestartedDevices,
                 durationMs), ApiJson.Options);
-        });
+        }).RequirePermission(Permissions.ConfigWrite);
 
         app.MapGet("/api/v1/config/versions", () =>
         {
@@ -89,7 +90,7 @@ public static partial class RestApi
                 .ToArray();
 
             return Results.Json(new PagedResponse<ConfigVersionDto>(versions, null, versions.Length), ApiJson.Options);
-        });
+        }).RequirePermission(Permissions.ConfigRead);
 
         app.MapGet("/api/v1/config/versions/{id}", (string id) =>
         {
@@ -98,7 +99,7 @@ public static partial class RestApi
                           new { version = id });
 
             return Results.Json(new { version = id, config = Redact(doc) }, ApiJson.Options);
-        });
+        }).RequirePermission(Permissions.ConfigRead);
 
         app.MapGet("/api/v1/config/diff", (HttpContext http) =>
         {
@@ -124,7 +125,7 @@ public static partial class RestApi
                 .ToArray();
 
             return Results.Json(new DiffResponseDto(from, to, entries), ApiJson.Options);
-        });
+        }).RequirePermission(Permissions.ConfigRead);
 
         app.MapPost("/api/v1/config/rollback", async (HttpContext http, CancellationToken ct) =>
         {
@@ -148,13 +149,24 @@ public static partial class RestApi
                 new ChangedCountsDto(0, 0, 0, 0, 0, 0),
                 outcome.RestartedDevices,
                 outcome.DurationMs), ApiJson.Options);
-        });
+        }).RequirePermission(Permissions.ConfigRollback);
 
         app.MapPost("/api/v1/commands", async (HttpContext http, CancellationToken ct) =>
         {
             var body = await ReadBodyAsync(http, ct).ConfigureAwait(false);
             var request = ReadJson<CommandRequestDto>(body)
                           ?? throw ApiException.BadRequest("request.invalid", "body is required");
+
+            // 命令的权限取决于 action，路由层无法标注单一权限；这里按动作查表，
+            // 路由上标 system.read 只是「已登录账号」的下限。
+            var principal = RequirePrincipal(http);
+            var required = PermissionForCommand(request.Action);
+            if (required is not null && !principal.Can(required))
+            {
+                AuditDenied(http, ctx, principal, "auth.forbidden", required);
+                throw ApiException.Forbidden("auth.forbidden",
+                    $"command '{request.Action}' requires permission '{required}'");
+            }
 
             var response = await AuditedAsync(
                 ctx, http, request.Action,
@@ -164,7 +176,7 @@ public static partial class RestApi
                 .ConfigureAwait(false);
 
             return Results.Json(response, ApiJson.Options);
-        });
+        }).RequirePermission(Permissions.SystemRead);
     }
 
     private static void MapDiagnostics(WebApplication app, NorthboundContext ctx)
@@ -180,13 +192,13 @@ public static partial class RestApi
                 .ToArray();
 
             return Results.Json(new PagedResponse<LogEntryDto>(entries, null, entries.Length), ApiJson.Options);
-        });
+        }).RequirePermission(Permissions.SystemRead);
 
         app.MapGet("/api/v1/diagnostics/bundle", () =>
         {
             var bytes = DiagnosticsBundle.Build(ctx);
             return Results.File(bytes, "application/zip", DiagnosticsBundle.FileName(DateTimeOffset.UtcNow));
-        });
+        }).RequirePermission(Permissions.SystemRead);
 
         app.MapGet("/api/v1/diagnostics/network", async (HttpContext http, CancellationToken ct) =>
         {
@@ -256,8 +268,18 @@ public static partial class RestApi
             result["selfTest"] = await ctx.Control.SelfTestAsync(device.Id, ct).ConfigureAwait(false);
 
             return Results.Json(result, ApiJson.Options);
-        });
+        }).RequirePermission(Permissions.SystemRead);
     }
+
+    /// <summary>命令动作到权限的映射。未知动作不在这里拦：执行器会返回 request.unknown_action。</summary>
+    private static string? PermissionForCommand(string action) => action switch
+    {
+        "driver.restart" or "device.selftest" => Permissions.DeviceControl,
+        "outbox.flush" or "outbox.drop" or "log.level" => Permissions.SystemControl,
+        "config.rollback" => Permissions.ConfigRollback,
+        "diag.bundle" => Permissions.SystemRead,
+        _ => null,
+    };
 
     /// <summary>脱敏：口令与 token 一律替换，配置本身照常可读。</summary>
     internal static JsonObject Redact(ConfigDocument config)

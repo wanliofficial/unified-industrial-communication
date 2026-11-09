@@ -6,7 +6,7 @@
 
     <Grid x:Name="Root" RowDefinitions="Auto,*">
 
-        <!-- 顶栏：站点、健康、退出。健康色点每 2.5 秒随 /health 刷新。 -->
+        <!-- 顶栏：站点、健康、当前账号。健康色点每 2.5 秒随 /health 刷新。 -->
         <Border Grid.Row="0" Background="#1B2029" Padding="16,10">
             <Grid ColumnDefinitions="Auto,*,Auto">
                 <StackPanel Orientation="Horizontal" Spacing="10" VerticalAlignment="Center">
@@ -26,26 +26,36 @@
                                VerticalAlignment="Center" Margin="8,0,0,0" />
                 </StackPanel>
 
-                <Button Grid.Column="2" Content="退出" Margin="16,0,0,0" Padding="12,4"
-                        Click="OnSignOutClick" />
+                <StackPanel Grid.Column="2" Orientation="Horizontal" Spacing="8" Margin="16,0,0,0"
+                            VerticalAlignment="Center">
+                    <!-- 当前账号：角色写在这里，现场换班时一眼能看出自己是什么身份。 -->
+                    <TextBlock x:Name="UserText" Text="" Foreground="#C8D1DE" FontSize="12"
+                               VerticalAlignment="Center" />
+                    <Button x:Name="PasswordButton" Content="改密" Padding="10,4" Visibility="Collapsed"
+                            Click="OnChangePasswordClick" />
+                    <Button x:Name="SignOutButton" Content="退出" Padding="12,4" Click="OnSignOutClick" />
+                </StackPanel>
             </Grid>
         </Border>
 
         <Grid Grid.Row="1" ColumnDefinitions="200,*">
 
-            <!-- 导航栏。用 ListView 而不是 NavigationView：只有一个内容宿主，不需要内置后退栈。 -->
+            <!-- 导航栏。用 ListView 而不是 NavigationView：只有一个内容宿主，不需要内置后退栈。
+                 每一项在登录后按权限显示/隐藏；隐藏只是减少误点，真正的边界在服务端。 -->
             <Border Grid.Column="0" Background="White" BorderBrush="#E1E5EB" BorderThickness="0,0,1,0">
                 <StackPanel>
                     <TextBlock Text="控制台" Margin="16,16,16,8" FontSize="11" FontWeight="SemiBold"
                                Foreground="#8A94A3" />
                     <ListView x:Name="NavList" SelectionMode="Single" SelectionChanged="OnNavSelectionChanged"
                               BorderThickness="0" Padding="6,0">
-                        <ListViewItem Content="设备" Tag="devices" />
-                        <ListViewItem Content="驱动" Tag="drivers" />
-                        <ListViewItem Content="点位" Tag="points" />
-                        <ListViewItem Content="监视" Tag="monitor" />
-                        <ListViewItem Content="日志" Tag="logs" />
-                        <ListViewItem Content="配置" Tag="config" />
+                        <ListViewItem Content="设备" Tag="devices" x:Name="NavDevices" />
+                        <ListViewItem Content="驱动" Tag="drivers" x:Name="NavDrivers" />
+                        <ListViewItem Content="点位" Tag="points" x:Name="NavPoints" />
+                        <ListViewItem Content="监视" Tag="monitor" x:Name="NavMonitor" />
+                        <ListViewItem Content="日志" Tag="logs" x:Name="NavLogs" />
+                        <ListViewItem Content="审计" Tag="audit" x:Name="NavAudit" />
+                        <ListViewItem Content="配置" Tag="config" x:Name="NavConfig" />
+                        <ListViewItem Content="账号" Tag="users" x:Name="NavUsers" />
                     </ListView>
                     <TextBlock Text="按 F5 刷新当前页" Margin="16,16,16,0" FontSize="11"
                                Foreground="#A8B1BE" TextWrapping="Wrap" />
@@ -55,26 +65,55 @@
             <Grid Grid.Column="1" x:Name="ContentHost" />
         </Grid>
 
-        <!-- 未认证时盖住整个控制台。网关未配置令牌时可直接「进入」。 -->
+        <!-- 未认证时盖住整个控制台。账号由网关本地管理，没有「免登录」入口。 -->
         <Grid Grid.RowSpan="2" x:Name="LoginOverlay" Background="#F2F5F9" Visibility="Collapsed">
             <Border Background="White" CornerRadius="10" Padding="28" MaxWidth="440"
                     VerticalAlignment="Center" HorizontalAlignment="Center"
                     BorderBrush="#E1E5EB" BorderThickness="1">
                 <StackPanel Spacing="14">
-                    <TextBlock Text="连接网关" Style="{StaticResource UicTitle}" />
+                    <TextBlock Text="登录网关" Style="{StaticResource UicTitle}" />
                     <TextBlock TextWrapping="Wrap" Style="{StaticResource UicCaption}"
-                               Text="输入网关的 REST 访问令牌（配置项 northbound.rest.token）。网关未配置令牌时留空即可直接进入。" />
+                               Text="使用网关本地账号登录。首次启动的初始口令在数据目录的 security/initial-admin-password.txt 中。" />
 
-                    <TextBox x:Name="TokenBox" Header="访问令牌" PlaceholderText="留空表示网关未启用鉴权"
-                             FontFamily="Consolas, Menlo, monospace" />
+                    <TextBox x:Name="UsernameBox" Header="用户名" Text="admin" />
+
+                    <PasswordBox x:Name="PasswordBox" Header="口令" />
 
                     <TextBlock x:Name="LoginError" Text="" Foreground="#C0392B" FontSize="12"
                                TextWrapping="Wrap" Visibility="Collapsed" />
 
                     <StackPanel Orientation="Horizontal" Spacing="8">
-                        <Button x:Name="ConnectButton" Content="连接" Style="{StaticResource AccentButtonStyle}"
+                        <Button x:Name="ConnectButton" Content="登录" Style="{StaticResource AccentButtonStyle}"
                                 Click="OnConnectClick" />
                         <TextBlock x:Name="LoginStatus" Style="{StaticResource UicCaption}"
+                                   VerticalAlignment="Center" />
+                    </StackPanel>
+                </StackPanel>
+            </Border>
+        </Grid>
+
+        <!-- 首次登录 / 被重置口令后：在拿到新口令之前不放行任何业务端点。 -->
+        <Grid Grid.RowSpan="2" x:Name="PasswordOverlay" Background="#F2F5F9" Visibility="Collapsed">
+            <Border Background="White" CornerRadius="10" Padding="28" MaxWidth="440"
+                    VerticalAlignment="Center" HorizontalAlignment="Center"
+                    BorderBrush="#E1E5EB" BorderThickness="1">
+                <StackPanel Spacing="14">
+                    <TextBlock Text="必须修改口令" Style="{StaticResource UicTitle}" />
+                    <TextBlock TextWrapping="Wrap" Style="{StaticResource UicCaption}"
+                               Text="当前口令是一次性口令。设置新口令之前，除改密与退出外的接口都会被拒绝。" />
+
+                    <PasswordBox x:Name="CurrentPasswordBox" Header="当前口令" />
+                    <PasswordBox x:Name="NewPasswordBox" Header="新口令（至少 8 位）" />
+                    <PasswordBox x:Name="ConfirmPasswordBox" Header="确认新口令" />
+
+                    <TextBlock x:Name="PasswordError" Text="" Foreground="#C0392B" FontSize="12"
+                               TextWrapping="Wrap" Visibility="Collapsed" />
+
+                    <StackPanel Orientation="Horizontal" Spacing="8">
+                        <Button x:Name="ChangePasswordButton" Content="保存并进入"
+                                Style="{StaticResource AccentButtonStyle}" Click="OnPasswordSaveClick" />
+                        <Button Content="退出" Click="OnSignOutClick" />
+                        <TextBlock x:Name="PasswordStatus" Style="{StaticResource UicCaption}"
                                    VerticalAlignment="Center" />
                     </StackPanel>
                 </StackPanel>

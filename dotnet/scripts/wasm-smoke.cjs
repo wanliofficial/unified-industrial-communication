@@ -73,6 +73,10 @@ async function main() {
     const started = Date.now();
     await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
 
+    // 账号体系默认开启：先登录，并走完「首次强制改密」，才可能看到业务数据。
+    // 这一段同时验证了登录表单、表单校验与改密后的令牌换发。
+    await signIn(page);
+
     // 判据不是「页面有 HTML」，而是「REST 数据已经渲染出来」：
     // 它同时要求 WASM 启动、裁剪后的序列化可用、同源地址解析正确。
     await page.waitForFunction(
@@ -118,7 +122,10 @@ async function main() {
 
   ok(!state.loader, '启动遮罩在应用挂载后被移除');
   ok(state.text.includes('设备') && state.text.includes('点位') && state.text.includes('监视')
-    && state.text.includes('日志') && state.text.includes('配置'), '五个导航项都渲染出来');
+    && state.text.includes('日志') && state.text.includes('配置') && state.text.includes('审计')
+    && state.text.includes('账号'), '管理员能看到全部八个导航项');
+  ok(state.text.includes('admin') && !state.text.includes('登录网关'),
+    '登录后顶栏显示当前账号，登录遮罩已移除');
   ok(/设备\s+\d+\/\d+\s+采集/.test(state.text), '健康状态行显示采集进度（REST /api/v1/health 已生效）');
   ok(form.ok, `设备页的新建设备表单走完校验与应用${form.ok ? `（${form.deviceId}）` : '：' + form.message}`);
   ok(pageErrors.length === 0, `没有未捕获的页面异常${pageErrors.length ? '：' + pageErrors[0] : ''}`);
@@ -149,6 +156,51 @@ async function main() {
 
   await browser.close();
   return failed === 0 ? 0 : 1;
+}
+
+/**
+ * 用首次启动生成的初始口令登录，并完成强制改密。
+ *
+ * 不依赖控件类型：Uno 的 TextBox 渲染成 <textarea>，PasswordBox 可能是 <input>。
+ * 只按「当前可见的输入控件顺序」取，登录表单是 用户名、口令；改密表单是
+ * 当前口令（已预填）、新口令、确认。
+ */
+async function signIn(page) {
+  const initial = process.env.UIC_SMOKE_PASSWORD;
+  if (!initial) throw new Error('缺少 UIC_SMOKE_PASSWORD：冒烟需要首次启动生成的初始口令');
+
+  await page.waitForFunction(
+    () => document.body.innerText.includes('登录网关'),
+    null,
+    { timeout: 60000 },
+  );
+
+  const loginFields = page.locator('textarea:visible, input:visible');
+  await loginFields.nth(0).fill('admin');
+  await loginFields.nth(1).fill(initial);
+
+  await page.getByText('登录', { exact: true }).first().click();
+
+  await page.waitForFunction(
+    () => document.body.innerText.includes('必须修改口令'),
+    null,
+    { timeout: 60000 },
+  );
+
+  const next = 'smoke-' + Math.random().toString(36).slice(2, 10);
+  const passwordFields = page.locator('textarea:visible, input:visible');
+  await passwordFields.nth(1).fill(next);
+  await passwordFields.nth(2).fill(next);
+
+  await page.getByText('保存并进入', { exact: true }).first().click();
+
+  await page.waitForFunction(
+    () => !document.body.innerText.includes('必须修改口令'),
+    null,
+    { timeout: 60000 },
+  );
+
+  return next;
 }
 
 /**

@@ -2,6 +2,7 @@ using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Http;
 using Uic.Domain;
 using Uic.Driver;
+using Uic.Northbound.Security;
 
 namespace Uic.Northbound;
 
@@ -18,7 +19,7 @@ public static partial class RestApi
         {
             var items = ctx.Engine.Drivers.List().Select(ToDriverView).ToArray();
             return Results.Json(new DriversDto(items), ApiJson.Options);
-        });
+        }).RequirePermission(Permissions.SystemRead);
     }
 
     private static DriverDto ToDriverView(DriverMeta meta) => new(

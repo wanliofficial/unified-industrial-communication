@@ -48,12 +48,22 @@ dotnet publish src/Uic.Ui -f net10.0-browserwasm -c Release -o /tmp/uic-ui
 dotnet run --project src/Uic.Host -- run --web /tmp/uic-ui/wwwroot
 ```
 
-浏览器打开 `http://127.0.0.1:8080/`。六个页面分别是设备、驱动、点位、监控、日志、配置，
-全部只通过 REST 与 SSE 通信——前端不认识任何驱动实现，也不持有第二份状态。
+浏览器打开 `http://127.0.0.1:8080/`。八个页面分别是设备、驱动、点位、监控、日志、审计、
+配置、账号，按当前账号的权限显示；全部只通过 REST 与 SSE 通信——前端不认识任何驱动实现，
+也不持有第二份状态。
 设备页的「新建设备」可以同时新建一条通道并挂上第一台设备（首个点位），提交走
 `config/validate` → `config/apply`，与配置页共用同一条版本与回滚链；继续加点位仍走
 CSV 导入或配置页。
-配置了 `northbound.rest.token` 时，首屏会先要求输入令牌（存在浏览器本地）。
+首次启动会自动创建 `admin`，随机初始口令写在 `data/security/initial-admin-password.txt`：
+
+```bash
+cat ./data/security/initial-admin-password.txt   # 只用于第一次登录
+```
+
+登录后必须先改密，改密成功该文件会被删除。账号与角色（`admin` / `operator` / `viewer` /
+`auditor`）由控制台「账号」页或 REST 管理；忘记口令时可在本机执行
+`uic user reset-password --user admin`。静态 `northbound.rest.token` 仍可作为全权限
+API Token 给运维脚本使用，但它不再能让浏览器跳过登录。
 
 > 发布必须显式指定 `-f net10.0-browserwasm`：项目是单目标 WASM 工程，
 > 省略框架时 MSBuild 会按 `net10.0` 还原并报 `NETSDK1129`。
@@ -66,8 +76,8 @@ scripts/wasm-smoke.sh --no-browser # 只做静态层
 scripts/wasm-smoke.sh --browser firefox   # 换引擎（默认 chromium）
 ```
 
-浏览器层会等 WASM 启动、等设备列表从 REST 渲染出来，再在设备页真填一次「新建设备」
-表单并等它出现在列表里，同时断言没有未捕获异常、失败请求或 4xx/5xx ——
+浏览器层会用初始口令登录、走完强制改密，等设备列表从 REST 渲染出来，再在设备页真填一次
+「新建设备」表单并等它出现在列表里，同时断言没有未捕获异常、失败请求或 4xx/5xx ——
 裁剪后的运行时问题只有这样才看得见。Chromium 与 Firefox 各跑过一遍。
 
 ## 命令行
@@ -78,6 +88,8 @@ uic sim   [--port <modbus-port>] [--data <dir>] [--listen <host:port>] [-v]
 uic check [--config <file>]
 uic secret keygen [--out <file>]          # 生成 32 字节密封密钥（仅属主可读）
 uic secret seal [--key-file <file>]       # 从 stdin 读明文，输出 enc:v1:...
+uic user list [--data <dir>]              # 列出本地账号、角色与最近登录
+uic user reset-password --user <id>       # 重置为一次性口令（走 stdout，提示走 stderr）
 uic version
 ```
 
@@ -117,7 +129,7 @@ uic check --config gateway.json                  # 逐项打印引用来源，�
 
 密钥从 `UIC_SECRET_KEY`（base64/hex）或 `UIC_SECRET_KEY_FILE` 读取。引用解析
 失败——环境变量没注入、密钥不对、密文被改过——启动与 `check` 都直接失败：
-令牌取不到时静默退化成空串等于关闭鉴权，那是最坏的一种失败。落盘、diff、导出
+令牌取不到时静默退化成空串不是降级，而是让脚本在第一次请求时吃 401——那是最坏的一种失败。落盘、diff、导出
 与 `GET /api/v1/config` 里只有引用（读接口一律显示 `***`），明文只在进程内存里。
 
 旧配置里的明文令牌仍能被**读**（迁移用），但 `check`、启动与 `config/apply` 都会
@@ -136,7 +148,8 @@ curl -s -H "Authorization: Bearer $TOKEN" \
 ```
 
 记录覆盖配置生效 / 回滚 / 导入 / 模板实例化、未脱敏导出、逐条点位写入（含旧值与新值）、
-REST 与 MQTT 命令、401 认证失败，以及审计自身的导出动作。文件写在
+REST 与 MQTT 命令、登录 / 登出 / 改密 / 越权与账号变更，以及审计自身的导出动作。
+`actor` 是真实账号 id（静态令牌记 `api-token`，认证失败记 `anonymous`）。文件写在
 `storage.audit.directory`（默认 `data/audit/`，一行一条 NDJSON），按天与按大小切分，
 保留最近 `retain` 份；每条立即 flush，进程被杀也只丢最后半行，重启后序号继续递增。
 
@@ -157,7 +170,7 @@ dotnet run --project tests/Uic.Tests -- --opcua             # 额外跑 OPC UA �
 dotnet run --project tests/Uic.Tests -- --stop-on-fail
 ```
 
-正常情况下输出 `219 passed, 0 failed, 1 skipped`（跳过的是默认不启用的 OPC UA 用例）。
+正常情况下输出 `233 passed, 0 failed, 1 skipped`（跳过的是默认不启用的 OPC UA 用例）。
 黄金帧测试默认从仓库的 `testdata/golden/` 读取，可用 `UIC_TESTDATA` 指向别的目录。
 
 串口用例（T15–T18）会用 libc 开一对伪终端，在 Linux 上默认执行，其它平台报 `skip`；

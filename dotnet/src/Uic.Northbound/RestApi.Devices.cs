@@ -4,6 +4,7 @@ using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Http;
 using Uic.Domain;
 using Uic.Driver;
+using Uic.Northbound.Security;
 
 namespace Uic.Northbound;
 
@@ -28,7 +29,7 @@ public static partial class RestApi
             var next = offset + page.Count < all.Count ? EncodeCursor(offset + page.Count) : null;
 
             return Results.Json(new PagedResponse<DeviceSummaryDto>(page, next, all.Count), ApiJson.Options);
-        });
+        }).RequirePermission(Permissions.SystemRead);
 
         app.MapGet("/api/v1/devices/{device}", (string device) =>
         {
@@ -37,7 +38,7 @@ public static partial class RestApi
                            new { device });
 
             return Results.Json(ToSummary(view), ApiJson.Options);
-        });
+        }).RequirePermission(Permissions.SystemRead);
 
         app.MapGet("/api/v1/devices/{device}/points", (HttpContext http, string device) =>
         {
@@ -64,7 +65,7 @@ public static partial class RestApi
             var next = offset + page.Count < views.Count ? EncodeCursor(offset + page.Count) : null;
 
             return Results.Json(new PagedResponse<PointDto>(page, next, views.Count), ApiJson.Options);
-        });
+        }).RequirePermission(Permissions.SystemRead);
 
         app.MapGet("/api/v1/points", (HttpContext http) =>
         {
@@ -99,13 +100,13 @@ public static partial class RestApi
             var next = offset + page.Count < points.Count ? EncodeCursor(offset + page.Count) : null;
 
             return Results.Json(new PagedResponse<PointDto>(page, next, points.Count), ApiJson.Options);
-        });
+        }).RequirePermission(Permissions.SystemRead);
 
         app.MapGet("/api/v1/points/{device}/{point}", (string device, string point) =>
         {
             var (dev, cfgPoint) = FindPoint(ctx, device, point);
             return Results.Json(ToPointView(ctx, dev, cfgPoint), ApiJson.Options);
-        });
+        }).RequirePermission(Permissions.SystemRead);
 
         app.MapPost("/api/v1/points/{device}/{point}/write",
             async (HttpContext http, string device, string point, CancellationToken ct) =>
@@ -114,7 +115,7 @@ public static partial class RestApi
 
             return await WriteWithIdempotencyAsync(http, ctx, device, $"point:{point}", request.Writes, ct)
                 .ConfigureAwait(false);
-        });
+        }).RequirePermission(Permissions.PointWrite);
 
         app.MapPost("/api/v1/points/{device}/write",
             async (HttpContext http, string device, CancellationToken ct) =>
@@ -123,7 +124,7 @@ public static partial class RestApi
 
             return await WriteWithIdempotencyAsync(http, ctx, device, "batch", request.Writes, ct)
                 .ConfigureAwait(false);
-        });
+        }).RequirePermission(Permissions.PointWrite);
     }
 
     /// <summary>

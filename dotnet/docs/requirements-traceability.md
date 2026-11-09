@@ -11,7 +11,7 @@
 它们不是 §6.1「不做」清单里的项，属于真实缺口；逐协议现状、原因与补法见
 [protocol-status.md](protocol-status.md)。
 
-当前测试基线：**219 passed / 0 failed / 1 skipped**（跳过的是需要 `--opcua` 的 OPC UA 端到端用例）。
+当前测试基线：**233 passed / 0 failed / 1 skipped**（跳过的是需要 `--opcua` 的 OPC UA 端到端用例）。
 
 ## 1. 采集（FR-COL）
 
@@ -80,7 +80,7 @@
 | 编号 | 需求 | 状态 | 证据 / 说明 |
 |---|---|---|---|
 | FR-NOR-01 | REST：当前值、历史、配置、状态 | 已实现 | 当前值/配置/状态：`contract/devices_and_points_are_listed`；历史：`GET /api/v1/history`，证据 `contract/history_query_reads_journal` |
-| FR-NOR-02 | REST：写入点位（需权限，三态结果） | 部分实现 | 三态结果与逐点裁决已实现：`contract/write_returns_per_point_results`；**权限是单一 Bearer Token**，没有 RBAC 细粒度 |
+| FR-NOR-02 | REST：写入点位（需权限，三态结果） | 已实现 | 三态结果与逐点裁决：`contract/write_returns_per_point_results`；写端点要求 `point.write`，只读角色与审计员被拒并记 `auth.forbidden`：`contract/auth_roles_are_enforced` |
 | FR-NOR-03 | SSE 实时推送（按订阅表达式） | 已实现 | `contract/*` 起真实 Kestrel；按 `device.point` / 通配过滤、质量过滤、心跳、50 路并发上限 |
 | FR-NOR-04 | MQTT 上报（Topic 模板、QoS、保留） | 已实现 | `mqtt/sink_renders_topic_and_injects_schema_version`、`mqtt/publish_qos1_waits_for_puback`、`mqtt/reconnect_republishes_birth_and_state`；`scripts/mqtt-interop.sh` 用真实 broker 验一遍 |
 | FR-NOR-05 | OPC UA 服务端 | 已实现 | `opcua/anonymous_session_read_write_subscribe`（需 `--opcua`） |
@@ -94,9 +94,9 @@
 
 | 编号 | 需求 | 状态 | 证据 / 说明 |
 |---|---|---|---|
-| FR-OPS-01 | Web 控制台（登录、设备、点位、监视、日志、配置） | 部分实现 | 六个页面都在（Uno WASM，含驱动能力页），`scripts/wasm-smoke.sh` 在 Playwright 里真跑首屏与 REST 调用；设备页内置「新建设备」表单（可同时新建通道：tcp 填 host/port，serial 填 port/baud，virtual 无传输参数），提交走「读脱敏配置 → 追加通道/设备 → `config/validate` → `config/apply`」，与配置页同一条版本链，`config/console_draft_builds_a_valid_document` 与 `contract/console_device_creation_flow` 覆盖拼装与端到端提交。表单只建**首个**点位，继续加点位仍走 CSV 导入或配置页；令牌登录属 FR-OPS-02 |
-| FR-OPS-02 | 认证（本地账号 + 会话 Token，首次强制改密） | 刻意没做（M） | 首版只有配置里的单个 Bearer Token，没有账号库。这是与 PRD 差距最大的一条，见文末「红线」 |
-| FR-OPS-03 | RBAC（页面级 + 操作级，≥3 角色） | 刻意没做（S） | 依赖 FR-OPS-02；命令白名单是硬编码能力边界，不是角色 |
+| FR-OPS-01 | Web 控制台（登录、设备、点位、监视、日志、配置） | 已实现 | 八个页面（Uno WASM）：设备、驱动、点位、监视、日志、审计、配置、账号；登录页 + 强制改密界面，按权限隐藏导航与写操作。`scripts/wasm-smoke.sh` 在 Playwright 里真跑「登录 → 强制改密 → 首屏数据 → 新建设备」。设备页内置「新建设备」表单（可同时新建通道：tcp 填 host/port，serial 填 port/baud，virtual 无传输参数），提交走「读脱敏配置 → 追加通道/设备 → `config/validate` → `config/apply`」，与配置页同一条版本链，`config/console_draft_builds_a_valid_document` 与 `contract/console_device_creation_flow` 覆盖拼装与端到端提交。表单只建**首个**点位，继续加点位仍走 CSV 导入或配置页 |
+| FR-OPS-02 | 认证（本地账号 + 会话 Token，首次强制改密） | 已实现 | 账号存 `data/security/users.json`（PBKDF2-SHA256、210k 迭代、每账号随机盐、原子替换写盘，无明文）；首次启动生成随机 `admin` 口令到 `data/security/initial-admin-password.txt`，改密前除 `auth/me`、`auth/password`、`auth/logout` 外全部 403 `auth.password_change_required`，改密成功后删除该文件。会话 Token 内存保存 12 小时，进程重启即失效；登录失败 5 次/分钟/IP 锁定 60 秒。静态 `northbound.rest.token` 保留为全权限 API Token（审计记 `api-token`）。证据：`auth/*`（9 条）与 `contract/auth_login_forces_password_change`、`contract/auth_login_is_rate_limited`、`contract/auth_logout_revokes_session` |
+| FR-OPS-03 | RBAC（页面级 + 操作级，≥3 角色） | 已实现 | 四个内置角色 `admin` / `operator` / `viewer` / `auditor`，九项权限（`system.read`、`system.control`、`device.control`、`point.write`、`config.read`、`config.write`、`config.rollback`、`audit.read`、`user.manage`）。页面级：导航与服务端返回的有效权限集合一致，`users` / `audit` 按 `user.manage` / `audit.read` 出现；操作级：每个端点 `.RequirePermission(...)` + 中间件默认拒绝（漏标即 403），命令按 action 二次查表。证据：`auth/role_matrix`、`contract/auth_roles_are_enforced`、`contract/auth_users_require_manage` |
 | FR-OPS-04 | 审计日志（可查询、可导出） | 已实现 | 追加写 NDJSON（`storage.audit`，默认 `data/audit/audit-yyyyMMdd-HHmmss-fff.ndjson`），按天 + 按大小切分，按份数保留，逐条 `Flush(flushToDisk: true)`；重启后从文件末尾恢复序号，`seq` 单调。记录 `config.apply` / `config.rollback` / `config.import` / `config.points_import` / `config.template_instantiate` / `config.export`（仅 `redact=false`）/ `point.write`（逐条，含旧值与新值）/ REST 与 MQTT 命令 / `auth.failed`（按来源 IP 30 秒去重）/ `audit.export`。`GET /api/v1/audit` 按时间、动作、身份、结果、目标过滤并分页（最新在前），`GET /api/v1/audit/export` 导出同条件的 NDJSON 附件。写失败只告警 + `uic_audit_write_failures`，不阻断业务。证据：`audit/*`（7 条）与 `contract/audit_records_write_and_config`、`contract/audit_export_is_ndjson`、`contract/audit_denies_are_recorded` |
 | FR-OPS-05 | 指标（Prometheus 文本格式） | 已实现 | `GET /api/v1/metrics`；设备状态、样本发布、Outbox、OPC UA、看门狗都有序列；`/api/v1/health` 汇总 |
 | FR-OPS-06 | 健康检查三级（live/ready/business） | 已实现 | `/healthz`、`/readyz`、`/api/v1/health`；`contract/health_and_version_are_public` |
@@ -137,39 +137,39 @@
 | 优雅退出 ≤ 10 s | SIGTERM | 已实现 | flush 3 s + `$death` 2 s 的预算，留有余量 |
 | 掉电配置完整性 | 100% | 已实现（机制） | 临时文件 + `Flush(flushToDisk: true)` + `File.Move(overwrite)` |
 | 故障注入矩阵 12 类 | 全通过 | 部分实现 | 连接拒绝/中断/超时/半包/错 CRC/异常码/部分响应/慢响应/Broker 断线都有用例；磁盘满、时钟跳变、进程假死属环境级，未自动化 |
-| 安全：认证默认开启 | — | 不满足 | 未配置 token 时明确告警但不阻断（本机调试场景） |
+| 安全：认证默认开启 | — | 满足 | 本地账号库始终存在，未认证请求一律 401；首次启动生成随机 `admin` 口令并强制改密，没有「不配令牌就放行」的路径。`contract/api_requires_bearer_token`、`contract/auth_login_forces_password_change` |
 | 安全：配置文件无明文口令 | 红线 | 满足 | 凭据字段只接受 `${env:}` / `${file:}` / `enc:v1:`，`check`、启动、`config/validate`、`config/apply` 四处拒绝明文；`secret/*`（9 条）与 `contract/plaintext_credentials_are_rejected` |
-| 安全：未认证即可写点位 | 红线 | 满足（配置了 token 时） | 写端点走鉴权中间件；不配 token 时等同于开放 |
+| 安全：未认证即可写点位 | 红线 | 满足 | 写端点除鉴权外还要求 `point.write`；未认证 401、角色不足 403 并记审计。`contract/auth_roles_are_enforced` |
 | 安全：诊断包含凭据 | 红线 | 满足 | `Redact` 把 `token`/`password`/`secret` 替换为 `***`，`contract/config_is_redacted` 验证 |
 | 安全：脱敏配置回写不降级凭据 | — | 满足 | `apply`/`import` 把同路径的 `***` 还原成**当前引用**（不是明文），显式空串仍表示清空；`config/redacted_secrets_are_restored`、`contract/apply_keeps_redacted_secrets` |
 | 可观测：日志字段 | `ts/level/msg/device/...` | 已实现 | 环形缓冲与 JSON 行文件共用同一套字段：`ts/level/category/msg/device/exception`；`logs/json_line_fields_are_complete` |
-| 可观测：审计可追溯 | 查询 + 导出 | 已实现 | 配置变更、写入、命令与认证失败都落 NDJSON，重启不清空；`audit/*`（7 条）与 `contract/audit_*`（3 条） |
+| 可观测：审计可追溯 | 查询 + 导出 | 已实现 | 配置变更、写入、命令、登录/登出/改密、越权与账号变更都落 NDJSON，重启不清空；`actor` 是真实账号 id；`audit/*`（7 条）与 `contract/audit_*`（3 条）、`contract/auth_*`（5 条） |
 | 兼容：配置向后兼容 ≥2 大版本 | 自动迁移 | 已实现（现有 v0 形状） | `ConfigMigrations` 覆盖 7 条 v0 规则（server.listen/token、storage.dir、mqtt.broker、channels[].concurrency、channels[].transport 对象、serial.stopBits、devices[].channel）；`config/migrates_v0_legacy_shapes` 逐项断言迁移结果，`config/migration_is_explicit_and_versioned` 验证升级项回显与「更新版本拒绝启动」。仓库只有 v1，尚不存在第二个历史主版本可测 |
-| 兼容：浏览器最近 2 个版本 | Chrome/Edge/Firefox | 已实现 | `scripts/wasm-smoke.sh` 在 Playwright 里各跑一遍：Chromium（同一引擎覆盖 Chrome/Edge，首屏约 14 s）与 Firefox（Gecko，约 34 s），两条都走完「首屏 + 新建一台设备」并被断言；Safari/WebKit 未装，用 `--browser webkit` 可补跑 |
+| 兼容：浏览器最近 2 个版本 | Chrome/Edge/Firefox | 已实现 | `scripts/wasm-smoke.sh` 在 Playwright 里各跑一遍：Chromium（同一引擎覆盖 Chrome/Edge，首屏约 12 s）与 Firefox（Gecko，约 38 s），两条都走完「登录 → 强制改密 → 首屏 + 新建一台设备」并被断言；Safari/WebKit 未装，用 `--browser webkit` 可补跑 |
 | 可维护：单文件 ≤600 行 | — | 已实现 | 新增端点都拆成 `RestApi.*.cs` partial |
 | 可维护：依赖数量 ≤10 | 直接依赖 | 已实现 | 生产 4 个（日志抽象、串口、OPC UA Server/Configuration）+ ASP.NET Core 框架引用；测试 1 个 |
-| 构建/测试时间 | ≤60 s / ≤120 s | 已实现 | 全量构建约 20 s；测试空载约 66 s（219 条），机器有其它负载时量到 119 s，仍在门槛内 |
+| 构建/测试时间 | ≤60 s / ≤120 s | 已实现 | 全量构建约 20 s；219 条时空载 65.5 s，新增认证用例后为 233 条；机器有其它负载时量到 114.2 s，仍在 120 s 门槛内 |
 
 ## 9. 与 PRD 安全红线的差距
 
-PRD `06-nfr.md` §4 列了五条红线。凭据落盘这一条在本版补齐后，剩下的是「认证是否
-默认开启」：
+PRD `06-nfr.md` §4 列了五条红线。凭据落盘（FR-OPS-09）与认证/RBAC（FR-OPS-02/03）
+补齐后，这一节只剩 TLS 一项仍在范围之外：
 
-| 红线 | 首版 | 怎么补 |
+| 红线 | 首版 | 说明 |
 |---|---|---|
-| 存在默认口令 | **没有账号体系，因此也没有默认口令**（形式上满足，实质上是把问题推给了「必须配 token」） | 引入账号库时同时引入首次改密流程 |
+| 存在默认口令 | **满足**：首次启动生成 16 位随机口令，只写进 `data/security/initial-admin-password.txt`，登录后强制改密，改密成功即删除文件 | 没有 `admin/admin` 这类固定默认口令 |
 | 配置文件含明文口令 | **满足**：`token`/`password` 只接受引用，明文在检查、启动与两条配置写入路径上都被拒 | — |
-| 未认证即可写点位 | 配了 token 就满足；不配则公开（启动告警） | 把「无 token」从告警改成拒绝启动，或仅允许 `127.0.0.1` 绑定 |
+| 未认证即可写点位 | **满足**：账号库始终存在，未认证 401；写点位还要 `point.write` | 不再存在「不配 token = 公开」 |
 | 依赖含 GPL/AGPL | 满足 | — |
 | 诊断包含凭据 | 满足 | — |
 
-剩下的差距是**首版范围的取舍**，不是实现疏漏：PRD §6.1 把账号、RBAC、TLS 都放在了
-「不做」里。审计（FR-OPS-04）已在本版补齐并落盘；把认证与账号补上之后，
-FR-OPS-02/03/10 才能从「刻意没做」转为「已实现」。
+剩下的差距是**首版范围的取舍**：TLS（FR-OPS-10）仍由反向代理 / stunnel 终结，
+本仓库只监听明文端口。审计（FR-OPS-04）、认证（FR-OPS-02）与 RBAC（FR-OPS-03）
+均已在本版补齐并落盘。
 
 ## 10. 怎么用这份表
 
-- 评审时按行看「状态」列，不要按「需求优先级」看：`M` 里也有刻意没做的（FR-OPS-02/10），`S`/`C` 里也有已实现的；
+- 评审时按行看「状态」列，不要按「需求优先级」看：`M` 里仍有刻意没做的（FR-OPS-10 TLS），`S`/`C` 里也有已实现的；
 - 要复现某条证据：`dotnet run --project tests/Uic.Tests -- --filter <用例名>`；
 - 要补某条：先看「补法」，再看 [implementation-notes.md](implementation-notes.md) 的扩展点章节；
 - 新增 FR 或改变状态时，**同一提交里**更新这份表与 `testing.md` 的用例计数。

@@ -6,6 +6,7 @@ using Uic.Domain;
 using Uic.Driver;
 using Uic.Engine;
 using Uic.Northbound;
+using Uic.Northbound.Security;
 using Uic.Obs;
 using Uic.OpcUa;
 using Uic.Outbox;
@@ -51,6 +52,7 @@ public sealed class GatewayRuntime : IGatewayControl, IAsyncDisposable
     private readonly DeviceStateWatcher _watcher;
     private readonly ResourceMonitor _resources;
     private readonly AuditLog _audit;
+    private readonly AuthService _auth;
     private readonly string _dataDir;
     private readonly string _gatewayVersion;
     private readonly DateTimeOffset _startedAt = DateTimeOffset.UtcNow;
@@ -111,6 +113,9 @@ public sealed class GatewayRuntime : IGatewayControl, IAsyncDisposable
         // 审计随数据目录走，默认开启：它是「谁改了什么」的唯一落盘记录。
         _audit = new AuditLog(dataDir, config.Storage.Audit);
 
+        // 账号库与审计放在同一层「运行期状态」：都不属于配置文件，也不参与版本回滚。
+        _auth = new AuthService(dataDir, message => logs.CreateLogger("uic.security").LogWarning("{Message}", message));
+
         var storage = config.Storage;
         _outbox = new OutboxQueue(dataDir, new OutboxOptions
         {
@@ -153,6 +158,7 @@ public sealed class GatewayRuntime : IGatewayControl, IAsyncDisposable
     public MetricsRegistry Metrics => _metrics;
     public RingBufferLogProvider Logs => _ring;
     public AuditLog Audit => _audit;
+    public AuthService Auth => _auth;
     public DateTimeOffset StartedAt => _startedAt;
     public LogLevelSwitch Level { get; private init; } = new();
 
@@ -249,7 +255,8 @@ public sealed class GatewayRuntime : IGatewayControl, IAsyncDisposable
             _startedAt,
             _resources,
             new JournalHistory(_dataDir),
-            _audit);
+            _audit,
+            _auth);
 
     // ------------------------------------------------------------------
     // IGatewayControl

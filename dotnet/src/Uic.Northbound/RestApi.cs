@@ -4,6 +4,7 @@ using Microsoft.AspNetCore.Http;
 using Uic.Config;
 using Uic.Domain;
 using Uic.Engine;
+using Uic.Northbound.Security;
 using Uic.Obs;
 
 namespace Uic.Northbound;
@@ -40,11 +41,43 @@ public static partial class RestApi
 
             try
             {
-                if (!Authorize(http, ctx))
+                var path = http.Request.Path.Value ?? "/";
+
+                if (!IsPublicPath(path))
                 {
-                    AuditAuthFailure(http, ctx);
-                    http.Response.Headers["WWW-Authenticate"] = "Bearer";
-                    throw ApiException.Unauthorized();
+                    var principal = Authenticate(http, ctx);
+                    if (principal is null)
+                    {
+                        AuditAuthFailure(http, ctx);
+                        throw ApiException.Unauthorized();
+                    }
+
+                    http.Items["principal"] = principal;
+
+                    // 首次登录必须先改密。除改密、看自己、退出之外一律 403，
+                    // 否则「强制改密」只是一句提示，客户端换个端点就绕过去了。
+                    if (principal.MustChangePassword && !IsPasswordChangePath(path))
+                    {
+                        AuditDenied(http, ctx, principal, "auth.password_change_required");
+                        throw ApiException.Forbidden("auth.password_change_required",
+                            "the initial password must be changed before using the API");
+                    }
+
+                    if (path.StartsWith("/api/", StringComparison.Ordinal) && !IsAuthPath(path))
+                    {
+                        // 默认拒绝：端点没声明权限就是配置错误，不能当作「公开」。
+                        var required = http.GetEndpoint()?.Metadata.GetMetadata<RequirePermissionAttribute>();
+
+                        if (required is null || !principal.Can(required.Permission))
+                        {
+                            AuditDenied(http, ctx, principal, "auth.forbidden",
+                                required?.Permission ?? "(undeclared)");
+                            throw ApiException.Forbidden("auth.forbidden",
+                                required is null
+                                    ? "this endpoint has no permission declaration"
+                                    : $"permission '{required.Permission}' is required");
+                        }
+                    }
                 }
 
                 if (!EnforceRateLimit(http))
@@ -102,6 +135,7 @@ public static partial class RestApi
         MapDevices(app, ctx);
         MapHistory(app, ctx);
         MapAudit(app, ctx);
+        MapAuth(app, ctx);
         MapDrivers(app, ctx);
         MapConfig(app, ctx);
         MapTemplates(app, ctx);
@@ -116,25 +150,47 @@ public static partial class RestApi
     // 认证与限流
     // ------------------------------------------------------------------
 
-    /// <summary>无需认证的路径：存活/就绪/版本/指标。指标之所以放开，是因为它通常由内网抓取器读取。</summary>
+    /// <summary>
+    /// 无需认证的路径：存活/就绪/版本/指标/健康。这些端点是给探针与抓取器用的，
+    /// 不含凭据，也不改变任何状态。登录本身当然不能要求先登录。
+    /// </summary>
     private static bool IsPublicPath(string path) =>
-        path is "/healthz" or "/readyz" or "/api/v1/version" or "/api/v1/metrics" ||
+        path is "/healthz" or "/readyz" or "/api/v1/version" or "/api/v1/metrics" or
+            "/api/v1/health" or "/api/v1/auth/login" ||
         !path.StartsWith("/api/", StringComparison.Ordinal);
 
-    private static bool Authorize(HttpContext http, NorthboundContext ctx)
+    private static bool IsAuthPath(string path)
+        => path.StartsWith("/api/v1/auth/", StringComparison.Ordinal);
+
+    private static bool IsPasswordChangePath(string path)
+        => path is "/api/v1/auth/me" or "/api/v1/auth/password" or "/api/v1/auth/logout";
+
+    /// <summary>
+    /// 解析调用者。两条来源：配置里的静态 API Token（运维脚本，全权限、不过期）
+    /// 与会话 Token（登录签发，12 小时）。没有「不配令牌就不鉴权」这条路径了：
+    /// 账号库始终存在，未认证的请求一律 401。
+    /// </summary>
+    private static Principal? Authenticate(HttpContext http, NorthboundContext ctx)
     {
-        var path = http.Request.Path.Value ?? "/";
-        if (IsPublicPath(path)) return true;
-
-        var expected = ctx.Rest.Token;
-        if (string.IsNullOrWhiteSpace(expected)) return true;
-
         var header = http.Request.Headers.Authorization.FirstOrDefault();
-        if (string.IsNullOrWhiteSpace(header)) return false;
-        if (!header.StartsWith("Bearer ", StringComparison.OrdinalIgnoreCase)) return false;
+        if (string.IsNullOrWhiteSpace(header)) return null;
+        if (!header.StartsWith("Bearer ", StringComparison.OrdinalIgnoreCase)) return null;
 
         var presented = header["Bearer ".Length..].Trim();
-        return CryptographicEquals(presented, expected);
+        if (presented.Length == 0) return null;
+
+        if (!string.IsNullOrEmpty(ctx.Rest.Token) && CryptographicEquals(presented, ctx.Rest.Token))
+        {
+            return new Principal(
+                "api-token",
+                "API Token",
+                Roles.Admin,
+                Roles.ApiTokenPermissions,
+                MustChangePassword: false,
+                IsApiToken: true);
+        }
+
+        return ctx.Auth?.Resolve(presented, DateTimeOffset.UtcNow);
     }
 
     /// <summary>定长比较，避免用耗时差反推 token。</summary>

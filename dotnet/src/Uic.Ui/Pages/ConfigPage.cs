@@ -23,6 +23,9 @@ public sealed class ConfigPage : IPage, IDisposable
     private readonly StackPanel _versions = new() { Spacing = 0 };
     private readonly Button _applyButton;
 
+    /// <summary>只读角色也能看配置；应用与回滚按钮按权限隐藏，服务端仍然会再校验一次。</summary>
+    private readonly bool _canWrite;
+
     private bool _disposed;
     private string _loadedJson = string.Empty;
     private string _loadedVersion = string.Empty;
@@ -52,8 +55,14 @@ public sealed class ConfigPage : IPage, IDisposable
         _comment = Ui.Input(placeholder: "变更说明（可选）");
         _comment.Width = 240;
 
+        _canWrite = Session.Can(UiPermissions.ConfigWrite);
+
         _applyButton = Ui.Button("应用", OnApplyClick, accent: true);
         _applyButton.IsEnabled = false;
+        _applyButton.Visibility = _canWrite ? Visibility.Visible : Visibility.Collapsed;
+
+        _editor.IsReadOnly = !_canWrite;
+        _comment.Visibility = _canWrite ? Visibility.Visible : Visibility.Collapsed;
 
         actions.Children.Add(_comment);
         actions.Children.Add(Ui.Button("校验", OnValidateClick));
@@ -190,10 +199,14 @@ public sealed class ConfigPage : IPage, IDisposable
         }
         else
         {
-            var rollback = Ui.Button("回滚", async (_, _) => await RollbackAsync(version.Id));
-            rollback.Padding = new Thickness(8, 2, 8, 2);
-            rollback.FontSize = 11.5;
-            actions.Children.Add(rollback);
+            // 回滚会把整份配置切回旧版本，运营员角色默认没有这项能力。
+            if (Session.Can(UiPermissions.ConfigRollback))
+            {
+                var rollback = Ui.Button("回滚", async (_, _) => await RollbackAsync(version.Id));
+                rollback.Padding = new Thickness(8, 2, 8, 2);
+                rollback.FontSize = 11.5;
+                actions.Children.Add(rollback);
+            }
         }
 
         Grid.SetColumn(actions, 1);
@@ -211,7 +224,7 @@ public sealed class ConfigPage : IPage, IDisposable
     private void OnEditorChanged()
     {
         var dirty = _editor.Text != _loadedJson;
-        _applyButton.IsEnabled = dirty && !_disposed;
+        _applyButton.IsEnabled = _canWrite && dirty && !_disposed;
 
         if (dirty)
         {

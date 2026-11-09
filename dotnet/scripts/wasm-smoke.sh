@@ -106,6 +106,19 @@ curl -fsS -o /dev/null "http://127.0.0.1:$PORT/healthz" 2>/dev/null ||
 BASE="http://127.0.0.1:$PORT"
 ok "宿主监听 $BASE"
 
+# 账号体系默认开启：首次启动会生成 admin 与一个随机初始口令，冒烟必须用它登录。
+# 口令只从文件读，不打印进日志或命令行参数。
+PASSWORD_FILE="$TMP/data/security/initial-admin-password.txt"
+for ((i = 0; i < 100; i++)); do
+  [[ -f "$PASSWORD_FILE" ]] && break
+  sleep 0.1
+done
+[[ -f "$PASSWORD_FILE" ]] || die "首次启动没有生成初始口令文件：$PASSWORD_FILE"
+printf -v UIC_SMOKE_PASSWORD '%s' "$(sed -n 's/^password: //p' "$PASSWORD_FILE")"
+[[ -n "$UIC_SMOKE_PASSWORD" ]] || die "初始口令文件格式不符合预期"
+export UIC_SMOKE_PASSWORD
+ok "读取初始管理员口令（仅用于登录，不输出内容）"
+
 log "静态层"
 status=$(curl -sS -o "$TMP/index.html" -w '%{http_code}' "$BASE/")
 [[ "$status" == "200" ]] || die "GET / 返回 $status"

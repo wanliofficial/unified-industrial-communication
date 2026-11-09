@@ -10,6 +10,8 @@ public sealed record CliOptions
 {
     public string Command { get; init; } = "run";
     public string? SecretAction { get; init; }
+    public string? UserAction { get; init; }
+    public string? User { get; init; }
     public string? ConfigPath { get; init; }
     public string? DataDir { get; init; }
     public string? Listen { get; init; }
@@ -28,6 +30,9 @@ public sealed record CliOptions
           uic check [--config <file>]
           uic secret keygen [--out <file>]          # 生成 32 字节密封密钥（0600）
           uic secret seal [--key-file <file>]       # 从 stdin 读明文，输出 enc:v1:...
+          uic user list [--data <dir>]              # 列出本地账号
+          uic user reset-password --user <id> [--data <dir>]
+                                                    # 重置口令并打印一次性临时口令
           uic version
 
         选项:
@@ -38,6 +43,7 @@ public sealed record CliOptions
           --port <n>        sim 模式内置 Modbus 从站端口，默认 15020
           --out <file>      keygen 的密钥输出路径；缺省时打印到 stdout
           --key-file <file> seal 使用的密钥文件（缺省读 UIC_SECRET_KEY / UIC_SECRET_KEY_FILE）
+          --user <id>       user 子命令要操作的账号
           -v, --verbose     以 Debug 级别输出日志
           -h, --help        显示本帮助
 
@@ -51,6 +57,8 @@ public sealed record CliOptions
     {
         var command = "run";
         string? secretAction = null;
+        string? userAction = null;
+        string? user = null;
         string? config = null;
         string? data = null;
         string? listen = null;
@@ -78,8 +86,22 @@ public sealed record CliOptions
                     command = "secret";
                     break;
 
+                case "user":
+                    command = "user";
+                    break;
+
                 case "keygen" or "seal":
                     secretAction = arg;
+                    break;
+
+                case "list":
+                    if (command == "user") userAction = arg;
+                    else throw new ArgumentException($"unknown argument '{arg}'");
+                    break;
+
+                case "reset-password":
+                    if (command == "user") userAction = arg;
+                    else throw new ArgumentException($"unknown argument '{arg}'");
                     break;
 
                 case "run" or "sim" or "version":
@@ -114,6 +136,10 @@ public sealed record CliOptions
                     keyFile = Next(args, ref i, arg);
                     break;
 
+                case "--user":
+                    user = Next(args, ref i, arg);
+                    break;
+
                 case "--port":
                     port = int.TryParse(Next(args, ref i, arg), out var p) ? p : port;
                     break;
@@ -125,6 +151,7 @@ public sealed record CliOptions
                     else if (arg.StartsWith("--web=", StringComparison.Ordinal)) web = arg["--web=".Length..];
                     else if (arg.StartsWith("--out=", StringComparison.Ordinal)) outPath = arg["--out=".Length..];
                     else if (arg.StartsWith("--key-file=", StringComparison.Ordinal)) keyFile = arg["--key-file=".Length..];
+                    else if (arg.StartsWith("--user=", StringComparison.Ordinal)) user = arg["--user=".Length..];
                     else if (arg.StartsWith("--port=", StringComparison.Ordinal))
                         port = int.TryParse(arg["--port=".Length..], out var p2) ? p2 : port;
 
@@ -140,6 +167,8 @@ public sealed record CliOptions
         {
             Command = command,
             SecretAction = secretAction,
+            UserAction = userAction,
+            User = user,
             ConfigPath = config,
             DataDir = data,
             Listen = listen,

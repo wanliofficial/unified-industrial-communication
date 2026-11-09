@@ -5,6 +5,7 @@ using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Http;
 using Uic.Config;
 using Uic.Domain;
+using Uic.Northbound.Security;
 
 namespace Uic.Northbound;
 
@@ -93,7 +94,7 @@ public static partial class RestApi
             return Results.Json(new PointsImportResponseDto(
                 target.Id, true, true, outcome.Version,
                 result.Added, result.Updated, merged, Array.Empty<ValidationProblem>()), ApiJson.Options);
-        });
+        }).RequirePermission(Permissions.ConfigWrite);
 
         app.MapGet("/api/v1/config/export", (HttpContext http) =>
         {
@@ -122,7 +123,7 @@ public static partial class RestApi
                 ctx.Control.ConfigVersion,
                 redact,
                 node), ApiJson.Options);
-        });
+        }).RequirePermission(Permissions.ConfigRead);
 
         app.MapPost("/api/v1/config/import", async (HttpContext http, CancellationToken ct) =>
         {
@@ -158,6 +159,6 @@ public static partial class RestApi
             return Results.Json(new ConfigImportResponseDto(
                 true, true, outcome.Version, migration.Applied, migration.Root,
                 Array.Empty<ValidationProblem>()), ApiJson.Options);
-        });
+        }).RequirePermission(Permissions.ConfigWrite);
     }
 }

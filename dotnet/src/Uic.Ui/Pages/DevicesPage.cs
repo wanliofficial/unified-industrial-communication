@@ -87,7 +87,11 @@ public sealed class DevicesPage : IPage, IDisposable
         _status = Ui.Caption(string.Empty);
 
         actions.Children.Add(_search);
-        actions.Children.Add(Ui.Button("新建设备", (_, _) => _ = ToggleFormAsync()));
+
+        // 新建设备最终走 config.apply：没有 config.write 的角色不该看到这个入口。
+        if (Session.Can(UiPermissions.ConfigWrite))
+            actions.Children.Add(Ui.Button("新建设备", (_, _) => _ = ToggleFormAsync()));
+
         actions.Children.Add(Ui.Button("刷新", (_, _) => _ = RefreshAsync(), accent: true));
 
         // 按钮必须在 BuildForm 之前建好：表单构造时就要把它挂进行里。

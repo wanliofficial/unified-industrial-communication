@@ -24,6 +24,9 @@ public sealed class PointsPage : IPage, IDisposable
     private readonly Button _writeButton;
 
     private PointDto? _selected;
+    /// <summary>没有 point.write 时整块写入面板不渲染：只读角色看点位就够。</summary>
+    private readonly bool _canWrite = Session.Can(UiPermissions.PointWrite);
+
     private bool _disposed;
     private bool _loadingDevices;
 
@@ -73,6 +76,7 @@ public sealed class PointsPage : IPage, IDisposable
         editorCard.Width = 260;
         editorCard.VerticalAlignment = VerticalAlignment.Top;
         editorCard.Margin = new Thickness(14, 0, 0, 0);
+        editorCard.Visibility = _canWrite ? Visibility.Visible : Visibility.Collapsed;
 
         var split = new Grid();
         split.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
@@ -240,7 +244,7 @@ public sealed class PointsPage : IPage, IDisposable
             ? $"类型 {point.Value.Type}{(point.Count > 1 ? $" × {point.Count}（逗号分隔）" : string.Empty)}，当前值 {point.Value.Display}{(point.Unit is null ? string.Empty : " " + point.Unit)}。"
             : "该点位不可写（只读地址或未开启写入）。";
 
-        _writeButton.IsEnabled = point.Writable;
+        _writeButton.IsEnabled = _canWrite && point.Writable;
         _ = RefreshAsync();
     }
 

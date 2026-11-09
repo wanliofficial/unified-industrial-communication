@@ -53,20 +53,25 @@
 - **凭据**：配置里不落明文。`northbound.rest.token` / `northbound.mqtt.password`
   只能是 `${env:NAME}`、`${file:PATH}` 或 `enc:v1:...`（AES-256-GCM，密钥来自
   `UIC_SECRET_KEY` / `UIC_SECRET_KEY_FILE`）；`uic secret keygen|seal` 负责生成密钥与密封。
-  解析失败一律硬失败（空令牌等于关闭鉴权），明文只存在进程内存。
+  解析失败一律硬失败（空值只表示不提供静态令牌，匿名访问并不存在），明文只存在进程内存。
 - **审计**：追加写 NDJSON（`data/audit/`），按天与按大小切分、按份数保留、逐条
   `Flush(flushToDisk: true)`；记录配置变更、逐条写入（旧值 + 新值）、REST/MQTT 命令、
-  401 认证失败与审计导出；`GET /api/v1/audit` 查询、`/api/v1/audit/export` 导出。
+  登录/登出/改密/越权、账号变更与审计导出；`GET /api/v1/audit` 查询、`/api/v1/audit/export` 导出。
   写失败只告警并暴露指标，不阻断业务（`AuditLog` 在 `Uic.Obs`，选项在 `Uic.Domain`）。
-- **控制台**：Uno WASM 六个页面（设备 / 驱动 / 点位 / 监控 / 日志 / 配置）；
-  设备页可新建通道 + 设备（含首个点位），提交走 `config/validate` → `config/apply`。
+- **账号与权限**：本地账号库 `data/security/users.json`（PBKDF2-SHA256 / 210k 迭代 /
+  每账号随机盐 / 原子替换写盘）；首次启动生成随机 `admin` 口令并强制改密；会话 Token
+  内存保存 12 小时；四个内置角色（`admin` / `operator` / `viewer` / `auditor`）与九项权限，
+  端点 `.RequirePermission(...)` + 中间件默认拒绝；`uic user list|reset-password` 作为离线兜底。
+- **控制台**：Uno WASM 八个页面（设备 / 驱动 / 点位 / 监控 / 日志 / 审计 / 配置 / 账号）；
+  登录 + 强制改密 + 按权限隐藏导航与写操作；设备页可新建通道 + 设备（含首个点位），
+  提交走 `config/validate` → `config/apply`。
 - **验收**：黄金帧 20 份（含 4 份数组帧）；T1–T18 全部有对应用例，其中 T15–T18 跑在 libc 开出来的
   真实伪终端上；MQTT 先在测试内按规范独立实现的最小 broker 上做协议级验收（发布、
   订阅、入站 PUBACK、下行命令去重与权限），再用官方 mosquitto 容器跑一次互操作
   （`scripts/mqtt-interop.sh`：上线、重启重连、命令请求/结果、kill -9 后由 broker
   代发遗嘱）；WASM 控制台用 `scripts/wasm-smoke.sh` 发布后
   在 Playwright 里真跑一遍（Chromium 与 Firefox 各一遍：`index.html` / 引导脚本 /
-  SPA 回退 / REST 首屏 / 在设备页真填表新建一台设备并等它出现在列表里）；容量与写延迟
+  SPA 回退 / 登录与强制改密 / REST 首屏 / 在设备页真填表新建一台设备并等它出现在列表里）；容量与写延迟
   由 `scripts/capacity-bench.sh` 起真宿主按 PRD 档位（200 设备 / 10,000 点）量出来，
   不从代码推断。
   见 [testing.md](testing.md)。
@@ -83,7 +88,6 @@
 | MQTT 命令的 ACL 与跨重启幂等 | 这一版只有匿名明文，幂等窗口在进程内，重启即清空；命令本身已进审计 | 在 Broker 侧做主题 ACL 与 TLS；需要跨重启幂等时把幂等台账落到外部存储 |
 | 多协议（S7 / OPC DA / IEC 104 …） | 首版把一条链路的每一层都做透，比铺开十个半成品有用 | 见下「扩展点」 |
 | S7comm 主站、OPC UA 客户端、MQTT 南向取数 | **这三项在 PRD 里是 M 级要求，本版本没做**（不是 §6.1 的不做项）；驱动边界已收窄到 `IDriver`/`IConn`，补一个协议不需要动调度与北向 | 按 [protocol-status.md](protocol-status.md) 的五步接入，并补黄金帧 |
-| 账号体系与 RBAC 细粒度权限 | PRD §6.1 明确列为不做；首版只有单个 Bearer Token，「谁能做什么」由部署侧网络隔离兜底 | 引入用户库 + 角色表，在中间件里把 `require: 权限名` 落到每个端点；命令白名单同样按角色过滤。审计已按 `actor` 字段预留了身份位置 |
 | TLS 终结 | REST/MQTT 都是明文端口，证书轮换也是独立运维负担 | 由反向代理 / stunnel 终结 TLS；确需内置时在 Kestrel 绑 `https`，`MqttClient` 接 `SslStream` |
 | 报警引擎与专用时序库 | 报警需要独立的状态机（阈值、抑制、确认）；专用时序库需要保留策略与索引，塞进采集进程会把边缘设备压垮 | 历史查询已先用 journal NDJSON 做了「时间范围 + 降采样 + 分页」的轻量实现（FR-NOR-08）；报警与更高数据量的保留策略仍按 PRD 路线图 Wave 2 单独立项 |
 | 计算点 / 订阅型协议（COV、事件、通知） | 计算点依赖「输入质量传播」的产品定义；订阅型协议在 Wave 2 | `Pipeline` 已留出质量传播点；驱动侧 `Capabilities.Subscribe` 已是四态声明，接入时按 `RuntimeDependent` 逐步放开 |

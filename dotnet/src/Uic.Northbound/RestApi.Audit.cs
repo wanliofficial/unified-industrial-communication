@@ -2,6 +2,7 @@ using System.Collections.Concurrent;
 using System.Text;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Http;
+using Uic.Northbound.Security;
 using Uic.Obs;
 
 namespace Uic.Northbound;
@@ -26,7 +27,7 @@ public static partial class RestApi
             var next = offset < page.Total ? EncodeCursor(offset) : null;
 
             return Results.Json(new PagedResponse<AuditEntry>(page.Items, next, page.Total), ApiJson.Options);
-        });
+        }).RequirePermission(Permissions.AuditRead);
 
         app.MapGet("/api/v1/audit/export", async (HttpContext http, CancellationToken ct) =>
         {
@@ -53,7 +54,7 @@ public static partial class RestApi
 
             var name = $"uic-audit-{DateTimeOffset.UtcNow:yyyyMMdd-HHmmss}.ndjson";
             return Results.File(Encoding.UTF8.GetBytes(text.ToString()), "application/x-ndjson", name);
-        });
+        }).RequirePermission(Permissions.AuditRead);
     }
 
     /// <summary>
@@ -100,11 +101,16 @@ public static partial class RestApi
     // ------------------------------------------------------------------
 
     /// <summary>
-    /// 当前调用者的身份。这一版没有账号体系，只有「配了令牌」与「没配令牌」两种；
-    /// FR-OPS-02 落地后这里换成账号 id，审计记录的形状不变。
+    /// 当前调用者的身份。账号体系落地后这里是真实的账号 id；
+    /// 静态 API Token 记 <c>api-token</c>，认证失败时仍是 <c>anonymous</c>。
     /// </summary>
-    private static string ActorOf(NorthboundContext ctx)
-        => string.IsNullOrWhiteSpace(ctx.Rest.Token) ? "anonymous" : "bearer";
+    private static string ActorOf(HttpContext http)
+    {
+        if (http.Items["principal"] is Principal principal) return principal.Id;
+
+        // 走到这里说明认证失败或公开端点调用了审计写入：没有可信身份。
+        return "anonymous";
+    }
 
     private static void WriteAudit(
         NorthboundContext ctx,
@@ -118,7 +124,7 @@ public static partial class RestApi
         ctx.Audit?.Write(
             action,
             result,
-            ActorOf(ctx),
+            ActorOf(http),
             source,
             target,
             http.Connection.RemoteIpAddress?.ToString(),
@@ -201,4 +207,56 @@ public static partial class RestApi
 
     /// <summary>用例需要在同一进程里连续验证 401 审计；去重窗口会跨用例生效。</summary>
     internal static void ResetAuthFailureThrottleForTests() => AuthFailureSeen.Clear();
+
+    // ------------------------------------------------------------------
+    // 授权失败
+    // ------------------------------------------------------------------
+
+    private static readonly ConcurrentDictionary<string, DateTimeOffset> DenialSeen = new(StringComparer.Ordinal);
+
+    /// <summary>
+    /// 已认证但被拒绝的请求。按「身份 + 路径」做 30 秒去重：授权失败通常意味着
+    /// 有人在反复点一个不属于他的按钮，或者脚本用错了角色——这两种都不需要
+    /// 把每次点击写成一条磁盘记录。
+    /// </summary>
+    private static void AuditDenied(
+        HttpContext http,
+        NorthboundContext ctx,
+        Principal principal,
+        string code,
+        string? permission = null)
+    {
+        var path = http.Request.Path.Value ?? "/";
+        var key = principal.Id + "\n" + path;
+        var now = DateTimeOffset.UtcNow;
+
+        if (DenialSeen.TryGetValue(key, out var last) && now - last < TimeSpan.FromSeconds(30)) return;
+        DenialSeen[key] = now;
+
+        if (DenialSeen.Count > 1024)
+        {
+            foreach (var (stale, seenAt) in DenialSeen)
+            {
+                if (now - seenAt >= TimeSpan.FromSeconds(30)) DenialSeen.TryRemove(stale, out _);
+            }
+        }
+
+        ctx.Audit?.Write(
+            "auth.forbidden",
+            "denied",
+            actor: principal.Id,
+            source: "rest",
+            target: path,
+            remote: http.Connection.RemoteIpAddress?.ToString(),
+            requestId: http.Items["requestId"] as string,
+            detail: new
+            {
+                method = http.Request.Method,
+                code,
+                permission,
+                role = principal.Role,
+            });
+    }
+
+    internal static void ResetDenialThrottleForTests() => DenialSeen.Clear();
 }

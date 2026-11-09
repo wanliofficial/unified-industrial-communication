@@ -17,19 +17,37 @@ namespace Uic.Ui;
 /// </summary>
 public sealed class GatewayApi
 {
+    /// <summary>
+    /// 会话失效（401）时触发。挂在类型上而不是实例上：页面各自持有同一个
+    /// <see cref="GatewayApi"/>，但「被踢回登录页」是 Shell 的职责，只该有一个订阅者。
+    /// </summary>
+    public static event Action? SessionExpired;
+
     private readonly HttpClient _http;
+    private string? _token;
 
     public GatewayApi(string? baseUrl = null)
     {
         _http = new HttpClient { Timeout = TimeSpan.FromSeconds(20) };
         _http.BaseAddress = new Uri(baseUrl ?? ResolveBaseUrl(), UriKind.Absolute);
 
-        var token = TokenStore.Load();
-        if (!string.IsNullOrEmpty(token))
-        {
-            _http.DefaultRequestHeaders.Authorization = new("Bearer", token);
-        }
+        SetToken(TokenStore.Load());
     }
+
+    /// <summary>
+    /// 换用另一个会话 Token。登录、改密、退出都走这里，
+    /// 避免「保存了 localStorage 但当前 HttpClient 还在用旧令牌」这类分裂状态。
+    /// </summary>
+    public void SetToken(string? token)
+    {
+        _token = string.IsNullOrEmpty(token) ? null : token;
+
+        _http.DefaultRequestHeaders.Authorization = _token is null
+            ? null
+            : new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", _token);
+    }
+
+    public string? Token => _token;
 
     public string BaseUrl => _http.BaseAddress!.ToString().TrimEnd('/');
 
@@ -77,16 +95,27 @@ public sealed class GatewayApi
         return await ReadAsync<T>(response, path, ct).ConfigureAwait(false);
     }
 
-    private static async Task<T> ReadAsync<T>(HttpResponseMessage response, string path, CancellationToken ct)
+    private async Task<T> PutAsync<T>(string path, HttpContent content, CancellationToken ct = default)
+    {
+        using var request = new HttpRequestMessage(HttpMethod.Put, path) { Content = content };
+        using var response = await _http.SendAsync(request, ct).ConfigureAwait(false);
+        return await ReadAsync<T>(response, path, ct).ConfigureAwait(false);
+    }
+
+    /// <summary>没有响应体的动作（DELETE / 204）也要走同一套错误映射。</summary>
+    private async Task ThrowOnErrorAsync(HttpResponseMessage response, string path, CancellationToken ct)
+    {
+        var text = await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
+        if (response.IsSuccessStatusCode) return;
+
+        throw Error(response, path, text);
+    }
+
+    private async Task<T> ReadAsync<T>(HttpResponseMessage response, string path, CancellationToken ct)
     {
         var text = await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
 
-        if (!response.IsSuccessStatusCode)
-        {
-            throw new GatewayException($"{(int)response.StatusCode} {path}: {Trim(text)}",
-                response.StatusCode is System.Net.HttpStatusCode.Unauthorized
-                    or System.Net.HttpStatusCode.Forbidden);
-        }
+        if (!response.IsSuccessStatusCode) throw Error(response, path, text);
 
         if (string.IsNullOrWhiteSpace(text)) return default!;
 
@@ -98,6 +127,44 @@ public sealed class GatewayApi
         catch (JsonException ex)
         {
             throw new GatewayException($"{path} returned malformed JSON: {ex.Message}");
+        }
+    }
+
+    /// <summary>
+    /// 把错误响应翻成异常，并解析契约里的 <c>error.code</c>。
+    /// 只有已经带着 Token 的请求被 401 才算「会话失效」：
+    /// 登录接口本身返回 401 是口令错误，不能顺手把用户踢出登录页。
+    /// </summary>
+    private GatewayException Error(HttpResponseMessage response, string path, string text)
+    {
+        var status = (int)response.StatusCode;
+        var (code, message) = ParseError(text);
+
+        if (status == 401 && _token is not null) SessionExpired?.Invoke();
+
+        return new GatewayException(
+            message ?? $"{(int)response.StatusCode} {path}: {Trim(text)}",
+            unauthorized: status is 401 or 403,
+            status: status,
+            code: code);
+    }
+
+    private static (string? Code, string? Message) ParseError(string text)
+    {
+        if (string.IsNullOrWhiteSpace(text)) return (null, null);
+
+        try
+        {
+            using var document = JsonDocument.Parse(text);
+            if (!document.RootElement.TryGetProperty("error", out var error)) return (null, null);
+
+            var code = error.TryGetProperty("code", out var c) ? c.GetString() : null;
+            var message = error.TryGetProperty("message", out var m) ? m.GetString() : null;
+            return (code, message);
+        }
+        catch (JsonException)
+        {
+            return (null, null);
         }
     }
 
@@ -116,6 +183,75 @@ public sealed class GatewayApi
 
     public Task<VersionDto> VersionAsync(CancellationToken ct = default)
         => GetAsync<VersionDto>("/api/v1/version", ct);
+
+    public Task<MeDto> MeAsync(CancellationToken ct = default)
+        => GetAsync<MeDto>("/api/v1/auth/me", ct);
+
+    public Task<LoginResponseDto> LoginAsync(string username, string password, CancellationToken ct = default)
+        => PostAsync<LoginResponseDto>("/api/v1/auth/login",
+            JsonContent.Create(new LoginRequestDto(username, password), Info<LoginRequestDto>()), ct);
+
+    public async Task LogoutAsync(CancellationToken ct = default)
+    {
+        using var request = new HttpRequestMessage(HttpMethod.Post, "/api/v1/auth/logout")
+        {
+            Content = new StringContent("{}", Encoding.UTF8, "application/json"),
+        };
+
+        using var response = await _http.SendAsync(request, ct).ConfigureAwait(false);
+        // 会话可能已经过期；退出动作本身不需要向用户报错。
+    }
+
+    public Task<PasswordChangeResponseDto> ChangePasswordAsync(
+        string currentPassword, string newPassword, CancellationToken ct = default)
+        => PostAsync<PasswordChangeResponseDto>("/api/v1/auth/password",
+            JsonContent.Create(new PasswordChangeRequestDto(currentPassword, newPassword),
+                Info<PasswordChangeRequestDto>()), ct);
+
+    public Task<Paged<UserDto>> UsersAsync(CancellationToken ct = default)
+        => GetAsync<Paged<UserDto>>("/api/v1/users", ct);
+
+    public Task<CreateUserResponseDto> CreateUserAsync(
+        string id, string? displayName, string? role, string? password, CancellationToken ct = default)
+        => PostAsync<CreateUserResponseDto>("/api/v1/users",
+            JsonContent.Create(new CreateUserRequestDto(id, displayName, role, password),
+                Info<CreateUserRequestDto>()), ct);
+
+    public Task<UserDto> UpdateUserAsync(
+        string id, string? displayName, string? role, bool? enabled, CancellationToken ct = default)
+        => PutAsync<UserDto>($"/api/v1/users/{Uri.EscapeDataString(id)}",
+            JsonContent.Create(new UpdateUserRequestDto(displayName, role, enabled),
+                Info<UpdateUserRequestDto>()), ct);
+
+    public Task<ResetPasswordResponseDto> ResetPasswordAsync(
+        string id, string? password = null, CancellationToken ct = default)
+        => PostAsync<ResetPasswordResponseDto>(
+            $"/api/v1/users/{Uri.EscapeDataString(id)}/reset-password",
+            JsonContent.Create(new ResetPasswordRequestDto(password), Info<ResetPasswordRequestDto>()), ct);
+
+    public async Task DeleteUserAsync(string id, CancellationToken ct = default)
+    {
+        using var response = await _http
+            .DeleteAsync($"/api/v1/users/{Uri.EscapeDataString(id)}", ct)
+            .ConfigureAwait(false);
+
+        await ThrowOnErrorAsync(response, "/api/v1/users/" + id, ct).ConfigureAwait(false);
+    }
+
+    public Task<Paged<AuditEntryDto>> AuditAsync(
+        string? action = null,
+        string? actor = null,
+        string? result = null,
+        int limit = 100,
+        CancellationToken ct = default)
+    {
+        var query = new StringBuilder($"?limit={limit}");
+        if (!string.IsNullOrWhiteSpace(action)) query.Append("&action=").Append(Uri.EscapeDataString(action));
+        if (!string.IsNullOrWhiteSpace(actor)) query.Append("&actor=").Append(Uri.EscapeDataString(actor));
+        if (!string.IsNullOrWhiteSpace(result)) query.Append("&result=").Append(Uri.EscapeDataString(result));
+
+        return GetAsync<Paged<AuditEntryDto>>("/api/v1/audit" + query, ct);
+    }
 
     public Task<Paged<DeviceSummaryDto>> DevicesAsync(int limit = 200, CancellationToken ct = default)
         => GetAsync<Paged<DeviceSummaryDto>>($"/api/v1/devices?limit={limit}", ct);
@@ -237,10 +373,24 @@ public sealed record SseEvent(string Type, string Data);
 
 public sealed class GatewayException : Exception
 {
-    public GatewayException(string message, bool unauthorized = false) : base(message)
-        => Unauthorized = unauthorized;
+    public GatewayException(
+        string message,
+        bool unauthorized = false,
+        int status = 0,
+        string? code = null) : base(message)
+    {
+        Unauthorized = unauthorized;
+        Status = status;
+        Code = code;
+    }
 
     public bool Unauthorized { get; }
+
+    /// <summary>HTTP 状态码；非 HTTP 来源（如 SSE 断流）为 0。</summary>
+    public int Status { get; }
+
+    /// <summary>契约错误码，例如 <c>auth.password_change_required</c>。</summary>
+    public string? Code { get; }
 }
 
 /// <summary>会话 Token 只放 localStorage：刷新保持登录，关标签页即失效。</summary>
@@ -322,6 +472,47 @@ public sealed record ProblemDto(string Device, string State, string? Reason, Dat
 
 public sealed record VersionDto(string Name, string Version, string ApiVersion, string SchemaVersion,
     string Site, string Runtime, DateTimeOffset StartedAt, string ConfigVersion);
+
+// ----------------------------------------------------------------------
+// 认证与账号
+// ----------------------------------------------------------------------
+
+public sealed record LoginRequestDto(string Username, string Password);
+
+public sealed record PasswordChangeRequestDto(string CurrentPassword, string NewPassword);
+
+public sealed record CreateUserRequestDto(string Id, string? DisplayName, string? Role, string? Password);
+
+public sealed record UpdateUserRequestDto(string? DisplayName, string? Role, bool? Enabled);
+
+public sealed record ResetPasswordRequestDto(string? Password);
+
+public sealed record MeDto(string Id, string? DisplayName, string Role, string[] Permissions,
+    bool Enabled, bool MustChangePassword, string Kind);
+
+public sealed record UserDto(string Id, string? DisplayName, string Role, string[] Permissions,
+    bool Enabled, bool MustChangePassword, DateTimeOffset CreatedAt, DateTimeOffset? LastLoginAt = null);
+
+public sealed record LoginResponseDto(string Token, DateTimeOffset ExpiresAt, UserDto User);
+
+public sealed record PasswordChangeResponseDto(string Token, DateTimeOffset ExpiresAt, UserDto User);
+
+public sealed record CreateUserResponseDto(UserDto User, string? TemporaryPassword);
+
+public sealed record ResetPasswordResponseDto(string User, string? TemporaryPassword,
+    bool MustChangePassword);
+
+// ----------------------------------------------------------------------
+// 审计
+// ----------------------------------------------------------------------
+
+/// <summary>
+/// 审计条目。Detail 保持为原始 JSON：不同动作的细节结构不同，
+/// 前端只把它当一段折叠文本展示，没必要为每种动作各建一个 DTO。
+/// </summary>
+public sealed record AuditEntryDto(long Seq, DateTimeOffset At, string Action, string Result,
+    string Actor, string Source, string? Remote, string? RequestId, string? Target,
+    JsonElement? Detail = null);
 
 public sealed record DriversDto(DriverDto[] Items);
 

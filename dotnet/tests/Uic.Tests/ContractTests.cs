@@ -66,6 +66,11 @@ internal static class ContractTests
         tests.Add(new TestCase("contract/audit_records_write_and_config", AuditRecordsWriteAndConfig));
         tests.Add(new TestCase("contract/audit_export_is_ndjson", AuditExportIsNdjson));
         tests.Add(new TestCase("contract/audit_denies_are_recorded", AuditDeniesAreRecorded));
+        tests.Add(new TestCase("contract/auth_login_forces_password_change", AuthLoginForcesPasswordChange));
+        tests.Add(new TestCase("contract/auth_roles_are_enforced", AuthRolesAreEnforced));
+        tests.Add(new TestCase("contract/auth_users_require_manage", AuthUsersRequireManage));
+        tests.Add(new TestCase("contract/auth_login_is_rate_limited", AuthLoginIsRateLimited));
+        tests.Add(new TestCase("contract/auth_logout_revokes_session", AuthLogoutRevokesSession));
     }
 
     // ------------------------------------------------------------------
@@ -1312,7 +1317,8 @@ internal static class ContractTests
 
             t.Ok(pointWrite.ValueKind == JsonValueKind.Object, "the point write is audited");
             t.Equal("ok", pointWrite.GetProperty("result").GetString(), "a successful write is recorded as ok");
-            t.Equal("bearer", pointWrite.GetProperty("actor").GetString(), "the actor is the token holder");
+            t.Equal("api-token", pointWrite.GetProperty("actor").GetString(),
+                "the actor is the static API token, not a made-up user");
             t.Equal("rest", pointWrite.GetProperty("source").GetString(), "the source says where the action came from");
             t.Equal("v1/temp", pointWrite.GetProperty("target").GetString(), "the target names the point");
             t.Equal(writeRequestId, pointWrite.GetProperty("requestId").GetString(),
@@ -1450,6 +1456,330 @@ internal static class ContractTests
             // 不能把令牌本身写进审计。
             t.Ok(!entry.GetRawText().Contains(Token, StringComparison.Ordinal),
                 "the audit record never contains the credential");
+        });
+    }
+
+
+    // ------------------------------------------------------------------
+    // 认证夹具
+    // ------------------------------------------------------------------
+
+    private static HttpRequestMessage GetWith(string path, string? token)
+    {
+        var request = new HttpRequestMessage(HttpMethod.Get, path);
+        if (!string.IsNullOrEmpty(token))
+            request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
+
+        return request;
+    }
+
+    private static HttpRequestMessage PostWith(string path, string json, string? token)
+    {
+        var request = new HttpRequestMessage(HttpMethod.Post, path)
+        {
+            Content = new StringContent(json, Encoding.UTF8, "application/json"),
+        };
+
+        if (!string.IsNullOrEmpty(token))
+            request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
+
+        return request;
+    }
+
+    private static HttpRequestMessage PutWith(string path, string json, string? token)
+    {
+        var request = new HttpRequestMessage(HttpMethod.Put, path)
+        {
+            Content = new StringContent(json, Encoding.UTF8, "application/json"),
+        };
+
+        if (!string.IsNullOrEmpty(token))
+            request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
+
+        return request;
+    }
+
+    private static HttpRequestMessage DeleteWith(string path, string? token)
+    {
+        var request = new HttpRequestMessage(HttpMethod.Delete, path);
+        if (!string.IsNullOrEmpty(token))
+            request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
+
+        return request;
+    }
+
+    private static string AdminInitialPassword(Host host)
+    {
+        var path = host.Runtime.Auth.Users.InitialPasswordPath
+                   ?? throw new CheckFailedException("the runtime did not write an initial password file");
+
+        var line = File.ReadAllLines(path)
+            .FirstOrDefault(l => l.StartsWith("password:", StringComparison.Ordinal));
+
+        return line is null
+            ? throw new CheckFailedException("the initial password file has no password line")
+            : line["password:".Length..].Trim();
+    }
+
+    private static async Task<(string Token, JsonElement User)> LoginAsync(
+        TestContext t, Host host, string username, string password)
+    {
+        var body = JsonSerializer.Serialize(new { username, password });
+        var response = await host.Client.SendAsync(PostWith("/api/v1/auth/login", body, null), t.Ct);
+        t.Equal(HttpStatusCode.OK, response.StatusCode, $"login as '{username}' succeeds");
+
+        using var document = await ReadJsonAsync(t, response);
+        var root = document.RootElement.Clone();
+
+        return (root.GetProperty("token").GetString()!, root.GetProperty("user").Clone());
+    }
+
+    private static async Task<string> ChangePasswordAsync(
+        TestContext t, Host host, string token, string current, string next)
+    {
+        var body = JsonSerializer.Serialize(new { currentPassword = current, newPassword = next });
+        var response = await host.Client.SendAsync(PostWith("/api/v1/auth/password", body, token), t.Ct);
+        t.Equal(HttpStatusCode.OK, response.StatusCode, "the password change succeeds");
+
+        using var document = await ReadJsonAsync(t, response);
+        return document.RootElement.GetProperty("token").GetString()!;
+    }
+
+    /// <summary>建一个已知口令的账号并完成首次改密，返回可直接使用的会话 Token。</summary>
+    private static async Task<string> SignInAsAsync(
+        TestContext t, Host host, string id, string role, string password)
+    {
+        var create = JsonSerializer.Serialize(new { id, role, password });
+        var created = await host.Client.SendAsync(PostWith("/api/v1/users", create, Token), t.Ct);
+        t.Equal(HttpStatusCode.OK, created.StatusCode, $"user '{id}' is created");
+
+        var (token, user) = await LoginAsync(t, host, id, password);
+        t.Equal(true, user.GetProperty("mustChangePassword").GetBoolean(),
+            "a newly created account must change its password");
+
+        return await ChangePasswordAsync(t, host, token, password, password + "-changed");
+    }
+
+    /// <summary>
+    /// 登录 → 强制改密 → 用新口令正常工作。这是现场第一次开机时的完整路径。
+    /// </summary>
+    private static Task AuthLoginForcesPasswordChange(TestContext t)
+    {
+        return RunAsync(async () =>
+        {
+            await using var host = await Host.StartAsync(t);
+
+            var initial = AdminInitialPassword(host);
+            var (token, user) = await LoginAsync(t, host, "admin", initial);
+
+            t.Equal("admin", user.GetProperty("role").GetString(), "the bootstrap user is an admin");
+            t.Equal(true, user.GetProperty("mustChangePassword").GetBoolean(),
+                "the bootstrap password is flagged as temporary");
+            t.Ok(!initial.Contains("admin", StringComparison.OrdinalIgnoreCase),
+                "the generated password is not a default like the user name");
+
+            var blocked = await host.Client.SendAsync(GetWith("/api/v1/devices", token), t.Ct);
+            t.Equal(HttpStatusCode.Forbidden, blocked.StatusCode,
+                "before changing the password, reading devices is forbidden");
+
+            using (var error = await ReadJsonAsync(t, blocked))
+            {
+                t.Equal("auth.password_change_required", error.RootElement.GetProperty("error")
+                    .GetProperty("code").GetString(), "the error code says why");
+            }
+
+            var next = "admin-password-1";
+            var newToken = await ChangePasswordAsync(t, host, token, initial, next);
+
+            var old = await host.Client.SendAsync(GetWith("/api/v1/devices", token), t.Ct);
+            t.Equal(HttpStatusCode.Unauthorized, old.StatusCode,
+                "the old session is revoked when the password changes");
+
+            var allowed = await host.Client.SendAsync(GetWith("/api/v1/devices", newToken), t.Ct);
+            t.Equal(HttpStatusCode.OK, allowed.StatusCode, "the new session works");
+
+            var (_, again) = await LoginAsync(t, host, "admin", next);
+            t.Equal(false, again.GetProperty("mustChangePassword").GetBoolean(),
+                "the forced-change flag is cleared");
+
+            using var me = await ReadJsonAsync(t,
+                await host.Client.SendAsync(GetWith("/api/v1/auth/me", newToken), t.Ct));
+            t.Equal("session", me.RootElement.GetProperty("kind").GetString(),
+                "a logged-in user is a session, not the static token");
+        });
+    }
+
+    private static Task AuthRolesAreEnforced(TestContext t)
+    {
+        RestApi.ResetDenialThrottleForTests();
+
+        return RunAsync(async () =>
+        {
+            await using var host = await Host.StartAsync(t);
+            await WaitForPointAsync(host, "v1", "temp", t);
+
+            var viewer = await SignInAsAsync(t, host, "viewer1", "viewer", "viewer-password-1");
+            var auditor = await SignInAsAsync(t, host, "auditor1", "auditor", "auditor-password-1");
+
+            var read = await host.Client.SendAsync(GetWith("/api/v1/devices", viewer), t.Ct);
+            t.Equal(HttpStatusCode.OK, read.StatusCode, "a viewer can read devices");
+
+            var write = await host.Client.SendAsync(
+                PostWith("/api/v1/points/v1/temp/write",
+                    """{"value":{"type":"float64","num":10},"confirm":true}""", viewer), t.Ct);
+            t.Equal(HttpStatusCode.Forbidden, write.StatusCode, "a viewer cannot write points");
+
+            var apply = await host.Client.SendAsync(
+                PostWith("/api/v1/config/apply", """{"json":"{}"}""", viewer), t.Ct);
+            t.Equal(HttpStatusCode.Forbidden, apply.StatusCode, "a viewer cannot apply configuration");
+
+            var command = await host.Client.SendAsync(
+                PostWith("/api/v1/commands",
+                    """{"action":"driver.restart","params":{"device":"v1"}}""", viewer), t.Ct);
+            t.Equal(HttpStatusCode.Forbidden, command.StatusCode,
+                "a viewer cannot restart a driver even though the route is readable");
+
+            var audit = await host.Client.SendAsync(GetWith("/api/v1/audit", viewer), t.Ct);
+            t.Equal(HttpStatusCode.Forbidden, audit.StatusCode, "a viewer cannot read the audit log");
+
+            var auditorAudit = await host.Client.SendAsync(GetWith("/api/v1/audit", auditor), t.Ct);
+            t.Equal(HttpStatusCode.OK, auditorAudit.StatusCode, "an auditor can read the audit log");
+
+            var auditorWrite = await host.Client.SendAsync(
+                PostWith("/api/v1/points/v1/temp/write",
+                    """{"value":{"type":"float64","num":10},"confirm":true}""", auditor), t.Ct);
+            t.Equal(HttpStatusCode.Forbidden, auditorWrite.StatusCode, "an auditor cannot write points");
+
+            // 权限矩阵在前端只是一份导航；真正的边界要在审计里能查到。
+            using var entries = await ReadJsonAsync(t,
+                await host.Client.SendAsync(GetWith("/api/v1/audit?action=auth.forbidden", Token), t.Ct));
+
+            var denied = entries.RootElement.GetProperty("items").EnumerateArray()
+                .Select(e => e.Clone())
+                .ToArray();
+
+            t.Ok(denied.Any(e => e.GetProperty("actor").GetString() == "viewer1"),
+                "the denial is attributed to the real account, not the token");
+            t.Ok(denied.All(e => e.GetProperty("result").GetString() == "denied"),
+                "denials are recorded as denied");
+
+            using var me = await ReadJsonAsync(t,
+                await host.Client.SendAsync(GetWith("/api/v1/auth/me", viewer), t.Ct));
+            t.Equal("viewer", me.RootElement.GetProperty("role").GetString(), "me reports the role");
+            t.Ok(me.RootElement.GetProperty("permissions").EnumerateArray()
+                    .All(p => p.GetString() != "point.write"),
+                "me reports the effective permissions");
+        });
+    }
+
+    private static Task AuthUsersRequireManage(TestContext t)
+    {
+        return RunAsync(async () =>
+        {
+            await using var host = await Host.StartAsync(t);
+
+            var viewer = await SignInAsAsync(t, host, "viewer2", "viewer", "viewer-password-2");
+
+            var denied = await host.Client.SendAsync(
+                PostWith("/api/v1/users", """{"id":"mallory","role":"admin"}""", viewer), t.Ct);
+            t.Equal(HttpStatusCode.Forbidden, denied.StatusCode, "only user.manage can create accounts");
+
+            // 不传口令时服务端生成一个一次性口令，管理员抄给用户，用户首次登录必须改。
+            var created = await host.Client.SendAsync(
+                PostWith("/api/v1/users", """{"id":"operator1","role":"operator"}""", Token), t.Ct);
+            t.Equal(HttpStatusCode.OK, created.StatusCode, "an admin can create an account");
+
+            using var document = await ReadJsonAsync(t, created);
+            var temporary = document.RootElement.GetProperty("temporaryPassword").GetString();
+            t.Ok(!string.IsNullOrWhiteSpace(temporary), "a temporary password is returned once");
+            t.Equal(true, document.RootElement.GetProperty("user").GetProperty("mustChangePassword")
+                .GetBoolean(), "the new account must change it");
+
+            var (_, user) = await LoginAsync(t, host, "operator1", temporary!);
+            t.Equal(true, user.GetProperty("mustChangePassword").GetBoolean(),
+                "the temporary password is marked as temporary");
+
+            using var list = await ReadJsonAsync(t,
+                await host.Client.SendAsync(GetWith("/api/v1/users", Token), t.Ct));
+            var text = list.RootElement.GetRawText();
+
+            t.Contains(text, "operator1", "the list contains the new account");
+            t.Ok(!text.Contains("pbkdf2", StringComparison.OrdinalIgnoreCase),
+                "the user list never exposes password hashes");
+
+            var update = await host.Client.SendAsync(
+                PutWith("/api/v1/users/operator1",
+                    """{"enabled":false}""", Token), t.Ct);
+            t.Equal(HttpStatusCode.OK, update.StatusCode, "an admin can disable an account");
+
+            var disabledLogin = await host.Client.SendAsync(
+                PostWith("/api/v1/auth/login",
+                    JsonSerializer.Serialize(new { username = "operator1", password = temporary }), null),
+                t.Ct);
+            t.Equal(HttpStatusCode.Forbidden, disabledLogin.StatusCode,
+                "a disabled account cannot log in");
+
+            var remove = await host.Client.SendAsync(
+                DeleteWith("/api/v1/users/operator1", Token), t.Ct);
+            t.Equal(HttpStatusCode.NoContent, remove.StatusCode, "an admin can delete an account");
+        });
+    }
+
+    private static Task AuthLoginIsRateLimited(TestContext t)
+    {
+        return RunAsync(async () =>
+        {
+            await using var host = await Host.StartAsync(t);
+            var initial = AdminInitialPassword(host);
+
+            for (var i = 0; i < 5; i++)
+            {
+                var bad = await host.Client.SendAsync(
+                    PostWith("/api/v1/auth/login",
+                        JsonSerializer.Serialize(new { username = "admin", password = "wrong-" + i }), null),
+                    t.Ct);
+
+                t.Equal(HttpStatusCode.Unauthorized, bad.StatusCode, "a wrong password is a 401");
+            }
+
+            var locked = await host.Client.SendAsync(
+                PostWith("/api/v1/auth/login",
+                    JsonSerializer.Serialize(new { username = "admin", password = initial }), null),
+                t.Ct);
+
+            t.Equal((HttpStatusCode)429, locked.StatusCode,
+                "the sixth attempt is rate limited even with the correct password");
+
+            using var body = await ReadJsonAsync(t, locked);
+            t.Equal("request.rate_limited", body.RootElement.GetProperty("error")
+                .GetProperty("code").GetString(), "the error code is the contract's rate-limit code");
+        });
+    }
+
+    private static Task AuthLogoutRevokesSession(TestContext t)
+    {
+        return RunAsync(async () =>
+        {
+            await using var host = await Host.StartAsync(t);
+
+            var initial = AdminInitialPassword(host);
+            var (token, _) = await LoginAsync(t, host, "admin", initial);
+            var session = await ChangePasswordAsync(t, host, token, initial, "admin-password-2");
+
+            var bye = await host.Client.SendAsync(
+                PostWith("/api/v1/auth/logout", "{}", session), t.Ct);
+
+            t.Equal(HttpStatusCode.NoContent, bye.StatusCode, "logout succeeds");
+
+            var me = await host.Client.SendAsync(GetWith("/api/v1/auth/me", session), t.Ct);
+            t.Equal(HttpStatusCode.Unauthorized, me.StatusCode, "the session no longer works");
+
+            using var audit = await ReadJsonAsync(t,
+                await host.Client.SendAsync(GetWith("/api/v1/audit?action=auth.logout", Token), t.Ct));
+
+            var entry = audit.RootElement.GetProperty("items")[0];
+            t.Equal("admin", entry.GetProperty("actor").GetString(),
+                "logout is audited against the account that logged out");
         });
     }
 

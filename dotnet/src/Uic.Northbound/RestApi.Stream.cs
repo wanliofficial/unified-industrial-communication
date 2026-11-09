@@ -2,6 +2,7 @@ using System.Text;
 using System.Text.Json;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Http;
+using Uic.Northbound.Security;
 
 namespace Uic.Northbound;
 
@@ -82,7 +83,7 @@ public static partial class RestApi
             }
 
             return Results.Empty;
-        });
+        }).RequirePermission(Permissions.SystemRead);
     }
 
     private static async Task WriteEventAsync(

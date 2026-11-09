@@ -3,6 +3,7 @@ using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Http;
 using Uic.Config;
 using Uic.Domain;
+using Uic.Northbound.Security;
 
 namespace Uic.Northbound;
 
@@ -33,7 +34,7 @@ public static partial class RestApi
 
             return Results.Json(new PagedResponse<TemplateSummaryDto>(templates, null, templates.Length),
                 ApiJson.Options);
-        });
+        }).RequirePermission(Permissions.ConfigRead);
 
         app.MapGet("/api/v1/templates/{id}", (string id) =>
         {
@@ -42,7 +43,7 @@ public static partial class RestApi
                                $"template '{id}' not found", new { template = id });
 
             return Results.Json(template, ApiJson.Options);
-        });
+        }).RequirePermission(Permissions.ConfigRead);
 
         app.MapPost("/api/v1/templates", async (HttpContext http, CancellationToken ct) =>
         {
@@ -52,7 +53,7 @@ public static partial class RestApi
 
             var saved = await store.SaveAsync(template, ct).ConfigureAwait(false);
             return Results.Json(saved, ApiJson.Options, statusCode: StatusCodes.Status201Created);
-        });
+        }).RequirePermission(Permissions.ConfigWrite);
 
         app.MapDelete("/api/v1/templates/{id}", async (string id, CancellationToken ct) =>
         {
@@ -61,7 +62,7 @@ public static partial class RestApi
                 throw ApiException.NotFound("template.not_found", $"template '{id}' not found");
 
             return Results.NoContent();
-        });
+        }).RequirePermission(Permissions.ConfigWrite);
 
         app.MapPost("/api/v1/templates/{id}/instantiate", async (HttpContext http, string id, CancellationToken ct) =>
         {
@@ -145,6 +146,6 @@ public static partial class RestApi
 
             return Results.Json(new InstantiateResponseDto(
                 template.Id, true, outcome.Version, devices, Array.Empty<ValidationProblem>()), ApiJson.Options);
-        });
+        }).RequirePermission(Permissions.ConfigWrite);
     }
 }

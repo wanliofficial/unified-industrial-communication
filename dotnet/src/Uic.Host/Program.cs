@@ -6,6 +6,7 @@ using Uic.Driver;
 using Uic.Driver.Modbus;
 using Uic.Driver.Virtual;
 using Uic.Northbound;
+using Uic.Northbound.Security;
 using Uic.Obs;
 using Uic.Runtime;
 
@@ -46,6 +47,9 @@ internal static class Program
             case "secret":
                 return Secret(cli);
 
+            case "user":
+                return User(cli);
+
             case "sim":
                 return await RunAsync(cli, simulate: true).ConfigureAwait(false);
 
@@ -76,6 +80,77 @@ internal static class Program
 
             default:
                 Console.Error.WriteLine("uic secret needs an action: keygen | seal");
+                Console.Error.WriteLine();
+                Console.Error.WriteLine(CliOptions.Usage);
+                return 64;
+        }
+    }
+
+    /// <summary>
+    /// <c>uic user</c>：账号的离线兜底。REST 需要有人能登录，控制台需要有人能进去；
+    /// 忘记管理员口令时，这台机器上的操作员必须还能恢复访问。
+    ///
+    /// 重置口令走与 REST 相同的存储与派生实现，不另写一份「命令行专用格式」——
+    /// 两份实现迟早会分叉，然后在最需要登录的时候互相不认。
+    /// </summary>
+    private static int User(CliOptions cli)
+    {
+        var dataDir = cli.DataDir ?? "./data";
+
+        UserStore store;
+        try
+        {
+            store = new UserStore(dataDir, message => Console.Error.WriteLine("warning: " + message));
+        }
+        catch (ConfigException ex)
+        {
+            Console.Error.WriteLine($"cannot open user store under '{dataDir}':");
+            Console.Error.WriteLine(ex.ToDetailedString());
+            return 3;
+        }
+
+        switch (cli.UserAction)
+        {
+            case "list":
+                Console.WriteLine($"{"id",-20} {"role",-10} {"enabled",-8} {"must-change",-12} last-login");
+                foreach (var user in store.All().OrderBy(u => u.Id, StringComparer.Ordinal))
+                {
+                    Console.WriteLine(
+                        $"{user.Id,-20} {user.Role,-10} {(user.Enabled ? "yes" : "no"),-8} " +
+                        $"{(user.MustChangePassword ? "yes" : "no"),-12} " +
+                        $"{user.LastLoginAt?.ToString("u") ?? "-"}");
+                }
+
+                return 0;
+
+            case "reset-password":
+            {
+                if (string.IsNullOrWhiteSpace(cli.User))
+                {
+                    Console.Error.WriteLine("uic user reset-password requires --user <id>");
+                    return 64;
+                }
+
+                var user = store.Find(cli.User);
+                if (user is null)
+                {
+                    Console.Error.WriteLine($"user '{cli.User}' not found");
+                    return 3;
+                }
+
+                var password = UserStore.GeneratePassword();
+                store.SetPassword(user.Id, password, mustChange: true);
+                store.ClearInitialPasswordFile();
+
+                // 口令走 stdout，提示走 stderr：方便脚本 `PASSWORD=$(uic user reset-password ...)`。
+                Console.WriteLine(password);
+                Console.Error.WriteLine(
+                    $"temporary password for '{user.Id}' (must be changed at next login)");
+                return 0;
+            }
+
+            default:
+                Console.Error.WriteLine("uic user needs an action: list | reset-password");
                 Console.Error.WriteLine();
                 Console.Error.WriteLine(CliOptions.Usage);
                 return 64;
@@ -480,11 +555,27 @@ internal static class Program
             log.LogInformation("simulation mode: embedded Modbus TCP slave on 127.0.0.1:{Port}", simPort);
         }
 
-        if (string.IsNullOrWhiteSpace(config.Northbound.Rest.Token))
+        // 首次启动会生成 admin 与一个随机初始口令。口令本身不进日志（日志会被收走），
+        // 只提示文件位置；用户改密成功后文件会被删除。
+        var initial = runtime.Auth.Users.InitialPasswordPath;
+        if (runtime.Auth.Users.CreatedInitialAdmin)
         {
             log.LogWarning(
-                "northbound.rest.token is empty; the API accepts unauthenticated requests. " +
-                "Set a token before exposing this port to a network.");
+                "first start: created user 'admin' with a random password; read it from {Path} " +
+                "and change it after the first login (the file is removed once changed)",
+                initial);
+        }
+        else if (initial is not null && File.Exists(initial))
+        {
+            log.LogWarning(
+                "the initial admin password has not been changed yet; read it from {Path}", initial);
+        }
+
+        if (string.IsNullOrWhiteSpace(config.Northbound.Rest.Token))
+        {
+            log.LogInformation(
+                "no static API token configured; scripts must log in with an account " +
+                "(local accounts are always required for the API)");
         }
 
         if (!config.Northbound.OpcUa.Enabled)

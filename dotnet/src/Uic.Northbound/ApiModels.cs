@@ -205,6 +205,48 @@ public sealed record ConfigImportResponseDto(
     JsonNode? Config,
     IReadOnlyList<ValidationProblem> Problems);
 
+// ----------------------------------------------------------------------
+// 认证与账号
+// ----------------------------------------------------------------------
+
+public sealed record LoginRequestDto(string? Username, string? Password);
+
+/// <summary>账号的对外视图。永远不带口令派生值——它连哈希都不该出现在 API 里。</summary>
+public sealed record UserViewDto(
+    string Id,
+    string? DisplayName,
+    string Role,
+    IReadOnlyList<string> Permissions,
+    bool Enabled,
+    bool MustChangePassword,
+    DateTimeOffset CreatedAt,
+    DateTimeOffset? LastLoginAt);
+
+public sealed record LoginResponseDto(string Token, DateTimeOffset ExpiresAt, UserViewDto User);
+
+public sealed record CurrentUserResponse(
+    string Id,
+    string? DisplayName,
+    string Role,
+    IReadOnlyList<string> Permissions,
+    bool Enabled,
+    bool MustChangePassword,
+    string Kind);
+
+public sealed record PasswordChangeRequestDto(string? CurrentPassword, string? NewPassword);
+
+public sealed record PasswordChangeResponseDto(string Token, DateTimeOffset ExpiresAt, UserViewDto User);
+
+public sealed record CreateUserRequestDto(string? Id, string? DisplayName, string? Role, string? Password);
+
+public sealed record CreateUserResponseDto(UserViewDto User, string? TemporaryPassword);
+
+public sealed record UpdateUserRequestDto(string? DisplayName, string? Role, bool? Enabled);
+
+public sealed record ResetPasswordRequestDto(string? Password);
+
+public sealed record ResetPasswordResponseDto(string User, string? TemporaryPassword, bool MustChangePassword);
+
 /// <summary>契约序列化选项：与 <see cref="JsonDefaults"/> 一致，额外忽略 null。</summary>
 public static class ApiJson
 {

@@ -7,19 +7,98 @@
 
 ### 认证
 
-配置了 `northbound.rest.token` 时，除下列路径外都需要 `Authorization: Bearer <token>`：
+除下列公开路径外，所有 `/api/` 端点都需要：
 
 ```
-/healthz   /readyz   /api/v1/version   /api/v1/metrics
+Authorization: Bearer <token>
+```
+
+公开路径（探针、抓取器与登录本身）：
+
+```
+/healthz   /readyz   /api/v1/version   /api/v1/metrics   /api/v1/health
+/api/v1/auth/login
 ```
 
 以及所有非 `/api/` 的静态资源（否则 WASM 首屏拉不到程序集）。
 
+系统始终存在本地账号库（`data/security/users.json`），**没有「不配令牌就不鉴权」这条路径**：
+
+- 会话 Token：`POST /api/v1/auth/login` 用账号口令换取，12 小时有效，进程重启即失效；
+- 静态 API Token：配置项 `northbound.rest.token`，给运维脚本用，不过期、不参与强制改密，
+  审计里记为 `api-token`；
 - 令牌比较是定长的，避免用耗时差反推；
-- 令牌本身**不接受明文**：配置里只能是 `${env:NAME}`、`${file:PATH}` 或 `enc:v1:...`，
+- 静态令牌本身**不接受明文**：配置里只能是 `${env:NAME}`、`${file:PATH}` 或 `enc:v1:...`，
   启动与 `config/apply` 遇到明文直接失败（见 [configuration.md](configuration.md#凭据)）；
-- 配置里没写令牌 = 不鉴权，启动时会打一条告警；
 - 401 响应带 `WWW-Authenticate: Bearer`。
+
+首次启动会生成随机口令的 `admin`，写入 `data/security/initial-admin-password.txt`。
+该口令带「必须修改」标记：改密之前，除 `auth/me`、`auth/password`、`auth/logout` 之外的
+请求一律 `403 auth.password_change_required`。改密成功后文件会被删除。
+
+口令派生用 PBKDF2-SHA256（210,000 次迭代、每账号独立随机盐），账号文件里没有明文。
+登录失败按来源 IP 计 **5 次/分钟**，超限锁定 60 秒并返回 `429 request.rate_limited`；
+锁定按 IP 而不是按账号，避免有人用错误口令把管理员锁在门外。
+
+### 账号与权限
+
+| 方法 | 路径 | 所需权限 | 说明 |
+|---|---|---|---|
+| POST | `/api/v1/auth/login` | 公开 | 口令换会话；返回 `token`、`expiresAt`、`user` |
+| POST | `/api/v1/auth/logout` | 已登录 | 撤销当前会话，返回 204 |
+| GET | `/api/v1/auth/me` | 已登录 | 当前身份、角色与**有效权限集合** |
+| POST | `/api/v1/auth/password` | 已登录 | 改自己的口令（需当前口令），换发新 Token |
+| GET | `/api/v1/users` | `user.manage` | 账号列表（不含口令派生值） |
+| POST | `/api/v1/users` | `user.manage` | 新建账号；不传口令时生成一次性临时口令 |
+| PUT | `/api/v1/users/{id}` | `user.manage` | 改显示名、角色、启用/停用 |
+| POST | `/api/v1/users/{id}/reset-password` | `user.manage` | 重置为一次性临时口令 |
+| DELETE | `/api/v1/users/{id}` | `user.manage` | 删除账号 |
+
+登录响应：
+
+```json
+{
+  "token": "3n1...base64url...",
+  "expiresAt": "2026-11-09T22:14:03.512Z",
+  "user": {
+    "id": "admin", "displayName": "管理员", "role": "admin",
+    "permissions": ["audit.read", "config.read", "..."],
+    "enabled": true, "mustChangePassword": false,
+    "createdAt": "2026-11-09T10:12:55.104Z", "lastLoginAt": "2026-11-09T10:14:03.512Z"
+  }
+}
+```
+
+新建或重置口令时，`temporaryPassword` **只返回这一次**，账号同时被标记为必须改密，
+该用户的所有旧会话立即作废。`PUT` 停用账号或改角色同样会撤销其会话——权限变更不能
+等 12 小时自然过期。
+
+内置角色（`admin` / `operator` / `viewer` / `auditor`）：
+
+| 权限 | admin | operator | viewer | auditor |
+|---|---|---|---|---|
+| `system.read`（设备/点位/日志/历史/诊断） | ✓ | ✓ | ✓ | ✓ |
+| `system.control`（outbox、日志级别） | ✓ | ✓ | | |
+| `device.control`（重启驱动、自检） | ✓ | ✓ | | |
+| `point.write` | ✓ | ✓ | | |
+| `config.read` | ✓ | ✓ | ✓ | ✓ |
+| `config.write` | ✓ | ✓ | | |
+| `config.rollback` | ✓ | | | |
+| `audit.read` | ✓ | | | ✓ |
+| `user.manage` | ✓ | | | |
+
+端点用 `.RequirePermission(...)` 声明所需能力，中间件**默认拒绝**：漏标的端点返回 403，
+而不是「忘了标 = 谁都能进」。`POST /api/v1/commands` 是例外：路由本身只要求已登录，
+具体动作在处理器里查表（`driver.restart`/`device.selftest` → `device.control`，
+`outbox.*`/`log.level` → `system.control`，`config.rollback` → `config.rollback`，
+`diag.bundle` → `system.read`）。
+
+`403` 有两种 code：
+
+| `code` | 含义 |
+|---|---|
+| `auth.forbidden` | 身份有效，但缺少所需权限（`details` 里带 `permission`） |
+| `auth.password_change_required` | 仍在用一次性口令，先调 `auth/password` |
 
 ### 限流
 
@@ -51,8 +130,13 @@
 |---|---|---|
 | 400 | `request.invalid` / `request.invalid_parameter` / `request.missing_parameter` | 请求体或参数不合法 |
 | 400 | `request.confirm_required` | 破坏性操作缺少 `confirm: true` |
-| 401 | `auth.unauthorized` | 缺少或错误的令牌 |
-| 404 | `device.not_found` / `point.not_found` / `resource.not_found` | 找不到对象 |
+| 400 | `auth.weak_password` / `auth.invalid_password` / `user.invalid_role` | 新口令不合规、当前口令不对、角色名未知 |
+| 401 | `auth.unauthorized` | 缺少、错误或已过期的令牌 |
+| 401 | `auth.invalid_credentials` | 登录时用户名或口令不对（不区分是哪一个错） |
+| 403 | `auth.forbidden` / `auth.password_change_required` | 权限不足 / 尚未改掉一次性口令 |
+| 403 | `auth.user_disabled` | 账号已停用 |
+| 404 | `device.not_found` / `point.not_found` / `resource.not_found` / `user.not_found` | 找不到对象 |
+| 409 | `user.exists` / `user.last_admin` / `user.cannot_delete_self` | 账号重名、要停用或降级最后一个管理员、删除自己 |
 | 422 | `config.invalid` | 配置语法或语义非法，`details` 里是逐条问题 |
 | 429 | `request.too_many_requests` | 限流或 SSE 连接数超限 |
 | 500 | `internal.error` | 未预期异常 |
@@ -413,7 +497,7 @@
 |---|---|---|
 | `from` / `to` | `to - 24h` / 现在 | ISO-8601；带偏移自动转 UTC，不带偏移按 UTC 解释 |
 | `action` | 全部 | 动作名，精确匹配（如 `config.apply`、`point.write`） |
-| `actor` | 全部 | 执行者：这一版是 `anonymous`（没配令牌）或 `bearer`（配了令牌） |
+| `actor` | 全部 | 执行者：账号 id、`api-token`（静态令牌）或 `anonymous`（认证失败） |
 | `result` | 全部 | `ok` / `failed` / `denied` |
 | `target` | 全部 | 目标：`device/point`、配置版本、被拒的路径等 |
 | `limit` | 查询 100 / 导出 5000 | 查询上限 1000，导出上限 100000 |
@@ -429,7 +513,7 @@
       "at": "2026-11-08T14:38:16.123Z",
       "action": "point.write",
       "result": "failed",
-      "actor": "bearer",
+      "actor": "zhangsan",
       "source": "rest",
       "remote": "127.0.0.1",
       "requestId": "req-e2e28d3f4f30444e",
@@ -457,6 +541,11 @@
 - REST 命令与 MQTT 下行命令各自记录（`source` 分别是 `rest` / `mqtt`）；
 - `auth.failed`：401 也会留痕，`actor` 固定为 `anonymous`，同一来源 IP 30 秒内去重
   ——审计回答「谁在被拒绝」，不是把扫描器的每个请求都写成一条磁盘记录；
+- `auth.login`（成功与失败）、`auth.logout`、`auth.password_changed`：登录失败记用户名
+  与失败原因，**不记口令**；
+- `auth.forbidden`：已认证但缺少权限，按「账号 + 路径」30 秒去重，`details` 带
+  `permission` 与 `role`——它是「角色配错了」还是「有人在点不该点的按钮」的唯一线索；
+- `user.create` / `user.update` / `user.reset_password` / `user.delete`：账号变更本身必须留痕；
 - `audit.export`：导出动作本身也记一条，谁在什么时候把审计拿走和内容同等重要。
 
 行为约定：
@@ -467,8 +556,8 @@
 - 重启后 `seq` 从最新文件的最后一条继续，不会回退；旧记录仍可查询。
 - 审计写失败（磁盘满、权限错）**不阻断**业务：口头告警一次，指标
   `uic_audit_write_failures` 非零，审计进入降级直到进程重启。
-- 这一版没有账号体系，`actor` 只有 `anonymous` / `bearer`；FR-OPS-02 落地后换成账号 id，
-  记录形状不变。
+- `actor` 是真实的账号 id；静态 API Token 记为 `api-token`，认证失败记为 `anonymous`。
+  `source` 区分 `rest` / `mqtt`，MQTT 命令当前没有身份，同为 `anonymous`。
 - 查询是全量扫描文件后过滤（按文件名日期先做一次粗筛），适合「最近几天」的量级；
   需要长期归档时应把文件转到外部存储。
 

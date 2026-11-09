@@ -1,6 +1,7 @@
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Http;
 using Uic.Domain;
+using Uic.Northbound.Security;
 
 namespace Uic.Northbound;
 
@@ -47,7 +48,7 @@ public static partial class RestApi
             var next = offset + page.Count < result.Total ? EncodeCursor(offset + page.Count) : null;
 
             return Results.Json(new PagedResponse<SampleDto>(page, next, result.Total), ApiJson.Options);
-        });
+        }).RequirePermission(Permissions.SystemRead);
     }
 
     private static DateTimeOffset ParseTime(string? text, DateTimeOffset fallback, string parameter)
