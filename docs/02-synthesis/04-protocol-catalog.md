@@ -273,6 +273,14 @@ MC 3E、FINS、EtherNet/IP + CIP、BACnet/IP、IEC 104、DL/T 645、CJ/T 188、A
 
 IEC 61850、DNP3、SECS/GEM、KNX、CoAP、Mewtocol、Host Link、MTConnect、IEC 101、MS/TP。
 
+> 截至当前实现：DNP3 已落地（编解码 + 主站 + 内置从站 + `uic dnp3read` +
+> `examples/dnp3.json`）。只做 TCP 主站、类 0 总召唤、类 1/2/3 事件轮询、CROB 与
+> 组 41 直接控制、未请求响应的接收与确认；不做串口、安全认证、文件传输、时间同步
+> 写路径、SBO 两段式控制。三层协议最难的不是字段编码，而是**三种确认不能漏**：
+> 链路 ACK、传输分片重组、应用层 CON。漏掉应用层确认会让从站事件缓冲区被重发撑爆，
+> 现场表现为「跑了几小时后全是旧值」。另外两个线格式陷阱——双点静态量是 2 位/点、
+> 静态变体 2 只有「状态+品质」字节而没有独立位图——都已用往返自洽测试钉死。
+
 **明确不做**：PROFINET IO、PROFIBUS、CANopen、CC-Link、FOCAS、DALI、LonWorks、DDS、EtherCAT、HART、GB/T 28181、Euromap、Matter、LoRaWAN、OCPP、Redfish。
 
 不做这些的理由不是「难」，而是**它们需要专用硬件、厂商授权或非工业场景**，投入产出比不成立。若客户有需求，通过「进程外驱动 SDK」由合作方实现。

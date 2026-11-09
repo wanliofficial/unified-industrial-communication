@@ -1,4 +1,4 @@
-// Command uic 是单一可执行入口：run（默认）/ sim / mbread / mcread / finsread / enipread / bacread / iec104read / uaread / s7blocks / s7upload / instantiate / import / token / version。
+// Command uic 是单一可执行入口：run（默认）/ sim / mbread / mcread / finsread / enipread / bacread / iec104read / dnp3read / uaread / s7blocks / s7upload / instantiate / import / token / version。
 //
 //	uic -config config.json            # 前台运行
 //	uic run -config config.json        # 同上
@@ -17,6 +17,7 @@
 //	uic enipread -addr 127.0.0.1:44818 -tag DINT_TAG  # EtherNet/IP CIP 自检
 //	uic bacread -addr 127.0.0.1:47808 -type analog-input -instance 1  # BACnet/IP 自检
 //	uic iec104read -addr 127.0.0.1:2404 -ca 1   # IEC 60870-5-104 自检（总召唤 + 上送对象）
+//	uic dnp3read -addr 127.0.0.1:20000 -probe   # DNP3 自检（链路复位 + 总召唤 + 对象清单）
 //	uic snmpread -addr 127.0.0.1:16161 -oid 1.3.6.1.2.1.1.1.0   # SNMP v1/v2c 自检
 //	uic adsread -addr 127.0.0.1:48898 -probe   # ADS/AMS 自检（设备信息握手）
 //	uic uaread -addr 127.0.0.1:4840 -nodes ns=2;s=site/dev/point  # OPC UA 读写自检
@@ -58,6 +59,7 @@ import (
 	bacnetsim "uic/internal/sim/bacnet"
 	cjt188sim "uic/internal/sim/cjt188"
 	dlt645sim "uic/internal/sim/dlt645"
+	dnp3sim "uic/internal/sim/dnp3"
 	enipsim "uic/internal/sim/enip"
 	finsim "uic/internal/sim/fins"
 	iec104sim "uic/internal/sim/iec104"
@@ -96,6 +98,8 @@ func main() {
 		bacreadCmd(args)
 	case "iec104read":
 		iec104readCmd(args)
+	case "dnp3read":
+		dnp3readCmd(args)
 	case "dlt645read":
 		dlt645readCmd(args)
 	case "cjt188read":
@@ -133,7 +137,7 @@ func usage() {
 用法:
   uic [run] -config config.json [-listen :8080] [-token TOKEN]
   uic -check -config config.json
-  uic sim [-listen 127.0.0.1:15020] [-protocol modbus|s7|opcua|mqtt|mc|fins|enip|bacnet|iec104|dlt645|cjt188|snmp|ads]
+  uic sim [-listen 127.0.0.1:15020] [-protocol modbus|s7|opcua|mqtt|mc|fins|enip|bacnet|iec104|dnp3|dlt645|cjt188|snmp|ads]
   uic mbread -addr 127.0.0.1:1502 -unit 1 -area holding -offset 0 -qty 2
   uic mbread -addr 127.0.0.1:1502 -area holding -offset 5 -write 777
   uic mcread -addr 127.0.0.1:5000 -area d -offset 100 -qty 2
@@ -146,6 +150,8 @@ func usage() {
   uic bacread -addr 127.0.0.1:47808 -type analog-value -instance 2 -write 55.5
   uic iec104read -addr 127.0.0.1:2404 -ca 1 [-ioa 1001,1002] [-json]
   uic iec104read -addr 127.0.0.1:2404 -area single-command -cmd-ioa 4001 -write on
+  uic dnp3read -addr 127.0.0.1:20000 [-index 0,1] [-json] [-raw]
+  uic dnp3read -addr 127.0.0.1:20000 -binary 0=on -analog 0=12.5
   uic dlt645read -addr 127.0.0.1:14001 -address 000000000042 -di 00000000,02010100
   uic dlt645read -transport serial -port /dev/ttyUSB0 -baud 2400 -address 0042 -probe
   uic dlt645read -addr 127.0.0.1:14001 -address 42 -di 04000101 -write 20261107120000
@@ -502,6 +508,9 @@ func simCmd(args []string) {
 	case "iec104":
 		simIEC104(*addr)
 		return
+	case "dnp3":
+		simDNP3(*addr)
+		return
 	case "dlt645":
 		simDLT645(*addr)
 		return
@@ -516,7 +525,7 @@ func simCmd(args []string) {
 		return
 	case "modbus":
 	default:
-		fmt.Fprintf(os.Stderr, "未知协议 %q（支持 modbus | s7 | opcua | mqtt | mc | fins | enip | bacnet | iec104 | dlt645 | cjt188 | snmp | ads）\n", *proto)
+		fmt.Fprintf(os.Stderr, "未知协议 %q（支持 modbus | s7 | opcua | mqtt | mc | fins | enip | bacnet | iec104 | dnp3 | dlt645 | cjt188 | snmp | ads）\n", *proto)
 		os.Exit(2)
 	}
 
@@ -881,6 +890,37 @@ func simIEC104(addr string) {
 
 	<-ctx.Done()
 	_ = srv.Close()
+	slog.Info("sim_stopped")
+}
+
+// simDNP3 启动内置 DNP3 从站（IEEE 1815，TCP 20000）。
+//
+// 初始值与 examples/dnp3.json 一一对应：先起这个从站，再跑
+// `./uic -config examples/dnp3.json`，就能看到点位被正常采集；默认点表
+// 每秒变化一次（二进制输入 0 翻转、计数器 0 自增），用来观察事件轮询、
+// 应用层确认与 SSE。
+func simDNP3(addr string) {
+	srv, err := dnp3sim.NewServer(addr)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "启动 DNP3 从站失败: %v\n", err)
+		os.Exit(1)
+	}
+	defer func() { _ = srv.Close() }()
+
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	fmt.Printf("dnp3 slave listening on %s (link address 1)\n", srv.Addr())
+	fmt.Println("  binary-input:    [0]=on(类1) [1]=off(类1) [2]=on [3]=off")
+	fmt.Println("  double-bit-input:[0]=1(分) [1]=2(合)")
+	fmt.Println("  binary-output:   [0]=off [1]=off（可 CROB 直接控制）")
+	fmt.Println("  counter:         [0]=1000(类3，每秒自增) [1]=42")
+	fmt.Println("  analog-input:    [0]=42.5 [1]=7.25 [2]=-3.5 [3]=1234（类2）")
+	fmt.Println("  analog-output:   [0]=0（可组 41 直接控制）")
+	fmt.Printf("  自检：   uic dnp3read -addr %s\n", srv.Addr())
+	fmt.Println("  Ctrl+C 停止")
+
+	<-ctx.Done()
 	slog.Info("sim_stopped")
 }
 

@@ -39,6 +39,7 @@ import (
 	cjt188drv "uic/internal/driver/cjt188"
 	"uic/internal/driver/computed"
 	dlt645drv "uic/internal/driver/dlt645"
+	dnp3drv "uic/internal/driver/dnp3"
 	enipdrv "uic/internal/driver/enip"
 	finsdrv "uic/internal/driver/fins"
 	"uic/internal/driver/iec104"
@@ -162,6 +163,7 @@ func RegisterBuiltins() error {
 			bacnetdrv.New(),
 			iec104.New(),
 			dlt645drv.New(),
+			dnp3drv.New(),
 			cjt188drv.New(),
 			snmpdrv.New(),
 			adsdrv.New(),

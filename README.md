@@ -388,6 +388,48 @@ IEC 104 与其它协议的根本差别是**数据由从站推上来**：建链�
 传送原因、时标），初次接陌生设备时先看清「它送什么」再写点表。双点的 0/3 中间态
 原样显示成「不确定 (3)」，不硬转成布尔。
 
+DNP3（IEEE 1815）调度主站（TCP 20000）：
+
+```bash
+./uic sim -protocol dnp3 -listen 127.0.0.1:20000 &   # 内置 DNP3 从站（链路地址 1）
+./uic -config examples/dnp3.json
+curl -s -H 'Authorization: Bearer dev-token-0123456789' localhost:8098/api/v1/points
+#   13 点：二进制输入（类 1，每秒翻转）、双点 1/2、计数器（类 3，每秒自增）、
+#          模拟量 42.5/7.25/-3.5/1234（类 2）、
+#          二进制输出（CROB）+ 模拟量输出（组 41）（可写）
+#   自检（不需要网关）：./uic dnp3read -addr 127.0.0.1:20000
+#   只验链路层：./uic dnp3read -addr 127.0.0.1:20000 -probe
+#   直接控制：./uic dnp3read -addr 127.0.0.1:20000 -binary 0=on -analog 0=12.5
+```
+
+DNP3 是三层协议：链路层（`05 64` 起始、每 16 字节一块 CRC、主站/从站各有自己的
+链路地址）、传输层（应用报文分片，首尾字节带 FIR/FIN/序号）、应用层（功能码、对象头、
+限定词、IIN）。三层任何一层错位都表现为「TCP 连上了但读不到值」，所以 `Open` 阶段
+分三步走：复位链路（等链路 ACK）→ 探活（TEST_LINK）→ 用一条 READ 同时请求类
+0/1/2/3 做首次总召唤。
+
+与 IEC 104 一样，**数据由从站推上来**：`Read` 只查本地最新值表，不做网络交互。总召唤
+（默认 5 分钟）刷新静态值，事件轮询（默认 1 秒）拉类 1/2/3。事件响应的应用层 CON 位
+必须回一条确认，否则从站把事件留在待确认队列里反复重发，最终撑爆它的事件缓冲区——
+这是现场「刚开始正常、几小时后突然全是旧值」最常见的原因。驱动在收到带 CON 的响应后
+立即回确认，并在收到**非请求响应**（UNSOLICITED）时同样回确认。
+
+质量映射只看低 6 位：`ONLINE=0` 或 `COMM_LOST=1` → bad；`RESTART`、强置、越限、
+参考误差 → uncertain；其余 good。**二进制量的 bit7、双点量的 bit6-7 是过程状态而不是
+品质位**，必须先屏蔽——否则所有处于「合」位的开关都会被判成 uncertain。
+
+点位用 `kind=register` 寻址，`offset` 是对象索引，`area` 取 `binary-input` /
+`double-bit-input` / `binary-output` / `counter` / `analog-input` / `analog-output`
+（也接受 `bi`/`dbi`/`bo`/`ctr`/`ai`/`ao` 短别名）。双点量按 bool 映射时：1（分）→
+false、2（合）→ true、0/3（中间态/不确定）→ false + uncertain，绝不把「未知」显示成
+「已关闭」。写二进制输出用 CROB（组 12，锁存开/关），写模拟量输出用组 41；两者都等
+从站的应用响应并检查回显状态，**只写 socket 不检查回显会把拒绝当成成功**。不做选择-
+执行（SBO）两段式、不做安全认证、不做文件传输、不做时间同步写路径、不做串口。
+
+`dnp3read` 同样不依赖点表：驱动旁路表按「区 + 索引」记录设备实际送过的每个对象
+（组、变体、原始品质位、时标），初次接陌生设备时先看清「它到底送哪些对象」，再写点表。
+带 `-raw` 时把组/变体与原始 flags 一起打出来，便于和生产方对账。
+
 DL/T 645-2007 多功能电能表（RS-485 / 串口服务器）：
 
 ```bash
@@ -533,7 +575,7 @@ go test -race -count=1 ./...
 
 | 路径 | 内容 |
 |---|---|
-| `cmd/uic/` | 单入口：`run` / `sim`（Modbus / S7 / OPC UA / MQTT / MC / FINS / EtherNet-IP / BACnet-IP / IEC 104 / 645 / 188 / SNMP / ADS）/ `mbread` / `mcread` / `finsread` / `enipread` / `bacread` / `iec104read` / `dlt645read` / `cjt188read` / `snmpread` / `adsread` / `uaread` / `s7blocks` / `s7upload` / `instantiate` / `import` / `token` / `-check` / `version` |
+| `cmd/uic/` | 单入口：`run` / `sim`（Modbus / S7 / OPC UA / MQTT / MC / FINS / EtherNet-IP / BACnet-IP / IEC 104 / DNP3 / 645 / 188 / SNMP / ADS）/ `mbread` / `mcread` / `finsread` / `enipread` / `bacread` / `iec104read` / `dnp3read` / `dlt645read` / `cjt188read` / `snmpread` / `adsread` / `uaread` / `s7blocks` / `s7upload` / `instantiate` / `import` / `token` / `-check` / `version` |
 | `internal/model` | 通道 / 设备 / 点位 / 地址 / 采样 / 质量码 |
 | `internal/driver` | 驱动契约（Codec / Transport / Driver）、错误分类、注册表、只读 `Lookup` 注入 |
 | `internal/calc` | 零依赖表达式引擎（编译期类型检查、短路求值、引用 `device:point`） |
@@ -552,6 +594,9 @@ go test -race -count=1 ./...
 | `internal/codec/iec104` | IEC 60870-5-104 纯函数编解码（APCI 三种帧型 / ASDU / 元素宽度 / CP56Time2a / 品质位 / 命令构造 / 类型与原因名表） |
 | `internal/driver/iec104` | IEC 104 主站（STARTDT 建链、站总召唤、电能量召唤、最新值表、五种命令、否定确认分类、旁路表） |
 | `internal/sim/iec104` | IEC 104 内置从站（对象表 / STARTDT 门控 / 召唤快照 / 命令三段式 / 突发上送） |
+| `internal/codec/dnp3` | DNP3 纯函数编解码（链路帧与 CRC / 流式收帧 / 传输分片重组 / 应用层请求响应 / 对象解析 / 请求头 / CROB 与组 41 构造） |
+| `internal/driver/dnp3` | DNP3 主站（复位链路 + TEST_LINK、类 0/1/2/3 轮询、未请求响应、应用层确认、CROB 与模拟量直接控制、旁路表） |
+| `internal/sim/dnp3` | DNP3 内置从站（链路 ACK / 类 0 静态快照 / 三类事件队列与 inflight / CROB 与组 41 直接控制回显） |
 | `internal/codec/dlt645` | 645-2007 纯函数编解码（帧/校验和 / 数据标识 DI 表 / 压缩 BCD 与小数位 / 时间与地址 / 收帧扫描 / 后续帧序号） |
 | `internal/driver/dlt645` | 645 主站（RS-485 与串口服务器双承载、总线锁、逐点读 + 后续帧、写权限四道闸门、错误分类） |
 | `internal/sim/dlt645` | 645 内置从站（按标准宽度回数据 / 地址过滤 / 后续帧拆分 / 写权限与密码 / 广播校时静默生效 / 拉合闸） |

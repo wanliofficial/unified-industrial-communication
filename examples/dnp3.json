@@ -1,0 +1,216 @@
+{
+  "schemaVersion": 1,
+  "site": "dnp3-lab",
+  "server": {
+    "listen": "127.0.0.1:8098",
+    "token": "dev-token-0123456789"
+  },
+  "storage": {
+    "dir": "./data-dnp3",
+    "journal": true,
+    "outboxMaxRecords": 5000,
+    "outboxTtl": "10m"
+  },
+  "logging": {
+    "level": "info"
+  },
+  "northbound": {
+    "webhook": {
+      "enabled": false,
+      "url": "http://127.0.0.1:9999/ingest",
+      "timeout": "3s"
+    }
+  },
+  "channels": [
+    {
+      "id": "ch-dnp3",
+      "protocol": "dnp3",
+      "transport": {
+        "kind": "tcp",
+        "address": "127.0.0.1:20000"
+      },
+      "concurrency": 1,
+      "timeout": "5s"
+    }
+  ],
+  "devices": [
+    {
+      "id": "rtu-dnp3",
+      "name": "内置 DNP3 从站（TCP 20000，链路地址 1）",
+      "channel": "ch-dnp3",
+      "unitId": 1,
+      "interval": "1s",
+      "timeout": "5s",
+      "enabled": true,
+      "labels": {
+        "masterAddress": "1024",
+        "eventPoll": "1s",
+        "integrityPoll": "30s"
+      },
+      "points": [
+        {
+          "id": "run",
+          "name": "二进制输入 0（类 1，每秒翻转）",
+          "address": {
+            "kind": "register",
+            "area": "binary-input",
+            "offset": 0,
+            "bit": -1
+          },
+          "dataType": "bool",
+          "enabled": true
+        },
+        {
+          "id": "stopped",
+          "name": "二进制输入 1（类 1，常闭）",
+          "address": {
+            "kind": "register",
+            "area": "binary-input",
+            "offset": 1,
+            "bit": -1
+          },
+          "dataType": "bool",
+          "enabled": true
+        },
+        {
+          "id": "breaker",
+          "name": "双点输入 0（1=分）",
+          "address": {
+            "kind": "register",
+            "area": "double-bit-input",
+            "offset": 0,
+            "bit": -1
+          },
+          "dataType": "bool",
+          "enabled": true
+        },
+        {
+          "id": "valve",
+          "name": "双点输入 1（2=合）",
+          "address": {
+            "kind": "register",
+            "area": "double-bit-input",
+            "offset": 1,
+            "bit": -1
+          },
+          "dataType": "bool",
+          "enabled": true
+        },
+        {
+          "id": "energy",
+          "name": "计数器 0（类 3，每秒自增）",
+          "address": {
+            "kind": "register",
+            "area": "counter",
+            "offset": 0,
+            "bit": -1
+          },
+          "dataType": "uint32",
+          "unit": "kWh",
+          "enabled": true
+        },
+        {
+          "id": "pulses",
+          "name": "计数器 1（静态）",
+          "address": {
+            "kind": "register",
+            "area": "counter",
+            "offset": 1,
+            "bit": -1
+          },
+          "dataType": "uint32",
+          "enabled": true
+        },
+        {
+          "id": "temp",
+          "name": "模拟量输入 0（42.5）",
+          "address": {
+            "kind": "register",
+            "area": "analog-input",
+            "offset": 0,
+            "bit": -1
+          },
+          "dataType": "float32",
+          "unit": "degC",
+          "enabled": true
+        },
+        {
+          "id": "flow",
+          "name": "模拟量输入 1（7.25）",
+          "address": {
+            "kind": "register",
+            "area": "analog-input",
+            "offset": 1,
+            "bit": -1
+          },
+          "dataType": "float32",
+          "unit": "m3/h",
+          "enabled": true
+        },
+        {
+          "id": "offset",
+          "name": "模拟量输入 2（-3.5）",
+          "address": {
+            "kind": "register",
+            "area": "analog-input",
+            "offset": 2,
+            "bit": -1
+          },
+          "dataType": "float32",
+          "enabled": true
+        },
+        {
+          "id": "load",
+          "name": "模拟量输入 3（1234）",
+          "address": {
+            "kind": "register",
+            "area": "analog-input",
+            "offset": 3,
+            "bit": -1
+          },
+          "dataType": "float64",
+          "enabled": true
+        },
+        {
+          "id": "trip",
+          "name": "二进制输出 0（CROB 直接控制）",
+          "address": {
+            "kind": "register",
+            "area": "binary-output",
+            "offset": 0,
+            "bit": -1
+          },
+          "dataType": "bool",
+          "writable": true,
+          "enabled": true
+        },
+        {
+          "id": "close",
+          "name": "二进制输出 1（CROB 直接控制）",
+          "address": {
+            "kind": "register",
+            "area": "binary-output",
+            "offset": 1,
+            "bit": -1
+          },
+          "dataType": "bool",
+          "writable": true,
+          "enabled": true
+        },
+        {
+          "id": "setpoint",
+          "name": "模拟量输出 0（组 41 直接控制）",
+          "address": {
+            "kind": "register",
+            "area": "analog-output",
+            "offset": 0,
+            "bit": -1
+          },
+          "dataType": "float64",
+          "writable": true,
+          "enabled": true
+        }
+      ]
+    }
+  ]
+}
