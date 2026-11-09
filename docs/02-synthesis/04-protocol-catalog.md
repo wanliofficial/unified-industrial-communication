@@ -140,7 +140,7 @@
 
 | 协议 | 角色 | 传输 | 寻址 | 提及 | 最佳参照 | 难度 | 优先级 | 关键坑 |
 |---|---|---|---|---|---|---|---|---|
-| **SECS/GEM（HSMS）** | B | TCP | 数据项（SVID/VID/CEID） | 4 | PA-31（唯一有真实测试） | 5 | P2 | 会话状态机复杂（Select/Deselect/Linktest）；SECS-II 消息字典；事件与报警模型；本仓库已落地 HSMS 通信层（Select/Deselect/Linktest/消息分帧），GEM300 语义只做最薄一层 |
+| **SECS/GEM（HSMS）** | B | TCP | 对象（SVID/ECID 编号） | 4 | PA-31（唯一有真实测试） | 5 | P2 | 会话状态机复杂（Select/Deselect/Linktest）；SECS-II 消息字典；事件与报警模型；本仓库已落地主站 + 内置设备（S1F3/S1F11/S2F13/S2F15），上层设备模型语义只做最薄一层 |
 | **Euromap 63/77** | C | 文件/OPC UA | 文件/节点 | 1 | — | 4 | X | 注塑机行业；63 是文件接口，77 是 OPC UA 伴生规范 |
 | **Toledo（称重）** | C | 串口/TCP | 寄存器/字符串 | 1 | — | 2 | P2 | 多种帧格式；连续输出模式 |
 
@@ -289,14 +289,14 @@ IEC 61850、SECS/GEM、KNX、Mewtocol、Host Link、MTConnect、IEC 101。
 | 协议 | 角色/传输 | 为什么值得做 | 最小可行版本 |
 |---|---|---|---|
 | **IEC 61850（MMS）** | 客户端 / TCP 102 | 变电站自动化的事实标准；逻辑设备/逻辑节点/数据对象的层次模型是唯一能表达「一台 IED 上有哪几个保护」的寻址方式 | MMS 会话（Initiate/Terminate）+ 读/写已知引用（`LD0LLN0.$MX$...`），不做 SCL 解析、Report、GOOSE、SV |
-| **SECS/GEM（HSMS）** | 设备/主机 / TCP 5000 | 半导体设备与工厂的通信主干；PA-31 是 38 份分析里唯一带真实测试的协议 | HSMS 通信层 + SECS-II 数据项编解码 + 少量 SxFy 消息，不做 GEM300 全部场景 |
+| **SECS/GEM（HSMS）** | 设备/主机 / TCP 5000 | 半导体设备与工厂的通信主干；PA-31 是 38 份分析里唯一带真实测试的协议 | HSMS 通信层 + SECS-II 数据项编解码 + 少量 SxFy 消息，不做上层设备模型的全部场景 |
 | **KNXnet/IP** | 客户端 / UDP 3670 | 楼宇自控第一大总线；组地址模型（GA vs PA）是它的核心 | TUNNELING 请求 + 组地址读写，不做 routing / device management / 安全 |
 | **Mewtocol** | 主站 / TCP 2400 或串口 | 松下 PLC 的事实协议；帧极简单但异常码是日文风格文本 | TCP 主站 + 读/写寄存器 + 错误码映射，不做串口与自动登录 |
 | **Host Link** | 主站 / 串口（RS-232/422/485） | 欧姆龙/三菱 PLC 的经典串口协议；串口层是已有共享资源 | 复用共享串口层 + FINS/MEWTOKEN 帧，不做串口时序优化 |
 | **MTConnect** | 客户端 / HTTP | 机床数据采集的事实标准；纯 REST + XML，无二进制编解码 | HTTP GET 取 `probe`/`current`/`sample`，XML 解析，不做资产/事件完整模型 |
 | **IEC 60870-5-101** | 主站 / 串口 | 104 的串口版；同一套 ASDU 复用已有编解码 | 复用 iec104 的 ASDU 编解码 + FT1.2 帧 + 共享串口层，不做平衡式传输 |
 
-> 截至当前实现：DNP3、CoAP、SECS/GEM 通信层已落地。
+> 截至当前实现：DNP3、CoAP、SECS/GEM 已落地。
 >
 > **DNP3**（编解码 + 主站 + 内置从站 + `uic dnp3read` + `examples/dnp3.json`）：只做
 > TCP 主站、类 0 总召唤、类 1/2/3 事件轮询、CROB 与组 41 直接控制、未请求响应的接收
@@ -313,6 +313,19 @@ IEC 61850、SECS/GEM、KNX、Mewtocol、Host Link、MTConnect、IEC 101。
 > 相对值且扩展字节先 delta 后 length**、以及**收到空 ACK 后只能等分离响应、不能重发**。
 > Block2 的首请求默认不带选项，由服务端决定块大小；服务端回 `4.02` 时退回一次。
 > JSON 写入只发 selector 子树，不做隐藏的读-改-写。
+>
+> **SECS/GEM**（编解码 + 主站 + 内置设备 + `uic secsread` + `examples/secs.json`）：只做
+> HSMS/TCP 主站，消息面覆盖 S1F1/F2、S1F3/F4、S1F11/F12、S1F13/F14、S2F13/F14、
+> S2F15/F16、S5F1/F2、S6F11/F12；不做时间（S2F17/S2F31）与报告定义/链接
+> （S2F33~S2F45），那些是改设备侧配置的调试动作。点位用**对象地址**承载协议原生编号
+> （`svid:1001.value` 只读、`ecid:200.value` 可写），不发明符号映射。四处真正会踩的坑：
+> 控制消息的 Stream/Function 线上填 `0xFF`；格式字节低 2 位是**长度字节数**而不是长度
+> 值（`00`/`01` 都是 1 字节）；L 项的长度是**子项个数**；整数定宽大端，3 字节的 U4 是
+> 畸形而不是「补个 0」。事务配对要同时满足「同 SystemBytes + 同 Stream + Function=
+> 请求+1 + W 位清零」，设备异步推的 S6F11 必须丢弃继续读——按 Function 相同去匹配，
+> 现象就是「设备明明回了、驱动却总超时」。读按对象类型分组，3 个 svid 点是 1 次事务；
+> 写只有 ecid，`ACKC7=0` 才接受，且只认点表里声明过 `writable` 的点（读可按地址临时
+> 解析，两者刻意不对称）。
 
 **明确不做**：PROFINET IO、PROFIBUS、CANopen、CC-Link、FOCAS、DALI、LonWorks、DDS、EtherCAT、HART、GB/T 28181、Euromap、Matter、LoRaWAN、OCPP、Redfish。
 

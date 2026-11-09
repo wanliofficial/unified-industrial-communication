@@ -49,6 +49,7 @@ import (
 	mqttdriver "uic/internal/driver/mqtt"
 	opcuadriver "uic/internal/driver/opcua"
 	"uic/internal/driver/s7"
+	secsdrv "uic/internal/driver/secs"
 	snmpdrv "uic/internal/driver/snmp"
 	"uic/internal/driver/virtual"
 	"uic/internal/history"
@@ -169,6 +170,7 @@ func RegisterBuiltins() error {
 			snmpdrv.New(),
 			adsdrv.New(),
 			coapdrv.New(),
+			secsdrv.New(),
 		} {
 			if err := driver.Register(d); err != nil {
 				registerErr = err

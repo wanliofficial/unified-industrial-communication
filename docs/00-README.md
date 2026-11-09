@@ -5,9 +5,9 @@
 | 项 | 数字 |
 |---|---|
 | 分析的参考方案 | 38 份（PA-01 … PA-38，其中 PA-06 合并了两个完全相同的仓库） |
-| 文档总量 | 55 份 Markdown / 18,997 行（含 3 份 ADR） |
-| 代码总量 | 192 个 Go 文件 / 76,209 行（其中测试 33,245 行 / 1,112 个测试函数） |
-| Go 包 | 48 个（1 个入口 + 47 个内部包；47 个有测试） |
+| 文档总量 | 55 份 Markdown / 22,754 行（含 3 份 ADR） |
+| 代码总量 | 305 个 Go 文件 / 131,472 行（其中测试 152 个文件 / 57,471 行 / 1,906 个测试函数） |
+| Go 包 | 80 个（1 个入口 + 79 个内部包；79 个有测试） |
 | 第三方依赖 | 0（仅标准库，零 CGO） |
 
 ---
@@ -34,11 +34,11 @@ cmd/ + internal/            可运行的最小骨架（不是伪代码，能采�
 
 ### 1.2 它不是什么
 
-- 不是协议库大杂烩。当前实现了 19 个驱动（Modbus TCP / RTU / ASCII 主站、S7、OPC UA、MQTT 南向订阅、
+- 不是协议库大杂烩。当前实现了 20 个驱动（Modbus TCP / RTU / ASCII 主站、S7、OPC UA、MQTT 南向订阅、
   MC 3E、FINS、EtherNet/IP CIP、BACnet/IP、IEC 60870-5-104、DNP3、CoAP、DL/T 645、CJ/T 188、
-  SNMP v1/v2c、ADS/AMS、计算点、virtual），外加
-  Modbus 从站（TCP / RTU / ASCII）、十四个内置模拟从站/Broker（Modbus TCP、S7、MC 3E、FINS、CIP、BACnet/IP、
-  IEC 104、DNP3、CoAP、DL/T 645、CJ/T 188、SNMP v1/v2c、ADS/AMS、MQTT）与一个内置 OPC UA 服务端、一个零依赖报警引擎与一个有界历史采样日志；其余协议在
+  SNMP v1/v2c、ADS/AMS、SECS/GEM、计算点、virtual），外加
+  Modbus 从站（TCP / RTU / ASCII）、十五个内置模拟从站/Broker（Modbus TCP、S7、MC 3E、FINS、CIP、BACnet/IP、
+  IEC 104、DNP3、CoAP、DL/T 645、CJ/T 188、SNMP v1/v2c、ADS/AMS、HSMS/SECS-II、MQTT）与一个内置 OPC UA 服务端、一个零依赖报警引擎与一个有界历史采样日志；其余协议在
   `04-protocol-catalog.md` 里按工作量排了三波，没有假装已经支持。
   注意 MQTT 出现了两次且**互不相干**：北向是「网关把数据发出去」（sink），南向是「网关订阅别人发来的数据」（driver）。
 - 不是组态软件。不做画面、不做报表、不做自研时序库——理由见 `02-synthesis/01-capability-matrix.md` §6.4。
@@ -968,6 +968,9 @@ obs  ← 所有包（不依赖任何内部包）
 | `internal/codec/ads` | ADS/AMS 纯函数编解码（6 字节 AMS/TCP 头、32 字节 AMS 头、7 类命令、两层长度一致性、NetId 解析、错误码分类） | 无 I/O、无时钟、无可变状态；TCP 长度含 AMS 头、AMS 长度只含载荷，少写一层会让对端把载荷开头当长度；flags 低位是应答位、`0x0004` 是 ADS 位；invoke 0 保留；错误码分 AMS 与 ADS 两段，只有临时性错误可重试 | 86.7% |
 | `internal/driver/ads` | ADS/AMS 主站（符号名→句柄→值、句柄缓存与失效重解析、逐点事务、类型范围检查、AMS/ADS 错误分类、自检 `DeviceInfo`/`DeviceState`/`WriteControl`） | 地址必须是 `symbol`，`index>0` 直接报地址错；读写在返回 `invalid offset/group` 时只重解析一次；写前拒绝越界/小数/BCD，字符串刚好占满整段也拒绝；只重试超时与临时性协议错，断链与地址/权限错不重试 | 92.8% |
 | `internal/sim/ads` | ADS/AMS 内置服务端（默认变量表、按名分配句柄、只读标记、宽度校验、状态控制、句柄失效模拟） | 与主站共用 codec/ads；变量表扁平、每个数组元素单独占一个符号名（与真实符号表一致）；句柄全局编号以便一次调用让所有句柄失效；未知 IndexGroup 一律 `invalid group`，通知帧不应答 | 96.9% |
+| `internal/codec/secs` | SECS 纯函数编解码（12 字节 HSMS 帧头、控制消息 Stream/Function=0xFF、SECS-II 项编解码、`MaxPayload` 上限、SxFy 消息体语义） | 无 I/O、无时钟、无可变状态；格式字节低 2 位是长度字节数（`00` 视同 1）不是长度值；L 项长度是子项个数；整数定宽大端，宽度不符即报错而不是补零；BOOLEAN 非 0 即 true；数据长度上限 16 MiB，读、解、编三处都校验；L 项声明数超过剩余字节数直接报错，不按声明数预分配 | 94.6% |
+| `internal/driver/secs` | HSMS 主站（Select 握手、SystemBytes + Stream + Function+1 + W 位清零四条件配对、按对象分组批量读、S2F15 写常数、Linktest 探活、`Describe`/`RawRead` 自检扩展） | 只做 TCP 主站；Object 地址 `svid:<id>.value`（只读）/ `ecid:<id>.value`（可写）；读按对象类型分组，svid+ecid 混排是两次事务；未匹配的消息（异步 S6F11、迟到应答）丢弃继续读而不是判失败；写只认点表内的点，按地址临时构造的写请求一律 `permission`（读允许按地址解析）；ACKC7≠0 表示整批被拒；`attemptDeadline` 取设备超时与 ctx 的更早者 | 89.1% |
+| `internal/sim/secs` | HSMS 内置设备（SVID/ECID 双编号空间、Select 门控、常数写拒绝未知编号、事件与报警推送） | 与主站共用 codec/secs；SVID 与 ECID 用 `(对象类型, 编号)` 作键，同号互不干扰；未选中时 DATA 回 Reject；写未知 ECID 回 ACKC7≠0（不新建）；S1F11 空列表=全部 SVID；设备侧只设写截止时间（`SetDeadline` 会让空闲连接被判超时） | 95.1% |
 | `internal/driver/link` | 表计协议的承载层：串口与串口服务器（TCP 透传）统一成一条带总线锁的链路 | 锁覆盖「排空 → 发送 → 收完帧」整段；TCP 上 Drain 退化为读掉残留字节（分帧同步仍由 codec 扫描兜底）；`host` 省略端口时补默认端口；参数错误 `ErrUnsupported`、打开/连接失败 `ErrDisconnected`；`Drain` 必须早于 `SetDeadline` | 91.2% |
 
 | `internal/planner` | 点位 → 批量读请求（ReadSpan） | 协议无关；按连续性/上限合并；按 `area:db` 分组；计算点合成单个 `expr` span（漏组会表现为全坏且无日志） | 92.6% |

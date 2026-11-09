@@ -1,0 +1,131 @@
+{
+  "schemaVersion": 1,
+  "site": "secs-lab",
+  "server": {
+    "listen": "127.0.0.1:8100",
+    "token": "dev-token-0123456789"
+  },
+  "storage": {
+    "dir": "./data-secs",
+    "journal": true,
+    "outboxMaxRecords": 5000,
+    "outboxTtl": "10m"
+  },
+  "logging": {
+    "level": "info"
+  },
+  "northbound": {
+    "webhook": {
+      "enabled": false,
+      "url": "http://127.0.0.1:9999/ingest",
+      "timeout": "3s"
+    }
+  },
+  "channels": [
+    {
+      "id": "ch-secs",
+      "protocol": "secs",
+      "transport": {
+        "kind": "tcp",
+        "address": "127.0.0.1:5000"
+      },
+      "concurrency": 1,
+      "timeout": "5s"
+    }
+  ],
+  "devices": [
+    {
+      "id": "secs-equipment",
+      "name": "内置 HSMS 设备（状态变量，S1F3 批量读）",
+      "channel": "ch-secs",
+      "interval": "2s",
+      "timeout": "5s",
+      "enabled": true,
+      "labels": {
+        "commTimeout": "5s",
+        "retries": "1"
+      },
+      "points": [
+        {
+          "id": "temperature",
+          "name": "温度（SVID 1，设备回 U4）",
+          "address": {
+            "kind": "object",
+            "objectType": "svid",
+            "instance": 1,
+            "property": "value"
+          },
+          "dataType": "uint32",
+          "unit": "degC",
+          "enabled": true
+        },
+        {
+          "id": "state",
+          "name": "运行状态（SVID 2，设备回 A 字符串）",
+          "address": {
+            "kind": "object",
+            "objectType": "svid",
+            "instance": 2,
+            "property": "value"
+          },
+          "dataType": "string",
+          "enabled": true
+        },
+        {
+          "id": "reading",
+          "name": "读数（SVID 3，设备回 F4）",
+          "address": {
+            "kind": "object",
+            "objectType": "svid",
+            "instance": 3,
+            "property": "value"
+          },
+          "dataType": "float32",
+          "unit": "V",
+          "enabled": true
+        }
+      ]
+    },
+    {
+      "id": "secs-constants",
+      "name": "内置 HSMS 设备（设备常数，S2F13 读 / S2F15 写）",
+      "channel": "ch-secs",
+      "interval": "5s",
+      "timeout": "5s",
+      "enabled": true,
+      "labels": {
+        "commTimeout": "5s",
+        "retries": "1"
+      },
+      "points": [
+        {
+          "id": "temp-limit",
+          "name": "温度上限（ECID 10，可写）",
+          "address": {
+            "kind": "object",
+            "objectType": "ecid",
+            "instance": 10,
+            "property": "value"
+          },
+          "dataType": "uint32",
+          "unit": "degC",
+          "writable": true,
+          "enabled": true
+        },
+        {
+          "id": "mode",
+          "name": "运行模式（ECID 11，可写）",
+          "address": {
+            "kind": "object",
+            "objectType": "ecid",
+            "instance": 11,
+            "property": "value"
+          },
+          "dataType": "string",
+          "writable": true,
+          "enabled": true
+        }
+      ]
+    }
+  ]
+}

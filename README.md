@@ -588,6 +588,41 @@ TCP 48898 与 AMS 端口是两层：`labels.netid` 是 6 段 NetId，`labels.por
 `Open` 立即做 `ReadDeviceInfo` 握手。只做 AMS/TCP 符号读写：通知订阅、符号表浏览、跨
 AMS 路由发现、多句柄合并读写都显式 `unsupported`，不做半成品。
 
+SECS/GEM（半导体设备，HSMS/TCP 5000）：
+
+```bash
+./uic sim -protocol secs -listen 127.0.0.1:5000 &   # 内置 HSMS 设备
+./uic -config examples/secs.json
+curl -s -H 'Authorization: Bearer dev-token-0123456789' localhost:8100/api/v1/points
+#   5 点：svid 1/2/3（U4 25、A "RUN"、F4 21.5，只读）、ecid 10/11（U4 300、A "AUTO"，可写）
+#   自检：./uic secsread -addr 127.0.0.1:5000 -probe
+#   看结构：./uic secsread -addr 127.0.0.1:5000 -describe -id 1,2,3
+#   看原始项：./uic secsread -addr 127.0.0.1:5000 -raw -id 1,2,3
+#   读值：  ./uic secsread -addr 127.0.0.1:5000 -id 3 -type float32
+#   写常数：./uic secsread -addr 127.0.0.1:5000 -object ecid -id 10 -write 350
+```
+
+SECS/GEM 分两层：HSMS 管会话（Select 握手、SystemBytes 事务配对、Linktest 探活），
+SECS-II 管消息体（格式字节 + 长度 + 内容的项序列）。点位用**对象地址**承载协议原生编号：
+`svid:1001.value`（状态变量，S1F3 批量读，只读）、`ecid:200.value`（设备常数，
+S2F13/S2F14 读、S2F15/S2F16 写，`ACKC7=0` 才算接受）。编号在标准里就是 32 位整数，
+没有可寻址的符号名——名称要用 S1F11 单独查，那是给人看的。
+
+读按对象类型分组：一个 span 里的 3 个 svid 点合成**一次** S1F3，svid + ecid 混排是
+**两次**事务。写只认点表里声明过 `writable` 的 ecid，按地址临时构造的写请求一律
+`permission`（读允许按地址解析，两者刻意不对称）。写 SVID 直接拒绝：状态变量没有写语义，
+把 S1F3 的编号塞进 S2F15 轻则被拒、重则写到同号的另一个常数上。
+
+线格式有四处会静默错位：控制消息的 Stream/Function 必须填 `0xFF`；格式字节低 2 位是
+**长度字节数**（1..3，`00` 视同 1），不是长度值；L 项的长度是**子项个数**；整数定宽大端，
+3 字节的 U4 是畸形而不是「补个 0」。12 字节帧头之外，数据长度字段设 16 MiB 上限
+（`MaxPayload`）——TCP 上第一条读到的可能是别的服务回的垃圾，`0xFFFFFFFF` 照单分配就是
+一次 OOM。应答配对要同时满足「同 SystemBytes + 同 Stream + Function=请求+1 + W 位清零」，
+不匹配的消息（例如设备异步推的 S6F11）丢弃继续读，而不是让整次采集失败。
+
+不做 S2F17/S2F31（时间）与 S2F33~S2F45（报告定义/链接）：那些改设备侧配置，配错会让
+设备停止上报，属于调试工具。`Subscribe` 是 `unsupported`——能解析 S6F11 不等于能订阅。
+
 FINS 只做 FINS/TCP；FINS/UDP 与 Host Link 配置期即拒。建链先做节点号协商（命令 0
 → 1），`device.unitId>0` 覆盖目标节点、0 用协商值。`offset` 是**字地址**、`bit` 是
 字内位号（`CIO0.3` → `offset=0, bit=3`）；字访问 2 字节/字，位访问**1 字节/位**；
@@ -614,7 +649,7 @@ go test -race -count=1 ./...
 
 | 路径 | 内容 |
 |---|---|
-| `cmd/uic/` | 单入口：`run` / `sim`（Modbus / S7 / OPC UA / MQTT / MC / FINS / EtherNet-IP / BACnet-IP / IEC 104 / DNP3 / CoAP / 645 / 188 / SNMP / ADS）/ `mbread` / `mcread` / `finsread` / `enipread` / `bacread` / `iec104read` / `dnp3read` / `coapread` / `dlt645read` / `cjt188read` / `snmpread` / `adsread` / `uaread` / `s7blocks` / `s7upload` / `instantiate` / `import` / `token` / `-check` / `version` |
+| `cmd/uic/` | 单入口：`run` / `sim`（Modbus / S7 / OPC UA / MQTT / MC / FINS / EtherNet-IP / BACnet-IP / IEC 104 / DNP3 / CoAP / 645 / 188 / SNMP / ADS / SECS）/ `mbread` / `mcread` / `finsread` / `enipread` / `bacread` / `iec104read` / `dnp3read` / `coapread` / `dlt645read` / `cjt188read` / `snmpread` / `adsread` / `secsread` / `uaread` / `s7blocks` / `s7upload` / `instantiate` / `import` / `token` / `-check` / `version` |
 | `internal/model` | 通道 / 设备 / 点位 / 地址 / 采样 / 质量码 |
 | `internal/driver` | 驱动契约（Codec / Transport / Driver）、错误分类、注册表、只读 `Lookup` 注入 |
 | `internal/calc` | 零依赖表达式引擎（编译期类型检查、短路求值、引用 `device:point`） |
@@ -652,6 +687,9 @@ go test -race -count=1 ./...
 | `internal/codec/ads` | ADS/AMS 纯函数编解码（6 字节 AMS/TCP 头 / 32 字节 AMS 头 / 7 类命令 / 两层长度一致性 / NetId 解析 / 错误码分类） |
 | `internal/driver/ads` | ADS/AMS 主站（符号名→句柄→值 / 句柄缓存与失效重解析 / 逐点事务 / 类型范围检查 / AMS 与 ADS 错误分类 / 自检 `DeviceInfo`、`DeviceState`、`WriteControl`） |
 | `internal/sim/ads` | ADS/AMS 内置服务端（默认变量表 / 按名分配句柄 / 只读标记 / 宽度校验 / 状态控制 / 句柄失效模拟） |
+| `internal/codec/secs` | SECS 纯函数编解码（12 字节 HSMS 帧头 / 控制消息 / SECS-II 项编解码 / `MaxPayload` 上限 / SxFy 消息体语义） |
+| `internal/driver/secs` | HSMS 主站（Select 握手、SystemBytes 配对、按对象分组批量读、S2F15 写常数、Linktest 探活、自检 `Describe`/`RawRead`） |
+| `internal/sim/secs` | HSMS 内置设备（SVID/ECID 双编号空间 / Select 门控 / 常数写拒绝未知编号 / 事件与报警推送） |
 | `internal/template` | 设备模板：参数校验 / 字符串字面量替换 / 实例化后完整校验 |
 | `internal/pointtable` | 点表 CSV：列别名 / 地址表达式 / 按协议推导宽度 / 合并动作 |
 | `internal/alarm` | 报警引擎：五态机 / 滞回 / 延时 / 表达式规则 / 确认 / 订阅 |

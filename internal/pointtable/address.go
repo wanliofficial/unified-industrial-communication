@@ -116,6 +116,15 @@ func PolicyFor(protocol string) AddressPolicy {
 		return AddressPolicy{
 			AllowSymbol: true, AllowSymbolLength: true, SymbolIndexInPath: true,
 		}
+	case "secs":
+		// SECS 的寻址是「对象类型 + 编号 + 属性」：`svid:1001.value`、
+		// `ecid:200.value`。编号是协议原生的 32 位整数（不是寄存器偏移），
+		// 所以用对象地址承载；没有区域、偏移或数组下标。
+		//
+		// 宽度不可推导：同一个编号在不同设备上可能是 U4、A 或 F8，
+		// 由点表声明 dataType 决定如何解释。因此 Width 用 WidthProtocol，
+		// 点表层不复制 SECS-II 的格式表。
+		return AddressPolicy{Width: WidthProtocol, AllowObject: true}
 	case "snmp":
 		// SNMP 的地址就是一个点分十进制 OID。没有区域、没有偏移、没有
 		// 数组下标（实例号写在 OID 里），也没有 MQTT 那种载荷字段选择器。

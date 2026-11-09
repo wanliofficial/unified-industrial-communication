@@ -3288,7 +3288,7 @@ curl -s -X POST -H 'Authorization: Bearer dev-token-0123456789' \
 | `codec/snmp` | GET/应答金帧、INTEGER 最短编码与负数、无符号前导零（`0x80000000`）、OID base-128（`2.39.1`→`77 01`）、OID 排序与前缀、非法 OID、版本解析（v3 拒绝）、异常标记只允许出现在应答、GetBulk 线格式、错误码分类、字符串/字节值、截断错误可识别 |
 | `driver/snmp` | 五种线类型解码、MultiRead 一条 GET、按 maxOids 与字节预算分批（顺序不变、每条 ≤1400 字节）、v1 `noSuchName` 逐点重发、写类型映射与回显校验、类型/范围拒绝不发包、9 种 error-status 分类、SET 回显被收敛、Probe 接受异常标记/超时提示、request-id 陈旧应答丢弃、链路失败停止后续批次、坏地址与线类型不符、Counter64 精度边界、`GetRaw`/`Walk`（子树边界、max、v1 表尾） |
 | `sim/snmp` | 真实 UDP 回环：GET 与计数器、错 community 静默、v1/v2c 缺 OID 差异、GETNEXT 遍历与表尾、GETBULK 三行递增、SET 可写与回读、只读/类型错/不存在、SET 原子性、坏报文与非请求丢弃、`Set`/`SetWritable`/`Close` 幂等 |
-| 点表/规划 | `PolicyFor("snmp")` 只允许 symbol、selector/寄存器/对象地址在导入期拒绝、`examples/snmp.json` 通过 `-check`（19 个驱动） |
+| 点表/规划 | `PolicyFor("snmp")` 只允许 symbol、selector/寄存器/对象地址在导入期拒绝、`examples/snmp.json` 通过 `-check`（20 个驱动） |
 | `cmd/uic` | `-set` 值解析（bool/int/uint/string/bytes、进制、越界、float/BCD 拒绝）、`snmpRow` 的 raw/error 显示 |
 
 ### 3.10.13 ADS/AMS（TCP 48898）
@@ -3604,7 +3604,7 @@ result，没有回显），但缓存里的值要等下一轮采集才刷新；�
 | `codec/ads` | AMS/TCP 与 AMS 头金帧（HandleByName `MAIN.nCounter`）、两层长度一致性、reserved 非零拒绝、NetID 解析（6 段/0..255/非法）、7 类请求构造、Read/Write/ReadWrite/DeviceInfo/State/Control 应答解析、错误码分类与临时性、Command/State 字符串 |
 | `driver/ads` | 真实 TCP 回环：9 种类型读写、数组与字符串、地址/权限/宽度错误逐点隔离、坏 NetId/端口、握手超时、Close 幂等、句柄失效重解析（读与写）、类型范围/小数/BCD/字符串 NUL 拒绝、脚本化服务端：临时 AMS 错误重试、通知帧与陈旧 invoke 丢弃、畸形帧、句柄 0/短句柄、设备信息/状态/控制的 AMS 错误与短载荷、ctx 超时、拨号失败 |
 | `sim/ads` | 真实 TCP 回环：默认变量表、GET/PUT 夹具、句柄分配/释放/失效、只读与宽度校验、数组仅 `[2]` 可写、字符串/浮点、错误 NetId/端口、未知命令、通知不应答、畸形载荷、坏帧断链后仍可服务、Close 幂等 |
-| 点表/规划 | `PolicyFor("ads")` 只允许 symbol、`NAME:81` 与 length 列、`MAIN.arr[2]` 保留在 path、寄存器/selector 在导入期拒绝、`examples/ads.json` 通过 `-check`（19 个驱动） |
+| 点表/规划 | `PolicyFor("ads")` 只允许 symbol、`NAME:81` 与 length 列、`MAIN.arr[2]` 保留在 path、寄存器/selector 在导入期拒绝、`examples/ads.json` 通过 `-check`（20 个驱动） |
 | `cmd/uic` | `-symbol` 声明解析（类型/长度/错误写法）、`-set` 值解析（bool/int/uint/float/string/bytes、进制、越界、BCD 拒绝）、`-control` 映射、行显示与错误质量 |
 
 ### 3.10.14 DNP3（IEEE 1815：三层链路 + 类轮询 + 直接控制，TCP 20000）
@@ -4334,6 +4334,362 @@ uncertain，等下一轮采集确认）；加 `"confirm":true` 时会立刻回�
 | `driver/coap` | 真实 UDP 回环：纯文本/布尔/JSON selector/整文档/octets 读、Block2 3000 字节重组、服务端不认 Block2 时降级、分离响应 + 回 ACK、RST 分类、`4.04` 地址错误不计熔断、混合成功与失败、PUT/POST/JSON 子树/octets 写入与回读、数组下标拒绝、只读资源拒绝、`Probe`/`Discover`、超时重传次数（`maxRetransmit` 0/2）、ctx 取消零发送、坏包跳过、无关 CON 回 RST、读错误后重连、`Close` 幂等、并发 Read、配置校验表、标签默认值与别名 |
 | `sim/coap` | CON/NON 响应类型与 MID 规则、同 MID 去重（写不重复执行）、Block2 多块与越界 `4.02`、`4.04`/`4.05`、Block1 `4.02`、空载荷 `4.00`、发现清单自洽（自动续块、不列自己、`rt`/`ct` 正确）、分离响应 + ACK、RST、畸形计数、块大小参数与非法回落 |
 | `cmd/uic` | `-discover`/`-probe`/读/写/`-json`/`-raw` 的显示、`-type` 与 `-block` 校验、`-content-format` 归一化、文本值解析 |
+
+### 3.10.16 SECS/GEM（HSMS/TCP + SECS-II：SVID/ECID 对象寻址，端口 5000）
+
+SECS/GEM 是半导体与电子制造设备之间的通信约定。它由两层组成：**HSMS** 负责「在 TCP
+上建立并维护一条会话」（谁在发、这条消息属于哪个事务、链路选没选中），**SECS-II** 负责
+「消息体里装什么」（一组带头部类型字节的数据项）。这两层必须分开看：HSMS 的坑在状态机
+与配对，SECS-II 的坑在格式字节与长度字节。
+
+本节的写法与 DNP3、CoAP 那两节一致：先讲清边界，再讲线格式里真正会踩的地方，最后讲
+寻址、读写、错误分类与自检。
+
+#### 3.10.16.1 范围：只做 HSMS/TCP 主站，只做采集与设备常数
+
+| 做 | 不做 | 原因 |
+|---|---|---|
+| HSMS over TCP（设备侧端口，默认 5000） | HSMS over 串口（旧式点对点链路） | 新装设备几乎都是 TCP；串口形态需要另一套成帧与流控，属于独立实现 |
+| 主站（Active）发起 Select | 被动模式（Passive，监听等设备来连） | 本平台是采集侧，连接方向由网关决定；被动模式还要处理「谁先发 Select」 |
+| Select / Deselect / Linktest / Separate | T3~T8 全套定时器、Data Delimiter、Ping、Reject 的完整应答语义 | 采集只需要「选中后交换 DATA」；其余是设备侧状态机的完整性要求，网关作为主站不必全实现 |
+| S1F1/S1F2、S1F13/S1F14（编解码） | 主动发送它们 | 握手用 Select 就够；建立通信（S1F13）会改变设备侧的通信状态，属于调试动作 |
+| S1F3/S1F4（状态变量批量读） | S1F11 之外的列表查询 | S1F3 是 SECS 里唯一「一次读多个变量」的原生手段 |
+| S1F11/S1F12（名称列表，仅自检） | 用名称做点位寻址 | 名称是给人看的；采集按编号，避免每次读都先查名字 |
+| S2F13/S2F14（设备常数读） | — | 常数也需要被采集（上限、模式、配方号） |
+| S2F15/S2F16（设备常数写，ACKC7=0 接受） | S2F17/S2F31（时间）、S2F33~S2F45（报告定义与链接） | 那些是「改设备侧配置」的动作：配错会让设备停止上报，属于调试工具而非采集进程 |
+| S5F1/S5F2、S6F11/S6F12（编解码） | 主动订阅事件/报警 | 网关按周期采集；事件上报要长期维护订阅关系与去重，留给后续独立实现 |
+
+能力声明与实现一致：`Subscribe`、`Browse`、`Discovery` 都是 `unsupported`，`MultiRead`
+是 `supported`（同类型编号合并成一次事务）。把「能解析 S6F11」标成「支持订阅」，会让上层
+以为推送可用，然后永远等不到值更新。
+
+#### 3.10.16.2 12 字节帧头：Stream 与 W 位挤在一个字节里
+
+```
+ 0                   1                   2                   3
++-------+-------+-------+-------+-------+-------+-------+-------+
+|S|W| 低7位(F) | Function |            SystemBytes (4)            |
++-------+-------+-------+-------+-------+-------+-------+-------+
+|              数据长度(4)                  | MsgType | ByteOrder |
++-------+-------+-------+-------+-------+-------+-------+-------+
+|                         数据（仅 DATA）                        |
++---------------------------------------------------------------+
+```
+
+- 字节 0：高 1 位是 **W 位**（这条 Primary 消息是否期待一条 Secondary 应答），低 7 位是
+  Stream（1..15）。把 Stream 整个写成 8 位，会让 W 位被解读成 Stream 的最高位，于是
+  S1F3 变成「S129F3」——某些设备会直接回 Reject，另一些静默丢弃。
+- 字节 1：Function（0..255）。
+- 字节 2..5：**SystemBytes**，事务配对标识，由发起方自选，应答方原样回显。
+- 字节 6..9：数据长度，**只算数据区**，不含 12 字节头。
+- 字节 10：消息类型。`0x00` 是 DATA；`0x01..0x0B` 是 Select/Deselect/Linktest/Separate/
+  NotSelect/Reject 的请求与应答。
+- 字节 11：字节顺序，标准只定义 `1`（大端）。本实现遇到非 1 直接报错，而不是「试试看」。
+
+**控制消息的 Stream/Function 没有意义，线上填 `0xFF`。** 这是最容易漏的一条：一个只写
+`Stream=0` 的实现，在抓包工具里看起来像是「S0F0 的数据消息」，而对端可能因此把它当 DATA
+处理。控制消息的区分只看 MsgType。
+
+#### 3.10.16.3 SECS-II 数据项：格式字节的低 2 位是「长度字节数」
+
+每个数据项是「1 字节格式 + 1..3 字节长度 + 内容」：
+
+```
+格式字节 = (format << 2) | 长度字节数(1..3)
+```
+
+- `format` 占高 6 位：L=0、B=8、BOOLEAN=9、A=16、J=17、I8=24、I1=25、I2=26、I4=28、
+  F8=32、F4=36、U8=40、U1=41、U2=42、U4=44。
+- 低 2 位是长度字段**本身占几个字节**，不是长度值。`00` 与 `01` 都表示 1 字节（`00` 是
+  历史写法，现场仍能见到），`10` 是 2 字节，`11` 是 3 字节。
+
+四类真正会踩的坑：
+
+1. **把「长度字节数」当成「长度区的第一个字节」。** 解析偏移会整体错一位，于是每个项都
+   从错误的位置开始读。这种错误的症状特别像「设备数据格式不对」，因为读出来的值往往还
+   是个合法整数，只是不是那个变量的。
+2. **L 项的长度是「子项个数」，不是字节数。** 一条 L,3 后面跟三个子项，长度字段写 3。
+   把它当字节数会让解析器只读 3 字节就以为列表结束。
+3. **整数是定宽大端。** U4 必须正好 4 字节；3 字节的 U4 是畸形，不是「补一个 0」。本实现
+   在 `U1/U2/U4/U8/I1/...` 的取值函数里严格校验宽度，宽度不符即报格式错误——静默补零会
+   让「设备回了个错的格式」这件事永远查不出来。
+4. **BOOLEAN 是 1 字节，非 0 即 true。** 标准不要求恰好是 1，`0x80` 也是 true。
+
+编解码层的测试对 `00/01/10/11` 四种长度写法和 `255/256/65535/65536/16777215` 的边界都
+钉了金字节，另有一条专门断言「L 项声明 16M 个子项但一个字节都没有」时不会按声明数预
+分配——长度字段是 24 位，照它分配就是一条 12 字节的畸形帧申请几百 MB。
+
+#### 3.10.16.4 防御：长度字段必须设上限
+
+数据长度字段是 32 位的，理论上允许 4 GiB。读循环若照着它 `make([]byte, n)`，一条被噪声
+篡改长度字段的帧就能让进程 OOM。本实现有 `MaxPayload = 16 MiB`：超过即按协议错误处理，
+读、解、编三处都校验。SECS-II 的实际载荷远小于此——最大的常见消息是整批状态值或报告
+定义，量级在几十 KB。
+
+这个上限不是「保护措施之一」，而是必须的：HSMS 跑在 TCP 上，第一次读到的 12 字节完全可能
+来自一条错的连接（比如把一个 HTTP 端口配进来了），它前四个字节就可能是 `0xFFFFFFFF`。
+
+#### 3.10.16.5 会话：Select 必须在 Open 里完成
+
+TCP 连上不等于可以发 DATA。链路处于 **NOT SELECTED** 状态时，设备对 DATA 消息的合法
+应答是 Reject（或干脆丢弃）。因此握手放在 `Open` 里：
+
+```
+Open ──> TCP connect ──> Select.req ──> 等 Select.rsp
+                                          ├─ status=0  → 链路选中，返回 Conn
+                                          ├─ status≠0  → Open 失败（disconnected）
+                                          └─ 超时/错帧 → Open 失败（timeout/protocol）
+```
+
+`Select.rsp` 的 status 是 2 字节大端，常见值：`0` 成功、`1` 不支持、`2` 设备忙、`3` 已处于
+该状态、`4` 链路未激活、`5` 重复的系统字节、`6` 未定义的消息类型、`7` 非法消息、`0x0200`
+请稍候。本实现把**任何非 0** 都当作 Open 失败并归为 `disconnected`（可重连）：`2`「设备忙」
+和 `0x0200`「请稍候」确实是暂时的，重连有意义。
+
+反过来，**如果第一条收到的不是 Select.rsp**（比如配错了端口，对面是一个 HTTP 服务），归为
+`protocol`：这不是链路抖动，是配置错误，重试一万次也不会好。
+
+关闭时主动发 `Separate.req` 再关连接。对端据此区分「正常结束」与「断链」——它的日志与
+重连退避策略会不同。发送失败不影响关闭结果。
+
+#### 3.10.16.6 事务配对：SystemBytes + Stream + Function-1 + W 位清零
+
+`exchange` 的匹配规则有四个条件，缺一不可：
+
+| 条件 | 说明 |
+|---|---|
+| `dm.SystemBytes == sys` | 只有同一次事务的应答才算数 |
+| `dm.Stream == sf.Stream` | 应答的 Stream 与请求相同 |
+| `dm.Function == sf.Function + 1` | 应答的 Function 是请求的 +1（S1F3→S1F4、S2F15→S2F16） |
+| `!dm.WBit` | 应答不带 W 位 |
+
+第二条与第三条是最容易写错的：如果按「Function 相同」去匹配，真正的应答会被当成「无关
+消息」跳过，然后一直读到超时。这个 bug 的现象是「设备明明回了，驱动却总超时」——抓包
+一看，设备回的每一条都是对的。
+
+第四条同样重要：`W=1` 表示「这是一条请求」，它要么是设备主动推的事件（S6F11），要么是
+别人的事务。**不匹配的消息一律丢弃，继续读**，而不是报错。设备在本平台等待应答的同时
+异步推送报警是常态；因为一条推送让整次采集失败，弱网下会随机抖动。
+
+#### 3.10.16.7 寻址：对象地址承载协议原生编号
+
+SECS 的编号（SVID、ECID）在标准里就是 32 位无符号整数，没有可以打出来的符号名。因此
+点位用**对象地址**：
+
+| 表达式 | objectType | instance | property | 语义 |
+|---|---|---|---|---|
+| `svid:1001.value` | `svid` | 1001 | `value` | 状态变量，S1F3 读，**只读** |
+| `ecid:200.value` | `ecid` | 200 | `value` | 设备常数，S2F13 读、S2F15 写 |
+
+用对象地址而不是发明一套符号映射，理由与 OPC UA 的对象节点、SNMP 的 OID 相同：编号就是
+协议原生的寻址单位，中间加一层名字只会多一处失配。名字确实存在（S1F12 会返回），但它是
+**人读的信息**，不是寻址单位；自检命令里的 `-describe` 就是用来把编号和名字对上的。
+
+点表策略 `PolicyFor("secs")` 是 `{Width: WidthProtocol, AllowObject: true}`：宽度不可推导，
+因为同一个编号在不同设备上可能是 U4、A 或 F8，由点表声明的 `dataType` 决定如何解释。
+把 SECS-II 的格式表复制进点表层，只会得到两份会互相漂移的规则。
+
+`address.length` 对 `string`/`bytes` 是**接收上限**，0 表示不限制；短于上限要接受。把上限
+当定长会让「设备这次只回了 3 个字符」被判成错误。
+
+#### 3.10.16.8 读：按对象类型分组，一个 span 最多两次事务
+
+`Read` 把 span 里的点按 `objectType` 分成两组，每组合并编号发一次请求：
+
+```
+svid 点 ──合并──> S1F3 (L,n{U4}) ──> S1F4 (L,n{L,2{U4,值}}) ──分发──> 各点
+ecid 点 ──合并──> S2F13           ──> S2F14                   ──分发──> 各点
+```
+
+三个 svid 点加两个 ecid 点是 **2 次事务**，不是 5 次。这与 Modbus「一次读多个寄存器」是
+同一个优化：SECS 事务有往返成本。
+
+分发阶段逐点独立：应答里缺某个编号 → 该点 `address_error`；项格式与声明类型不符 → 该点
+`protocol`；其余点照常返回。**批量读的价值就是「一次往返拿到多数」，不能因为一个坏编号
+让整组作废。**
+
+分组阶段就把点位解析成 `pointPlan`（连同编号、类型、可写标记）随组带走，而不是在读的
+时候按点位 ID 回查设备点表。原因是外部调用方（自检 CLI、北向按需读）传进来的点可能不在
+设备点表里，回查会拿到零值编号然后**静默读 0 号**——这个 bug 已经犯过一次，现在的写法
+用 `planFor` 明确区分「点表内的点」与「按地址临时解析的点」。
+
+#### 3.10.16.9 写：只有设备常数，ACKC7=0 才算接受
+
+S2F15 的请求体与 S1F4 布局相同（`L,n{L,2{U4,值}}`），但应答 S2F16 只回**一个**字节
+（EAC / ACKC7）：
+
+| ACKC7 | 含义 | 驱动处理 |
+|---|---|---|
+| 0 | 接受 | 该批次全部标 `good` |
+| 非 0 | 拒绝 | 该批次全部标 `unsupported`（设备侧拒绝） |
+
+一条 S2F15 携带多个常数时，S2F16 只有一个确认码——它不告诉你「哪一个被拒」。因此自检
+命令的 `-write` 只允许**一个编号**：多编号写无法区分失败原因，报出来的「失败」是不可
+诊断的。
+
+写只认点表里的点。`writable` 是设备配置里声明过的写权限，凭一个地址就允许写等于让任何
+能构造 API 请求的人绕过它。**读可以按地址临时解析，写不行**——两者刻意不对称。
+
+写 SVID 一律拒绝（`permission`）。SECS/GEM 里状态变量没有写语义，写它要走 S2F49/S2F41
+那套「远程命令 + 应答确认」的流程；把 S1F3 读到的编号直接塞进 S2F15，设备会当作「写一个
+不存在的常数」而拒绝，或者更糟：编号碰巧是一个 ECID，于是写错了对象。
+
+值编码严格按声明类型，不做隐式转换：
+
+- `string` 点写入数值 → 报错。曾经的实现直接取 `v.Text`，一个数值值的 `Text` 是空字符串，
+  于是**静默写入一个空标签**。设备会「成功地」收到它，比报错危险得多。
+- 整数点写入小数 → 报错，不截断。
+- 布尔点写入非布尔 → 报错。
+
+#### 3.10.16.10 超时与重发
+
+设备标签：
+
+| 标签 | 默认 | 范围 | 说明 |
+|---|---|---|---|
+| `commTimeout` | `5s` | > 0 | `Open` 时等 Select.rsp 的时长；超时即 Open 失败 |
+| `retries` | `1` | 0..5 | 事务超时后的额外重发次数；0 表示只发一次 |
+
+`attemptDeadline` 取「设备超时」与「ctx 截止时间」中**更早**的那个。这一条是关闭预算的
+保障：调度器的关闭预算只有 10 秒，如果重发不受 ctx 约束，一轮采集能被拖成 N 倍超时。
+
+重发只在 `timeout` 与 `disconnected` 两类错误上发生；`protocol`、`address` 立即返回——
+重发一条被拒的消息不会变成功。
+
+HSMS 跑在 TCP 上，重发只在「对端进程卡住但连接没断」时有意义。这也是默认只重试一次、
+而不是 CoAP 的 4 次的原因：TCP 自身已经处理了丢包。
+
+#### 3.10.16.11 错误分类
+
+| 现象 | `ErrorKind` | 可重试 | 是否计入熔断 |
+|---|---|---|---|
+| 拨号失败、TCP 写/读失败、对端关闭 | `disconnected` | 是 | 是 |
+| Select 被拒（status≠0） | `disconnected` | 是 | 是 |
+| 超时（含重发耗尽）、ctx 取消 | `timeout` | 是 | 是 |
+| 第一条应答不是 Select.rsp | `protocol` | 否 | 否 |
+| 畸形帧头、长度超限、解码失败 | `protocol` | 否 | 否 |
+| 应答里没有被请求的编号 | `address` | 否 | **否** |
+| 写只读点（svid 或未声明 writable） | `permission` | 否 | 否 |
+| 点表外地址写入 | `permission` | 否 | 否 |
+| 设备拒绝写（ACKC7≠0） | `unsupported` | 否 | 否 |
+| 值无法按声明类型编码 | `unsupported` | 否 | 否 |
+| 配置错误（非 TCP 传输、标签非法、地址非法、类型不支持） | `unsupported` / `address` | 否 | — |
+
+`address` 不计入熔断是刻意的：点表里写错一个编号，不应该让整台设备被判死。`protocol`
+也不计入：对端说的东西我们听不懂，重试不会好，但也不代表设备离线。
+
+质量映射：`timeout` → `timeout`，`disconnected` → `comm_error`，`address` →
+`address_error`，其余 → `bad`。
+
+#### 3.10.16.12 内置设备（`internal/sim/secs`）
+
+内置设备是一个只应答的 HSMS 设备，用来在没有硬件时跑通整条链路：
+
+| 编号 | 类型 | 初值 | 可写 | 说明 |
+|---|---|---|---|---|
+| SVID 1 | U4 | 25 | 否 | Temperature，单位 C |
+| SVID 2 | A | `RUN` | 否 | State |
+| SVID 3 | F4 | 21.5 | 否 | Reading，单位 V |
+| ECID 10 | U4 | 300 | **是** | 温度上限 |
+| ECID 11 | A | `AUTO` | **是** | 运行模式 |
+
+三条刻意保持的性质：
+
+1. **SVID 与 ECID 是两套独立的编号空间。** 同一个数字 1 既可以既是状态变量又是设备常数，
+   仿真里用 `(对象类型, 编号)` 作键。共用一张表会让「把 SVID 编号发到 S2F13」这类主站
+   错误被静默接受——那正是仿真最该抓住的错误。
+2. **写未知 ECID 回 ACKC7≠0。** 真实设备对未知常数编号的应答是「拒绝」，而不是「新建一个」。
+3. **未选中时 DATA 回 Reject；Deselect 之后重新变回拒绝。** 链路状态是真的在维护，不是
+   一个永远为真的开关。
+
+另外两条与「稳定」直接相关：
+
+- `S1F11` 给空列表 = **全部 SVID**（标准语义），且 ECID 不会混进来。
+- 设备侧发送时**只设写截止时间**。曾经用 `SetDeadline`（同时设读截止），空闲超过 2 秒的
+  连接会在下一次读取时直接超时断开——现象是「主站每几秒重连一次」，设备日志里一串
+  `broken pipe`。这个 bug 在内置设备里存在时，主站侧看起来像设备不稳定。
+
+`PushEvent` / `PushAlarm` 让测试能构造「设备在主站等应答时异步推送」的场景，钉住主站的
+丢弃行为。
+
+#### 3.10.16.13 自检：先看编号和格式，再读值
+
+自检命令 `uic secsread` 有五种模式，顺序上刻意把「看结构」排在「读值」前面：
+
+| 模式 | 动作 | 用途 |
+|---|---|---|
+| `-probe` | Linktest | 只验链路，不看点表 |
+| `-describe` | S1F11/S1F12 | 列出设备声明的编号、名称、单位 |
+| `-raw` | S1F3（或 S2F13） | 打印**原始 SECS-II 项**，不做类型转换 |
+| 默认 | S1F3/S2F13 + 类型转换 | 按 `-type` 解释，输出值与质量 |
+| `-write` | S2F15/S2F16 | 仅 `-object ecid`，仅单编号 |
+
+`-raw` 是排查效率最高的一档。现场最常见的问题是「设备回的格式与点表声明不一致」（点表
+写 int32、设备回 `A "RUN"`）；先看原始项就能一眼定位，而不是从一个「类型不符」的错误里猜。
+
+`-describe` 会显式提示「设备未返回编号 N」——请求了却没回，说明该编号在设备上不存在，
+这比静默少一行有用。
+
+自检链路（无硬件，TCP 回环）：
+
+```bash
+./uic sim -protocol secs -listen 127.0.0.1:5000 &
+./uic secsread -addr 127.0.0.1:5000 -probe
+# 链路正常: 127.0.0.1:5000（Linktest 有响应）
+
+./uic secsread -addr 127.0.0.1:5000 -describe -id 1,2,3,9
+# 设备声明 3 个状态变量
+# 编号      名称                        单位
+# 1         Temperature                 C
+# 2         State
+# 3         Reading                     V
+# （设备未返回编号 9）
+
+./uic secsread -addr 127.0.0.1:5000 -raw -id 1,2,3
+# 对象    编号      格式      原始项
+# svid    1         U4        U4 25
+# svid    2         A         A "RUN"
+# svid    3         F4        F4 21.5
+
+./uic secsread -addr 127.0.0.1:5000 -object ecid -id 10 -write 350
+# OK   ecid 10 = 350
+
+./uic secsread -addr 127.0.0.1:5000 -id 1 -write 5
+# SECS/GEM 的状态变量（svid）只读：写设备常数请加 -object ecid
+```
+
+示例配置 `examples/secs.json` 带上网关跑真实采集（2 台设备 5 个点位）：
+
+```bash
+./uic -config examples/secs.json
+curl -s -H 'Authorization: Bearer dev-token-0123456789' localhost:8100/api/v1/points
+curl -s -X POST -H 'Authorization: Bearer dev-token-0123456789' \
+  -H 'Content-Type: application/json' \
+  -d '{"value":{"type":"uint32","num":360}}' \
+  localhost:8100/api/v1/points/secs-constants/temp-limit/write
+```
+
+#### 3.10.16.14 代码位置
+
+| 内容 | 路径 |
+|---|---|
+| 编解码 | `internal/codec/secs`（`Encode`/`Decode` HSMS 帧、`FrameDataLen`、`ParseFrame`、`EncodeItem`/`DecodeItem`、`MaxPayload`） |
+| 消息语义 | `internal/codec/secs`（`EncodeIDList`/`DecodeIDList`、`EncodeStatusReply`/`DecodeStatusReply`、`EncodeStatusNameReply`/`DecodeStatusNameReply`、`EncodeConstantSend`、`EncodeConstantAck`/`DecodeAck`、`EncodeCommAck`/`DecodeCommAck`、`EncodeOnLineData`、`EncodeEventReport`、`EncodeAlarmReport`、`itemUint`） |
+| 主站驱动 | `internal/driver/secs`（`Meta`/`Open`/`Read`/`Write`/`Probe`/`Close`；内部 `selectLink`/`exchange`/`awaitSecondary`/`readOne`/`readGroup`/`planFor`；值转换 `itemValue`/`itemFloat`/`valueItem`；自检扩展 `Inspector`/`Describe`/`RawRead`） |
+| 内置设备 | `internal/sim/secs`（`NewServer`/`NewServerWithOptions`/`Addr`/`Name`/`SetVID`/`SetVIDNamed`/`SetECID`/`Value`/`ValueOf`/`IDs`/`IDsOf`/`SortedIDs`/`Requests`/`Writes`/`PushEvent`/`PushAlarm`/`Close`） |
+| CLI | `uic secsread`（`-addr`/`-object`/`-id`/`-type`/`-timeout`/`-comm-timeout`/`-retries`/`-probe`/`-describe`/`-raw`/`-write`/`-json`） |
+| 示例 | `examples/secs.json`（2 台设备 5 个点位，REST 8100，设备 5000） |
+
+#### 3.10.16.15 测试矩阵
+
+| 层 | 用例 |
+|---|---|
+| `codec/secs` | 帧往返与金字节（含 W 位、控制消息 0xFF）、Stream 1..15 边界、字节顺序非 1 拒绝、长度字段与实际数据不一致、`FrameDataLen` 短头与超上限、`ParseFrame` 半帧/多帧、长度字节数 00/01/10/11、`encodeLen`/`decodeLen` 边界（255/256/65535/65536/16777215）、L 项子项数边界与畸形声明、各格式 `Item` 取值与宽度校验、BOOLEAN 非 0 即 true、`Int`/`Float` 的非定长格式、`FormatName`/`TypeName`/`StatusName` 兜底 |
+| `codec/secs`（消息） | `L,n{U4}` 编号列表往返与 U1/U2 容忍、S1F4/S2F14 往返与金字节、S1F12 往返与第四项容忍、S2F15/S2F16 与 `B,1` 应答、S1F14 COMMACK、S1F2 机型版本、S6F11 多层报告与 `FindVID`、S5F1 ALCD 的发生/解除与类别保留、各消息体的畸形形状拒绝、空值与 nil 值 |
+| `driver/secs` | 真实 TCP 回环：Select 握手成功/被拒/错应答/沉默、批量读 SVID（3 点 1 次事务）、混合 svid+ecid（2 次事务）、缺失编号 → `address`、类型不符、范围校验、字符串数字、异步推送被忽略、迟到应答被忽略、S2F15 写入与回读、只读 ECID、svid 不可写、点表外写入被拒、未知 ECID 被拒、重发一次后成功、ctx 取消、半帧/畸形帧头/对端挂断、`Probe` 的 timeout/protocol、`Close` 发 Separate 且幂等、系统字节回绕跳过 0、禁用点不入表、负 length 拒绝、`RawRead`（svid/ecid）、`Describe`、值转换全类型与全错误分支 |
+| `sim/secs` | 默认值与两个独立编号空间、`SetVIDNamed` 与 S1F12、S1F11 空列表=全部 SVID、未知编号回空列表、S2F15 写入与未知 ECID 拒绝、未选中 Reject、Deselect 后 Reject、S1F1 无 W 位不应答、S5F1 报警推送与解除、S6F11 事件推送、未选中不推送、计数器语义、Separate 关闭连接、畸形请求容错、空闲 2.5 秒不断链、重复监听报错、二次 Close 幂等 |
+
+覆盖率（`go test -cover`）：`codec/secs` 94.6%、`driver/secs` 89.1%、`sim/secs` 95.1%。
 
 ### 3.11 计算点（`computed`）
 

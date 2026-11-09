@@ -22,6 +22,8 @@
 //	uic sim -protocol coap -listen 127.0.0.1:5683  # 内置 CoAP 服务端（UDP）
 //	uic snmpread -addr 127.0.0.1:16161 -oid 1.3.6.1.2.1.1.1.0   # SNMP v1/v2c 自检
 //	uic adsread -addr 127.0.0.1:48898 -probe   # ADS/AMS 自检（设备信息握手）
+//	uic secsread -addr 127.0.0.1:5000 -probe  # SECS/GEM 自检（HSMS Linktest）
+//	uic sim -protocol secs -listen 127.0.0.1:5000  # 内置 HSMS 设备
 //	uic uaread -addr 127.0.0.1:4840 -nodes ns=2;s=site/dev/point  # OPC UA 读写自检
 //	uic s7blocks -addr 127.0.0.1:15102   # S7 块目录（-type db / -num 1 可细看）
 //	uic s7upload -addr 127.0.0.1:15102 -type db -num 1 -out db1.bin  # 块上传备份
@@ -70,6 +72,7 @@ import (
 	sim "uic/internal/sim/modbus"
 	simmqtt "uic/internal/sim/mqtt"
 	sims7 "uic/internal/sim/s7"
+	secssim "uic/internal/sim/secs"
 	snmpsim "uic/internal/sim/snmp"
 )
 
@@ -111,6 +114,8 @@ func main() {
 		cjt188readCmd(args)
 	case "snmpread":
 		snmpreadCmd(args)
+	case "secsread":
+		secsreadCmd(args)
 	case "adsread":
 		adsreadCmd(args)
 	case "uaread":
@@ -142,7 +147,7 @@ func usage() {
 用法:
   uic [run] -config config.json [-listen :8080] [-token TOKEN]
   uic -check -config config.json
-  uic sim [-listen 127.0.0.1:15020] [-protocol modbus|s7|opcua|mqtt|mc|fins|enip|bacnet|iec104|dnp3|coap|dlt645|cjt188|snmp|ads]
+  uic sim [-listen 127.0.0.1:15020] [-protocol modbus|s7|opcua|mqtt|mc|fins|enip|bacnet|iec104|dnp3|coap|dlt645|cjt188|snmp|ads|secs]
   uic mbread -addr 127.0.0.1:1502 -unit 1 -area holding -offset 0 -qty 2
   uic mbread -addr 127.0.0.1:1502 -area holding -offset 5 -write 777
   uic mcread -addr 127.0.0.1:5000 -area d -offset 100 -qty 2
@@ -176,6 +181,11 @@ func usage() {
   uic adsread -addr 127.0.0.1:48898 -symbol MAIN.nSetpoint:int16 -set 750
   uic adsread -addr 127.0.0.1:48898 -state
   uic adsread -addr 127.0.0.1:48898 -control run -allow-control
+  uic secsread -addr 127.0.0.1:5000 [-id 1,2,3] [-type uint32] [-json]
+  uic secsread -addr 127.0.0.1:5000 -raw -id 1,2,3
+  uic secsread -addr 127.0.0.1:5000 -describe -id 1,2,3
+  uic secsread -addr 127.0.0.1:5000 -object ecid -id 10 -write 350
+  uic secsread -addr 127.0.0.1:5000 -probe
   uic mbread -transport rtu|ascii -port /dev/ttyUSB0 [-baud 19200] [-parity even]
   uic uaread -addr 127.0.0.1:4840 -nodes ns=2;s=site/dev/point [-type float64]
   uic uaread -addr 127.0.0.1:4840 -nodes ns=2;s=site/dev/setpoint -write 42.5
@@ -489,7 +499,7 @@ func simCmd(args []string) {
 	fs := flag.NewFlagSet("sim", flag.ExitOnError)
 	addr := fs.String("listen", "127.0.0.1:15020", "监听地址")
 	size := fs.Int("size", 1024, "寄存器数量")
-	proto := fs.String("protocol", "modbus", "从站协议：modbus | s7 | opcua | mqtt | mc | fins | enip | bacnet | iec104 | dnp3 | coap | dlt645 | cjt188 | snmp | ads")
+	proto := fs.String("protocol", "modbus", "从站协议：modbus | s7 | opcua | mqtt | mc | fins | enip | bacnet | iec104 | dnp3 | coap | dlt645 | cjt188 | snmp | ads | secs")
 	pdu := fs.Int("pdu", 480, "S7 协商 PDU 长度（240/480/960）")
 	fs.Parse(args)
 
@@ -536,9 +546,12 @@ func simCmd(args []string) {
 	case "ads":
 		simADS(*addr)
 		return
+	case "secs":
+		simSECS(*addr)
+		return
 	case "modbus":
 	default:
-		fmt.Fprintf(os.Stderr, "未知协议 %q（支持 modbus | s7 | opcua | mqtt | mc | fins | enip | bacnet | iec104 | dnp3 | coap | dlt645 | cjt188 | snmp | ads）\n", *proto)
+		fmt.Fprintf(os.Stderr, "未知协议 %q（支持 modbus | s7 | opcua | mqtt | mc | fins | enip | bacnet | iec104 | dnp3 | coap | dlt645 | cjt188 | snmp | ads | secs）\n", *proto)
 		os.Exit(2)
 	}
 
@@ -1104,6 +1117,40 @@ func simADS(addr string) {
 	fmt.Println("  Ctrl+C 停止")
 	fmt.Println("  自检：   uic adsread -addr " + srv.Addr() + " -probe")
 	fmt.Println("  读点位： uic adsread -addr " + srv.Addr() + " -symbol MAIN.nCounter:int16,MAIN.sRecipe:string:81")
+
+	<-ctx.Done()
+	_ = srv.Close()
+	slog.Info("sim_stopped")
+}
+
+// simSECS 启动内置 HSMS/SECS-II 设备（TCP 5000）。
+//
+// 初始值与 examples/secs.json 一一对应：先起这个从站，再跑
+// `./uic -config examples/secs.json`，就能看到状态变量与设备常数被正常采集。
+//
+// 用 TCP 而不是真实设备的串口/网口无差别：HSMS 本来就是 TCP 之上的会话层，
+// 这里验证的正是「帧头、系统字节配对、Select 前置、应答 W 位清零」这些线上
+// 语义。设备主动推送（S6F11/S5F1）需要外部触发，仿真里没有定时器——它刻意
+// 保持「只应答」，这样自检结果不会被异步消息干扰。
+func simSECS(addr string) {
+	srv, err := secssim.NewServer(addr)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "启动 SECS 服务端失败: %v\n", err)
+		os.Exit(1)
+	}
+	defer func() { _ = srv.Close() }()
+
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	fmt.Printf("hsms/secs-ii equipment listening on %s\n", srv.Addr())
+	fmt.Println("  状态变量（S1F3/S1F4，只读）：1=温度 U4 25   2=运行状态 A \"RUN\"   3=读数 F4 21.5")
+	fmt.Println("  设备常数（S2F13/S2F14 读，S2F15/S2F16 写）：10=温度上限 U4 300   11=模式 A \"AUTO\"")
+	fmt.Println("  控制消息：Select / Deselect / Linktest / Separate；未选中时 DATA 回 Reject")
+	fmt.Println("  Ctrl+C 停止")
+	fmt.Printf("  自检：   uic secsread -addr %s -probe\n", srv.Addr())
+	fmt.Printf("           uic secsread -addr %s -id 1,2,3\n", srv.Addr())
+	fmt.Printf("           uic secsread -addr %s -object ecid -id 10,11 -write 350\n", srv.Addr())
 
 	<-ctx.Done()
 	_ = srv.Close()

@@ -109,6 +109,11 @@ func TestAddressPolicyStatic(t *testing.T) {
 	if p := PolicyFor("ads"); !p.AllowSymbol || !p.AllowSymbolLength || !p.SymbolIndexInPath || p.AllowSelector {
 		t.Fatalf("ads = %+v", p)
 	}
+	// SECS 用对象地址：编号是协议原生整数，宽度由点表声明（同一编号可能是
+	// U4、A 或 F8，点表层不复制 SECS-II 的格式表）。
+	if p := PolicyFor("secs"); !p.AllowObject || p.AllowRegister || p.AllowSymbol || p.Width != WidthProtocol {
+		t.Fatalf("secs = %+v", p)
+	}
 	if p := PolicyFor("weird"); !p.AllowRegister || !p.AllowSymbol || p.Width != WidthExplicit {
 		t.Fatalf("unknown = %+v", p)
 	}
@@ -345,5 +350,32 @@ func TestParseAddressADS(t *testing.T) {
 	// 其它符号协议不接受显式长度：OPC UA 的宽度来自服务端类型。
 	if _, err := ParseAddressWithLength("ns=2;s=Plant.Temp", model.TypeString, "opcua", 81); err == nil {
 		t.Fatal("opcua must reject explicit symbol length")
+	}
+}
+
+// SECS 的对象地址是 `svid:1001.value`：类型 + 编号 + 属性。它必须只对声明
+// 了 AllowObject 的协议可用，modbus 这类寄存器协议要明确拒绝而不是当成
+// 符号名。
+func TestParseSecsObjectAddress(t *testing.T) {
+	a, err := ParseAddress("svid:1001.value", model.TypeUint32, "secs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a.Kind != model.AddressObject || a.ObjectType != "svid" || a.Instance != 1001 || a.Property != "value" {
+		t.Fatalf("地址 = %+v", a)
+	}
+	if _, err := ParseAddress("ecid:200.value", model.TypeUint32, "secs"); err != nil {
+		t.Fatalf("ecid 也应可解析: %v", err)
+	}
+	// 寄存器协议不接受对象地址。
+	if _, err := ParseAddress("svid:1.value", model.TypeUint32, "modbus-tcp"); err == nil {
+		t.Fatal("modbus-tcp 必须拒绝对象地址")
+	}
+	// 属性为空、编号非数字都要在导入时被挡住。
+	if _, err := ParseAddress("svid:1.", model.TypeUint32, "secs"); err == nil {
+		t.Fatal("空属性必须失败")
+	}
+	if _, err := ParseAddress("svid:x.value", model.TypeUint32, "secs"); err == nil {
+		t.Fatal("非数字编号必须失败")
 	}
 }
