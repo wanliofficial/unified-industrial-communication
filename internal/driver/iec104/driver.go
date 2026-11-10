@@ -36,6 +36,7 @@ import (
 	"time"
 
 	"uic/internal/codec/iec104"
+	"uic/internal/codec/iec60870"
 	"uic/internal/driver"
 	"uic/internal/model"
 )
@@ -60,18 +61,15 @@ const (
 	maxObserved = 4096
 )
 
-// 地址 area 的取值：声明点位的对象类别，决定写入时用哪种命令。
-//
-// 为什么把「命令类型」放在 area 而不是 dataType：同一份点表里，一个 float32
-// 点位可能是短浮点设定值，也可能是标度化设定值（放大后的整数）。dataType
-// 只说明平台怎么存这个数，不说明设备接受哪种命令。
+// 地址 area 的取值与「点位语义」层共用一份实现（见 iec60870 包）：同一套
+// 对象类别、同一条命令推导规则，串行承载与以太网承载没有理由不同。
 const (
-	AreaIOA                = "ioa"                 // 监视方向，写入时按 dataType 推导命令类型
-	AreaSingleCommand      = "single-command"      // 单点命令
-	AreaDoubleCommand      = "double-command"      // 双点命令
-	AreaSetpointFloat      = "setpoint-float"      // 短浮点设定值命令
-	AreaSetpointScaled     = "setpoint-scaled"     // 标度化设定值命令
-	AreaSetpointNormalized = "setpoint-normalized" // 归一化设定值命令
+	AreaIOA                = iec60870.AreaIOA
+	AreaSingleCommand      = iec60870.AreaSingleCommand
+	AreaDoubleCommand      = iec60870.AreaDoubleCommand
+	AreaSetpointFloat      = iec60870.AreaSetpointFloat
+	AreaSetpointScaled     = iec60870.AreaSetpointScaled
+	AreaSetpointNormalized = iec60870.AreaSetpointNormalized
 )
 
 // DefaultPort 是 IEC 60870-5-104 的默认 TCP 端口。
@@ -228,7 +226,7 @@ func (d *Driver) Open(ctx context.Context, cfg driver.OpenConfig) (driver.Conn, 
 		timeout:  cfg.Channel.EffectiveTimeout(),
 		points:   plans,
 		byIOA:    byIOA,
-		values:   make(map[uint32]cachedValue, len(plans)),
+		values:   make(map[string]cachedValue, len(plans)),
 		done:     make(chan struct{}),
 		ackCh:    make(chan struct{}, 1),
 		started:  make(chan struct{}),
@@ -295,38 +293,13 @@ func buildPlans(dev model.Device) (map[string]*pointPlan, map[uint32][]*pointPla
 }
 
 func planPoint(p driver.PointRef) (*pointPlan, error) {
-	if p.Address.Kind != model.AddressRegister {
-		return nil, driver.E(driver.ErrAddress, "open", "",
-			fmt.Sprintf("point %q: iec104 requires register addressing (area=ioa, offset=IOA), got %q",
-				p.ID, p.Address.Kind), false, nil)
+	// 104 的 IOA 固定 3 字节，上限 16777215；规划逻辑本身与承载无关，
+	// 放在 iec60870 里与 101 共用。
+	pl, err := iec60870.PlanPoint(p, "iec104", 0xFFFFFF)
+	if err != nil {
+		return nil, err
 	}
-	area := strings.ToLower(strings.TrimSpace(p.Address.Area))
-	switch area {
-	case AreaIOA, AreaSingleCommand, AreaDoubleCommand,
-		AreaSetpointFloat, AreaSetpointScaled, AreaSetpointNormalized:
-	default:
-		return nil, driver.E(driver.ErrAddress, "open", "",
-			fmt.Sprintf("point %q: unknown area %q (want %s, %s, %s, %s, %s or %s)",
-				p.ID, p.Address.Area, AreaIOA, AreaSingleCommand, AreaDoubleCommand,
-				AreaSetpointFloat, AreaSetpointScaled, AreaSetpointNormalized), false, nil)
-	}
-	ioa := p.Address.Offset
-	if ioa <= 0 || ioa > 0xFFFFFF {
-		return nil, driver.E(driver.ErrAddress, "open", "",
-			fmt.Sprintf("point %q: IOA %d out of range 1..16777215", p.ID, ioa), false, nil)
-	}
-	if p.Address.Length != 0 || p.Address.Bit > 0 {
-		return nil, driver.E(driver.ErrAddress, "open", "",
-			fmt.Sprintf("point %q: length/bit are not used by iec104", p.ID), false, nil)
-	}
-	switch p.DataType {
-	case model.TypeBool, model.TypeInt16, model.TypeUint16, model.TypeInt32, model.TypeUint32,
-		model.TypeInt64, model.TypeUint64, model.TypeFloat32, model.TypeFloat64:
-	default:
-		return nil, driver.E(driver.ErrAddress, "open", "",
-			fmt.Sprintf("point %q: dataType %q is not supported by iec104", p.ID, p.DataType), false, nil)
-	}
-	return &pointPlan{ref: p, ioa: uint32(ioa), area: area, dataType: p.DataType}, nil
+	return &pointPlan{ref: pl.Ref, ioa: pl.IOA, area: pl.Area, dataType: pl.DataType}, nil
 }
 
 // ---------------------------------------------------------------------------
@@ -373,8 +346,12 @@ type conn struct {
 
 	// mu 保护缓存、链路状态与等待者。所有「先取状态、再发帧」的路径都
 	// 必须先放掉 mu 再进 wmu，反过来也一样，避免自锁。
-	mu       sync.Mutex
-	values   map[uint32]cachedValue
+	mu sync.Mutex
+	// values 按**点位 ID** 而不是 IOA 缓存。同一个 IOA 可以既被监视
+	// （遥信/遥测）又被遥控（命令点位），两边的平台类型不同：用 IOA
+	// 做键会让后写入的一方覆盖另一方，症状是「遥信布尔点显示成
+	// double 的 2」。键换成点位 ID 之后，各点位各存一份，互不干扰。
+	values   map[string]cachedValue
 	linkErr  error
 	closed   bool
 	testWait chan error
@@ -577,7 +554,7 @@ func (c *conn) lookupLocked(id string) driver.RawSample {
 				fmt.Sprintf("point %q is not configured", id), false, nil),
 		}
 	}
-	cv, seen := c.values[plan.ioa]
+	cv, seen := c.values[plan.ref.ID]
 	if !seen {
 		msg := fmt.Sprintf("no data received for IOA %d yet (not in the station's transmission set?)", plan.ioa)
 		if !c.monitoredLocked(plan.ioa) {
@@ -705,8 +682,8 @@ func (c *conn) writeOne(ctx context.Context, req driver.WriteRequest) (driver.Wr
 			// 带真实品质位的上送换成本地推测值，而这个推测值在 104 里可能
 			// 长期得不到纠正（只在变化时上送）。
 			c.mu.Lock()
-			if cur, ok := c.values[plan.ioa]; !ok || cur.at.Before(sentAt) {
-				c.values[plan.ioa] = cachedValue{
+			if cur, ok := c.values[plan.ref.ID]; !ok || cur.at.Before(sentAt) {
+				c.values[plan.ref.ID] = cachedValue{
 					value: comm.value, q: model.QualityUncertain, at: time.Now()}
 			}
 			c.mu.Unlock()
@@ -735,107 +712,19 @@ type command struct {
 }
 
 func buildCommand(plan *pointPlan, req driver.WriteRequest, ca uint16) (command, error) {
-	area := plan.area
-	if area == AreaIOA {
-		// 未显式声明命令类型的可写点：按平台类型推导。这个默认值在文档
-		// 里写明，避免「同一份点表在两台设备上走不同命令」。
-		switch plan.dataType {
-		case model.TypeBool:
-			area = AreaSingleCommand
-		case model.TypeFloat32, model.TypeFloat64:
-			area = AreaSetpointFloat
-		default:
-			area = AreaSetpointScaled
-		}
+	asdu, value, err := iec60870.BuildCommand(plan.area, plan.ioa, plan.dataType, req, ca)
+	if err != nil {
+		return command{}, err
 	}
-	bad := func(format string, args ...any) (command, error) {
-		return command{}, driver.E(driver.ErrAddress, "write", "", fmt.Sprintf(format, args...), false, nil)
-	}
-	wrap := func(asdu []byte, err error, value model.Value) (command, error) {
-		if err != nil {
-			return command{}, driver.E(driver.ErrInternal, "write", "", err.Error(), false, err)
-		}
-		return command{asdu: asdu, value: value}, nil
-	}
-	switch area {
-	case AreaSingleCommand:
-		if req.Value.Type != model.TypeBool {
-			return bad("point %q: single command requires bool value, got %s", req.PointID, req.Value.Type)
-		}
-		asdu, err := iec104.BuildSingleCommand(ca, plan.ioa, req.Value.Bool, false)
-		return wrap(asdu, err, req.Value)
-	case AreaDoubleCommand:
-		state, ok := doubleState(req.Value)
-		if !ok {
-			return bad("point %q: double command requires bool or numeric 1 (off) / 2 (on), got %+v",
-				req.PointID, req.Value)
-		}
-		asdu, err := iec104.BuildDoubleCommand(ca, plan.ioa, state, false)
-		return wrap(asdu, err, req.Value)
-	case AreaSetpointFloat:
-		f, ok := numeric(req.Value)
-		if !ok {
-			return bad("point %q: setpoint requires numeric value, got %s", req.PointID, req.Value.Type)
-		}
-		asdu, err := iec104.BuildSetpointFloat(ca, plan.ioa, float32(f), false)
-		return wrap(asdu, err, model.NumValue(plan.dataType, f))
-	case AreaSetpointNormalized:
-		f, ok := numeric(req.Value)
-		if !ok || f < -1 || f > 1 {
-			return bad("point %q: normalized setpoint requires numeric value in -1..1", req.PointID)
-		}
-		asdu, err := iec104.BuildSetpointNormalized(ca, plan.ioa, f, false)
-		return wrap(asdu, err, model.NumValue(plan.dataType, f))
-	case AreaSetpointScaled:
-		f, ok := numeric(req.Value)
-		if !ok {
-			return bad("point %q: setpoint requires numeric value, got %s", req.PointID, req.Value.Type)
-		}
-		if f < -32768 || f > 32767 {
-			return bad("point %q: scaled setpoint %v out of int16 range", req.PointID, f)
-		}
-		asdu, err := iec104.BuildSetpointScaled(ca, plan.ioa, int16(f), false)
-		return wrap(asdu, err, model.NumValue(plan.dataType, f))
-	}
-	return bad("point %q: area %q is not a command type", req.PointID, plan.area)
+	return command{asdu: asdu, value: value}, nil
 }
 
-func numeric(v model.Value) (float64, bool) {
-	if v.Type == model.TypeBool {
-		if v.Bool {
-			return 1, true
-		}
-		return 0, true
-	}
-	if !v.Type.IsNumeric() {
-		return 0, false
-	}
-	return v.Num, true
-}
-
-// doubleState 把平台值映射成双点命令的两位状态。
-//
-// 双点命令只有两个合法状态：1=分、2=合。0 与 3 在标准里是「不允许」，
-// 不是「中间态」——把它们当合法值发下去，好设备会回否定确认，差设备
-// 会静默不动，两种情况在现场都表现为「按钮点了没反应」。因此这里直接
-// 拒绝，让错误在点击的那一刻就暴露出来。
-func doubleState(v model.Value) (byte, bool) {
-	if v.Type == model.TypeBool {
-		if v.Bool {
-			return 2, true // 合
-		}
-		return 1, true // 分
-	}
-	f, ok := numeric(v)
-	if !ok || f != float64(int(f)) {
-		return 0, false
-	}
-	switch int(f) {
-	case 1, 2:
-		return byte(f), true
-	}
-	return 0, false
-}
+// numeric / doubleState 是共享层的一行转发，保留本地名字是因为单元测试与
+// 命令构造的调用点都按「本协议的语义」读它们。
+var (
+	numeric     = iec60870.Numeric
+	doubleState = iec60870.DoubleState
+)
 
 func negativeConfirm(deviceID string, ioa uint32, asdu iec104.ASDU) error {
 	kind := driver.ErrPermission
@@ -1113,7 +1002,7 @@ func (c *conn) storeValues(asdu iec104.ASDU) {
 				// 「类型错但看起来正常」的值。
 				continue
 			}
-			c.values[o.IOA] = cachedValue{value: v, q: q, at: now}
+			c.values[p.ref.ID] = cachedValue{value: v, q: q, at: now}
 		}
 	}
 }
@@ -1162,68 +1051,12 @@ func (c *conn) Dropped() uint64 {
 
 // convert 把信息对象转换成点位声明的平台类型。
 func convert(o iec104.Object, typeID byte, dt model.DataType) (model.Value, model.Quality, bool) {
-	q := qualityOf(o.Quality)
-	if dt == model.TypeBool {
-		switch typeID {
-		case iec104.TypeSinglePoint, iec104.TypeSinglePointTime:
-			return model.BoolValue(o.Bool), q, true
-		case iec104.TypeDoublePoint, iec104.TypeDoublePointTime:
-			switch o.Uint {
-			case 1: // 分
-				return model.BoolValue(false), q, true
-			case 2: // 合
-				return model.BoolValue(true), q, true
-			default:
-				// 0/3 是「中间状态 / 不确定」。把 false 报成 good 会让
-				// 「阀门状态未知」显示成「已关闭」——最危险的一类误报。
-				return model.BoolValue(false), worse(q, model.QualityUncertain), true
-			}
-		}
-		return model.Value{}, model.QualityBad, false
-	}
-	if !dt.IsNumeric() {
-		return model.Value{}, model.QualityBad, false
-	}
-	switch typeID {
-	case iec104.TypeMeasuredNormalized, iec104.TypeMeasuredNormalizedTime,
-		iec104.TypeMeasuredScaled, iec104.TypeMeasuredScaledTime,
-		iec104.TypeMeasuredFloat, iec104.TypeMeasuredFloatTime:
-		return model.NumValue(dt, o.Num), q, true
-	case iec104.TypeIntegratedTotals:
-		return model.NumValue(dt, float64(o.Uint)), q, true
-	case iec104.TypeSinglePoint, iec104.TypeSinglePointTime:
-		if o.Bool {
-			return model.NumValue(dt, 1), q, true
-		}
-		return model.NumValue(dt, 0), q, true
-	case iec104.TypeDoublePoint, iec104.TypeDoublePointTime:
-		return model.NumValue(dt, float64(o.Uint)), q, true
-	}
-	return model.Value{}, model.QualityBad, false
+	return iec60870.Convert(o, typeID, dt)
 }
 
-func qualityOf(q iec104.Quality) model.Quality {
-	switch {
-	case q.Has(iec104.QInvalid):
-		return model.QualityBad
-	case q.Has(iec104.QNotTopical):
-		return model.QualityStale
-	case q.Has(iec104.QSubstituted), q.Has(iec104.QBlocked), q.Has(iec104.QOverflow):
-		return model.QualityUncertain
-	}
-	return model.QualityGood
-}
+func qualityOf(q iec104.Quality) model.Quality { return iec60870.QualityOf(q) }
 
-// worse 取两个质量码里更差的一个（good < uncertain < stale < bad）。
-func worse(a, b model.Quality) model.Quality {
-	rank := map[model.Quality]int{
-		model.QualityGood: 0, model.QualityUncertain: 1, model.QualityStale: 2, model.QualityBad: 3,
-	}
-	if rank[b] > rank[a] {
-		return b
-	}
-	return a
-}
+func worse(a, b model.Quality) model.Quality { return iec60870.Worse(a, b) }
 
 // keeper 负责接收循环不能阻塞去做的三件事：确认收到的帧、空闲时发测试帧、
 // 把「对端已经很久不说话」变成一条明确的链路错误。

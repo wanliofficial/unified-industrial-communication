@@ -1,4 +1,4 @@
-// Command uic 是单一可执行入口：run（默认）/ sim / mbread / mcread / finsread / enipread / bacread / iec104read / dnp3read / uaread / s7blocks / s7upload / instantiate / import / token / version。
+// Command uic 是单一可执行入口：run（默认）/ sim / mbread / mcread / finsread / enipread / bacread / iec104read / iec101read / dnp3read / uaread / s7blocks / s7upload / instantiate / import / token / version。
 //
 //	uic -config config.json            # 前台运行
 //	uic run -config config.json        # 同上
@@ -17,6 +17,8 @@
 //	uic enipread -addr 127.0.0.1:44818 -tag DINT_TAG  # EtherNet/IP CIP 自检
 //	uic bacread -addr 127.0.0.1:47808 -type analog-input -instance 1  # BACnet/IP 自检
 //	uic iec104read -addr 127.0.0.1:2404 -ca 1   # IEC 60870-5-104 自检（总召唤 + 上送对象）
+//	uic sim -protocol iec101 -listen 127.0.0.1:4001 # 内置串行远动从站（FT1.2 over TCP）
+//	uic iec101read -addr 127.0.0.1:4001        # IEC 60870-5-101 自检（轮询 + 上送对象）
 //	uic dnp3read -addr 127.0.0.1:20000 -probe   # DNP3 自检（链路复位 + 总召唤 + 对象清单）
 //	uic coapread -addr 127.0.0.1:5683 -discover # CoAP 自检（资源发现 / 读写）
 //	uic sim -protocol coap -listen 127.0.0.1:5683  # 内置 CoAP 服务端（UDP）
@@ -67,6 +69,7 @@ import (
 	dnp3sim "uic/internal/sim/dnp3"
 	enipsim "uic/internal/sim/enip"
 	finsim "uic/internal/sim/fins"
+	iec101sim "uic/internal/sim/iec101"
 	iec104sim "uic/internal/sim/iec104"
 	mcsim "uic/internal/sim/mc"
 	sim "uic/internal/sim/modbus"
@@ -104,6 +107,8 @@ func main() {
 		bacreadCmd(args)
 	case "iec104read":
 		iec104readCmd(args)
+	case "iec101read":
+		iec101readCmd(args)
 	case "dnp3read":
 		dnp3readCmd(args)
 	case "coapread":
@@ -147,7 +152,7 @@ func usage() {
 用法:
   uic [run] -config config.json [-listen :8080] [-token TOKEN]
   uic -check -config config.json
-  uic sim [-listen 127.0.0.1:15020] [-protocol modbus|s7|opcua|mqtt|mc|fins|enip|bacnet|iec104|dnp3|coap|dlt645|cjt188|snmp|ads|secs]
+  uic sim [-listen 127.0.0.1:15020] [-protocol modbus|s7|opcua|mqtt|mc|fins|enip|bacnet|iec104|iec101|dnp3|coap|dlt645|cjt188|snmp|ads|secs]
   uic mbread -addr 127.0.0.1:1502 -unit 1 -area holding -offset 0 -qty 2
   uic mbread -addr 127.0.0.1:1502 -area holding -offset 5 -write 777
   uic mcread -addr 127.0.0.1:5000 -area d -offset 100 -qty 2
@@ -160,6 +165,9 @@ func usage() {
   uic bacread -addr 127.0.0.1:47808 -type analog-value -instance 2 -write 55.5
   uic iec104read -addr 127.0.0.1:2404 -ca 1 [-ioa 1001,1002] [-json]
   uic iec104read -addr 127.0.0.1:2404 -area single-command -cmd-ioa 4001 -write on
+  uic iec101read -addr 127.0.0.1:4001 [-link-addr 1] [-ca 1] [-ioa-size 2] [-json] [-raw]
+  uic iec101read -transport serial -port /dev/ttyUSB0 -baud 9600 -link-addr 1 -ca 1 -probe
+  uic iec101read -addr 127.0.0.1:4001 -area double-command -cmd-ioa 2003 -write on
   uic dnp3read -addr 127.0.0.1:20000 [-index 0,1] [-json] [-raw]
   uic dnp3read -addr 127.0.0.1:20000 -binary 0=on -analog 0=12.5
   uic coapread -addr 127.0.0.1:5683 -path /sensors/temp [-type float64] [-json]
@@ -499,7 +507,7 @@ func simCmd(args []string) {
 	fs := flag.NewFlagSet("sim", flag.ExitOnError)
 	addr := fs.String("listen", "127.0.0.1:15020", "监听地址")
 	size := fs.Int("size", 1024, "寄存器数量")
-	proto := fs.String("protocol", "modbus", "从站协议：modbus | s7 | opcua | mqtt | mc | fins | enip | bacnet | iec104 | dnp3 | coap | dlt645 | cjt188 | snmp | ads | secs")
+	proto := fs.String("protocol", "modbus", "从站协议：modbus | s7 | opcua | mqtt | mc | fins | enip | bacnet | iec104 | iec101 | dnp3 | coap | dlt645 | cjt188 | snmp | ads | secs")
 	pdu := fs.Int("pdu", 480, "S7 协商 PDU 长度（240/480/960）")
 	fs.Parse(args)
 
@@ -528,6 +536,9 @@ func simCmd(args []string) {
 	case "iec104":
 		simIEC104(*addr)
 		return
+	case "iec101":
+		simIEC101(*addr)
+		return
 	case "dnp3":
 		simDNP3(*addr)
 		return
@@ -551,7 +562,7 @@ func simCmd(args []string) {
 		return
 	case "modbus":
 	default:
-		fmt.Fprintf(os.Stderr, "未知协议 %q（支持 modbus | s7 | opcua | mqtt | mc | fins | enip | bacnet | iec104 | dnp3 | coap | dlt645 | cjt188 | snmp | ads | secs）\n", *proto)
+		fmt.Fprintf(os.Stderr, "未知协议 %q（支持 modbus | s7 | opcua | mqtt | mc | fins | enip | bacnet | iec104 | iec101 | dnp3 | coap | dlt645 | cjt188 | snmp | ads | secs）\n", *proto)
 		os.Exit(2)
 	}
 
@@ -912,6 +923,41 @@ func simIEC104(addr string) {
 	fmt.Println("            1005=-3.5(带时标)  2001=on  2002=off  2003=double 2(可遥控)")
 	fmt.Println("            2004=double 1  3001=1000(累计量，每秒自增)")
 	fmt.Println("  控制方向：4001=单点  4002=短浮点设定值  4003=标度化设定值（可写）")
+	fmt.Println("  Ctrl+C 停止")
+
+	<-ctx.Done()
+	_ = srv.Close()
+	slog.Info("sim_stopped")
+}
+
+// simIEC101 启动内置串行远动从站（FT1.2，经 TCP 透传承载）。
+//
+// 串口服务器把一条 RS-485 总线原样透传到以太网，因此用 TCP 承载内置从站
+// 不是「另造一个协议」：分帧、校验、轮询语义与真实串口完全一致，现场
+// 自检与自动化测试可以共用同一套代码。默认对象表与 examples/iec101.json
+// 一一对应，覆盖监视方向（短浮点、标度化、单点、双点、带时标、累计量）
+// 与控制方向的三种命令。
+//
+// 从站只会在被点名时说话——这正是主站驱动要复现的语义，也是「连上了但
+// 没有数据」最常见的误解来源：没有 `iec101read` 去轮询，链路看起来是死的。
+func simIEC101(addr string) {
+	srv, err := iec101sim.NewServer(addr, iec101sim.WithAutoIncrement(true))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "启动 IEC 101 从站失败: %v\n", err)
+		os.Exit(1)
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	fmt.Printf("iec 60870-5-101 slave listening on %s (link addr 1, CA 1)\n", srv.Addr())
+	fmt.Println("  剖面：链路地址 1 字节 / 公共地址 1 字节 / IOA 2 字节 / 无源发地址")
+	fmt.Println("  监视方向：1001=42.5  1002=7.25  1003=1234(标度化)  1004=0.5(取代)")
+	fmt.Println("            1005=-3.5(带时标)  2001=on  2002=off  2003=double 2(可遥控)")
+	fmt.Println("            2004=double 1  3001=1000(累计量，每秒自增)")
+	fmt.Println("  控制方向：4001=单点  4002=短浮点设定值  4003=标度化设定值（可写）")
+	fmt.Printf("  自检：   uic iec101read -addr %s\n", srv.Addr())
+	fmt.Println("  注意：从站不会主动发送，必须由主站轮询（这条命令就是那个主站）")
 	fmt.Println("  Ctrl+C 停止")
 
 	<-ctx.Done()

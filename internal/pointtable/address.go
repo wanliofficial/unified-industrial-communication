@@ -35,6 +35,11 @@ const (
 	WidthRegisters
 	// WidthBytes 是 S7 语义：DB1.DBD0 的 length 是 4。
 	WidthBytes
+	// WidthNone 表示地址里**不表达宽度**：值有多宽由协议元素类型决定
+	// （远动协议的 ASDU 类型标识一个对象就是固定几字节），写 length 反而
+	// 是误配。它与 WidthProtocol 的区别是「点表这一层是否还需要宽度」：
+	// WidthProtocol 仍要求驱动确认宽度，WidthNone 则连问都不问。
+	WidthNone
 	// WidthProtocol 表示宽度由协议层按数据项定义决定，地址里可以省略。
 	//
 	// 与 WidthExplicit 的区别不是「谁更宽松」，而是**长度的归属**：Modbus/S7
@@ -89,6 +94,13 @@ var (
 		"db": true, "input": true, "output": true, "merker": true,
 		"counter": true, "timer": true,
 	}
+	// iecAreas 是远动协议的「对象类别」：监视方向的 ioa，加上五种命令
+	// 类别。它们长得像寄存器区域，实际是应用层的对象类别——放在
+	// address.area 而不是另造字段，是为了让点表、北向、日志共用一种形状。
+	iecAreas = map[string]bool{
+		"ioa": true, "single-command": true, "double-command": true,
+		"setpoint-float": true, "setpoint-scaled": true, "setpoint-normalized": true,
+	}
 )
 
 // PolicyFor 返回协议对应的地址策略。
@@ -142,6 +154,14 @@ func PolicyFor(protocol string) AddressPolicy {
 			Width: WidthBytes, AllowRegister: true, AllowSymbol: true,
 			AllowComputed: true, AllowSelector: true,
 		}
+	case "iec101", "iec104":
+		// 远动协议用「对象类别 + 信息对象地址」寻址，值有多宽由 ASDU 的
+		// 类型标识决定，地址里写 length 只会让驱动拒绝这条点位。因此
+		// Width 用 WidthNone：点表层不推导、也不要求宽度。
+		//
+		// 两个承载共用同一套地址形态：104 多出来的只是 TCP 与序号层，
+		// 点表没有任何理由不同。
+		return AddressPolicy{Width: WidthNone, AllowRegister: true, RegisterAreas: iecAreas}
 	case "dlt645":
 		// 数据标识型寻址：`<DI>:0[:length]`，DI 是手册顺序的 8 位十六进制。
 		// offset 恒为 0（协议没有偏移概念），长度由 DI 表推导；只有数据块
@@ -310,7 +330,9 @@ func splitRegisterPrefix(expr string) (area string, db int, rest string, ok bool
 	}
 
 	switch lower {
-	case "holding", "input", "coil", "discrete", "output", "merker", "counter", "timer":
+	case "holding", "input", "coil", "discrete", "output", "merker", "counter", "timer",
+		"ioa", "single-command", "double-command",
+		"setpoint-float", "setpoint-scaled", "setpoint-normalized":
 		return lower, 0, expr[colon+1:], true
 	}
 	return "", 0, "", false
@@ -368,7 +390,23 @@ func parseRegister(area string, db int, rest string, dt model.DataType, pol Addr
 	} else if hint > 0 {
 		length, explicit = hint, true
 	}
-	if !explicit {
+	if explicit && pol.Width == WidthNone {
+		// 宽度由协议元素决定时，地址里写 length 不表达任何东西：同一个
+		// `ioa:1001` 读成 float32 还是 int16 由点位的 dataType 与 ASDU 类型
+		// 决定，多写一个 2 只会让驱动在 Open 阶段拒绝整条点位。宁可在导入
+		// 期说清楚「这里不该有长度」，也不要留一条启动后才炸的点表。
+		return model.Address{}, fmt.Errorf(
+			"%s: length is not expressed by this protocol (the value width comes from the data type), got %d",
+			area, length)
+	}
+	if pol.Width == WidthNone && bit >= 0 {
+		// 远动协议没有「寄存器里的第 n 位」：一个布尔量就是一个单点对象，
+		// 位号写在这里没有含义。驱动会拒，但在导入期拒可以说清原因。
+		return model.Address{}, fmt.Errorf(
+			"%s: bit addressing is not used by this protocol (a bool point is a single-point object), got bit %d",
+			area, bit)
+	}
+	if !explicit && pol.Width != WidthNone {
 		// 位访问的宽度恒为 1 字节/1 个线圈：bool 没有「类型宽度」，
 		// 如果走通用推导会得到「长度必须显式给出」这种莫名其妙的错误。
 		if dt == model.TypeBool && (area == "coil" || area == "discrete" || bit >= 0) {
@@ -384,7 +422,7 @@ func parseRegister(area string, db int, rest string, dt model.DataType, pol Addr
 	if length > 125 {
 		return model.Address{}, fmt.Errorf("length %d must be <= 125", length)
 	}
-	if dt == model.TypeBool && area != "coil" && area != "discrete" && bit < 0 {
+	if dt == model.TypeBool && area != "coil" && area != "discrete" && bit < 0 && pol.Width != WidthNone {
 		return model.Address{}, fmt.Errorf("bool point needs a bit (e.g. %s:%d.0)", area, offset)
 	}
 
@@ -482,6 +520,10 @@ func deriveLength(area string, dt model.DataType, mode WidthMode) (int, error) {
 	// for bool」更好懂。
 	if dt == model.TypeBool {
 		return 1, nil
+	}
+	if mode == WidthNone {
+		// 协议元素自带宽度，地址里没有位置放它，也不需要放。
+		return 0, nil
 	}
 	if mode == WidthExplicit {
 		return 0, fmt.Errorf("length is required for %s (protocol width is unknown)", dt)

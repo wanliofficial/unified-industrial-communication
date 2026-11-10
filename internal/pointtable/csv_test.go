@@ -206,3 +206,64 @@ func asErrors(err error, target *Errors) bool {
 	}
 	return false
 }
+
+// 远动点表必须能从 CSV 一路跑到结构化地址，否则 `uic import` 这条路对
+// IEC 101/104 就是废的——而 CI 里没有设备，这条路径没人会手测。
+//
+// 这条用例是冲着一次真实缺陷来的：`PolicyFor("iec101")` 接上 `WidthNone`
+// 之后，`parseRegister` 里仍然保留着「bool 必须有位号」与「必须推导长度」
+// 两条寄存器协议的习惯，结果一份**完全正确**的远动点表在导入期被全数拒绝
+// （`bool point needs a bit (e.g. ioa:2001.0)`）。直接写 JSON 的示例配置
+// 绕过了这一层，所以自检通过也发现不了。
+func TestParseCSVIEC101(t *testing.T) {
+	raw := "point,address,type,name,writable\n" +
+		"temp,ioa:1001,float32,温度,\n" +
+		"scaled,ioa:1003,int16,标度化,\n" +
+		"run,ioa:2001,bool,运行,\n" +
+		"breaker,ioa:2003,bool,双点遥信,\n" +
+		"breaker-cmd,double-command:2003,uint16,双点遥控,true\n" +
+		"cmd,single-command:4001,bool,单点命令,true\n" +
+		"sp,setpoint-float:4002,float32,设定值,true\n" +
+		"sps,setpoint-scaled:4003,int16,标度化设定值,true\n" +
+		"spn,setpoint-normalized:4004,float32,归一化设定值,true\n" +
+		"counter,ioa:3001,uint32,累计量,\n"
+	res, err := ParseCSV(strings.NewReader(raw), "iec101")
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if len(res.Points) != 10 {
+		t.Fatalf("points = %d, want 10", len(res.Points))
+	}
+	if len(res.Warnings) != 0 {
+		t.Fatalf("warnings = %v", res.Warnings)
+	}
+	// 同一个 IOA 挂了两套语义（遥信 + 遥控），地址必须原样保留，不能被
+	// 任何一层「去重」或「按 IOA 归一」抹平成同一条。
+	if got := res.Points[3].Address.Canonical(); got != "ioa:2003:0" {
+		t.Fatalf("monitored 2003 = %s", got)
+	}
+	if got := res.Points[4].Address.Canonical(); got != "double-command:2003:0" {
+		t.Fatalf("command 2003 = %s", got)
+	}
+	if !res.Points[4].Writable || !res.Points[5].Writable {
+		t.Fatalf("command points must stay writable: %+v", res.Points[4:6])
+	}
+	for _, p := range res.Points {
+		if p.Address.Length != 0 {
+			t.Fatalf("point %q: length = %d, want 0", p.ID, p.Address.Length)
+		}
+	}
+}
+
+// 远动点表里的 length 列不是「可选」而是「不该有」：写上去说明这份点表是
+// 按寄存器协议抄的。导入期就要拒绝，不能留给启动后的 Open 去炸。
+func TestParseCSVIEC101RejectsLengthColumn(t *testing.T) {
+	raw := "point,address,type,length\ntemp,ioa:1001,float32,2\n"
+	_, err := ParseCSV(strings.NewReader(raw), "iec101")
+	if err == nil {
+		t.Fatal("a length column must be rejected for IEC 101")
+	}
+	if !strings.Contains(err.Error(), "length is not expressed") {
+		t.Fatalf("error = %v", err)
+	}
+}

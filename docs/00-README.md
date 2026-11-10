@@ -5,9 +5,9 @@
 | 项 | 数字 |
 |---|---|
 | 分析的参考方案 | 38 份（PA-01 … PA-38，其中 PA-06 合并了两个完全相同的仓库） |
-| 文档总量 | 55 份 Markdown / 22,754 行（含 3 份 ADR） |
-| 代码总量 | 305 个 Go 文件 / 131,472 行（其中测试 152 个文件 / 57,471 行 / 1,906 个测试函数） |
-| Go 包 | 80 个（1 个入口 + 79 个内部包；79 个有测试） |
+| 文档总量 | 55 份 Markdown / 23,268 行（含 3 份 ADR） |
+| 代码总量 | 318 个 Go 文件 / 137,400 行（其中测试 158 个文件 / 59,708 行 / 1,979 个测试函数） |
+| Go 包 | 84 个（1 个入口 + 83 个内部包；83 个有测试） |
 | 第三方依赖 | 0（仅标准库，零 CGO） |
 
 ---
@@ -34,11 +34,11 @@ cmd/ + internal/            可运行的最小骨架（不是伪代码，能采�
 
 ### 1.2 它不是什么
 
-- 不是协议库大杂烩。当前实现了 20 个驱动（Modbus TCP / RTU / ASCII 主站、S7、OPC UA、MQTT 南向订阅、
-  MC 3E、FINS、EtherNet/IP CIP、BACnet/IP、IEC 60870-5-104、DNP3、CoAP、DL/T 645、CJ/T 188、
-  SNMP v1/v2c、ADS/AMS、SECS/GEM、计算点、virtual），外加
-  Modbus 从站（TCP / RTU / ASCII）、十五个内置模拟从站/Broker（Modbus TCP、S7、MC 3E、FINS、CIP、BACnet/IP、
-  IEC 104、DNP3、CoAP、DL/T 645、CJ/T 188、SNMP v1/v2c、ADS/AMS、HSMS/SECS-II、MQTT）与一个内置 OPC UA 服务端、一个零依赖报警引擎与一个有界历史采样日志；其余协议在
+- 不是协议库大杂烩。当前实现了 21 个驱动（Modbus TCP / RTU / ASCII 主站、S7、OPC UA、MQTT 南向订阅、
+  MC 3E、FINS、EtherNet/IP CIP、BACnet/IP、IEC 60870-5-104、IEC 60870-5-101、DNP3、CoAP、DL/T 645、
+  CJ/T 188、SNMP v1/v2c、ADS/AMS、SECS/GEM、计算点、virtual），外加
+  Modbus 从站（TCP / RTU / ASCII）、十六个内置模拟从站/Broker（Modbus TCP、S7、MC 3E、FINS、CIP、BACnet/IP、
+  IEC 104、IEC 101、DNP3、CoAP、DL/T 645、CJ/T 188、SNMP v1/v2c、ADS/AMS、HSMS/SECS-II、MQTT）与一个内置 OPC UA 服务端、一个零依赖报警引擎与一个有界历史采样日志；其余协议在
   `04-protocol-catalog.md` 里按工作量排了三波，没有假装已经支持。
   注意 MQTT 出现了两次且**互不相干**：北向是「网关把数据发出去」（sink），南向是「网关订阅别人发来的数据」（driver）。
 - 不是组态软件。不做画面、不做报表、不做自研时序库——理由见 `02-synthesis/01-capability-matrix.md` §6.4。
@@ -237,6 +237,64 @@ IEC 104 与前面所有协议的根本差别是**数据由从站推上来**：�
 `iec104read` 不依赖点表：驱动维护一张 4096 条上限的**旁路表**，按 IOA 记录设备实际
 送过的原始对象（类型标识、传送原因、是否带时标），所以初次接一台陌生设备就能先看清
 「它送什么」再写点表。双点的 0/3 中间态原样显示成「不确定 (3)」，不硬转成布尔。
+
+IEC 60870-5-101（串行远动主站，FT1.2，串口 / 串口服务器）：
+
+```bash
+./uic sim -protocol iec101 -listen 127.0.0.1:4001 &   # 内置 101 从站（FT1.2 over TCP 透传）
+./uic -config examples/iec101.json
+curl -s -H 'Authorization: Bearer dev-token-0123456789' localhost:8092/api/v1/points
+#   14 点：短浮点 42.5/7.25、标度化 1234、被取代值（质量 uncertain）、
+#         带时标值、单点 on/off、双点 1/2、累计量每秒自增（需电能量召唤）、
+#         单点命令 + 短浮点/标度化设定值 + 双点遥控（可写）
+#   自检（不需要网关）：./uic iec101read -addr 127.0.0.1:4001
+#   只验链路层：./uic iec101read -transport serial -port /dev/ttyUSB0 -baud 9600 -probe
+#   下发命令：./uic iec101read -addr 127.0.0.1:4001 -area double-command -cmd-ioa 2003 -write on
+```
+
+101 与 104 只在**应用层**相同：类型标识、传送原因、品质位、时标、命令格式是同一套，
+本仓库把这一层抽成共享包 `internal/codec/iec60870`，两个驱动共用，避免「同一份点表走
+串口和走网口行为不一样」。承载层是另一套物理事实：**只有主站可以发言**，从站被点名才
+回答；没有会话，建链就是复位链路（固定帧 `FC=0`）；可靠性靠帧计数位 FCB + 链路确认 +
+应用层激活确认，而不是 15 位收发序号。
+
+因此 101 的 `Read` **真的去走线**——每轮请求第 1 级事件、按周期做站总召唤、再顺带请求
+第 2 级，而不是像 104 那样只查本地表。总召唤不放在 `Open`（几百个点在 9600 上要好几秒，
+塞进 `Open` 会让「连接超时」与「装置没数据」混在一起），由第一次 `Read` 触发。**电能量
+召唤必须单独做一次**：累计量不在站召唤范围内，只发站召唤的实现现场表现为「电度点位永远
+没有值」。终止报文有三种形态（`100`/`101` 的激活终止、`70` 初始化结束），但 `100` 的
+**激活确认不能当结束**，否则总召唤只回来一个点。
+
+FT1.2 有三个必须按字节记住的点：长度字段只计「控制域 + 链路地址 + ASDU」（整帧 = `L+6`）；
+校验和从控制域累加到 ASDU 末字节；单字节帧没有地址也没有控制域（`E5` 肯定确认、`A2` 否定
+确认，把 `A2` 当 `E5` 的症状是「装置拒绝了但主站报成功」）。链路地址宽度 0..2 字节，`0`
+表示不带地址，此时固定帧只有 4 字节。
+
+重传必须**原样重发同一帧字节**（含 FCB）而不是重新组帧：重新组帧等于发出另一条新命令，
+从站会再执行一次，症状是「确认超时后开关被拉合了两次」。本实现保存整帧字节，超时后用
+同一份重发一次；内置从站按「最近一次被接受的 FCB」去重，重复帧只回确认、不再执行。
+
+写入有**两层确认**：链路层 `E5` 只说明报文到了，应用层激活确认（`cause=7`）才说明装置
+收到并要执行。本实现等应用层确认才返回成功，`44..47`（未知类型/原因/公共地址/IOA）按
+错误分类返回。写成功后用请求值回填本地缓存（质量 `uncertain`），只补「没有」或「比命令
+更旧」的条目，避免抹掉一条更新的上送。
+
+地址形态与 104 完全一致（`kind=register`、`offset` 即 IOA、`area` 取 `ioa` 与五种命令），
+点表层用 `WidthNone`：远动协议的值宽度由类型标识决定，地址里写 `length` 反而是误配。
+**同一个 IOA 可以同时挂遥信与遥控**（`ioa:2003` 布尔 + `double-command:2003` 可写），
+两套语义、两种平台类型，所以缓存按**点位 ID** 而不是 IOA——按 IOA 存会让后写入的一方
+覆盖另一方，症状是「布尔遥信显示成 double 的 2」。这条修正同时改到了 104。
+
+剖面全部走设备标签：链路地址 1（1 字节）、CA 1（取 `unitId`）、IOA 2 字节、ORG 0 字节；
+可用 `linkAddress` / `linkAddressSize` / `commonAddress` / `commonAddressSize` / `ioaSize` /
+`orgSize` / `interrogate` / `class2` 覆盖。把某一组当成标准写死，是接不同厂家装置时最先
+撞上的墙：帧能收发、校验也对，只是所有字段整体错位一到三个字节。四类报文（总召唤、电能
+量召唤、时钟同步、初始化结束）**没有信息对象地址**，由共享层的 `HasIOA` 统一表达，编码
+与解码两侧走同一个判断，并用黄金字节钉住。
+
+`iec101read` 与 `iec104read` 一样不依赖点表，但诊断口径更贴串行现场：串口远动的失败模式
+几乎全是「没有应答」，所以它把「卡在哪一层」直接打出来——帧计数、解析失败帧数、公共地址
+不符帧数、每轮新增/更新数。
 
 DNP3（IEEE 1815 调度侧主站，TCP 20000）：
 
@@ -933,7 +991,7 @@ obs  ← 所有包（不依赖任何内部包）
 | `internal/history` | 有界采样日志：NDJSON 分段、整段淘汰、原始查询、定步长聚合与窗口摘要 | 一条记录不跨段；永远保留至少一段；末尾半行触发新段；查询升序、桶对齐、桶质量取最差；非数值点位不产出 `min/max/avg`；`WindowStats` 只统计 good 的数值样本，空窗口返回 `Count=0` 而非错误 | 84% |
 | `internal/calc` | 零依赖表达式引擎（编译期类型检查、短路求值、历史窗口聚合） | 无 `eval`；引用是 `device:point`；除零/NaN/Inf/溢出都报错而不是降级；窗口只允许 1s..24h，且只在第二个参数是时长时生效；窗口引用不进 `Refs()` | 92.7% |
 | `internal/template` | 设备模板：参数校验、字符串字面量替换、实例化后完整校验 | 占位符只替换字符串字面量且不做算术；整字面量是占位符时 int/float/bool 落成 JSON 数字/布尔；未知字段/参数/占位符与键里的占位符一律报错；必填缺失一次列全 | 92.5% |
-| `internal/pointtable` | 点表 CSV：列别名、地址表达式、按协议推导宽度、合并动作 | 列名大小写/空格/下划线不敏感；未知列报错；行错误带行号列名并聚合；重复 ID 是错误、重复地址是警告；`length` 先于地址解析；`#selector` 只允许 MQTT；SNMP 只允许 OID；默认拒绝静默覆盖 | 89.7% |
+| `internal/pointtable` | 点表 CSV：列别名、地址表达式、按协议推导宽度、合并动作 | 列名大小写/空格/下划线不敏感；未知列报错；行错误带行号列名并聚合；重复 ID 是错误、重复地址是警告；`length` 先于地址解析；`#selector` 只允许 MQTT；SNMP 只允许 OID；远动用 `WidthNone`（不表达长度、布尔量无位号，`length` 列与 `ioa:1.3` 在导入期拒绝）；默认拒绝静默覆盖 | 90.7% |
 | `internal/codec/mc` | 三菱 MC 3E 纯函数编解码（帧头/设备码表/位打包/结束码/24 位设备号） | 无 I/O、无时钟、无可变状态；起始设备号 3 字节小端；位软元件按位打包（首点 bit0）；`Lookup`/`ByCode` 大小写不敏感；结束代码表 `0xC052/53/54/56`→地址错 | 86.5% |
 | `internal/driver/mc` | MC 3E 主站驱动（字/位读写、字软元件 bool 的 RMW、字序归一化、结束码分类） | 只做 3E 二进制帧 + TCP；字软元件 bool 必须显式 `address.bit`，驱动读整字→改位→写整字不清零邻位；字序归一化后按 `byteOrder` 解码默认 CDAB；结束码映射质量码 | 56.9% |
 | `internal/sim/mc` | MC 3E 内置从站（内存字/位表、按区读写、越界/未知设备结束码） | 一问一答；未配置编号读返回 0、写落表；越界返回 0xC054；设备码反查 | 89.8% |
@@ -946,9 +1004,13 @@ obs  ← 所有包（不依赖任何内部包）
 | `internal/codec/bacnet` | BACnet/IP 纯函数编解码（BVLC/NPDU/APDU、application 与 context 标签、对象属性请求与应答、Error/Reject/Abort、对象类型与属性名表） | 无 I/O、无时钟、无可变状态；BVLC 长度只算 NPDU+APDU；Forwarded-NPDU 跳过 4 字节转发信息；application 与 context 的 LVT 含义分开实现；BOOLEAN 的 LVT 直接承载值；数值用最短字节数；编号解析只接受纯十进制（`-1` 不会被吃掉减号） | 90.8% |
 | `internal/driver/bacnet` | BACnet/IP 主站（对象属性读写、UDP invoke ID 配对、按对象语义选写标签、错误类映射） | 只做 ReadProperty/WriteProperty；UDP 用 connected socket，整条会话串行化；按 invoke 丢弃迟到应答；超时重发 2 次、断链不重试；写 `present-value` 的标签由对象语义决定；读数值宽松、bool/string 严格 | 87.3% |
 | `internal/sim/bacnet` | BACnet/IP 内置从站（对象表、属性读写、数组下标、写权限、类型收敛） | 与主站共用 codec/bacnet；AI 的 present-value 只读、AV 可写；数组下标越界与「对标量带下标」都回 invalid-array-index；写入按目标属性类型收敛，不收的类型回 invalid-data-type；垃圾报文静默丢弃 | 85.2% |
-| `internal/codec/iec104` | IEC 60870-5-104 纯函数编解码（APCI 三种帧型、ASDU 头与信息对象、元素宽度表、归一化/标度化/短浮点、CP56Time2a、品质位、命令构造、类型/原因名表） | 无 I/O、无时钟、无可变状态；长度字段只算控制域+ASDU；U 帧功能码低两位必须 `11`；I 帧无 ASDU 直接判错；`ParseFrame` 只解析已切好的整帧，不做流式重组；SIQ/DIQ 品质位整体左移 3 位、QDS 低 5 位，两者不混用；CP56Time2a 逐位掩保留位 | 91.2% |
-| `internal/driver/iec104` | IEC 60870-5-104 主站（STARTDT/STOPDT/TESTFR、站总召唤、电能量召唤、最新值表、五种命令、否定确认分类、旁路表） | 只做平衡式 TCP；`Read` 不产生网络交互；质量只来自 ASDU 品质位与链路活性，不按「多久没更新」降级；召唤超时不拆链、EndOfInit 重新召唤并 1 秒去重；命令类型由 `area` 声明；双点 0/3 本地即拒；写成功先填缓存并标 uncertain，但只补「没有」或「比命令更旧（`sentAt`）」的条目（避免覆盖紧跟确认的突发上送）；否定确认 44/45→protocol、46/47→address、其它→permission；旁路表 4096 条上限 | 93.6% |
+| `internal/codec/iec60870` | IEC 60870-5 **共享应用层**（ASDU 头与信息对象、元素宽度表、归一化/标度化/短浮点、CP56Time2a、品质位、`Profile{OrgSize,CASize,IOASize}`、`HasIOA`、请求构造；点位语义：对象类别、`PlanPoint`、值转换、命令构造、类型/原因名表） | 无 I/O、无时钟、无可变状态；剖面不合法在编码前拒绝（超宽地址不静默截断）；总召唤/电能量召唤/时钟同步/初始化结束四类**没有 IOA**，编码解码共用 `HasIOA` 判断并拒绝带地址与多对象；SIQ/DIQ 品质位整体左移 3 位、QDS 低 5 位，两者不混用；CP56Time2a 逐位掩保留位；8 种剖面组合回环 + 四类无地址报文黄金字节 | 73.9% |
+| `internal/codec/iec104` | IEC 60870-5-104 纯函数编解码（APCI 三种帧型、15 位收发序号、k/w 流控）+ 对共享应用层的别名转发 | 无 I/O、无时钟、无可变状态；长度字段只算控制域+ASDU；U 帧功能码低两位必须 `11`；I 帧无 ASDU 直接判错；`ParseFrame` 只解析已切好的整帧，不做流式重组；本包不重复实现 ASDU，转发到 `codec/iec60870`，既有调用点零改动 | 88.2% |
+| `internal/driver/iec104` | IEC 60870-5-104 主站（STARTDT/STOPDT/TESTFR、站总召唤、电能量召唤、按点位 ID 的最新值表、五种命令、否定确认分类、旁路表） | 只做平衡式 TCP；`Read` 不产生网络交互；质量只来自 ASDU 品质位与链路活性，不按「多久没更新」降级；召唤超时不拆链、EndOfInit 重新召唤并 1 秒去重；命令类型由 `area` 声明；双点 0/3 本地即拒；缓存按点位 ID（同一 IOA 的遥信与遥控互不覆盖）；写成功先填缓存并标 uncertain，但只补「没有」或「比命令更旧（`sentAt`）」的条目（避免覆盖紧跟确认的突发上送）；否定确认 44/45→protocol、46/47→address、其它→permission；旁路表 4096 条上限 | 92.0% |
 | `internal/sim/iec104` | IEC 60870-5-104 内置从站（对象表、STARTDT 门控、站总召唤快照、电能量召唤、命令三段式、突发上送） | 与主站共用 codec/iec104；STARTDT 之前不发数据；站召唤跳过纯命令对象；SQ=1 分组不跨类型；累计量只走电能量召唤且每秒自增；只读对象回否定确认「未知 IOA」；乱序 I 帧立即断链；`Close` 幂等 | 95.7% |
+| `internal/codec/iec101` | IEC 60870-5-101 纯函数帧层（FT1.2 固定帧/可变帧/单字节帧、控制域 FCB/FCV/ACD/DFC、校验和、`ParseAt`/`FrameLen`、流式收帧 `Reader`） | 无 I/O；长度字段只计「控制域+链路地址+ASDU」（整帧 = `L+6`）；校验和从控制域累加到 ASDU 末字节；链路地址宽度 0..2 字节且必须来自配置（不从报文猜）；噪声逐字节跳过而不是整段丢弃；单字节帧保留原始字节（`E5`/`A2` 不混同）；黄金字节钉住四种帧 | 73.0% |
+| `internal/driver/iec101` | IEC 60870-5-101 非平衡轮询主站（复位链路、第 1/2 级轮询、站总召唤 + 电能量召唤、FCB 原帧重传、命令两段确认、串口/透传双承载、旁路表） | `Read` **真的走总线**（与 104 的纯缓存不同）；总召唤不放在 `Open`（几百点在 9600 上要几秒，会和「连接超时」混淆）；每轮无条件请求第 1 级，连续取数上限 32 条/轮（公平性）；终止只认类型 100/101 的激活终止与 70，激活确认不当结束；重传复用同一帧字节（FCB 不变），依赖从站去重避免命令重复执行；写等到应用层激活确认才成功，44..47 分类返回；缓存按点位 ID，写后只补「没有或更旧」的条目；半双工纪律：先 `Drain` 再设截止时间，总线锁覆盖整段事务 | 72.7% |
+| `internal/sim/iec101` | IEC 60870-5-101 内置从站（FT1.2 over TCP 透传、FCB 去重、ACD、两级队列、召唤快照与终止、命令两段确认、可配置剖面） | 从站不主动开口；重复帧只确认不重执行；`ACD` 只表示「还有数据」；站召唤排除纯命令对象与累计量，电能量召唤用类型 101 终止；`SetValue` 保留 `Command`/`Writable` 身份位（改值不会让遥控号变成监视点）；默认对象 IOA 是四位数，小地址剖面必须 `WithNoDefaults` 自己 `Add` | 82.9% |
 | `internal/codec/dnp3` | DNP3（IEEE 1815）纯函数编解码（CRC-16/DNP、链路帧、流式收帧、传输分片重组、应用层请求/响应、对象解析、请求头、CROB 与组 41 构造） | 无 I/O、无时钟、无可变状态；CRC 按 16 字节分块且块尾插校验；链路帧 LEN 只算用户数据；双点静态量变体 1 是 2 位/点；变体 2 是每点一个「状态+品质」字节、无独立位图；计数器/模拟量是每对象 `flags+值` 交错，不是 flags 块 + 值块；带时标事件只接受索引前缀逐点编码；未知组/变体直接报错不猜布局 | 70.4% |
 | `internal/driver/dnp3` | DNP3 主站（复位链路 + TEST_LINK、类 0/1/2/3 轮询、未请求响应、应用层确认、CROB 与组 41 直接控制、旁路表） | 只做 TCP 主站；`Read` 只查本地表不产生网络交互；总召唤默认 5m、事件轮询默认 1s 且必须 < 总召唤；`masterAddress` 与 `unitId` 必须不同且 1..65519；带 CON 的响应与未请求响应立即回确认；质量只看低 6 位（状态位必须先屏蔽）；双点 0/3 → false + uncertain；写操作检查从站回显状态，非零 status 按 protocol 错误上报；不做 SBO、安全认证、文件传输、时间同步写路径、串口 | 75.1% |
 | `internal/sim/dnp3` | DNP3 内置从站（链路 ACK、类 0 静态快照、类 1/2/3 事件队列与 inflight、CROB 与组 41 直接控制回显） | 与主站共用 codec/dnp3；链路复位/探活/TEST_LINK 都回 ACK；确认用户数据先回链路 ACK 再处理应用报文；事件响应置 CON 且未确认前留在 inflight 重发；一次 READ 可同时请求类 0/1/2/3；未配置的点按 flags=0（离线）编码而不是 good；未知输出索引回 CROB not-supported；静态编码 → 主站解析有往返自洽测试 | 22.7% |
@@ -989,7 +1051,7 @@ obs  ← 所有包（不依赖任何内部包）
 | `internal/mqtt` | MQTT 3.1.1 客户端（北向发布 + 南向订阅共用，纯 Go 零依赖） | 单 goroutine 读 socket；QoS1 必须等到 PUBACK；`Ping` 必须等到 PINGRESP（写成功不算活着）；断线立即失败而非超时；`Epoch` 暴露连接代数，供订阅方区分「新会话的第一条消息」 | 70.3% |
 | `internal/mqtt/mqtttest` | 测试封装：`internal/sim/mqtt` 的 `*testing.T` 生命周期 + 等待断言 | 不另写 Broker（两份实现必然长歪）；开关一律走 setup 函数而非直接赋字段 | — |
 | `internal/runtime` | 唯一编排层 + 后端实现 + 看门狗 + 审计埋点 + 窗口缓存 | 启动/关闭顺序（失败逆序收口）；`configuredState` 与 `runtimeState` 分离；协议/传输匹配在装配期校验；只向驱动与报警引擎注入只读 `cache.Get` 与窗口数据源；北向 OPC UA 启停与热重建；凭据表热替换后旧用户立即失效；MQTT 北向以 `northboundSink` 接口隔离 json 与 sparkplug-b | 81.1% |
-| `cmd/uic` | 单入口：run / sim / mbread / mcread / finsread / enipread / bacread / iec104read / dnp3read / coapread / uaread / dlt645read / cjt188read / snmpread / adsread / s7blocks / s7upload / instantiate / import / token / check / version | 关闭预算 10 秒；`uaread`、`mbread`、`mcread`、`finsread`、`enipread`、`bacread`、`iec104read`、`dnp3read`、`coapread`、`dlt645read`、`cjt188read`、`snmpread`、`adsread` 是不装第三方客户端即可自证链路的自检工具；块服务放在 CLI 而不是北向 API（动作重、数据大、归操作系统账号管）；模板实例化与点表导入只产出文件，不在运行期动态生成设备 | — |
+| `cmd/uic` | 单入口：run / sim / mbread / mcread / finsread / enipread / bacread / iec104read / iec101read / dnp3read / coapread / uaread / dlt645read / cjt188read / snmpread / adsread / s7blocks / s7upload / instantiate / import / token / check / version | 关闭预算 10 秒；`uaread`、`mbread`、`mcread`、`finsread`、`enipread`、`bacread`、`iec104read`、`iec101read`、`dnp3read`、`coapread`、`dlt645read`、`cjt188read`、`snmpread`、`adsread` 是不装第三方客户端即可自证链路的自检工具；块服务放在 CLI 而不是北向 API（动作重、数据大、归操作系统账号管）；模板实例化与点表导入只产出文件，不在运行期动态生成设备 | — |
 
 覆盖率一列是 `go test -cover ./<包>/` 的语句覆盖率（只统计包内测试，不做跨包交叉覆盖），
 随测试增删会有 1% 级的漂移；要看当前值请按 §9.2 的命令重跑。
@@ -1110,7 +1172,8 @@ OPC UA 服务端（同一份点位表的另一个出口）：
 | EtherNet/IP + CIP 主站 + 内置从站 | ✅ | `internal/codec/enip` + `internal/driver/enip` + `internal/sim/enip` + `uic enipread` + `examples/enip.json`；只做 CIP 显式报文 + TCP 44818 + 符号标签（隐式 I/O、对象/属性寻址、结构体展开配置期即拒）；三层封装（24 字节封装头 / CPF / CIP）、封装长度只算负载、CPF 奇数条目对齐、发送方上下文严格校验；CIP 无事务号，整条会话串行化；地址字段按 CIP 重解释（标签名/元素 offset/按类型解释的 length/位号）；数值线上小端，整元素反转后走统一解码；类型以设备应答为准；STRING 为「4 字节长度 + 容量」；bytes 两阶段读；多服务合包（450 字节拆批、单次 400 字节上限）且设备不支持时自动退回；位写 RMW 只回写目标元素；状态码统一分类，封装 0x64 判可重试；三层测试含真实 TCP 回环与错误路径脚本流 |
 | BACnet/IP 主站 + 内置从站 | ✅ | `internal/codec/bacnet` + `internal/driver/bacnet` + `internal/sim/bacnet` + `uic bacread` + `examples/bacnet.json`；只做 ReadProperty（0x0C）/ WriteProperty（0x0F）（不做 Who-Is/I-Am、COV、批量读、分段）；四层封装（BVLC/NPDU/APDU/标签），BVLC 长度只算 NPDU+APDU，Forwarded-NPDU 跳过 4 字节转发头；application 与 context 的 LVT 含义分开实现（context 6/7 是 opening/closing），BOOLEAN 的 LVT 直接承载值；点位用 `kind=object` 寻址（对象类型/实例/属性/数组下标，都支持名字或编号）；写 `present-value` 的标签由对象语义决定（REAL/ENUMERATED/UNSIGNED/CHARACTER STRING）；UDP 用 connected socket、8 位 invoke ID 配对、整条会话串行化、迟到应答丢弃、超时重发 2 次；错误类 1/2→address、40/27→permission、3→disconnected（可重试）、4→permission；三层测试含真实 UDP 回环 |
 | BACnet/IP 的边界 | ⚠️ | 不做广播发现、COV 订阅、ReadPropertyMultiple、分段传输、对象浏览；优先级数组可读但不暴露写优先级（避免「写了一直不生效、其实是更高优先级压住」）；实例号必须写在配置里，不能靠发现补齐 |
-| IEC 60870-5-104 主站 + 内置从站 | ✅ | `internal/codec/iec104` + `internal/driver/iec104` + `internal/sim/iec104` + `uic iec104read` + `examples/iec104.json`；只做平衡式 TCP + STARTDT/STOPDT/TESTFR + 站总召唤 + 电能量召唤 + 单点/双点/设定值命令（不做 101 串口、文件传输、时钟同步写路径、冗余通道、带时标命令、组召唤）；APCI 长度只算控制域+ASDU、U 帧功能码低两位必须 `11`、I 帧空载荷判错；`Read` 只查本地最新值表不产生网络交互；质量只来自 ASDU 品质位与 TESTFR 活性（**不做按时间降级**——104 只在变化时上送）；`Open` 只等 STARTDT、召唤超时不拆链、电能量召唤无条件发送、EndOfInit 触发重新召唤并去重；命令类型由 `area` 声明，双点只接受 1/2（0/3 本地即拒），写成功先填缓存标 uncertain；旁路表 `Observed` 让 CLI 不依赖点表就能列出「设备送什么」；三层测试含真实 TCP 回环与注入式假链路 |
+| IEC 60870-5-104 主站 + 内置从站 | ✅ | `internal/codec/iec104` + `internal/driver/iec104` + `internal/sim/iec104` + `uic iec104read` + `examples/iec104.json`；只做平衡式 TCP + STARTDT/STOPDT/TESTFR + 站总召唤 + 电能量召唤 + 单点/双点/设定值命令（不做文件传输、时钟同步写路径、冗余通道、带时标命令、组召唤；非平衡轮询是独立的 101 驱动）；APCI 长度只算控制域+ASDU、U 帧功能码低两位必须 `11`、I 帧空载荷判错；ASDU 层由 `codec/iec60870` 共享，本包只保留 APCI 与别名转发；`Read` 只查本地最新值表不产生网络交互；质量只来自 ASDU 品质位与 TESTFR 活性（**不做按时间降级**——104 只在变化时上送）；`Open` 只等 STARTDT、召唤超时不拆链、电能量召唤无条件发送、EndOfInit 触发重新召唤并去重；命令类型由 `area` 声明，双点只接受 1/2（0/3 本地即拒），写成功先填缓存标 uncertain；缓存按点位 ID（同一 IOA 的遥信与遥控互不覆盖）；旁路表 `Observed` 让 CLI 不依赖点表就能列出「设备送什么」；三层测试含真实 TCP 回环与注入式假链路 |
+| IEC 60870-5-101 主站 + 内置从站 | ✅ | `internal/codec/iec101`（FT1.2 帧）+ `internal/codec/iec60870`（共享应用层）+ `internal/driver/iec101` + `internal/sim/iec101` + `uic iec101read` + `examples/iec101.json`；只做非平衡式主站 + 串口/串口服务器双承载（不做平衡式、FT1.1、文件传输、时钟同步写路径、带时标命令、选择-执行、分组召唤）；`Read` 真实轮询：每轮请求第 1 级、按周期站总召唤 + 电能量召唤、可选第 2 级；长度只计「控制域+链路地址+ASDU」、校验和从控制域起、单字节帧无地址无控制域；剖面 ORG/CA/IOA 宽度全部走设备标签，非法组合配置期拒绝；总召唤不放在 `Open`，终止只认激活终止与初始化结束（激活确认不算结束）；重传复用同一帧字节避免命令重复执行；写入等应用层激活确认，44..47 按 protocol/address 分类；缓存按点位 ID；点表层用 `WidthNone`（远动地址不表达宽度，布尔量不需要位号，`length` 与位号在导入期拒绝）；内置从站覆盖 FCB 去重、ACD、两级队列、召唤快照与终止类型、命令两段确认 |
 | DNP3（IEEE 1815）主站 + 内置从站 | ✅ | `internal/codec/dnp3` + `internal/driver/dnp3` + `internal/sim/dnp3` + `uic dnp3read` + `examples/dnp3.json`；只做 TCP 主站 + 类 0/1/2/3 + CROB + 组 41 直接控制（不做串口、安全认证、文件传输、时间同步写路径、SBO 两段式）；三层各自的确认都必须处理——链路 ACK、传输分片、应用层 CON；带 CON 响应与未请求响应立即回确认，否则从站事件缓冲区会被重发撑爆；`Read` 只查本地最新值表；质量只看低 6 位，二进制 bit7 / 双点 bit6-7 是状态不是品质；双点 0/3 → false + uncertain；写操作检查从站回显状态；静态编码 → 解析有往返自洽测试，双点 2 位/点与「变体 2 无独立位图」两个易错点各钉了一个用例 |
 | CoAP 主站 + 内置服务端 | ✅ | `internal/codec/coap` + `internal/codec/textval` + `internal/driver/coap` + `internal/sim/coap` + `uic coapread` + `examples/coap.json`；只做明文 UDP 主站 + GET/PUT/POST + Block2 分块接收 + `/.well-known/core` 资源发现（不做 DTLS、Observe 订阅、Block1 分块发送、CBOR）；点位 `kind=symbol`，`path` 是资源、`selector` 取 JSON 字段、`length` 限接收字节；读取严格按响应 `Content-Format` 解码，不猜；Block2 首请求默认不带选项、由服务端决定块大小，`4.02` 时退回一次；`ackTimeout` 指数翻倍且不越过设备级 timeout，空 ACK 后只等分离响应，分离响应的 CON 回空 ACK，无关 CON 回 RST；PUT 是替换整个资源，JSON 带 selector 只发子树、数组下标写入拒绝；写成功标 good；不做响应缓存与隐藏读-改-写 |
 | CoAP 的边界 | ⚠️ | 不做 DTLS、Observe 订阅、Block1 分块发送、DELETE/FETCH/iPATCH、CBOR/SenML、组播发现；`Subscribe` 诚实声明 unsupported——一次性 GET 不伪装成推送；CoAP 没有批量读，一轮采集耗时约等于「点位数 × 单次事务」，同路径多点位也不合并；JSON 写入只支持「替换整个资源或字段子树」，不做读-改-写，数组元素写入直接拒绝 |
@@ -1118,7 +1181,7 @@ OPC UA 服务端（同一份点位表的另一个出口）：
 | DL/T 645 的边界 | ⚠️ | 不做 97 版、广播校时/广播冻结、厂商扩展的主动上报、合并读（一次一 DI）、位寻址（状态字按 uint16 整体读）、DI 自动发现、表地址扫描；`MultiRead` 诚实声明 unsupported——一轮采集耗时等于「点数 × 单次事务」，300 点挂 2400bps 总线要几十秒，这个代价必须让配点表的人看见 |
 | CJ/T 188-2004 主站 + 内置从站 | ✅ | `internal/codec/cjt188` + `internal/driver/cjt188` + `internal/sim/cjt188` + `uic cjt188read` + `examples/cjt188.json`；`serial`（共享串口层总线锁）与 `tcp`（串口服务器/DTU 透传，每连接互斥）双承载；单 `68`、数据域无 `0x33`、7 字节 BCD 地址；一个 DI 一组字段，按 `labels.type`（10 水/20 热/30 气/40 其他）分派 schema，同一 DI 多字段复用一次事务；单位显式字节统一到规范单位、未知代号报错；阀门（`allow-control`）与表地址（`allow-write` + 完整 14 位）两个写入口，写地址后驱动自动切换；不提供广播与缩位地址；三层测试含真实 TCP 回环 |
 | CJ/T 188 的边界 | ⚠️ | 只做 2004 版（2018 版配置期显式拒绝）；只收录 901F 与 D120..D12B，价格/金额/密钥/机电同步等未收录 DI 直接报错；不做位寻址、DI 自动发现、跨 DI 合并读、表地址扫描；`MultiRead` 诚实声明 unsupported——一轮采集耗时约等于「DI 数 × 单次事务」，这个代价必须让配点表的人看见 |
-| 共享串口层 | ✅ | `internal/transport/serialport`：`Acquire` 按路径引用计数复用、同路径不同参数显式报错（不静默复用）、`Ref.Lock` 总线级互斥覆盖「排空 → 发送 → 收完帧」、`Drain` 必须早于 `SetDeadline`（反序会让每次写都 i/o timeout）；`modbus-rtu` / `modbus-ascii` / `dlt645` / `cjt188` 共用 |
+| 共享串口层 | ✅ | `internal/transport/serialport`：`Acquire` 按路径引用计数复用、同路径不同参数显式报错（不静默复用）、`Ref.Lock` 总线级互斥覆盖「排空 → 发送 → 收完帧」、`Drain` 必须早于 `SetDeadline`（反序会让每次写都 i/o timeout）；`modbus-rtu` / `modbus-ascii` / `dlt645` / `cjt188` / `iec101` 共用 |
 | IEC 104 的边界 | ⚠️ | 不做非平衡式（101 串口）、文件传输、驱动侧时钟同步、冗余通道切换、带时标命令、组召唤；没有「列举 IOA」这种协议动作，点表发现只能靠驱动旁路表（被动观察），设备不发就永远看不到；`Subscribe` 声明 supported 但对外仍是 `Read` 拉取契约 |
 | DNP3 的边界 | ⚠️ | 不做串口、Secure Authentication、文件传输（组 70）、时间同步写路径、SBO 两段式控制、事件缓冲区重配（组 50 写）、类 0 单组召唤、主动触发非请求响应；没有「列举点索引」这种协议动作，点表发现同样只能靠旁路表（被动观察）；总召唤与事件轮询都是整类扫描，点位数的增加不会增加单次事务数，但会增加响应体积 |
 | Modbus TCP 从站 | ✅ | `slaves[]` 存在即启用；四区（holding/input/coil/discrete）映射；跨映射与半值读；写穿透到 `Runtime.Write`；坏质量保留最后值并计入 `uic_slave_degraded_reads_total`；映射变化按指纹重建监听；`uic mbread` 可自检 |

@@ -379,3 +379,157 @@ func TestParseSecsObjectAddress(t *testing.T) {
 		t.Fatal("非数字编号必须失败")
 	}
 }
+
+// 远动协议（IEC 60870-5-101/104）用「对象类别 + 信息对象地址」寻址，与
+// 寄存器协议最容易混淆：形状一样（`area:offset`），语义完全不同。
+//
+// 这一组测试钉住四件事，它们各自对应一个现场会踩到的坑：
+//
+//  1. 地址里**不表达宽度**（`WidthNone`）。值有多宽由 ASDU 类型标识决定，
+//     写 `:2` 不表达「读两个寄存器」，只会让驱动在 Open 阶段拒掉整条点位。
+//  2. **布尔点不需要位号**。0-based 寄存器里 bool 必须写 `.3`，远动里一个
+//     布尔量就是一个单点对象——按寄存器习惯校验会让一份完全正确的远动点表
+//     在导入期全数被拒。
+//  3. `area` 是**对象类别白名单**：`ioa` 是监视方向，另外五个是控制方向。
+//     把 Modbus 的 `holding` 写进来必须明确拒绝，而不是当成未知区域静默
+//     接受、等到启动后每个周期返回 address_error。
+//  4. 101 与 104 共用同一套地址形态：两者只是承载层不同（串口 / TCP），
+//     点表没有任何理由不同。
+func TestPolicyForIEC60870(t *testing.T) {
+	for _, proto := range []string{"iec101", "iec104"} {
+		p := PolicyFor(proto)
+		if p.Width != WidthNone {
+			t.Fatalf("%s: width = %v, want WidthNone", proto, p.Width)
+		}
+		if !p.AllowRegister || p.AllowSymbol || p.AllowObject || p.AllowFile || p.AllowComputed || p.AllowSelector {
+			t.Fatalf("%s: policy accepts non-register kinds: %+v", proto, p)
+		}
+		if p.DIBits != 0 || p.DIField || p.AllowSymbolLength || p.SymbolIndexInPath {
+			t.Fatalf("%s: policy carries unrelated fields: %+v", proto, p)
+		}
+		// 六个对象类别一个不能少：少了任何一个，对应的点位在导入期就被拒。
+		for _, area := range []string{"ioa", "single-command", "double-command",
+			"setpoint-float", "setpoint-scaled", "setpoint-normalized"} {
+			if !p.RegisterAreas[area] {
+				t.Fatalf("%s: area %q is missing from the whitelist", proto, area)
+			}
+		}
+		if p.RegisterAreas["holding"] || p.RegisterAreas["coil"] || p.RegisterAreas["db"] {
+			t.Fatalf("%s: register-protocol areas leaked into the whitelist: %v", proto, p.RegisterAreas)
+		}
+	}
+}
+
+// 正向用例：六种对象类别、四种平台类型、两个承载，都应当解析成
+// `area:offset` 且 length 恒为 0。
+func TestParseAddressIEC60870(t *testing.T) {
+	cases := []struct {
+		name string
+		expr string
+		dt   model.DataType
+		want string
+	}{
+		{"float measurement", "ioa:1001", model.TypeFloat32, "ioa:1001:0"},
+		{"scaled measurement", "ioa:1003", model.TypeInt16, "ioa:1003:0"},
+		{"counter", "ioa:3001", model.TypeUint32, "ioa:3001:0"},
+		// 布尔量在远动里是单点对象：**不带位号**也必须被接受。
+		{"single point", "ioa:2001", model.TypeBool, "ioa:2001:0"},
+		{"single command", "single-command:4001", model.TypeBool, "single-command:4001:0"},
+		{"double command", "double-command:2003", model.TypeUint16, "double-command:2003:0"},
+		{"float setpoint", "setpoint-float:4002", model.TypeFloat32, "setpoint-float:4002:0"},
+		{"scaled setpoint", "setpoint-scaled:4003", model.TypeInt16, "setpoint-scaled:4003:0"},
+		{"normalized setpoint", "setpoint-normalized:4004", model.TypeFloat32, "setpoint-normalized:4004:0"},
+		// area 大小写不敏感：点表是人手写的，`IOA` 与 `ioa` 必须等价。
+		{"uppercase area", "IOA:1001", model.TypeFloat32, "ioa:1001:0"},
+		// 大 IOA（3 字节剖面能到 16777215）不能被 16 位宽度截断。
+		{"3-byte IOA", "ioa:16777215", model.TypeFloat32, "ioa:16777215:0"},
+	}
+	for _, proto := range []string{"iec101", "iec104"} {
+		for _, tc := range cases {
+			t.Run(proto+"/"+tc.name, func(t *testing.T) {
+				a, err := ParseAddress(tc.expr, tc.dt, proto)
+				if err != nil {
+					t.Fatalf("parse: %v", err)
+				}
+				if got := a.Canonical(); got != tc.want {
+					t.Fatalf("canonical = %q, want %q", got, tc.want)
+				}
+				if a.Kind != model.AddressRegister {
+					t.Fatalf("kind = %q, want register", a.Kind)
+				}
+				if a.Length != 0 {
+					t.Fatalf("length = %d, want 0 (width comes from the ASDU type)", a.Length)
+				}
+				if a.Bit != -1 {
+					t.Fatalf("bit = %d, want -1", a.Bit)
+				}
+			})
+		}
+	}
+}
+
+// 反向用例：每一条都必须给出**能指路的**错误，而不是让点表带着错进运行期。
+func TestParseAddressIEC60870Rejects(t *testing.T) {
+	cases := []struct {
+		name string
+		expr string
+		dt   model.DataType
+		hint int
+		want string
+	}{
+		// 寄存器协议的区名与远动无关：写进来一定是抄错了列。
+		{"modbus area", "holding:0", model.TypeUint16, 0, "not valid for protocol"},
+		{"coil area", "coil:5", model.TypeBool, 0, "not valid for protocol"},
+		{"s7 area", "db1:0", model.TypeUint16, 0, "not valid for protocol"},
+		// 地址里没有长度这个概念，两种写法（地址内 / length 列）都要拒。
+		{"length in address", "ioa:1001:2", model.TypeFloat32, 0, "length is not expressed"},
+		{"length column", "ioa:1001", model.TypeFloat32, 2, "length is not expressed"},
+		// 布尔量没有位号：按寄存器习惯写 `.3` 是误配。
+		{"bit on measured", "ioa:1001.3", model.TypeFloat32, 0, "only valid for bool"},
+		{"bit on bool", "ioa:2001.3", model.TypeBool, 0, "bit addressing is not used"},
+		// 寄存器协议最常见的两种错法：符号地址与对象地址。
+		{"symbol", "Plant.Temp", model.TypeFloat32, 0, "does not accept symbol"},
+		{"object", "analog_input:1.present_value", model.TypeFloat32, 0, "does not accept object"},
+		// 负偏移与非数字偏移。
+		{"negative offset", "ioa:-1", model.TypeFloat32, 0, "not a non-negative integer"},
+		{"non numeric offset", "ioa:x", model.TypeFloat32, 0, "not a non-negative integer"},
+		{"empty offset", "ioa:", model.TypeFloat32, 0, "misses offset"},
+	}
+	for _, proto := range []string{"iec101", "iec104"} {
+		for _, tc := range cases {
+			t.Run(proto+"/"+tc.name, func(t *testing.T) {
+				_, err := ParseAddressWithLength(tc.expr, tc.dt, proto, tc.hint)
+				if err == nil {
+					t.Fatal("must fail")
+				}
+				if !strings.Contains(err.Error(), tc.want) {
+					t.Fatalf("error = %v, want substring %q", err, tc.want)
+				}
+			})
+		}
+	}
+}
+
+// 反向的跨协议检查：远动协议的地址不能被寄存器协议接受。这条防的是
+// 「点表整段贴错协议」——那种错法在导入期放过，现场表现是每个点地址错。
+func TestOtherProtocolsRejectIECAreas(t *testing.T) {
+	for _, proto := range []string{"modbus-tcp", "s7", "dlt645"} {
+		if _, err := ParseAddress("ioa:1001", model.TypeFloat32, proto); err == nil {
+			t.Fatalf("%s must reject an IEC object-category area", proto)
+		}
+	}
+}
+
+// 点表层只做静态校验，不替协议判断 IOA 的合法范围：0 与「超过当前剖面
+// 上限」都放行，由驱动在 Open 阶段按剖面给出准确报错（那里知道设备配了
+// 几个字节的 IOA）。这一条写下来是为了防止有人后来「顺手」在点表层加上
+// `offset >= 1` 的校验——那会让 Profile 的差异无法被测到。
+func TestParseAddressIECLeavesRangeToDriver(t *testing.T) {
+	a, err := ParseAddress("ioa:0", model.TypeFloat32, "iec101")
+	if err != nil {
+		t.Fatalf("offset 0 must parse (the driver rejects it with a clearer message): %v", err)
+	}
+	if a.Offset != 0 || a.Length != 0 {
+		t.Fatalf("address = %+v", a)
+	}
+}

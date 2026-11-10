@@ -1,0 +1,234 @@
+{
+  "schemaVersion": 1,
+  "site": "iec101-lab",
+  "server": {
+    "listen": "127.0.0.1:8092",
+    "token": "dev-token-0123456789"
+  },
+  "storage": {
+    "dir": "./data-iec101",
+    "journal": true,
+    "outboxMaxRecords": 5000,
+    "outboxTtl": "10m"
+  },
+  "logging": {
+    "level": "info"
+  },
+  "northbound": {
+    "webhook": {
+      "enabled": false,
+      "url": "http://127.0.0.1:9999/ingest",
+      "timeout": "3s"
+    }
+  },
+  "channels": [
+    {
+      "id": "ch-iec101",
+      "protocol": "iec101",
+      "transport": {
+        "kind": "tcp",
+        "address": "127.0.0.1:4001"
+      },
+      "concurrency": 1,
+      "timeout": "5s"
+    }
+  ],
+  "devices": [
+    {
+      "id": "rtu01",
+      "name": "内置串行远动从站（FT1.2 over TCP 4001，链路地址 1 / CA 1）",
+      "channel": "ch-iec101",
+      "unitId": 1,
+      "interval": "1s",
+      "timeout": "5s",
+      "enabled": true,
+      "labels": {
+        "linkAddress": "1",
+        "linkAddressSize": "1",
+        "commonAddress": "1",
+        "commonAddressSize": "1",
+        "ioaSize": "2",
+        "orgSize": "0",
+        "interrogate": "5m",
+        "class2": "true"
+      },
+      "points": [
+        {
+          "id": "temp",
+          "name": "短浮点测量值（IOA 1001）",
+          "address": {
+            "kind": "register",
+            "area": "ioa",
+            "offset": 1001,
+            "bit": -1
+          },
+          "dataType": "float32",
+          "unit": "degC",
+          "enabled": true
+        },
+        {
+          "id": "flow",
+          "name": "短浮点测量值（IOA 1002）",
+          "address": {
+            "kind": "register",
+            "area": "ioa",
+            "offset": 1002,
+            "bit": -1
+          },
+          "dataType": "float32",
+          "unit": "m3/h",
+          "enabled": true
+        },
+        {
+          "id": "scaled",
+          "name": "标度化测量值（IOA 1003，int16）",
+          "address": {
+            "kind": "register",
+            "area": "ioa",
+            "offset": 1003,
+            "bit": -1
+          },
+          "dataType": "int16",
+          "enabled": true
+        },
+        {
+          "id": "subst",
+          "name": "被取代值 SB（IOA 1004，质量应为 uncertain）",
+          "address": {
+            "kind": "register",
+            "area": "ioa",
+            "offset": 1004,
+            "bit": -1
+          },
+          "dataType": "float32",
+          "enabled": true
+        },
+        {
+          "id": "ts",
+          "name": "带时标测量值（IOA 1005）",
+          "address": {
+            "kind": "register",
+            "area": "ioa",
+            "offset": 1005,
+            "bit": -1
+          },
+          "dataType": "float32",
+          "enabled": true
+        },
+        {
+          "id": "run",
+          "name": "单点遥信 on（IOA 2001）",
+          "address": {
+            "kind": "register",
+            "area": "ioa",
+            "offset": 2001,
+            "bit": -1
+          },
+          "dataType": "bool",
+          "enabled": true
+        },
+        {
+          "id": "stopped",
+          "name": "单点遥信 off（IOA 2002）",
+          "address": {
+            "kind": "register",
+            "area": "ioa",
+            "offset": 2002,
+            "bit": -1
+          },
+          "dataType": "bool",
+          "enabled": true
+        },
+        {
+          "id": "breaker",
+          "name": "双点遥信（IOA 2003，合=2）",
+          "address": {
+            "kind": "register",
+            "area": "ioa",
+            "offset": 2003,
+            "bit": -1
+          },
+          "dataType": "bool",
+          "enabled": true
+        },
+        {
+          "id": "breaker-cmd",
+          "name": "双点遥控（同一 IOA 2003，控制方向）",
+          "address": {
+            "kind": "register",
+            "area": "double-command",
+            "offset": 2003,
+            "bit": -1
+          },
+          "dataType": "uint16",
+          "writable": true,
+          "enabled": true
+        },
+        {
+          "id": "breaker2",
+          "name": "双点遥信 分（IOA 2004）",
+          "address": {
+            "kind": "register",
+            "area": "ioa",
+            "offset": 2004,
+            "bit": -1
+          },
+          "dataType": "bool",
+          "enabled": true
+        },
+        {
+          "id": "counter",
+          "name": "累计量（IOA 3001，每秒自增；需电能量召唤才有值）",
+          "address": {
+            "kind": "register",
+            "area": "ioa",
+            "offset": 3001,
+            "bit": -1
+          },
+          "dataType": "uint32",
+          "unit": "kWh",
+          "enabled": true
+        },
+        {
+          "id": "cmd",
+          "name": "单点命令（IOA 4001，只存在于控制方向）",
+          "address": {
+            "kind": "register",
+            "area": "single-command",
+            "offset": 4001,
+            "bit": -1
+          },
+          "dataType": "bool",
+          "writable": true,
+          "enabled": true
+        },
+        {
+          "id": "sp",
+          "name": "短浮点设定值命令（IOA 4002）",
+          "address": {
+            "kind": "register",
+            "area": "setpoint-float",
+            "offset": 4002,
+            "bit": -1
+          },
+          "dataType": "float32",
+          "writable": true,
+          "enabled": true
+        },
+        {
+          "id": "sps",
+          "name": "标度化设定值命令（IOA 4003，int16）",
+          "address": {
+            "kind": "register",
+            "area": "setpoint-scaled",
+            "offset": 4003,
+            "bit": -1
+          },
+          "dataType": "int16",
+          "writable": true,
+          "enabled": true
+        }
+      ]
+    }
+  ]
+}

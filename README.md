@@ -388,6 +388,81 @@ IEC 104 与其它协议的根本差别是**数据由从站推上来**：建链�
 传送原因、时标），初次接陌生设备时先看清「它送什么」再写点表。双点的 0/3 中间态
 原样显示成「不确定 (3)」，不硬转成布尔。
 
+IEC 60870-5-101 串行远动主站（FT1.2，串口 / 串口服务器）：
+
+```bash
+./uic sim -protocol iec101 -listen 127.0.0.1:4001 &   # 内置 101 从站（FT1.2 over TCP 透传）
+./uic -config examples/iec101.json
+curl -s -H 'Authorization: Bearer dev-token-0123456789' localhost:8092/api/v1/points
+#   14 点：短浮点 42.5/7.25、标度化 1234、被取代值（uncertain）、带时标值、
+#         单点 on/off、双点 1/2、累计量每秒自增（需电能量召唤）、
+#         单点命令 + 短浮点/标度化设定值 + 双点遥控（可写）
+#   自检（不需要网关）：./uic iec101read -addr 127.0.0.1:4001
+#   只验链路层：./uic iec101read -transport serial -port /dev/ttyUSB0 -baud 9600 -probe
+#   下发命令：./uic iec101read -addr 127.0.0.1:4001 -area double-command -cmd-ioa 2003 -write on
+```
+
+101 与 104 只在**应用层**相同：类型标识、传送原因、品质位、时标、命令格式是同一套，
+本仓库把这一层抽成共享的 `internal/codec/iec60870`，两个驱动共用。承载层则是另一套
+物理事实，六条差异决定了驱动的形状：
+
+| 事实 | 104 | 101 |
+|---|---|---|
+| 谁可以发言 | 双方都可以（序号 + k/w 流控） | **只有主站**；从站被点名才回答 |
+| 数据怎么来 | 从站按变化主动上送 | 主站轮询第 1/2 级；不轮询就永远没有新值 |
+| 可靠性 | 15 位收发序号 | 帧计数位 FCB + 链路确认 + 应用层激活确认 |
+| 建链 | TCP + STARTDT | 复位链路（固定帧 `FC=0`），没有会话 |
+| 地址宽度 | 固定 ORG 1 / CA 2 / IOA 3 | 每一项都是工程参数，按装置手册配 |
+| 帧边界 | APCI 长度字段 | 起始符 + 长度字段 + 校验和 + 结束符 |
+
+所以 101 的 `Read` **真的去走线**：每轮请求第 1 级事件、按周期做站总召唤、再顺带
+请求第 2 级，而不是像 104 那样只查本地表。总召唤**不放在 `Open`**：一台几百个点的
+装置在 9600 的总线上传完整站快照要好几秒，塞进 `Open` 会让「连接超时」与「装置没
+数据」两件事混在一起。**电能量召唤必须单独做一次**——累计量不在站召唤范围内，只发站
+召唤的实现现场表现为「电度点位永远没有值」。终止报文的形态有三种（`100`/`101` 的激活
+终止、`70` 初始化结束），但 `100` 的**激活确认不能当结束**，否则总召唤只回来一个点。
+
+FT1.2 有三个必须按字节记住的点：**长度字段只计「控制域 + 链路地址 + ASDU」**（整帧 =
+`L + 6`，按含头写会多算 6 字节）；**校验和从控制域累加到 ASDU 末字节**；**单字节帧没有
+地址也没有控制域**（`E5` 肯定确认、`A2` 否定确认，把 `A2` 当 `E5` 的症状是「设备拒绝
+了但主站报成功」）。链路地址宽度是 0..2 字节，`0` 表示不带地址，此时固定帧只有 4 字节。
+
+重传必须**原样重发同一帧字节**（含 FCB），而不是重新组帧：重新组帧会把 FCB 翻转成
+另一条新命令，从站再执行一次，症状是「确认超时后开关被拉合了两次」。本实现的
+`sendUser` 保存整帧字节，超时后用同一份重发一次；内置从站按「最近一次被接受的 FCB」
+去重，重复帧只回确认、不再执行。复位链路是唯一的「帧序号归零」手段，因此 `Open`
+第一件事就是复位链路。
+
+写入有**两层确认**：链路层 `E5` 只说明报文到了，应用层激活确认（`cause=7`）才说明
+装置收到并要执行。把第一层当成功是这类驱动最常见的一处谎报——装置完全可能因为
+「未知 IOA」「不允许遥控」而拒绝。本实现等到应用层确认才返回，`44..47`（未知类型/
+原因/公共地址/IOA）按错误分类返回。写成功后用请求值回填本地缓存（质量 `uncertain`），
+只补「没有」或「比命令更旧」的条目，避免抹掉一条更新的上送。
+
+地址形态用 `kind=register`，`offset` 即 IOA，`area` 取 `ioa` / `single-command` /
+`double-command` / `setpoint-float` / `setpoint-scaled` / `setpoint-normalized`。
+点表层用 `WidthNone`：远动协议的值宽度由类型标识决定，地址里写 `length` 反而是误配。
+**同一个 IOA 可以同时挂遥信与遥控**（`ioa:2003` 布尔状态 + `double-command:2003`
+可写命令），两套语义、两种平台类型，所以缓存按**点位 ID** 而不是 IOA——按 IOA 存会让
+后写入的一方覆盖另一方，症状是「布尔遥信显示成 double 的 2」。这条修正同时改到了 104。
+
+剖面全部走设备标签，默认取「一台装置一个公共地址、站内点数不超过 65535」：链路地址
+1（1 字节）、CA 1（`unitId`）、IOA 2 字节、ORG 0 字节；可用 `linkAddress` /
+`linkAddressSize` / `commonAddress` / `commonAddressSize` / `ioaSize` / `orgSize` /
+`interrogate` / `class2` 覆盖。把某一组当成标准写死，是接不同厂家设备时最先撞上的墙：
+帧能收发、校验也对，只是所有字段整体错位一到三个字节。
+
+`iec101read` 与 `iec104read` 一样不依赖点表：先复位链路（证明物理层与链路层通），再
+请求链路状态，然后做一轮完整采集，最后按 IOA 列出装置实际送过的对象。串口远动的失败
+模式几乎全是「没有应答」，所以它把「卡在哪一层」直接打出来：帧计数、解析失败帧数、
+公共地址不符帧数、每轮新增/更新数。
+
+点表侧写 `ioa:1001`（`kind=register`，`offset` 即 IOA），**不写 `length`、布尔量也不写
+位号**：远动协议的值宽度由 ASDU 类型标识决定，一个布尔量就是一个单点对象。这与
+Modbus/S7 的习惯正好相反（那里 `float32` 要 2 个寄存器、`bool` 必须给 `.3`），所以点
+表层用独立的 `WidthNone` 模式而不是复用寄存器那套推导——`ioa:1001:2` 与 `ioa:2001.3`
+都会在 `uic import` 阶段就被拒绝，而不是等到网关起来后每个周期返回 `address_error`。
+
 DNP3（IEEE 1815）调度主站（TCP 20000）：
 
 ```bash
@@ -649,7 +724,7 @@ go test -race -count=1 ./...
 
 | 路径 | 内容 |
 |---|---|
-| `cmd/uic/` | 单入口：`run` / `sim`（Modbus / S7 / OPC UA / MQTT / MC / FINS / EtherNet-IP / BACnet-IP / IEC 104 / DNP3 / CoAP / 645 / 188 / SNMP / ADS / SECS）/ `mbread` / `mcread` / `finsread` / `enipread` / `bacread` / `iec104read` / `dnp3read` / `coapread` / `dlt645read` / `cjt188read` / `snmpread` / `adsread` / `secsread` / `uaread` / `s7blocks` / `s7upload` / `instantiate` / `import` / `token` / `-check` / `version` |
+| `cmd/uic/` | 单入口：`run` / `sim`（Modbus / S7 / OPC UA / MQTT / MC / FINS / EtherNet-IP / BACnet-IP / IEC 104 / IEC 101 / DNP3 / CoAP / 645 / 188 / SNMP / ADS / SECS）/ `mbread` / `mcread` / `finsread` / `enipread` / `bacread` / `iec104read` / `iec101read` / `dnp3read` / `coapread` / `dlt645read` / `cjt188read` / `snmpread` / `adsread` / `secsread` / `uaread` / `s7blocks` / `s7upload` / `instantiate` / `import` / `token` / `-check` / `version` |
 | `internal/model` | 通道 / 设备 / 点位 / 地址 / 采样 / 质量码 |
 | `internal/driver` | 驱动契约（Codec / Transport / Driver）、错误分类、注册表、只读 `Lookup` 注入 |
 | `internal/calc` | 零依赖表达式引擎（编译期类型检查、短路求值、引用 `device:point`） |
@@ -665,9 +740,13 @@ go test -race -count=1 ./...
 | `internal/codec/bacnet` | BACnet/IP 纯函数编解码（BVLC / NPDU / APDU / 标签 / 对象属性名表 / Read-WriteProperty） |
 | `internal/driver/bacnet` | BACnet/IP 主站（对象属性读写、UDP invoke ID 配对、按对象语义选写标签、错误类映射） |
 | `internal/sim/bacnet` | BACnet/IP 内置从站（对象表 / 属性读写 / 数组下标 / 写权限 / 类型收敛） |
-| `internal/codec/iec104` | IEC 60870-5-104 纯函数编解码（APCI 三种帧型 / ASDU / 元素宽度 / CP56Time2a / 品质位 / 命令构造 / 类型与原因名表） |
-| `internal/driver/iec104` | IEC 104 主站（STARTDT 建链、站总召唤、电能量召唤、最新值表、五种命令、否定确认分类、旁路表） |
+| `internal/codec/iec60870` | IEC 60870-5 共享应用层（ASDU 头与元素 / 剖面 `Profile` / `HasIOA` / CP56Time2a / 品质位 / 请求构造 / 点位语义：对象类别、值转换、命令构造 / 类型与原因名表） |
+| `internal/codec/iec104` | IEC 60870-5-104 纯函数编解码（APCI 三种帧型、序号与 k/w）+ 对共享应用层的别名转发 |
+| `internal/driver/iec104` | IEC 104 主站（STARTDT 建链、站总召唤、电能量召唤、按点位 ID 的最新值表、五种命令、否定确认分类、旁路表） |
 | `internal/sim/iec104` | IEC 104 内置从站（对象表 / STARTDT 门控 / 召唤快照 / 命令三段式 / 突发上送） |
+| `internal/codec/iec101` | IEC 60870-5-101 纯函数帧层（FT1.2 固定帧 / 可变帧 / 单字节帧、控制域 FCB/FCV/ACD/DFC、校验和、流式收帧 `Reader`） |
+| `internal/driver/iec101` | IEC 101 非平衡轮询主站（复位链路、第 1/2 级轮询、站总召唤 + 电能量召唤、FCB 原帧重传、命令两段确认、双承载、旁路表） |
+| `internal/sim/iec101` | IEC 101 内置从站（FT1.2 over TCP 透传、FCB 去重、ACD、两级队列、召唤快照与终止、命令两段确认） |
 | `internal/codec/dnp3` | DNP3 纯函数编解码（链路帧与 CRC / 流式收帧 / 传输分片重组 / 应用层请求响应 / 对象解析 / 请求头 / CROB 与组 41 构造） |
 | `internal/driver/dnp3` | DNP3 主站（复位链路 + TEST_LINK、类 0/1/2/3 轮询、未请求响应、应用层确认、CROB 与模拟量直接控制、旁路表） |
 | `internal/sim/dnp3` | DNP3 内置从站（链路 ACK / 类 0 静态快照 / 三类事件队列与 inflight / CROB 与组 41 直接控制回显） |

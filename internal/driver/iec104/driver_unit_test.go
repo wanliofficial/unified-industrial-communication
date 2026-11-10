@@ -106,7 +106,7 @@ func newTestConn(t *testing.T, w *wireLink, dev model.Device) *conn {
 		testIdle: time.Hour,
 		points:   plans,
 		byIOA:    byIOA,
-		values:   map[uint32]cachedValue{},
+		values:   map[string]cachedValue{},
 		done:     make(chan struct{}),
 		ackCh:    make(chan struct{}, 1),
 		started:  make(chan struct{}),
@@ -554,7 +554,7 @@ func TestDispatchStoresValues(t *testing.T) {
 	})
 	c.dispatch(raw)
 	c.mu.Lock()
-	v, ok := c.values[1001]
+	v, ok := c.values["f"]
 	c.mu.Unlock()
 	if !ok || v.value.Num != 3.5 {
 		t.Fatalf("value = %+v/%v", v, ok)
@@ -567,7 +567,7 @@ func TestDispatchStoresValues(t *testing.T) {
 	})
 	c.dispatch(raw)
 	c.mu.Lock()
-	v = c.values[1001]
+	v = c.values["f"]
 	c.mu.Unlock()
 	if v.value.Num == 99 {
 		t.Fatal("frame for another common address must be ignored")
@@ -580,10 +580,10 @@ func TestDispatchStoresValues(t *testing.T) {
 	})
 	c.dispatch(raw)
 	c.mu.Lock()
-	_, ok = c.values[7777]
+	n := len(c.values)
 	c.mu.Unlock()
-	if ok {
-		t.Fatal("unconfigured IOA must not be cached")
+	if n != 1 {
+		t.Fatalf("cache has %d entries, want 1 (unconfigured IOA must not be cached)", n)
 	}
 }
 
@@ -593,7 +593,7 @@ func TestDispatchKeepsOldValueOnTypeMismatch(t *testing.T) {
 	w := newWireLink()
 	c := newTestConn(t, w, dev)
 	c.mu.Lock()
-	c.values[1001] = cachedValue{value: model.NumValue(model.TypeFloat32, 1), q: model.QualityGood}
+	c.values["f"] = cachedValue{value: model.NumValue(model.TypeFloat32, 1), q: model.QualityGood}
 	c.mu.Unlock()
 
 	raw, _ := iec104.BuildASDU(iec104.ASDU{
@@ -602,7 +602,7 @@ func TestDispatchKeepsOldValueOnTypeMismatch(t *testing.T) {
 	})
 	c.dispatch(raw)
 	c.mu.Lock()
-	v := c.values[1001]
+	v := c.values["f"]
 	c.mu.Unlock()
 	// 单点 → 数值是允许的转换（true=1），所以这里应当更新成 1。
 	if v.value.Num != 1 {
@@ -618,7 +618,7 @@ func TestDispatchKeepsOldValueOnTypeMismatch(t *testing.T) {
 	})
 	c2.dispatch(raw)
 	c2.mu.Lock()
-	_, ok := c2.values[1002]
+	_, ok := c2.values["b"]
 	c2.mu.Unlock()
 	if ok {
 		t.Fatal("mismatched type must not be cached")
@@ -734,7 +734,7 @@ func TestDispatchIgnoresUnknownDataFrame(t *testing.T) {
 	})
 	c.dispatch(raw)
 	c.mu.Lock()
-	_, cached := c.values[1]
+	_, cached := c.values["f"]
 	c.mu.Unlock()
 	if cached {
 		t.Fatal("clock sync must not produce a value")
@@ -1110,7 +1110,7 @@ func TestWriteUpdatesCacheBeforeReadBack(t *testing.T) {
 		t.Fatalf("res = %+v err = %v", res, err)
 	}
 	c.mu.Lock()
-	cv, ok := c.values[4002]
+	cv, ok := c.values["sp"]
 	c.mu.Unlock()
 	if !ok || cv.value.Num != 12.5 || cv.q != model.QualityUncertain {
 		t.Fatalf("cache = %+v/%v", cv, ok)
@@ -1150,7 +1150,7 @@ func TestWriteNegativeDoesNotUpdateCache(t *testing.T) {
 		t.Fatalf("res = %+v err = %v", res, err)
 	}
 	c.mu.Lock()
-	_, cached := c.values[4001]
+	_, cached := c.values["c"]
 	c.mu.Unlock()
 	if cached {
 		t.Fatal("failed write must not populate the cache")
@@ -1180,7 +1180,7 @@ func TestReadInvalidQuality(t *testing.T) {
 	dev := testDevice(pt("f", AreaIOA, 1001, model.TypeFloat32, false))
 	c := newTestConn(t, newWireLink(), dev)
 	c.mu.Lock()
-	c.values[1001] = cachedValue{value: model.NumValue(model.TypeFloat32, 1), q: model.QualityBad}
+	c.values["f"] = cachedValue{value: model.NumValue(model.TypeFloat32, 1), q: model.QualityBad}
 	c.mu.Unlock()
 	out, err := c.Read(context.Background(), []driver.ReadSpan{{
 		Points: []driver.PointRef{{ID: "f"}},
@@ -1474,7 +1474,7 @@ func TestWriteDoesNotOverwriteNewerSpontaneousValue(t *testing.T) {
 		}
 		// 模拟「确认之前就已经收到的突发上送」：带 good 质量的新值。
 		c.mu.Lock()
-		c.values[4002] = cachedValue{
+		c.values["sp"] = cachedValue{
 			value: model.NumValue(model.TypeFloat32, 20), q: model.QualityGood,
 			at: time.Now(),
 		}
@@ -1497,7 +1497,7 @@ func TestWriteDoesNotOverwriteNewerSpontaneousValue(t *testing.T) {
 		t.Fatalf("res = %+v err = %v", res, err)
 	}
 	c.mu.Lock()
-	cv := c.values[4002]
+	cv := c.values["sp"]
 	c.mu.Unlock()
 	if cv.value.Num != 20 {
 		t.Fatalf("cache value = %v, want the spontaneous 20 (write must not clobber newer upstream)", cv.value.Num)

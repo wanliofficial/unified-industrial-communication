@@ -715,7 +715,7 @@ func TestOutOfOrderIFrameFailsLink(t *testing.T) {
 			1001: {{ref: driver.PointRef{ID: "t", DataType: model.TypeFloat32},
 				ioa: 1001, area: AreaIOA, dataType: model.TypeFloat32}},
 		},
-		values:   map[uint32]cachedValue{},
+		values:   map[string]cachedValue{},
 		done:     make(chan struct{}),
 		ackCh:    make(chan struct{}, 1),
 		started:  make(chan struct{}),
@@ -753,7 +753,7 @@ func TestGarbageByteFailsLink(t *testing.T) {
 	c := &conn{
 		link: f, deviceID: "x", ca: 1, timeout: 100 * time.Millisecond,
 		points: map[string]*pointPlan{}, byIOA: map[uint32][]*pointPlan{},
-		values: map[uint32]cachedValue{}, done: make(chan struct{}),
+		values: map[string]cachedValue{}, done: make(chan struct{}),
 		ackCh: make(chan struct{}, 1), started: make(chan struct{}),
 		pending: map[uint32]chan iec104.ASDU{}, testIdle: time.Hour,
 	}
@@ -778,7 +778,7 @@ func TestSendFrameWrites(t *testing.T) {
 	f := newFakeLink()
 	c := &conn{link: f, timeout: 100 * time.Millisecond, done: make(chan struct{}),
 		ackCh: make(chan struct{}, 1), pending: map[uint32]chan iec104.ASDU{},
-		values: map[uint32]cachedValue{}, byIOA: map[uint32][]*pointPlan{},
+		values: map[string]cachedValue{}, byIOA: map[uint32][]*pointPlan{},
 		points: map[string]*pointPlan{}}
 	if err := c.sendU(iec104.UStartAct); err != nil {
 		t.Fatal(err)

@@ -1,4 +1,4 @@
-package iec104
+package iec60870
 
 import (
 	"fmt"
