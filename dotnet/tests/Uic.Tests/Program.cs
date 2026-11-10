@@ -29,6 +29,7 @@ EngineTests.Register(tests);
 ScheduleTests.Register(tests);
 PlannerTests.Register(tests);
 OutboxTests.Register(tests);
+FaultTests.Register(tests);
 ConfigStoreTests.Register(tests);
 HistoryTests.Register(tests);
 JsonTests.Register(tests);

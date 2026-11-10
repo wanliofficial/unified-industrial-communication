@@ -61,9 +61,12 @@ public sealed class SampleFanout : IDisposable
             {
                 _outbox.Enqueue(target, payload);
             }
-            catch (IOException)
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
             {
-                // 磁盘满或权限错误：丢一条并计数，比让采集停下更合理。
+                // 磁盘满（IOException/ENOSPC）与数据目录不可写（UnauthorizedAccessException）
+                // 是同一类现场故障：丢这一条并计数，比让采集停下更合理。
+                // 注意 UnauthorizedAccessException 不继承 IOException——只捕获后者会让
+                // 权限错误一路静默丢掉所有样本，监控上却一条错误都没有。
                 _metrics.Counter("uic_outbox_enqueue_errors_total",
                     1, new Dictionary<string, string> { ["sink"] = target });
             }

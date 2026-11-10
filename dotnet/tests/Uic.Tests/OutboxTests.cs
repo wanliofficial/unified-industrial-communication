@@ -21,6 +21,7 @@ internal static class OutboxTests
         tests.Add(new TestCase("outbox/drops_expired_records", DropsExpiredRecords));
         tests.Add(new TestCase("outbox/tolerates_a_torn_last_line", ToleratesTornLastLine));
         tests.Add(new TestCase("outbox/stats_report_pending_and_delivered", StatsReportPendingAndDelivered));
+        tests.Add(new TestCase("outbox/disk_full_keeps_records_pending", DiskFullKeepsRecordsPending));
     }
 
     /// <summary>可编程的投递目标：按脚本成功或失败，并记录每次拿到的批次。</summary>
@@ -248,6 +249,63 @@ internal static class OutboxTests
             // Delivered 是累计量，Pending 是瞬时量：监控面板两个都要。
             t.Equal(1L, queue.Stats().Delivered, "delivered counter");
             t.Equal(0L, queue.Stats().Pending, "pending counter");
+        });
+    }
+
+    /// <summary>
+    /// 磁盘满：写入失败必须「位点不动、数据还在」，磁盘恢复后补投不丢不重。
+    ///
+    /// 注入方式是真的：把 journal 的目标文件软链到 <c>/dev/full</c>，内核在写入时返回
+    /// ENOSPC。不用假 sink 模拟异常，是因为这里要验证的正是「真实 IOException 的形状」——
+    /// <see cref="Uic.Runtime.SampleFanout"/> 只捕获 IOException，其余类型会漏出去。
+    ///
+    /// 顺带钉住退出路径：关机预算 10 秒里刷盘失败不能抛，否则后面的清理全被顶掉。
+    /// </summary>
+    private static Task DiskFullKeepsRecordsPending(TestContext t)
+    {
+        return RunAsync(t, async () =>
+        {
+            // 没有 /dev/full 的环境（macOS、Windows、精简容器）跳过而不是假装通过。
+            if (!OperatingSystem.IsLinux() || !File.Exists("/dev/full"))
+                throw new SkipException("/dev/full is not available on this platform");
+
+            var dir = t.TempDir;
+            var journal = Path.Combine(dir, "journal.ndjson");
+            File.CreateSymbolicLink(journal, "/dev/full");
+
+            await using var queue = new OutboxQueue(dir, FastOptions());
+            var broken = new JournalSink(dir);
+            queue.RegisterSink(broken);
+
+            queue.Enqueue("journal", "j1");
+            queue.Enqueue("journal", "j2");
+
+            var ex = await t.ThrowsAsync<IOException>(
+                () => queue.FlushAsync(t.Ct),
+                "ENOSPC must surface as an IOException, that is what the caller catches");
+            t.Contains(ex.Message, "No space left", "the message names the real cause");
+
+            // 整批失败 → 位点不推进。这里若变成 1 条或 0 条，就是静默丢数据。
+            t.Equal(2L, queue.Stats().Pending, "both records stay pending after ENOSPC");
+            t.Equal(0L, queue.Stats().Delivered, "nothing is counted as delivered");
+
+            // 退出路径：刷不出去的缓冲区只能在关闭时丢弃，不能抛。
+            await broken.DisposeAsync();
+            queue.RemoveSink("journal");
+
+            // 磁盘恢复：换成真文件后重新挂 sink，积压要原样补投。
+            File.Delete(journal);
+            var healthy = new JournalSink(dir);
+            queue.RegisterSink(healthy);
+
+            await queue.FlushAsync(t.Ct);
+
+            t.Equal(0L, queue.Stats().Pending, "the backlog drains once the disk is back");
+            t.Equal(2L, queue.Stats().Delivered, "both records were delivered, none lost twice");
+            var lines = File.ReadAllLines(journal);
+            t.Equal(2, lines.Length, "the journal has exactly the two records");
+            t.Equal("j1", lines[0], "order is preserved");
+            t.Equal("j2", lines[1], "order is preserved");
         });
     }
 

@@ -16,20 +16,20 @@ dotnet run --project tests/Uic.Tests -- --stop-on-fail      # 首个失败即停
 正常输出：
 
 ```
-294 passed, 0 failed, 3 skipped · 112.6s
+299 passed, 0 failed, 3 skipped · 108.8s
 ```
 
 加 `--opcua` 跑全量（含 3 条 OPC UA 端到端）：
 
 ```
-297 passed, 0 failed, 0 skipped · 136.5s
+302 passed, 0 failed, 0 skipped · 173.6s
 ```
 
 耗时随机器负载波动较大：219 条时在同一台机器上空载量到 65.5 s，233 条在同时跑着
 发布/容器时量到 114.2 s；239 条时空载量到 112.7 s，而机器有 20+ 后台负载时量到 1471 s；
 269 条时空载量到 106.4 s；280 条时空载量到 92.0 s（加 `--opcua` 的 283 条是 112.5 s）；
-同一份代码连跑四次落在 88.7–110.0 s 之间。294/297 条量到 112.6 s / 136.5 s
-（当时 `load average` 8–9，不是空载基线）。
+同一份代码连跑四次落在 88.7–110.0 s 之间。299/302 条量到 108.8 s / 173.6 s
+（当时 `load average` 8–13，不是空载基线）。
 NFR 的门槛是 120 s，压测用例、PBKDF2 派生与 TLS 握手是主要开销——**这个门槛只在空载机器上有意义**，
 比对数字前先看 `uptime`。TLS 用例全部用进程内生成的自签证书跑真实握手，不依赖系统信任库，也不联网。
 
@@ -60,7 +60,8 @@ NFR 的门槛是 120 s，压测用例、PBKDF2 派生与 TLS 握手是主要开�
 | `cache/*` | 5 | 序号单调、只在变化时通知、按点位死区判定、移除设备、订阅者故障隔离 |
 | `planner/*` | 8 | 窗口合并、切分上限、区分离、非寄存器寻址 |
 | `history/*` | 9 | journal 历史：时间/身份过滤、每桶降采样、重放去重、缺失文件、坏行跳过、跨读取缓冲区行、跨缓冲区胜出行回读、转义名回退、非法日历日期跳过 |
-| `outbox/*` | 8 | 位点推进、重启重放、批次、分区隔离、三重上限、半行容错 |
+| `outbox/*` | 9 | 位点推进、重启重放、批次、分区隔离、三重上限、半行容错、**磁盘满（`/dev/full` 注入 ENOSPC）时不推进位点且恢复后补投** |
+| `fault/*` | 4 | 环境级故障注入：**进程假死**（驱动卡在不可取消的 Task 上，看门狗报停滞并做 5 分钟去重）、**时钟跳变**不误判停滞、**时钟跳变**不清空 Outbox 积压（TTL 按单调时长）、数据目录不可写时样本被计数丢弃而不是静默消失 |
 | `config/*` | 18 | 内容寻址、回滚、启动优先级、非法文档、diff、旧配置迁移、复合时长、死区/量程规则、数组维度规则（类型/125 寄存器上限）、仓库示例可校验、25 类非法配置逐条定位、脱敏占位符还原、控制台草稿拼装出的配置能被真的解析器接受、四类寻址各自必填/禁止字段与混填拒绝 |
 | `json/*` | 11 | 时长、枚举、值形状、数组值形状、`count` 往返、UTC、往返稳定、前向兼容 |
 | `logs/*` | 7 | JSON 行字段、轮转不丢行、归档裁剪、默认关闭、热更新开关、非法配置拒绝、环形缓冲顺序与过滤 |
@@ -79,6 +80,30 @@ NFR 的门槛是 120 s，压测用例、PBKDF2 派生与 TLS 握手是主要开�
 | `audit/*` | 7 | 审计落盘：按动作/结果/身份查询、重启后序号单调且旧记录可查、按大小轮转与保留只删旧文件、禁用时不写盘、断电半行跳过、按文件名日期跳过无关归档、分页最新在前 |
 | `auth/*` | 9 | 本地账号：PBKDF2 加盐且文件无明文、首次启动只建一次 admin、改密清除强制标记并删初始口令文件、会话 12 小时过期、5 次失败/分钟锁定与按 IP 隔离、角色权限矩阵、停用账号立即失效、最后一个管理员不可停用/降级、口令策略 |
 | `opcua/*` | 14 | 北向服务端：标准 OPC UA 客户端浏览/读/写/订阅（`--opcua`）；南向客户端：NodeId 解析与拒绝形态、StatusCode→质量表、Variant 标量/数组/形状与范围校验、写入编码、时标、端点/策略/PKI 参数推导、端点精确匹配不降级（11 条纯函数），以及客户端↔内置服务端回环：批量读（坏地址单独失败）、写与回读、越界拒绝、订阅推送、要求 Basic256Sha256 而服务端只有 None 时显式失败（2 条 `--opcua`） |
+
+## 故障注入矩阵 12 类
+
+前 9 类靠协议级用例覆盖（真实回环、真实 broker、真实伪终端，或虚拟驱动的故障模式）；
+后 3 类是环境级故障，各自有一个**真实**注入点，而不是用一个假实现把断言凑出来。
+
+| # | 故障 | 注入方式 | 用例 |
+|---|---|---|---|
+| 1 | 连接拒绝 | 指向未监听的端口 | `loopback/*`、`s7/silent_plc_times_out` |
+| 2 | 连接中断 | 回环中主动断链 | `loopback/*`、`mqtt/driver_resubscribes_after_broker_drop` |
+| 3 | 读超时 | 从站沉默 | `loopback/probe_times_out`、`loopback/silent_slave_times_out` |
+| 4 | 半包 | 响应分片到达 | `loopback/fragmented_response_is_reassembled` |
+| 5 | 错 CRC | 篡改校验和 | `codec/framing_rejects_corruption` |
+| 6 | 异常码 | 从站返回 01/02/03/04/06/11 | `codec/exception_codes_map_to_kinds` |
+| 7 | 部分响应 | 少于请求的寄存器数 | `codec/decode_rejects_inconsistent_frames` |
+| 8 | 慢响应 | 延迟应答 | `engine/deadline_is_retried_as_timeout`、`s7/silent_plc_times_out` |
+| 9 | Broker 断线 | 测试内 broker 主动断开 | `mqtt/driver_resubscribes_after_broker_drop` |
+| 10 | 磁盘满 | 目标文件软链到 `/dev/full`，内核写时返回 ENOSPC | `outbox/disk_full_keeps_records_pending` |
+| 11 | 时钟跳变 | 注入可拨的 `TimeProvider`，墙钟与单调时钟分开推进 | `fault/clock_jump_does_not_fake_a_stall`、`fault/outbox_ttl_ignores_a_clock_jump` |
+| 12 | 进程假死 | 驱动卡在一个不响应取消的 `Task` 上，actor 真的不再产出样本 | `fault/collection_stall_is_reported` |
+
+两条与平台相关的跳过写在这里，免得看到 `skip` 时以为用例坏了：
+第 10 类需要 `/dev/full`（非 Linux 没有），`fault/outbox_permission_error_is_counted`
+需要 POSIX 文件权限（Windows 上跳过）。**跳过不计入通过数**。
 
 ## 规范用例 T1–T18 的对应关系
 

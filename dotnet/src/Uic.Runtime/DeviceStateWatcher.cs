@@ -21,7 +21,18 @@ public sealed class DeviceStateWatcher : IAsyncDisposable
     private readonly ILogger _log;
     private readonly MetricsRegistry _metrics;
     private readonly Dictionary<string, string> _lastState = new(StringComparer.Ordinal);
-    private readonly Dictionary<string, DateTimeOffset> _staleWarned = new(StringComparer.Ordinal);
+
+    /// <summary>每台设备最近一次被判为停滞的单调时刻（去重用，不用墙钟）。</summary>
+    private readonly Dictionary<string, long> _staleWarned = new(StringComparer.Ordinal);
+
+    /// <summary>
+    /// 每台设备「第一次看到当前这个最新样本」的单调时刻。
+    ///
+    /// 停滞必须是**观察出来的**，不能只凭墙钟算：NTP 校时把钟往前跳一小时，
+    /// 墙钟意义上的年龄会立刻超过阈值，而设备其实一直在采集。
+    /// </summary>
+    private readonly Dictionary<string, (DateTimeOffset Newest, long SeenAt)> _firstSeen = new(StringComparer.Ordinal);
+
     private readonly CancellationTokenSource _cts = new();
     private Task? _loop;
     private int _disposed;
@@ -42,6 +53,12 @@ public sealed class DeviceStateWatcher : IAsyncDisposable
 
     /// <summary>连续多久没有新样本判定为采集停滞。取 10 个周期与 30 秒的较大值。</summary>
     public TimeSpan MinimumStaleAge { get; init; } = TimeSpan.FromSeconds(30);
+
+    /// <summary>
+    /// 时间来源。默认系统时钟；用例注入可拨的时钟，把「校时跳变」与「设备真的不动」
+    /// 分开验证——这两件事在墙钟上看起来一模一样，只看墙钟就分不开。
+    /// </summary>
+    public TimeProvider Time { get; init; } = TimeProvider.System;
 
     public void Start()
     {
@@ -71,10 +88,15 @@ public sealed class DeviceStateWatcher : IAsyncDisposable
         }
     }
 
-    private async Task TickAsync(CancellationToken ct)
+    /// <summary>
+    /// 跑一轮观测。公开是为了让用例能确定性地推一轮，而不是等 <see cref="Period"/>；
+    /// 生产路径只由 <see cref="LoopAsync"/> 调用。
+    /// </summary>
+    public async Task TickAsync(CancellationToken ct)
     {
         var sink = _mqtt();
-        var now = DateTimeOffset.UtcNow;
+        var wallNow = Time.GetUtcNow();
+        var monoNow = Time.GetTimestamp();
 
         foreach (var actor in _engine.Actors)
         {
@@ -104,14 +126,18 @@ public sealed class DeviceStateWatcher : IAsyncDisposable
                 }
             }
 
-            if (actor.State == RuntimeState.Collecting) CheckStale(actor, now);
+            if (actor.State == RuntimeState.Collecting) CheckStale(actor, wallNow, monoNow);
         }
     }
 
-    private void CheckStale(DeviceActor actor, DateTimeOffset now)
+    private void CheckStale(DeviceActor actor, DateTimeOffset wallNow, long monoNow)
     {
         var samples = _engine.Cache.ForDevice(actor.DeviceId);
-        if (samples.Count == 0) return;
+        if (samples.Count == 0)
+        {
+            _firstSeen.Remove(actor.DeviceId);
+            return;
+        }
 
         var newest = samples.Max(s => s.CollectedAt);
 
@@ -121,18 +147,31 @@ public sealed class DeviceStateWatcher : IAsyncDisposable
             MinimumStaleAge.TotalMilliseconds,
             actor.SlowestInterval.TotalMilliseconds * 10));
 
-        if (now - newest <= threshold) return;
+        if (!_firstSeen.TryGetValue(actor.DeviceId, out var seen) || seen.Newest != newest)
+        {
+            // 新样本到了：重置观察起点。首次观测也从这里进，所以刚启动的进程
+            // 不会拿「重启前的历史」判停滞——那段时间我们没有观察过。
+            seen = (newest, monoNow);
+            _firstSeen[actor.DeviceId] = seen;
+        }
+
+        var wallAge = wallNow - newest;
+        var monoAge = Time.GetElapsedTime(seen.SeenAt, monoNow);
+
+        // 两个时钟都要越过阈值才算停滞：墙钟说「很久没动」可能是刚被校时跳过去，
+        // 单调时钟说「很久没动」才是真的没有新样本。
+        if (wallAge <= threshold || monoAge <= threshold) return;
 
         if (_staleWarned.TryGetValue(actor.DeviceId, out var last) &&
-            now - last < TimeSpan.FromMinutes(5)) return;
+            Time.GetElapsedTime(last, monoNow) < TimeSpan.FromMinutes(5)) return;
 
-        _staleWarned[actor.DeviceId] = now;
+        _staleWarned[actor.DeviceId] = monoNow;
         _metrics.Counter("uic_watchdog_stale_total", 1, new Dictionary<string, string>
         {
             ["device"] = actor.DeviceId,
         });
         _log.LogWarning("device {Device} reports collecting but newest sample is {Age}s old",
-            actor.DeviceId, (int)(now - newest).TotalSeconds);
+            actor.DeviceId, (int)wallAge.TotalSeconds);
     }
 
     public async ValueTask DisposeAsync()

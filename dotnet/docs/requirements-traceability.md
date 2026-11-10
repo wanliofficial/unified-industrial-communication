@@ -8,11 +8,12 @@
 
 首版的目标范围是 PRD §6.1 的 Wave 1 子集：**Modbus 三封装 + S7 主站 + OPC UA 客户端 + MQTT 南向订阅 + 虚拟设备 + 四北向通道 + 配置治理 + Outbox + 可观测**。
 PRD 中 M 级的采集协议已全部落地，FR-CFG-01 的四类寻址模型也已按验收口径闭环
-（object/file 只差驱动，见该行备注）。剩余延期项只有三类依赖环境的故障注入，
-逐条见 §7 与 [protocol-status.md](protocol-status.md)。
+（object/file 只差驱动，见该行备注）。非 M 级验收里的 12 类故障注入同样全部有了
+可自动跑的用例（见 §7），唯一剩下的延期项是 object/file 寻址的实际驱动，
+见 [protocol-status.md](protocol-status.md) §4.1。
 
-当前测试基线：**294 passed / 0 failed / 3 skipped**（跳过的是需要 `--opcua` 的 OPC UA 端到端用例）；
-加 `-- --opcua` 跑全量是 **297 passed / 0 failed / 0 skipped**。
+当前测试基线：**299 passed / 0 failed / 3 skipped**（跳过的是需要 `--opcua` 的 OPC UA 端到端用例）；
+加 `-- --opcua` 跑全量是 **302 passed / 0 failed / 0 skipped**。
 
 ## 1. 采集（FR-COL）
 
@@ -137,7 +138,7 @@ PRD 中 M 级的采集协议已全部落地，FR-CFG-01 的四类寻址模型也
 | 采集假死检测 ≤ 60 s | — | 已实现 | `DeviceStateWatcher`：max(10 × 设备内最慢点位周期, 30 s) |
 | 优雅退出 ≤ 10 s | SIGTERM | 已实现 | flush 3 s + `$death` 2 s 的预算，留有余量 |
 | 掉电配置完整性 | 100% | 已实现（机制） | 临时文件 + `Flush(flushToDisk: true)` + `File.Move(overwrite)` |
-| 故障注入矩阵 12 类 | 全通过 | 部分实现 | 连接拒绝/中断/超时/半包/错 CRC/异常码/部分响应/慢响应/Broker 断线都有用例；磁盘满、时钟跳变、进程假死属环境级，未自动化 |
+| 故障注入矩阵 12 类 | 全通过 | 已实现 | 连接拒绝/中断/超时/半包/错 CRC/异常码/部分响应/慢响应/Broker 断线沿用各自的协议用例；环境级三类用真实注入点补齐：**磁盘满** `outbox/disk_full_keeps_records_pending`（软链 `/dev/full`，内核返回 ENOSPC，位点不推进、磁盘恢复后补投）、**时钟跳变** `fault/clock_jump_does_not_fake_a_stall` + `fault/outbox_ttl_ignores_a_clock_jump`（可拨 `TimeProvider`，墙钟跳一小时不误判停滞、TTL 按单调时长算）、**进程假死** `fault/collection_stall_is_reported`（驱动卡在不可取消的 Task 上，看门狗按双时钟判定并做 5 分钟去重）。磁盘满用例需要 `/dev/full`、权限用例需要 POSIX 文件系统，不具备时显式跳过而不是假装通过 |
 | 安全：认证默认开启 | — | 满足 | 本地账号库始终存在，未认证请求一律 401；首次启动生成随机 `admin` 口令并强制改密，没有「不配令牌就放行」的路径。`contract/api_requires_bearer_token`、`contract/auth_login_forces_password_change` |
 | 安全：配置文件无明文口令 | 红线 | 满足 | 凭据字段只接受 `${env:}` / `${file:}` / `enc:v1:`，`check`、启动、`config/validate`、`config/apply` 四处拒绝明文；`secret/*`（9 条）与 `contract/plaintext_credentials_are_rejected` |
 | 安全：未认证即可写点位 | 红线 | 满足 | 写端点除鉴权外还要求 `point.write`；未认证 401、角色不足 403 并记审计。`contract/auth_roles_are_enforced` |
@@ -166,9 +167,8 @@ PRD `06-nfr.md` §4 列了五条红线，本版全部满足。TLS（FR-OPS-10）
 
 安全面上没有刻意留白的项：认证（FR-OPS-02/03）、审计（FR-OPS-04）、凭据落盘
 （FR-OPS-09）与 TLS（FR-OPS-10）都已在本版实现。剩下的差距是**PRD §6.1 之外的
-协议范围**（Wave 2/3，见 [protocol-status.md](protocol-status.md)）、object/file
-寻址的实际驱动（模型与校验已就绪），以及依赖环境的三类故障注入（见
-[testing.md](testing.md)），都不是安全红线。
+协议范围**（Wave 2/3，见 [protocol-status.md](protocol-status.md)）与 object/file
+寻址的实际驱动（模型与校验已就绪），都不是安全红线。
 
 ## 10. 怎么用这份表
 

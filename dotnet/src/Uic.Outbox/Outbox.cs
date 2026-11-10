@@ -52,14 +52,17 @@ public sealed class Outbox : IAsyncDisposable
     private readonly ConcurrentDictionary<string, IOutboxSink> _sinks = new(StringComparer.Ordinal);
     private readonly CancellationTokenSource _cts = new();
     private readonly SemaphoreSlim _flushLock = new(1, 1);
+    private readonly TimeProvider _time;
     private Task? _loop;
     private long _dropped;
     private int _disposed;
 
-    public Outbox(string dataDir, OutboxOptions? options = null)
+    /// <param name="time">时间来源。TTL 用它的单调时钟算，避免校时跳变清空积压。</param>
+    public Outbox(string dataDir, OutboxOptions? options = null, TimeProvider? time = null)
     {
         _root = Path.Combine(dataDir, "outbox");
         _options = options ?? new OutboxOptions();
+        _time = time ?? TimeProvider.System;
         Directory.CreateDirectory(_root);
 
         // 启动时就把磁盘上的分区读回来。
@@ -70,7 +73,7 @@ public sealed class Outbox : IAsyncDisposable
             var name = Path.GetFileName(dir);
             if (name.Length == 0) continue;
 
-            _partitions.TryAdd(name, new Partition(dir));
+            _partitions.TryAdd(name, new Partition(dir, _time));
         }
     }
 
@@ -88,7 +91,7 @@ public sealed class Outbox : IAsyncDisposable
 
     public void Enqueue(string sink, string payload)
     {
-        var partition = _partitions.GetOrAdd(sink, name => new Partition(Path.Combine(_root, Sanitize(name))));
+        var partition = _partitions.GetOrAdd(sink, name => new Partition(Path.Combine(_root, Sanitize(name)), _time));
         var dropped = partition.Enqueue(payload, _options);
         if (dropped > 0) Interlocked.Add(ref _dropped, dropped);
     }
@@ -234,15 +237,25 @@ public sealed class Outbox : IAsyncDisposable
         private readonly string _ackFile;
         private readonly object _lock = new();
         private readonly List<OutboxRecord> _pending = new();
+
+        /// <summary>记录入队时的单调时刻，只用于 TTL。</summary>
+        ///
+        /// 为什么不用记录里的 CreatedAt 算年龄：那是墙钟，一次 NTP 校时往前跳
+        /// 就能让整条积压「同时过期」而被清空。TTL 要防的是磁盘无限增长，
+        /// 用单调时钟算出来的真实存放时长才是它想表达的东西。
+        private readonly Dictionary<long, long> _enqueuedAt = new();
+
+        private readonly TimeProvider _time;
         private FileStream? _stream;
         private long _nextId = 1;
         private long _acked;
         private long _delivered;
         private long _dropped;
 
-        public Partition(string dir)
+        public Partition(string dir, TimeProvider time)
         {
             _dir = dir;
+            _time = time;
             Directory.CreateDirectory(dir);
             _dataFile = Path.Combine(dir, "records.ndjson");
             _ackFile = Path.Combine(dir, "acked.id");
@@ -269,7 +282,13 @@ public sealed class Outbox : IAsyncDisposable
                     if (rec is null) continue;
 
                     _nextId = Math.Max(_nextId, rec.Id + 1);
-                    if (rec.Id > _acked) _pending.Add(rec);
+                    if (rec.Id > _acked)
+                    {
+                        _pending.Add(rec);
+                        // 重启后无法知道它原来的单调年龄，按「刚入队」算：
+                        // 宁可多留一个 TTL，也不要因为一次重启把积压清空。
+                        _enqueuedAt[rec.Id] = _time.GetTimestamp();
+                    }
                 }
                 catch (JsonException)
                 {
@@ -284,20 +303,20 @@ public sealed class Outbox : IAsyncDisposable
             {
                 var rec = new OutboxRecord(_nextId++, payload, DateTimeOffset.UtcNow);
                 _pending.Add(rec);
+                _enqueuedAt[rec.Id] = _time.GetTimestamp();
                 Append(rec);
 
                 var dropped = 0;
-                var cutoff = DateTimeOffset.UtcNow - options.Ttl;
 
                 while (_pending.Count > options.MaxRecords || EstimateBytesLocked() > options.MaxBytes)
                 {
-                    _pending.RemoveAt(0);
+                    DropHead();
                     dropped++;
                 }
 
-                while (_pending.Count > 0 && _pending[0].CreatedAt < cutoff)
+                while (_pending.Count > 0 && _time.GetElapsedTime(_enqueuedAt[_pending[0].Id]) > options.Ttl)
                 {
-                    _pending.RemoveAt(0);
+                    DropHead();
                     dropped++;
                 }
 
@@ -321,13 +340,29 @@ public sealed class Outbox : IAsyncDisposable
         {
             lock (_lock)
             {
-                var removed = _pending.RemoveAll(r => r.Id <= id);
+                var removed = 0;
+
+                // 队列按 id 递增，确认位点只会前进，所以从队头摘即可；
+                // 这样 _enqueuedAt 能与 _pending 同步清理，不会随运行时长无界增长。
+                while (_pending.Count > 0 && _pending[0].Id <= id)
+                {
+                    _enqueuedAt.Remove(_pending[0].Id);
+                    _pending.RemoveAt(0);
+                    removed++;
+                }
+
                 if (removed == 0) return;
 
                 _acked = Math.Max(_acked, id);
                 _delivered += removed;
                 PersistAck();
             }
+        }
+
+        private void DropHead()
+        {
+            _enqueuedAt.Remove(_pending[0].Id);
+            _pending.RemoveAt(0);
         }
 
         public (long Pending, long Dropped, long Delivered, long Bytes) Stats()
@@ -390,8 +425,13 @@ public sealed class Outbox : IAsyncDisposable
         {
             lock (_lock)
             {
-                _stream?.Dispose();
-                _stream = null;
+                // 关闭时要把缓冲区刷盘。磁盘满 / 只读介质上这一刷必然抛 IOException，
+                // 但这里没有补救动作：记录还在 records.ndjson 里、位点没推进，
+                // 下次启动会重放。让异常从退出路径冒出去，只会把后面的清理顶掉
+                // （关机预算是 10 秒，没有时间处理第二个异常）。
+                try { _stream?.Dispose(); }
+                catch (IOException) { }
+                finally { _stream = null; }
             }
         }
     }
@@ -436,8 +476,12 @@ public sealed class JournalSink : IOutboxSink, IAsyncDisposable
 
     public ValueTask DisposeAsync()
     {
-        _stream?.Dispose();
-        _stream = null;
+        // 同 Partition.Dispose：退出路径上的刷盘失败只说明磁盘有问题，
+        // 而记录仍在分区文件里等下一轮投递。这里抛出去会打断优雅退出。
+        try { _stream?.Dispose(); }
+        catch (IOException) { }
+        finally { _stream = null; }
+
         _lock.Dispose();
         return ValueTask.CompletedTask;
     }
