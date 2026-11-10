@@ -7,6 +7,7 @@
   </ItemGroup>
   <ItemGroup>
     <ProjectReference Include="..\Uic.Domain\Uic.Domain.csproj" />
+    <ProjectReference Include="..\Uic.Codec.Mqtt\Uic.Codec.Mqtt.csproj" />
     <ProjectReference Include="..\Uic.Driver\Uic.Driver.csproj" />
     <ProjectReference Include="..\Uic.Engine\Uic.Engine.csproj" />
     <ProjectReference Include="..\Uic.Outbox\Uic.Outbox.csproj" />

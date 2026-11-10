@@ -322,14 +322,49 @@ MQTT 的 TLS 是独立开关（`northbound.mqtt.tls`），语义见
         { "key": "address.index", "label": "命名空间索引", "type": "int", "default": 0, "scope": "point" }
       ],
       "description": "OPC UA 客户端：NodeId 符号寻址、批量读、写、监控项订阅；None / Basic256Sha256。"
+    },
+    {
+      "id": "mqtt",
+      "name": "MQTT 订阅",
+      "version": "1.0.0",
+      "sdkVersion": "1.0",
+      "roles": ["master"],
+      "transports": ["tcp"],
+      "addressKinds": ["symbol"],
+      "capabilities": {
+        "read": "supported",
+        "write": "unsupported",
+        "subscribe": "supported",
+        "browse": "unsupported",
+        "discovery": "unsupported",
+        "multiRead": "supported",
+        "bitAccess": "unsupported",
+        "structTypes": "unsupported"
+      },
+      "configFields": [
+        { "key": "transport.host", "label": "主机", "type": "string", "required": true, "scope": "channel" },
+        { "key": "transport.port", "label": "端口", "type": "int", "required": true, "default": 1883, "scope": "channel" },
+        { "key": "labels.payloadField", "label": "默认取值字段", "type": "string", "default": "value", "scope": "device" },
+        { "key": "labels.qos", "label": "订阅 QoS", "type": "int", "default": 1, "scope": "device" },
+        { "key": "labels.staleAfterSeconds", "label": "过期秒数", "type": "int", "default": 0, "scope": "device" },
+        { "key": "labels.tlsEnabled", "label": "启用 TLS", "type": "bool", "default": false, "scope": "device" }
+      ],
+      "pointFields": [
+        { "key": "address.path", "label": "主题", "type": "string", "required": true, "scope": "point",
+          "help": "要订阅的主题或主题过滤器，可含 + 与 #" },
+        { "key": "address.property", "label": "取值字段", "type": "string", "scope": "point",
+          "help": "留空时用设备标签 payloadField；填 . 表示整个载荷就是值" }
+      ],
+      "description": "MQTT 3.1.1 订阅方：主题寻址、JSON 字段取值、QoS0/1、TLS；只读。"
     }
   ]
 }
 ```
 
-`subscribe: supported` 只表示**驱动能提供订阅**（`ISubscriptionConn`），不代表采集走订阅：
-调度器当前仍按周期轮询，与 Modbus / S7 一致。`addressKinds: ["symbol"]` 说明它只接受
-符号寻址——寄存器地址（`area` / `offset`）在 UA 上没有对应物。
+`subscribe: supported` 只表示**驱动能提供订阅**，不代表采集走订阅：调度器当前仍按周期
+轮询，与 Modbus / S7 一致。OPC UA 的订阅通过 `ISubscriptionConn` 提供；MQTT 的订阅由
+驱动内部维持，`ReadAsync` 读的是最近一条报文的缓存。`addressKinds: ["symbol"]` 说明
+两者只接受符号寻址——寄存器地址（`area` / `offset`）在 UA 与 MQTT 上没有对应物。
 
 `configFields` / `pointFields` 是驱动自己声明的表单元数据：控制台据此渲染参数，
 不把协议知识写死在页面里。S7 的 `address.offset` 是**字节**偏移（Modbus 是寄存器序号），

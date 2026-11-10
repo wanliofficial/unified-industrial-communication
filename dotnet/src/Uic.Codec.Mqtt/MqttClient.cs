@@ -9,10 +9,7 @@ using System.Threading.Channels;
 using Microsoft.Extensions.Logging;
 using Uic.Domain;
 
-namespace Uic.Northbound;
-
-/// <summary>一条入站消息。主题已由 Broker 过滤，这里不再做通配匹配。</summary>
-public sealed record MqttMessage(string Topic, byte Qos, bool Retain, byte[] Payload);
+namespace Uic.Codec.Mqtt;
 
 /// <summary>
 /// 最小 MQTT 3.1.1 客户端：发布 + 订阅。
@@ -23,6 +20,11 @@ public sealed record MqttMessage(string Topic, byte Qos, bool Retain, byte[] Pay
 /// 那些路径一旦被配置误开，反而变成「以为加密了其实没有」的风险点。
 /// TLS 用 <see cref="SslStream"/> 在流这一层包起来，几十行就能做完，
 /// 因此不构成引入第三方库的理由。
+///
+/// 为什么单独成一个项目而不是留在某一侧：北向要用它发，南向要用它收，
+/// 而两侧的生命周期互不相干（北向 sink 随配置重载重建，南向连接跟着设备走）。
+/// 放在任一方的程序集里，另一方就得反向依赖它的宿主层；抽到协议层之后
+/// 两边各自 new 一个实例即可，报文实现仍然只有一份。
 ///
 /// 明确不支持：QoS2、WebSocket、持久会话。TLS 只做服务端证书校验（含自定义 CA），
 /// 不做客户端证书；MQTT 报文层与明文路径完全相同，加密只发生在流这一层。
@@ -50,12 +52,15 @@ public sealed class MqttClient : IAsyncDisposable
     private readonly ConcurrentDictionary<ushort, TaskCompletionSource<bool>> _pending = new();
     private readonly ConcurrentDictionary<ushort, TaskCompletionSource<byte[]>> _subackPending = new();
     private readonly ConcurrentDictionary<string, byte> _subscriptions = new(StringComparer.Ordinal);
+    private readonly ConcurrentDictionary<string, byte> _granted = new(StringComparer.Ordinal);
     private readonly System.Threading.Channels.Channel<MqttMessage> _inbound =
         System.Threading.Channels.Channel.CreateUnbounded<MqttMessage>(
             new UnboundedChannelOptions { SingleReader = true });
     private readonly object _connLock = new();
 
     private readonly string _dataDir;
+    private readonly string _caField;
+    private readonly bool _announceWill;
 
     private TcpClient? _client;
     private Stream? _stream;
@@ -68,12 +73,29 @@ public sealed class MqttClient : IAsyncDisposable
     private int _started;
     private int _disposed;
 
-    public MqttClient(MqttOptions options, string site, ILogger log, string? dataDir = null)
+    /// <param name="caField">
+    /// CA 读不出来时，校验问题里报的字段路径。协议层不知道自己被挂在哪一棵配置树上
+    /// （北向是 <c>northbound.mqtt.*</c>，南向是设备标签），因此由调用方给。
+    /// </param>
+    /// <param name="announceWill">
+    /// 是否在连接异常断开时向 Broker 宣告遗嘱（<c>$death</c>）。北向发布方需要它来报告
+    /// 「网关掉线」；南向订阅方只是收数，宣告一个自己从不使用的主题只会往 Broker 上
+    /// 留一条误导性的遗言，因此关掉。默认 <c>true</c>，北向行为不变。
+    /// </param>
+    public MqttClient(
+        MqttOptions options,
+        string site,
+        ILogger log,
+        string? dataDir = null,
+        string caField = "mqtt.tls.caFile",
+        bool announceWill = true)
     {
         _options = options;
         _site = site;
         _log = log;
         _dataDir = dataDir ?? Environment.CurrentDirectory;
+        _caField = caField;
+        _announceWill = announceWill;
 
         // 告警放在构造时而不是第一次握手里：Broker 连不上时也要在启动日志里
         // 留下「这次部署没有认证对端」的证据，否则 TLS 看起来一直是开着的。
@@ -112,6 +134,16 @@ public sealed class MqttClient : IAsyncDisposable
     }
 
     public IReadOnlyList<string> Subscriptions => _subscriptions.Keys.ToArray();
+
+    /// <summary>
+    /// 某个主题过滤器最近一次 SUBACK 的结果：<c>true</c> 已授权、<c>false</c> 被拒、
+    /// <c>null</c> 还没收到（未订阅或正在重连）。
+    ///
+    /// 南向驱动需要它：Broker 通过 ACL 拒掉订阅时，不会报错，只会永远没有消息。
+    /// 那种「静默失败」在界面上和「发布方没上线」完全一样，无法定位。
+    /// </summary>
+    public bool? SubscriptionGranted(string topicFilter)
+        => _granted.TryGetValue(topicFilter, out var code) ? code != 0x80 : null;
 
     public void Start()
     {
@@ -182,6 +214,10 @@ public sealed class MqttClient : IAsyncDisposable
             finally
             {
                 _connected = false;
+
+                // 授权结果是一次性握手的产物：断链之后「上次被授权过」不再是事实。
+                _granted.Clear();
+
                 await session.CancelAsync().ConfigureAwait(false);
 
                 if (keepAlive is not null)
@@ -233,7 +269,7 @@ public sealed class MqttClient : IAsyncDisposable
         byte flags = 0x02; // clean session
         var willPayload = Encoding.UTF8.GetBytes("{\"schemaVersion\":1,\"online\":false}");
 
-        if (_options.Qos >= 0)
+        if (_announceWill && _options.Qos >= 0)
         {
             flags |= 0x04;          // will flag
             flags |= 0x20;          // will retain
@@ -251,7 +287,9 @@ public sealed class MqttClient : IAsyncDisposable
 
         WriteString(body, clientId);
 
-        if (_options.Qos >= 0)
+        // 只有真的声明了 will flag 才写遗嘱字段：CONNECT 报文里两者必须成对出现，
+        // 少了 flag 却带着字段，Broker 会把后面的用户名当成遗嘱负载解析。
+        if (_announceWill && _options.Qos >= 0)
         {
             WriteString(body, WillTopic);
             WriteUInt16(body, (ushort)willPayload.Length);
@@ -347,10 +385,13 @@ public sealed class MqttClient : IAsyncDisposable
             var rejected = 0;
             for (var i = 0; i < granted.Length; i++)
             {
+                var topic = topics[Math.Min(i, topics.Length - 1)].Key;
+                _granted[topic] = granted[i];
+
                 if (granted[i] == 0x80)
                 {
                     rejected++;
-                    _log.LogError("broker rejected subscription to {Topic}", topics[Math.Min(i, topics.Length - 1)].Key);
+                    _log.LogError("broker rejected subscription to {Topic}", topic);
                 }
             }
 
@@ -629,12 +670,12 @@ public sealed class MqttClient : IAsyncDisposable
 
     private void FailPending(string reason)
     {
-        foreach (var (id, tcs) in _pending)
+        foreach (var (id, _) in _pending)
         {
             if (_pending.TryRemove(id, out var removed)) removed.TrySetException(new IOException(reason));
         }
 
-        foreach (var (id, tcs) in _subackPending)
+        foreach (var (id, _) in _subackPending)
         {
             if (_subackPending.TryRemove(id, out var removed)) removed.TrySetException(new IOException(reason));
         }
@@ -683,11 +724,11 @@ public sealed class MqttClient : IAsyncDisposable
         // 主机名校验不清除，避免「链对了但连错了机器」。
         if ((errors & SslPolicyErrors.RemoteCertificateChainErrors) != 0 && certificate is not null)
         {
-            _customRoots ??= Tls.LoadCustomRoots(_options.Tls.CaFile, _dataDir);
+            _customRoots ??= MqttTls.LoadRoots(_options.Tls.CaFile, _dataDir, _caField);
 
             if (_customRoots.Count > 0)
             {
-                using var leaf = new X509Certificate2(certificate);
+                using var leaf = X509CertificateLoader.LoadCertificate(certificate.GetRawCertData());
                 using var custom = new X509Chain();
 
                 custom.ChainPolicy.TrustMode = X509ChainTrustMode.CustomRootTrust;

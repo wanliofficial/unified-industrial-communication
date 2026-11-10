@@ -660,6 +660,29 @@ internal static class ConfigFeatureTests
         t.Ok(indexed["address"]!.AsObject().ContainsKey("area") is false,
             "symbol addressing carries no register area");
 
+        // MQTT 南向：主题就是符号地址，端口默认 1883。控制台拼出来的点位必须能被
+        // 网关解析成 topic 过滤器，而不是落回 holding/0 那种寄存器地址。
+        t.Equal("tcp", ConfigDraft.TransportFor("mqtt"), "MQTT runs over TCP");
+        t.Equal(1883, ConfigDraft.DefaultPort("mqtt"), "MQTT defaults to port 1883");
+
+        var mqttChannel = ConfigDraft.NewChannel("mqtt-1", "边缘 Broker", "mqtt", "127.0.0.1", 1883);
+        t.Equal("tcp", mqttChannel["transport"]?.ToString(), "the MQTT channel uses the TCP transport");
+        t.Ok(ConfigDraft.AddChannel(root!, mqttChannel) is null, "the MQTT channel is appended");
+
+        var mqttDevice = ConfigDraft.NewDevice(
+            "edge-1", "边缘数据", "mqtt-1", TimeSpan.FromSeconds(1), 1,
+            ConfigDraft.NewSymbolPoint("temp", "温度", "float64", "plant/line1/temp"));
+
+        t.Ok(ConfigDraft.AddDevice(root!, mqttDevice) is null, "the MQTT device is appended");
+
+        var mqttDocument = ConfigStore.Parse(root!.ToJsonString(JsonDefaults.Indented), "mqtt-draft");
+        var mqttPoint = mqttDocument.Devices.Single(d => d.Id == "edge-1").Points[0];
+
+        t.Equal(AddressKind.Symbol, mqttPoint.Address.Kind, "the MQTT point uses symbol addressing");
+        t.Equal("plant/line1/temp", mqttPoint.Address.Path, "the topic filter is kept verbatim");
+        t.Ok(mqttPoint.Address.Property is null,
+            "no field override is written when the device default applies");
+
         t.Equal("500ms", ConfigDraft.FormatDuration(TimeSpan.FromMilliseconds(500)),
             "sub-second durations stay readable");
         t.Equal("2m", ConfigDraft.FormatDuration(TimeSpan.FromMinutes(2)),

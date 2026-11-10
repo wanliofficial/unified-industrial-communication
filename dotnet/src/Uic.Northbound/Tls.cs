@@ -6,8 +6,11 @@ using Uic.Domain;
 namespace Uic.Northbound;
 
 /// <summary>
-/// TLS 材料装载。放在北向而不是宿主：REST 与 MQTT 都要用证书，
-/// 两边的失败语义必须一致——「证书读不出来」是配置问题，不是运行期偶发。
+/// TLS 材料装载。放在北向而不是宿主，是因为它只服务北向 REST 监听：
+/// 「证书读不出来」是配置问题，不是运行期偶发，必须在启动阶段失败。
+///
+/// MQTT 的自定义 CA 不在这里：北向发布与南向订阅要校验同一个自签 Broker，
+/// 那份逻辑已下沉到协议层 <c>Uic.Codec.Mqtt.MqttTls</c>，两侧共用一套语义。
 /// </summary>
 public static class Tls
 {
@@ -60,29 +63,6 @@ public static class Tls
             {
                 new ValidationProblem("northbound.rest.tls.certificateFile",
                     $"'{certPath}': {ex.Message}"),
-            });
-        }
-    }
-
-    /// <summary>MQTT 自定义 CA。空文件返回空集合，调用方退回系统信任库。</summary>
-    public static X509Certificate2Collection LoadCustomRoots(string? caFile, string dataDir)
-    {
-        var roots = new X509Certificate2Collection();
-        if (string.IsNullOrWhiteSpace(caFile)) return roots;
-
-        var path = Path.GetFullPath(Secrets.ResolvePath(caFile, dataDir));
-
-        try
-        {
-            roots.ImportFromPemFile(path);
-            return roots;
-        }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException
-                                       or CryptographicException or ArgumentException)
-        {
-            throw new ConfigException("MQTT CA certificate is not usable", new[]
-            {
-                new ValidationProblem("northbound.mqtt.tls.caFile", $"'{path}': {ex.Message}"),
             });
         }
     }

@@ -40,6 +40,7 @@ S7CodecTests.Register(tests);
 S7LoopbackTests.Register(tests);
 SerialTests.Register(tests);
 MqttTests.Register(tests);
+MqttDriverTests.Register(tests);
 MqttCommandTests.Register(tests);
 ConfigFeatureTests.Register(tests);
 SecretTests.Register(tests);

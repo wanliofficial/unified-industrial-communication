@@ -3,6 +3,7 @@ using System.Net;
 using System.Security.Cryptography.X509Certificates;
 using Microsoft.Extensions.Logging.Abstractions;
 using Uic.Config;
+using Uic.Codec.Mqtt;
 using Uic.Domain;
 using Uic.Northbound;
 

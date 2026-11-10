@@ -2,6 +2,7 @@ using System.Diagnostics;
 using System.Text.Json;
 using Microsoft.Extensions.Logging;
 using Uic.Config;
+using Uic.Codec.Mqtt;
 using Uic.Domain;
 using Uic.Driver;
 using Uic.Engine;
@@ -500,7 +501,8 @@ public sealed class GatewayRuntime : IGatewayControl, IAsyncDisposable
 
                 // CA 读不出来是配置问题：在装配阶段就失败，而不是让重连线程
                 // 每 2 秒往日志里写一次握手错误。
-                if (resolved.Tls.Enabled) _ = Tls.LoadCustomRoots(resolved.Tls.CaFile, _dataDir);
+                if (resolved.Tls.Enabled)
+                    _ = MqttTls.LoadRoots(resolved.Tls.CaFile, _dataDir, "northbound.mqtt.tls.caFile");
 
                 var sink = new MqttSink(resolved, config.Site, _logs.CreateLogger("uic.mqtt"), _dataDir);
 

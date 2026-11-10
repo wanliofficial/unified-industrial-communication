@@ -14,6 +14,7 @@
     <ProjectReference Include="..\Uic.Driver.Modbus\Uic.Driver.Modbus.csproj" />
     <ProjectReference Include="..\Uic.Driver.S7\Uic.Driver.S7.csproj" />
     <ProjectReference Include="..\Uic.Driver.OpcUa\Uic.Driver.OpcUa.csproj" />
+    <ProjectReference Include="..\Uic.Driver.Mqtt\Uic.Driver.Mqtt.csproj" />
     <ProjectReference Include="..\Uic.Sim.S7\Uic.Sim.S7.csproj" />
     <ProjectReference Include="..\Uic.Driver.Virtual\Uic.Driver.Virtual.csproj" />
     <ProjectReference Include="..\Uic.Engine\Uic.Engine.csproj" />

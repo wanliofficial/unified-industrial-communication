@@ -16,19 +16,20 @@ dotnet run --project tests/Uic.Tests -- --stop-on-fail      # 首个失败即停
 正常输出：
 
 ```
-280 passed, 0 failed, 3 skipped · 92.0s
+292 passed, 0 failed, 3 skipped · 264.9s
 ```
 
 加 `--opcua` 跑全量（含 3 条 OPC UA 端到端）：
 
 ```
-283 passed, 0 failed, 0 skipped · 112.5s
+295 passed, 0 failed, 0 skipped · 146.5s
 ```
 
 耗时随机器负载波动较大：219 条时在同一台机器上空载量到 65.5 s，233 条在同时跑着
 发布/容器时量到 114.2 s；239 条时空载量到 112.7 s，而机器有 20+ 后台负载时量到 1471 s；
 269 条时空载量到 106.4 s；280 条时空载量到 92.0 s（加 `--opcua` 的 283 条是 112.5 s）；
-同一份代码连跑四次落在 88.7–110.0 s 之间。
+同一份代码连跑四次落在 88.7–110.0 s 之间。292/295 条连续两次验证落在 146.5–264.9 s
+（当时 `load average` 7–11，不是空载基线）。
 NFR 的门槛是 120 s，压测用例、PBKDF2 派生与 TLS 握手是主要开销——**这个门槛只在空载机器上有意义**，
 比对数字前先看 `uptime`。TLS 用例全部用进程内生成的自签证书跑真实握手，不依赖系统信任库，也不联网。
 
@@ -69,7 +70,7 @@ NFR 的门槛是 120 s，压测用例、PBKDF2 派生与 TLS 握手是主要开�
 | `loopback/*` | 12 | Modbus 主站 ↔ 内置从站的真实链路 |
 | `s7/*` | 30 | S7comm：16 条手算黄金帧与地址解析（TPKT/COTP 握手、PDU 协商、读/写/位读写、长度单位是位、错误分类），14 条主站 ↔ 内置从站回环（探活、DB/I/Q/M 读、位读写、写输入区被拒、越界落 `address_error`、bool 缺 bit 被拒、数组、按 PDU 切片、单点装不下点名失败、沉默 PLC 超时、断线重连） |
 | `serial/*` | 7 | 真实伪终端上的 RTU / ASCII、半双工、帧间静默、deadline、关闭打断读 |
-| `mqtt/*` | 19 | 测试内 broker：CONNECT/SUBSCRIBE 字段、QoS0/1、主题渲染、重连补发、命令去重与权限、TLS 发布与不可信 CA 拒绝 |
+| `mqtt/*` | 31 | 测试内 broker：CONNECT/SUBSCRIBE 字段、QoS0/1、主题渲染、重连补发、命令去重与权限、TLS 发布与不可信 CA 拒绝；南向驱动：主题通配匹配、JSON 字段/类型/信封取值、首次读数前 `stale`、QoS0/1 取数、点位字段覆盖、坏载荷与恢复、断线重订阅、过期窗口、订阅被 ACL 拒绝 |
 | `template/*` | 3 | 50 实例批量生成、参数类型/缺失/未知参数拒绝、未声明占位符拒绝 |
 | `csv/*` | 5 | 地址表达式（参考号/区域偏移/分列）、按 id 合并与冲突行号、死区模式与量程列、点位周期列、数组元素个数列 |
 | `contract/*` | 29 | 进程内真实 Kestrel 的 REST 契约（含驱动能力、模板、CSV、导入导出、单点幂等、资源降级联动、脱敏配置往返、明文凭据被拒、journal 历史查询、审计写入/导出/拒绝留痕、点位有效周期、数组元素个数与值形态、HTTPS 监听、控制台新建设备的完整链路；认证的 5 条见 `contract/auth_*`） |
@@ -216,6 +217,11 @@ WebApplication.CreateBuilder → UseUrls("http://127.0.0.1:0")
 - 订阅：SUBSCRIBE 带 packet id 与 QoS，SUBACK 被消费；入站 QoS1 要回 PUBACK
   （漏了这条 broker 会一直重投同一条命令）；
 - 反例：CONNACK 非 0 时不报「已连接」但继续重试；入站 PUBLISH 不会被当成 PUBACK。
+
+南向驱动（`MqttClientDriver`）的 12 条用例同样跑在这个 broker 上：先 `ProbeAsync`
+确认订阅被接受，再用 `PublishToClientAsync` 往客户端推报文，断言 `ReadAsync` 从缓存里
+读到的值、质量与过期行为。它证明的是「订阅登记 → 收到 → 解析 → 缓存」这条链路，
+不代替真实 Broker 的 ACL/保留消息语义。
 
 命令通道（`MqttCommandSink`）另有 8 条端到端用例，用 stub `IGatewayControl` 计数
 来证明「执行了/没执行」而不是只看结果 JSON：
@@ -399,6 +405,7 @@ journal、outbox、MQTT 都按默认关闭——它们各自的成本由 `histor
 | 缺口 | 影响 | 建议 |
 |---|---|---|
 | MQTT 只与 mosquitto 互操作过 | 用户认证、ACL 与其它 broker 的差异未覆盖（TLS 只有自签证书的进程内用例，没有与真实 Broker 的 TLS 互操作）；命令通道同样依赖 Broker 侧隔离 | 接入现场时用目标 broker 重跑 `scripts/mqtt-interop.sh`，用现场 CA 再跑一次 TLS 连接，并验命令主题的 ACL |
+| MQTT 南向只与测试内 broker 对过 | 订阅被 ACL 拒绝、保留消息、Broker 重启后的 `$SYS` 主题等真实差异没有端到端；驱动不实现持久会话，Broker 停机期间的消息会丢 | 现场接入前用目标 Broker 的 ACL 验证一次 `ProbeAsync`（被拒应报 `permission`），并用真实发布方确认断线窗口内可接受丢数 |
 | MQTT 命令去重只在进程内 | 幂等窗口 5 分钟、重启即清空；命令本身已落审计，但幂等状态不跨重启 | 需要跨重启幂等时用 REST 的 `X-Idempotency-Key`，或把幂等台账落到外部存储 |
 | WASM 控制台只验过 Chromium 与 Firefox | Safari / WebKit、移动端与真实触屏未覆盖；冒烟脚本已覆盖「登录 → 强制改密 → 首屏 → 新建设备」，但只验证 admin 一个角色 | 上线前在目标浏览器各跑一次同一套检查：`scripts/wasm-smoke.sh --browser <name>`（装了 webkit 后可直接跑） |
 | 真实硬件 | 全部用例都跑在内置从站 / 虚拟设备 / 伪终端上 | 现场接入时先用 `uic check` 与 `/api/v1/commands` 的 `device.selftest` |

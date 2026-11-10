@@ -5,6 +5,7 @@ using Uic.Config;
 using Uic.Domain;
 using Uic.Driver;
 using Uic.Driver.Modbus;
+using Uic.Driver.Mqtt;
 using Uic.Driver.OpcUa;
 using Uic.Driver.S7;
 using Uic.Driver.Virtual;
@@ -441,6 +442,7 @@ internal static class Program
         drivers.Register(ModbusMasterDriver.Tcp(), ModbusMasterDriver.Rtu(), ModbusMasterDriver.Ascii());
         drivers.Register(new S7MasterDriver());
         drivers.Register(new OpcUaClientDriver());
+        drivers.Register(new MqttClientDriver());
         drivers.Register(new VirtualDriver());
 
         Simulator? simulator = null;

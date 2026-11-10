@@ -724,7 +724,12 @@ internal static class EngineTests
                 new[] { new WriteCommand(actor.Spans[0].Points[0], DataValue.Number(DataType.UInt16, 7)) },
                 t.Ct);
 
-            await Task.Delay(150, t.Ct);
+            // 等到采集确实跑起来再收敛，而不是「固定 150 ms 内至少几轮」：
+            // 机器一忙，墙钟等待就会变成假失败。真正的断言是下面的 Overlaps == 0。
+            var clock = Stopwatch.StartNew();
+            while (driver.Reads + driver.Writes < 3 && clock.Elapsed < TimeSpan.FromSeconds(10))
+                await Task.Delay(5, t.Ct);
+
             var results = await write;
             await actor.StopAsync();
 

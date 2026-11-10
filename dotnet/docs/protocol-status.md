@@ -28,7 +28,7 @@
 | OPC UA | 客户端 | 已实现（None / Basic256Sha256） | `Uic.Driver.OpcUa` | FR-COL-05 |
 | MQTT | 北向发布 | 已实现（3.1.1） | `Uic.Northbound` | FR-NOR-04 |
 | MQTT | 北向下行命令 | 已实现（白名单） | `Uic.Northbound/MqttCommandSink.cs` | FR-OPS 远程命令 |
-| MQTT | 南向订阅取数 | **未实现** | — | FR-COL-06（M，首版缺口） |
+| MQTT | 南向订阅取数 | 已实现（只读） | `Uic.Codec.Mqtt` + `Uic.Driver.Mqtt` | FR-COL-06 |
 | REST + SSE | 北向 | 已实现 | `Uic.Northbound/RestApi*.cs` | FR-NOR-01..03 |
 | S7comm（西门子） | 主站 | 已实现 | `Uic.Codec.S7` + `Uic.Driver.S7` | FR-COL-04 |
 | S7comm | 从站 | 已实现（仅仿真） | `Uic.Sim.S7` | FR-COL-04 的自测 |
@@ -44,10 +44,11 @@
 
 先给结论：
 
-- **能用的是 Modbus 三个变体（主站）+ Modbus TCP 从站 + S7 主站 + OPC UA 客户端 + 虚拟设备**，
-  北向是 REST/SSE/MQTT/OPC UA 服务端。这条链路是完整的，带黄金帧和端到端用例。
-- **MQTT 南向取数（FR-COL-06）是 PRD 里的 M 级需求，本版本没做**。这不是 PRD §6.1
-  「不做」清单里的项，属于真实缺口（见 [requirements-traceability.md](requirements-traceability.md)）。
+- **能用的是 Modbus 三个变体（主站）+ Modbus TCP 从站 + S7 主站 + OPC UA 客户端 +
+  MQTT 订阅方 + 虚拟设备**，北向是 REST/SSE/MQTT/OPC UA 服务端。这条链路是完整的，
+  带黄金帧和端到端用例。
+- **MQTT 南向（FR-COL-06）已实现**：主题过滤器寻址、JSON 字段取值、QoS0/1、TLS、
+  断线重订阅。采集主路径仍是调度器轮询，`ReadAsync` 读的是驱动内缓存（见 §3.5）。
 - OPC UA 客户端有两处**已验证边界**，不要当成「全都能接」：订阅没有接入采集主路径
   （仍是轮询），Basic256Sha256 没有仓内端到端（见 §3.4）。
 - **BACnet、IEC 104、CIP、MC、FINS 是 PRD §6.1 明确不做**，属于产品范围决定。
@@ -152,8 +153,9 @@ validate/apply/versions/diff/rollback/export/import、模板 CRUD 与批量实�
 | 下行命令 | 请求/结果双主题，按 `id` 做 5 分钟进程内幂等；只放行 `driver.restart`、`device.selftest`、`outbox.flush`、`log.level`、`diag.bundle` |
 | 传输 | 明文 TCP 或 TLS（`northbound.mqtt.tls`，校验服务端证书链与主机名，支持自定义 CA）；WebSocket 未内置 |
 
-「MQTT 南向订阅取数」（FR-COL-06）没有实现：北向 MQTT 的连接是「发出去 + 收命令」，
-南向需要另一套点位映射、生命周期与质量传播，不能复用同一个客户端实例。
+MQTT 3.1.1 的报文实现放在协议层 `Uic.Codec.Mqtt`：北向发布与南向订阅各持有一个
+客户端实例，生命周期互不相干（北向 sink 随配置重载重建，南向连接跟着设备走）。
+南向取数见 §3.5；两侧共用同一份 CONNECT/PUBLISH/SUBSCRIBE 编码，行为不会漂移。
 
 ### 3.3 OPC UA 服务端
 
@@ -201,16 +203,48 @@ validate/apply/versions/diff/rollback/export/import、模板 CRUD 与批量实�
 **明确不支持并显式报错**：`nsu=` / `svr=`（服务端作用域命名空间）、
 Basic128Rsa15/Aes 系列策略、结构体/ExtensionObject 类型的值、BCD 类型。
 
+### 3.5 MQTT 南向订阅（只读）
+
+| 能力 | 实现情况 |
+|---|---|
+| 角色 | 订阅方（网关从 Broker 取现场数据） |
+| 协议栈 | `Uic.Codec.Mqtt`（与北向发布共用一份 3.1.1 实现），驱动在 `Uic.Driver.Mqtt` |
+| 传输 | 明文 TCP（默认 1883）或 TLS（`labels.tlsEnabled` / `tlsCaFile` / `tlsInsecureSkipVerify`） |
+| 寻址 | 符号寻址：`address.path` 是主题过滤器（可含 `+` / `#`）；`address.property` 是载荷里的 JSON 字段路径 |
+| 取值 | 字段名（`data.temp`）或 JSON 指针（`/data/temp`）；设备标签 `payloadField` 提供默认值（默认 `value`）；`address.property` 逐点覆盖 |
+| 载荷 | JSON 标量/对象/数组；北向 Sample JSON 的 `{"type","num"}` 值信封会先解包再按本地点表类型转换，网关可级联 |
+| QoS | 0 / 1；QoS2 不支持 |
+| 重连 | 协议层自动重连并重发 SUBSCRIBE（clean session）；起始间隔可配（≥500 ms），指数退避上限 30 s |
+| 质量 | 从未收到报文 / 超过 `labels.staleAfterSeconds` 未更新 → `stale`；非 JSON → `bad`；字段缺失或类型不符 → `address_error` |
+| 写入 | 不支持（`Capabilities.Write = unsupported`）；南向命令通道不在本版范围 |
+
+**边界必须说清**：
+
+1. **采集路径是「订阅 + 缓存」，不是推送驱动。** 驱动在内部维持订阅，`ReadAsync`
+   返回最近一条报文的解析结果；调度器仍按周期轮询。这样不需要改 `DeviceActor`，
+   代价是缓存值会被反复采样（死区与 Outbox 的既有语义照常生效）。
+2. **首次读到值之前是 `stale`。** `ProbeAsync` 只验证「连上 Broker + 订阅未被 ACL
+   拒绝」，不等数据——发布方可能本来就没上线。没有数据时点位报 `stale` 而不是
+   `good` 的旧值。连续多轮 `stale` 会计入设备熔断（与其它坏质量一致），这是刻意的：
+   一台「连着但永远没数据」的设备应当进入降级而不是看起来正常。
+3. **不支持用户名/口令。** 本版本的凭据链路只覆盖北向，南向设备标签是明文落盘的；
+   配了 `labels.username` / `labels.password` 会显式报 `unsupported`，而不是静默忽略。
+   需要认证时用 TLS + Broker 侧网络 ACL（与 OPC UA 的匿名身份策略一致）。
+4. **不支持 QoS2、持久会话、客户端证书、WebSocket。** 需要这些语义的部署应当把
+   Broker 的能力边界写清楚，而不是期待驱动「顺手」兼容。
+
 ## 4. 没实现的协议：分三类，不要混为一谈
 
-### 4.1 首版缺口（PRD 要求 M，但本版本没做）
+### 4.1 剩余延期项（不是 M 级采集缺口）
 
-| 协议 | 缺什么 | 补的时候要动哪里 |
+**PRD 中 M 级的采集协议缺口已全部补齐**：Modbus、S7、OPC UA 客户端与 MQTT 南向
+订阅都已落地并有可自动跑的用例。剩余延期项（非 M 级采集缺口，逐条记录在
+[requirements-traceability.md](requirements-traceability.md)）：
+
+| 项 | 状态 | 说明 |
 |---|---|---|
-| **MQTT 南向取数** | 全部。订阅主题 → 点位映射、断线重订阅、质量传播 | 新增 `Uic.Driver.Mqtt`；连接生命周期要与北向 MQTT 隔离，避免一个 broker 抖动同时打穿两侧 |
-
-这一项是**真实的验收缺口**。当前版本能进现场做的是 Modbus + S7 + OPC UA 客户端 + OPC UA 服务端/北向，
-不能说「PRD 的首版范围已经闭环」。
+| FR-CFG-01 非 register 寻址驱动 | 部分实现 | symbol 已由 OPC UA 与 MQTT 消费；object / file 仍只是模型扩展点 |
+| 故障注入矩阵 | 部分实现 | 磁盘满、时钟跳变、进程假死三类未覆盖 |
 
 ### 4.2 PRD §6.1 明确不做（产品范围决定）
 
@@ -224,7 +258,9 @@ Basic128Rsa15/Aes 系列策略、结构体/ExtensionObject 类型的值、BCD �
 
 这些协议的扩展点与 S7 相同：一个驱动包 + 黄金帧 + 一致性用例，不需要改调度、
 北向或 UI。差别只在协议本身的复杂度（CIP 的标签/结构体、BACnet 的对象模型、
-104 的遥测/遥信分类）。### 4.3 不适合本架构（不是排期问题）
+104 的遥测/遥信分类）。
+
+### 4.3 不适合本架构（不是排期问题）
 
 | 协议 | 为什么不适合 | 如果客户硬要 |
 |---|---|---|

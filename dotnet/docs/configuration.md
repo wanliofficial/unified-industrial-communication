@@ -89,7 +89,7 @@
 |---|---|---|
 | `id` | 必填 | `^[a-z0-9][a-z0-9-]{0,31}$`，设备靠它引用 |
 | `name` | — | 显示名 |
-| `protocol` | 必填 | `modbus-tcp` / `modbus-rtu` / `modbus-ascii` / `s7` / `opcua` / `virtual` |
+| `protocol` | 必填 | `modbus-tcp` / `modbus-rtu` / `modbus-ascii` / `s7` / `opcua` / `mqtt` / `virtual` |
 | `enabled` | `true` | 关闭后该通道上的设备不采集 |
 | `transport` | `tcp` | `tcp` / `serial` / `udp` / `none` |
 | `host` / `port` | — / `0` | `tcp`/`udp` 必填；端口 1..65535 |
@@ -180,6 +180,44 @@ OPC UA 的建链参数在**设备**的 `labels` 里：
 配置成 `Basic256Sha256` 时，首次连接会在 `pkiDir` 生成客户端自签证书。
 换机器/换数据目录会得到一张新证书，服务端侧需要重新信任——这一点与现场
 「证书绑定」的预期一致，不是缺陷。
+
+### MQTT 通道（南向订阅）
+
+`protocol: "mqtt"` 表示网关作为**订阅方**从 Broker 取数，`transport` 必须是 `tcp`，
+端口默认 **1883**。与北向 MQTT 发布无关：两者各持一个客户端实例，互不影响。
+
+```json
+{
+  "id": "mqtt-edge",
+  "name": "边缘 Broker",
+  "protocol": "mqtt",
+  "transport": "tcp",
+  "host": "192.168.1.30",
+  "port": 1883
+}
+```
+
+建链参数放在**设备**的 `labels` 里：
+
+| 键 | 默认 | 说明 |
+|---|---|---|
+| `payloadField` | `value` | 默认 JSON 字段路径（`data.temp` 或 `/data/temp`）；填 `.` 表示整个载荷就是值 |
+| `clientId` | `uic-<设备 id>` | 同一 Broker 上不能与其它客户端重复 |
+| `qos` | `1` | 订阅 QoS，0 或 1；QoS2 不支持 |
+| `keepAliveSeconds` | `30` | 心跳周期，5..600 |
+| `reconnectDelayMs` | `2000` | 重连起始间隔（毫秒），500..300000；之后指数退避，上限 30 秒 |
+| `staleAfterSeconds` | `0` | 超过这么久没有新报文就把值判为 `stale`；0 表示不按时间过期 |
+| `tlsEnabled` | `false` | 打开后整条连接走 TLS |
+| `tlsCaFile` | 空 | 自签 Broker 的 CA（PEM）；相对路径按数据目录解析 |
+| `tlsInsecureSkipVerify` | `false` | 只用于联调；跳过证书链与主机名校验，启动日志会告警 |
+| `username` / `password` | — | **不支持**：配了会显式报 `unsupported`。需要认证时用 TLS + Broker ACL |
+
+**为什么南向不支持用户名/口令**：本版本的凭据链路只覆盖北向，设备 `labels` 是明文
+落盘的；把 Broker 口令写进 `labels` 等于把凭据抄进配置文件。需要认证的部署应在
+Broker 侧用 TLS + 网络 ACL 把订阅方限定到固定网段，与 OPC UA 的匿名身份策略一致。
+
+`ProbeAsync` 只验证「连上 Broker + 订阅未被 ACL 拒绝（SUBACK 不是 `0x80`）」，
+不等数据：发布方可能本来就没上线，那属于数据面而不是链路故障。
 
 ## 设备 `devices[]`
 
@@ -378,6 +416,41 @@ OPC UA 的建链参数在**设备**的 `labels` 里：
   `3` → `3.0` 可以，`3.7` → `3` 不行。
 - **数组点位**（`count > 1`）要求服务端返回同长度的数组；`string`/`bytes`/`datetime`
   不支持数组，配了会在读的时候明确报错。
+
+#### MQTT 的主题与取值
+
+`protocol: "mqtt"` 的设备只能用**符号寻址**：`address.path` 是要订阅的主题过滤器
+（可含 `+` / `#`），`address.property` 是载荷里的 JSON 字段路径；`property` 留空时
+用设备标签 `payloadField`。
+
+```json
+{ "id": "temp", "dataType": "float64",
+  "address": { "kind": "symbol", "path": "plant/line1/temp" } }
+{ "id": "temp_override", "dataType": "float64",
+  "address": { "kind": "symbol", "path": "plant/+/temp", "property": "data.temp" } }
+{ "id": "raw", "dataType": "float64",
+  "address": { "kind": "symbol", "path": "plant/line1/raw", "property": "." } }
+```
+
+| 载荷 | 字段 | 结果 |
+|---|---|---|
+| `{"value":21.5}` | `value`（默认） | `21.5` |
+| `{"data":{"temp":3}}` | `data.temp` 或 `/data/temp` | `3` |
+| `21.5` | `.` | `21.5`（整个载荷就是值） |
+| `{"value":{"type":"float64","num":21.5}}` | `value` | `21.5`（北向值信封自动解包） |
+| `not json` | 任意 | `bad`：发布方或 Broker 的问题，重连/重试有意义 |
+| `{"other":1}` | `value` | `address_error`：点表与发布方的契约问题，不触发链路重试 |
+
+- **同一主题可以拆成多个点位**：例如 `{"temp":1,"hum":2}` 用 `property: temp` 与
+  `property: hum` 两个点位，驱动只订阅一次主题，收到一条报文时分发给两个点位。
+- **类型以本地点表为准**：信封里的 `type` 只用于取值，最终按点位声明的 `dataType`
+  转换；装不下（例如 `"abc"` 转 `float64`）落 `address_error`，不静默截断。
+- **数组**：`count > 1` 时要求载荷里是等长 JSON 数组，元素类型与点位一致。
+- **质量语义**：从未收到报文、或超过 `staleAfterSeconds` 没有新报文 → `stale`；
+  值保留最后一条读数，便于界面显示。连续多轮 `stale` 会计入设备熔断——一台
+  「连着但永远没数据」的设备应当进入降级，而不是看起来正常。
+- **只读**：`Capabilities.Write = unsupported`。需要下行控制时，应发布到设备的
+  命令主题，而不是指望驱动写点位。
 
 ### 数据类型
 

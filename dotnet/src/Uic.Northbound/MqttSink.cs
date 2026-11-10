@@ -3,6 +3,7 @@ using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 using Microsoft.Extensions.Logging;
+using Uic.Codec.Mqtt;
 using Uic.Domain;
 using Uic.Outbox;
 
@@ -27,7 +28,9 @@ public sealed class MqttSink : IOutboxSink, IAsyncDisposable
         _options = options;
         _site = site;
         _log = log;
-        _client = new MqttClient(options, site, log, dataDir);
+        _client = new MqttClient(options, site, log, dataDir,
+            // 北向的 CA 来自配置树；报错时必须指向那一行，而不是协议层的通用路径。
+            caField: "northbound.mqtt.tls.caFile");
         _client.OnConnected = OnConnectedAsync;
     }
 

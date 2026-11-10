@@ -22,7 +22,7 @@ namespace Uic.Ui.Pages;
 public sealed class DevicesPage : IPage, IDisposable
 {
     private static readonly string[] Protocols =
-        { "modbus-tcp", "modbus-rtu", "modbus-ascii", "s7", "opcua", "virtual" };
+        { "modbus-tcp", "modbus-rtu", "modbus-ascii", "s7", "opcua", "mqtt", "virtual" };
 
     private static readonly string[] PointTypes =
     {
@@ -229,7 +229,7 @@ public sealed class DevicesPage : IPage, IDisposable
         deviceRow.Children.Add(Field("采集周期", _interval, 100));
         deviceRow.Children.Add(Field("从站地址", _unitId, 90));
 
-        _nodeIdField.Children.Add(Field("NodeId", _nodeId, 260));
+        _nodeIdField.Children.Add(Field("节点 / 主题", _nodeId, 260));
         _registerFields.Children.Add(Field("区域", _area, 130));
         _registerFields.Children.Add(Field("偏移", _offset, 90));
 
@@ -286,6 +286,12 @@ public sealed class DevicesPage : IPage, IDisposable
     /// <summary>OPC UA 用 NodeId 文本寻址：没有区名，也没有寄存器偏移。</summary>
     private bool SelectedProtocolIsOpcUa => SelectedProtocol == "opcua";
 
+    /// <summary>MQTT 用主题寻址，和 UA 一样没有区名/寄存器偏移；字段框共用。</summary>
+    private bool SelectedProtocolIsMqtt => SelectedProtocol == "mqtt";
+
+    /// <summary>符号寻址：地址是一段文本（NodeId 或主题）。</summary>
+    private bool SelectedProtocolUsesSymbol => SelectedProtocolIsOpcUa || SelectedProtocolIsMqtt;
+
     /// <summary>协议决定可用的区名。S7 的区是 db&lt;N&gt;/i/q/m，与 Modbus 的 holding/coil 不通用。</summary>
     private void RebuildAreaPicker()
     {
@@ -317,9 +323,12 @@ public sealed class DevicesPage : IPage, IDisposable
 
         RebuildAreaPicker();
 
-        // 寻址方式随协议切换：UA 没有寄存器窗口，寄存器协议也没有 NodeId。
-        _registerFields.Visibility = SelectedProtocolIsOpcUa ? Visibility.Collapsed : Visibility.Visible;
-        _nodeIdField.Visibility = SelectedProtocolIsOpcUa ? Visibility.Visible : Visibility.Collapsed;
+        // 寻址方式随协议切换：UA/MQTT 没有寄存器窗口，寄存器协议也没有 NodeId/主题。
+        _registerFields.Visibility = SelectedProtocolUsesSymbol ? Visibility.Collapsed : Visibility.Visible;
+        _nodeIdField.Visibility = SelectedProtocolUsesSymbol ? Visibility.Visible : Visibility.Collapsed;
+        _nodeId.PlaceholderText = SelectedProtocolIsMqtt
+            ? "plant/line1/temp"
+            : "ns=2;s=Demo.Temp";
 
         // 端口默认值只在「刚切协议」时有意义：填过 102 再切回 Modbus 不该被改回 502，
         // 所以只在用户没动过的时候替换。
@@ -429,6 +438,11 @@ public sealed class DevicesPage : IPage, IDisposable
             if (string.IsNullOrWhiteSpace(_nodeId.Text))
                 problems.Add("OPC UA 点位必须填写 NodeId，例如 ns=2;s=Demo.Temp");
         }
+        else if (SelectedProtocolIsMqtt)
+        {
+            if (string.IsNullOrWhiteSpace(_nodeId.Text))
+                problems.Add("MQTT 点位必须填写主题，例如 plant/line1/temp");
+        }
         else if (!TryParseOffset(_offset.Text, SelectedProtocolIsS7 ? 7 : 15,
                      out offset, out bit, out var offsetError))
         {
@@ -493,7 +507,7 @@ public sealed class DevicesPage : IPage, IDisposable
                 }
             }
 
-            var point = SelectedProtocolIsOpcUa
+            var point = SelectedProtocolUsesSymbol
                 ? ConfigDraft.NewSymbolPoint(
                     pointId, _pointName.Text, SelectedPointType, _nodeId.Text ?? string.Empty)
                 : ConfigDraft.NewRegisterPoint(

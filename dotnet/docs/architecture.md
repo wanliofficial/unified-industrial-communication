@@ -45,6 +45,10 @@
 （网关把自己的点位暴露出去），位于北向侧、认识 `PointCache` 与调度器。
 两者不互相引用——共享的只有同名的协议栈依赖。
 
+`Uic.Codec.Mqtt` 同时服务两侧：北向 MQTT sink 用它发布，南向 `Uic.Driver.Mqtt`
+用它订阅。报文实现只有一份，但各自持有独立的客户端实例与生命周期——一个 Broker
+抖动不该同时打穿上报和采集。
+
 依赖只向下：下层不认识上层。`Uic.Domain` 不引用任何框架包，
 所以同一份模型既能在服务端序列化，也能编译进 WASM 前端。
 
@@ -56,10 +60,12 @@
 | `Uic.Driver` | `IDriver` / `IConn` 接口、驱动元数据、错误分类、协议无关的 `ValueCodec`（字节序 / BCD / 数组） | 具体协议字节 |
 | `Uic.Codec.Modbus` | PDU 编解码、CRC/LRC、批量窗口计算 | socket、重试 |
 | `Uic.Codec.S7` | TPKT/COTP 分帧、S7 PDU 编解码、区名与字节偏移解析 | socket、会话状态 |
+| `Uic.Codec.Mqtt` | MQTT 3.1.1 报文编解码、订阅登记与重发、主题匹配、TLS 装载 | 采集节奏、点位映射 |
 | `Uic.Transport` | 字节流（TCP / 串口 / 内存）、超时、分帧 | 业务语义 |
 | `Uic.Driver.Modbus` | 主站：连接、探活、读写、异常码映射 | 采集节奏 |
 | `Uic.Driver.S7` | 主站：COTP 会话、PDU 协商、按 PDU 切片、位读写 | 采集节奏 |
 | `Uic.Driver.OpcUa` | 主站（客户端）：NodeId 寻址、批量读、写、订阅、证书/PKI | 采集节奏、地址空间暴露 |
+| `Uic.Driver.Mqtt` | 订阅方：主题寻址、JSON 字段取值、订阅缓存、质量/过期判定 | 采集节奏、南向命令通道、写点位 |
 | `Uic.Sim.Modbus` | 从站：寄存器模型、异常注入 | 北向 |
 | `Uic.Sim.S7` | 从站：DB/I/Q/M 内存模型、返回码 | 北向 |
 | `Uic.Driver.Virtual` | 波形生成、故障注入 | 网络 |
@@ -77,9 +83,11 @@
 
 1. `DeviceActor` 按点位有效周期分桶（点位 `interval` 覆盖设备周期）后唤醒：每轮只读到期的桶，到期的多桶合并成一次读取（调度 tick 50 ms；启动相位按设备内最快点位周期把设备均匀铺开；到期时间用单调时钟，NTP 校时不会打乱节奏）；
 2. `ReadPlanner` 把每个周期桶内的点位合并成若干「寄存器窗口」——连续地址合并、按区分离、按协议上限切分。
-   符号寻址（OPC UA）没有窗口概念，一个点一个 span，由驱动在一轮里合并成一次 Read 服务调用；
+   符号寻址（OPC UA、MQTT）没有窗口概念，一个点一个 span，由驱动在一轮里合并成一次
+   Read 服务调用；
 3. `IConn.ReadAsync(spans)` 一次往返拿回整窗；
-4. `ModbusCodec` / S7 编解码 / OPC UA `Variant` 按点位类型与字节序解出 `RawSample`；
+4. `ModbusCodec` / S7 编解码 / OPC UA `Variant` / MQTT JSON 字段按点位类型与字节序解出 `RawSample`；
+   MQTT 没有请求/应答，`ReadAsync` 返回的是驱动内订阅缓存的最近一条报文；
 5. `Pipeline.Process` 做缩放/偏移、质量传播、整数类型的取整；
 6. `PointCache.PublishConfigured` 按点位的死区模式（绝对值 / 量程百分比 / 变化率）判断是否越过阈值，只有「确实变化」才通知订阅者；
 7. `SampleFanout` 把变化序列化成一行 JSON，追加到每个 sink 的分区。

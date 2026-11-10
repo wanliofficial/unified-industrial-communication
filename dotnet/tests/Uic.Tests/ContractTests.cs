@@ -16,6 +16,7 @@ using Uic.Config;
 using Uic.Domain;
 using Uic.Driver;
 using Uic.Driver.Modbus;
+using Uic.Driver.Mqtt;
 using Uic.Driver.Virtual;
 using Uic.Northbound;
 using Uic.Obs;
@@ -222,6 +223,7 @@ internal static class ContractTests
         var registry = new DriverRegistry();
         registry.Register(ModbusMasterDriver.Tcp(), ModbusMasterDriver.Rtu(), ModbusMasterDriver.Ascii());
         registry.Register(new VirtualDriver());
+        registry.Register(new MqttClientDriver());
         return registry;
     }
 
@@ -700,7 +702,7 @@ internal static class ContractTests
                 t, await host.Client.SendAsync(Get("/api/v1/drivers"), t.Ct));
 
             var items = document.RootElement.GetProperty("items");
-            t.Equal(4, items.GetArrayLength(), "all registered drivers are listed");
+            t.Equal(5, items.GetArrayLength(), "all registered drivers are listed");
 
             var byId = items.EnumerateArray().ToDictionary(
                 d => d.GetProperty("id").GetString()!,
@@ -708,7 +710,8 @@ internal static class ContractTests
                 StringComparer.Ordinal);
 
             t.Ok(byId.ContainsKey("modbus-tcp") && byId.ContainsKey("modbus-rtu") &&
-                 byId.ContainsKey("modbus-ascii") && byId.ContainsKey("virtual"),
+                 byId.ContainsKey("modbus-ascii") && byId.ContainsKey("virtual") &&
+                 byId.ContainsKey("mqtt"),
                 "the built-in drivers are present");
 
             var modbus = byId["modbus-tcp"];
@@ -727,6 +730,13 @@ internal static class ContractTests
             t.Equal("supported", Cap(virtualDriver, "subscribe"), "the virtual device can push changes");
             t.Equal("supported", Cap(virtualDriver, "browse"), "the virtual device exposes symbols");
             t.Equal("unsupported", Cap(virtualDriver, "discovery"), "discovery stays unsupported");
+
+            var mqtt = byId["mqtt"];
+            t.Equal("supported", Cap(mqtt, "read"), "mqtt can read from its subscription cache");
+            t.Equal("unsupported", Cap(mqtt, "write"), "the mqtt southbound driver is read-only");
+            t.Equal("supported", Cap(mqtt, "subscribe"), "mqtt is subscription based");
+            t.Equal("symbol", mqtt.GetProperty("addressKinds")[0].GetString(),
+                "mqtt addresses points by topic (symbol addressing)");
 
             static string? Cap(JsonElement driver, string name)
                 => driver.GetProperty("capabilities").GetProperty(name).GetString();

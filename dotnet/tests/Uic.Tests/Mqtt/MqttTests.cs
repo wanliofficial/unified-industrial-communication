@@ -2,6 +2,7 @@ using System.Diagnostics;
 using System.Text;
 using System.Text.Json.Nodes;
 using Microsoft.Extensions.Logging.Abstractions;
+using Uic.Codec.Mqtt;
 using Uic.Domain;
 using Uic.Northbound;
 using Uic.Outbox;

@@ -24,6 +24,8 @@ public static class ConfigDraft
         // OPC UA 的端点是 opc.tcp://，与 Modbus TCP 同样是 TCP 承载，
         // 但端口默认值是 4840 而不是 502（见 DefaultPort）。
         "opcua" => "tcp",
+        // MQTT 订阅方连的是 Broker，同样是 TCP 承载，端口默认 1883。
+        "mqtt" => "tcp",
         _ => "tcp",
     };
 
@@ -36,6 +38,7 @@ public static class ConfigDraft
         "modbus-tcp" => 502,
         "s7" => 102,
         "opcua" => 4840,
+        "mqtt" => 1883,
         _ => 502,
     };
 

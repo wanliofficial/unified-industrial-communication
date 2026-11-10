@@ -3,6 +3,7 @@ using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 using Microsoft.Extensions.Logging;
+using Uic.Codec.Mqtt;
 using Uic.Domain;
 using Uic.Obs;
 
