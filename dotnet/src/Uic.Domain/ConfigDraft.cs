@@ -21,6 +21,9 @@ public static class ConfigDraft
         // S7 只有 ISO-on-TCP 一种承载；显式列出来，免得以后有人给别的协议
         // 加传输方式时顺手把 S7 也改了。
         "s7" => "tcp",
+        // OPC UA 的端点是 opc.tcp://，与 Modbus TCP 同样是 TCP 承载，
+        // 但端口默认值是 4840 而不是 502（见 DefaultPort）。
+        "opcua" => "tcp",
         _ => "tcp",
     };
 
@@ -32,6 +35,7 @@ public static class ConfigDraft
     {
         "modbus-tcp" => 502,
         "s7" => 102,
+        "opcua" => 4840,
         _ => 502,
     };
 
@@ -117,6 +121,39 @@ public static class ConfigDraft
         };
 
         if (bit >= 0) address["bit"] = bit;
+
+        var point = new JsonObject
+        {
+            ["id"] = id,
+            ["address"] = address,
+            ["dataType"] = dataType,
+        };
+
+        if (!string.IsNullOrWhiteSpace(name)) point["name"] = name.Trim();
+        return point;
+    }
+
+    /// <summary>
+    /// 符号点位（目前只有 OPC UA 用）。地址是一段 NodeId 文本，形如
+    /// <c>ns=2;s=Demo.Temp</c>；省略 <c>ns=</c> 时用 <paramref name="index"/> 作命名空间。
+    ///
+    /// 不把 NodeId 拆成「命名空间 + 标识符」两个表单字段：规范文本是运维在客户端里
+    /// 看到的原样，拆开再拼回去只会多一个出错的地方。
+    /// </summary>
+    public static JsonObject NewSymbolPoint(
+        string id,
+        string? name,
+        string dataType,
+        string path,
+        int index = 0)
+    {
+        var address = new JsonObject
+        {
+            ["kind"] = "symbol",
+            ["path"] = path.Trim(),
+        };
+
+        if (index > 0) address["index"] = index;
 
         var point = new JsonObject
         {

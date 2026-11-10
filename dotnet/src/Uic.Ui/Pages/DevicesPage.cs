@@ -21,7 +21,8 @@ namespace Uic.Ui.Pages;
 /// </summary>
 public sealed class DevicesPage : IPage, IDisposable
 {
-    private static readonly string[] Protocols = { "modbus-tcp", "modbus-rtu", "modbus-ascii", "s7", "virtual" };
+    private static readonly string[] Protocols =
+        { "modbus-tcp", "modbus-rtu", "modbus-ascii", "s7", "opcua", "virtual" };
 
     private static readonly string[] PointTypes =
     {
@@ -69,6 +70,13 @@ public sealed class DevicesPage : IPage, IDisposable
     private readonly ComboBox _pointType = new();
     private readonly ComboBox _area = new();
     private readonly TextBox _offset = Ui.Input(mono: true);
+
+    /// <summary>OPC UA 的 NodeId 文本。寄存器协议的「区域 + 偏移」在 UA 上没有对应物。</summary>
+    private readonly TextBox _nodeId = Ui.Input(mono: true);
+
+    /// <summary>两种寻址各自的字段容器：切换协议时整块显示/隐藏，而不是逐个控件改。</summary>
+    private readonly StackPanel _nodeIdField = new() { Orientation = Orientation.Horizontal, Spacing = 10 };
+    private readonly StackPanel _registerFields = new() { Orientation = Orientation.Horizontal, Spacing = 10 };
     private readonly TextBlock _formResult = Ui.Text(string.Empty, 12, Ui.Faint, wrap: true);
     private readonly Button _createButton;
 
@@ -190,6 +198,7 @@ public sealed class DevicesPage : IPage, IDisposable
         _pointId.PlaceholderText = "voltage";
         _pointName.PlaceholderText = "电压（可选）";
         _offset.PlaceholderText = "0 或 0.3";
+        _nodeId.PlaceholderText = "ns=2;s=Demo.Temp";
 
         foreach (var type in PointTypes) _pointType.Items.Add(type);
         _pointType.SelectedIndex = 0;
@@ -220,12 +229,16 @@ public sealed class DevicesPage : IPage, IDisposable
         deviceRow.Children.Add(Field("采集周期", _interval, 100));
         deviceRow.Children.Add(Field("从站地址", _unitId, 90));
 
+        _nodeIdField.Children.Add(Field("NodeId", _nodeId, 260));
+        _registerFields.Children.Add(Field("区域", _area, 130));
+        _registerFields.Children.Add(Field("偏移", _offset, 90));
+
         var pointRow = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 10 };
         pointRow.Children.Add(Field("首个点位 ID", _pointId, 150));
         pointRow.Children.Add(Field("点位名称", _pointName, 170));
         pointRow.Children.Add(Field("数据类型", _pointType, 130));
-        pointRow.Children.Add(Field("区域", _area, 130));
-        pointRow.Children.Add(Field("偏移", _offset, 90));
+        pointRow.Children.Add(_registerFields);
+        pointRow.Children.Add(_nodeIdField);
 
         var buttons = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 8 };
         buttons.Children.Add(_createButton);
@@ -270,6 +283,9 @@ public sealed class DevicesPage : IPage, IDisposable
 
     private bool SelectedProtocolIsS7 => SelectedProtocol == "s7";
 
+    /// <summary>OPC UA 用 NodeId 文本寻址：没有区名，也没有寄存器偏移。</summary>
+    private bool SelectedProtocolIsOpcUa => SelectedProtocol == "opcua";
+
     /// <summary>协议决定可用的区名。S7 的区是 db&lt;N&gt;/i/q/m，与 Modbus 的 holding/coil 不通用。</summary>
     private void RebuildAreaPicker()
     {
@@ -300,6 +316,10 @@ public sealed class DevicesPage : IPage, IDisposable
         _serialFields.Visibility = creatingChannel && transport == "serial" ? Visibility.Visible : Visibility.Collapsed;
 
         RebuildAreaPicker();
+
+        // 寻址方式随协议切换：UA 没有寄存器窗口，寄存器协议也没有 NodeId。
+        _registerFields.Visibility = SelectedProtocolIsOpcUa ? Visibility.Collapsed : Visibility.Visible;
+        _nodeIdField.Visibility = SelectedProtocolIsOpcUa ? Visibility.Visible : Visibility.Collapsed;
 
         // 端口默认值只在「刚切协议」时有意义：填过 102 再切回 Modbus 不该被改回 502，
         // 所以只在用户没动过的时候替换。
@@ -399,9 +419,21 @@ public sealed class DevicesPage : IPage, IDisposable
 
         if (!TryInt(_unitId.Text, out var unitId)) problems.Add("从站地址必须是 1..255 的整数");
 
-        if (!TryParseOffset(_offset.Text, SelectedProtocolIsS7 ? 7 : 15,
-                out var offset, out var bit, out var offsetError))
+        var offset = 0;
+        var bit = -1;
+
+        if (SelectedProtocolIsOpcUa)
+        {
+            // UA 的点位没有寄存器偏移；缺 NodeId 时不要退回 "0"，那会生成一个
+            // 语法合法但指向 NamespaceIndex 0 的节点，读回来永远是 BadNodeIdUnknown。
+            if (string.IsNullOrWhiteSpace(_nodeId.Text))
+                problems.Add("OPC UA 点位必须填写 NodeId，例如 ns=2;s=Demo.Temp");
+        }
+        else if (!TryParseOffset(_offset.Text, SelectedProtocolIsS7 ? 7 : 15,
+                     out offset, out bit, out var offsetError))
+        {
             problems.Add(offsetError!);
+        }
 
         // S7 的 bool 必须落在某一位上：整字节非零不等于「ON」，猜出来的值比读不出更危险。
         if (SelectedProtocolIsS7 && SelectedPointType == "bool" && bit < 0)
@@ -461,8 +493,11 @@ public sealed class DevicesPage : IPage, IDisposable
                 }
             }
 
-            var point = ConfigDraft.NewRegisterPoint(
-                pointId, _pointName.Text, SelectedPointType, SelectedArea, offset, bit);
+            var point = SelectedProtocolIsOpcUa
+                ? ConfigDraft.NewSymbolPoint(
+                    pointId, _pointName.Text, SelectedPointType, _nodeId.Text ?? string.Empty)
+                : ConfigDraft.NewRegisterPoint(
+                    pointId, _pointName.Text, SelectedPointType, SelectedArea, offset, bit);
 
             var device = ConfigDraft.NewDevice(
                 deviceId, _deviceName.Text, channelId, interval, unitId, point);
@@ -508,6 +543,7 @@ public sealed class DevicesPage : IPage, IDisposable
             _deviceName.Text = string.Empty;
             _pointId.Text = string.Empty;
             _pointName.Text = string.Empty;
+            _nodeId.Text = string.Empty;
 
             await LoadChannelsAsync();
             await RefreshAsync();

@@ -45,6 +45,8 @@ ConfigFeatureTests.Register(tests);
 SecretTests.Register(tests);
 TlsTests.Register(tests);
 ContractTests.Register(tests);
+OpcUaClientTests.Register(tests);
+OpcUaClientLoopbackTests.Register(tests);
 OpcUaTests.Register(tests);
 
 return await TestRunner.RunAsync(tests, args);

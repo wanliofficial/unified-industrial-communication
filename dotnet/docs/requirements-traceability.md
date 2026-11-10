@@ -6,12 +6,13 @@
 - 「部分实现」= 主干能用，但验收标准里有明确没做到的部分，写在备注里；
 - 「刻意没做」= 有意识不做，给出原因与补法（与 [implementation-notes.md](implementation-notes.md) 的「刻意没做」一致）。
 
-首版的目标范围是 PRD §6.1 的 Wave 1 子集：**Modbus 三封装 + S7 主站 + 虚拟设备 + 四北向通道 + 配置治理 + Outbox + 可观测**。
-需要说清楚的一点：**OPC UA 客户端、MQTT 南向在 PRD 里是 M 级要求，本版本没有实现**，
-它们不是 §6.1「不做」清单里的项，属于真实缺口；逐协议现状、原因与补法见
+首版的目标范围是 PRD §6.1 的 Wave 1 子集：**Modbus 三封装 + S7 主站 + OPC UA 客户端 + 虚拟设备 + 四北向通道 + 配置治理 + Outbox + 可观测**。
+需要说清楚的是：**MQTT 南向（FR-COL-06）在 PRD 里是 M 级要求，本版本还没实现**，
+它不是 §6.1「不做」清单里的项，属于真实缺口；逐协议现状、原因与补法见
 [protocol-status.md](protocol-status.md)。
 
-当前测试基线：**269 passed / 0 failed / 1 skipped**（跳过的是需要 `--opcua` 的 OPC UA 端到端用例）。
+当前测试基线：**280 passed / 0 failed / 3 skipped**（跳过的是需要 `--opcua` 的 OPC UA 端到端用例）；
+加 `-- --opcua` 跑全量是 **283 passed / 0 failed / 0 skipped**。
 
 ## 1. 采集（FR-COL）
 
@@ -21,20 +22,20 @@
 | FR-COL-02 | Modbus RTU/ASCII 主站，含串口参数与帧间延时 | 已实现 | `serial/rtu_golden_frame_over_pty`、`serial/ascii_golden_frame_over_pty`、`serial/half_duplex_does_not_cross_responses`；波特率 300–921600 可配，半双工由通道闸门 + 发送前清空输入缓冲保证。帧间静默按 3.5 字符时间（>19200 bps 固定 1.75 ms），计时挂在物理串口上，多从站共享：`serial/rtu_waits_between_frames` |
 | FR-COL-03 | Modbus TCP 从站 | 已实现 | 内置从站被主站回环读写：`loopback/write_then_read_back`、`loopback/write_to_missing_register_is_rejected` |
 | FR-COL-04 | S7comm 主站 | 已实现 | `Uic.Codec.S7`（TPKT/COTP/S7 PDU 纯函数）+ `Uic.Driver.S7`（会话与驱动）+ `Uic.Sim.S7`（进程内从站）。DB/IB/QB/MB 区、位地址、PDU 自动协商（240/480/960 以 PLC 回应为准）与按 PDU 自动切片；`address.offset` 是字节偏移。证据：`s7/connect_request_frame`、`s7/setup_response_takes_plc_pdu`、`s7/read_response_length_is_in_bits`、`s7/address_parses_areas`（16 条黄金帧与地址解析）、`s7/probe_establishes_full_session`、`s7/read_mixed_areas_and_types`、`s7/write_bit_toggles_only_that_bit`、`s7/read_beyond_block_is_address_error`、`s7/negotiated_pdu_limits_the_window`、`s7/silent_plc_times_out`、`s7/reconnect_after_peer_closes`（14 条主站↔从站回环）。明确不支持并明确报错：符号寻址（0xB2）、S7Plus、TPDU 分片重组、多连接并发 |
-| FR-COL-05 | OPC UA 客户端 | 未实现（首版缺口） | PRD 列为 M，本版本只实现 OPC UA **服务端**（`Uic.OpcUa`）。客户端需要会话/订阅/证书/重连，建议直接基于 `Opc.Ua.Client` 而不是手写栈 |
+| FR-COL-05 | OPC UA 客户端 | 已实现 | `Uic.Driver.OpcUa`，基于官方协议栈（`Opc.Ua.Client`），不手写二进制层。寻址用符号寻址（`address.path` 写 NodeId 文本）；读是「一轮合并成一次 Read 服务调用 + 按 `MaxNodesPerRead` 分片」；写走 Write 服务并逐点裁决；订阅用 MonitoredItem 暴露为 `ISubscriptionConn`。SecurityPolicy **None / Basic256Sha256**（模式 None / Sign / SignAndEncrypt），端点按配置精确匹配，找不到就报错并列出服务端实际档位，**不静默降级**。证据：`opcua/address_parses_node_ids`、`opcua/address_rejects_bad_input`、`opcua/status_maps_to_quality`、`opcua/variant_decodes_scalars`、`opcua/variant_decodes_arrays`、`opcua/variant_rejects_shape_mismatch`、`opcua/encode_writes_values`、`opcua/sample_keeps_device_timestamp`、`opcua/options_from_channel_and_labels`、`opcua/options_reject_bad_config`、`opcua/endpoint_selection_never_downgrades`（纯函数），`opcua/client_read_write_subscribe`、`opcua/client_secure_policy_fails_without_match`（`--opcua` 回环）。明确不支持并显式报错：用户名/口令身份、Basic256Sha256 之外的安全策略、`nsu=`/`svr=` 命名空间、结构体/ExtensionObject。**订阅没有接入采集主路径**：调度器仍按周期轮询，与 Modbus/S7 一致；Basic256Sha256 没有仓内端到端（内置服务端只提供 None），见 [protocol-status.md](protocol-status.md) |
 | FR-COL-06 | MQTT 南向订阅取数 | 未实现（首版缺口） | PRD 列为 M，本版本的 MQTT 只做北向发布与下行命令；南向取数需要另一套连接生命周期、点位映射与质量传播，不能复用北向客户端 |
 | FR-COL-07 | 虚拟设备（正弦/斜坡/随机/常量/故障注入） | 已实现 | `loopback/*`、`contract/*` 都以 `virtual` 驱动跑通全链路；五类故障注入见 `Uic.Driver.Virtual` |
 | FR-COL-08 | 驱动能力四态声明 | 已实现 | `GET /api/v1/drivers` 暴露 `Capabilities`；控制台「驱动」页渲染八项四态徽标、设备页显示读写/订阅/浏览四项；`contract/drivers_expose_capability_states` 锁住四态线上名字 |
 | FR-COL-09 | 批量读规划（合并 / 非法跨越拒绝） | 已实现 | `planner/*` 八条：相邻合并、跨空洞不合并、按寄存器与位上限切分、按区域分离、每点恰好覆盖一次 |
 | FR-COL-10 | 每点位独立采集周期 | 已实现 | `Point.interval` 覆盖设备周期（空/0 表示继承，非 0 时 100ms..24h）；`DeviceActor` 按有效周期分桶，每轮只读到期的桶并合并成一次串行读取，快慢变量互不拖累。证据 `engine/point_interval_overrides_device_period`（1s 设备 + 100ms 点位）、`engine/point_interval_failure_is_scoped_to_due_bucket`、`csv/imports_point_interval`、`schedule/phase_follows_fastest_point`、`contract/points_expose_effective_interval`；看门狗阈值取设备内最慢周期，启动相位取最快周期，点位 DTO 暴露 `interval` 与 `effectiveInterval` |
 | FR-COL-11 | 写入（单点/多点），写后校验与超时 | 已实现 | 单点/多点、逐点裁决、超时三态（`ok`/`disabled`/`timeout`）已实现：`contract/write_returns_per_point_results`。`confirm: true` 在同一个通道租约内立即回读并比较，结果带 `verified`；不一致返回 `ok=false` + `uncertain` + `verify.mismatch`：`engine/write_confirmation_reads_back`、`engine/write_confirmation_detects_mismatch`、`engine/write_without_confirmation_skips_readback`。数组点位的元素个数在**建链前**校验，不符直接拒绝而不是交给驱动：`engine/array_write_shape_is_validated_before_the_device` |
-| FR-COL-12 | 订阅型协议（COV/事件/通知） | 刻意没做（C） | 路线图 Wave 2；`Capabilities.Subscribe` 已有四态占位 |
+| FR-COL-12 | 订阅型协议（COV/事件/通知） | 刻意没做（C） | 路线图 Wave 2。`Capabilities.Subscribe` 是四态声明，OPC UA 客户端已声明 `supported` 并通过 `ISubscriptionConn` 提供真实的 MonitoredItem 订阅（`opcua/client_read_write_subscribe`），但**采集主路径仍是按周期轮询**，与 Modbus/S7 一致：把订阅接到调度器需要另一套「推送驱动的重试/熔断/死区」语义，不在本版范围内 |
 
 ## 2. 数据模型与配置（FR-CFG）
 
 | 编号 | 需求 | 状态 | 证据 / 说明 |
 |---|---|---|---|
-| FR-CFG-01 | 四类寻址统一模型 | 部分实现 | `Address` 已含 register/symbol/object/file 四类字段与校验；**只有 register 有驱动实现**，其余三类是扩展点 |
+| FR-CFG-01 | 四类寻址统一模型 | 部分实现 | `Address` 已含 register/symbol/object/file 四类字段与校验。**register** 由 Modbus 与 S7 实现；**symbol** 由 OPC UA 实现（`path` 承载 NodeId 文本，`index` 作省略 `ns=` 时的命名空间）；**object / file** 仍只是扩展点，没有驱动消费。证据：`opcua/address_parses_node_ids`、`opcua/address_rejects_bad_input`、`config/console_draft_builds_a_valid_document` |
 | FR-CFG-02 | 数据类型系统（≥8 类，含数组） | 已实现 | 13 种标量类型（bool/int/uint 16/32/64/float 32/64/string/BCD16/BCD32/bytes/datetime）；datetime 固定 4 寄存器 int64 Unix 毫秒 UTC，北向用 ISO-8601 UTC 文本：`codec/datetime_is_unix_milliseconds`、`json/datavalue_wire_shape_is_stable`、`opcua/anonymous_session_read_write_subscribe`。数组用「元素类型 + 元素个数」正交表达（`dataType` + `count`），只允许定宽数值类型，逐元素套字节序、逐元素缩放、死区取最大变化：`codec/array_roundtrip_per_element_byte_order`、`codec/array_encode_rejects_wrong_element_count`、`codec/array_rejects_non_numeric_element_types`、`json/datavalue_array_shape`、`json/config_point_count_roundtrip`、`pipeline/array_scales_element_wise`、`pipeline/deadband_array_uses_largest_change`、`config/array_count_rules`、`csv/imports_array_count`、`contract/points_expose_array_count_and_values`，另 4 份数组黄金帧 |
 | FR-CFG-03 | 字节序 ABCD/CDAB/BADC/DCBA | 已实现 | `codec/byte_order_encodes_as_expected`、`codec/byte_order_roundtrip`、`json/enums_are_lowercase_wire_names` |
 | FR-CFG-04 | 设备模板 + 参数化实例化（≥50 实例） | 已实现 | `template/instantiate_fifty_devices`（50 个实例逐个断言）、`contract/template_instantiates_and_applies_devices`、`template/rejects_bad_parameters`、`template/store_rejects_unknown_placeholder` |

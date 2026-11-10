@@ -37,6 +37,7 @@
     <ProjectReference Include="..\..\src\Uic.Driver.Modbus\Uic.Driver.Modbus.csproj" />
     <ProjectReference Include="..\..\src\Uic.Codec.S7\Uic.Codec.S7.csproj" />
     <ProjectReference Include="..\..\src\Uic.Driver.S7\Uic.Driver.S7.csproj" />
+    <ProjectReference Include="..\..\src\Uic.Driver.OpcUa\Uic.Driver.OpcUa.csproj" />
     <ProjectReference Include="..\..\src\Uic.Driver.Virtual\Uic.Driver.Virtual.csproj" />
     <ProjectReference Include="..\..\src\Uic.Sim.Modbus\Uic.Sim.Modbus.csproj" />
     <ProjectReference Include="..\..\src\Uic.Sim.S7\Uic.Sim.S7.csproj" />

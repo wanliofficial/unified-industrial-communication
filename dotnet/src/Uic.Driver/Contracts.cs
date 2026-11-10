@@ -69,11 +69,17 @@ public static class DriverSdk
 }
 
 /// <summary>驱动实例化所需的全部输入。驱动不得读取全局配置。</summary>
+/// <param name="DataDir">
+/// 数据目录。需要落本地文件（证书、密钥库）的协议用它，而不是去读进程的
+/// 当前目录——那会让「同一份配置在两台机器上表现不同」变成常态。
+/// 为空表示调用方没有提供，此时只有不落盘的驱动能用。
+/// </param>
 public sealed record OpenContext(
     Channel Channel,
     Device Device,
     ILogger Log,
-    IMetrics Metrics);
+    IMetrics Metrics,
+    string? DataDir = null);
 
 /// <summary>驱动可用的最小埋点接口。</summary>
 public interface IMetrics
@@ -140,6 +146,31 @@ public interface IConn : IAsyncDisposable
     Task ProbeAsync(CancellationToken ct);
     Task<IReadOnlyList<RawSample>> ReadAsync(IReadOnlyList<ReadSpan> spans, CancellationToken ct);
     Task<IReadOnlyList<WriteResult>> WriteAsync(IReadOnlyList<WriteCommand> commands, CancellationToken ct);
+}
+
+/// <summary>
+/// 可选能力：推送式采集。协议会话主动把数据变化推上来，而不是等调度器轮询。
+///
+/// 单独一个接口而不是加进 <see cref="IConn"/>：轮询是默认且必须有的路径，
+/// 推送只有部分协议有；把它们合成一个接口，所有驱动都得写一个空实现。
+/// </summary>
+public interface ISubscriptionConn : IConn
+{
+    /// <summary>
+    /// 为这些点位建立监控项。回调可能来自协议栈自己的线程，实现方不得在回调里阻塞；
+    /// 返回的句柄释放即取消订阅。
+    /// </summary>
+    Task<ISubscription> SubscribeAsync(
+        IReadOnlyList<PointRef> points,
+        Func<RawSample, ValueTask> onSample,
+        CancellationToken ct);
+}
+
+/// <summary>一条活的订阅。</summary>
+public interface ISubscription : IAsyncDisposable
+{
+    /// <summary>订阅建立时实际协商出的发布周期。诊断用。</summary>
+    TimeSpan PublishingInterval { get; }
 }
 
 /// <summary>错误分类。上层据此决定「重试 / 熔断 / 立即失败」。</summary>

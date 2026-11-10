@@ -89,7 +89,7 @@
 |---|---|---|
 | `id` | 必填 | `^[a-z0-9][a-z0-9-]{0,31}$`，设备靠它引用 |
 | `name` | — | 显示名 |
-| `protocol` | 必填 | `modbus-tcp` / `modbus-rtu` / `modbus-ascii` / `s7` / `virtual` |
+| `protocol` | 必填 | `modbus-tcp` / `modbus-rtu` / `modbus-ascii` / `s7` / `opcua` / `virtual` |
 | `enabled` | `true` | 关闭后该通道上的设备不采集 |
 | `transport` | `tcp` | `tcp` / `serial` / `udp` / `none` |
 | `host` / `port` | — / `0` | `tcp`/`udp` 必填；端口 1..65535 |
@@ -137,6 +137,49 @@ S7 的会话参数放在**设备**的 `labels` 里（它们是 COTP 建链参数
 | `rack` | `0` | 机架号 0..7；S7-1200/1500 通常是 0 |
 | `slot` | `1` | 槽位号 0..31；S7-1200/1500 通常是 1，S7-300 常见 2 |
 | `pduSize` | `480` | 请求的 PDU 长度 240..960；**实际以 PLC 回应为准**，只有抓包联调才需要改 |
+
+### OPC UA 通道
+
+`protocol: "opcua"` 走 `opc.tcp://`，`transport` 必须是 `tcp`，端口默认 **4840**。
+通道只描述「连到哪里」；安全策略、证书目录这些属于设备侧参数，放在 `labels` 里。
+
+```json
+{
+  "id": "ua-1",
+  "name": "1 号线 SCADA",
+  "protocol": "opcua",
+  "transport": "tcp",
+  "host": "192.168.1.20",
+  "port": 4840,
+  "timeout": "5s"
+}
+```
+
+OPC UA 的建链参数在**设备**的 `labels` 里：
+
+| 键 | 默认 | 说明 |
+|---|---|---|
+| `endpointPath` | 空 | 服务端 URL 带路径时填（`opc.tcp://host:4840<path>`），一般留空 |
+| `securityPolicy` | `None` | `None` 或 `Basic256Sha256`；其它值直接拒绝（不降级） |
+| `securityMode` | 随策略 | `None` 策略只允许 `None`；`Basic256Sha256` 默认 `SignAndEncrypt`，也可 `Sign` |
+| `acceptUntrustedCertificates` | `true` | 打开时自动接受自签服务端证书；关闭后必须把对端证书放进 `<pkiDir>/trusted` |
+| `pkiDir` | `<dataDir>/opcua-client-pki` | 客户端证书与信任列表目录；相对路径按数据目录解析 |
+| `sessionTimeout` | `60000` | 会话超时（毫秒），5000..3600000 |
+| `operationTimeout` | `5000` | 单次服务调用超时（毫秒），100..600000 |
+| `publishingInterval` | `1000` | 订阅发布周期（毫秒），只影响 `ISubscriptionConn`；采集轮询按设备/点位周期走 |
+
+**为什么端点要精确匹配**：服务端通常会同时公布 `None`、`Basic256Sha256/Sign`、
+`Basic256Sha256/SignAndEncrypt` 等多个端点。客户端先取全部端点，再按配置的
+策略 + 模式**精确**挑一个；挑不到就报错并列出服务端实际提供的档位。
+「有安全的就用安全的」或者「配置要加密但退回明文」都是错的——前者会让
+配置形同虚设，后者更糟：看起来在加密，实际在明文跑。
+
+**身份固定匿名**：本版本的凭据链路只覆盖北向（`Secrets.*`），没有把用户名/口令
+接进南向驱动。需要用户身份的部署应在服务端侧放行匿名只读会话，或等后续版本。
+
+配置成 `Basic256Sha256` 时，首次连接会在 `pkiDir` 生成客户端自签证书。
+换机器/换数据目录会得到一张新证书，服务端侧需要重新信任——这一点与现场
+「证书绑定」的预期一致，不是缺陷。
 
 ## 设备 `devices[]`
 
@@ -299,6 +342,42 @@ S7 的会话参数放在**设备**的 `labels` 里（它们是 COTP 建链参数
 - 读请求会按协商出的 PDU 自动切片（请求项 12 字节 + 响应项都计入预算）。
   单个点位本身就装不下时**只让那个点位失败**并说明 PDU 上限，不拖垮整窗。
 - 符号寻址（`kind: "symbol"` 的 0xB2）与 S7Plus 明确未实现，配置成那样会在运行期明确报错。
+
+#### OPC UA 的 NodeId
+
+`protocol: "opcua"` 的通道只能用**符号寻址**：`address.path` 写 NodeId 文本，
+寄存器寻址（`area`/`offset`）在 UA 上没有对应物，配了也读不到东西。
+
+```json
+{ "id": "temperature", "dataType": "float64",
+  "address": { "kind": "symbol", "path": "ns=2;s=Demo.Temp" } }
+{ "id": "alarm_count", "dataType": "uint16",
+  "address": { "kind": "symbol", "path": "i=85", "index": 2 } }
+{ "id": "level", "dataType": "float32",
+  "address": { "kind": "symbol", "path": "Demo.Level", "index": 2 } }
+```
+
+支持的形式：
+
+| 写法 | 含义 |
+|---|---|
+| `ns=2;s=Demo.Temp` | 命名空间 2 的字符串标识符 |
+| `ns=2;i=85` | 命名空间 2 的数字标识符 |
+| `ns=2;g=<guid>` / `ns=2;b=<base64>` | GUID / ByteString 标识符 |
+| `i=85`、`s=Demo.Temp` | 省略 `ns=`，命名空间取 `address.index`（默认 0） |
+| `Demo.Temp` | 纯文本按字符串标识符处理，命名空间取 `address.index` |
+
+- **为什么用文本而不是「命名空间 + 标识符」两个字段**：这串文本是 UA 规范的一部分，
+  也是运维在客户端软件里看到的原样。拆成两个字段，现场就得手工拆一次，
+  拆错了照样能连上，只是读回 `BadNodeIdUnknown`。
+- **`nsu=` / `svr=` 显式拒绝**：它们依赖服务端的命名空间表，而「表里第几项」
+  在不同服务端之间会变。要求写死数字索引，配置里看到的就是抓包里看到的。
+- **`dataType` 必须与服务端一致**：读回的值装不下声明的类型（例如服务端给 `70000`、
+  点位声明 `uint16`）会被判为 `address_error`，而不是静默截断成 4464；
+  数组点位的元素个数不符同理。写入时的类型转换只做「不需要丢精度」的那部分：
+  `3` → `3.0` 可以，`3.7` → `3` 不行。
+- **数组点位**（`count > 1`）要求服务端返回同长度的数组；`string`/`bytes`/`datetime`
+  不支持数组，配了会在读的时候明确报错。
 
 ### 数据类型
 

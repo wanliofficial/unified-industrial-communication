@@ -630,6 +630,36 @@ internal static class ConfigFeatureTests
         t.Equal(5, ConfigDraft.NewDevice("plc-3", null, "s7-1", TimeSpan.FromSeconds(1), 1, bitPoint)
             ["points"]![0]!["address"]!["bit"]!.GetValue<int>(), "the bit index is written");
 
+        // OPC UA：NodeId 文本是地址，端口默认 4840。控制台必须拼出符号寻址，
+        // 而不是把 UA 点位写成 holding/0 —— 那种点位连上去只会读回 BadNodeIdUnknown。
+        t.Equal("tcp", ConfigDraft.TransportFor("opcua"), "OPC UA runs over TCP");
+        t.Equal(4840, ConfigDraft.DefaultPort("opcua"), "OPC UA defaults to port 4840");
+        t.Equal(502, ConfigDraft.DefaultPort("modbus-rtu"), "serial protocols keep the Modbus default port");
+
+        var uaChannel = ConfigDraft.NewChannel("ua-1", "UA 链路", "opcua", "127.0.0.1", 4840);
+        t.Equal("tcp", uaChannel["transport"]?.ToString(), "the UA channel uses the TCP transport");
+        t.Ok(ConfigDraft.AddChannel(root!, uaChannel) is null, "the UA channel is appended");
+
+        var uaDevice = ConfigDraft.NewDevice(
+            "plc-ua", "UA 服务端", "ua-1", TimeSpan.FromMilliseconds(500), 1,
+            ConfigDraft.NewSymbolPoint("temp", "温度", "float64", "ns=2;s=Demo.Temp"));
+
+        t.Ok(ConfigDraft.AddDevice(root!, uaDevice) is null, "the UA device is appended");
+
+        var uaDocument = ConfigStore.Parse(root!.ToJsonString(JsonDefaults.Indented), "opcua-draft");
+        var uaPoint = uaDocument.Devices.Single(d => d.Id == "plc-ua").Points[0];
+
+        t.Equal(AddressKind.Symbol, uaPoint.Address.Kind, "the UA point uses symbol addressing");
+        t.Equal("ns=2;s=Demo.Temp", uaPoint.Address.Path, "the NodeId text is kept verbatim");
+        t.Equal(0, uaPoint.Address.Index, "no namespace index is written when it is zero");
+
+        var indexed = ConfigDraft.NewSymbolPoint("p", null, "uint16", "i=85", index: 3);
+        t.Equal(3, indexed["address"]!["index"]!.GetValue<int>(), "a non-zero default namespace is written");
+
+        // 符号点位不写 area/offset：写了会被静态校验当成寄存器地址来算长度。
+        t.Ok(indexed["address"]!.AsObject().ContainsKey("area") is false,
+            "symbol addressing carries no register area");
+
         t.Equal("500ms", ConfigDraft.FormatDuration(TimeSpan.FromMilliseconds(500)),
             "sub-second durations stay readable");
         t.Equal("2m", ConfigDraft.FormatDuration(TimeSpan.FromMinutes(2)),

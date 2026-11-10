@@ -290,10 +290,46 @@ MQTT 的 TLS 是独立开关（`northbound.mqtt.tls`），语义见
         { "key": "address.offset", "label": "字节偏移", "type": "int", "required": true, "scope": "point" }
       ],
       "description": "S7comm 主站：DB/IB/QB/MB 区、位访问、PDU 自动协商（240/480/960）。"
+    },
+    {
+      "id": "opcua",
+      "name": "OPC UA 客户端",
+      "version": "1.0.0",
+      "sdkVersion": "1.0",
+      "roles": ["master"],
+      "transports": ["tcp"],
+      "addressKinds": ["symbol"],
+      "capabilities": {
+        "read": "supported",
+        "write": "supported",
+        "subscribe": "supported",
+        "browse": "unsupported",
+        "discovery": "unsupported",
+        "multiRead": "supported",
+        "bitAccess": "unsupported",
+        "structTypes": "unsupported"
+      },
+      "configFields": [
+        { "key": "labels.securityPolicy", "label": "安全策略", "type": "string", "default": "None", "scope": "device",
+          "enum": ["None", "Basic256Sha256"] },
+        { "key": "labels.securityMode", "label": "安全模式", "type": "string", "scope": "device",
+          "enum": ["None", "Sign", "SignAndEncrypt"] },
+        { "key": "labels.pkiDir", "label": "证书目录", "type": "string", "scope": "device" }
+      ],
+      "pointFields": [
+        { "key": "address.path", "label": "NodeId", "type": "string", "required": true, "scope": "point",
+          "help": "ns=<n>;s=<文本> 或 ns=<n>;i=<数字>；省略 ns= 时用 address.index" },
+        { "key": "address.index", "label": "命名空间索引", "type": "int", "default": 0, "scope": "point" }
+      ],
+      "description": "OPC UA 客户端：NodeId 符号寻址、批量读、写、监控项订阅；None / Basic256Sha256。"
     }
   ]
 }
 ```
+
+`subscribe: supported` 只表示**驱动能提供订阅**（`ISubscriptionConn`），不代表采集走订阅：
+调度器当前仍按周期轮询，与 Modbus / S7 一致。`addressKinds: ["symbol"]` 说明它只接受
+符号寻址——寄存器地址（`area` / `offset`）在 UA 上没有对应物。
 
 `configFields` / `pointFields` 是驱动自己声明的表单元数据：控制台据此渲染参数，
 不把协议知识写死在页面里。S7 的 `address.offset` 是**字节**偏移（Modbus 是寄存器序号），

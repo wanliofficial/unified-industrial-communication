@@ -1,8 +1,8 @@
 # UIC 工业网关 · .NET 10 实现
 
-跨平台工业数据采集网关的 .NET 10 版本：南向接 Modbus（TCP / RTU / ASCII，主站与从站）与
-S7comm（S7-300/400/1200/1500 主站），中间做采集调度、数据加工与持久化队列，
-北向出 REST / SSE / MQTT / OPC UA 四个通道。
+跨平台工业数据采集网关的 .NET 10 版本：南向接 Modbus（TCP / RTU / ASCII，主站与从站）、
+S7comm（S7-300/400/1200/1500 主站）与 OPC UA 客户端（None / Basic256Sha256），
+中间做采集调度、数据加工与持久化队列，北向出 REST / SSE / MQTT / OPC UA 四个通道。
 控制台是 Uno Platform 编译到 WebAssembly 的单页应用，由同一个进程托管，浏览器直接访问。
 
 设计重心不在「能连多少种设备」，而在**可治理**：
@@ -246,6 +246,7 @@ src/
   Uic.Codec.S7/       TPKT / COTP / S7 PDU 编解码与地址解析（纯函数）
   Uic.Driver.Modbus/  Modbus 主站（TCP / RTU / ASCII）
   Uic.Driver.S7/      S7comm 主站：会话、PDU 协商、按 PDU 切片、位读写
+  Uic.Driver.OpcUa/   OPC UA 客户端：NodeId 寻址、批量读、写、订阅、证书/PKI
   Uic.Driver.Virtual/ 虚拟设备：波形 + 故障注入
   Uic.Sim.Modbus/     Modbus 从站模拟器（被 sim 模式与测试复用）
   Uic.Sim.S7/         S7 从站模拟器（同上）
@@ -275,8 +276,8 @@ docs/                 架构、配置、北向契约、测试矩阵、实现说�
 | `Microsoft.Extensions.Logging.Abstractions` 10.0.14 | 日志抽象（实现由宿主注入） |
 | `System.IO.Ports` 10.0.14 | 串口字节流 |
 | `FrameworkReference Microsoft.AspNetCore.App` | 宿主、REST、SSE |
-| `OPCFoundation.NetStandard.Opc.Ua.Server` / `.Configuration` 1.5.378.182 | OPC UA 服务端 |
-| `OPCFoundation.NetStandard.Opc.Ua.Client` 1.5.378.182 | 仅测试：用标准客户端验收端点 |
+| `OPCFoundation.NetStandard.Opc.Ua.Server` / `.Configuration` 1.5.378.182 | OPC UA 服务端（北向） |
+| `OPCFoundation.NetStandard.Opc.Ua.Client` 1.5.378.182 | OPC UA 客户端驱动（南向），测试里同时用它验收服务端 |
 
 前端另用 Uno Platform（`Uno.WinUI` / `Uno.Wasm.Bootstrap`），版本集中在 `src/Uic.Ui/Uic.Ui.csproj`。
 

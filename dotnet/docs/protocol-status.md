@@ -25,7 +25,7 @@
 | Modbus RTU/ASCII | 从站 | 未实现 | — | FR-COL-03 的延伸 |
 | 虚拟设备 | 主站侧 | 已实现 | `Uic.Driver.Virtual` | FR-COL-07 |
 | OPC UA | 服务端 | 已实现（匿名 + None） | `Uic.OpcUa` | 北向 FR-NOR |
-| OPC UA | 客户端 | **未实现** | — | FR-COL-05（M，首版缺口） |
+| OPC UA | 客户端 | 已实现（None / Basic256Sha256） | `Uic.Driver.OpcUa` | FR-COL-05 |
 | MQTT | 北向发布 | 已实现（3.1.1） | `Uic.Northbound` | FR-NOR-04 |
 | MQTT | 北向下行命令 | 已实现（白名单） | `Uic.Northbound/MqttCommandSink.cs` | FR-OPS 远程命令 |
 | MQTT | 南向订阅取数 | **未实现** | — | FR-COL-06（M，首版缺口） |
@@ -44,10 +44,12 @@
 
 先给结论：
 
-- **能用的只有 Modbus 三个变体（主站）+ Modbus TCP 从站 + S7 主站 + 虚拟设备**，
+- **能用的是 Modbus 三个变体（主站）+ Modbus TCP 从站 + S7 主站 + OPC UA 客户端 + 虚拟设备**，
   北向是 REST/SSE/MQTT/OPC UA 服务端。这条链路是完整的，带黄金帧和端到端用例。
-- **OPC UA 客户端与 MQTT 南向取数是 PRD 里的 M 级需求，本版本没做**。这不是 PRD §6.1
+- **MQTT 南向取数（FR-COL-06）是 PRD 里的 M 级需求，本版本没做**。这不是 PRD §6.1
   「不做」清单里的项，属于真实缺口（见 [requirements-traceability.md](requirements-traceability.md)）。
+- OPC UA 客户端有两处**已验证边界**，不要当成「全都能接」：订阅没有接入采集主路径
+  （仍是轮询），Basic256Sha256 没有仓内端到端（见 §3.4）。
 - **BACnet、IEC 104、CIP、MC、FINS 是 PRD §6.1 明确不做**，属于产品范围决定。
 - **PROFINET、EtherCAT、GB/T 28181 不在协议路线图内**，原因是它们与轮询式采集模型
   冲突或需要专用硬件，不是「以后补个驱动」的事（见 §4）。
@@ -166,9 +168,38 @@ validate/apply/versions/diff/rollback/export/import、模板 CRUD 与批量实�
 | 订阅 | 由标准服务端栈提供 MonitoredItem/Subscription |
 | 审计 | 写入次数/失败次数计入服务端指标 |
 
-**OPC UA 客户端**（FR-COL-05）没有实现，也没有半成品：会话建立、重连、
-MonitoredItem 生命周期、证书信任链都要另写一套。北向服务端的地址空间模型
-不能直接反用成客户端，所以不能靠「把服务端代码翻过来」省事。
+### 3.4 OPC UA 客户端
+
+| 能力 | 实现情况 |
+|---|---|
+| 角色 | 客户端（网关去读 PLC/SCADA 的 UA 服务端） |
+| 协议栈 | `OPCFoundation.NetStandard.Opc.Ua.Client`（官方栈），不手写二进制层 |
+| 传输 | `opc.tcp://`，端点由通道 `host`/`port`（默认 4840）+ `labels.endpointPath` 拼出 |
+| 寻址 | 符号寻址：`address.path` 写 NodeId 文本（`ns=2;s=Demo.Temp` / `ns=2;i=85`）；省略 `ns=` 时用 `address.index` |
+| 安全 | `labels.securityPolicy` = `None` / `Basic256Sha256`，`labels.securityMode` = `None` / `Sign` / `SignAndEncrypt`；**端点按配置精确匹配，找不到就报错并列出服务端实际档位，绝不静默降级** |
+| 身份 | 匿名（`UserIdentity` 空实例）。用户名/口令链路没有接进驱动，配置了也不会试图登录 |
+| 读 | 一轮的点位合并成一次 Read 服务调用，按服务端 `MaxNodesPerRead` 分片；地址写错的点位单独落 `address_error`，不拖累同批其他点 |
+| 写 | Write 服务，逐点裁决；越界/类型不符在**发到线上之前**就被拒绝 |
+| 订阅 | MonitoredItem + Subscription，通过 `Uic.Driver` 的可选接口 `ISubscriptionConn` 暴露 |
+| 证书 | PKI 默认落在 `<dataDir>/opcua-client-pki`（`labels.pkiDir` 可覆盖，相对路径按数据目录解析）；首次连接自动生成客户端自签证书 |
+
+**两处必须说清的边界**：
+
+1. **订阅没有接入采集主路径。** `ISubscriptionConn` 已实现并通过回环用例，
+   但 `DeviceActor` 仍然按周期轮询——与 Modbus/S7 完全一致。把订阅接进去要另做
+   「推送驱动的重试/熔断/代次隔离」，以及没有周期可依据时的看门狗语义，
+   属于独立的调度改造。所以现在的 `Capabilities.Subscribe = supported` 说的是
+   「这个驱动能提供订阅」，不是「采集走订阅」。
+2. **Basic256Sha256 没有仓内端到端。** 内置服务端（`Uic.OpcUa`）只提供
+   `SecurityPolicy.None`（配置校验就拒绝其它策略），因此无法在仓库内跑通一条
+   加密会话。已覆盖的部分：策略名/模式校验、`SelectEndpoint` 的精确匹配与
+   失败信息（`opcua/endpoint_selection_never_downgrades`），以及真连一次
+   「配置要 Basic256Sha256、服务端只有 None」必须显式失败
+   （`opcua/client_secure_policy_fails_without_match`）。**首次上真机时必须单独验一次
+   证书信任链与加密会话**，别拿这套用例当加密已验收。
+
+**明确不支持并显式报错**：`nsu=` / `svr=`（服务端作用域命名空间）、
+Basic128Rsa15/Aes 系列策略、结构体/ExtensionObject 类型的值、BCD 类型。
 
 ## 4. 没实现的协议：分三类，不要混为一谈
 
@@ -176,10 +207,9 @@ MonitoredItem 生命周期、证书信任链都要另写一套。北向服务端
 
 | 协议 | 缺什么 | 补的时候要动哪里 |
 |---|---|---|
-| **OPC UA 客户端** | 全部。会话、订阅、证书、重连、点位映射 | 新增 `Uic.Driver.OpcUa`，建议直接用 `Opc.Ua.Client` 而不是手写二进制栈；`Capabilities.Subscribe` 放开为 `Supported` |
 | **MQTT 南向取数** | 全部。订阅主题 → 点位映射、断线重订阅、质量传播 | 新增 `Uic.Driver.Mqtt`；连接生命周期要与北向 MQTT 隔离，避免一个 broker 抖动同时打穿两侧 |
 
-这两项是**真实的验收缺口**。当前版本能进现场做的只有 Modbus + S7 + OPC UA 服务端/北向，
+这一项是**真实的验收缺口**。当前版本能进现场做的是 Modbus + S7 + OPC UA 客户端 + OPC UA 服务端/北向，
 不能说「PRD 的首版范围已经闭环」。
 
 ### 4.2 PRD §6.1 明确不做（产品范围决定）

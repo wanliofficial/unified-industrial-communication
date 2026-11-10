@@ -82,6 +82,12 @@ public sealed record SchedulerOptions
 
     /// <summary>探活间隔（熔断后）。</summary>
     public TimeSpan ProbeInterval { get; init; } = TimeSpan.FromSeconds(30);
+
+    /// <summary>
+    /// 数据目录。需要落本地文件的协议（证书库）通过 <see cref="OpenContext"/> 拿到它，
+    /// 而不是去读进程的当前目录——驱动的输入必须全部来自显式参数。
+    /// </summary>
+    public string? DataDir { get; init; }
 }
 
 /// <summary>
@@ -547,7 +553,7 @@ public sealed class DeviceActor : IAsyncDisposable
             SetState(RuntimeState.Connecting);
             var generation = Interlocked.Increment(ref _generation);
 
-            var ctx = new OpenContext(_channel, _device, _log, NullMetrics.Instance);
+            var ctx = new OpenContext(_channel, _device, _log, NullMetrics.Instance, _options.DataDir);
             var conn = _driver.Open(ctx);
 
             try

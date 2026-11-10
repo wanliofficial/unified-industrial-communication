@@ -107,7 +107,8 @@ public sealed class GatewayRuntime : IGatewayControl, IAsyncDisposable
         _log = logs.CreateLogger("uic.runtime");
         _metrics = new MetricsRegistry();
 
-        _engine = new Scheduler(drivers, new PointCache(), logs, schedulerOptions);
+        _engine = new Scheduler(drivers, new PointCache(), logs,
+            (schedulerOptions ?? new SchedulerOptions()) with { DataDir = dataDir });
         _engine.Start(config);
 
         // 审计随数据目录走，默认开启：它是「谁改了什么」的唯一落盘记录。

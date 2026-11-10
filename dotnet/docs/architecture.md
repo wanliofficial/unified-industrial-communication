@@ -33,11 +33,17 @@
         ┌─────────▼──────────┐   ┌───────────────────┐
         │ Uic.Driver.Modbus  │   │ Uic.Domain         │
         │ Uic.Driver.S7      │   │ 模型 + 线上契约     │
-        │ Uic.Driver.Virtual │   └───────────────────┘
-        │ Uic.Sim.Modbus     │
+        │ Uic.Driver.OpcUa   │   └───────────────────┘
+        │ Uic.Driver.Virtual │
+        │ Uic.Sim.Modbus     │   ← 南向驱动（取数）
         │ Uic.Sim.S7         │
         └────────────────────┘
 ```
+
+`Uic.Driver.OpcUa` 与 `Uic.OpcUa` 是两条相反的边：前者是南向**客户端**（网关去读别人的
+地址空间），位于驱动层、只引用 `Uic.Domain` + `Uic.Driver`；后者是北向**服务端**
+（网关把自己的点位暴露出去），位于北向侧、认识 `PointCache` 与调度器。
+两者不互相引用——共享的只有同名的协议栈依赖。
 
 依赖只向下：下层不认识上层。`Uic.Domain` 不引用任何框架包，
 所以同一份模型既能在服务端序列化，也能编译进 WASM 前端。
@@ -53,6 +59,7 @@
 | `Uic.Transport` | 字节流（TCP / 串口 / 内存）、超时、分帧 | 业务语义 |
 | `Uic.Driver.Modbus` | 主站：连接、探活、读写、异常码映射 | 采集节奏 |
 | `Uic.Driver.S7` | 主站：COTP 会话、PDU 协商、按 PDU 切片、位读写 | 采集节奏 |
+| `Uic.Driver.OpcUa` | 主站（客户端）：NodeId 寻址、批量读、写、订阅、证书/PKI | 采集节奏、地址空间暴露 |
 | `Uic.Sim.Modbus` | 从站：寄存器模型、异常注入 | 北向 |
 | `Uic.Sim.S7` | 从站：DB/I/Q/M 内存模型、返回码 | 北向 |
 | `Uic.Driver.Virtual` | 波形生成、故障注入 | 网络 |
@@ -69,9 +76,10 @@
 ### 南向：一次采集
 
 1. `DeviceActor` 按点位有效周期分桶（点位 `interval` 覆盖设备周期）后唤醒：每轮只读到期的桶，到期的多桶合并成一次读取（调度 tick 50 ms；启动相位按设备内最快点位周期把设备均匀铺开；到期时间用单调时钟，NTP 校时不会打乱节奏）；
-2. `ReadPlanner` 把每个周期桶内的点位合并成若干「寄存器窗口」——连续地址合并、按区分离、按协议上限切分；
+2. `ReadPlanner` 把每个周期桶内的点位合并成若干「寄存器窗口」——连续地址合并、按区分离、按协议上限切分。
+   符号寻址（OPC UA）没有窗口概念，一个点一个 span，由驱动在一轮里合并成一次 Read 服务调用；
 3. `IConn.ReadAsync(spans)` 一次往返拿回整窗；
-4. `ModbusCodec` 按点位类型与字节序解出 `RawSample`；
+4. `ModbusCodec` / S7 编解码 / OPC UA `Variant` 按点位类型与字节序解出 `RawSample`；
 5. `Pipeline.Process` 做缩放/偏移、质量传播、整数类型的取整；
 6. `PointCache.PublishConfigured` 按点位的死区模式（绝对值 / 量程百分比 / 变化率）判断是否越过阈值，只有「确实变化」才通知订阅者；
 7. `SampleFanout` 把变化序列化成一行 JSON，追加到每个 sink 的分区。
