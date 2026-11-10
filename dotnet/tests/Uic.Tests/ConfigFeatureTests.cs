@@ -1,3 +1,4 @@
+using System.Text.Json;
 using System.Text.Json.Nodes;
 using Uic.Config;
 using Uic.Domain;
@@ -32,6 +33,8 @@ internal static class ConfigFeatureTests
         tests.Add(new TestCase("config/redacted_secrets_are_restored", RedactedSecretsAreRestored));
         tests.Add(new TestCase("config/repository_examples_validate", RepositoryExamplesValidate));
         tests.Add(new TestCase("config/console_draft_builds_a_valid_document", ConsoleDraftBuildsValidDocument));
+        tests.Add(new TestCase("config/four_address_kinds_validate", FourAddressKindsValidate));
+        tests.Add(new TestCase("template/one_template_targets_modbus_and_s7", OneTemplateTargetsModbusAndS7));
     }
 
     private static DeviceTemplate Template(string json)
@@ -687,6 +690,185 @@ internal static class ConfigFeatureTests
             "sub-second durations stay readable");
         t.Equal("2m", ConfigDraft.FormatDuration(TimeSpan.FromMinutes(2)),
             "minutes use the short form");
+
+        return Task.CompletedTask;
+    }
+
+    /// <summary>
+    /// FR-CFG-01 的模型一半：四类寻址共用同一个 <see cref="Address"/>，各自必填/禁止的
+    /// 字段由 <see cref="Address.Validate"/> 收口。
+    ///
+    /// 这里断言的是「模型真的认这四种、且拒绝混填」，不是「已经有驱动去读对象/文件」：
+    /// object 要等 BACnet/CIP，file 要等带文件记录语义的协议。把它们混填进寄存器点位
+    /// 是跨协议复制粘贴最常见的错误，必须在配置阶段就指出具体字段。
+    /// </summary>
+    private static Task FourAddressKindsValidate(TestContext t)
+    {
+        static string Document(string address) => """
+            {
+              "schemaVersion": 1,
+              "site": "kinds",
+              "channels": [{ "id": "ch", "protocol": "virtual", "transport": "none" }],
+              "devices": [{
+                "id": "d1", "channelId": "ch", "interval": "1s",
+                "points": [ { "id": "p", "address": ADDRESS, "dataType": "float32" } ]
+              }]
+            }
+            """.Replace("ADDRESS", address);
+
+        var register = ConfigStore.Parse(Document(
+            """{ "kind": "register", "area": "holding", "offset": 4 }"""), "register.json");
+        t.Equal(AddressKind.Register, register.Devices[0].Points[0].Address.Kind,
+            "register addressing is accepted");
+
+        var symbol = ConfigStore.Parse(Document(
+            """{ "kind": "symbol", "path": "ns=2;s=Demo.Temp" }"""), "symbol.json");
+        t.Equal("ns=2;s=Demo.Temp", symbol.Devices[0].Points[0].Address.Path,
+            "symbol addressing keeps the path verbatim");
+
+        var obj = ConfigStore.Parse(Document("""
+            { "kind": "object", "objectType": "analogInput", "instance": 3, "property": "presentValue" }
+            """), "object.json");
+        t.Equal(AddressKind.Object, obj.Devices[0].Points[0].Address.Kind,
+            "object addressing carries type/instance/property");
+        t.Equal("analogInput", obj.Devices[0].Points[0].Address.ObjectType, "the object type survives");
+        t.Equal(3, obj.Devices[0].Points[0].Address.Instance, "the instance survives");
+
+        var file = ConfigStore.Parse(Document(
+            """{ "kind": "file", "fileId": 2, "recordId": 7 }"""), "file.json");
+        t.Equal(2, file.Devices[0].Points[0].Address.FileId, "file addressing carries file and record ids");
+
+        // 稳定键决定批量规划的分组：四种寻址不能算出同一个键。
+        var keys = new[] { register, symbol, obj, file }
+            .Select(d => d.Devices[0].Points[0].Address.StableKey())
+            .ToArray();
+        t.Equal(4, keys.Distinct(StringComparer.Ordinal).Count(), "each kind has its own stable key");
+
+        // 混填必须在配置阶段被拒绝，并指出是哪一类多出来的字段。
+        void ExpectRejected(string address, string path, string what)
+        {
+            try
+            {
+                ConfigStore.Parse(Document(address), "mixed.json");
+                t.Fail($"{what}: a mixed address was accepted");
+            }
+            catch (ConfigException ex)
+            {
+                t.Contains(string.Join("; ", ex.Problems), path, what);
+            }
+        }
+
+        ExpectRejected("""{ "kind": "register", "area": "holding", "path": "ns=2;s=X" }""",
+            "address.path", "a path on a register address is rejected");
+        ExpectRejected("""{ "kind": "symbol", "path": "s=X", "area": "holding" }""",
+            "address.area", "an area on a symbol address is rejected");
+        ExpectRejected("""{ "kind": "object", "instance": 1, "property": "p" }""",
+            "address.objectType", "an object address needs its type");
+        ExpectRejected("""{ "kind": "file", "fileId": 1, "recordId": 2, "area": "db1" }""",
+            "address.area", "an area on a file address is rejected");
+
+        return Task.CompletedTask;
+    }
+
+    /// <summary>
+    /// FR-CFG-01 的验收口径：**同一套模板可生成 Modbus 与 S7 设备**。
+    ///
+    /// 两者线上都是「寄存器 + 区名 + 偏移」，差别只在区名（holding / db1）与偏移单位
+    /// （字 / 字节）。模板里把这两个值参数化，就能用同一份骨架产出两台设备——这正是
+    /// 「四类寻址统一模型」要买到的东西：模板不必为每个协议各写一份。
+    /// </summary>
+    private static Task OneTemplateTargetsModbusAndS7(TestContext t)
+    {
+        // 区名与偏移都来自参数：Modbus 用字偏移，S7 用字节偏移。
+        var template = Template("""
+            {
+              "schemaVersion": 1,
+              "id": "meter",
+              "parameters": [
+                { "name": "id", "type": "string", "required": true },
+                { "name": "channel", "type": "string", "required": true },
+                { "name": "area", "type": "string", "required": true },
+                { "name": "offset", "type": "int", "required": true }
+              ],
+              "device": {
+                "id": "{id}",
+                "channelId": "{channel}",
+                "interval": "1s",
+                "points": [
+                  {
+                    "id": "voltage",
+                    "address": { "kind": "register", "area": "{area}", "offset": "{offset}" },
+                    "dataType": "float32"
+                  }
+                ]
+              }
+            }
+            """);
+
+        var channels = new[] { "modbus-bus", "s7-bus" };
+
+        var modbus = TemplateInstantiator.Instantiate(template, new Dictionary<string, string?>
+        {
+            ["id"] = "meter-1",
+            ["channel"] = "modbus-bus",
+            ["area"] = "holding",
+            ["offset"] = "20",
+        }, channels);
+        t.Ok(modbus.Ok, $"the Modbus instance is valid: {string.Join("; ", modbus.Problems)}");
+
+        var s7 = TemplateInstantiator.Instantiate(template, new Dictionary<string, string?>
+        {
+            ["id"] = "plc-1",
+            ["channel"] = "s7-bus",
+            ["area"] = "db1",
+            ["offset"] = "16",
+        }, channels);
+        t.Ok(s7.Ok, $"the S7 instance is valid: {string.Join("; ", s7.Problems)}");
+
+        // 两份实例除了参数值之外完全同构：区名与偏移来自模板，而不是按协议写的分支。
+        t.Equal("modbus-bus", modbus.Device!.ChannelId, "the Modbus instance keeps its channel");
+        t.Equal("holding", modbus.Device.Points[0].Address.Area, "the Modbus area comes from the parameter");
+        t.Equal(20, modbus.Device.Points[0].Address.Offset, "the Modbus offset is a word offset");
+
+        t.Equal("s7-bus", s7.Device!.ChannelId, "the S7 instance keeps its channel");
+        t.Equal("db1", s7.Device.Points[0].Address.Area, "the S7 area comes from the same parameter");
+        t.Equal(16, s7.Device.Points[0].Address.Offset, "the S7 offset is a byte offset");
+
+        // 真正的断言：两台设备放进同一份配置后仍然合法，而不是「各自能反序列化」。
+        var root = new JsonObject
+        {
+            ["schemaVersion"] = 1,
+            ["site"] = "mixed",
+            ["channels"] = new JsonArray
+            {
+                new JsonObject
+                {
+                    ["id"] = "modbus-bus", ["protocol"] = "modbus-tcp", ["transport"] = "tcp",
+                    ["host"] = "127.0.0.1", ["port"] = 1502,
+                },
+                new JsonObject
+                {
+                    ["id"] = "s7-bus", ["protocol"] = "s7", ["transport"] = "tcp",
+                    ["host"] = "127.0.0.1", ["port"] = 102,
+                },
+            },
+            ["devices"] = new JsonArray(),
+        };
+
+        t.Ok(ConfigDraft.AddDevice(root,
+                JsonSerializer.SerializeToNode(modbus.Device, JsonDefaults.Options)!.AsObject()) is null,
+            "the Modbus device is appended");
+        t.Ok(ConfigDraft.AddDevice(root,
+                JsonSerializer.SerializeToNode(s7.Device, JsonDefaults.Options)!.AsObject()) is null,
+            "the S7 device is appended");
+
+        var document = ConfigStore.Parse(root.ToJsonString(JsonDefaults.Indented), "one-template.json");
+        t.Equal(2, document.Devices.Count, "both protocol variants landed in one document");
+
+        var plc = document.Devices.Single(d => d.Id == "plc-1");
+        t.Equal("db1", plc.Points[0].Address.Area, "the document keeps the S7 area");
+        t.Equal(0, ModelValidator.Validate(document).Count,
+            "the document produced by one template passes validation for both protocols");
 
         return Task.CompletedTask;
     }

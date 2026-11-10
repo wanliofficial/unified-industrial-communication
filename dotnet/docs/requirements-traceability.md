@@ -7,11 +7,12 @@
 - 「刻意没做」= 有意识不做，给出原因与补法（与 [implementation-notes.md](implementation-notes.md) 的「刻意没做」一致）。
 
 首版的目标范围是 PRD §6.1 的 Wave 1 子集：**Modbus 三封装 + S7 主站 + OPC UA 客户端 + MQTT 南向订阅 + 虚拟设备 + 四北向通道 + 配置治理 + Outbox + 可观测**。
-PRD 中 M 级的采集协议已全部落地；剩余延期项只有非 register 寻址的 object/file 驱动
-与三类依赖环境的故障注入，逐条见 §7 与 [protocol-status.md](protocol-status.md)。
+PRD 中 M 级的采集协议已全部落地，FR-CFG-01 的四类寻址模型也已按验收口径闭环
+（object/file 只差驱动，见该行备注）。剩余延期项只有三类依赖环境的故障注入，
+逐条见 §7 与 [protocol-status.md](protocol-status.md)。
 
-当前测试基线：**292 passed / 0 failed / 3 skipped**（跳过的是需要 `--opcua` 的 OPC UA 端到端用例）；
-加 `-- --opcua` 跑全量是 **295 passed / 0 failed / 0 skipped**。
+当前测试基线：**294 passed / 0 failed / 3 skipped**（跳过的是需要 `--opcua` 的 OPC UA 端到端用例）；
+加 `-- --opcua` 跑全量是 **297 passed / 0 failed / 0 skipped**。
 
 ## 1. 采集（FR-COL）
 
@@ -34,7 +35,7 @@ PRD 中 M 级的采集协议已全部落地；剩余延期项只有非 register 
 
 | 编号 | 需求 | 状态 | 证据 / 说明 |
 |---|---|---|---|
-| FR-CFG-01 | 四类寻址统一模型 | 部分实现 | `Address` 已含 register/symbol/object/file 四类字段与校验。**register** 由 Modbus 与 S7 实现；**symbol** 由 OPC UA（`path` 承载 NodeId 文本，`index` 作省略 `ns=` 时的命名空间）与 MQTT 南向（`path` 承载主题过滤器，`property` 承载 JSON 字段）实现；**object / file** 仍只是扩展点，没有驱动消费。证据：`opcua/address_parses_node_ids`、`opcua/address_rejects_bad_input`、`mqtt/topic_matcher_follows_wildcard_rules`、`mqtt/driver_uses_point_field_override`、`config/console_draft_builds_a_valid_document` |
+| FR-CFG-01 | 四类寻址统一模型 | 已实现 | `Address` 一个结构承载 register/symbol/object/file，四类各自必填与禁止字段由 `Address.Validate` 收口（混填即拒绝并指出多余字段）。**register** 由 Modbus 与 S7 实现；**symbol** 由 OPC UA（`path` 承载 NodeId 文本，`index` 作省略 `ns=` 时的命名空间）与 MQTT 南向（`path` 承载主题过滤器，`property` 承载 JSON 字段）实现；**object / file** 模型与校验已就绪，但还没有驱动消费（要等 BACnet/CIP 的对象模型、带文件记录语义的协议）。验收口径「同一套模板可生成 Modbus 与 S7 设备」由 `template/one_template_targets_modbus_and_s7` 覆盖。证据：`config/four_address_kinds_validate`、`template/one_template_targets_modbus_and_s7`、`opcua/address_parses_node_ids`、`opcua/address_rejects_bad_input`、`mqtt/topic_matcher_follows_wildcard_rules`、`mqtt/driver_uses_point_field_override`、`config/console_draft_builds_a_valid_document` |
 | FR-CFG-02 | 数据类型系统（≥8 类，含数组） | 已实现 | 13 种标量类型（bool/int/uint 16/32/64/float 32/64/string/BCD16/BCD32/bytes/datetime）；datetime 固定 4 寄存器 int64 Unix 毫秒 UTC，北向用 ISO-8601 UTC 文本：`codec/datetime_is_unix_milliseconds`、`json/datavalue_wire_shape_is_stable`、`opcua/anonymous_session_read_write_subscribe`。数组用「元素类型 + 元素个数」正交表达（`dataType` + `count`），只允许定宽数值类型，逐元素套字节序、逐元素缩放、死区取最大变化：`codec/array_roundtrip_per_element_byte_order`、`codec/array_encode_rejects_wrong_element_count`、`codec/array_rejects_non_numeric_element_types`、`json/datavalue_array_shape`、`json/config_point_count_roundtrip`、`pipeline/array_scales_element_wise`、`pipeline/deadband_array_uses_largest_change`、`config/array_count_rules`、`csv/imports_array_count`、`contract/points_expose_array_count_and_values`，另 4 份数组黄金帧 |
 | FR-CFG-03 | 字节序 ABCD/CDAB/BADC/DCBA | 已实现 | `codec/byte_order_encodes_as_expected`、`codec/byte_order_roundtrip`、`json/enums_are_lowercase_wire_names` |
 | FR-CFG-04 | 设备模板 + 参数化实例化（≥50 实例） | 已实现 | `template/instantiate_fifty_devices`（50 个实例逐个断言）、`contract/template_instantiates_and_applies_devices`、`template/rejects_bad_parameters`、`template/store_rejects_unknown_placeholder` |
@@ -165,9 +166,9 @@ PRD `06-nfr.md` §4 列了五条红线，本版全部满足。TLS（FR-OPS-10）
 
 安全面上没有刻意留白的项：认证（FR-OPS-02/03）、审计（FR-OPS-04）、凭据落盘
 （FR-OPS-09）与 TLS（FR-OPS-10）都已在本版实现。剩下的差距是**PRD §6.1 之外的
-协议范围**（Wave 2/3，见 [protocol-status.md](protocol-status.md)）、非 register
-寻址的 object/file 驱动，以及依赖环境的三类故障注入（见 [testing.md](testing.md)），
-都不是安全红线。
+协议范围**（Wave 2/3，见 [protocol-status.md](protocol-status.md)）、object/file
+寻址的实际驱动（模型与校验已就绪），以及依赖环境的三类故障注入（见
+[testing.md](testing.md)），都不是安全红线。
 
 ## 10. 怎么用这份表
 

@@ -243,7 +243,7 @@ Basic128Rsa15/Aes 系列策略、结构体/ExtensionObject 类型的值、BCD �
 
 | 项 | 状态 | 说明 |
 |---|---|---|
-| FR-CFG-01 非 register 寻址驱动 | 部分实现 | symbol 已由 OPC UA 与 MQTT 消费；object / file 仍只是模型扩展点 |
+| object / file 寻址的驱动 | 模型已就绪，驱动未做 | 四类寻址的模型与校验已闭环（`config/four_address_kinds_validate`），symbol 由 OPC UA 与 MQTT 消费；object 要等 BACnet/CIP 的对象模型，file 要等带文件记录语义的协议 |
 | 故障注入矩阵 | 部分实现 | 磁盘满、时钟跳变、进程假死三类未覆盖 |
 
 ### 4.2 PRD §6.1 明确不做（产品范围决定）
