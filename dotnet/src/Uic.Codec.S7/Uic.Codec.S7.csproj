@@ -1,0 +1,9 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <RootNamespace>Uic.Codec.S7</RootNamespace>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\Uic.Domain\Uic.Domain.csproj" />
+    <ProjectReference Include="..\Uic.Driver\Uic.Driver.csproj" />
+  </ItemGroup>
+</Project>

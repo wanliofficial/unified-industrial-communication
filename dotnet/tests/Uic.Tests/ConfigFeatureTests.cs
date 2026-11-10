@@ -604,6 +604,32 @@ internal static class ConfigFeatureTests
         t.Equal("none", ConfigDraft.NewChannel("v-1", null, "virtual")["transport"]?.ToString(),
             "virtual needs no transport");
 
+        // S7：协议决定默认端口（102）与区域下拉内容。这两件事都在域层，
+        // 页面只是照抄；写错的话现场表现是「点创建就 422」或「连 502 超时」。
+        t.Equal("tcp", ConfigDraft.TransportFor("s7"), "S7 runs over ISO-on-TCP");
+        t.Equal(102, ConfigDraft.DefaultPort("s7"), "S7 defaults to port 102");
+        t.Equal(502, ConfigDraft.DefaultPort("modbus-tcp"), "Modbus still defaults to 502");
+
+        var s7Channel = ConfigDraft.NewChannel("s7-1", "S7 链路", "s7", "127.0.0.1", 102);
+        t.Equal("tcp", s7Channel["transport"]?.ToString(), "the S7 channel uses the TCP transport");
+        t.Equal("102", s7Channel["port"]?.ToString(), "the S7 port is written");
+        t.Ok(ConfigDraft.AddChannel(root!, s7Channel) is null, "the S7 channel is appended");
+
+        var s7Device = ConfigDraft.NewDevice(
+            "plc-2", "PLC 2", "s7-1", TimeSpan.FromMilliseconds(500), 1,
+            ConfigDraft.NewRegisterPoint("count", "计数", "uint32", "db1", 16));
+        t.Ok(ConfigDraft.AddDevice(root!, s7Device) is null, "the S7 device is appended");
+
+        var s7Document = ConfigStore.Parse(root!.ToJsonString(JsonDefaults.Indented), "s7-draft");
+        var plc = s7Document.Devices.Single(d => d.Id == "plc-2");
+        t.Equal("db1", plc.Points[0].Address.Area, "the S7 area is kept verbatim (db<N>)");
+        t.Equal(16, plc.Points[0].Address.Offset, "the S7 offset is a byte offset");
+
+        // 位点位：bit 必须落进连线的地址里，否则 bool 点位读不出单个位。
+        var bitPoint = ConfigDraft.NewRegisterPoint("motor", "电机", "bool", "m", 4, bit: 5);
+        t.Equal(5, ConfigDraft.NewDevice("plc-3", null, "s7-1", TimeSpan.FromSeconds(1), 1, bitPoint)
+            ["points"]![0]!["address"]!["bit"]!.GetValue<int>(), "the bit index is written");
+
         t.Equal("500ms", ConfigDraft.FormatDuration(TimeSpan.FromMilliseconds(500)),
             "sub-second durations stay readable");
         t.Equal("2m", ConfigDraft.FormatDuration(TimeSpan.FromMinutes(2)),

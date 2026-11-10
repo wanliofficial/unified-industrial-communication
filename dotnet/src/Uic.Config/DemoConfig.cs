@@ -12,13 +12,18 @@ public static class DemoConfig
 {
     /// <summary>
     /// <paramref name="enableLocalModbus"/> 为 true 时启用指向本机 15020 的 Modbus 设备，
+    /// <paramref name="enableLocalS7"/> 为 true 时启用指向本机 15102 的 S7 设备，
     /// 供 <c>uic sim</c> 使用：模拟从站与采集主站跑在同一个进程里，开箱即可看到完整闭环。
     /// </summary>
-    public static ConfigDocument Build(bool enableLocalModbus = false, int modbusPort = 15020) => new()
+    public static ConfigDocument Build(
+        bool enableLocalModbus = false,
+        int modbusPort = 15020,
+        bool enableLocalS7 = false,
+        int s7Port = 15102) => new()
     {
         SchemaVersion = 1,
         Site = "demo-site",
-        Description = "开箱即用的示例配置：一台虚拟设备 + 一台本机 Modbus TCP 设备",
+        Description = "开箱即用的示例配置：一台虚拟设备 + 本机 Modbus TCP / S7 设备",
         Channels = new List<Channel>
         {
             new()
@@ -39,6 +44,18 @@ public static class DemoConfig
                 Timeout = TimeSpan.FromSeconds(2),
                 ConnectTimeout = TimeSpan.FromSeconds(2),
                 MaxConcurrency = 2,
+            },
+            new()
+            {
+                Id = "s7-tcp-1",
+                Name = "本机 S7 PLC",
+                Protocol = "s7",
+                Transport = "tcp",
+                Host = "127.0.0.1",
+                Port = s7Port,
+                Timeout = TimeSpan.FromSeconds(2),
+                ConnectTimeout = TimeSpan.FromSeconds(2),
+                MaxConcurrency = 1,
             },
         },
         Devices = new List<Device>
@@ -133,6 +150,64 @@ public static class DemoConfig
                         Id = "alarm",
                         Name = "报警位",
                         Address = Address.Register("coil", 3),
+                        DataType = DataType.Bool,
+                    },
+                },
+            },
+            new()
+            {
+                Id = "s7-1",
+                Name = "本机 S7 从站",
+                ChannelId = "s7-tcp-1",
+                Enabled = enableLocalS7,
+                Interval = TimeSpan.FromMilliseconds(500),
+                UnitId = 1,
+                ByteOrder = ByteOrder.ABCD,
+                Timeout = TimeSpan.FromSeconds(2),
+                FailureThreshold = 3,
+                RecoverInterval = TimeSpan.FromSeconds(10),
+                // 机架/槽位是会话参数，不是点位参数：S7-1200/1500 用 0/1，
+                // S7-300 常见 0/2。内置从站不校验，填默认值即可连通。
+                Labels = new Dictionary<string, string>(StringComparer.Ordinal)
+                {
+                    ["rack"] = "0",
+                    ["slot"] = "1",
+                },
+                Points = new List<Point>
+                {
+                    new()
+                    {
+                        Id = "temperature",
+                        Name = "温度",
+                        // S7 的 offset 是**字节**偏移，不是寄存器序号。
+                        Address = Address.Register("db1", 0),
+                        DataType = DataType.Float64,
+                        Unit = "°C",
+                        Deadband = 0.05,
+                    },
+                    new()
+                    {
+                        Id = "pressure",
+                        Name = "压力",
+                        Address = Address.Register("db1", 8),
+                        DataType = DataType.Float64,
+                        Unit = "kPa",
+                        Deadband = 0.1,
+                    },
+                    new()
+                    {
+                        Id = "counter",
+                        Name = "累计计数",
+                        Address = Address.Register("db1", 16),
+                        DataType = DataType.UInt32,
+                        Unit = "pcs",
+                    },
+                    new()
+                    {
+                        Id = "running",
+                        Name = "运行状态",
+                        // 位地址：M0.0。bool 点位必须带 bit，否则驱动会拒绝。
+                        Address = Address.Register("m", 0, bit: 0),
                         DataType = DataType.Bool,
                     },
                 },

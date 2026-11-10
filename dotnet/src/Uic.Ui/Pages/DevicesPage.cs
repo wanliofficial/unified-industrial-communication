@@ -21,7 +21,7 @@ namespace Uic.Ui.Pages;
 /// </summary>
 public sealed class DevicesPage : IPage, IDisposable
 {
-    private static readonly string[] Protocols = { "modbus-tcp", "modbus-rtu", "modbus-ascii", "virtual" };
+    private static readonly string[] Protocols = { "modbus-tcp", "modbus-rtu", "modbus-ascii", "s7", "virtual" };
 
     private static readonly string[] PointTypes =
     {
@@ -29,7 +29,13 @@ public sealed class DevicesPage : IPage, IDisposable
         "float32", "float64", "bool", "bcd16", "bcd32",
     };
 
-    private static readonly string[] Areas = { "holding", "input", "coil", "discrete" };
+    private static readonly string[] ModbusAreas = { "holding", "input", "coil", "discrete" };
+
+    /// <summary>
+    /// S7 的区名。db1/db2 是最常用的，先列出来；其余区在地址栏里照样能手填。
+    /// 不在这里铺满 db1..db65535 的下拉——那种下拉没人能滚到第 40 项。
+    /// </summary>
+    private static readonly string[] S7Areas = { "db1", "db2", "db3", "db10", "i", "q", "m" };
 
     private readonly GatewayApi _api;
     private readonly StackPanel _list = new() { Spacing = 0 };
@@ -68,6 +74,12 @@ public sealed class DevicesPage : IPage, IDisposable
 
     /// <summary>通道目录。选择「既有通道」时才需要它，因此只在打开表单时拉一次。</summary>
     private List<(string Id, string Protocol)> _channels = new();
+
+    /// <summary>用户是否手动改过端口。改过就不再用协议默认值覆盖他填的值。</summary>
+    private bool _portTouched;
+
+    /// <summary>程序正在回填默认端口：此时触发的 TextChanged 不算用户输入。</summary>
+    private bool _settingPort;
 
     private bool _disposed;
     private bool _busy;
@@ -158,6 +170,12 @@ public sealed class DevicesPage : IPage, IDisposable
         _host.PlaceholderText = "192.168.1.10";
         _port.PlaceholderText = "502";
         _port.Text = "502";
+        _port.TextChanged += (_, _) =>
+        {
+            // 程序自己写默认端口不算「用户改过」；否则切一次协议后
+            // 就再也不跟着默认值走了。
+            if (!_settingPort) _portTouched = true;
+        };
         _serialPort.PlaceholderText = "/dev/ttyUSB0";
         _baud.PlaceholderText = "9600";
         _baud.Text = "9600";
@@ -176,7 +194,7 @@ public sealed class DevicesPage : IPage, IDisposable
         foreach (var type in PointTypes) _pointType.Items.Add(type);
         _pointType.SelectedIndex = 0;
 
-        foreach (var area in Areas) _area.Items.Add(area);
+        foreach (var area in ModbusAreas) _area.Items.Add(area);
         _area.SelectedIndex = 0;
 
         // 通道：既有通道下拉 + 新建通道时展开的传输参数。
@@ -240,11 +258,37 @@ public sealed class DevicesPage : IPage, IDisposable
 
     private string SelectedPointType => _pointType.SelectedItem as string ?? PointTypes[0];
 
-    private string SelectedArea => _area.SelectedItem as string ?? Areas[0];
+    /// <summary>
+    /// 当前区域下拉里选中的值。下拉内容随协议变化（S7 没有 holding/coil），
+    /// 所以不能像以前那样写死回退到 <c>holding</c>——那会把 S7 的点位
+    /// 悄悄写成 Modbus 的形状。
+    /// </summary>
+    private string SelectedArea =>
+        _area.SelectedItem as string
+        ?? (_area.Items.Count > 0 ? _area.Items[0] as string : null)
+        ?? "holding";
+
+    private bool SelectedProtocolIsS7 => SelectedProtocol == "s7";
+
+    /// <summary>协议决定可用的区名。S7 的区是 db&lt;N&gt;/i/q/m，与 Modbus 的 holding/coil 不通用。</summary>
+    private void RebuildAreaPicker()
+    {
+        var wanted = SelectedProtocolIsS7 ? S7Areas : ModbusAreas;
+        var previous = _area.SelectedItem as string;
+
+        _area.Items.Clear();
+        foreach (var area in wanted) _area.Items.Add(area);
+
+        var index = previous is null ? -1 : Array.IndexOf(wanted, previous);
+        _area.SelectedIndex = index >= 0 ? index : 0;
+
+        _offset.PlaceholderText = SelectedProtocolIsS7 ? "字节偏移，例如 0 或 0.3" : "0 或 0.3";
+    }
 
     /// <summary>
     /// 只显示当前选择下真正有用的字段。虚拟设备没有传输参数，
     /// 串口设备不该看到 host/port —— 少一个能填错的框，就少一次 422。
+    /// 区域下拉也要跟着协议换：S7 没有 holding/coil，留着只会让人选错。
     /// </summary>
     private void ApplyFormVisibility()
     {
@@ -254,6 +298,17 @@ public sealed class DevicesPage : IPage, IDisposable
         _newChannelFields.Visibility = creatingChannel ? Visibility.Visible : Visibility.Collapsed;
         _tcpFields.Visibility = creatingChannel && transport == "tcp" ? Visibility.Visible : Visibility.Collapsed;
         _serialFields.Visibility = creatingChannel && transport == "serial" ? Visibility.Visible : Visibility.Collapsed;
+
+        RebuildAreaPicker();
+
+        // 端口默认值只在「刚切协议」时有意义：填过 102 再切回 Modbus 不该被改回 502，
+        // 所以只在用户没动过的时候替换。
+        if (creatingChannel && transport == "tcp" && !_portTouched)
+        {
+            _settingPort = true;
+            _port.Text = ConfigDraft.DefaultPort(SelectedProtocol).ToString(CultureInfo.InvariantCulture);
+            _settingPort = false;
+        }
     }
 
     private async Task ToggleFormAsync()
@@ -344,8 +399,13 @@ public sealed class DevicesPage : IPage, IDisposable
 
         if (!TryInt(_unitId.Text, out var unitId)) problems.Add("从站地址必须是 1..255 的整数");
 
-        if (!TryParseOffset(_offset.Text, out var offset, out var bit, out var offsetError))
+        if (!TryParseOffset(_offset.Text, SelectedProtocolIsS7 ? 7 : 15,
+                out var offset, out var bit, out var offsetError))
             problems.Add(offsetError!);
+
+        // S7 的 bool 必须落在某一位上：整字节非零不等于「ON」，猜出来的值比读不出更危险。
+        if (SelectedProtocolIsS7 && SelectedPointType == "bool" && bit < 0)
+            problems.Add("S7 的 bool 点位必须带位号，例如 0.0 或 12.5");
 
         var creatingChannel = _channelPicker.SelectedIndex <= 0;
 
@@ -357,7 +417,7 @@ public sealed class DevicesPage : IPage, IDisposable
 
         var transport = ConfigDraft.TransportFor(SelectedProtocol);
 
-        var port = 502;
+        var port = ConfigDraft.DefaultPort(SelectedProtocol);
         if (creatingChannel && transport == "tcp" && !TryInt(_port.Text, out port))
             problems.Add("端口必须是 1..65535 的整数");
 
@@ -471,8 +531,12 @@ public sealed class DevicesPage : IPage, IDisposable
     /// <summary>
     /// 偏移解析只处理「非负整数[.位号]」。参考号（40001）的解析规则留在
     /// <c>Uic.Config</c> 的点表导入里：同一套规则抄两遍，两个入口迟早给出不同结果。
+    ///
+    /// <paramref name="maxBit"/> 由协议决定：Modbus 的线圈/寄存器位可到 15，
+    /// S7 的位地址只有 0..7，写超过 7 的位会在线路上被 PLC 拒掉。
     /// </summary>
-    private static bool TryParseOffset(string? text, out int offset, out int bit, out string? error)
+    private static bool TryParseOffset(
+        string? text, int maxBit, out int offset, out int bit, out string? error)
     {
         offset = 0;
         bit = -1;
@@ -489,9 +553,9 @@ public sealed class DevicesPage : IPage, IDisposable
         if (dot > 0)
         {
             if (!int.TryParse(value[(dot + 1)..], NumberStyles.Integer, CultureInfo.InvariantCulture,
-                    out bit) || bit is < 0 or > 15)
+                    out bit) || bit < 0 || bit > maxBit)
             {
-                error = "位号必须是 0..15";
+                error = $"位号必须是 0..{maxBit}";
                 return false;
             }
 

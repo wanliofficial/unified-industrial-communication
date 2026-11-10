@@ -143,13 +143,17 @@ internal static class AuditTests
         Directory.CreateDirectory(dir);
 
         // 归档的日期在文件名里；查询范围不覆盖那一天时整份文件跳过。
-        var yesterday = DateTimeOffset.UtcNow.AddDays(-1);
+        //
+        // 用「3 天前」而不是「昨天」：查询窗口是 now ± 5 分钟，在 UTC 刚过零点时
+        // 会跨到昨天，那样的用例每天有 5 分钟必然失败。与测试目标无关的边界
+        // 拉得越远越好。
+        var archived = DateTimeOffset.UtcNow.AddDays(-3);
         var archive = new AuditEntry(
             99, DateTimeOffset.UtcNow, "archive.old", "ok", "system", "test",
             null, null, null, null);
 
         File.WriteAllText(
-            Path.Combine(dir, $"audit-{yesterday:yyyyMMdd}-120000-000.ndjson"),
+            Path.Combine(dir, $"audit-{archived:yyyyMMdd}-120000-000.ndjson"),
             AuditLog.Serialize(archive) + "\n");
 
         using var log = new AuditLog(t.TempDir);
@@ -159,7 +163,7 @@ internal static class AuditTests
         t.Equal(1, narrow.Total, "a file named for another day is skipped");
 
         var wide = await log.QueryAsync(new AuditQuery(
-            null, null, null, null, yesterday.AddDays(-1), To, 100));
+            null, null, null, null, archived.AddDays(-1), To, 100));
         t.Equal(2, wide.Total, "widening the range includes the archive");
     }
 

@@ -5,6 +5,7 @@ using Uic.Config;
 using Uic.Domain;
 using Uic.Driver;
 using Uic.Driver.Modbus;
+using Uic.Driver.S7;
 using Uic.Driver.Virtual;
 using Uic.Northbound;
 using Uic.Northbound.Security;
@@ -364,7 +365,8 @@ internal static class Program
 
         var log = loggerFactory.CreateLogger("uic.host");
 
-        ConfigDocument Fallback() => DemoConfig.Build(simulate, cli.SimPort);
+        ConfigDocument Fallback() =>
+            DemoConfig.Build(simulate, cli.SimPort, simulate, cli.SimS7Port);
 
         // 先读一次配置：监听地址、静态目录都来自配置，必须在 Build() 之前确定。
         ConfigDocument bootstrap;
@@ -436,12 +438,14 @@ internal static class Program
 
         var drivers = new DriverRegistry();
         drivers.Register(ModbusMasterDriver.Tcp(), ModbusMasterDriver.Rtu(), ModbusMasterDriver.Ascii());
+        drivers.Register(new S7MasterDriver());
         drivers.Register(new VirtualDriver());
 
         Simulator? simulator = null;
         if (simulate)
         {
-            simulator = new Simulator(cli.SimPort, loggerFactory.CreateLogger("uic.sim"));
+            simulator = new Simulator(
+                cli.SimPort, cli.SimS7Port, loggerFactory.CreateLogger("uic.sim"));
             simulator.Start();
         }
 
@@ -552,7 +556,8 @@ internal static class Program
                 "text/plain; charset=utf-8"));
         }
 
-        PrintBanner(log, scheme, listen, dataDir, runtime, hasWeb ? webRoot : null, simulate, cli.SimPort);
+        PrintBanner(log, scheme, listen, dataDir, runtime, hasWeb ? webRoot : null,
+            simulate, cli.SimPort, cli.SimS7Port);
 
         try
         {
@@ -578,7 +583,8 @@ internal static class Program
         GatewayRuntime runtime,
         string? webRoot,
         bool simulate,
-        int simPort)
+        int simPort,
+        int simS7Port)
     {
         var config = runtime.CurrentConfig;
 
@@ -590,7 +596,9 @@ internal static class Program
 
         if (simulate)
         {
-            log.LogInformation("simulation mode: embedded Modbus TCP slave on 127.0.0.1:{Port}", simPort);
+            log.LogInformation(
+                "simulation mode: embedded slaves on 127.0.0.1 — Modbus TCP {ModbusPort}, S7 {S7Port}",
+                simPort, simS7Port);
         }
 
         // 首次启动会生成 admin 与一个随机初始口令。口令本身不进日志（日志会被收走），

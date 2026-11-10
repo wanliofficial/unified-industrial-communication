@@ -6,12 +6,12 @@
 - 「部分实现」= 主干能用，但验收标准里有明确没做到的部分，写在备注里；
 - 「刻意没做」= 有意识不做，给出原因与补法（与 [implementation-notes.md](implementation-notes.md) 的「刻意没做」一致）。
 
-首版的目标范围是 PRD §6.1 的 Wave 1 子集：**Modbus 三封装 + 虚拟设备 + 四北向通道 + 配置治理 + Outbox + 可观测**。
-需要说清楚的一点：**S7、OPC UA 客户端、MQTT 南向在 PRD 里是 M 级要求，本版本没有实现**，
+首版的目标范围是 PRD §6.1 的 Wave 1 子集：**Modbus 三封装 + S7 主站 + 虚拟设备 + 四北向通道 + 配置治理 + Outbox + 可观测**。
+需要说清楚的一点：**OPC UA 客户端、MQTT 南向在 PRD 里是 M 级要求，本版本没有实现**，
 它们不是 §6.1「不做」清单里的项，属于真实缺口；逐协议现状、原因与补法见
 [protocol-status.md](protocol-status.md)。
 
-当前测试基线：**239 passed / 0 failed / 1 skipped**（跳过的是需要 `--opcua` 的 OPC UA 端到端用例）。
+当前测试基线：**269 passed / 0 failed / 1 skipped**（跳过的是需要 `--opcua` 的 OPC UA 端到端用例）。
 
 ## 1. 采集（FR-COL）
 
@@ -20,7 +20,7 @@
 | FR-COL-01 | Modbus TCP 主站，FC1/2/3/4/5/6/15/16 | 已实现 | `golden/read_coils_10`、`golden/write_multiple_regs_float32`、`loopback/*`；编解码覆盖 0x01–0x06/0x0F/0x10 |
 | FR-COL-02 | Modbus RTU/ASCII 主站，含串口参数与帧间延时 | 已实现 | `serial/rtu_golden_frame_over_pty`、`serial/ascii_golden_frame_over_pty`、`serial/half_duplex_does_not_cross_responses`；波特率 300–921600 可配，半双工由通道闸门 + 发送前清空输入缓冲保证。帧间静默按 3.5 字符时间（>19200 bps 固定 1.75 ms），计时挂在物理串口上，多从站共享：`serial/rtu_waits_between_frames` |
 | FR-COL-03 | Modbus TCP 从站 | 已实现 | 内置从站被主站回环读写：`loopback/write_then_read_back`、`loopback/write_to_missing_register_is_rejected` |
-| FR-COL-04 | S7comm 主站 | 未实现（首版缺口） | PRD 列为 M，本版本没有代码。驱动边界只有 `IDriver`/`IConn`，接入时按 [protocol-status.md](protocol-status.md) 的五步走；TPKT/COTP 分帧、PDU 协商、DB/IB/QB/MB 区都要新写 |
+| FR-COL-04 | S7comm 主站 | 已实现 | `Uic.Codec.S7`（TPKT/COTP/S7 PDU 纯函数）+ `Uic.Driver.S7`（会话与驱动）+ `Uic.Sim.S7`（进程内从站）。DB/IB/QB/MB 区、位地址、PDU 自动协商（240/480/960 以 PLC 回应为准）与按 PDU 自动切片；`address.offset` 是字节偏移。证据：`s7/connect_request_frame`、`s7/setup_response_takes_plc_pdu`、`s7/read_response_length_is_in_bits`、`s7/address_parses_areas`（16 条黄金帧与地址解析）、`s7/probe_establishes_full_session`、`s7/read_mixed_areas_and_types`、`s7/write_bit_toggles_only_that_bit`、`s7/read_beyond_block_is_address_error`、`s7/negotiated_pdu_limits_the_window`、`s7/silent_plc_times_out`、`s7/reconnect_after_peer_closes`（14 条主站↔从站回环）。明确不支持并明确报错：符号寻址（0xB2）、S7Plus、TPDU 分片重组、多连接并发 |
 | FR-COL-05 | OPC UA 客户端 | 未实现（首版缺口） | PRD 列为 M，本版本只实现 OPC UA **服务端**（`Uic.OpcUa`）。客户端需要会话/订阅/证书/重连，建议直接基于 `Opc.Ua.Client` 而不是手写栈 |
 | FR-COL-06 | MQTT 南向订阅取数 | 未实现（首版缺口） | PRD 列为 M，本版本的 MQTT 只做北向发布与下行命令；南向取数需要另一套连接生命周期、点位映射与质量传播，不能复用北向客户端 |
 | FR-COL-07 | 虚拟设备（正弦/斜坡/随机/常量/故障注入） | 已实现 | `loopback/*`、`contract/*` 都以 `virtual` 驱动跑通全链路；五类故障注入见 `Uic.Driver.Virtual` |
@@ -148,7 +148,7 @@
 | 兼容：浏览器最近 2 个版本 | Chrome/Edge/Firefox | 已实现 | `scripts/wasm-smoke.sh` 在 Playwright 里各跑一遍：Chromium（同一引擎覆盖 Chrome/Edge，首屏约 12 s）与 Firefox（Gecko，约 38 s），两条都走完「登录 → 强制改密 → 首屏 + 新建一台设备」并被断言；Safari/WebKit 未装，用 `--browser webkit` 可补跑 |
 | 可维护：单文件 ≤600 行 | — | 已实现 | 新增端点都拆成 `RestApi.*.cs` partial |
 | 可维护：依赖数量 ≤10 | 直接依赖 | 已实现 | 生产 4 个（日志抽象、串口、OPC UA Server/Configuration）+ ASP.NET Core 框架引用；测试 1 个 |
-| 构建/测试时间 | ≤60 s / ≤120 s | 已实现 | 全量构建约 20 s；219 条时空载 65.5 s，233 条时量到 114.2 s，新增 TLS 用例后 239 条空载 112.7 s，仍在 120 s 门槛内（机器有 20+ 后台负载时会量到 1471 s，那不是这份代码的耗时） |
+| 构建/测试时间 | ≤60 s / ≤120 s | 已实现 | 全量增量构建约 20 s（改 UI 后的首次全量约 5 min）；用例数随时间增长：219 条 65.5 s、233 条 114.2 s、239 条 112.7 s、269 条 106.4 s，仍在 120 s 门槛内（机器有 20+ 后台负载时会量到 1471 s，那不是这份代码的耗时） |
 
 ## 9. 与 PRD 安全红线的差距
 
@@ -165,7 +165,7 @@ PRD `06-nfr.md` §4 列了五条红线，本版全部满足。TLS（FR-OPS-10）
 
 安全面上没有刻意留白的项：认证（FR-OPS-02/03）、审计（FR-OPS-04）、凭据落盘
 （FR-OPS-09）与 TLS（FR-OPS-10）都已在本版实现。剩下的差距是**协议范围的取舍**
-（S7、OPC UA 客户端、MQTT 南向，见 §3 与 §6）与依赖环境的三类故障注入（见
+（OPC UA 客户端、MQTT 南向，见 §3 与 §6）与依赖环境的三类故障注入（见
 [testing.md](testing.md)），不是安全红线。
 
 ## 10. 怎么用这份表

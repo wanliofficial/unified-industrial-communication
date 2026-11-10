@@ -30,7 +30,8 @@
 | MQTT | 北向下行命令 | 已实现（白名单） | `Uic.Northbound/MqttCommandSink.cs` | FR-OPS 远程命令 |
 | MQTT | 南向订阅取数 | **未实现** | — | FR-COL-06（M，首版缺口） |
 | REST + SSE | 北向 | 已实现 | `Uic.Northbound/RestApi*.cs` | FR-NOR-01..03 |
-| S7comm（西门子） | 主站 | **未实现** | — | FR-COL-04（M，首版缺口） |
+| S7comm（西门子） | 主站 | 已实现 | `Uic.Codec.S7` + `Uic.Driver.S7` | FR-COL-04 |
+| S7comm | 从站 | 已实现（仅仿真） | `Uic.Sim.S7` | FR-COL-04 的自测 |
 | MC 3E（三菱） | 主站 | 未实现 | — | Wave 2 |
 | FINS（欧姆龙） | 主站 | 未实现 | — | Wave 2 |
 | EtherNet/IP + CIP（罗克韦尔/AB） | 主站 | 未实现 | — | Wave 2 |
@@ -43,9 +44,9 @@
 
 先给结论：
 
-- **能用的只有 Modbus 三个变体（主站）+ Modbus TCP 从站 + 虚拟设备**，
+- **能用的只有 Modbus 三个变体（主站）+ Modbus TCP 从站 + S7 主站 + 虚拟设备**，
   北向是 REST/SSE/MQTT/OPC UA 服务端。这条链路是完整的，带黄金帧和端到端用例。
-- **S7 与 OPC UA 客户端是 PRD 里的 M 级需求，本版本没做**。这不是 PRD §6.1
+- **OPC UA 客户端与 MQTT 南向取数是 PRD 里的 M 级需求，本版本没做**。这不是 PRD §6.1
   「不做」清单里的项，属于真实缺口（见 [requirements-traceability.md](requirements-traceability.md)）。
 - **BACnet、IEC 104、CIP、MC、FINS 是 PRD §6.1 明确不做**，属于产品范围决定。
 - **PROFINET、EtherCAT、GB/T 28181 不在协议路线图内**，原因是它们与轮询式采集模型
@@ -98,6 +99,34 @@
 从站的 PDU 处理器（`ModbusSlaveHandler`）与分帧无关，所以补 RTU/ASCII 从站
 只需要加一层 framing，不需要重写语义。
 
+## 2.3 S7comm 主站
+
+`Uic.Codec.S7` 只做纯编解码（TPKT / COTP / S7 PDU），`Uic.Driver.S7` 管会话；
+分层与 Modbus 一致，所以抓包排查的路径认得出来。
+
+| 能力 | 实现情况 |
+|---|---|
+| 传输 | ISO-on-TCP（TPKT 4 字节头 + COTP DT），仅 TCP；端口默认 102 |
+| 会话 | COTP 连接请求/确认 → Setup Communication 协商 PDU；两者都在连接建立时完成，之后每个 Job 带 PDU 引用号 |
+| PDU 协商 | 请求 480，以 PLC 回应为准（240/480/960）。协商值决定**读请求自动切片**：请求项 12 字节 + 响应项 `4+data+偶对齐` 都计入预算 |
+| 区域 | `db<N>` / `i`(`e`) / `q`(`a`) / `m`(`merker`) / `l` / `p`(`pe`) / `c` / `t`；DB 号嵌在区名里 |
+| 寻址 | `address.offset` 是**字节偏移**（不是寄存器序号），`address.bit` 限 0..7；bool 点位必须带 bit |
+| 读写 | Read Var / Write Var，位访问用 BIT 传输尺寸（长度单位是位）；写输入区由 PLC 拒绝 |
+| 返回码 | `0x05` 越界 / `0x0A` 对象不存在 → `address_error`（不参与熔断）；`0x03` → `disabled`；其余 `bad` |
+| 数据类型 | 与 Modbus 共用 `Uic.Driver/ValueCodec.cs`：字节序四位、有/无符号 16/32/64、float32/64、bool、BCD16/32、string、bytes、定长数组 |
+| 探活 | 建会话 + 读 `MB0` 一个字节；只判「TCP 通」会把握手失败当成可用 |
+| 明确不支持 | 符号寻址（0xB2）、S7Plus、TPDU 分片重组、一条链路上的多连接并发；都明确报错，不静默降级 |
+
+**为什么 offset 是字节而不是寄存器**：S7 的地址本来就是 `DB1.DBW4` 这种字节+位，
+`DBW3` 这种奇数字节偏移在现场很常见。按寄存器组织地址会在每个奇地址上做二次换算，
+那正是把 Modbus 思维搬过来最容易错的地方。
+
+从站 `Uic.Sim.S7` 与主站共用一个进程也能跑：`uic sim` 默认在 127.0.0.1:15102 起
+S7 从站，示例配置里的 `s7-1` 设备直连它（DB1 放温度/压力/计数，M0.0 放运行状态）。
+
+测试证据：`s7/*`（16 条黄金帧与地址解析 + 14 条主站↔从站回环，含 PDU 切片、
+位写只清一位、越界落 `address_error`、沉默 PLC 超时、断线重连）。
+
 ## 3. 北向：只做「网关 → 上位机」，其中只有 OPC UA 是双向的
 
 ### 3.1 REST + SSE
@@ -147,11 +176,10 @@ MonitoredItem 生命周期、证书信任链都要另写一套。北向服务端
 
 | 协议 | 缺什么 | 补的时候要动哪里 |
 |---|---|---|
-| **S7comm 主站** | 全部。TPKT/COTP 分帧、S7 PDU 协商（240/480/960）、DB/IB/QB/MB 区、位地址、S7-1200 的 PUT/GET 语义 | 新增 `Uic.Driver.S7`：`IDriver`/`IConn` + 自己的分帧；`Address` 已有 symbol/register 字段可用；按「加一个协议」五步接入 |
 | **OPC UA 客户端** | 全部。会话、订阅、证书、重连、点位映射 | 新增 `Uic.Driver.OpcUa`，建议直接用 `Opc.Ua.Client` 而不是手写二进制栈；`Capabilities.Subscribe` 放开为 `Supported` |
 | **MQTT 南向取数** | 全部。订阅主题 → 点位映射、断线重订阅、质量传播 | 新增 `Uic.Driver.Mqtt`；连接生命周期要与北向 MQTT 隔离，避免一个 broker 抖动同时打穿两侧 |
 
-这三项是**真实的验收缺口**。当前版本能进现场做的只有 Modbus + OPC UA 服务端/北向，
+这两项是**真实的验收缺口**。当前版本能进现场做的只有 Modbus + S7 + OPC UA 服务端/北向，
 不能说「PRD 的首版范围已经闭环」。
 
 ### 4.2 PRD §6.1 明确不做（产品范围决定）
@@ -166,9 +194,7 @@ MonitoredItem 生命周期、证书信任链都要另写一套。北向服务端
 
 这些协议的扩展点与 S7 相同：一个驱动包 + 黄金帧 + 一致性用例，不需要改调度、
 北向或 UI。差别只在协议本身的复杂度（CIP 的标签/结构体、BACnet 的对象模型、
-104 的遥测/遥信分类）。
-
-### 4.3 不适合本架构（不是排期问题）
+104 的遥测/遥信分类）。### 4.3 不适合本架构（不是排期问题）
 
 | 协议 | 为什么不适合 | 如果客户硬要 |
 |---|---|---|
@@ -181,18 +207,20 @@ MonitoredItem 生命周期、证书信任链都要另写一套。北向服务端
 
 ## 5. 加一个协议要做什么
 
-以 S7 为例，最小闭环是五步（细节见 [implementation-notes.md](implementation-notes.md)）：
+以已落地的 S7 为参照，最小闭环是五步（细节见 [implementation-notes.md](implementation-notes.md)）：
 
 1. **地址表达式**：`Address` 已支持 register/symbol 两类字段，先确认目标协议的寻址能落在模型里；
-   落不进去就先改模型，不要先写驱动。
-2. **分帧层**：把「收一条完整报文」抽成独立类型（参考 `Uic.Codec.Modbus/Frames.cs`），
+   落不进去就先改模型，不要先写驱动。S7 复用了 `register`（`area` 写 `db1`），没有新增字段。
+2. **分帧层**：把「收一条完整报文」抽成独立类型（参考 `Uic.Codec.S7/S7Frames.cs`、`Uic.Codec.Modbus/Frames.cs`），
    驱动只面对完整 PDU。
 3. **编解码 + 黄金帧**：每个功能码至少一份请求/响应黄金帧，异常码也要有；
-   `testdata/golden/*.json` 是验收门槛，不是可选文档。
+   `testdata/golden/*.json` 是验收门槛，不是可选文档。S7 的黄金帧是手算十六进制写在
+   `tests/Uic.Tests/S7/S7CodecTests.cs` 里的（它依赖运行时构造的字节，不适合静态 JSON）。
 4. **`IDriver` / `IConn`**：`Meta` 声明角色、传输、地址类型与能力四态；
    `Probe` 负责探活，`Read`/`Write` 只做协议语义，不做调度。
 5. **注册 + 用例**：在 `Program.cs` 注册驱动，补一致性用例（T1–T18 中适用的部分）
-   与一条端到端回环（有仿真的协议优先用仿真）。
+   与一条端到端回环（有仿真的协议优先用仿真）。S7 的四步是
+   `Uic.Codec.S7` + `Uic.Driver.S7` + `Uic.Sim.S7` + `s7/*` 用例。
 
 ## 6. 怎么核对这份文档
 

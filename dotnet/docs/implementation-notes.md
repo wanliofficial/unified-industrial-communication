@@ -89,8 +89,9 @@
 | MQTT QoS2 | 现场 QoS1 + 持久化队列已经够用，QoS2 的握手复杂度不划算 | 在 `MqttClient` 里加 PUBREL 状态机 |
 | MQTT WebSocket | 现场 Broker 走原生 TCP；浏览器不直连 MQTT，控制台只走 REST/SSE | 在 `MqttClient` 的连接建立处换成 WebSocket 传输 |
 | MQTT 命令的 ACL 与跨重启幂等 | MQTT 命令这一版没有用户身份（TLS 只保护链路，不认证发布者），幂等窗口在进程内，重启即清空；命令本身已进审计 | 在 Broker 侧做主题 ACL；需要跨重启幂等时把幂等台账落到外部存储 |
-| 多协议（S7 / OPC DA / IEC 104 …） | 首版把一条链路的每一层都做透，比铺开十个半成品有用 | 见下「扩展点」 |
-| S7comm 主站、OPC UA 客户端、MQTT 南向取数 | **这三项在 PRD 里是 M 级要求，本版本没做**（不是 §6.1 的不做项）；驱动边界已收窄到 `IDriver`/`IConn`，补一个协议不需要动调度与北向 | 按 [protocol-status.md](protocol-status.md) 的五步接入，并补黄金帧 |
+| 多协议（OPC DA / IEC 104 / MC / FINS …） | 首版把一条链路的每一层都做透，比铺开十个半成品有用 | 见下「扩展点」 |
+| S7 的符号寻址（0xB2）、S7Plus、TPDU 分片重组、多连接并发 | 前三项要么依赖 S7-1200/1500 的编程环境（符号表/证书），要么需要把「一个 PDU」重组成多帧状态机；多连接并发与调度器「一设备一通道串行」的模型冲突。**这些都明确报错，不静默降级** | 符号寻址需要先有符号表的导入路径（TIA 导出 XML/CSV），再在驱动里加功能码 0xB2；分片要在 COTP 层加重组缓冲 |
+| OPC UA 客户端、MQTT 南向取数 | **这两项在 PRD 里是 M 级要求，本版本没做**（不是 §6.1 的不做项）；驱动边界已收窄到 `IDriver`/`IConn`，补一个协议不需要动调度与北向 | 按 [protocol-status.md](protocol-status.md) 的五步接入，并补黄金帧 |
 | 报警引擎与专用时序库 | 报警需要独立的状态机（阈值、抑制、确认）；专用时序库需要保留策略与索引，塞进采集进程会把边缘设备压垮 | 历史查询已先用 journal NDJSON 做了「时间范围 + 降采样 + 分页」的轻量实现（FR-NOR-08）；报警与更高数据量的保留策略仍按 PRD 路线图 Wave 2 单独立项 |
 | 计算点 / 订阅型协议（COV、事件、通知） | 计算点依赖「输入质量传播」的产品定义；订阅型协议在 Wave 2 | `Pipeline` 已留出质量传播点；驱动侧 `Capabilities.Subscribe` 已是四态声明，接入时按 `RuntimeDependent` 逐步放开 |
 | Sparkplug B、进程外驱动 | PRD §6.1 明确列为不做；进程外驱动需要稳定的 IPC 契约与进程生命周期管理 | Sparkplug 可作为一个 MQTT sink；进程外驱动按 `IDriver` 的进程内形状定义 IPC 协议后再拆 |
@@ -123,8 +124,15 @@
 1. 实现 `IDriver` / `IConn`（`src/Uic.Driver/Contracts.cs`）；
 2. 在 `DriverMeta` 里声明支持的传输、寻址范式与能力；
 3. 在 `Uic.Host/Program.cs` 与 `Uic.Runtime` 的注册处 `Register(...)`；
-4. 加一份黄金帧（`testdata/golden/<proto>_*.json`）与一条回环用例；
+4. 加黄金帧与一条回环用例：能用静态字节描述的协议放 `testdata/golden/<proto>_*.json`，
+   需要在运行时构造字节的（S7 的 TPKT/COTP 头带长度与引用号）写在测试代码里，
+   但同样是手算十六进制逐字节比对；
 5. 配置里 `channel.protocol` 写新驱动的 `Meta.Id`。
+
+分层照 S7 的三段走最省事：`Uic.Codec.<proto>`（纯编解码，能被黄金帧直接调用）+
+`Uic.Driver.<proto>`（会话与驱动）+ `Uic.Sim.<proto>`（进程内从站，供回环与
+`uic sim`）。值编解码（字节序/BCD/数组）直接复用 `Uic.Driver/ValueCodec.cs`，
+不要再写第二份——两份实现在奇数字节偏移或数组边界上迟早分叉。
 
 不需要改：调度器、缓存、北向、UI。这就是把驱动边界收窄到两个接口的目的。
 

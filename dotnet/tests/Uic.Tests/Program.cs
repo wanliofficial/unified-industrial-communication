@@ -36,6 +36,8 @@ ObsTests.Register(tests);
 AuditTests.Register(tests);
 AuthTests.Register(tests);
 LoopbackTests.Register(tests);
+S7CodecTests.Register(tests);
+S7LoopbackTests.Register(tests);
 SerialTests.Register(tests);
 MqttTests.Register(tests);
 MqttCommandTests.Register(tests);

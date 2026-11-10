@@ -3,20 +3,26 @@ using System.Diagnostics;
 using System.Net;
 using Microsoft.Extensions.Logging;
 using Uic.Sim.Modbus;
+using Uic.Sim.S7;
 
 namespace Uic.Host;
 
 /// <summary>
-/// 内置模拟现场：Modbus TCP 从站 + 数据泵。
+/// 内置模拟现场：Modbus TCP 从站 + S7 从站 + 数据泵。
 ///
 /// 它的价值在于「一条命令就能看到完整链路」——主站连的是真实 TCP、走的是真实
-/// MBAP 帧、经真实编解码，只是对端换成了同进程的内存模型。比任何 mock 都更接近现场。
+/// 协议帧、经真实编解码，只是对端换成了同进程的内存模型。比任何 mock 都更接近现场。
+///
+/// 两种从站同时起：Modbus 与 S7 的地址模型不同（寄存器序号 vs 字节偏移），
+/// 合成一个模型只会让两边的点位互相迁就。分开两套内存更诚实。
 /// </summary>
 public sealed class Simulator : IAsyncDisposable
 {
     private readonly ModbusSlaveModel _model;
+    private readonly S7SlaveModel _s7Model;
     private readonly object _gate = new();
     private readonly ModbusTcpSlaveServer _server;
+    private readonly S7TcpSlaveServer _s7Server;
     private readonly CancellationTokenSource _cts = new();
     private readonly ILogger _log;
     private readonly TimeSpan _period;
@@ -24,26 +30,34 @@ public sealed class Simulator : IAsyncDisposable
     private long _counter;
     private int _disposed;
 
-    public Simulator(int port, ILogger log, TimeSpan? period = null)
+    public Simulator(int port, int s7Port, ILogger log, TimeSpan? period = null)
     {
         _log = log;
         _period = period ?? TimeSpan.FromSeconds(1);
         _model = new ModbusSlaveModel();
+        _s7Model = new S7SlaveModel();
 
         Seed();
+        SeedS7();
 
         _server = new ModbusTcpSlaveServer(IPAddress.Loopback, port, _model, _gate);
+        _s7Server = new S7TcpSlaveServer(IPAddress.Loopback, s7Port, _s7Model);
         Port = port;
+        S7Port = s7Port;
     }
 
     public int Port { get; }
+    public int S7Port { get; }
     public ModbusSlaveModel Model => _model;
+    public S7SlaveModel S7Model => _s7Model;
 
     public void Start()
     {
         _server.Start();
+        _s7Server.Start();
         _pump = Task.Run(() => PumpAsync(_cts.Token));
         _log.LogInformation("modbus slave listening on 127.0.0.1:{Port}", Port);
+        _log.LogInformation("s7 slave listening on 127.0.0.1:{Port}", S7Port);
     }
 
     private void Seed()
@@ -60,10 +74,22 @@ public sealed class Simulator : IAsyncDisposable
         }
     }
 
+    private void SeedS7()
+    {
+        // S7 的点位用字节偏移：DB1 里的温度 0..7、压力 8..15、计数 16..19，
+        // 再加一个标志位 M0.0。与 DemoConfig 的 s7-1 设备对应。
+        var db = _s7Model.DataBlock(1);
+        WriteS7Double(db, 0, 55.5);
+        WriteS7Double(db, 8, 101.25);
+        BinaryPrimitives.WriteUInt32BigEndian(db.AsSpan(16, 4), 0);
+        _s7Model.SeedFlagBit(0, 0, false);
+    }
+
     private async Task PumpAsync(CancellationToken ct)
     {
         var started = Stopwatch.GetTimestamp();
         var period = _period;
+        var db = _s7Model.DataBlock(1);
 
         while (!ct.IsCancellationRequested)
         {
@@ -79,6 +105,13 @@ public sealed class Simulator : IAsyncDisposable
                 _model.Holding[8] = (ushort)(_counter >> 16);
                 _model.Holding[9] = (ushort)(_counter & 0xFFFF);
                 _model.SeedCoils(3, _counter % 20 < 3);
+
+                // S7 侧同一份脉搏：现场联调时两条链路的曲线应当长得一模一样，
+                // 否则看曲线分不清「协议读错了」还是「模拟源不同」。
+                WriteS7Double(db, 0, 55.5 + 30 * Math.Sin(2 * Math.PI * t / 30));
+                WriteS7Double(db, 8, 101.25 + 10 * Math.Sin(2 * Math.PI * t / 45));
+                BinaryPrimitives.WriteUInt32BigEndian(db.AsSpan(16, 4), (uint)_counter);
+                _s7Model.SeedFlagBit(0, 0, _counter % 20 < 3);
             }
 
             try { await Task.Delay(period, ct).ConfigureAwait(false); }
@@ -110,6 +143,10 @@ public sealed class Simulator : IAsyncDisposable
         }
     }
 
+    /// <summary>S7 直接按字节写：DB 本来就是字节数组，不需要寄存器换算。</summary>
+    private static void WriteS7Double(byte[] block, int offset, double value)
+        => BinaryPrimitives.WriteDoubleBigEndian(block.AsSpan(offset, 8), value);
+
     public async ValueTask DisposeAsync()
     {
         if (Interlocked.Exchange(ref _disposed, 1) != 0) return;
@@ -122,6 +159,7 @@ public sealed class Simulator : IAsyncDisposable
         }
 
         await _server.DisposeAsync().ConfigureAwait(false);
+        await _s7Server.DisposeAsync().ConfigureAwait(false);
         _cts.Dispose();
     }
 }

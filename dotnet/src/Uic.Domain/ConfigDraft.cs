@@ -18,7 +18,21 @@ public static class ConfigDraft
         "modbus-tcp" => "tcp",
         "modbus-rtu" or "modbus-ascii" => "serial",
         "virtual" => "none",
+        // S7 只有 ISO-on-TCP 一种承载；显式列出来，免得以后有人给别的协议
+        // 加传输方式时顺手把 S7 也改了。
+        "s7" => "tcp",
         _ => "tcp",
+    };
+
+    /// <summary>
+    /// 协议默认端口。填错端口的现象是「连不上」而不是「协议不对」，
+    /// 所以默认值必须按协议来，不能让所有人都去查手册。
+    /// </summary>
+    public static int DefaultPort(string protocol) => protocol switch
+    {
+        "modbus-tcp" => 502,
+        "s7" => 102,
+        _ => 502,
     };
 
     /// <summary>新增一条通道。只写与 transport 相关的字段，其余交给配置默认值。</summary>

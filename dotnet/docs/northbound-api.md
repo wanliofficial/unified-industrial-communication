@@ -259,10 +259,45 @@ MQTT 的 TLS 是独立开关（`northbound.mqtt.tls`），语义见
         "structTypes": "unsupported"
       },
       "description": "Modbus TCP 主站：FC1/2/3/4/5/6/15/16，位访问与四种字序。"
+    },
+    {
+      "id": "s7",
+      "name": "S7comm 主站",
+      "version": "1.0.0",
+      "sdkVersion": "1.0",
+      "roles": ["master"],
+      "transports": ["tcp"],
+      "addressKinds": ["register"],
+      "capabilities": {
+        "read": "supported",
+        "write": "supported",
+        "subscribe": "unsupported",
+        "browse": "unsupported",
+        "discovery": "unsupported",
+        "multiRead": "supported",
+        "bitAccess": "supported",
+        "structTypes": "unsupported"
+      },
+      "configFields": [
+        { "key": "transport.port", "label": "端口", "type": "int", "required": true, "default": 102, "scope": "channel" },
+        { "key": "labels.rack", "label": "机架号", "type": "int", "default": 0, "scope": "device" },
+        { "key": "labels.slot", "label": "槽位号", "type": "int", "default": 1, "scope": "device" },
+        { "key": "labels.pduSize", "label": "请求的 PDU 长度", "type": "int", "default": 480, "scope": "device" }
+      ],
+      "pointFields": [
+        { "key": "address.area", "label": "区域", "type": "string", "required": true, "scope": "point",
+          "help": "db<N> 表示数据块，i/q/m 表示输入/输出/标志区" },
+        { "key": "address.offset", "label": "字节偏移", "type": "int", "required": true, "scope": "point" }
+      ],
+      "description": "S7comm 主站：DB/IB/QB/MB 区、位访问、PDU 自动协商（240/480/960）。"
     }
   ]
 }
 ```
+
+`configFields` / `pointFields` 是驱动自己声明的表单元数据：控制台据此渲染参数，
+不把协议知识写死在页面里。S7 的 `address.offset` 是**字节**偏移（Modbus 是寄存器序号），
+`labels.rack` / `labels.slot` 是 COTP 建链参数（S7-1200/1500 通常 0/1）。
 
 ### 设备与点位
 

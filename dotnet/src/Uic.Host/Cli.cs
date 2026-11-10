@@ -19,6 +19,10 @@ public sealed record CliOptions
     public string? OutPath { get; init; }
     public string? KeyFile { get; init; }
     public int SimPort { get; init; } = 15020;
+
+    /// <summary>sim 模式内置 S7 从站端口。默认 15102：避开需要 root 的 102。</summary>
+    public int SimS7Port { get; init; } = 15102;
+
     public bool Verbose { get; init; }
 
     public const string Usage = """
@@ -26,7 +30,7 @@ public sealed record CliOptions
 
         用法:
           uic run   [--config <file>] [--data <dir>] [--listen <host:port>] [--web <dir>] [-v]
-          uic sim   [--port <modbus-port>] [--data <dir>] [--listen <host:port>] [-v]
+          uic sim   [--port <modbus-port>] [--s7-port <s7-port>] [--data <dir>] [--listen <host:port>] [-v]
           uic check [--config <file>]
           uic secret keygen [--out <file>]          # 生成 32 字节密封密钥（0600）
           uic secret seal [--key-file <file>]       # 从 stdin 读明文，输出 enc:v1:...
@@ -41,6 +45,7 @@ public sealed record CliOptions
           --listen <addr>   覆盖 northbound.rest.listen
           --web <dir>       覆盖前端静态资源目录
           --port <n>        sim 模式内置 Modbus 从站端口，默认 15020
+          --s7-port <n>     sim 模式内置 S7 从站端口，默认 15102
           --out <file>      keygen 的密钥输出路径；缺省时打印到 stdout
           --key-file <file> seal 使用的密钥文件（缺省读 UIC_SECRET_KEY / UIC_SECRET_KEY_FILE）
           --user <id>       user 子命令要操作的账号
@@ -66,6 +71,7 @@ public sealed record CliOptions
         string? outPath = null;
         string? keyFile = null;
         var port = 15020;
+        var s7Port = 15102;
         var verbose = false;
 
         for (var i = 0; i < args.Length; i++)
@@ -144,6 +150,10 @@ public sealed record CliOptions
                     port = int.TryParse(Next(args, ref i, arg), out var p) ? p : port;
                     break;
 
+                case "--s7-port":
+                    s7Port = int.TryParse(Next(args, ref i, arg), out var sp) ? sp : s7Port;
+                    break;
+
                 default:
                     if (arg.StartsWith("--config=", StringComparison.Ordinal)) config = arg["--config=".Length..];
                     else if (arg.StartsWith("--data=", StringComparison.Ordinal)) data = arg["--data=".Length..];
@@ -154,6 +164,8 @@ public sealed record CliOptions
                     else if (arg.StartsWith("--user=", StringComparison.Ordinal)) user = arg["--user=".Length..];
                     else if (arg.StartsWith("--port=", StringComparison.Ordinal))
                         port = int.TryParse(arg["--port=".Length..], out var p2) ? p2 : port;
+                    else if (arg.StartsWith("--s7-port=", StringComparison.Ordinal))
+                        s7Port = int.TryParse(arg["--s7-port=".Length..], out var sp2) ? sp2 : s7Port;
 
                     // 拼错的子命令或选项必须立刻失败。
                     // 静默忽略的后果是 `uic simm` 被当成 `uic run` 起了一个网关：
@@ -176,6 +188,7 @@ public sealed record CliOptions
             OutPath = outPath,
             KeyFile = keyFile,
             SimPort = port,
+            SimS7Port = s7Port,
             Verbose = verbose,
         };
     }

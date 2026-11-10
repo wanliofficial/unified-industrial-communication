@@ -1,7 +1,8 @@
 # UIC 工业网关 · .NET 10 实现
 
-跨平台工业数据采集网关的 .NET 10 版本：南向接 Modbus（TCP / RTU / ASCII，主站与从站），
-中间做采集调度、数据加工与持久化队列，北向出 REST / SSE / MQTT / OPC UA 四个通道。
+跨平台工业数据采集网关的 .NET 10 版本：南向接 Modbus（TCP / RTU / ASCII，主站与从站）与
+S7comm（S7-300/400/1200/1500 主站），中间做采集调度、数据加工与持久化队列，
+北向出 REST / SSE / MQTT / OPC UA 四个通道。
 控制台是 Uno Platform 编译到 WebAssembly 的单页应用，由同一个进程托管，浏览器直接访问。
 
 设计重心不在「能连多少种设备」，而在**可治理**：
@@ -19,7 +20,8 @@
 # 编译全部项目（含 WASM 前端）
 dotnet build uic.sln
 
-# 仿真模式：进程内起一个 Modbus 从站 + 一台虚拟设备，另有一台设备走真实 Modbus 主站链路
+# 仿真模式：进程内起 Modbus 从站（15020）与 S7 从站（15102）+ 一台虚拟设备，
+# 另有两台设备分别走真实的 Modbus / S7 主站链路；端口可用 --port / --s7-port 改
 dotnet run --project src/Uic.Host -- sim --listen 127.0.0.1:8080
 
 # 另开一个终端
@@ -216,7 +218,7 @@ dotnet run --project tests/Uic.Tests -- --opcua             # 额外跑 OPC UA �
 dotnet run --project tests/Uic.Tests -- --stop-on-fail
 ```
 
-正常情况下输出 `239 passed, 0 failed, 1 skipped`（跳过的是默认不启用的 OPC UA 用例）。
+正常情况下输出 `269 passed, 0 failed, 1 skipped`（跳过的是默认不启用的 OPC UA 用例）。
 黄金帧测试默认从仓库的 `testdata/golden/` 读取，可用 `UIC_TESTDATA` 指向别的目录。
 
 串口用例（T15–T18）会用 libc 开一对伪终端，在 Linux 上默认执行，其它平台报 `skip`；
@@ -241,9 +243,12 @@ src/
   Uic.Domain/         领域模型与线上序列化契约（无外部依赖）
   Uic.Driver/         驱动 SDK：接口、元数据、错误分类
   Uic.Codec.Modbus/   Modbus PDU 编解码、校验和、字节序、批量窗口
+  Uic.Codec.S7/       TPKT / COTP / S7 PDU 编解码与地址解析（纯函数）
   Uic.Driver.Modbus/  Modbus 主站（TCP / RTU / ASCII）
+  Uic.Driver.S7/      S7comm 主站：会话、PDU 协商、按 PDU 切片、位读写
   Uic.Driver.Virtual/ 虚拟设备：波形 + 故障注入
   Uic.Sim.Modbus/     Modbus 从站模拟器（被 sim 模式与测试复用）
+  Uic.Sim.S7/         S7 从站模拟器（同上）
   Uic.Transport/      字节流：TCP / 串口 / 内存
   Uic.Engine/         调度器、设备 actor、读规划、数据加工、点位缓存
   Uic.Outbox/         持久化上报队列（分区分位点）
