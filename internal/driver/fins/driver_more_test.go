@@ -8,6 +8,7 @@ import (
 
 	finscodec "uic/internal/codec/fins"
 	"uic/internal/driver"
+	"uic/internal/driver/finscore"
 	"uic/internal/model"
 	"uic/internal/transport"
 )
@@ -301,11 +302,13 @@ func TestTCPLevelErrorIsRetryable(t *testing.T) {
 	}
 }
 
-func TestOrderFor(t *testing.T) {
-	if orderFor(2, "") != model.OrderCDAB || orderFor(8, "") != model.OrderDCBA {
-		t.Fatalf("defaults = %q/%q", orderFor(2, ""), orderFor(8, ""))
+// 字节序默认值的测试已迁到 finscore（那里才是实现），这里只保留一条
+// 回归检查：确保 FINS/TCP 仍然经由共享层拿到 CDAB 默认值。
+func TestOrderForViaCore(t *testing.T) {
+	if finscore.OrderFor(2, "") != model.OrderCDAB || finscore.OrderFor(8, "") != model.OrderDCBA {
+		t.Fatalf("defaults = %q/%q", finscore.OrderFor(2, ""), finscore.OrderFor(8, ""))
 	}
-	if orderFor(2, model.OrderABCD) != model.OrderABCD {
+	if finscore.OrderFor(2, model.OrderABCD) != model.OrderABCD {
 		t.Fatal("explicit order ignored")
 	}
 }

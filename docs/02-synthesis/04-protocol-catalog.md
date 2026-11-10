@@ -104,7 +104,7 @@
 |---|---|---|---|---|---|---|---|---|
 | **MC 协议（1E/3E/4E）** | M | TCP/UDP | 软元件（D/M/X/Y/W/R/ZR） | 17 | PA-06、PA-34 | 3 | P1 | 1E 与 3E 帧头不同；4E 带序列；位/字混排；二进/ASCII 两种 |
 | **FINS** | M/S | TCP/UDP | 内存区（DM/CIO/WR/HR/AR/EM） | 19 | PA-06、PA-30 | 3 | P1 | 命令码 0101/0102/0103；ICF/RSV/GCT/DNA/DA1/DA2/SNA/SA1/SA2/SID；字/位寻址位偏移 |
-| **Host Link（上位链路）** | M/S | 串口 | 寄存器（DM/CIO） | 3 | PA-26（从站）、PA-25 | 2 | P2 | ASCII 帧、FCS 校验、命令码 RR/WR/RD/WD |
+| **Host Link（上位链路）** | M/S | 串口/TCP | 寄存器（DM/CIO） | 3 | PA-26（从站）、PA-25 | 2 | P2（已落地） | 两套命令集：C 模式（`RR`/`WR`/`RD`/`WD`，BCD 寻址）与 FINS 帧（`FA` 信封，复用 FINS 内存区语义）；FCS 从 `@` 起算、含 `@`；应答多一格结束码；单次上限 269/267 与 FINS/TCP 的 999 不同 |
 | **Mewtocol** | M | 串口/TCP | 寄存器（DT/内部继电器） | 3 | PA-09 | 2 | P2 | 松下的「%」地址语法；响应码两级 |
 | **CC-Link / CC-Link IE** | M/S | 总线/以太网 | 站号 + 软元件 | 1 | — | 5 | X | 需专用硬件；规范收费 |
 | **MTConnect** | C | HTTP/XML | 数据项（item） | 2 | — | 2 | P2 | 机床行业；Agent 轮询 + 流式（probe/current/sample） |
@@ -292,10 +292,10 @@ IEC 61850、SECS/GEM、KNX、Mewtocol、Host Link、MTConnect。
 | **SECS/GEM（HSMS）** | 设备/主机 / TCP 5000 | 半导体设备与工厂的通信主干；PA-31 是 38 份分析里唯一带真实测试的协议 | HSMS 通信层 + SECS-II 数据项编解码 + 少量 SxFy 消息，不做上层设备模型的全部场景 |
 | **KNXnet/IP** | 客户端 / UDP 3670 | 楼宇自控第一大总线；组地址模型（GA vs PA）是它的核心 | TUNNELING 请求 + 组地址读写，不做 routing / device management / 安全 |
 | **Mewtocol** | 主站 / 串口或 TCP（端口各厂不同，默认 2000） | 松下 PLC 的事实协议；全 ASCII 帧看起来简单，真正的坑是一帧里混着十进制与十六进制 | 主站 + 字区读写 + 接点按字/按点读写 + 定时器值 + 错误码映射，不做 FP2-ET-LAN 封装 |
-| **Host Link** | 主站 / 串口（RS-232/422/485） | 欧姆龙/三菱 PLC 的经典串口协议；串口层是已有共享资源 | 复用共享串口层 + FINS/MEWTOKEN 帧，不做串口时序优化 |
+| **Host Link** | 主站 / 串口（RS-232/422/485）或串口服务器 TCP | 上位链接是欧姆龙小型 PLC 的默认串口协议；它有两种命令集，选错等于重写一遍驱动 | 只做 **FINS 帧（头码 `FA`）**，命令语义与 FINS/TCP 共用；不做 C 模式、跨网长格式、自动重试 |
 | **MTConnect** | 客户端 / HTTP | 机床数据采集的事实标准；纯 REST + XML，无二进制编解码 | HTTP GET 取 `probe`/`current`/`sample`，XML 解析，不做资产/事件完整模型 |
 
-> 截至当前实现：DNP3、CoAP、SECS/GEM、IEC 101、Mewtocol 已落地。
+> 截至当前实现：DNP3、CoAP、SECS/GEM、IEC 101、Mewtocol、Host Link 已落地。
 >
 > **DNP3**（编解码 + 主站 + 内置从站 + `uic dnp3read` + `examples/dnp3.json`）：只做
 > TCP 主站、类 0 总召唤、类 1/2/3 事件轮询、CROB 与组 41 直接控制、未请求响应的接收
@@ -359,6 +359,28 @@ IEC 61850、SECS/GEM、KNX、Mewtocol、Host Link、MTConnect。
 > T/C 接点不走 `RCC`（手册会把它们按「每字 16 点」重新编号，与十进制定时器号是两套体系），
 > 只走 `RCS`/`RCP`。错误码保留手册四类再映射到 address/permission/protocol，`23/24/26`
 > 明确不可重试。
+
+> **Host Link**（编解码 + 主站 + 内置从站 + `uic hostlinkread` + `examples/hostlink.json`）：
+> 只做 **FINS 帧**（头码 `FA`），不做 C 模式，不做跨网长格式，也不自动重试。它的价值在于
+> 把「FINS 的语义」与「串口信封」分开：内存区、字/位寻址、读写语义、数值字节序与 FINS/TCP
+> 逐字节相同，所以命令语义抽进 `driver/finscore` 与 `sim/finsmem` 共用，同一份点表换个
+> `protocol`（`fins` ↔ `hostlink`）就能跑；`codec/hostlink` 只负责「FINS 帧 ↔ ASCII 信封」。
+> 信封本身有六件必须按字节记的事：等待时间只有**一位**十六进制（0..F，单位 10ms）；应答在
+> `FA` 后**多一格结束码、少一格等待时间**（收发是两条独立布局，按请求布局解应答会从第三格
+> 起全部错位）；FCS 从 `@` 起异或到正文末、不含 `*` 与 CR（少算 `@` 时本地回环永远通过、
+> 真机必挂）；正文是「一字节两字符」的十六进制，整帧纯可打印 ASCII；单元号是两位**十进制**
+> （00..31，写成十六进制会让 31 号站变 `1F`）；直连 ICF 是 `0x00`（照抄 FINS/TCP 的 `0x80`
+> 会被当跨网帧、找不到路由）。**单次上限读 269 字 / 538 位、写 267 字 / 534 位**，不是
+> FINS/TCP 的 999——命令不能在信封上分段，上限由整帧字符预算反推（读看应答能带多少数据、
+> 写看命令能塞多少正文，读写差两个字是结构性的），照抄 999 会稳定收到结束码 `0x18`。
+> **串口出厂参数是 9600-7-E-2**，与 Mewtocol 的 9600-8-O-1 相反；「FINS 必须 8 位数据位」是
+> 错的，套用 8/N/1 的症状是「发得出去、收不到东西」且不报错。错误分两层：信封层结束码
+> （`0x13` FCS 错 / `0x14` 格式错 / `0x18` 帧长错，属于配置或组帧问题，修一次永久消失）与
+> FINS 层结束码（与 FINS/TCP 同一张表）。两条刻意边界：**不做 C 模式**（`RR`/`RD`/`WD` 是
+> 另一套命令集与 BCD 寻址，混进来每个字段都要先判断「现在走哪套」）；**不自动重试**（没有
+> 可靠事务号，重发一次写可能把同一个字写两遍，对「加计数」点位是真实数据错误），重连交给
+> 调度器。内置从站在单元号不匹配时**完全沉默**（真 PLC 只回应点名到自己的帧），FCS 错回
+> `0x13`、格式错回 `0x14`、认不出的头码回 `0x16`。
 
 **明确不做**：PROFINET IO、PROFIBUS、CANopen、CC-Link、FOCAS、DALI、LonWorks、DDS、EtherCAT、HART、GB/T 28181、Euromap、Matter、LoRaWAN、OCPP、Redfish。
 

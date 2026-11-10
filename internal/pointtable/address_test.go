@@ -1,6 +1,7 @@
 package pointtable
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 
@@ -651,6 +652,139 @@ func TestOtherProtocolsRejectMewAreas(t *testing.T) {
 	for _, proto := range []string{"modbus-tcp", "s7", "iec104"} {
 		if _, err := ParseAddress("dt:0", model.TypeUint16, proto); err == nil {
 			t.Fatalf("%s must reject a Mewtocol area", proto)
+		}
+	}
+}
+
+// Host Link / FINS 共用同一套内存区：点表写法必须完全一致。
+func TestPolicyForHostLink(t *testing.T) {
+	for _, proto := range []string{"hostlink", "fins"} {
+		p := PolicyFor(proto)
+		if p.Width != WidthRegisters {
+			t.Fatalf("%s width = %v, want WidthRegisters", proto, p.Width)
+		}
+		if !p.AllowRegister || p.AllowSymbol || p.AllowObject || p.AllowFile || p.AllowComputed || p.AllowSelector {
+			t.Fatalf("%s policy accepts non-register kinds: %+v", proto, p)
+		}
+		if p.DIBits != 0 || p.DIField {
+			t.Fatalf("%s is not a DI protocol: %+v", proto, p)
+		}
+		// 五个固定区 + 当前 EM 区 + 13 个 bank，一个不能少。
+		want := []string{"cio", "wr", "hr", "ar", "dm", "em"}
+		for i := 0; i <= 12; i++ {
+			want = append(want, fmt.Sprintf("em%d", i))
+		}
+		for _, area := range want {
+			if !p.RegisterAreas[area] {
+				t.Fatalf("%s: area %q is missing from the whitelist", proto, area)
+			}
+		}
+		// 别的协议的区不能漏进来；EM 的越界 bank 同理。
+		for _, area := range []string{"holding", "coil", "db", "dt", "x", "em13", "dmm"} {
+			if p.RegisterAreas[area] {
+				t.Fatalf("%s: foreign area %q leaked into the whitelist", proto, area)
+			}
+		}
+		// FINS 的区都能按位访问（EM 当前区降级为读字取位，仍算支持位点位）。
+		if p.BitlessAreas != nil {
+			t.Fatalf("%s: no bit-less areas expected, got %v", proto, p.BitlessAreas)
+		}
+	}
+}
+
+func TestParseAddressHostLink(t *testing.T) {
+	cases := []struct {
+		name string
+		expr string
+		dt   model.DataType
+		want string
+	}{
+		{"data memory u16", "dm:100", model.TypeUint16, "dm:100:1"},
+		{"data memory float32", "dm:200", model.TypeFloat32, "dm:200:2"},
+		{"cio bit", "cio:0.5", model.TypeBool, "cio:0.5:1"},
+		{"work relay bit", "wr:10.15", model.TypeBool, "wr:10.15:1"},
+		{"holding relay bit", "hr:1.0", model.TypeBool, "hr:1.0:1"},
+		{"aux relay bit", "ar:2.3", model.TypeBool, "ar:2.3:1"},
+		{"current em", "em:5", model.TypeUint16, "em:5:1"},
+		{"em bank 0", "em0:5", model.TypeUint16, "em0:5:1"},
+		{"em bank 12", "em12:7", model.TypeInt16, "em12:7:1"},
+		// 现场简写归一化成规范名：Canonical 只输出一种写法。
+		{"short data memory", "d:0", model.TypeUint16, "dm:0:1"},
+		{"short work relay", "w:0", model.TypeUint16, "wr:0:1"},
+		{"short holding relay", "h:0", model.TypeUint16, "hr:0:1"},
+		{"short aux relay", "a:0", model.TypeUint16, "ar:0:1"},
+		// 区名大小写不敏感。
+		{"uppercase area", "DM:0", model.TypeUint16, "dm:0:1"},
+		// 显式长度：一次读多个字。
+		{"explicit length", "dm:0:10", model.TypeUint16, "dm:0:10"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			a, err := ParseAddress(tc.expr, tc.dt, "hostlink")
+			if err != nil {
+				t.Fatalf("parse: %v", err)
+			}
+			if got := a.Canonical(); got != tc.want {
+				t.Fatalf("canonical = %q, want %q", got, tc.want)
+			}
+			// 同一份地址在 FINS/TCP 上必须解析成同一个结果：这是「点表
+			// 换个 protocol 就能跑」的可执行证据。
+			b, err := ParseAddress(tc.expr, tc.dt, "fins")
+			if err != nil {
+				t.Fatalf("parse as fins: %v", err)
+			}
+			if b != a {
+				t.Fatalf("fins = %+v, hostlink = %+v", b, a)
+			}
+			// 往返：Canonical 的文本必须能被重新解析成同一个地址。
+			c, err := ParseAddress(a.Canonical(), tc.dt, "hostlink")
+			if err != nil {
+				t.Fatalf("reparse %q: %v", a.Canonical(), err)
+			}
+			if c != a {
+				t.Fatalf("round trip: %+v != %+v", c, a)
+			}
+		})
+	}
+}
+
+func TestParseAddressHostLinkRejects(t *testing.T) {
+	cases := []struct {
+		name string
+		expr string
+		dt   model.DataType
+		want string
+	}{
+		// 写错的区名必须在导入期被拒，而不是运行时每个周期报一次。
+		{"unknown area", "dmm:0", model.TypeUint16, "dmm"},
+		{"em bank out of range", "em13:0", model.TypeUint16, "em13"},
+		// 布尔量必须带位号：FINS 没有「一个号一个接点」的区。
+		{"bool needs bit", "dm:0", model.TypeBool, "bool point needs a bit"},
+		// 位号范围 0..15。
+		{"bit out of range", "cio:0.16", model.TypeBool, "bit must be 0..15"},
+		// 位号只对布尔量有意义。
+		{"bit on u16", "dm:0.3", model.TypeUint16, "only valid for bool"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := ParseAddress(tc.expr, tc.dt, "hostlink")
+			if err == nil {
+				t.Fatalf("expected an error for %q", tc.expr)
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("error = %v, want substring %q", err, tc.want)
+			}
+		})
+	}
+}
+
+// 别的协议不能借用 FINS 的区名（尤其 DM：Modbus 里没有这个名字）。
+func TestOtherProtocolsRejectFinsAreas(t *testing.T) {
+	for _, proto := range []string{"modbus-tcp", "s7", "iec104", "mewtocol"} {
+		for _, expr := range []string{"dm:0", "cio:0.1", "em5:0"} {
+			if _, err := ParseAddress(expr, model.TypeUint16, proto); err == nil {
+				t.Fatalf("%s must reject FINS address %q", proto, expr)
+			}
 		}
 	}
 }

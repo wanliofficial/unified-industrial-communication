@@ -5,9 +5,9 @@
 | 项 | 数字 |
 |---|---|
 | 分析的参考方案 | 38 份（PA-01 … PA-38，其中 PA-06 合并了两个完全相同的仓库） |
-| 文档总量 | 55 份 Markdown / 23,268 行（含 3 份 ADR） |
-| 代码总量 | 318 个 Go 文件 / 137,400 行（其中测试 158 个文件 / 59,708 行 / 1,979 个测试函数） |
-| Go 包 | 84 个（1 个入口 + 83 个内部包；83 个有测试） |
+| 文档总量 | 55 份 Markdown / 24,149 行（含 3 份 ADR） |
+| 代码总量 | 342 个 Go 文件 / 146,625 行（其中测试 169 个文件 / 63,523 行 / 2,145 个测试函数） |
+| Go 包 | 92 个（1 个入口 + 91 个内部包；89 个内部包有测试，`internal/mqtt/mqtttest` 与 `internal/sim/finsmem` 无独立测试文件） |
 | 第三方依赖 | 0（仅标准库，零 CGO） |
 
 ---
@@ -34,10 +34,10 @@ cmd/ + internal/            可运行的最小骨架（不是伪代码，能采�
 
 ### 1.2 它不是什么
 
-- 不是协议库大杂烩。当前实现了 22 个驱动（Modbus TCP / RTU / ASCII 主站、S7、OPC UA、MQTT 南向订阅、
-  MC 3E、FINS、EtherNet/IP CIP、BACnet/IP、IEC 60870-5-104、IEC 60870-5-101、Mewtocol、DNP3、CoAP、DL/T 645、
+- 不是协议库大杂烩。当前实现了 23 个驱动（Modbus TCP / RTU / ASCII 主站、S7、OPC UA、MQTT 南向订阅、
+  MC 3E、FINS、Host Link FINS、EtherNet/IP CIP、BACnet/IP、IEC 60870-5-104、IEC 60870-5-101、Mewtocol、DNP3、CoAP、DL/T 645、
   CJ/T 188、SNMP v1/v2c、ADS/AMS、SECS/GEM、计算点、virtual），外加
-  Modbus 从站（TCP / RTU / ASCII）、十七个内置模拟从站/Broker（Modbus TCP、S7、MC 3E、FINS、CIP、BACnet/IP、
+  Modbus 从站（TCP / RTU / ASCII）、十八个内置模拟从站/Broker（Modbus TCP、S7、MC 3E、FINS、Host Link FINS、CIP、BACnet/IP、
   IEC 104、IEC 101、Mewtocol、DNP3、CoAP、DL/T 645、CJ/T 188、SNMP v1/v2c、ADS/AMS、HSMS/SECS-II、MQTT）与一个内置 OPC UA 服务端、一个零依赖报警引擎与一个有界历史采样日志；其余协议在
   `04-protocol-catalog.md` 里按工作量排了三波，没有假装已经支持。
   注意 MQTT 出现了两次且**互不相干**：北向是「网关把数据发出去」（sink），南向是「网关订阅别人发来的数据」（driver）。
@@ -343,6 +343,44 @@ TCP 承载**只发裸帧**：FP7 的 LAN 口若设成「与 FP2-ET-LAN 连接」
 `60/61/66/67` → `address`（点表或型号配置问题，重试无用）、`65` 写保护与 `63` 模式错 →
 `permission`、`40..43`/`53` → `protocol`（可重试）、`23` 站号重号 / `24` 硬件错 / `26`
 站号设置错不可重试。
+
+Host Link FINS（欧姆龙上位链接，头码 `FA`，串口 / 串口服务器 TCP 2000）：
+
+```bash
+./uic sim -protocol hostlink -listen 127.0.0.1:2000 &  # 内置上位链接从站（单元号 0）
+./uic -config examples/hostlink.json
+curl -s -H 'Authorization: Bearer dev-token-0123456789' localhost:8090/api/v1/points
+#   6 点：DM0/DM1 字、DM2..DM3=3.14（float32，CDAB）、CIO0.1 运行位、
+#         CIO0.5 可写故障位、DM10 可写计数器
+#   自检（不需要网关）：./uic hostlinkread -addr 127.0.0.1:2000 -area dm -offset 0 -qty 4
+#   只验链路：./uic hostlinkread -transport serial -port /dev/ttyUSB0 \
+#             -baud 9600 -dataBits 7 -parity even -stopBits 2 -probe
+#   打印单次上限：./uic hostlinkread -limits
+```
+
+Host Link 不是另一种协议，而是 **FINS 命令换了一层 ASCII 信封**：内存区、字/位寻址、
+读写语义、数值字节序与 FINS/TCP 逐字节相同，差别只在「怎么把一帧发到线上」。所以命令
+语义抽进 `driver/finscore`（主站）与 `sim/finsmem`（从站内存表）与 FINS/TCP 共用，同一份
+点表换个 `protocol`（`fins` ↔ `hostlink`）就能跑。
+
+帧的形状要按字节记住六件事：等待时间只有**一位**十六进制（0..F，单位 10ms）；应答在
+`FA` 后**多一格结束码**、少一格等待时间（收发两条独立布局）；FCS 从 `@` 起异或到正文
+末尾、不含 `*` 与 CR；正文是「一字节两字符」的十六进制，整帧纯可打印 ASCII；单元号是
+两位数**十进制**（00..31）；直连 ICF 是 `0x00`（不是 FINS/TCP 惯用的 `0x80`）。
+
+**单次上限读 269 字、写 267 字**（不是 FINS/TCP 的 999）：命令不能在信封上分段，上限
+由整帧字符预算反推——读看应答帧能带多少数据，写看命令帧能塞多少正文，读写差两个字是
+结构性的。照抄 999 会稳定收到结束码 `0x18`（帧长错）。
+
+**串口出厂参数是 9600-7-E-2**，与 Mewtocol 的 9600-8-O-1 正好相反。7 位数据位够用是
+因为整帧是可打印 ASCII；把 FINS/TCP 用户的 8/N/1 套过来会「发得出去、收不到东西」，而且
+不报错。错误分两层：信封层结束码（`0x13` FCS 错 / `0x14` 格式错 / `0x18` 帧长错，修一次
+永久消失）与 FINS 层结束码（与 FINS/TCP 同一张表）。
+
+两条刻意的边界：**只做 FINS 帧（`FA`），不做 C 模式**（那是另一套命令集与 BCD 寻址，
+混进来每个字段都要先判断走哪套）；**不做跨网长格式，也不自动重试**（跨网多 12 个路由
+字段，目标由单元号承载；自动重发一次写可能把同一个字写两遍，对「加计数」点位是真实
+数据错误）。
 
 DNP3（IEEE 1815 调度侧主站，TCP 20000）：
 
@@ -1045,7 +1083,9 @@ obs  ← 所有包（不依赖任何内部包）
 | `internal/sim/mc` | MC 3E 内置从站（内存字/位表、按区读写、越界/未知设备结束码） | 一问一答；未配置编号读返回 0、写落表；越界返回 0xC054；设备码反查 | 89.8% |
 | `internal/codec/fins` | 欧姆龙 FINS 纯函数编解码（FINS/TCP 封装、节点协商、内存区码表、字/位读写命令、结束码） | 无 I/O、无时钟、无可变状态；TCP 长度只含「命令+错误码+负载」；读/写 MRC 同为 0x01、靠 SRC 区分；位访问一位一字节（不是按位打包）；当前 EM 区无位访问码 | 96.6% |
 | `internal/driver/fins` | FINS/TCP 主站驱动（节点号协商、字/位读写、当前 EM 区 bool 的 RMW、低字在前字序、结束码分类、SID 校验） | 只做 FINS/TCP；`offset` 是字地址、`bit` 是字内位号；`unitId>0` 覆盖目标节点；字/位混合 span 拆两次事务再按原序合并；节点协商失败归类为可重试连接错 | 81.4% |
-| `internal/sim/fins` | FINS/TCP 内置从站（节点分配、字内存表同时承载字/位视图、结束码） | 未配置地址读 0、写落表；位写只改目标位；越界 0x1103、未知区码 0x1101、点数 0/超限 0x1102；节点冲突回 `0x24` | 85.5% |
+| `internal/sim/fins` | FINS/TCP 内置从站（节点分配、字内存表同时承载字/位视图、结束码） | 未配置地址读 0、写落表；位写只改目标位；越界 0x1103、未知区码 0x1101、点数 0/超限 0x1102；节点冲突回 `0x24` | 78.9%（抽出 `finsmem` 后） |
+| `internal/driver/finscore` | 与 FINS/TCP 共享的主站会话（区拆分、字/位读写、按 `Limits` 切块、结束码分类、错误分类、内存区码表） | FINS/TCP 与 Host Link 复用同一实现：FINS/TCP 用 `fins.MaxWords=999` 切块，Host Link 用 `Limits`（读 269 字 / 538 位、写 267 字 / 534 位）切块；位写走内存区原生位命令（不需要 RMW）；结束码分类 0x11xx→address、0x03xx 写保护→permission、0x02xx→comm 可重试 | 82.4%（跨包） |
+| `internal/sim/finsmem` | 与 FINS/TCP 共享的从站内存表（字视图 + 位视图、EM bank 0..12、区码表、`Respond`） | 同一张内存表被 `sim/fins`（FINS/TCP）与 `sim/hostlink`（Host Link）复用，从站不再各写一套；未配置地址读 0、写落表；位写只改目标位；越界 0x1103、未知区码 0x1101、点数 0/超限 0x1102 | 0%（无独立测试，跨包覆盖） |
 | `internal/codec/enip` | EtherNet/IP 纯函数编解码（封装头/CPF/SendRRData/RegisterSession、CIP 请求与应答、符号路径与逻辑路径、Read/Write Tag、多服务合包、类型表、STRING） | 无 I/O、无时钟、无可变状态；封装长度只算负载（不含 24 字节头）；CPF 奇数条目补 1 字节对齐；发送方上下文原样回显；属性段不做（0x2C/0x30 编码有歧义）；CIP 状态码在 codec 层统一分类 | 97% |
 | `internal/driver/enip` | CIP 显式报文主站（RegisterSession、符号标签读/写、数组 offset、STRING、bytes 两阶段读、位 RMW、多服务合包与自动退回） | 只做显式报文 + TCP；`address.length` 按类型解释（不能用 `PointRef.Length` 当元素数）；数值线上小端，解码先整元素反转再走 `value.Decode(ABCD)`；类型以应答里的实际类型为准；offset 写读整段再改目标元素；设备回 0x08/0x14 自动关合包；封装状态 0x64 单独判可重试 | 87.4% |
 | `internal/sim/enip` | EtherNet/IP 内置从站（RegisterSession/UnRegister、Read/Write Tag、多服务合包、默认标签表） | 与主站共用 codec/enip；标签表显式指定类型与元素数；未配置标签回 0x05、越界 0x15、类型不匹配 0x03、数据不足 0x13；`SetMultipleSupported(false)` 验证主站退回路径 | 87.4% |
@@ -1062,6 +1102,9 @@ obs  ← 所有包（不依赖任何内部包）
 | `internal/codec/mewtocol` | Mewtocol 纯函数编解码（ASCII 帧 / BCC 含 `%` / 站号十进制 / 接点编号「十进制字 + 十六进制位」/ RD/WD/RCC/WCC/RCS/RCP/WCS/WCP/RS/WS/RK/WK 组帧 / 字内低字节在前 / 错误码四类 / 流式收帧） | 无 I/O、无时钟；BCC 从 `%` 到最后一位正文字符，不含 CR；站号 1..99 两位十进制，广播 `FF`；RD/WD 地址 5 位、RCC/WCC 4 位、索引寄存器「区码 + 9 个 0」；读用起止地址而非「起点 + 个数」；写的结束地址由数据长度反推；应答只回显前两位命令码（`RCC`→`RC`、`WCS`→`WC`）；`MaxWords=24`（写侧 `20+4n` 比读侧 `9+4n` 更紧）、`MaxContacts=8`（个数位一位）；T/C 接点全十进制且无位号；黄金字节含手册 BCC 实例 | 77.6% |
 | `internal/driver/mewtocol` | Mewtocol 主站（区拆分与 24 字切分、T/C 按点读 RCS/RCP、布尔量 WCS 单点写、字区布尔量拒绝、站号与回显校验、串口/TCP 双承载） | `Read` 真实走线：span 必须同区、按 `[min,max]` 合并后每 24 字切一刀、逐点按 `address.bit` 取位；T/C 不走 `RCC`（会按每字 16 点重编号），只走 `RCS`/`RCP`；布尔量只走 `WCS`，字区布尔量直接 `unsupported`（协议没有原子位写）；写的结束地址由数据长度反推；帧间静默 10ms 可配，`Drain` 必须早于 `SetDeadline`；应答校验站号 + 回显前两位；错误分类 `60/61/66/67`→address、`63/65`→permission、`40..43`/`53`→protocol 可重试，`23/24/26` 不可重试；不做 FP2-ET-LAN 16 字节封装 | 62.7%（跨包） |
 | `internal/sim/mewtocol` | Mewtocol 内置从站（站位图、两套接点编号、RCC 按字与 RCS/RCP 按点、WCS/WCP、错误码、站号过滤） | 与主站共用区域表与帧构造（`ParseRequest`/`BuildResponse`）；非本机站号的请求静默（广播也不应答）；`RCC` 对 T/C 按「每字 16 点」真实重编号，避免主站误以为按字读 T/C 安全；字区位写回 61H/66H 而不是「当字写成功」；未知区 60H、格式错 41H、命令不支持 42H、越界 66H | 64.9% |
+| `internal/codec/hostlink` | Host Link FINS 纯函数编解码（ASCII 信封 `FA` / FCS 含 `@` / 收发两条独立布局 / 单元号两位十进制 / 等待时间一位十六进制 / 读 269 字、写 267 字上限 / 结束码分层 / 流式收帧 `*`+CR 定界） | 无 I/O、无时钟；请求与应答是两条独立布局（应答 `FA` 后多一格结束码、少一格等待时间）；FCS 从 `@` 起异或到正文末、不含 `*`/CR；单元号 0..31 两位十进制、等待时间 0..F 一位十六进制、ICF 直连 0x00；`FromFINS` 丢弃六个跨网路由字段；单次上限读 269 字/538 位、写 267 字/534 位（读写差两个字是字符预算反推的结果）；黄金字节逐字节钉住 | 73.1% |
+| `internal/driver/hostlink` | Host Link FINS 主站（`FA` 信封组帧与收发校验 / 单元号与等待时间配置 / 串口出厂 9600-7-E-2 / 帧间静默 / 超时排查顺序 / 不自动重试） | `RoundTrip` 先 `Drain` 再设截止时间、总线锁覆盖整段事务；校验应答单元号、MRC/SRC 回显、FCS；超时文案带排查顺序（单元号→串口参数→端口模式→波特率）；不自动重试（无可靠事务号，重发写可能是脏写），重连交给调度器；串口缺省只在用户完全没配时补 9600-7-E-2 | 76.7%（跨包） |
+| `internal/sim/hostlink` | Host Link FINS 内置从站（TCP 透传 / 逐字节扫帧 / `*`+CR 定界 / 单元号不匹配完全沉默 / FCS 错 0x13 / 格式错 0x14 / 头码错 0x16） | 与主站共用 `codec/fins` 与 `codec/hostlink`；单元号不匹配就完全不出声（真 PLC 只回应点名到自己的帧）；FCS 错回 0x13、格式错 0x14、认不出的头码 0x16；预置初值与 `examples/hostlink.json` 对应（DM0=1234/DM1=5678/DM2..3=float32 3.14/CIO0.1=on/CIO0.5=on） | 85.5% |
 | `internal/codec/dnp3` | DNP3（IEEE 1815）纯函数编解码（CRC-16/DNP、链路帧、流式收帧、传输分片重组、应用层请求/响应、对象解析、请求头、CROB 与组 41 构造） | 无 I/O、无时钟、无可变状态；CRC 按 16 字节分块且块尾插校验；链路帧 LEN 只算用户数据；双点静态量变体 1 是 2 位/点；变体 2 是每点一个「状态+品质」字节、无独立位图；计数器/模拟量是每对象 `flags+值` 交错，不是 flags 块 + 值块；带时标事件只接受索引前缀逐点编码；未知组/变体直接报错不猜布局 | 70.4% |
 | `internal/driver/dnp3` | DNP3 主站（复位链路 + TEST_LINK、类 0/1/2/3 轮询、未请求响应、应用层确认、CROB 与组 41 直接控制、旁路表） | 只做 TCP 主站；`Read` 只查本地表不产生网络交互；总召唤默认 5m、事件轮询默认 1s 且必须 < 总召唤；`masterAddress` 与 `unitId` 必须不同且 1..65519；带 CON 的响应与未请求响应立即回确认；质量只看低 6 位（状态位必须先屏蔽）；双点 0/3 → false + uncertain；写操作检查从站回显状态，非零 status 按 protocol 错误上报；不做 SBO、安全认证、文件传输、时间同步写路径、串口 | 75.1% |
 | `internal/sim/dnp3` | DNP3 内置从站（链路 ACK、类 0 静态快照、类 1/2/3 事件队列与 inflight、CROB 与组 41 直接控制回显） | 与主站共用 codec/dnp3；链路复位/探活/TEST_LINK 都回 ACK；确认用户数据先回链路 ACK 再处理应用报文；事件响应置 CON 且未确认前留在 inflight 重发；一次 READ 可同时请求类 0/1/2/3；未配置的点按 flags=0（离线）编码而不是 good；未知输出索引回 CROB not-supported；静态编码 → 主站解析有往返自洽测试 | 22.7% |
@@ -1220,12 +1263,15 @@ OPC UA 服务端（同一份点位表的另一个出口）：
 | 点表 CSV 导入 | ✅ | `internal/pointtable` + `uic import`；列别名、协议感知的地址解析与长度推导、行错误聚合、new/unchanged/replaced/conflict 合并；默认拒绝静默覆盖 |
 | 三菱 MC 3E 主站 + 内置从站 | ✅ | `internal/codec/mc` + `internal/driver/mc` + `internal/sim/mc` + `uic mcread` + `examples/mc.json`；只做 3E 二进制帧 + TCP；位软元件按位打包、X/Y 按十六进制、字软元件 bool 走 RMW 不清零邻位；结束码 0xC052/53/54/56→address_error；主站/从站/编解码三层测试 |
 | 欧姆龙 FINS 主站 + 内置从站 | ✅ | `internal/codec/fins` + `internal/driver/fins` + `internal/sim/fins` + `uic finsread` + `examples/fins.json`；只做 FINS/TCP（FINS/UDP 与 Host Link 配置期即拒）；三层封装（FINS/TCP 头 / 10 字节 FINS 帧头 / 命令）各自独立；建链先做节点号协商，`unitId>0` 覆盖目标节点；读写 MRC 同为 0x01、靠 SRC 区分；`offset` 是字地址、`bit` 是字内位号；位访问一位一字节，32 位低字在前（CDAB）、64 位 DCBA；当前 EM 区无位码，bool 走 RMW；结束码 0x11xx→address_error、0x02xx/0x03xx→comm_error；每帧校验 SID；三层测试含真实 TCP 回环 |
+| 欧姆龙 Host Link（上位链接 FINS）主站 + 内置从站 | ✅ | `internal/codec/hostlink` + `internal/driver/hostlink` + `internal/sim/hostlink` + `internal/driver/finscore` + `internal/sim/finsmem` + `uic hostlinkread` + `examples/hostlink.json`；只做头码 `FA` 的 FINS 帧（C 模式与跨网长格式配置期即拒）；**命令语义由 `driver/finscore` + `sim/finsmem` 与 FINS/TCP 共用，同一份点表换个 `protocol`（`fins` ↔ `hostlink`）就能跑**；ASCII 信封（请求 `@`+单元号两位十进制+`FA`+等待时间一位十六进制+精简 FINS 头+命令正文+FCS 两位十六进制+`*`+CR，应答多一格结束码、少一格等待时间）；FCS 从 `@` 起异或到正文末；单次上限读 269 字/538 位、写 267 字/534 位（读写差两个字是字符预算反推的结果，照抄 FINS/TCP 的 999 会收到结束码 0x18）；串口出厂 9600-7-E-2（与 Mewtocol 的 9600-8-O-1 相反，只发不收的典型症状）；CIO/WR/HR/AR 走 FINS 原生位写、DM/EM 走字写，无 RMW；信封层结束码 0x13/0x14/0x15/0x18→格式错（修一次永久消失）、0x03/0x23→permission、其余 protocol 可重试；FINS 层结束码与 FINS/TCP 同一张表；不自动重试（无可靠事务号，重发写可能是脏写），重连交给调度器；内置从站单元号不匹配完全沉默、FCS 错回 0x13、头码错回 0x16；三层测试含真实 TCP 回环 |
 | EtherNet/IP + CIP 主站 + 内置从站 | ✅ | `internal/codec/enip` + `internal/driver/enip` + `internal/sim/enip` + `uic enipread` + `examples/enip.json`；只做 CIP 显式报文 + TCP 44818 + 符号标签（隐式 I/O、对象/属性寻址、结构体展开配置期即拒）；三层封装（24 字节封装头 / CPF / CIP）、封装长度只算负载、CPF 奇数条目对齐、发送方上下文严格校验；CIP 无事务号，整条会话串行化；地址字段按 CIP 重解释（标签名/元素 offset/按类型解释的 length/位号）；数值线上小端，整元素反转后走统一解码；类型以设备应答为准；STRING 为「4 字节长度 + 容量」；bytes 两阶段读；多服务合包（450 字节拆批、单次 400 字节上限）且设备不支持时自动退回；位写 RMW 只回写目标元素；状态码统一分类，封装 0x64 判可重试；三层测试含真实 TCP 回环与错误路径脚本流 |
 | BACnet/IP 主站 + 内置从站 | ✅ | `internal/codec/bacnet` + `internal/driver/bacnet` + `internal/sim/bacnet` + `uic bacread` + `examples/bacnet.json`；只做 ReadProperty（0x0C）/ WriteProperty（0x0F）（不做 Who-Is/I-Am、COV、批量读、分段）；四层封装（BVLC/NPDU/APDU/标签），BVLC 长度只算 NPDU+APDU，Forwarded-NPDU 跳过 4 字节转发头；application 与 context 的 LVT 含义分开实现（context 6/7 是 opening/closing），BOOLEAN 的 LVT 直接承载值；点位用 `kind=object` 寻址（对象类型/实例/属性/数组下标，都支持名字或编号）；写 `present-value` 的标签由对象语义决定（REAL/ENUMERATED/UNSIGNED/CHARACTER STRING）；UDP 用 connected socket、8 位 invoke ID 配对、整条会话串行化、迟到应答丢弃、超时重发 2 次；错误类 1/2→address、40/27→permission、3→disconnected（可重试）、4→permission；三层测试含真实 UDP 回环 |
 | BACnet/IP 的边界 | ⚠️ | 不做广播发现、COV 订阅、ReadPropertyMultiple、分段传输、对象浏览；优先级数组可读但不暴露写优先级（避免「写了一直不生效、其实是更高优先级压住」）；实例号必须写在配置里，不能靠发现补齐 |
 | IEC 60870-5-104 主站 + 内置从站 | ✅ | `internal/codec/iec104` + `internal/driver/iec104` + `internal/sim/iec104` + `uic iec104read` + `examples/iec104.json`；只做平衡式 TCP + STARTDT/STOPDT/TESTFR + 站总召唤 + 电能量召唤 + 单点/双点/设定值命令（不做文件传输、时钟同步写路径、冗余通道、带时标命令、组召唤；非平衡轮询是独立的 101 驱动）；APCI 长度只算控制域+ASDU、U 帧功能码低两位必须 `11`、I 帧空载荷判错；ASDU 层由 `codec/iec60870` 共享，本包只保留 APCI 与别名转发；`Read` 只查本地最新值表不产生网络交互；质量只来自 ASDU 品质位与 TESTFR 活性（**不做按时间降级**——104 只在变化时上送）；`Open` 只等 STARTDT、召唤超时不拆链、电能量召唤无条件发送、EndOfInit 触发重新召唤并去重；命令类型由 `area` 声明，双点只接受 1/2（0/3 本地即拒），写成功先填缓存标 uncertain；缓存按点位 ID（同一 IOA 的遥信与遥控互不覆盖）；旁路表 `Observed` 让 CLI 不依赖点表就能列出「设备送什么」；三层测试含真实 TCP 回环与注入式假链路 |
 | IEC 60870-5-101 主站 + 内置从站 | ✅ | `internal/codec/iec101`（FT1.2 帧）+ `internal/codec/iec60870`（共享应用层）+ `internal/driver/iec101` + `internal/sim/iec101` + `uic iec101read` + `examples/iec101.json`；只做非平衡式主站 + 串口/串口服务器双承载（不做平衡式、FT1.1、文件传输、时钟同步写路径、带时标命令、选择-执行、分组召唤）；`Read` 真实轮询：每轮请求第 1 级、按周期站总召唤 + 电能量召唤、可选第 2 级；长度只计「控制域+链路地址+ASDU」、校验和从控制域起、单字节帧无地址无控制域；剖面 ORG/CA/IOA 宽度全部走设备标签，非法组合配置期拒绝；总召唤不放在 `Open`，终止只认激活终止与初始化结束（激活确认不算结束）；重传复用同一帧字节避免命令重复执行；写入等应用层激活确认，44..47 按 protocol/address 分类；缓存按点位 ID；点表层用 `WidthNone`（远动地址不表达宽度，布尔量不需要位号，`length` 与位号在导入期拒绝）；内置从站覆盖 FCB 去重、ACD、两级队列、召唤快照与终止类型、命令两段确认 |
 | Mewtocol 主站 + 内置从站 | ✅ | `internal/codec/mewtocol` + `internal/driver/mewtocol` + `internal/sim/mewtocol` + `uic mewtocolread` + `examples/mewtocol.json`；只做计算机链接 ASCII 裸帧 + 串口/串口服务器双承载（不做 FP2-ET-LAN 16 字节封装、二进制变体、`SC`/`SD` 整块置位、扩展头发送）；一帧三种进制：站号两位十进制、数据区地址五位十进制、接点编号「三位十进制字 + 末位十六进制」、T/C 四位十进制；BCC 从 `%` 起算且不含 CR；读用起止地址（不是起点+个数）、写也带结束地址并由数据长度反推；应答只回显前两位命令码；`MaxWords=24`（写侧比读侧更紧）、`MaxContacts=8`（个数位一位）；`Read` 按区拆 span、按 `[min,max]` 合并后每 24 字切一刀、逐点取位；T/C 只走 `RCS`/`RCP`（按字读会按每字 16 点重编号）；布尔量只走 `WCS` 原子单点写，字区布尔量本地拒绝（协议没有位写）；站号 1..99、广播 `FF`，应答校验站号与回显；错误码四类映射到 address/permission/protocol 并区分可重试；三层测试含真实 TCP 回环与两套接点编号 |
+| Host Link FINS 主站 + 内置从站 | ✅ | `internal/codec/hostlink` + `internal/driver/hostlink` + `internal/sim/hostlink` + `internal/driver/finscore` + `internal/sim/finsmem` + `uic hostlinkread` + `examples/hostlink.json`；只做 FINS 帧（头码 `FA`）+ 串口/串口服务器双承载（不做 C 模式、跨网长格式）；命令语义抽进 `finscore`/`finsmem` 与 FINS/TCP 共用，同一份点表换个 `protocol`（`fins`↔`hostlink`）就能跑；帧全可打印 ASCII，六件按字节记的事——等待时间一位十六进制、应答 `FA` 后多一格结束码、FCS 含 `@`、正文一字节两字符、单元号两位十进制、直连 ICF=0x00；单次上限读 269 字 / 538 位、写 267 字 / 534 位（读写差两字是字符预算反推，不是随便统一的）；串口出厂 9600-7-E-2（与 Mewtocol 的 8-O-1 相反）；不自动重试（无可靠事务号，重发写可能是脏写），重连交给调度器；错误分信封层结束码（`0x13/0x14/0x18` 修一次永久消失）与 FINS 层结束码（同 FINS/TCP 一张表）；三层测试含真实 TCP 回环、单元号不匹配沉默、FCS 错 0x13 / 格式错 0x14 / 头码错 0x16 |
+| Host Link FINS 的边界 | ⚠️ | 只做 FINS 帧（`FA`），不做 C 模式（`RR`/`RD`/`WD`… 是另一套命令集与 BCD 寻址）；不做跨网长格式（多 12 个路由字段，目标由单元号承载）；不做自动重试（没有可靠事务号，重发一次写可能把同一字写两遍，对「加计数」点位是真实数据错误）；不做多主站 / 令牌传递（单主站模型） |
 | DNP3（IEEE 1815）主站 + 内置从站 | ✅ | `internal/codec/dnp3` + `internal/driver/dnp3` + `internal/sim/dnp3` + `uic dnp3read` + `examples/dnp3.json`；只做 TCP 主站 + 类 0/1/2/3 + CROB + 组 41 直接控制（不做串口、安全认证、文件传输、时间同步写路径、SBO 两段式）；三层各自的确认都必须处理——链路 ACK、传输分片、应用层 CON；带 CON 响应与未请求响应立即回确认，否则从站事件缓冲区会被重发撑爆；`Read` 只查本地最新值表；质量只看低 6 位，二进制 bit7 / 双点 bit6-7 是状态不是品质；双点 0/3 → false + uncertain；写操作检查从站回显状态；静态编码 → 解析有往返自洽测试，双点 2 位/点与「变体 2 无独立位图」两个易错点各钉了一个用例 |
 | CoAP 主站 + 内置服务端 | ✅ | `internal/codec/coap` + `internal/codec/textval` + `internal/driver/coap` + `internal/sim/coap` + `uic coapread` + `examples/coap.json`；只做明文 UDP 主站 + GET/PUT/POST + Block2 分块接收 + `/.well-known/core` 资源发现（不做 DTLS、Observe 订阅、Block1 分块发送、CBOR）；点位 `kind=symbol`，`path` 是资源、`selector` 取 JSON 字段、`length` 限接收字节；读取严格按响应 `Content-Format` 解码，不猜；Block2 首请求默认不带选项、由服务端决定块大小，`4.02` 时退回一次；`ackTimeout` 指数翻倍且不越过设备级 timeout，空 ACK 后只等分离响应，分离响应的 CON 回空 ACK，无关 CON 回 RST；PUT 是替换整个资源，JSON 带 selector 只发子树、数组下标写入拒绝；写成功标 good；不做响应缓存与隐藏读-改-写 |
 | CoAP 的边界 | ⚠️ | 不做 DTLS、Observe 订阅、Block1 分块发送、DELETE/FETCH/iPATCH、CBOR/SenML、组播发现；`Subscribe` 诚实声明 unsupported——一次性 GET 不伪装成推送；CoAP 没有批量读，一轮采集耗时约等于「点位数 × 单次事务」，同路径多点位也不合并；JSON 写入只支持「替换整个资源或字段子树」，不做读-改-写，数组元素写入直接拒绝 |

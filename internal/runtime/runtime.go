@@ -43,6 +43,7 @@ import (
 	dnp3drv "uic/internal/driver/dnp3"
 	enipdrv "uic/internal/driver/enip"
 	finsdrv "uic/internal/driver/fins"
+	hostlinkdrv "uic/internal/driver/hostlink"
 	iec101drv "uic/internal/driver/iec101"
 	"uic/internal/driver/iec104"
 	mcdrv "uic/internal/driver/mc"
@@ -168,6 +169,7 @@ func RegisterBuiltins() error {
 			iec104.New(),
 			iec101drv.New(),
 			mewtocoldrv.New(),
+			hostlinkdrv.New(),
 			dlt645drv.New(),
 			dnp3drv.New(),
 			cjt188drv.New(),

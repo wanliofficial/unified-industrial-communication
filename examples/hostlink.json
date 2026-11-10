@@ -1,0 +1,98 @@
+{
+  "schemaVersion": 1,
+  "site": "hostlink-lab",
+  "server": {
+    "listen": "127.0.0.1:8090",
+    "token": "dev-token-0123456789"
+  },
+  "storage": {
+    "dir": "./data-hostlink",
+    "journal": true,
+    "outboxMaxRecords": 5000,
+    "outboxTtl": "10m"
+  },
+  "logging": {
+    "level": "info"
+  },
+  "northbound": {
+    "webhook": {
+      "enabled": false,
+      "url": "http://127.0.0.1:9999/ingest",
+      "timeout": "3s"
+    }
+  },
+  "channels": [
+    {
+      "id": "ch-hostlink",
+      "protocol": "hostlink",
+      "transport": {
+        "kind": "tcp",
+        "address": "127.0.0.1:2000"
+      },
+      "concurrency": 1,
+      "timeout": "2s"
+    }
+  ],
+  "devices": [
+    {
+      "id": "plc01",
+      "name": "一号 PLC（欧姆龙上位链接，单元号 0）",
+      "channel": "ch-hostlink",
+      "unitId": 0,
+      "interval": "1s",
+      "timeout": "2s",
+      "enabled": true,
+      "labels": {
+        "options": "wait=0"
+      },
+      "points": [
+        {
+          "id": "dm0",
+          "name": "DM0 字（uint16）",
+          "address": { "kind": "register", "area": "dm", "offset": 0, "length": 1, "bit": -1 },
+          "dataType": "uint16",
+          "enabled": true
+        },
+        {
+          "id": "dm1",
+          "name": "DM1 字（int16）",
+          "address": { "kind": "register", "area": "dm", "offset": 1, "length": 1, "bit": -1 },
+          "dataType": "int16",
+          "enabled": true
+        },
+        {
+          "id": "temp",
+          "name": "DM2 温度（float32，低字在前）",
+          "address": { "kind": "register", "area": "dm", "offset": 2, "length": 2, "bit": -1 },
+          "dataType": "float32",
+          "byteOrder": "CDAB",
+          "unit": "degC",
+          "enabled": true
+        },
+        {
+          "id": "run",
+          "name": "运行标志（CIO0.1）",
+          "address": { "kind": "register", "area": "cio", "offset": 0, "bit": 1 },
+          "dataType": "bool",
+          "enabled": true
+        },
+        {
+          "id": "fault",
+          "name": "故障（CIO0.5，可写）",
+          "address": { "kind": "register", "area": "cio", "offset": 0, "bit": 5 },
+          "dataType": "bool",
+          "writable": true,
+          "enabled": true
+        },
+        {
+          "id": "counter",
+          "name": "DM10 计数器（可用 WCS 单点写）",
+          "address": { "kind": "register", "area": "dm", "offset": 10, "length": 1, "bit": -1 },
+          "dataType": "uint16",
+          "writable": true,
+          "enabled": true
+        }
+      ]
+    }
+  ]
+}

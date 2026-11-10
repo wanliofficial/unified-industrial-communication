@@ -123,6 +123,28 @@ var (
 	// mewBitless 是 mewtocol 里「布尔量不带位号」的区：T/C 接点按定时器/
 	// 计数器编号，一个号就是一个接点。
 	mewBitless = map[string]bool{"t": true, "c": true}
+	// finsAreas 是 FINS 内存区的区名集合：CIO/WR/HR/AR 四个继电器区，
+	// 数据存储器 DM，加上「当前 EM 区」（em）与 13 个 bank（em0..em12）。
+	//
+	// 与 modbusAreas 同样处理成可穷举的白名单：区名写错（例如把 dm 写成
+	// dmm、把 em5 写成 em15）应当在点表导入期就报出来，而不是等到运行时
+	// 每个周期都返回 address_error。别名 D/W/H/A 由 splitRegisterPrefix
+	// 归一化成小写全名，所以这里只列规范名。
+	finsAreas = func() map[string]bool {
+		m := map[string]bool{
+			"cio": true, "wr": true, "hr": true, "ar": true, "dm": true, "em": true,
+		}
+		for i := 0; i <= 12; i++ {
+			m[fmt.Sprintf("em%d", i)] = true
+		}
+		return m
+	}()
+	// finsAliases 是现场口语里的单字母区名。它们只在 splitRegisterPrefix
+	// 里归一化，不进入 finsAreas：白名单只放规范名，别名一旦归一化就
+	// 不再是别名，写错的 `dmm` 也就不会因为「像 dm」而蒙混过去。
+	finsAliases = map[string]string{
+		"d": "dm", "w": "wr", "h": "hr", "a": "ar",
+	}
 )
 
 // PolicyFor 返回协议对应的地址策略。
@@ -197,6 +219,21 @@ func PolicyFor(protocol string) AddressPolicy {
 		return AddressPolicy{
 			Width: WidthRegisters, RegisterAreas: mewAreas,
 			BitlessAreas: mewBitless, AllowRegister: true,
+		}
+	case "fins", "hostlink":
+		// 寄存器型寻址，与 Mewtocol 同形：`区名:字地址[.位号][:长度]`。
+		//
+		// Host Link（头码 FA）与 FINS/TCP 在应用层是同一套命令：内存区、
+		// 字地址、位号、读写语义完全一致，差别只在信封（ASCII 十六进制 +
+		// FCS）与承载。因此点表没有理由分成两种写法——同一份点表换个
+		// protocol 就能跑，是本项目把两者放在一起的核心理由。
+		//
+		// 宽度仍按寄存器推导（uint16 = 1，float32 = 2）。两者的单次上限
+		// 不同（Host Link 读 269 字、写 267 字；FINS/TCP 读 480 字），
+		// 那是驱动按信封算出来的，点表层不复制这些数字：同一个点表在
+		// Host Link 上会被驱动切成更多次事务，而不是被拒绝。
+		return AddressPolicy{
+			Width: WidthRegisters, RegisterAreas: finsAreas, AllowRegister: true,
 		}
 	case "dlt645":
 		// 数据标识型寻址：`<DI>:0[:length]`，DI 是手册顺序的 8 位十六进制。
@@ -370,8 +407,22 @@ func splitRegisterPrefix(expr string) (area string, db int, rest string, ok bool
 		"ioa", "single-command", "double-command",
 		"setpoint-float", "setpoint-scaled", "setpoint-normalized",
 		"x", "y", "r", "l", "t", "c", "dt", "ld", "fl",
-		"ix", "iy", "id", "sv", "ev":
+		"ix", "iy", "id", "sv", "ev",
+		// FINS 内存区（FINS/TCP 与 Host Link 共用）。别名 D/W/H/A 在这里
+		// 归一化成规范名，这样点表里写 `d:0` 与 `dm:0` 产出同一个地址，
+		// 与协议 codec 的 Lookup 行为一致。
+		"cio", "wr", "hr", "ar", "dm", "em",
+		"d", "w", "h", "a":
+		if alias, ok := finsAliases[lower]; ok {
+			lower = alias
+		}
 		return lower, 0, expr[colon+1:], true
+	}
+	// EM 区按 bank 编号写：em0..em12。
+	if rest, ok := strings.CutPrefix(lower, "em"); ok {
+		if n, err := strconv.Atoi(rest); err == nil && n >= 0 && n <= 12 {
+			return lower, 0, expr[colon+1:], true
+		}
 	}
 	return "", 0, "", false
 }

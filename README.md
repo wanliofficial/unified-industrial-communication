@@ -768,6 +768,65 @@ TCP 承载**只发裸帧**：FP7 的 LAN 口若设成「与 FP2-ET-LAN 连接」
 `permission`、`40..43`/`53` → `protocol`（可重试）、`23` 站号重号 / `24` 硬件错 / `26`
 站号设置错不可重试。质量码只由错误分类与链路状态决定，不做「多久没更新就降级」。
 
+Host Link FINS（欧姆龙上位链接，头码 `FA`，串口 / 串口服务器 TCP 2000）：
+
+```bash
+./uic sim -protocol hostlink -listen 127.0.0.1:2000 &  # 内置上位链接从站（单元号 0）
+./uic -config examples/hostlink.json
+curl -s -H 'Authorization: Bearer dev-token-0123456789' localhost:8090/api/v1/points
+#   6 点：DM0/DM1 字、DM2..DM3=3.14（float32，CDAB）、CIO0.1 运行位、
+#         CIO0.5 可写故障位、DM10 可写计数器
+#   自检（不需要网关）：./uic hostlinkread -addr 127.0.0.1:2000 -area dm -offset 0 -qty 4
+#   只验链路：./uic hostlinkread -transport serial -port /dev/ttyUSB0 \
+#             -baud 9600 -dataBits 7 -parity even -stopBits 2 -probe
+#   打印单次上限：./uic hostlinkread -limits
+```
+
+Host Link 不是另一种协议，而是 **FINS 命令换了一层 ASCII 信封**：内存区、字/位寻址、
+读写语义、数值字节序与 FINS/TCP 逐字节相同，差别只在「怎么把一帧发到线上」。所以
+`codec/hostlink` 只做「FINS 帧 ↔ Host Link 信封」的转换，命令语义由 `driver/finscore`
+与 `sim/finsmem` 与 FINS/TCP 共用——同一份点表换个 `protocol`（`fins` ↔ `hostlink`）就能跑。
+
+帧的形状要按字节记住六件事：
+
+| 细节 | 正确 | 记错的症状 |
+|---|---|---|
+| 等待时间宽度 | `FA` 后**一位**十六进制（0..F，单位 10ms） | 写成两位，PLC 把第二位当 ICF 高位，整帧错位 |
+| 收发对称性 | 应答 `FA` 后**多一格结束码**、少一格等待时间 | 按请求布局解应答，后面每个字段错位两格 |
+| FCS 范围 | 从 `@` 起异或到正文最后一个字符 | 少算 `@`：本地回环永远通过，真机必挂 |
+| 正文编码 | 一字节两字符的十六进制（全区可打印 ASCII） | 当成二进制发，PLC 回 0x14 |
+| 单元号进制 | 两位**十进制**（00..31） | 当成十六进制，31 号站写成 `1F` |
+| 直连 ICF | `0x00`（应答 `0x40`） | 照抄 FINS/TCP 的 `0x80`，PLC 按跨网解、找不到路由 |
+
+黄金字节（实现直接打印，单元号 0、等待 0）：
+
+```
+读 DM0..DM1   @00FA00000000001018200000000027F*\r       (34)
+读应答         @00FA004000000001010000123456784B*\r       (35)
+写 DM0=1234   @00FA000000000010282000000000112347B*\r     (38)
+```
+
+**单次上限是读 269 字、写 267 字**，不是 FINS/TCP 的 999。Host Link 的 FINS 命令不能
+在信封上分段，所以上限由整帧字符预算反推：读受应答帧长约束（数据 1076 字符 / 4），写
+受命令帧长约束（正文 1080 字符减 12 字符参数再 / 4）。读写相差两个字是结构性的，不是
+随便统一的数字；照抄 999 会稳定收到结束码 0x18（帧长错）。
+
+**串口出厂参数是 9600-7-E-2**，与 Mewtocol 的 9600-8-O-1 正好相反。整帧是可打印
+ASCII，7 位数据位完全够用——「FINS 必须 8 位数据位」是错的。把 FINS/TCP 用户的 8/N/1
+套过来会「发得出去、收不到东西」，而且不报错。
+
+两条刻意的边界：
+
+- **只做 FINS 帧（`FA`），不做 C 模式。** C 模式（`RR`/`RD`/`WD`…）是另一套命令集与
+  寻址（BCD「通道号 + 位号」），没有区码表也没有 FINS 结束码，混进来每个字段都要先
+  判断「现在走哪套」。
+- **不做跨网长格式，也不自动重试。** 跨网格式多 12 个路由字段，目标由单元号承载；
+  自动重发一次写可能把同一个字写两遍（没有可靠事务号排出迟到应答的歧义），对「加
+  计数」点位是真实数据错误。重连交给调度器。
+
+错误信息分两层：信封层结束码（`0x13` FCS 错 / `0x14` 格式错 / `0x15` 数据错 / `0x18`
+帧长错，修一次永久消失）与 FINS 层结束码（越界、写保护等，与 FINS/TCP 同一张表）。
+
 ## 文档
 
 - **[docs/00-README.md](docs/00-README.md)** — 总索引：阅读路径、38 个参考方案总览、结论速查、代码地图、接口速查、实现边界
@@ -789,7 +848,7 @@ go test -race -count=1 ./...
 
 | 路径 | 内容 |
 |---|---|
-| `cmd/uic/` | 单入口：`run` / `sim`（Modbus / S7 / OPC UA / MQTT / MC / FINS / EtherNet-IP / BACnet-IP / IEC 104 / IEC 101 / Mewtocol / DNP3 / CoAP / 645 / 188 / SNMP / ADS / SECS）/ `mbread` / `mcread` / `finsread` / `enipread` / `bacread` / `iec104read` / `iec101read` / `mewtocolread` / `dnp3read` / `coapread` / `dlt645read` / `cjt188read` / `snmpread` / `adsread` / `secsread` / `uaread` / `s7blocks` / `s7upload` / `instantiate` / `import` / `token` / `-check` / `version` |
+| `cmd/uic/` | 单入口：`run` / `sim`（Modbus / S7 / OPC UA / MQTT / MC / FINS / Host Link / EtherNet-IP / BACnet-IP / IEC 104 / IEC 101 / Mewtocol / DNP3 / CoAP / 645 / 188 / SNMP / ADS / SECS）/ `mbread` / `mcread` / `finsread` / `hostlinkread` / `enipread` / `bacread` / `iec104read` / `iec101read` / `mewtocolread` / `dnp3read` / `coapread` / `dlt645read` / `cjt188read` / `snmpread` / `adsread` / `secsread` / `uaread` / `s7blocks` / `s7upload` / `instantiate` / `import` / `token` / `-check` / `version` |
 | `internal/model` | 通道 / 设备 / 点位 / 地址 / 采样 / 质量码 |
 | `internal/driver` | 驱动契约（Codec / Transport / Driver）、错误分类、注册表、只读 `Lookup` 注入 |
 | `internal/calc` | 零依赖表达式引擎（编译期类型检查、短路求值、引用 `device:point`） |
@@ -799,6 +858,11 @@ go test -race -count=1 ./...
 | `internal/codec/fins` | 欧姆龙 FINS 纯函数编解码（FINS/TCP 封装、节点协商、内存区码表、字/位读写、结束码） |
 | `internal/driver/fins` | FINS/TCP 主站驱动（节点号协商、字/位读写、RMW 位写、低字在前字序、结束码分类、SID 校验） |
 | `internal/sim/fins` | FINS/TCP 内置从站（节点分配、字内存表同时承载字/位视图、结束码） |
+| `internal/driver/finscore` | 与 FINS/TCP 共享的主站会话（区拆分、字/位读、按 `Limits` 切块、结束码分类；Host Link 通过它复用，不复制） |
+| `internal/sim/finsmem` | 与 FINS/TCP 共享的从站内存表（字视图 + 位视图、EM bank、`Respond`） |
+| `internal/codec/hostlink` | Host Link（上位链接 FINS）纯函数编解码（ASCII 信封 `FA` / FCS 异或含 `@` / 收发两条布局 / 单元号十进制 / 单次上限 269·267 / 结束码分层 / 流式收帧） |
+| `internal/driver/hostlink` | Host Link 主站驱动（`FromFINS` 套信封、单元号·等待时间·ICF 收校验、结束码分层、串口 7-E-2 缺省、超时排查顺序、不自动重试） |
+| `internal/sim/hostlink` | Host Link 内置从站（逐字节扫帧、`*`+CR 定界、单元号过滤沉默、FCS 错 0x13 / 格式错 0x14 / 头码错 0x16） |
 | `internal/codec/enip` | EtherNet/IP 纯函数编解码（封装头 / CPF / SendRRData / CIP 请求应答 / 符号路径 / Read/Write Tag / 多服务合包 / 类型表） |
 | `internal/driver/enip` | CIP 显式报文主站（标签读写、数组 offset、STRING、bytes 两阶段读、位 RMW、多服务合包与自动退回） |
 | `internal/sim/enip` | EtherNet/IP 内置从站（RegisterSession / Read/Write Tag / 多服务合包 / 默认标签表） |

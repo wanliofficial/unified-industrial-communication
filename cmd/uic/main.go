@@ -69,6 +69,7 @@ import (
 	dnp3sim "uic/internal/sim/dnp3"
 	enipsim "uic/internal/sim/enip"
 	finsim "uic/internal/sim/fins"
+	hlsim "uic/internal/sim/hostlink"
 	iec101sim "uic/internal/sim/iec101"
 	iec104sim "uic/internal/sim/iec104"
 	mcsim "uic/internal/sim/mc"
@@ -112,6 +113,8 @@ func main() {
 		iec101readCmd(args)
 	case "mewtocolread":
 		mewtocolreadCmd(args)
+	case "hostlinkread":
+		hostlinkreadCmd(args)
 	case "dnp3read":
 		dnp3readCmd(args)
 	case "coapread":
@@ -155,7 +158,7 @@ func usage() {
 用法:
   uic [run] -config config.json [-listen :8080] [-token TOKEN]
   uic -check -config config.json
-  uic sim [-listen 127.0.0.1:15020] [-protocol modbus|s7|opcua|mqtt|mc|fins|enip|bacnet|iec104|iec101|mewtocol|dnp3|coap|dlt645|cjt188|snmp|ads|secs]
+  uic sim [-listen 127.0.0.1:15020] [-protocol modbus|s7|opcua|mqtt|mc|fins|hostlink|enip|bacnet|iec104|iec101|mewtocol|dnp3|coap|dlt645|cjt188|snmp|ads|secs]
   uic mbread -addr 127.0.0.1:1502 -unit 1 -area holding -offset 0 -qty 2
   uic mbread -addr 127.0.0.1:1502 -area holding -offset 5 -write 777
   uic mcread -addr 127.0.0.1:5000 -area d -offset 100 -qty 2
@@ -174,6 +177,10 @@ func usage() {
   uic mewtocolread -addr 127.0.0.1:2000 -station 1 -area dt -offset 0 -qty 3 [-json] [-raw]
   uic mewtocolread -transport serial -port /dev/ttyUSB0 -baud 9600 -parity odd -probe
   uic mewtocolread -addr 127.0.0.1:2000 -area x -offset 1 -bit 15 -write on
+  uic hostlinkread -addr 127.0.0.1:2000 -unit 0 -area dm -offset 0 -qty 2 [-json]
+  uic hostlinkread -transport serial -port /dev/ttyUSB0 -baud 9600 -dataBits 7 -parity even -stopBits 2 -probe
+  uic hostlinkread -addr 127.0.0.1:2000 -area cio -offset 0 -bit 3 -write on
+  uic hostlinkread -limits
   uic dnp3read -addr 127.0.0.1:20000 [-index 0,1] [-json] [-raw]
   uic dnp3read -addr 127.0.0.1:20000 -binary 0=on -analog 0=12.5
   uic coapread -addr 127.0.0.1:5683 -path /sensors/temp [-type float64] [-json]
@@ -513,7 +520,7 @@ func simCmd(args []string) {
 	fs := flag.NewFlagSet("sim", flag.ExitOnError)
 	addr := fs.String("listen", "127.0.0.1:15020", "监听地址")
 	size := fs.Int("size", 1024, "寄存器数量")
-	proto := fs.String("protocol", "modbus", "从站协议：modbus | s7 | opcua | mqtt | mc | fins | enip | bacnet | iec104 | iec101 | mewtocol | dnp3 | coap | dlt645 | cjt188 | snmp | ads | secs")
+	proto := fs.String("protocol", "modbus", "从站协议：modbus | s7 | opcua | mqtt | mc | fins | enip | bacnet | iec104 | iec101 | mewtocol | hostlink | dnp3 | coap | dlt645 | cjt188 | snmp | ads | secs")
 	pdu := fs.Int("pdu", 480, "S7 协商 PDU 长度（240/480/960）")
 	fs.Parse(args)
 
@@ -548,6 +555,9 @@ func simCmd(args []string) {
 	case "mewtocol":
 		simMewtocol(*addr)
 		return
+	case "hostlink":
+		simHostLink(*addr)
+		return
 	case "dnp3":
 		simDNP3(*addr)
 		return
@@ -571,7 +581,7 @@ func simCmd(args []string) {
 		return
 	case "modbus":
 	default:
-		fmt.Fprintf(os.Stderr, "未知协议 %q（支持 modbus | s7 | opcua | mqtt | mc | fins | enip | bacnet | iec104 | iec101 | mewtocol | dnp3 | coap | dlt645 | cjt188 | snmp | ads | secs）\n", *proto)
+		fmt.Fprintf(os.Stderr, "未知协议 %q（支持 modbus | s7 | opcua | mqtt | mc | fins | enip | bacnet | iec104 | iec101 | mewtocol | hostlink | dnp3 | coap | dlt645 | cjt188 | snmp | ads | secs）\n", *proto)
 		os.Exit(2)
 	}
 
@@ -1006,6 +1016,45 @@ func simMewtocol(addr string) {
 	fmt.Println("  字区：DT0=0x0063  DT1=0x3344  DT2..DT3=25.5(float32)")
 	fmt.Println("  接点：X0.1=on  X0.5=on  Y0.0=off（Y 可经 WCS 写）")
 	fmt.Printf("  自检：   uic mewtocolread -addr %s -area dt -offset 0 -qty 3\n", srv.Addr())
+	fmt.Println("  Ctrl+C 停止")
+
+	<-ctx.Done()
+	slog.Info("sim_stopped")
+}
+
+// simHostLink 启动内置 Host Link FINS 从站（经 TCP 透传承载）。
+//
+// 与 Mewtocol 从站同理由：现场把一条 RS-232/RS-485 线原样透传到以太网，因此
+// 用 TCP 承载不是「另造一个协议」——分帧（`*`+CR）、FCS、单元号过滤、结束码
+// 与真实串口完全一致。初始值对应 examples/hostlink.json：DM0..1 是
+// 0x1234/0x5678，DM2 是 3.14 的低半字（DM2..3 组成一个 float32），
+// CIO0.1 与 CIO0.5 为 on。
+func simHostLink(addr string) {
+	// 单元号固定 0：单机直连时出厂单元号就是 0。
+	srv, err := hlsim.NewServer(addr, 0)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "启动 Host Link 从站失败: %v\n", err)
+		os.Exit(1)
+	}
+	defer func() { _ = srv.Close() }()
+
+	srv.SetWord("dm", 0, 0x1234)
+	srv.SetWord("dm", 1, 0x5678)
+	// 3.14 的 float32 位模式是 0x4048F5C3；FINS 内存区按「字内大端、低字
+	// 在前」存放，所以 DM2 是低半 0xF5C3、DM3 是高半 0x4048。
+	srv.SetWord("dm", 2, 0xF5C3)
+	srv.SetWord("dm", 3, 0x4048)
+	srv.SetBit("cio", 0, 1, true)
+	srv.SetBit("cio", 0, 5, true)
+
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	fmt.Printf("host link (FINS) slave listening on %s (unit 0)\n", srv.Addr())
+	fmt.Println("  内存区：DM0=0x1234  DM1=0x5678  DM2..DM3=3.14(float32)  DM10=可写")
+	fmt.Println("  位    ：CIO0.1=on  CIO0.5=on  CIO0.0=off（可写）")
+	fmt.Printf("  自检：   uic hostlinkread -addr %s -unit 0 -area dm -offset 0 -qty 2\n", srv.Addr())
+	fmt.Println("  注意：单元号不匹配时从站完全不回应（与真机一致），所以 -unit 必须是 0")
 	fmt.Println("  Ctrl+C 停止")
 
 	<-ctx.Done()
