@@ -46,6 +46,7 @@ import (
 	iec101drv "uic/internal/driver/iec101"
 	"uic/internal/driver/iec104"
 	mcdrv "uic/internal/driver/mc"
+	mewtocoldrv "uic/internal/driver/mewtocol"
 	"uic/internal/driver/modbus"
 	mqttdriver "uic/internal/driver/mqtt"
 	opcuadriver "uic/internal/driver/opcua"
@@ -166,6 +167,7 @@ func RegisterBuiltins() error {
 			bacnetdrv.New(),
 			iec104.New(),
 			iec101drv.New(),
+			mewtocoldrv.New(),
 			dlt645drv.New(),
 			dnp3drv.New(),
 			cjt188drv.New(),

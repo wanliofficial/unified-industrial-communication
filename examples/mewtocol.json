@@ -1,0 +1,109 @@
+{
+  "schemaVersion": 1,
+  "site": "mewtocol-lab",
+  "server": {
+    "listen": "127.0.0.1:8089",
+    "token": "dev-token-0123456789"
+  },
+  "storage": {
+    "dir": "./data-mewtocol",
+    "journal": true,
+    "outboxMaxRecords": 5000,
+    "outboxTtl": "10m"
+  },
+  "logging": {
+    "level": "info"
+  },
+  "northbound": {
+    "webhook": {
+      "enabled": false,
+      "url": "http://127.0.0.1:9999/ingest",
+      "timeout": "3s"
+    }
+  },
+  "channels": [
+    {
+      "id": "ch-mew",
+      "protocol": "mewtocol",
+      "transport": {
+        "kind": "tcp",
+        "address": "127.0.0.1:2000"
+      },
+      "concurrency": 1,
+      "timeout": "2s"
+    }
+  ],
+  "devices": [
+    {
+      "id": "plc01",
+      "name": "松下 FP 系列（Mewtocol 计算机链接，站号 1）",
+      "channel": "ch-mew",
+      "unitId": 1,
+      "interval": "1s",
+      "timeout": "2s",
+      "enabled": true,
+      "points": [
+        {
+          "id": "dt0",
+          "name": "DT0 字（uint16）",
+          "address": { "kind": "register", "area": "dt", "offset": 0, "length": 1, "bit": -1 },
+          "dataType": "uint16",
+          "unit": "",
+          "enabled": true
+        },
+        {
+          "id": "dt1",
+          "name": "DT1 字（int16）",
+          "address": { "kind": "register", "area": "dt", "offset": 1, "length": 1, "bit": -1 },
+          "dataType": "int16",
+          "enabled": true
+        },
+        {
+          "id": "dt2",
+          "name": "DT2 字（float32，CDAB）",
+          "address": { "kind": "register", "area": "dt", "offset": 2, "length": 2, "bit": -1 },
+          "dataType": "float32",
+          "byteOrder": "CDAB",
+          "unit": "degC",
+          "enabled": true
+        },
+        {
+          "id": "x1",
+          "name": "输入继电器 X0.1",
+          "address": { "kind": "register", "area": "x", "offset": 0, "length": 1, "bit": 1 },
+          "dataType": "bool",
+          "enabled": true
+        },
+        {
+          "id": "x5",
+          "name": "输入继电器 X0.5",
+          "address": { "kind": "register", "area": "x", "offset": 0, "length": 1, "bit": 5 },
+          "dataType": "bool",
+          "enabled": true
+        },
+        {
+          "id": "y0",
+          "name": "输出继电器 Y0.0（可写，WCS 单点写）",
+          "address": { "kind": "register", "area": "y", "offset": 0, "length": 1, "bit": 0 },
+          "dataType": "bool",
+          "writable": true,
+          "enabled": true
+        },
+        {
+          "id": "t10",
+          "name": "定时器接点 T10（一个号一个接点，不带位号）",
+          "address": { "kind": "register", "area": "t", "offset": 10, "length": 1, "bit": -1 },
+          "dataType": "bool",
+          "enabled": true
+        },
+        {
+          "id": "sv5",
+          "name": "定时器设定值 SV5",
+          "address": { "kind": "register", "area": "sv", "offset": 5, "length": 1, "bit": -1 },
+          "dataType": "uint16",
+          "enabled": true
+        }
+      ]
+    }
+  ]
+}

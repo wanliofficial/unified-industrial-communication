@@ -703,6 +703,71 @@ FINS 只做 FINS/TCP；FINS/UDP 与 Host Link 配置期即拒。建链先做节�
 字内位号（`CIO0.3` → `offset=0, bit=3`）；字访问 2 字节/字，位访问**1 字节/位**；
 32 位值低字在前（默认 CDAB）、64 位 DCBA；当前 EM 区无位访问码，bool 走 RMW。
 
+Mewtocol（松下 FP 系列，计算机链接 ASCII 帧，串口 / 串口服务器 TCP 2000）：
+
+```bash
+./uic sim -protocol mewtocol -listen 127.0.0.1:2000 &   # 内置 FP 从站（站号 1）
+./uic -config examples/mewtocol.json
+curl -s -H 'Authorization: Bearer dev-token-0123456789' localhost:8089/api/v1/points
+#   8 点：DT0=0x0063、DT1=int16、DT2..DT3=25.5（float32，CDAB）、
+#         X0.1/X0.5（输入接点）、Y0.0（可写，WCS 单点写）、
+#         T10（定时器接点，不带位号）、SV5（定时器设定值）
+#   自检（不需要网关）：./uic mewtocolread -addr 127.0.0.1:2000 -area dt -offset 0 -qty 3
+#   只验链路：./uic mewtocolread -transport serial -port /dev/ttyUSB0 -baud 9600 -parity odd -probe
+#   写接点：./uic mewtocolread -addr 127.0.0.1:2000 -area y -offset 0 -bit 0 -write on
+```
+
+Mewtocol 全 ASCII、没有二进制字段，抓包肉眼可读，看起来比 Modbus RTU 简单——真正难的
+是那些「看起来是十进制」的位置。一帧里混着三种进制：
+
+| 位置 | 进制 | 例子 |
+|---|---|---|
+| 站号 | 两位**十进制** | 16 号站写 `16`，不是 `10` |
+| 数据区地址 | 五位**十进制** | DT100 → `00100` |
+| 接点编号 | 三位十进制字 + 末位**十六进制** | X1F → `001F`；X16.3 → `0163` |
+| 定时器/计数器接点 | 四位**十进制** | T10 → `0010` |
+| 数据内容 | 每字节两位十六进制、**字内低字节在前** | H0063 → `6300` |
+| BCC | 两位十六进制，**含帧头 `%`** | `%01#RCSX0000` → `1D` |
+
+任何一种读错都不会报格式错：PLC 会回一份别的地址的数据，值有、质量好、对应关系全错。
+所以点表里不让人写 `X1F`，而是写 `x:1.15`（字地址 + 位号两个十进制整数），把进制混排
+关在编解码层里。
+
+帧边界只有帧头的 `%` 与结尾 CR。半双工总线上一份迟到的应答如果被当成下一轮首部，
+症状是「数据永远滞后一轮」，所以收帧层强制首字节是 `%`/`<`，其余字节逐字节丢弃并
+在 `Dropped()` 里计数。
+
+**读写受不同的帧长限制**：读请求定长 20 字节、应答 `9+4n`；写请求 `20+4n`。118 字符
+上限下，读能到 27 字、写只能到 24 字，取较小者 `MaxWords = 24`。接点按点读写
+（`RCP`/`WCP`）的上限是 8，来自正文「个数」只有一位字符，不能靠拆帧绕开。
+
+三条刻意的边界：
+
+- **布尔量只走 `WCS` 单点写。** 「读字 → 改位 → 写字」把一次写变成两次事务，中间别
+  的客户端改了同字邻位，最后写入者会把它一起覆盖。协议给了原子单点写，就不该用非原子
+  方式替代。
+- **字区上的布尔点位可读不可写。** 协议没有「数据寄存器第 n 位」的写命令，驱动直接返
+  `unsupported`，并给出替代做法（把点位改成 `uint16` 按整字写）。读是可以的：读字后本
+  地取位。
+- **T/C 接点不走按字读。** 手册允许 `RCC` 读 T/C，但会按「每字 16 个接点」重新编号
+  （0000 表示 T0..T15），与 T/C 自身的十进制编号是两套体系；驱动只走 `RCS`/`RCP`。内
+  置从站仍按真实语义实现按字读，避免「从站答应、真 PLC 不答应」。
+
+写路径按对象分流：接点布尔量 `WCS`/`WCP`，接点区按字 `WCC`，字区 `WD`，定时器设定值
+`WS`，经过值 `WK`。`WD` 的正文也带结束地址（冗余，但必须与数据长度自洽，否则回 41H），
+本实现由数据长度反推结束地址，两者不可能不一致。
+
+承载有两种：串口（出厂 9600/8/**奇**/1，改成无校验的典型症状是「能发不能收」）与串口服
+务器 TCP 透传（端口各厂不同：2000、60001、9094、FP7 编程口 32769..32772，默认 2000）。
+TCP 承载**只发裸帧**：FP7 的 LAN 口若设成「与 FP2-ET-LAN 连接」，帧外会多一层 16 字节
+头，表现是「发出去没有任何应答」；正确做法是在 PLC 侧改回默认模式，而不是给驱动加一
+个「猜封装」的开关。
+
+错误码保留手册的四类（链路 / 基本过程 / 处理 / PLC 应用），再映射到驱动的错误分类：
+`60/61/66/67` → `address`（点表或型号配置问题，重试无用）、`65` 写保护与 `63` 模式错 →
+`permission`、`40..43`/`53` → `protocol`（可重试）、`23` 站号重号 / `24` 硬件错 / `26`
+站号设置错不可重试。质量码只由错误分类与链路状态决定，不做「多久没更新就降级」。
+
 ## 文档
 
 - **[docs/00-README.md](docs/00-README.md)** — 总索引：阅读路径、38 个参考方案总览、结论速查、代码地图、接口速查、实现边界
@@ -724,7 +789,7 @@ go test -race -count=1 ./...
 
 | 路径 | 内容 |
 |---|---|
-| `cmd/uic/` | 单入口：`run` / `sim`（Modbus / S7 / OPC UA / MQTT / MC / FINS / EtherNet-IP / BACnet-IP / IEC 104 / IEC 101 / DNP3 / CoAP / 645 / 188 / SNMP / ADS / SECS）/ `mbread` / `mcread` / `finsread` / `enipread` / `bacread` / `iec104read` / `iec101read` / `dnp3read` / `coapread` / `dlt645read` / `cjt188read` / `snmpread` / `adsread` / `secsread` / `uaread` / `s7blocks` / `s7upload` / `instantiate` / `import` / `token` / `-check` / `version` |
+| `cmd/uic/` | 单入口：`run` / `sim`（Modbus / S7 / OPC UA / MQTT / MC / FINS / EtherNet-IP / BACnet-IP / IEC 104 / IEC 101 / Mewtocol / DNP3 / CoAP / 645 / 188 / SNMP / ADS / SECS）/ `mbread` / `mcread` / `finsread` / `enipread` / `bacread` / `iec104read` / `iec101read` / `mewtocolread` / `dnp3read` / `coapread` / `dlt645read` / `cjt188read` / `snmpread` / `adsread` / `secsread` / `uaread` / `s7blocks` / `s7upload` / `instantiate` / `import` / `token` / `-check` / `version` |
 | `internal/model` | 通道 / 设备 / 点位 / 地址 / 采样 / 质量码 |
 | `internal/driver` | 驱动契约（Codec / Transport / Driver）、错误分类、注册表、只读 `Lookup` 注入 |
 | `internal/calc` | 零依赖表达式引擎（编译期类型检查、短路求值、引用 `device:point`） |
@@ -769,6 +834,9 @@ go test -race -count=1 ./...
 | `internal/codec/secs` | SECS 纯函数编解码（12 字节 HSMS 帧头 / 控制消息 / SECS-II 项编解码 / `MaxPayload` 上限 / SxFy 消息体语义） |
 | `internal/driver/secs` | HSMS 主站（Select 握手、SystemBytes 配对、按对象分组批量读、S2F15 写常数、Linktest 探活、自检 `Describe`/`RawRead`） |
 | `internal/sim/secs` | HSMS 内置设备（SVID/ECID 双编号空间 / Select 门控 / 常数写拒绝未知编号 / 事件与报警推送） |
+| `internal/codec/mewtocol` | Mewtocol 纯函数编解码（ASCII 帧 / BCC 含 `%` / 站号十进制 / 接点编号「十进制字 + 十六进制位」/ RD/WD/RCC/WCC/RCS/RCP/WCS/WCP/RS/WS/RK/WK 组帧 / 字内低字节在前 / 错误码四类 / 流式收帧） |
+| `internal/driver/mewtocol` | Mewtocol 主站（区拆分与 24 字切分、T/C 按点读 RCS/RCP、布尔量 WCS 单点写、字区布尔量拒绝、站号与回显校验、串口/TCP 双承载） |
+| `internal/sim/mewtocol` | Mewtocol 内置从站（站位图 / 两套接点编号 / RCC 按字与 RCS/RCP 按点 / WCS/WCP / 错误码 / 站号过滤） |
 | `internal/template` | 设备模板：参数校验 / 字符串字面量替换 / 实例化后完整校验 |
 | `internal/pointtable` | 点表 CSV：列别名 / 地址表达式 / 按协议推导宽度 / 合并动作 |
 | `internal/alarm` | 报警引擎：五态机 / 滞回 / 延时 / 表达式规则 / 确认 / 订阅 |

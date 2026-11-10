@@ -291,11 +291,11 @@ IEC 61850、SECS/GEM、KNX、Mewtocol、Host Link、MTConnect。
 | **IEC 61850（MMS）** | 客户端 / TCP 102 | 变电站自动化的事实标准；逻辑设备/逻辑节点/数据对象的层次模型是唯一能表达「一台 IED 上有哪几个保护」的寻址方式 | MMS 会话（Initiate/Terminate）+ 读/写已知引用（`LD0LLN0.$MX$...`），不做 SCL 解析、Report、GOOSE、SV |
 | **SECS/GEM（HSMS）** | 设备/主机 / TCP 5000 | 半导体设备与工厂的通信主干；PA-31 是 38 份分析里唯一带真实测试的协议 | HSMS 通信层 + SECS-II 数据项编解码 + 少量 SxFy 消息，不做上层设备模型的全部场景 |
 | **KNXnet/IP** | 客户端 / UDP 3670 | 楼宇自控第一大总线；组地址模型（GA vs PA）是它的核心 | TUNNELING 请求 + 组地址读写，不做 routing / device management / 安全 |
-| **Mewtocol** | 主站 / TCP 2400 或串口 | 松下 PLC 的事实协议；帧极简单但异常码是日文风格文本 | TCP 主站 + 读/写寄存器 + 错误码映射，不做串口与自动登录 |
+| **Mewtocol** | 主站 / 串口或 TCP（端口各厂不同，默认 2000） | 松下 PLC 的事实协议；全 ASCII 帧看起来简单，真正的坑是一帧里混着十进制与十六进制 | 主站 + 字区读写 + 接点按字/按点读写 + 定时器值 + 错误码映射，不做 FP2-ET-LAN 封装 |
 | **Host Link** | 主站 / 串口（RS-232/422/485） | 欧姆龙/三菱 PLC 的经典串口协议；串口层是已有共享资源 | 复用共享串口层 + FINS/MEWTOKEN 帧，不做串口时序优化 |
 | **MTConnect** | 客户端 / HTTP | 机床数据采集的事实标准；纯 REST + XML，无二进制编解码 | HTTP GET 取 `probe`/`current`/`sample`，XML 解析，不做资产/事件完整模型 |
 
-> 截至当前实现：DNP3、CoAP、SECS/GEM、IEC 101 已落地。
+> 截至当前实现：DNP3、CoAP、SECS/GEM、IEC 101、Mewtocol 已落地。
 >
 > **DNP3**（编解码 + 主站 + 内置从站 + `uic dnp3read` + `examples/dnp3.json`）：只做
 > TCP 主站、类 0 总召唤、类 1/2/3 事件轮询、CROB 与组 41 直接控制、未请求响应的接收
@@ -341,6 +341,24 @@ IEC 61850、SECS/GEM、KNX、Mewtocol、Host Link、MTConnect。
 > 等应用层激活确认（链路 `E5` 只说明报文到了）。剖面宽度（ORG/CA/IOA）全部走设备标签，
 > 默认值取「一台装置一个公共地址、站内点数不超过 65535」，把某一组当标准写死是接不同
 > 厂家装置时最先撞上的墙。
+
+> **Mewtocol**（编解码 + 主站 + 内置从站 + `uic mewtocolread` + `examples/mewtocol.json`）：
+> 只做计算机链接的 ASCII 裸帧，串口与串口服务器 TCP 双承载；不做 FP2-ET-LAN 的 16 字节
+> 封装、二进制变体、`SC`/`SD` 整块置位、扩展头发送，也不做自动登录。它全 ASCII、抓包可读，
+> 看起来比 Modbus RTU 简单，但一帧里混着三种进制：站号两位**十进制**（16 号站写 `16`）、
+> 数据区地址五位十进制（DT100 → `00100`）、接点编号是「三位十进制字 + 末位十六进制」
+> （X1F → `001F`、X16.3 → `0163`）、定时器接点四位十进制（T10 → `0010`）、数据内容每字节
+> 两位十六进制且**字内低字节在前**（H0063 → `6300`）、BCC 两位十六进制且**从帧头 `%` 起算、
+> 不含 CR**。任何一处读错都不报格式错，PLC 会回一份**别的地址**的数据——值有、质量好、
+> 对应关系全错，是这套协议最典型的假绿。另外四处必须按字节记住：读用「起止地址」而不是
+> 「起点 + 个数」；写也带结束地址（冗余，但与数据长度不自洽就回 41H）；应答只回显前两位
+> 命令码（`RCC`→`RC`、`WCS`→`WC`）；`RCC`/`WCC` 地址 4 位而 `RD`/`WD` 是 5 位。容量上限
+> 也要自己推：读应答 `9+4n`、写请求 `20+4n`，118 字符下取较小者 `MaxWords = 24`；接点按点
+> 读写的上限 8 来自「个数」只有一位字符，拆帧绕不开。三条刻意边界：布尔量只走 `WCS` 原子
+> 单点写（读-改-写会覆盖同字邻位）；字区上的布尔点位可读不可写（协议没有位写命令）；
+> T/C 接点不走 `RCC`（手册会把它们按「每字 16 点」重新编号，与十进制定时器号是两套体系），
+> 只走 `RCS`/`RCP`。错误码保留手册四类再映射到 address/permission/protocol，`23/24/26`
+> 明确不可重试。
 
 **明确不做**：PROFINET IO、PROFIBUS、CANopen、CC-Link、FOCAS、DALI、LonWorks、DDS、EtherCAT、HART、GB/T 28181、Euromap、Matter、LoRaWAN、OCPP、Redfish。
 

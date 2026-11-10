@@ -55,6 +55,13 @@ type AddressPolicy struct {
 	Width WidthMode
 	// RegisterAreas 为空表示不限制（未知协议）。
 	RegisterAreas map[string]bool
+	// BitlessAreas 是「布尔量不带位号」的区名集合。
+	//
+	// 绝大多数寄存器协议里，一个 bool 点位必须指明它是哪个字的第几位；
+	// 但 Mewtocol 的定时器/计数器接点（T/C）按定时器号/计数器号编号，
+	// 一个号就是一个接点，没有「字内第 n 位」。把它放进白名单而不是在
+	// parseRegister 里按协议名硬编码，是为了让这条规则跟着地址策略走。
+	BitlessAreas map[string]bool
 	// AllowRegister/Symbol/Object/File/Computed 是地址种类白名单。
 	AllowRegister bool
 	AllowSymbol   bool
@@ -101,6 +108,21 @@ var (
 		"ioa": true, "single-command": true, "double-command": true,
 		"setpoint-float": true, "setpoint-scaled": true, "setpoint-normalized": true,
 	}
+	// mewAreas 是 Mewtocol 的区名：字区（dt/ld/fl）、接点区（x/y/r/l/t/c）、
+	// 索引寄存器（ix/iy/id）、定时器/计数器值区（sv/ev）。
+	//
+	// 与 modbusAreas 一样是「固定的、可穷举的」集合，放进白名单而不是
+	// 放行任意区名：写错的区名（例如把 dt 写成 d）应当导入期就被拒，
+	// 而不是等到启动后每个周期都返回 address_error。
+	mewAreas = map[string]bool{
+		"x": true, "y": true, "r": true, "l": true, "t": true, "c": true,
+		"dt": true, "ld": true, "fl": true,
+		"ix": true, "iy": true, "id": true,
+		"sv": true, "ev": true,
+	}
+	// mewBitless 是 mewtocol 里「布尔量不带位号」的区：T/C 接点按定时器/
+	// 计数器编号，一个号就是一个接点。
+	mewBitless = map[string]bool{"t": true, "c": true}
 )
 
 // PolicyFor 返回协议对应的地址策略。
@@ -162,6 +184,20 @@ func PolicyFor(protocol string) AddressPolicy {
 		// 两个承载共用同一套地址形态：104 多出来的只是 TCP 与序号层，
 		// 点表没有任何理由不同。
 		return AddressPolicy{Width: WidthNone, AllowRegister: true, RegisterAreas: iecAreas}
+	case "mewtocol":
+		// 寄存器型寻址：`区名:字地址[.位号][:长度]`。
+		//
+		// 一个地址 = 一个 16 位字，因此 Width 用 WidthRegisters（与 Modbus
+		// 同语义）：16 位类型长度 1，32 位类型长度 2。布尔量分两种——
+		// 接点区（x/y/r/l）写 `x:1.15` 指「第 1 字第 15 位」；T/C 是
+		// 「一个号一个接点」，写 `t:10` 不带位号（见 BitlessAreas）。
+		//
+		// 字区（dt/ld/fl）上的布尔量也是 `dt:0.3`：读可以（字内取位），
+		// 写会被驱动拒绝——协议没有数据寄存器某一位的原子写命令。
+		return AddressPolicy{
+			Width: WidthRegisters, RegisterAreas: mewAreas,
+			BitlessAreas: mewBitless, AllowRegister: true,
+		}
 	case "dlt645":
 		// 数据标识型寻址：`<DI>:0[:length]`，DI 是手册顺序的 8 位十六进制。
 		// offset 恒为 0（协议没有偏移概念），长度由 DI 表推导；只有数据块
@@ -332,7 +368,9 @@ func splitRegisterPrefix(expr string) (area string, db int, rest string, ok bool
 	switch lower {
 	case "holding", "input", "coil", "discrete", "output", "merker", "counter", "timer",
 		"ioa", "single-command", "double-command",
-		"setpoint-float", "setpoint-scaled", "setpoint-normalized":
+		"setpoint-float", "setpoint-scaled", "setpoint-normalized",
+		"x", "y", "r", "l", "t", "c", "dt", "ld", "fl",
+		"ix", "iy", "id", "sv", "ev":
 		return lower, 0, expr[colon+1:], true
 	}
 	return "", 0, "", false
@@ -422,7 +460,8 @@ func parseRegister(area string, db int, rest string, dt model.DataType, pol Addr
 	if length > 125 {
 		return model.Address{}, fmt.Errorf("length %d must be <= 125", length)
 	}
-	if dt == model.TypeBool && area != "coil" && area != "discrete" && bit < 0 && pol.Width != WidthNone {
+	if dt == model.TypeBool && area != "coil" && area != "discrete" && bit < 0 &&
+		pol.Width != WidthNone && !pol.BitlessAreas[area] {
 		return model.Address{}, fmt.Errorf("bool point needs a bit (e.g. %s:%d.0)", area, offset)
 	}
 

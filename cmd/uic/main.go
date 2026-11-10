@@ -72,6 +72,7 @@ import (
 	iec101sim "uic/internal/sim/iec101"
 	iec104sim "uic/internal/sim/iec104"
 	mcsim "uic/internal/sim/mc"
+	mewsim "uic/internal/sim/mewtocol"
 	sim "uic/internal/sim/modbus"
 	simmqtt "uic/internal/sim/mqtt"
 	sims7 "uic/internal/sim/s7"
@@ -109,6 +110,8 @@ func main() {
 		iec104readCmd(args)
 	case "iec101read":
 		iec101readCmd(args)
+	case "mewtocolread":
+		mewtocolreadCmd(args)
 	case "dnp3read":
 		dnp3readCmd(args)
 	case "coapread":
@@ -152,7 +155,7 @@ func usage() {
 用法:
   uic [run] -config config.json [-listen :8080] [-token TOKEN]
   uic -check -config config.json
-  uic sim [-listen 127.0.0.1:15020] [-protocol modbus|s7|opcua|mqtt|mc|fins|enip|bacnet|iec104|iec101|dnp3|coap|dlt645|cjt188|snmp|ads|secs]
+  uic sim [-listen 127.0.0.1:15020] [-protocol modbus|s7|opcua|mqtt|mc|fins|enip|bacnet|iec104|iec101|mewtocol|dnp3|coap|dlt645|cjt188|snmp|ads|secs]
   uic mbread -addr 127.0.0.1:1502 -unit 1 -area holding -offset 0 -qty 2
   uic mbread -addr 127.0.0.1:1502 -area holding -offset 5 -write 777
   uic mcread -addr 127.0.0.1:5000 -area d -offset 100 -qty 2
@@ -168,6 +171,9 @@ func usage() {
   uic iec101read -addr 127.0.0.1:4001 [-link-addr 1] [-ca 1] [-ioa-size 2] [-json] [-raw]
   uic iec101read -transport serial -port /dev/ttyUSB0 -baud 9600 -link-addr 1 -ca 1 -probe
   uic iec101read -addr 127.0.0.1:4001 -area double-command -cmd-ioa 2003 -write on
+  uic mewtocolread -addr 127.0.0.1:2000 -station 1 -area dt -offset 0 -qty 3 [-json] [-raw]
+  uic mewtocolread -transport serial -port /dev/ttyUSB0 -baud 9600 -parity odd -probe
+  uic mewtocolread -addr 127.0.0.1:2000 -area x -offset 1 -bit 15 -write on
   uic dnp3read -addr 127.0.0.1:20000 [-index 0,1] [-json] [-raw]
   uic dnp3read -addr 127.0.0.1:20000 -binary 0=on -analog 0=12.5
   uic coapread -addr 127.0.0.1:5683 -path /sensors/temp [-type float64] [-json]
@@ -507,7 +513,7 @@ func simCmd(args []string) {
 	fs := flag.NewFlagSet("sim", flag.ExitOnError)
 	addr := fs.String("listen", "127.0.0.1:15020", "监听地址")
 	size := fs.Int("size", 1024, "寄存器数量")
-	proto := fs.String("protocol", "modbus", "从站协议：modbus | s7 | opcua | mqtt | mc | fins | enip | bacnet | iec104 | iec101 | dnp3 | coap | dlt645 | cjt188 | snmp | ads | secs")
+	proto := fs.String("protocol", "modbus", "从站协议：modbus | s7 | opcua | mqtt | mc | fins | enip | bacnet | iec104 | iec101 | mewtocol | dnp3 | coap | dlt645 | cjt188 | snmp | ads | secs")
 	pdu := fs.Int("pdu", 480, "S7 协商 PDU 长度（240/480/960）")
 	fs.Parse(args)
 
@@ -539,6 +545,9 @@ func simCmd(args []string) {
 	case "iec101":
 		simIEC101(*addr)
 		return
+	case "mewtocol":
+		simMewtocol(*addr)
+		return
 	case "dnp3":
 		simDNP3(*addr)
 		return
@@ -562,7 +571,7 @@ func simCmd(args []string) {
 		return
 	case "modbus":
 	default:
-		fmt.Fprintf(os.Stderr, "未知协议 %q（支持 modbus | s7 | opcua | mqtt | mc | fins | enip | bacnet | iec104 | iec101 | dnp3 | coap | dlt645 | cjt188 | snmp | ads | secs）\n", *proto)
+		fmt.Fprintf(os.Stderr, "未知协议 %q（支持 modbus | s7 | opcua | mqtt | mc | fins | enip | bacnet | iec104 | iec101 | mewtocol | dnp3 | coap | dlt645 | cjt188 | snmp | ads | secs）\n", *proto)
 		os.Exit(2)
 	}
 
@@ -962,6 +971,44 @@ func simIEC101(addr string) {
 
 	<-ctx.Done()
 	_ = srv.Close()
+	slog.Info("sim_stopped")
+}
+
+// simMewtocol 启动内置 Mewtocol 从站（计算机链接方式，经 TCP 透传承载）。
+//
+// 与其它内置从站同理由：现场把一条 RS-485 总线原样透传到以太网，因此用
+// TCP 承载不是「另造一个协议」——分帧、BCC、站号过滤与真实串口完全一致。
+// 默认值对应 examples/mewtocol.json：DT0..2 是 0063/3344/000A，X0.1 与 X0.5
+// 为 on，Y0.0 为 off（可经 WCS 单点写）。
+func simMewtocol(addr string) {
+	srv, err := mewsim.NewServer(addr)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "启动 Mewtocol 从站失败: %v\n", err)
+		os.Exit(1)
+	}
+	defer func() { _ = srv.Close() }()
+
+	// 与 examples/mewtocol.json 对应的初始值。字内是低字节在前，但这里
+	// 用 SetWord 写的是「规范值」，从站内部按大端存储、线上自动换序。
+	srv.SetWord("dt", 0, 0x0063)
+	srv.SetWord("dt", 1, 0x3344)
+	// DT2..DT3 是一个 32 位浮点：25.5 的位模式是 0x41CC0000，协议按
+	// 「低字在前」存，所以字 2 是低半 0x0000、字 3 是高半 0x41CC。
+	srv.SetWord("dt", 2, 0x0000)
+	srv.SetWord("dt", 3, 0x41CC)
+	srv.SetBit("x", 1, true)
+	srv.SetBit("x", 5, true)
+
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	fmt.Printf("mewtocol slave listening on %s (station 1)\n", srv.Addr())
+	fmt.Println("  字区：DT0=0x0063  DT1=0x3344  DT2..DT3=25.5(float32)")
+	fmt.Println("  接点：X0.1=on  X0.5=on  Y0.0=off（Y 可经 WCS 写）")
+	fmt.Printf("  自检：   uic mewtocolread -addr %s -area dt -offset 0 -qty 3\n", srv.Addr())
+	fmt.Println("  Ctrl+C 停止")
+
+	<-ctx.Done()
 	slog.Info("sim_stopped")
 }
 

@@ -533,3 +533,124 @@ func TestParseAddressIECLeavesRangeToDriver(t *testing.T) {
 		t.Fatalf("address = %+v", a)
 	}
 }
+
+// Mewtocol 的点表形态：字地址 + 位号，一个地址是一个 16 位字。
+func TestPolicyForMewtocol(t *testing.T) {
+	p := PolicyFor("mewtocol")
+	if p.Width != WidthRegisters {
+		t.Fatalf("width = %v, want WidthRegisters", p.Width)
+	}
+	if !p.AllowRegister || p.AllowSymbol || p.AllowObject || p.AllowFile || p.AllowComputed || p.AllowSelector {
+		t.Fatalf("policy accepts non-register kinds: %+v", p)
+	}
+	if p.DIBits != 0 || p.DIField {
+		t.Fatalf("mewtocol is not a DI protocol: %+v", p)
+	}
+	// 十四个区一个不能少：少了任何一个，对应点位在导入期就被拒。
+	for _, area := range []string{"x", "y", "r", "l", "t", "c", "dt", "ld", "fl", "ix", "iy", "id", "sv", "ev"} {
+		if !p.RegisterAreas[area] {
+			t.Fatalf("area %q is missing from the whitelist", area)
+		}
+	}
+	// 别的协议的区不能漏进来。
+	for _, area := range []string{"holding", "coil", "db", "ioa"} {
+		if p.RegisterAreas[area] {
+			t.Fatalf("foreign area %q leaked into the whitelist", area)
+		}
+	}
+	// T/C 是「一个号一个接点」，布尔量不带位号。
+	if !p.BitlessAreas["t"] || !p.BitlessAreas["c"] {
+		t.Fatalf("T/C must be bit-less bool areas: %v", p.BitlessAreas)
+	}
+	if p.BitlessAreas["x"] || p.BitlessAreas["dt"] {
+		t.Fatalf("X/DT must require a bit: %v", p.BitlessAreas)
+	}
+}
+
+func TestParseAddressMewtocol(t *testing.T) {
+	cases := []struct {
+		name string
+		expr string
+		dt   model.DataType
+		want string
+	}{
+		// 字区：16 位类型长度 1，32 位类型长度 2。
+		{"data register u16", "dt:0", model.TypeUint16, "dt:0:1"},
+		{"data register float32", "dt:100", model.TypeFloat32, "dt:100:2"},
+		{"file register", "fl:0", model.TypeInt16, "fl:0:1"},
+		{"link data register", "ld:5", model.TypeUint32, "ld:5:2"},
+		// 接点区：字 + 位。
+		{"input relay bit", "x:1.15", model.TypeBool, "x:1.15:1"},
+		{"output relay bit", "y:0.0", model.TypeBool, "y:0.0:1"},
+		{"internal relay bit", "r:16.3", model.TypeBool, "r:16.3:1"},
+		// 字区上的布尔量（可读不可写）：仍写位号。
+		{"bool on word area", "dt:0.3", model.TypeBool, "dt:0.3:1"},
+		// T/C：一个号一个接点，不带位号。
+		{"timer contact", "t:10", model.TypeBool, "t:10:1"},
+		{"counter contact", "c:999", model.TypeBool, "c:999:1"},
+		// 索引寄存器与定时器值区。
+		{"index register", "ix:0", model.TypeUint16, "ix:0:1"},
+		{"timer set value", "sv:5", model.TypeUint16, "sv:5:1"},
+		// 区名大小写不敏感。
+		{"uppercase area", "DT:0", model.TypeUint16, "dt:0:1"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			a, err := ParseAddress(tc.expr, tc.dt, "mewtocol")
+			if err != nil {
+				t.Fatalf("parse: %v", err)
+			}
+			if got := a.Canonical(); got != tc.want {
+				t.Fatalf("canonical = %q, want %q", got, tc.want)
+			}
+			// 往返：Canonical 的文本必须能被重新解析成同一个地址。
+			b, err := ParseAddress(a.Canonical(), tc.dt, "mewtocol")
+			if err != nil {
+				t.Fatalf("reparse %q: %v", a.Canonical(), err)
+			}
+			if b != a {
+				t.Fatalf("round trip: %+v != %+v", b, a)
+			}
+		})
+	}
+}
+
+func TestParseAddressMewtocolRejects(t *testing.T) {
+	cases := []struct {
+		name string
+		expr string
+		dt   model.DataType
+		want string
+	}{
+		// 未知区名必须在导入期被拒。
+		{"unknown area", "d:0", model.TypeUint16, "d"},
+		// 布尔量在 X/Y/R/L 上必须带位号。
+		{"bit required on relay", "x:1", model.TypeBool, "bool point needs a bit"},
+		// 位号范围 0..15。
+		{"bit out of range", "x:1.16", model.TypeBool, "bit must be 0..15"},
+		// 布尔量在字区也不能省位号。
+		{"bit required on word area", "dt:0", model.TypeBool, "bool point needs a bit"},
+		// 位号只对布尔量有意义。
+		{"bit on u16", "dt:0.3", model.TypeUint16, "only valid for bool"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := ParseAddress(tc.expr, tc.dt, "mewtocol")
+			if err == nil {
+				t.Fatalf("expected an error for %q", tc.expr)
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("error = %v, want substring %q", err, tc.want)
+			}
+		})
+	}
+}
+
+// 别的协议不能借用 mewtocol 的区名。
+func TestOtherProtocolsRejectMewAreas(t *testing.T) {
+	for _, proto := range []string{"modbus-tcp", "s7", "iec104"} {
+		if _, err := ParseAddress("dt:0", model.TypeUint16, proto); err == nil {
+			t.Fatalf("%s must reject a Mewtocol area", proto)
+		}
+	}
+}
