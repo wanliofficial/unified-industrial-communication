@@ -219,7 +219,7 @@ dotnet run --project tests/Uic.Tests -- --opcua             # 额外跑 OPC UA �
 dotnet run --project tests/Uic.Tests -- --stop-on-fail
 ```
 
-正常情况下输出 `307 passed, 0 failed, 3 skipped`（跳过的是默认不启用的 OPC UA 用例）。
+正常情况下输出 `308 passed, 0 failed, 3 skipped`（跳过的是默认不启用的 OPC UA 用例）。
 黄金帧测试默认从仓库的 `testdata/golden/` 读取，可用 `UIC_TESTDATA` 指向别的目录。
 
 串口用例（T15–T18）会用 libc 开一对伪终端，在 Linux 上默认执行，其它平台报 `skip`；

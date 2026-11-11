@@ -79,7 +79,12 @@ public sealed record OpenContext(
     Device Device,
     ILogger Log,
     IMetrics Metrics,
-    string? DataDir = null);
+    string? DataDir = null,
+    /// <summary>
+    /// 时间来源，供需要度量「多久没收到数据」这类时长的驱动使用（如 MQTT 南向的过期判定）。
+    /// 为 null 时驱动回退到系统时钟。只用于单调时长，对外时间戳仍用墙钟。
+    /// </summary>
+    TimeProvider? Time = null);
 
 /// <summary>驱动可用的最小埋点接口。</summary>
 public interface IMetrics

@@ -31,6 +31,7 @@ internal static class MqttDriverTests
         tests.Add(new TestCase("mqtt/driver_reports_bad_payload_and_recovers", DriverReportsBadPayloadAndRecovers));
         tests.Add(new TestCase("mqtt/driver_resubscribes_after_broker_drop", DriverResubscribesAfterBrokerDrop));
         tests.Add(new TestCase("mqtt/driver_marks_value_stale_after_window", DriverMarksValueStaleAfterWindow));
+        tests.Add(new TestCase("mqtt/driver_stale_ignores_a_clock_jump", DriverStaleIgnoresAClockJump));
         tests.Add(new TestCase("mqtt/driver_probe_fails_when_subscription_rejected", DriverProbeFailsWhenSubscriptionRejected));
     }
 
@@ -331,6 +332,43 @@ internal static class MqttDriverTests
         }
     }
 
+    /// <summary>
+    /// 南向过期判定必须用单调时钟，绝不能用墙钟。
+    ///
+    /// 它回答的是「多久没收到发布方的报文」。用墙钟算：前跳一小时会让所有点位瞬间误报
+    /// stale（数据其实刚到）；后跳则让过期点位无限期报 Good——把旧数据当新鲜值，正是
+    /// 这套代码反复警惕的那种假象。判定只看真实流逝了多久。
+    /// </summary>
+    private static async Task DriverStaleIgnoresAClockJump(TestContext t)
+    {
+        await using var broker = new FakeMqttBroker();
+        var clock = new FakeClock();
+        var (conn, device, point) = Connect(
+            t, broker.Port,
+            new Dictionary<string, string>(StringComparer.Ordinal) { ["staleAfterSeconds"] = "1" },
+            time: clock);
+
+        await using (conn)
+        {
+            await conn.ProbeAsync(t.Ct);
+
+            await broker.PublishToClientAsync("plant/line1/temp", """{"value":3}""", qos: 1);
+            await WaitForGoodAsync(t, conn, device, point);
+
+            // 只拨墙钟一小时、单调时钟不动：真实上没过多久，值必须仍然新鲜。
+            clock.Advance(TimeSpan.FromHours(1), TimeSpan.Zero);
+            var afterJump = await ReadOneAsync(conn, device, point);
+            t.Equal(Quality.Good, afterJump.Quality,
+                "a wall-clock jump must not make a fresh value look stale");
+
+            // 真实（单调）时间越过过期窗口，这时才应该转 stale。
+            clock.Advance(TimeSpan.Zero, TimeSpan.FromSeconds(2));
+            var stale = await ReadOneAsync(conn, device, point);
+            t.Equal(Quality.Stale, stale.Quality,
+                "the value turns stale only after the real window elapses");
+        }
+    }
+
     private static async Task DriverProbeFailsWhenSubscriptionRejected(TestContext t)
     {
         await using var broker = new FakeMqttBroker { RefuseSubscription = true };
@@ -389,11 +427,12 @@ internal static class MqttDriverTests
         TestContext t,
         int port,
         Dictionary<string, string>? labels = null,
-        string field = "value")
+        string field = "value",
+        TimeProvider? time = null)
     {
         var (channel, device) = Model("127.0.0.1", port, labels, field);
         var conn = new MqttClientDriver().Open(new OpenContext(
-            channel, device, NullLogger.Instance, new MetricsRegistry(), t.TempDir));
+            channel, device, NullLogger.Instance, new MetricsRegistry(), t.TempDir, time));
 
         return (conn, device, device.Points[0]);
     }

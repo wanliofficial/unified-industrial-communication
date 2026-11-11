@@ -608,7 +608,7 @@ public sealed class DeviceActor : IAsyncDisposable
             SetState(RuntimeState.Connecting);
             var generation = Interlocked.Increment(ref _generation);
 
-            var ctx = new OpenContext(_channel, _device, _log, NullMetrics.Instance, _options.DataDir);
+            var ctx = new OpenContext(_channel, _device, _log, NullMetrics.Instance, _options.DataDir, _options.Time);
             var conn = _driver.Open(ctx);
 
             try

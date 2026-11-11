@@ -93,6 +93,9 @@ internal sealed class MqttConn : IConn
     private readonly MqttClient _client;
     private readonly object _gate = new();
 
+    /// <summary>时间来源：过期判定按单调时长算，墙钟校时不能把旧值说成新鲜。</summary>
+    private readonly TimeProvider _time;
+
     /// <summary>点位 → 主题/字段。构造后只读，消息回调并发遍历是安全的。</summary>
     private readonly Dictionary<string, Watch> _watches = new(StringComparer.Ordinal);
 
@@ -109,6 +112,7 @@ internal sealed class MqttConn : IConn
     {
         _ctx = ctx;
         _options = MqttConnOptions.FromContext(ctx);
+        _time = ctx.Time ?? TimeProvider.System;
 
         // 发遗嘱需要一个站点名，但南向订阅方不发遗嘱（announceWill: false）；
         // 这里传设备 id，只是为了协议层默认客户端 ID 有个人类可读的形态。
@@ -186,7 +190,6 @@ internal sealed class MqttConn : IConn
         var points = spans.SelectMany(s => s.Points).ToArray();
         if (points.Length == 0) return Task.FromResult<IReadOnlyList<RawSample>>(Array.Empty<RawSample>());
 
-        var now = DateTimeOffset.UtcNow;
         var samples = new List<RawSample>(points.Length);
 
         foreach (var point in points)
@@ -204,7 +207,7 @@ internal sealed class MqttConn : IConn
                 continue;
             }
 
-            samples.Add(FromCache(point.Id, watch.Topic!, now));
+            samples.Add(FromCache(point.Id, watch.Topic!));
         }
 
         return Task.FromResult<IReadOnlyList<RawSample>>(samples);
@@ -227,7 +230,7 @@ internal sealed class MqttConn : IConn
         return Task.FromResult<IReadOnlyList<WriteResult>>(results);
     }
 
-    private RawSample FromCache(string pointId, string topic, DateTimeOffset now)
+    private RawSample FromCache(string pointId, string topic)
     {
         lock (_gate)
         {
@@ -250,9 +253,12 @@ internal sealed class MqttConn : IConn
 
             // 只在值本身是 Good 时判过期：已经报错的点位保留错误原因，
             // 否则「字段缺失」会在过期窗口后被改写成「没有新报文」，把真正的问题藏起来。
+            //
+            // 「多久没收到」是时长，只能用单调时钟算：墙钟前跳会让所有点位瞬间误报 stale，
+            // 后跳则让过期点位无限期报 Good——把旧数据当新鲜值，正是最危险的那种假象。
             if (resultQuality == Quality.Good &&
                 _options.StaleAfterSeconds > 0 &&
-                now - entry.At > TimeSpan.FromSeconds(_options.StaleAfterSeconds))
+                (MonoNow() - entry.MonoAt) / (double)TimeSpan.TicksPerSecond > _options.StaleAfterSeconds)
             {
                 resultQuality = Quality.Stale;
                 error = $"last message on '{topic}' is older than {_options.StaleAfterSeconds}s";
@@ -261,6 +267,10 @@ internal sealed class MqttConn : IConn
             return new RawSample(pointId, entry.Value, resultQuality, entry.At, error);
         }
     }
+
+    /// <summary>当前单调时刻，归一化到 <see cref="TimeSpan.Ticks"/>（与 Sample.MonoAt 同一单位）。</summary>
+    private long MonoNow()
+        => (long)(_time.GetTimestamp() / (double)_time.TimestampFrequency * TimeSpan.TicksPerSecond);
 
     /// <summary>
     /// 入站分发。由协议层的单线程 worker 调用，不在读循环里——
@@ -297,9 +307,10 @@ internal sealed class MqttConn : IConn
                     _cache[watch.Point.Id] = entry;
                 }
 
-                // 坏报文也要刷新 At：链路是通的，问题在载荷。过期判定看的是
+                // 坏报文也要刷新 At/MonoAt：链路是通的，问题在载荷。过期判定看的是
                 // 「多久没听到发布方」，不是「多久没解出一个好值」。
                 entry.At = at;
+                entry.MonoAt = MonoNow();
 
                 if (decoded.Value is not null) entry.Value = decoded.Value;
                 entry.Quality = decoded.Quality;
@@ -355,7 +366,13 @@ internal sealed class MqttConn : IConn
     private sealed class Entry
     {
         public DataValue? Value { get; set; }
+
+        /// <summary>报文到达的墙钟时刻，作为对外时间戳（设备时标）。</summary>
         public DateTimeOffset At { get; set; }
+
+        /// <summary>报文到达的单调时刻（归一化到 ticks），过期判定用它算「多久没收到」。</summary>
+        public long MonoAt { get; set; }
+
         public Quality Quality { get; set; } = Quality.Stale;
         public string? Error { get; set; }
     }
