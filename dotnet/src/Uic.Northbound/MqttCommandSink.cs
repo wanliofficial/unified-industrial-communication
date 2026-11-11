@@ -47,10 +47,20 @@ public sealed class MqttCommandSink : IAsyncDisposable
     private readonly AuditLog? _audit;
     private readonly Func<MqttClient, MqttMessage, CancellationToken, Task> _handler;
     private readonly ConcurrentDictionary<string, CacheEntry> _cache = new(StringComparer.Ordinal);
+    private readonly TimeProvider _time;
     private int _sweep;
     private int _disposed;
 
-    private sealed record CacheEntry(DateTimeOffset At, TaskCompletionSource<CommandResult> Result);
+    /// <summary>
+    /// 去重条目。<see cref="At"/> 是墙钟（进审计与对外结果），
+    /// <see cref="EnqueuedAt"/> 是单调时刻（只用于窗口判定）。
+    ///
+    /// 两者不能混用：用墙钟算窗口，一次校时前跳会让所有在途命令立刻「过期」，
+    /// 同一 id 会被再执行一次——对一个写点位的命令来说就是重复执行物理动作；
+    /// 后跳则让窗口永不失效，缓存只增不减。
+    /// </summary>
+    private sealed record CacheEntry(
+        DateTimeOffset At, long EnqueuedAt, TaskCompletionSource<CommandResult> Result);
 
     private sealed record CommandResult(
         string? Id,
@@ -67,13 +77,15 @@ public sealed class MqttCommandSink : IAsyncDisposable
         string site,
         IGatewayControl control,
         ILogger log,
-        AuditLog? audit = null)
+        AuditLog? audit = null,
+        TimeProvider? time = null)
     {
         _client = client;
         _control = control;
         _log = log;
         _site = site;
         _audit = audit;
+        _time = time ?? TimeProvider.System;
 
         Topic = MqttSink.Render(NonEmpty(options.CommandTopic, $"{options.TopicPrefix}/{{site}}/$command"),
             options, site);
@@ -111,12 +123,12 @@ public sealed class MqttCommandSink : IAsyncDisposable
 
         var key = id!;
         var now = DateTimeOffset.UtcNow;
-        var entry = new CacheEntry(now,
+        var entry = new CacheEntry(now, _time.GetTimestamp(),
             new TaskCompletionSource<CommandResult>(TaskCreationOptions.RunContinuationsAsynchronously));
 
         if (_cache.TryAdd(key, entry))
         {
-            Sweep(now);
+            Sweep();
 
             CommandResult result;
             try
@@ -344,13 +356,15 @@ public sealed class MqttCommandSink : IAsyncDisposable
     }
 
     /// <summary>窗口清理只在有命令进来时做，不额外起计时器——命令通道本来就是低频的。</summary>
-    private void Sweep(DateTimeOffset now)
+    private void Sweep()
     {
         if ((Interlocked.Increment(ref _sweep) & 0x1F) != 0) return;
 
+        var now = _time.GetTimestamp();
+
         foreach (var (key, entry) in _cache)
         {
-            if (now - entry.At > DedupWindow) _cache.TryRemove(key, out _);
+            if (_time.GetElapsedTime(entry.EnqueuedAt, now) > DedupWindow) _cache.TryRemove(key, out _);
         }
     }
 

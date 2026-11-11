@@ -27,6 +27,68 @@ internal static class MqttCommandTests
         tests.Add(new TestCase("mqtt/command_resubscribes_after_reconnect", ResubscribesAfterReconnect));
         tests.Add(new TestCase("mqtt/command_outbox_flush_forwards_sink", OutboxFlushForwardsSink));
         tests.Add(new TestCase("mqtt/command_diag_bundle_is_whitelisted", DiagBundleIsWhitelisted));
+        tests.Add(new TestCase("mqtt/command_dedup_ignores_clock_jump", DedupIgnoresClockJump));
+    }
+
+    /// <summary>
+    /// 去重窗口必须用单调时钟算。
+    ///
+    /// 这条钉的是「命令被重复执行」：窗口如果看墙钟，一次 NTP 前跳会让所有在途
+    /// 条目瞬间超出 5 分钟窗口而被清掉，同一个 id 再来一次就会**真的再执行一遍**
+    /// ——对一个写点位的命令，那就是重复的物理动作。反方向的跳变则让窗口永不失效，
+    /// 缓存只增不减。
+    /// </summary>
+    private static async Task DedupIgnoresClockJump(TestContext t)
+    {
+        await using var broker = new FakeMqttBroker();
+        var options = Options(broker.Port);
+        var clock = new FakeClock();
+
+        await using var sink = new MqttSink(options, "site-a", NullLogger.Instance);
+        var control = new StubControl();
+        await using var commands = new MqttCommandSink(
+            sink.Client, options, "site-a", control, NullLogger.Instance, audit: null, time: clock);
+
+        sink.Start();
+        await WaitUntil(t, () => broker.Subscriptions.Any(s => s.Topic == commands.Topic),
+            "the command topic is subscribed");
+
+        var payload = Payload("jump-1", "driver.restart", new { device = "d1" });
+
+        await broker.PublishToClientAsync(commands.Topic, payload);
+        await AwaitResult(t, broker, commands.ResultTopic);
+        t.Equal(1, control.Restarts, "the command executes once");
+
+        // 只拨墙钟：真实的 5 分钟窗口并没有过去。
+        clock.Advance(TimeSpan.FromHours(1), TimeSpan.Zero);
+
+        // Sweep 只在 TryAdd 成功时调用，而且每 32 条命令才真正扫一次
+        // （低频通道不值得起计时器）。所以要让清扫**在时钟跳变之后**发生，
+        // 必须在校时之后再发足够多的 filler：这样扫到 jump-1 的条目时，
+        // 墙钟实现会认为它已经放了 1 小时而把它清掉。
+        // filler 用 device.selftest：它们各自是新 id 会真的执行，
+        // 用 driver.restart 会把 control.Restarts 本身推高。
+        for (var i = 0; i < 70; i++)
+        {
+            await broker.PublishToClientAsync(commands.Topic,
+                Payload($"filler-{i}", "device.selftest", new { device = "filler" }));
+        }
+
+        await WaitUntil(t, () => broker.Published.Count(p => p.Topic == commands.ResultTopic) >= 71,
+            "all filler commands are answered");
+        t.Equal(1, control.Restarts, "the fillers did not restart anything");
+
+        // 同一 id 再来一次：窗口没真的过期，就只能重放结果。
+        await broker.PublishToClientAsync(commands.Topic, payload);
+        await AwaitResult(t, broker, commands.ResultTopic, count: 72);
+
+        t.Equal(1, control.Restarts,
+            "a wall-clock jump must not expire the dedup window and re-execute the command");
+
+        var replay = JsonNode.Parse(
+            broker.Published.Last(p => p.Topic == commands.ResultTopic).Payload)!.AsObject();
+        t.Equal(true, replay["replayed"]!.GetValue<bool>(),
+            "the duplicate is still answered as a replay, not an error");
     }
 
     private static MqttOptions Options(int port) => new()
