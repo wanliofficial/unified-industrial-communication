@@ -19,6 +19,7 @@ internal static class AuthTests
         tests.Add(new TestCase("auth/password_change_clears_must_change", PasswordChangeClearsMustChange));
         tests.Add(new TestCase("auth/session_expires_after_12h", SessionExpiresAfter12Hours));
         tests.Add(new TestCase("auth/lockout_after_five_failures", LockoutAfterFiveFailures));
+        tests.Add(new TestCase("auth/lockout_survives_a_clock_jump", LockoutSurvivesAClockJump));
         tests.Add(new TestCase("auth/role_matrix", RoleMatrix));
         tests.Add(new TestCase("auth/disabled_user_loses_sessions", DisabledUserLosesSessions));
         tests.Add(new TestCase("auth/last_admin_is_protected", LastAdminIsProtected));
@@ -120,7 +121,8 @@ internal static class AuthTests
 
     private static Task LockoutAfterFiveFailures(TestContext t)
     {
-        var auth = new AuthService(t.TempDir);
+        var clock = new FakeClock();
+        var auth = new AuthService(t.TempDir, time: clock);
         var password = InitialPassword(auth.Users);
         var now = DateTimeOffset.UtcNow;
 
@@ -144,9 +146,45 @@ internal static class AuthTests
         t.Ok(auth.Login("admin", password, "10.0.0.10", now).Token.Length > 0,
             "a different address can still log in");
 
-        auth.ResetThrottleForTests();
-        t.Ok(auth.Login("admin", password, "10.0.0.9", now.AddSeconds(61)).Token.Length > 0,
+        // 真实流逝 61 秒后解锁。锁定窗口用单调时钟，所以要拨 _time；
+        // 只推墙钟的话这条用例验证不到窗口的计时方式。
+        clock.Advance(TimeSpan.Zero, TimeSpan.FromSeconds(61));
+        t.Ok(auth.Login("admin", password, "10.0.0.9", now).Token.Length > 0,
             "after the lockout window the address can log in again");
+        return Task.CompletedTask;
+    }
+
+    /// <summary>
+    /// 认证锁定窗口必须用单调时钟，绝不能用墙钟。
+    ///
+    /// 锁定是防爆破的安全机制。用墙钟算剩余时间，两个方向都能绕过它：
+    /// 前跳一小时让窗口里所有旧尝试瞬间失效，被锁的攻击者等一次校时就能继续试；
+    /// 后跳则让 <c>now - t</c> 变负、窗口永不清理，合法用户被永久锁死。
+    /// </summary>
+    private static Task LockoutSurvivesAClockJump(TestContext t)
+    {
+        var clock = new FakeClock();
+        var auth = new AuthService(t.TempDir, time: clock);
+        var password = InitialPassword(auth.Users);
+        var now = DateTimeOffset.UtcNow;
+
+        for (var i = 0; i < 5; i++)
+            t.Throws<ApiException>(
+                () => auth.Login("admin", "wrong-" + i, "10.0.0.20", now),
+                "a bad password is rejected");
+
+        t.Ok(auth.LockedUntil("10.0.0.20", now) is not null, "the address is locked");
+
+        // 墙钟前跳一小时：单调时钟没有动，锁定必须仍然有效。
+        clock.Advance(TimeSpan.FromHours(1), TimeSpan.Zero);
+        t.Throws<ApiException>(
+            () => auth.Login("admin", password, "10.0.0.20", clock.GetUtcNow()),
+            "a forward clock jump must not lift the lockout");
+
+        // 真实 61 秒后解锁。
+        clock.Advance(TimeSpan.Zero, TimeSpan.FromSeconds(61));
+        t.Ok(auth.Login("admin", password, "10.0.0.20", clock.GetUtcNow()).Token.Length > 0,
+            "the lockout still expires after the real window elapses");
         return Task.CompletedTask;
     }
 

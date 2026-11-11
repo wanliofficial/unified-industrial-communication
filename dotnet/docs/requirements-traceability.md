@@ -12,8 +12,8 @@ PRD 中 M 级的采集协议已全部落地，FR-CFG-01 的四类寻址模型也
 可自动跑的用例（见 §7），唯一剩下的延期项是 object/file 寻址的实际驱动，
 见 [protocol-status.md](protocol-status.md) §4.1。
 
-当前测试基线：**305 passed / 0 failed / 3 skipped**（跳过的是需要 `--opcua` 的 OPC UA 端到端用例）；
-加 `-- --opcua` 跑全量是 **308 passed / 0 failed / 0 skipped**。
+当前测试基线：**306 passed / 0 failed / 3 skipped**（跳过的是需要 `--opcua` 的 OPC UA 端到端用例）；
+加 `-- --opcua` 跑全量是 **309 passed / 0 failed / 0 skipped**。
 
 ## 1. 采集（FR-COL）
 
@@ -97,7 +97,7 @@ PRD 中 M 级的采集协议已全部落地，FR-CFG-01 的四类寻址模型也
 | 编号 | 需求 | 状态 | 证据 / 说明 |
 |---|---|---|---|
 | FR-OPS-01 | Web 控制台（登录、设备、点位、监视、日志、配置） | 已实现 | 八个页面（Uno WASM）：设备、驱动、点位、监视、日志、审计、配置、账号；登录页 + 强制改密界面，按权限隐藏导航与写操作。`scripts/wasm-smoke.sh` 在 Playwright 里真跑「登录 → 强制改密 → 首屏数据 → 新建设备」。设备页内置「新建设备」表单（可同时新建通道：tcp 填 host/port，serial 填 port/baud，virtual 无传输参数），提交走「读脱敏配置 → 追加通道/设备 → `config/validate` → `config/apply`」，与配置页同一条版本链，`config/console_draft_builds_a_valid_document` 与 `contract/console_device_creation_flow` 覆盖拼装与端到端提交。表单只建**首个**点位，继续加点位仍走 CSV 导入或配置页 |
-| FR-OPS-02 | 认证（本地账号 + 会话 Token，首次强制改密） | 已实现 | 账号存 `data/security/users.json`（PBKDF2-SHA256、210k 迭代、每账号随机盐、原子替换写盘，无明文）；首次启动生成随机 `admin` 口令到 `data/security/initial-admin-password.txt`，改密前除 `auth/me`、`auth/password`、`auth/logout` 外全部 403 `auth.password_change_required`，改密成功后删除该文件。会话 Token 内存保存 12 小时，进程重启即失效；登录失败 5 次/分钟/IP 锁定 60 秒。静态 `northbound.rest.token` 保留为全权限 API Token（审计记 `api-token`）。证据：`auth/*`（9 条）与 `contract/auth_login_forces_password_change`、`contract/auth_login_is_rate_limited`、`contract/auth_logout_revokes_session` |
+| FR-OPS-02 | 认证（本地账号 + 会话 Token，首次强制改密） | 已实现 | 账号存 `data/security/users.json`（PBKDF2-SHA256、210k 迭代、每账号随机盐、原子替换写盘，无明文）；首次启动生成随机 `admin` 口令到 `data/security/initial-admin-password.txt`，改密前除 `auth/me`、`auth/password`、`auth/logout` 外全部 403 `auth.password_change_required`，改密成功后删除该文件。会话 Token 内存保存 12 小时，进程重启即失效；登录失败 5 次/分钟/IP 锁定 60 秒，锁定窗口按单调时钟计时，系统校时跳变既不能提前解锁也不能把账号锁死。静态 `northbound.rest.token` 保留为全权限 API Token（审计记 `api-token`）。证据：`auth/*`（10 条，含 `auth/lockout_survives_a_clock_jump`）与 `contract/auth_login_forces_password_change`、`contract/auth_login_is_rate_limited`、`contract/auth_logout_revokes_session` |
 | FR-OPS-03 | RBAC（页面级 + 操作级，≥3 角色） | 已实现 | 四个内置角色 `admin` / `operator` / `viewer` / `auditor`，九项权限（`system.read`、`system.control`、`device.control`、`point.write`、`config.read`、`config.write`、`config.rollback`、`audit.read`、`user.manage`）。页面级：导航与服务端返回的有效权限集合一致，`users` / `audit` 按 `user.manage` / `audit.read` 出现；操作级：每个端点 `.RequirePermission(...)` + 中间件默认拒绝（漏标即 403），命令按 action 二次查表。证据：`auth/role_matrix`、`contract/auth_roles_are_enforced`、`contract/auth_users_require_manage` |
 | FR-OPS-04 | 审计日志（可查询、可导出） | 已实现 | 追加写 NDJSON（`storage.audit`，默认 `data/audit/audit-yyyyMMdd-HHmmss-fff.ndjson`），按天 + 按大小切分，按份数保留，逐条 `Flush(flushToDisk: true)`；重启后从文件末尾恢复序号，`seq` 单调。记录 `config.apply` / `config.rollback` / `config.import` / `config.points_import` / `config.template_instantiate` / `config.export`（仅 `redact=false`）/ `point.write`（逐条，含旧值与新值）/ REST 与 MQTT 命令 / `auth.failed`（按来源 IP 30 秒去重）/ `audit.export`。`GET /api/v1/audit` 按时间、动作、身份、结果、目标过滤并分页（最新在前），`GET /api/v1/audit/export` 导出同条件的 NDJSON 附件。写失败只告警 + `uic_audit_write_failures`，不阻断业务。证据：`audit/*`（7 条）与 `contract/audit_records_write_and_config`、`contract/audit_export_is_ndjson`、`contract/audit_denies_are_recorded` |
 | FR-OPS-05 | 指标（Prometheus 文本格式） | 已实现 | `GET /api/v1/metrics`；设备状态、样本发布、Outbox、OPC UA、看门狗都有序列；`/api/v1/health` 汇总 |

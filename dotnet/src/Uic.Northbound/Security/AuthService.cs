@@ -31,11 +31,14 @@ public sealed class AuthService
     private const int MaxFailures = 5;
 
     private readonly object _throttleGate = new();
-    private readonly Dictionary<string, List<DateTimeOffset>> _failures = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, List<long>> _failures = new(StringComparer.Ordinal);
+    private readonly TimeProvider _time;
 
-    public AuthService(string dataDir, Action<string>? warn = null)
+    /// <param name="time">锁定窗口的时间来源，只用于<b>单调</b>的时长判定。</param>
+    public AuthService(string dataDir, Action<string>? warn = null, TimeProvider? time = null)
     {
         Users = new UserStore(dataDir, warn);
+        _time = time ?? TimeProvider.System;
     }
 
     public UserStore Users { get; }
@@ -72,11 +75,11 @@ public sealed class AuthService
                 return new LoginResult(token, session.ExpiresAt, user);
 
             case LoginCheck.Disabled:
-                RecordFailure(key, now);
+                RecordFailure(key);
                 throw ApiException.Forbidden("auth.user_disabled", $"user '{username}' is disabled");
 
             default:
-                RecordFailure(key, now);
+                RecordFailure(key);
                 // 不区分「用户不存在」与「口令错误」：错误信息本身会变成一个账号枚举接口。
                 throw new ApiException(401, "auth.invalid_credentials", "invalid username or password");
         }
@@ -118,35 +121,40 @@ public sealed class AuthService
         {
             if (!_failures.TryGetValue(key, out var attempts)) return null;
 
-            attempts.RemoveAll(t => now - t > FailureWindow);
+            var monoNow = _time.GetTimestamp();
+            attempts.RemoveAll(t => _time.GetElapsedTime(t, monoNow) > FailureWindow);
             if (attempts.Count < MaxFailures)
             {
                 if (attempts.Count == 0) _failures.Remove(key);
                 return null;
             }
 
-            var until = attempts[^1] + Lockout;
-            return until > now ? until : null;
+            // 锁定到期用单调时钟算「还剩多久」，再换算成墙钟时刻返回给调用方。
+            // 用墙钟算剩余时间，一次校时就能凭空改变锁定的长短。
+            var remaining = Lockout - _time.GetElapsedTime(attempts[^1], monoNow);
+            return remaining > TimeSpan.Zero ? now.Add(remaining) : null;
         }
     }
 
-    private void RecordFailure(string key, DateTimeOffset now)
+    private void RecordFailure(string key)
     {
         lock (_throttleGate)
         {
             if (!_failures.TryGetValue(key, out var attempts))
             {
-                attempts = new List<DateTimeOffset>();
+                attempts = new List<long>();
                 _failures[key] = attempts;
             }
 
-            attempts.RemoveAll(t => now - t > FailureWindow);
-            attempts.Add(now);
+            // 只存单调时刻：墙钟在这里出现一次，整条锁定逻辑就跟着校时一起撒谎。
+            var monoNow = _time.GetTimestamp();
+            attempts.RemoveAll(t => _time.GetElapsedTime(t, monoNow) > FailureWindow);
+            attempts.Add(monoNow);
 
             // 失败记录是攻击者可控的增长点，必须有上限。
             if (_failures.Count > 4096)
             {
-                foreach (var stale in _failures.Where(p => now - p.Value[^1] > FailureWindow)
+                foreach (var stale in _failures.Where(p => _time.GetElapsedTime(p.Value[^1], monoNow) > FailureWindow)
                              .Select(p => p.Key).ToArray())
                 {
                     _failures.Remove(stale);
@@ -160,9 +168,4 @@ public sealed class AuthService
         lock (_throttleGate) _failures.Remove(key);
     }
 
-    /// <summary>用例需要在同一进程里反复验证锁定与解锁；生产代码不会调用。</summary>
-    internal void ResetThrottleForTests()
-    {
-        lock (_throttleGate) _failures.Clear();
-    }
 }
