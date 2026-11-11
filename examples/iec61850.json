@@ -1,0 +1,137 @@
+{
+  "schemaVersion": 1,
+  "site": "iec61850-lab",
+  "server": {
+    "listen": "127.0.0.1:8102",
+    "token": "dev-token-0123456789"
+  },
+  "storage": {
+    "dir": "./data-iec61850",
+    "journal": true,
+    "outboxMaxRecords": 5000,
+    "outboxTtl": "10m"
+  },
+  "logging": {
+    "level": "info"
+  },
+  "northbound": {
+    "webhook": {
+      "enabled": false,
+      "url": "http://127.0.0.1:9999/ingest",
+      "timeout": "3s"
+    }
+  },
+  "channels": [
+    {
+      "id": "ch-iec61850",
+      "protocol": "iec61850",
+      "transport": {
+        "kind": "tcp",
+        "address": "127.0.0.1:10202"
+      },
+      "concurrency": 1,
+      "timeout": "3s"
+    }
+  ],
+  "devices": [
+    {
+      "id": "ied01",
+      "name": "内置 IED（逻辑设备 simpleIO，MMS 读写）",
+      "channel": "ch-iec61850",
+      "interval": "1s",
+      "timeout": "3s",
+      "enabled": true,
+      "labels": {
+        "defaultFC": "ST",
+        "probeObject": "simpleIO/LLN0.ST.Health"
+      },
+      "points": [
+        {
+          "id": "health",
+          "name": "逻辑节点健康（LLN0.ST.Health）",
+          "address": {
+            "kind": "symbol",
+            "path": "simpleIO/LLN0.ST.Health"
+          },
+          "dataType": "int32",
+          "enabled": true
+        },
+        {
+          "id": "ind1",
+          "name": "通用指示 1（GGIO1.ST.Ind1.stVal，省略 FC 由 labels.defaultFC 补齐）",
+          "address": {
+            "kind": "symbol",
+            "path": "simpleIO/GGIO1.Ind1.stVal"
+          },
+          "dataType": "bool",
+          "enabled": true
+        },
+        {
+          "id": "ind2",
+          "name": "通用指示 2（GGIO1.ST.Ind2.stVal）",
+          "address": {
+            "kind": "symbol",
+            "path": "simpleIO/GGIO1.ST.Ind2.stVal"
+          },
+          "dataType": "bool",
+          "enabled": true
+        },
+        {
+          "id": "pos",
+          "name": "位置（GGIO1.ST.Str.Pos.stVal，整型枚举）",
+          "address": {
+            "kind": "symbol",
+            "path": "simpleIO/GGIO1.ST.Str.Pos.stVal"
+          },
+          "dataType": "int32",
+          "enabled": true
+        },
+        {
+          "id": "voltage",
+          "name": "相电压（GGIO1.MX.PhV.mag.f，32 位浮点）",
+          "address": {
+            "kind": "symbol",
+            "path": "simpleIO/GGIO1.MX.PhV.mag.f"
+          },
+          "dataType": "float32",
+          "unit": "V",
+          "enabled": true
+        },
+        {
+          "id": "current",
+          "name": "电流（GGIO1.MX.A.mag.f，32 位浮点）",
+          "address": {
+            "kind": "symbol",
+            "path": "simpleIO/GGIO1.MX.A.mag.f"
+          },
+          "dataType": "float32",
+          "unit": "A",
+          "enabled": true
+        },
+        {
+          "id": "spcs",
+          "name": "可编程控制（GGIO1.CO.SPCs.stVal，可写）",
+          "address": {
+            "kind": "symbol",
+            "path": "simpleIO/GGIO1.CO.SPCs.stVal"
+          },
+          "dataType": "bool",
+          "writable": true,
+          "enabled": true
+        },
+        {
+          "id": "setpoint",
+          "name": "定值（GGIO1.SP.SETV.setMag.f，可写）",
+          "address": {
+            "kind": "symbol",
+            "path": "simpleIO/GGIO1.SP.SETV.setMag.f"
+          },
+          "dataType": "float32",
+          "unit": "V",
+          "writable": true,
+          "enabled": true
+        }
+      ]
+    }
+  ]
+}

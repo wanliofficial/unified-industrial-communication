@@ -911,3 +911,109 @@ func TestParseAddressKNXLeavesGroupSyntaxToDriver(t *testing.T) {
 		}
 	}
 }
+
+// IEC 61850 的对象引用是符号地址，宽度由装置侧的 MMS 类型决定：点表层不能
+// 要求也不能接受 length，否则会诱导人写出「读 4 个字节」这种不存在的概念。
+func TestPolicyForIEC61850(t *testing.T) {
+	p := PolicyFor("iec61850")
+	if p.Width != WidthNone {
+		t.Fatalf("width = %v, want WidthNone (the object's MMS type decides)", p.Width)
+	}
+	if !p.AllowSymbol {
+		t.Fatalf("iec61850 must accept symbol addresses: %+v", p)
+	}
+	if p.AllowRegister || p.AllowObject || p.AllowFile || p.AllowComputed ||
+		p.AllowSelector || p.AllowDPT {
+		t.Fatalf("iec61850 accepts other address kinds: %+v", p)
+	}
+	if p.DIBits != 0 || p.DIField || p.AllowSymbolLength || p.SymbolIndexInPath {
+		t.Fatalf("iec61850 policy leaked DI/symbol-length flags: %+v", p)
+	}
+}
+
+func TestParseAddressIEC61850(t *testing.T) {
+	cases := []struct {
+		name string
+		expr string
+		dt   model.DataType
+		path string
+	}{
+		{"status", "simpleIO/GGIO1.ST.Ind1.stVal", model.TypeBool, "simpleIO/GGIO1.ST.Ind1.stVal"},
+		{"measurement", "simpleIO/GGIO1.MX.PhV.mag.f", model.TypeFloat32, "simpleIO/GGIO1.MX.PhV.mag.f"},
+		{"health", "simpleIO/LLN0.ST.Health", model.TypeInt32, "simpleIO/LLN0.ST.Health"},
+		// 前后空白由解析器吃掉；路径里的点与斜杠原样保留（对象引用的
+		// 结构由驱动用 codec 校验，点表层不复制一份「差不多的」语法）。
+		{"padded", "  simpleIO/GGIO1.ST.Ind1.stVal  ", model.TypeBool, "simpleIO/GGIO1.ST.Ind1.stVal"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			a, err := ParseAddress(tc.expr, tc.dt, "iec61850")
+			if err != nil {
+				t.Fatalf("parse: %v", err)
+			}
+			if a.Kind != model.AddressSymbol || a.Path != tc.path {
+				t.Fatalf("address = %+v, want symbol %q", a, tc.path)
+			}
+			// length 不表达任何东西：宽度由数据对象的 MMS 类型决定。
+			if a.Length != 0 {
+				t.Fatalf("length = %d, want 0", a.Length)
+			}
+			// 往返：Canonical 的文本必须能重新解析成同一个地址。
+			b, err := ParseAddress(a.Canonical(), tc.dt, "iec61850")
+			if err != nil {
+				t.Fatalf("reparse %q: %v", a.Canonical(), err)
+			}
+			if b != a {
+				t.Fatalf("round trip: %+v != %+v", b, a)
+			}
+		})
+	}
+}
+
+// 反向用例里刻意区分「点表层能判」与「必须留给驱动判」两类：
+// 前一类在这里报错，后一类（对象引用的语法）必须放行。
+func TestParseAddressIEC61850Rejects(t *testing.T) {
+	cases := []struct {
+		name string
+		expr string
+		dt   model.DataType
+		hint int
+		want string
+	}{
+		// 宽度由装置侧决定，`AllowSymbolLength` 为 false：点表的 length 列
+		// 没有含义，直接拒绝；地址里的 `:2` 也不会被切掉当作长度（它是
+		// 名字的一部分，由驱动在 Open 阶段连同对象引用一起判）。
+		{"length column", "simpleIO/GGIO1.ST.Ind1.stVal", model.TypeFloat32, 2, "length is only valid for register addresses"},
+		{"register", "holding:0", model.TypeUint16, 0, "does not accept register"},
+		{"object", "analogInput:1.presentValue", model.TypeFloat32, 0, "does not accept object"},
+		{"computed", "expr:simpleIO/GGIO1.ST.Ind1.stVal", model.TypeBool, 0, "does not accept computed"},
+		{"empty", "   ", model.TypeBool, 0, "address is required"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := ParseAddressWithLength(tc.expr, tc.dt, "iec61850", tc.hint)
+			if err == nil {
+				t.Fatalf("expected an error for %q", tc.expr)
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("error = %v, want substring %q", err, tc.want)
+			}
+		})
+	}
+}
+
+// 对象引用的结构知识（几段、FC 是否合法、LD/LN 命名规则）属于 codec，
+// 点表层只保证「是一个非空的符号地址」。复制一份规则的结果是两份校验迟早
+// 不一致，而不一致的那一侧通常是宽松的那一侧。
+func TestParseAddressIEC61850LeavesRefSyntaxToDriver(t *testing.T) {
+	for _, expr := range []string{
+		"simpleIO/GGIO1.Ind1.stVal", // 缺 FC：由 labels.defaultFC 补
+		"simpleIO/GGIO1.MOD.Beh",    // MOD 不是功能约束：驱动拒绝
+		"GGIO1.ST.Ind1.stVal",       // 缺 LD：驱动拒绝
+		"a/b/c/d/e/f/g",             // 任意多段：驱动拒绝
+	} {
+		if _, err := ParseAddress(expr, model.TypeBool, "iec61850"); err != nil {
+			t.Fatalf("%q must parse at the point-table layer (the driver rejects it): %v", expr, err)
+		}
+	}
+}

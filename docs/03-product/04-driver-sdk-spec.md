@@ -6174,6 +6174,385 @@ uic knxread -list
 | `examples/knx.json` | 7 点示例（开关 ×2、2 字节浮点 ×2、1 字节百分比、4 字节浮点、2 字节有符号计数） |
 | `internal/runtime/runtime.go` | `RegisterBuiltins()` 注册 `knxdrv.New()` |
 
+### 3.10.21 IEC 61850（MMS over TCP：五段封套 + 对象引用读写，端口 102）
+
+IEC 61850 是变电站自动化的本体标准，它的价值不在「又一个协议」，而在**唯一一种能
+表达「一台装置上有哪几个保护/测量」的层次寻址**：逻辑设备（LD）→ 逻辑节点（LN）→
+数据对象（DO）→ 数据属性（DA）。上位机与 IED 之间的站控层通信在标准里指定为 MMS
+（制造报文规范）承载在 ISO-on-TCP 上，于是从一条网线到一次「读 `GGIO1.ST.Ind1.stVal`
+是什么值」之间，隔着**五层封套**：
+
+```
+TPKT (RFC1006)  →  COTP (ISO 8073)  →  会话层 (ISO 8327)  →  表示层 (ISO 8823)  →  ACSE (ISO 8649)  →  MMS
+```
+
+本仓库只做这一条路径上的采集子集：**ACSE 关联 + MMS 初始化 + 读/写变量 + 模型浏览
+（getNameList）**。不做 GOOSE/SV、报告控制块（BRCB/URCB）、文件传输、定值组、数据集
+读写、TLS。这些不是「懒得写」：GOOSE/SV 是二层/三层组播、有自己的生命周期与采样率；
+报告控制块是「服务端主动推」，与本平台调度式采集（拉）是两种语义；文件传输与定值组
+各有独立的权限模型。混进一个采集驱动里，超时、重连、死区三套逻辑会立刻互相干扰。
+
+#### 3.10.21.1 五段封套：谁的帧带谁的壳
+
+这是整节最容易做错、也最难从现象反推的地方。规则只有两条，但两条都必须精确：
+
+| 帧 | 自带 TPKT？ | 发送前需要做什么 |
+|---|---|---|
+| COTP 连接请求 `CR` / 连接确认 `CC` | ✅ 是 | 直接写 |
+| COTP 断开请求 `DR` | ✅ 是 | 直接写 |
+| 会话 `CN`（连接请求）/ `AC`（接受） | ❌ 否 | 套表示层 → 再 `BuildCOTPData`（补 TPKT + COTP DT） |
+| 会话 `DT`（数据）与所有 MMS 请求/响应 | ❌ 否 | `WrapData`（会话 DT + 表示层）→ `BuildCOTPData` → 写 |
+| 会话 `FIN`（有序释放）/ `AB`（中止） | ❌ 否 | 同 `DT` |
+
+封装顺序看起来「对称」，实际不对称：COTP 层在**连接阶段**自己产生完整的 TPKT 帧，
+在**数据阶段**只负责「在用户数据前面加 3 字节 COTP 头 + 4 字节 TPKT 头」。所以驱动
+里必须同时存在两个入口：`sendRaw`（发整帧，给 `CR`/`CC`/`DR` 用）与 `sendSession`
+（先 `BuildCOTPData` 再发，给会话层及以上用）。
+
+`readFrame` 反过来：它读一个**带 TPKT 头的整帧**，再按 COTP 类型（`CC` / `DT` / `DR`）
+决定交给谁解析。把 TPKT 头当成「传输层的私事」在解析侧剥掉，会让 COTP 的解析函数
+拿不到它需要的长度字段。
+
+这条不对称有个副作用值得写进测试：**少套一层或多套一层，对端只会断链**。没有
+「你的封套编号错了」这种诊断，只有一条连接被对端关闭。所以五段的组帧都用黄金字节钉住
+（`TestConnectPDUChain` / `TestSessionDataHeader` / `TestWrapUnwrapData`），一次失败
+就能定位到层。
+
+#### 3.10.21.2 会话层 LI 与 BER 长度是两套编码
+
+这是本仓库在这次实现里花时间最多的一个点，也是最容易「看起来对」的错误。
+
+会话层每个 SPDU 都以一个**长度指示（LI）**开头，它的编码规则是标准自己定的，**不是
+BER**：
+
+| 取值范围 | 编码 |
+|---|---|
+| 0 .. 254 | 单字节，就是长度 |
+| 255 及以上 | `0xFF` + **恰好两字节**大端长度 |
+
+而 BER 的长形式是「`0x81`/`0x82`/… 后面跟 N 个字节」，N 由首字节低 7 位决定。两者
+在短长度上**长得一模一样**（都是一个字节，值就是长度 < 128），所以在小型测试帧上
+永远发现不了差异；一旦某个 MMS 响应超过 254 字节（读一个结构体、翻一页模型、写一组
+数据），用 BER 解析器去读 LI 就会从错误的偏移继续——症状是「小响应一直正常，一读大
+结构就断链」。
+
+因此 `ParseSPDU` 里有一条独立的、**只服务会话层**的 LI 解析：
+
+```go
+// 伪代码，语义即实现
+switch {
+case head[0] < 0xFF:
+    li = int(head[0])
+    off = 1
+case head[0] == 0xFF:
+    li = int(binary.BigEndian.Uint16(head[1:3]))
+    off = 3
+default:
+    return SPDU{}, fmt.Errorf("session: invalid length indicator 0x%02X", head[0])
+}
+```
+
+`TestSessionConnectUsesExtendedUserData` 用一条超过 254 字节的连接帧钉住 `0xFF` 分支
+——短帧测试永远走不到那条分支。这与 CoAP 的 delta/length 扩展、Modbus RTU 的字符间
+静默属于同一类问题：**协议自己的长度编码看起来像通用编码，但不是**。
+
+#### 3.10.21.3 FC 是名字的一段，不是元数据
+
+IEC 61850 的对象引用写作 `LD/LN.FC.DO[.DA]`（示例：`simpleIO/GGIO1.MX.PhV.mag.f`），
+在 MMS 层被翻译成「域 + 项名」，项名用 `$` 分隔：
+
+```
+simpleIO/GGIO1.MX.PhV.mag.f   →   domain=simpleIO, item=GGIO1$MX$PhV$mag$f
+```
+
+关键在于 **FC（功能约束）是项名的一段**，不是可以被省略、被推导的元数据：
+`GGIO1$Ind1$stVal` 与 `GGIO1$ST$Ind1$stVal` 是两个**不同的对象**，只有一个存在。
+把 FC 当成「读的时候顺手补上」的东西，会得到稳定的 `object-non-existent`——而现场
+常见的读法是「这个点位永远坏，别的都好」，看不出任何协议层的异常。
+
+驱动因此规定：
+
+1. 引用里显式写了 FC 就用它；
+2. 没写则由 `labels.defaultFC` 补（`ST`/`MX`/`CO`/`SP`/`CF`/`DC`/`SG`/`SE`）；
+3. 两者都没有 → `Open` 阶段按地址错拒绝，不进采集循环。
+
+**绝不从数据属性名反推 FC。** 反推需要完整的 SCL 模型（`stVal` 在 `ST`/`CO`/`SP` 里
+都可能出现，取决于数据对象的 CDC），而驱动手上只有一份点表。
+
+FC 白名单严格限定为标准的八个功能约束。这一点看起来苛刻，实际是保护：`MOD`（模式）
+不是功能约束而是数据对象的一部分，把它当 FC 写进引用，得到的是一条**语法合法但语义
+错位**的项名，读回来是 `object-non-existent` 或者更糟——一个同名但不同语义的对象。
+`IsValidFC` 直接拒绝，配置期就暴露。
+
+#### 3.10.21.4 类型在装置侧，所以点表不写 width
+
+这与 KNX 恰好相反，值得对照着读：
+
+| | KNX | IEC 61850 |
+|---|---|---|
+| 类型在哪 | **不在总线上**，只有工程组地址表知道 | **在装置侧**，由 IED 的 MMS 模型给出 |
+| 点表要求 | DPT **必填**（`1/2/3@9.001`） | **不写** length/DPT，只写对象引用 |
+| 地址策略 | `WidthNone + AllowSymbol + AllowDPT` | `WidthNone + AllowSymbol` |
+| 猜错的后果 | 得到「合法的错值」（21.5 → `3.7e-41`） | 得到「按错误类型解释的值」（浮点按 int32 入账） |
+
+因为宽度由装置决定，`dataType` 在这里**只声明平台侧怎么存**，不参与线的解释。
+`uic iec61850read -raw` 打印的是**装置回的类型**（`bool` / `int64` / `float64`），
+而不是 `-type`：这正是自检最想看到的信息，也是唯一能验证「点表里的类型标注是否
+与装置一致」的手段。
+
+`PolicyFor("iec61850")` 是 `WidthNone + AllowSymbol`：`length` 在这条链路上没有意义
+（写上去会被 `WidthNone` 拒绝），`dpt`/`selector`/`bit` 等其它协议的字段同样不接受。
+把「反正 Modbus 都能写 length」的习惯带过来，会在导入阶段被拒——这比让点表带着一个
+被静默忽略的字段运行要好得多。
+
+#### 3.10.21.5 读写请求体：`listOfVariable` 与 `listOfData` 都是 `[0]`
+
+MMS 的读请求是「给我这些变量的值」，写请求是「把这些值写进这些变量」：
+
+```
+ReadRequest  ::= SEQUENCE { listOfVariable  [0]  SEQUENCE OF VariableAccessSpecification }
+WriteRequest ::= SEQUENCE { listOfVariable  [0]  ..., listOfData [0] SEQUENCE OF Data }
+```
+
+**两个字段的上下文标签都是 `[0]`，都编码成 `0xA0`。** 没有任何标签能把「变量列表」
+和「数据列表」区分开，唯一的判据是**出现顺序**：第一个 `0xA0` 是变量名列表，第二个
+是数据列表。写成「按标签找 `[0]`」的解析器会在写请求上把数据当成变量名，得到一个
+语法合法而语义完全错位的请求——服务端通常回 `object-non-existent`，看起来像点表
+错了。
+
+同样的坑在响应侧：读响应里每个结果要么是 `[1]` 数据、要么是 `[2]` 数据访问错误，
+按顺序一一对应请求里的变量；返回的结果条数与请求不等时，驱动必须拒绝而不是「尽量
+配对」——错位配对会把 A 的错误报成 B 的错误，运维照着错误信息改点表就会改错点。
+
+#### 3.10.21.6 invokeID：严格配对，迟到响应一律丢弃
+
+MMS 是请求/应答协议，但它允许**一条关联上同时有多个在途请求**，靠 32 位 `invokeID`
+把响应分回请求。因此驱动必须：
+
+1. 每次请求前 `c.invokeID++`，把新值传给 Build 函数（**由调用方分配**，编解码层
+   不自己维护计数器——否则「谁在推进」这件事会散在两个包里）；
+2. 收到响应后校验 `invokeID` 与当前请求一致；
+3. **不一致就丢弃并继续读下一帧**，不把它当作当前请求的答案。
+
+第 3 条是核心。不校验 invokeID 的实现在「一切正常」时完全正确，只在出过一次超时
+之后出错：那次的响应迟到到达，恰好被下一次请求读走，于是**A 的值被记到 B 头上**。
+症状是「偶尔有个点位显示别的点位的值」，而且刷新一次可能就恢复正常——这是最难查的
+一类缺陷。所以「迟到响应」必须有专门的测试：先发一次会超时的请求，再发一次正常请求，
+断言第二次拿到的是自己的值。
+
+串行化策略是「整条关联一把 `sync.Mutex`」：MMS 请求/应答在一条 TCP 上没有并发收益，
+只有乱序风险。`Read` 的多点位、`Write` 的多请求都在这把锁内逐项完成——代价是一轮
+采集等于点位数 × 单次事务，但这个代价可以解释、可以度量；引入并发则会把「慢」变成
+「慢 + 偶发错位」。
+
+#### 3.10.21.7 单项数据访问错误必须逐条分类
+
+MMS 的读/写响应是「逐项结果」：一批 5 个变量里可以 3 个成功、2 个报错，**不是整批
+失败**。因此错误分类发生在**单项**上，而不是整次 `Read` 上：
+
+| 数据访问错误码 | 含义 | 驱动分类 | 可重试 |
+|---|---|---|---|
+| 10 `object-non-existent` | 对象不存在 | `address` | ❌ |
+| 4 `object-undefined` | 对象未定义 | `address` | ❌ |
+| 5 `invalid-address` | 地址无效 | `address` | ❌ |
+| 6 `type-unsupported` | 类型不支持 | `address` | ❌ |
+| 3 `access-denied` | 访问被拒 | `permission` | ❌ |
+| 2 `temporarily-unavailable` | 暂时不可用 | `protocol` | ✅ |
+| 1 `hardware-fault` | 硬件故障 | `protocol` | ✅ |
+| 其余 | — | `protocol` | ❌ |
+
+这样分类的理由是**处理动作不同**：`address` 类错误不计入熔断（改点表就好，重试
+一万次也一样），`permission` 要改权限或换账号，只有 `2`/`1` 值得让调度器退避重试。
+把「点位配错了」与「装置在重启」混成一类，运维只能两边都查。
+
+链路级失败（超时、断链）则**中止本轮剩余点位**：后面的点不可能成功，逐个等超时只会
+把一轮采集拖成 N 倍时长。地址类错误不影响其它点，继续读下一个。
+
+一处实现细节：错误消息里已经带上了错误码与对象引用（`mms data access error
+object-non-existent (10) on simpleIO/GGIO1.ST.Ghost.stVal`），所以构造 `driver.E` 时
+**cause 必须留空**。`driver.E` 会把 cause 的文本再拼到消息尾部，非 nil 就会得到
+「... on X: ... on X」这种同一句话重复两遍的文案——这是本仓库在端到端手测里真的
+看到并修掉的一个缺陷，也说明自检命令的输出本身就是被测物的一部分。
+
+#### 3.10.21.8 浏览：能力位 unsupported，但提供包级入口
+
+`getNameList` 是 MMS 的标准服务，能枚举一个域（逻辑设备）下的全部命名变量。但驱动把
+`Browse` 能力位声明为 **`unsupported`**，理由与 SECS、ADS 等驱动一致：
+
+> 能力位描述的是**采集路径**。整棵模型枚举是运维动作（一次性、可能需要几十页、结果
+> 通常用来生成点表），与「每个周期读 N 个点位」是两种东西。把它注册成 `Browse`
+> 能力，只会让采集侧多一条难以解释的慢路径。
+
+所以实现分两层：
+
+| 层 | 入口 | 用途 |
+|---|---|---|
+| 包级 | `driver.Browse(ctx, cfg, domain)` | 自检/建模：独立建一条关联，枚举完即关 |
+| 连接级 | `(*conn).Browse(ctx, domain)` | 已有关联上的枚举，供包级入口转调 |
+| 内部 | `(*conn).listNames(ctx, domain)` | 逐页翻，处理 `moreFollows` 与游标 |
+
+分页语义：MMS 没有偏移量，只有**字典序游标** `continueAfter`。驱动把上一页的最后一项
+作为下一页的游标，直到对端说 `moreFollows=0`。这里有两个必须处理的边界：
+
+- **对端说「还有」却回了空页**：游标无从推进，再问只会空转 → 直接返回已收内容；
+- **上限 256 页**：防「永远说还有、游标却不前进」的畸形对端把自检命令变成死循环。
+  超过上限报 `protocol`，明确指出「getNameList did not terminate」。
+
+独立建链（而不是复用采集连接）是刻意的：枚举期间会长时间占用这条关联，塞进采集的
+那把锁里会让一轮采集莫名变长；独立关联也让 `invokeID` 序列互不干扰。
+
+#### 3.10.21.9 `Open` 只 dial，关联延后
+
+与 KNX、S7 驱动同样的取舍：
+
+| 时机 | 失败意味着 | 分类 |
+|---|---|---|
+| `Open` 失败 | 地址/端口/协议名写错 | 配置错误，不可重试 |
+| 首次 `Probe`/`Read`/`Write` 失败 | IED 正在重启、关联数已满、MMS 服务未就绪 | 临时问题，**必须可重试** |
+
+把五段握手放进 `Open` 会把「装置重启中」表现成「驱动加载失败」，进而让整台设备在
+配置里被判成坏设备——而它三十秒后就会自己好。
+
+`Probe` 的定义是「建立关联 +（可选）读一次探针对象」。探针对象默认为
+`LLN0$ST$Health`（所有 IED 都有的通用节点健康指示，且 `ST` 是标准 FC）。**读探针
+失败时降级为「仅关联成功」而不是判离线**：对象名拼错不等于链路坏，把标签笔误判成
+装置离线，会把人引向完全错误的方向。探针对象留空则 Probe 只建立关联——很多场景下
+「TCP 通、MMS 在应答」已经足够。
+
+关联建立失败时 `assocCount` 不计入成功关联（内置 IED 的观测计数钉住这一点），并且
+错误分类为 `protocol` 且**不可重试**：ACSE 层面的拒绝（应用上下文不匹配、认证失败、
+资源不足）重试同一个配置不会变好。
+
+#### 3.10.21.10 内置 IED 的语义
+
+`internal/sim/iec61850` 复用 `codec/iec61850` 的编解码函数——**主站与从站各写一套**
+是这类多层封套协议最容易出的问题：TPKT/COTP/会话/表示/ACSE/MMS 的长度与上下文编号
+在两侧各写一遍，然后对不上。共用之后，「从站能解析主站的帧」这件事几乎是自动成立的，
+剩下的测试价值就集中在**语义**上。
+
+它刻意复现五件真机会发生的事：
+
+1. **未知对象回 `object-non-existent`，不静默成功。** 如果模拟器「读什么给什么」，
+   「点表里对象引用写错」这个最常见的故障就永远测不到。
+2. **写只落在已存在的对象上。** 给未知对象凭空记账，会让一次错误的写在测试里表现为
+   成功——而真 IED 会回 `object-non-existent`。
+3. **`getNameList` 只回项名，不带宽前缀。** 变量树内部的键是 `simpleIO$GGIO1$ST$…`
+   （域 + 项，扁平索引），但 MMS 里 **identifier 在域内唯一、域由 `objectScope` 单独
+   携带**。把整键直接回出去，客户端会以为项名里还含域，拼一遍就变成
+   `simpleIO/simpleIO.GGIO1.ST.Ind1.stVal`——本仓库在端到端手测里真的看到过这个输出。
+4. **关联可被拒。** `RejectAssociation(true)` 让从站回一个 ACSE 永久拒绝，验证主站
+   把「关联被拒」与「读超时」分成两类事故（前者重试无用、后者可能只是装置忙），
+   同时钉住「拒绝的关联不计入成功关联数」。
+5. **读超时可注入且不拆连接。** `DropReads(true)` 让从站刻意不回读响应，客户端只能
+   靠自己的 deadline 超时；恢复投递后同一条连接还能继续读——真 IED 忙一阵之后就是
+   这样，不需要重连。
+
+还实现了有序释放（会话 `FIN` → `RLRE`）：不处理 `FIN` 会让客户端在关闭时白等一个
+超时，长期反复连接/断开的运维工具会因此留下一堆半开连接。
+
+#### 3.10.21.11 自检与示例
+
+```bash
+uic iec61850read -addr 192.168.1.10:102 -probe
+uic iec61850read -addr 192.168.1.10:102 -object simpleIO/GGIO1.ST.Ind1.stVal -type bool -raw
+uic iec61850read -addr 192.168.1.10:102 -object simpleIO/GGIO1.MX.PhV.mag.f -type float32
+uic iec61850read -addr 192.168.1.10:102 \
+    -object simpleIO/GGIO1.ST.Ind1.stVal,simpleIO/GGIO1.MX.PhV.mag.f -raw
+uic iec61850read -addr 192.168.1.10:102 -object simpleIO/GGIO1.CO.SPCs.stVal -type bool -write true
+uic iec61850read -addr 192.168.1.10:102 -browse -domain simpleIO
+uic iec61850read -list
+```
+
+- `-object` 支持逗号分隔多对象：一次命令看「同一台装置上几个点位分别是什么」，
+  每个点位独立报错误，不会因为一个坏点让整条命令失败（退出码仍反映是否有失败）。
+- `-raw` 在读取时打印**装置的 MMS 项名**（`simpleIO$GGIO1$MX$PhV$mag$f`）与装置回的
+  类型；在浏览时打印项名而不是渲染后的对象引用。它是排障时唯一能把「点表里写的」
+  与「线上发的」对上的输出。
+- `-fc` 提供默认 FC，与点表走同一条解析路径（`ParseObjectRef`），两处语法漂移是这类
+  CLI 最常见的腐化方式。
+- `-list` 不需要任何对端：直接打印内置 IED 的对象表，让人一眼看到「自检环境里有什么
+  可读」，避免对着一个空的 `-browse` 猜。
+
+`uic sim -protocol iec61850 -listen 127.0.0.1:10202` 起内置 IED，默认对象表与
+`examples/iec61850.json` 一一对应：
+
+| 对象引用 | MMS 项名 | 类型 | 初值 |
+|---|---|---|---|
+| `simpleIO/LLN0.ST.Health` | `simpleIO$LLN0$ST$Health` | integer | 1 |
+| `simpleIO/GGIO1.ST.Ind1.stVal` | `simpleIO$GGIO1$ST$Ind1$stVal` | boolean | true |
+| `simpleIO/GGIO1.ST.Ind2.stVal` | `simpleIO$GGIO1$ST$Ind2$stVal` | boolean | false |
+| `simpleIO/GGIO1.ST.Str.Pos.stVal` | `simpleIO$GGIO1$ST$Str$Pos$stVal` | integer | 2 |
+| `simpleIO/GGIO1.MX.PhV.mag.f` | `simpleIO$GGIO1$MX$PhV$mag$f` | float32 | 230.5 |
+| `simpleIO/GGIO1.MX.A.mag.f` | `simpleIO$GGIO1$MX$A$mag$f` | float32 | 5.25 |
+| `simpleIO/GGIO1.CO.SPCs.stVal` | `simpleIO$GGIO1$CO$SPCs$stVal` | boolean | false（可写） |
+| `simpleIO/GGIO1.SP.SETV.setMag.f` | `simpleIO$GGIO1$SP$SETV$setMag$f` | float32 | 230（可写） |
+
+对象表只有一份（`sim/iec61850.DefaultObjects()`）：安装初始值、`uic iec61850read -list`
+的清单、`uic sim` 的启动横幅都从它读，避免「文档里写的引用」与「实际配的引用」各说
+一套。
+
+**端口为什么是 10202**：102 是特权端口，普通用户起不了；示例配置与内置 IED 都用
+10202，避免与真实 IED 的端口打架。驱动本身默认端口仍是 102（`hostPort` 补端口时）。
+
+#### 3.10.21.12 点表这一层
+
+| 写法 | 结果 | 说明 |
+|---|---|---|
+| `simpleIO/GGIO1.ST.Ind1.stVal` | ✅ | 显式 FC |
+| `simpleIO/GGIO1.Ind1.stVal` + `labels.defaultFC=ST` | ✅ | FC 由设备标签补齐 |
+| `simpleIO/GGIO1.Ind1.stVal`，无 `defaultFC` | ❌ 导入期拒绝 | FC 不可推导 |
+| `simpleIO/GGIO1.MOD.Beh.stVal` | ❌ 拒绝 | `MOD` 不是功能约束 |
+| `simpleIO/GGIO1.ST.Ind1.stVal` + `length` | ❌ 拒绝 | `WidthNone` 不接受 length |
+| `simpleIO/GGIO1.ST.Ind1.stVal` + `selector` | ❌ 拒绝 | 符号地址不接受其它字段 |
+| `GGIO1.ST.Ind1.stVal`（缺 LD） | ❌ 拒绝 | 对象引用必须带逻辑设备 |
+
+语法校验全部在 `codec/iec61850.ParseObjectRef` 里做完，点表层不重复实现一份「差不多
+的」校验——两份校验迟早不一致，而不一致的那一侧通常是宽松的那一侧。
+
+#### 3.10.21.13 测试矩阵
+
+| 层 | 用例 |
+|---|---|
+| `codec/iec61850` | BER 整数最短补码与无符号符号位、不定长拒绝、长形式长度、位串/浮点往返；TPKT 往返与版本校验；COTP CR 形状、CC/DT 往返、TPDU size 码；**会话层 `0xFF` 扩展长度**、CN/AC 形状、DT 固定四字节头、FIN/AB；表示层 CP/CPA 形状与上下文编号；ACSE AARQ/AARE 往返、带认证、拒绝、固定 PDU（RLRQ/RLRE/ABRT）；MMS Initiate 形状与响应往返；对象名两种形态；读/写/getNameList 请求形状与响应往返、**写请求变量数与数据数不等时拒绝**、读响应部分失败；类型规格与数据值往返；`Data.ToValue` 拒绝结构体、`ValueFromData` 类型放宽、位串取值；连接 PDU 全链、连接响应全链、拒绝解析、`WrapData`/`UnwrapData`、错误上下文拒绝、释放 PDU；对象引用解析（显式 FC / 默认 FC / 六类语法错）、`String`、`SplitMMSName`、`DataSetName`；**服务端侧构造与解析往返**（`BuildReadResponse`/`ParseReadResponse`、`BuildWriteResponse`/`ParseWriteResponse`、四个请求解析、`MMSServiceTag`、`ConfirmedResponse` 对称、错误服务标签拒绝、坏值降级为 `object-invalidated`） |
+| `driver/iec61850` | `Meta`（能力/地址种类/`defaultFC` 与 `probeObject` 字段）；`Open` 拒绝非 TCP 与非法对象引用；`Probe` 建立关联；bool/int/float 三类读；`defaultFC` 补齐；对象不存在 → `address`；写后读回；写不存在对象 → `address`；关联被拒 → `protocol` 且 `assocCount==0`；读超时 → `timeout`；`Browse` 全量枚举且不产生读请求；`Browse` 未知域返回空列表 |
+| `sim/iec61850` | 手写最小客户端（**不复用驱动**）：默认对象表每个值都能被 `ToValue` 读懂、名字有序、`Set`/`Get`；真实 TCP 上的多对象读、未知对象逐项 `object-non-existent`、写落地、写未知对象失败；**getNameList 分页**（每页 3 项 + continueAfter 驱动读完，且只回项名）；关联被拒；`DropReads` 超时后恢复投递仍能读；有序释放回 RLRE |
+| `pointtable` | `PolicyFor("iec61850")` 是 `WidthNone + AllowSymbol` 且不泄漏 length/DPT/selector 标志；正向（显式 FC、默认 FC 补齐）× 反向（缺 LD、非标准 FC、带 length） |
+| `runtime` | `TestExamplesAreValid` 覆盖 `examples/iec61850.json` |
+
+覆盖率（`go test -count=1 -cover`）：
+
+| 包 | 覆盖率 | 说明 |
+|---|---|---|
+| `codec/iec61850` | 70.0% | 未覆盖的主要是各畸形输入分支与少量数据类型 |
+| `driver/iec61850` | 63.2% | I/O 路径由 `sim/iec61850` 的真实 TCP 回环覆盖 |
+| `sim/iec61850` | 83.3% | |
+
+与 KNX/Host Link 一节的处理一致：跨包统计（`-coverpkg`）下驱动的 I/O 路径覆盖率显著
+更高，本仓库选择「跨包统计 + 在文档里写清楚」，而不是为了数字造重复用例。
+
+#### 3.10.21.14 位置
+
+| 文件 | 内容 |
+|---|---|
+| `internal/codec/iec61850/ber.go` | BER 基础（TLV、长度、整数最短补码、无符号符号位、位串、浮点、时间） |
+| `internal/codec/iec61850/tpkt.go` | TPKT 组帧/解析/长度预读（版本 3） |
+| `internal/codec/iec61850/cotp.go` | COTP CR/CC/DT/DR、TPDU size 码、`DefaultCOTPOptions`、`BuildCOTPData`/`ParseCOTPData` |
+| `internal/codec/iec61850/session.go` | 会话层：**独立的 LI 解析**（`0xFF` + 恰好两字节）、CN/AC/DT/FIN/DN/AB/RF、`ParseSPDU`、SPDU 常量 |
+| `internal/codec/iec61850/presentation.go` | 表示层 CP/CPA/CP-Type/UserData/Abort、上下文编号（1=ACSE、3=MMS） |
+| `internal/codec/iec61850/acse.go` | AARQ/AARE/RLRQ/RLRE/ABRT、`ACSEReason`、应用上下文 OID |
+| `internal/codec/iec61850/association.go` | 建链三段封装：`BuildConnectPDU`/`ParseConnectResponse`、`WrapData`/`UnwrapData`、`BuildReleasePDU`/`ParseRelease`、`BuildAbortPDU` |
+| `internal/codec/iec61850/mms.go` | Initiate（请求/响应）、对象名、confirmed 封套、Read/Write/getNameList/getVarAccessAttrs、TypeSpec、ConfirmedError、Reject、`MMSServiceTag`、`ConfirmedInvokeID`、conclude |
+| `internal/codec/iec61850/data.go` | `Data`/`Value`、`DecodeData`/`EncodeData`、`ToValue`/`ValueFromData`/`DataFromValue`、数据访问错误码与名称 |
+| `internal/codec/iec61850/address.go` | `IsValidFC`、`ParseObjectRef`、`ObjectRef.{ObjectName,String}`、`SplitMMSName`、`DataSetName` |
+| `internal/driver/iec61850/driver.go` | 主站：`Dialer`/`New`/`NewWithDialer`、`Meta`、`parseSettings`、`buildPlans`/`planPoint`、`Open`、`Probe`/`Browse`/`listNames`/包级 `Browse`、`Close`、`ensure`/`redial`/`associate`/`awaitCOTPConfirm`/`awaitAssociation`/`release`、`sendRaw`/`sendSession`/`readFrame`/`roundTrip`、`Read`/`readObject`/`Write`/`writeOne`、`classifyMMS`/`dataError` |
+| `internal/sim/iec61850/server.go` | 内置 IED：`NewServer`/`Addr`/`Close`、变量树 `Set`/`SetBool`/`SetFloat`/`SetInt`/`Get`/`Names`、激励 `RejectAssociation`/`DropReads`、观测 `AssocCount`/`ReadCount`/`WriteCount`、`handleData`/`handleAssociate`/`handleRequest`/`handleRead`/`handleWrite`/`handleGetNameList` |
+| `internal/sim/iec61850/objects.go` | `DefaultObjects()`（单一事实来源） |
+| `internal/pointtable/address.go` | `PolicyFor("iec61850")`（`WidthNone + AllowSymbol`） |
+| `cmd/uic/iec61850read.go` | 自检命令（`-addr`/`-object`/`-type`/`-fc`/`-domain`/`-write`/`-probe`/`-browse`/`-list`/`-timeout`/`-json`/`-raw`） |
+| `cmd/uic/main.go` | `iec61850read` 分派、`sim -protocol iec61850`、`simIEC61850` 启动横幅 |
+| `examples/iec61850.json` | 8 点示例（健康/状态/位置/电压/电流/两个可写点） |
+| `internal/runtime/runtime.go` | `RegisterBuiltins()` 注册 `iec61850drv.New()` |
+
 ### 3.11 计算点（`computed`）
 
 

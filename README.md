@@ -598,6 +598,65 @@ KNX 与其它协议的根本差别是**组地址不携带类型**。同一个 `2
 重传」的边界、槽位满时回明确的 `StatusNoMoreConnections` 而不是静默丢弃、以及
 `FailNextConfirms(n)` 显式注入总线级故障（默认 con 正常）。
 
+IEC 61850（MMS over TCP，站控层读写）：
+
+```bash
+./uic sim -protocol iec61850 -listen 127.0.0.1:10202 &   # 内置 IED（逻辑设备 simpleIO）
+./uic -config examples/iec61850.json
+curl -s -H 'Authorization: Bearer dev-token-0123456789' localhost:8102/api/v1/points
+#   8 点：LLN0.ST.Health、GGIO1 的两路状态指示与位置、相电压/电流（32 位浮点）、
+#          GGIO1.CO.SPCs.stVal（可写）、GGIO1.SP.SETV.setMag.f（可写）
+#   自检（不需要 IED）：./uic iec61850read -list
+#   只验关联：./uic iec61850read -addr 127.0.0.1:10202 -probe
+#   读点位：  ./uic iec61850read -addr 127.0.0.1:10202 \
+#               -object simpleIO/GGIO1.MX.PhV.mag.f -type float32 -raw
+#   写点位：  ./uic iec61850read -addr 127.0.0.1:10202 \
+#               -object simpleIO/GGIO1.CO.SPCs.stVal -type bool -write true
+#   浏览模型：./uic iec61850read -addr 127.0.0.1:10202 -browse -domain simpleIO
+```
+
+这一条链路比前面所有协议都长：TPKT（RFC1006）→ COTP → 会话层 → 表示层 → ACSE →
+MMS，五段封套依次套上才算一次「读一个变量」。封套多不是难点，难点是**每层都有
+自己的长度与编号**，其中至少两处必须分开处理：
+
+- **会话层的 LI 与 BER 长度是两套编码。** `0x00..0xFE` 是单字节长度，`0xFF` 后面
+  跟**恰好两字节**大端长度——它不是 BER 的长形式（后者后面跟几个字节由低 7 位
+  决定）。拿通用的 BER 长度解析器去读 LI，短帧能过、长帧会读错位置。
+- **封套的归属不对称。** COTP 的连接请求/确认自带 TPKT，可以直接发；而会话的
+  CN/AC/DT/FIN 以及所有 MMS 请求都必须先套「会话 DT + 表示层」，再由 COTP 补上
+  TPKT 与 COTP 头。少套一层或多套一层，对端只会断链，没有更具体的提示。
+
+地址沿用 IEC 61850 的对象引用 `LD/LN.FC.DO[.DA]`（示例写作
+`simpleIO/GGIO1.MX.PhV.mag.f`）。**FC（功能约束）是名字的一段，不是元数据**：
+`GGIO1$Ind1$stVal` 与 `GGIO1$ST$Ind1$stVal` 是两个不同的对象，只有一个存在。所以
+点表要么把 FC 写全，要么由 `labels.defaultFC` 补默认值；驱动**不从数据属性名反推
+FC**——反推需要完整的 SCL 模型，而驱动手上只有一份点表。
+
+与 KNX 相反，这里的**类型在装置侧**：一个对象是布尔、整型还是浮点，由 IED 的 MMS
+模型决定，读回来才知道。因此地址策略是 `WidthNone + AllowSymbol`，点表**不写
+length**；`dataType` 只声明平台侧怎么存。把 `MX.PhV.mag.f` 标成 `int32` 不会变成
+「读四个字节的整数」，只会把读到的浮点按整数入账——所以 `-raw` 打印的是装置回的
+类型，而不是 `-type`。
+
+一条关联上可以有多个在途请求，靠 **invokeID** 分回对应关系。驱动严格配对：迟到的
+响应（上一次超时的那个）按 invokeID 丢弃，绝不当作当前请求的答案——不校验就会在
+「A 超时、B 复用同一条链路」时把 A 的值写给 B。整条关联仍然用一把锁串行化：MMS 是
+请求/应答协议，并发没有收益，只有乱序风险。
+
+单项数据访问错误（`object-non-existent`、`access-denied` 等）不是网络错误，逐条映射：
+对象不存在/未定义/地址无效/类型不支持 → `address`（改点表，不计入熔断），访问被拒 →
+`permission`，暂时不可用/硬件故障 → `protocol` 且**可重试**。把「点位配错了」与
+「装置在重启」混成一类，运维只能两边都查。
+
+模型浏览（`getNameList`）协议支持，但驱动把 `Browse` 能力位声明为 `unsupported`：
+枚举整棵 IED 模型是「一次性运维动作」，与调度式采集是两种语义，混进 `Read` 只会让
+采集多一条难以解释的慢路径。自检命令走包级 `Browse`，按页收齐（每页 3 项，
+continueAfter 用上一页最后一项做游标，上限 256 页防「永远说还有」的对端）。
+
+边界：只做 ACSE + MMS 初始化 + 读/写变量 + 模型浏览。不做 GOOSE/SV（二层/三层
+组播，另一套生命周期）、不做报告控制块（服务端主动推，与调度式采集冲突）、不做
+文件传输、定值组、数据集读写、TLS。
+
 DL/T 645-2007 多功能电能表（RS-485 / 串口服务器）：
 
 ```bash
@@ -902,7 +961,7 @@ go test -race -count=1 ./...
 
 | 路径 | 内容 |
 |---|---|
-| `cmd/uic/` | 单入口：`run` / `sim`（Modbus / S7 / OPC UA / MQTT / MC / FINS / Host Link / KNX / EtherNet-IP / BACnet-IP / IEC 104 / IEC 101 / Mewtocol / DNP3 / CoAP / 645 / 188 / SNMP / ADS / SECS）/ `mbread` / `mcread` / `finsread` / `hostlinkread` / `enipread` / `bacread` / `iec104read` / `iec101read` / `mewtocolread` / `dnp3read` / `coapread` / `knxread` / `dlt645read` / `cjt188read` / `snmpread` / `adsread` / `secsread` / `uaread` / `s7blocks` / `s7upload` / `instantiate` / `import` / `token` / `-check` / `version` |
+| `cmd/uic/` | 单入口：`run` / `sim`（Modbus / S7 / OPC UA / MQTT / MC / FINS / Host Link / KNX / IEC 61850 / EtherNet-IP / BACnet-IP / IEC 104 / IEC 101 / Mewtocol / DNP3 / CoAP / 645 / 188 / SNMP / ADS / SECS）/ `mbread` / `mcread` / `finsread` / `hostlinkread` / `enipread` / `bacread` / `iec104read` / `iec101read` / `mewtocolread` / `dnp3read` / `coapread` / `knxread` / `iec61850read` / `dlt645read` / `cjt188read` / `snmpread` / `adsread` / `secsread` / `uaread` / `s7blocks` / `s7upload` / `instantiate` / `import` / `token` / `-check` / `version` |
 | `internal/model` | 通道 / 设备 / 点位 / 地址 / 采样 / 质量码 |
 | `internal/driver` | 驱动契约（Codec / Transport / Driver）、错误分类、注册表、只读 `Lookup` 注入 |
 | `internal/calc` | 零依赖表达式引擎（编译期类型检查、短路求值、引用 `device:point`） |
@@ -940,6 +999,9 @@ go test -race -count=1 ./...
 | `internal/codec/knx` | KNXnet/IP 纯函数编解码（组地址 4/4/8 与物理地址 4/4/8 / DPT 切片表与编解码 / cEMI `L_Data.req/ind/con` / 信封与全部服务报文 / HPAI） |
 | `internal/driver/knx` | KNXnet/IP 隧道主站（建隧道/心跳/断链重建、8 位序号与重传、组地址读写、`L_Data.con` 短窗口确认、源地址三级优先） |
 | `internal/sim/knx` | KNXnet/IP 内置网关（隧道分配与回收、序号严格校验与 8 位回绕、组地址对象表、`L_Data.con`、四种故障注入） |
+| `internal/codec/iec61850` | IEC 61850 纯函数编解码（TPKT / COTP / 会话 LI 与 SPDU / 表示层 CP-CPA-CP-Type / ACSE AARQ-AARE / MMS Initiate 与 Read/Write/getNameList / 数据值与访问结果 / 对象引用与 FC） |
+| `internal/driver/iec61850` | IEC 61850（MMS）主站（五段关联握手、invokeID 严格配对、读写变量、对象引用 FC 补全、单项数据访问错误分类、`Browse` 分页枚举） |
+| `internal/sim/iec61850` | IEC 61850 内置 IED（变量树 / 关联可拒 / 读写 / getNameList 分页 / 有序释放 / 读超时注入） |
 | `internal/codec/dlt645` | 645-2007 纯函数编解码（帧/校验和 / 数据标识 DI 表 / 压缩 BCD 与小数位 / 时间与地址 / 收帧扫描 / 后续帧序号） |
 | `internal/driver/dlt645` | 645 主站（RS-485 与串口服务器双承载、总线锁、逐点读 + 后续帧、写权限四道闸门、错误分类） |
 | `internal/sim/dlt645` | 645 内置从站（按标准宽度回数据 / 地址过滤 / 后续帧拆分 / 写权限与密码 / 广播校时静默生效 / 拉合闸） |

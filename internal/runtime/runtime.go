@@ -46,6 +46,7 @@ import (
 	hostlinkdrv "uic/internal/driver/hostlink"
 	iec101drv "uic/internal/driver/iec101"
 	"uic/internal/driver/iec104"
+	iec61850drv "uic/internal/driver/iec61850"
 	knxdrv "uic/internal/driver/knx"
 	mcdrv "uic/internal/driver/mc"
 	mewtocoldrv "uic/internal/driver/mewtocol"
@@ -178,6 +179,7 @@ func RegisterBuiltins() error {
 			adsdrv.New(),
 			coapdrv.New(),
 			knxdrv.New(),
+			iec61850drv.New(),
 			secsdrv.New(),
 		} {
 			if err := driver.Register(d); err != nil {

@@ -34,11 +34,11 @@ cmd/ + internal/            可运行的最小骨架（不是伪代码，能采�
 
 ### 1.2 它不是什么
 
-- 不是协议库大杂烩。当前实现了 24 个驱动（Modbus TCP / RTU / ASCII 主站、S7、OPC UA、MQTT 南向订阅、
-  MC 3E、FINS、Host Link FINS、EtherNet/IP CIP、BACnet/IP、IEC 60870-5-104、IEC 60870-5-101、Mewtocol、DNP3、CoAP、KNXnet/IP、DL/T 645、
+- 不是协议库大杂烩。当前实现了 25 个驱动（Modbus TCP / RTU / ASCII 主站、S7、OPC UA、MQTT 南向订阅、
+  MC 3E、FINS、Host Link FINS、EtherNet/IP CIP、BACnet/IP、IEC 60870-5-104、IEC 60870-5-101、Mewtocol、DNP3、CoAP、KNXnet/IP、IEC 61850（MMS）、DL/T 645、
   CJ/T 188、SNMP v1/v2c、ADS/AMS、SECS/GEM、计算点、virtual），外加
-  Modbus 从站（TCP / RTU / ASCII）、十九个内置模拟从站/Broker（Modbus TCP、S7、MC 3E、FINS、Host Link FINS、CIP、BACnet/IP、
-  IEC 104、IEC 101、Mewtocol、DNP3、CoAP、KNXnet/IP、DL/T 645、CJ/T 188、SNMP v1/v2c、ADS/AMS、HSMS/SECS-II、MQTT）与一个内置 OPC UA 服务端、一个零依赖报警引擎与一个有界历史采样日志；其余协议在
+  Modbus 从站（TCP / RTU / ASCII）、二十个内置模拟从站/Broker（Modbus TCP、S7、MC 3E、FINS、Host Link FINS、CIP、BACnet/IP、
+  IEC 104、IEC 101、Mewtocol、DNP3、CoAP、KNXnet/IP、IEC 61850、DL/T 645、CJ/T 188、SNMP v1/v2c、ADS/AMS、HSMS/SECS-II、MQTT）与一个内置 OPC UA 服务端、一个零依赖报警引擎与一个有界历史采样日志；其余协议在
   `04-protocol-catalog.md` 里按工作量排了三波，没有假装已经支持。
   注意 MQTT 出现了两次且**互不相干**：北向是「网关把数据发出去」（sink），南向是「网关订阅别人发来的数据」（driver）。
 - 不是组态软件。不做画面、不做报表、不做自研时序库——理由见 `02-synthesis/01-capability-matrix.md` §6.4。
@@ -487,6 +487,53 @@ KNX 的地址是 **组地址**（`主组/中间组/子组`），但组地址在�
 重建隧道（不猜）。写操作在 300ms 窗口内等链路层确认：**收不到按成功**（部分网关
 不回），收到且标了故障才判失败——而那个故障位表示**总线级**发送失败，不是「这个
 组地址有没有人在听」。
+
+IEC 61850（MMS over TCP，站控层读写）：
+
+```bash
+./uic sim -protocol iec61850 -listen 127.0.0.1:10202 &   # 内置 IED（域 simpleIO）
+./uic -config examples/iec61850.json
+curl -s -H 'Authorization: Bearer dev-token-0123456789' localhost:8102/api/v1/points
+#   8 点：LLN0.ST.Health、GGIO1.ST.Ind1/Ind2、GGIO1.ST.Str.Pos、
+#          GGIO1.MX.PhV.mag.f / A.mag.f（32 位浮点）、
+#          GGIO1.CO.SPCs.stVal（可写）、GGIO1.SP.SETV.setMag.f（可写）
+#   自检（不需要 IED）：./uic iec61850read -list
+#   只验关联：./uic iec61850read -addr 127.0.0.1:10202 -probe
+#   读点位：  ./uic iec61850read -addr 127.0.0.1:10202 \
+#               -object simpleIO/GGIO1.MX.PhV.mag.f -type float32 -raw
+#   写点位：  ./uic iec61850read -addr 127.0.0.1:10202 \
+#               -object simpleIO/GGIO1.CO.SPCs.stVal -type bool -write true
+#   浏览模型：./uic iec61850read -addr 127.0.0.1:10202 -browse -domain simpleIO
+```
+
+这是本仓库里封套最长的一条链路：TPKT（RFC1006）→ COTP → 会话层 → 表示层 → ACSE →
+MMS。两层细节必须分开处理，否则**短帧能过、长帧错位**：
+
+- **会话层 LI 与 BER 长度是两套编码。** `0x00..0xFE` 是单字节长度；`0xFF` 后面跟
+  **恰好两字节**大端长度，与 BER 长形式（后面跟几个字节由低 7 位决定）不是一回事。
+- **封套归属不对称。** COTP 的 CR/CC 自带 TPKT，可以直接发；会话的 CN/AC/DT/FIN
+  与所有 MMS 请求都要先套「会话 DT + 表示层」，再由 COTP 补 TPKT 与 COTP 头。
+
+地址是对象引用 `LD/LN.FC.DO[.DA]`（`simpleIO/GGIO1.MX.PhV.mag.f`）。**FC 是名字的
+一段而不是元数据**：`GGIO1$Ind1$stVal` 与 `GGIO1$ST$Ind1$stVal` 是两个不同对象。
+点表要么写全 FC，要么由 `labels.defaultFC` 补；驱动不从数据属性名反推 FC——那需要
+完整 SCL 模型，而驱动手上只有一份点表。
+
+类型在装置侧：一个对象是布尔、整型还是浮点由 IED 的 MMS 模型决定，读回来才知道。
+所以地址策略是 `WidthNone + AllowSymbol`、点表**不写 length**，`dataType` 只声明
+平台侧怎么存。把 `MX.PhV.mag.f` 标成 `int32` 不会读成整数，只会把浮点按整数入账。
+
+一条关联上可以有多个在途请求，靠 invokeID 分回对应关系；驱动严格配对，迟到的响应
+按 invokeID 丢弃，绝不当作当前请求的答案（不校验就会在「A 超时、B 复用链路」时把
+A 的值写给 B）。整条关联一把锁串行化——MMS 是请求/应答协议，并发只有乱序风险。
+
+单项数据访问错误不是网络错误：对象不存在/未定义/地址无效/类型不支持 → `address`，
+访问被拒 → `permission`，暂时不可用/硬件故障 → `protocol` 且可重试。模型浏览
+（`getNameList`）协议支持，但 `Browse` 能力位诚实声明为 `unsupported`：整棵模型
+枚举是一次性运维动作，不是采集路径；自检命令走包级 `Browse` 按页收齐。
+
+边界：只做 ACSE + MMS 初始化 + 读/写变量 + 模型浏览；不做 GOOSE/SV、报告控制块、
+文件传输、定值组、数据集读写、TLS。
 
 DL/T 645-2007 多功能电能表（RS-485 / 串口服务器）：
 
@@ -1145,6 +1192,9 @@ obs  ← 所有包（不依赖任何内部包）
 | `internal/codec/knx` | KNX 纯函数编解码（组地址 4/4/8 与物理地址 4/4/8、DPT 切片表与 `Encode`/`Decode`、cEMI `L_Data.req/ind/con`、KNXnet/IP 信封与全部服务报文、HPAI） | 无 I/O、无时钟、无可变状态；1 位 DPT 的值在 APCI 字节 bit0，`ParseLData` 必须把它摘掉（不摘则「开」的写帧解析成 `0x0081`、调用方 switch 落空、报文静默丢弃）；TPDU 长度不含 TPCI 字节与 APCI 高 2 位；DPT 表用切片而不是 map（`9.1` ≡ `9.001`，字符串键要先补零）；`HostPort` 缺端口时补 3671 | 77.5% |
 | `internal/driver/knx` | KNXnet/IP 隧道主站（建隧道/心跳/断链重建、8 位序号与重传、组地址读写、`L_Data.con` 短窗口确认、源地址三级优先） | 只做 TUNNELING + 组地址读写；整条会话一把锁串行（一条隧道只有一个通道号 + 一个 8 位序号）；序号**收到 ACK 之后才加一**，超时重传用同一序号，序号错乱唯一可靠的复位是重建隧道；`Open` 只 dial 不建隧道（否则「槽位满」变成驱动加载失败），`Probe` = 建隧道 + CONNECTIONSTATE、不读组地址；写路径 300ms 窗口等 con，收不到按成功、收到且 error 位置位才判 `protocol`——error 位是总线级故障，不是「有没有人在听」；`Address.DPT` 必填且与 `dataType` 静态匹配 | 67.7% |
 | `internal/sim/knx` | KNXnet/IP 内置网关（隧道分配与回收、序号严格校验与 8 位回绕、组地址对象表、`L_Data.con`、四种故障注入） | 与主站共用 codec/knx；重传只重发 ACK 不重复执行；**只更新已有的组地址对象**（凭空造对象会让「点表地址写错」从测试里消失）；读未知地址只回 ACK + con、不回 `GroupValueResponse`（让客户端正常超时）；槽位满回明确状态码而不是静默丢弃；`DefaultObjects()` 是对象表的唯一事实来源 | 85.2% |
+| `internal/codec/iec61850` | IEC 61850 纯函数编解码（TPKT / COTP / 会话 LI 与 SPDU / 表示层 / ACSE / MMS Initiate 与 Read/Write/getNameList / 数据值与访问结果 / 对象引用与 FC） | 无 I/O、无时钟；**会话层 LI 与 BER 长度是两套编码**（`0xFF` 后恰好两字节大端，不是 BER 长形式）；封套归属不对称（COTP CR/CC 自带 TPKT，其余必须先 `WrapData` 再 `BuildCOTPData`）；读写请求体里 `listOfVariable` 与 `listOfData` 都编码成 `[0]`（同为 `0xA0`），只能按出现顺序区分；FC 严格限定 ST/MX/CO/SP/CF/DC/SG/SE（`MOD` 不是标准 FC，会被拒） | 70.0% |
+| `internal/driver/iec61850` | IEC 61850（MMS）主站（五段关联握手、invokeID 严格配对、读写变量、FC 补全、单项错误分类、`Browse` 分页枚举） | 只做 ACSE + MMS 初始化 + 读/写变量 + 浏览；`Open` 只 dial（关联延迟到首次读写，否则「装置重启中」会表现成加载失败）；FC 必须显式或由 `labels.defaultFC` 补齐，不从属性名反推；整条关联一把锁串行化；迟到响应按 invokeID 丢弃；数据访问错误逐条映射（10/4/5/6→address、3→permission、2/1→protocol 可重试）；`Browse` 能力位 unsupported，一次性枚举走包级入口 | 63.2% |
+| `internal/sim/iec61850` | IEC 61850 内置 IED（变量树 / 关联可拒 / 读写 / getNameList 分页 / 有序释放 / 读超时注入） | 与主站共用 codec/iec61850；`getNameList` 只回**项名**（剥掉域前缀，域由 objectScope 携带，重复带域会让客户端拼成 `LD/LD.…`）；未知对象回 `object-non-existent` 而不是默认值；读未知对象逐项报错、写只落在已存在对象上；关联被拒不计入成功关联 | 83.3% |
 | `internal/codec/dlt645` | 645-2007 纯函数编解码（前导/双 68 定界/地址 BCD 低字节先传/数据域 +0x33/校验和/数据标识 DI 表/压缩 BCD 符号位/时间与地址/收帧扫描/后续帧序号） | 无 I/O、无时钟、无可变状态；前导不计入长度与校验和，CS 从第一个 `0x68` 起到 DATA 末；地址域低字节先传、缩位补 `AA` 通配；DI 按手册顺序 `DI3DI2DI1DI0`，数据块（任一字节 FF）宽度为 0 由应答决定；读数据域上限 200、写上限 50（含 12 字节头）；解码只做「按 DI 小数位换算工程值」，不施加点位 Scale/Bias | 60.3% |
 | `internal/driver/dlt645` | 645 主站（serial/tcp 双承载、总线锁、探针 0x13、逐点读 + 后续帧重组、写权限四道闸门、错误分类） | 协议一次只能读一个 DI，`MultiRead` 声明 unsupported；同一 DI 的多个点位共用一次事务；链路级故障后本轮剩余点快速失败；非数据块长度必须等于 DI 宽度；数据块只按 bytes 交付；`length` 由 DI 表推导、点表写错在驱动层报错；表地址取 `labels.address` 而不是 `unitId`；写命令受 `allow-write`/`allow-control`/DI 可写/密码四道闸门约束；广播命令不提供入口 | 67.3% |
 | `internal/sim/dlt645` | 645 内置从站（TCP + `ServeStream`、按标准宽度回数据、地址过滤、后续帧拆分、写权限与密码、广播校时静默生效、拉合闸） | 与主站共用 codec；地址不匹配静默（RS-485 上不能替别人应答）；读地址应答用实际地址而非回显全 `AA`；读时钟从内部时钟现场生成，写时钟同时推进内部时钟；数据块超过单帧容量按 `followChunk` 拆分，序号编码偏移让无状态续传正确 | 82.7% |
@@ -1178,7 +1228,7 @@ obs  ← 所有包（不依赖任何内部包）
 | `internal/mqtt` | MQTT 3.1.1 客户端（北向发布 + 南向订阅共用，纯 Go 零依赖） | 单 goroutine 读 socket；QoS1 必须等到 PUBACK；`Ping` 必须等到 PINGRESP（写成功不算活着）；断线立即失败而非超时；`Epoch` 暴露连接代数，供订阅方区分「新会话的第一条消息」 | 70.3% |
 | `internal/mqtt/mqtttest` | 测试封装：`internal/sim/mqtt` 的 `*testing.T` 生命周期 + 等待断言 | 不另写 Broker（两份实现必然长歪）；开关一律走 setup 函数而非直接赋字段 | — |
 | `internal/runtime` | 唯一编排层 + 后端实现 + 看门狗 + 审计埋点 + 窗口缓存 | 启动/关闭顺序（失败逆序收口）；`configuredState` 与 `runtimeState` 分离；协议/传输匹配在装配期校验；只向驱动与报警引擎注入只读 `cache.Get` 与窗口数据源；北向 OPC UA 启停与热重建；凭据表热替换后旧用户立即失效；MQTT 北向以 `northboundSink` 接口隔离 json 与 sparkplug-b | 81.1% |
-| `cmd/uic` | 单入口：run / sim / mbread / mcread / finsread / hostlinkread / enipread / bacread / iec104read / iec101read / mewtocolread / dnp3read / coapread / knxread / uaread / dlt645read / cjt188read / snmpread / adsread / s7blocks / s7upload / instantiate / import / token / check / version | 关闭预算 10 秒；`uaread`、`mbread`、`mcread`、`finsread`、`enipread`、`bacread`、`iec104read`、`iec101read`、`mewtocolread`、`dnp3read`、`coapread`、`knxread`、`dlt645read`、`cjt188read`、`snmpread`、`adsread` 是不装第三方客户端即可自证链路的自检工具；块服务放在 CLI 而不是北向 API（动作重、数据大、归操作系统账号管）；模板实例化与点表导入只产出文件，不在运行期动态生成设备 | — |
+| `cmd/uic` | 单入口：run / sim / mbread / mcread / finsread / hostlinkread / enipread / bacread / iec104read / iec101read / mewtocolread / dnp3read / coapread / knxread / iec61850read / uaread / dlt645read / cjt188read / snmpread / adsread / s7blocks / s7upload / instantiate / import / token / check / version | 关闭预算 10 秒；`uaread`、`mbread`、`mcread`、`finsread`、`enipread`、`bacread`、`iec104read`、`iec101read`、`mewtocolread`、`dnp3read`、`coapread`、`knxread`、`iec61850read`、`dlt645read`、`cjt188read`、`snmpread`、`adsread` 是不装第三方客户端即可自证链路的自检工具；块服务放在 CLI 而不是北向 API（动作重、数据大、归操作系统账号管）；模板实例化与点表导入只产出文件，不在运行期动态生成设备 | — |
 
 覆盖率一列是 `go test -cover ./<包>/` 的语句覆盖率（只统计包内测试，不做跨包交叉覆盖），
 随测试增删会有 1% 级的漂移；要看当前值请按 §9.2 的命令重跑。
@@ -1308,6 +1358,8 @@ OPC UA 服务端（同一份点位表的另一个出口）：
 | DNP3（IEEE 1815）主站 + 内置从站 | ✅ | `internal/codec/dnp3` + `internal/driver/dnp3` + `internal/sim/dnp3` + `uic dnp3read` + `examples/dnp3.json`；只做 TCP 主站 + 类 0/1/2/3 + CROB + 组 41 直接控制（不做串口、安全认证、文件传输、时间同步写路径、SBO 两段式）；三层各自的确认都必须处理——链路 ACK、传输分片、应用层 CON；带 CON 响应与未请求响应立即回确认，否则从站事件缓冲区会被重发撑爆；`Read` 只查本地最新值表；质量只看低 6 位，二进制 bit7 / 双点 bit6-7 是状态不是品质；双点 0/3 → false + uncertain；写操作检查从站回显状态；静态编码 → 解析有往返自洽测试，双点 2 位/点与「变体 2 无独立位图」两个易错点各钉了一个用例 |
 | KNXnet/IP 隧道主站 + 内置网关 | ✅ | `internal/codec/knx`（`group.go` 组地址/物理地址 4/4+8、`dpt.go` DPT 切片表、`cemi.go` cEMI、`netip.go` 信封与服务报文）+ `internal/driver/knx` + `internal/sim/knx` + `uic knxread` + `examples/knx.json`；只做 **TUNNELING（UDP 单播隧道 3671）+ 组地址读写**（不做 ROUTING 组播、设备管理连接、KNX Secure、raw/busmon）；**DPT 是必填字段且是地址的一部分**（`1/2/3@9.001`）——组地址不携带类型，由 `dataType` 反推得不到答案（`float32` 既可能是 2 字节 9.xxx 也可能是 4 字节 14.xxx），猜错不报错、只会得到「合法的错值」（21.5 → `3.7e-41`，质量还是 good）；因此 `PolicyFor("knx")` 用 `WidthNone + AllowSymbol + AllowDPT` 强制要求，`Address.Canonical()` 把 `@DPT` 拼回去（否则重复地址检查漏判、改 DPT 不被视为冲突）；DPT 表用切片而非 map（`9.1` ≡ `9.001`，字符串键要先补零，而补零要在三处各写一遍）；**1 位 DPT 的值在 APCI 字节 bit0、不在数据域**，解析时必须摘掉（不摘则「开」的 `GroupValueWrite` 变成 `0x0081`、调用方 switch 落空、报文静默丢弃，现场症状是「写成功但设备没动」），编码侧 TPDU 长度不含 TPCI 字节与 APCI 高位；序号 8 位、**收到 ACK 之后才加一**、超时重传用**同一序号**、序号错乱时唯一可靠的复位是**重建隧道**（通道号与序号是一体的）；整条会话一把锁串行化（一条隧道只有一个通道号 + 一个 8 位序号，总线 9600 波特）；`Open` 只 dial 不建隧道（CONNECT 延后，否则「隧道槽位满」会表现成驱动加载失败），`Probe` = 建隧道 + CONNECTIONSTATE 往返、不读组地址；写路径 300ms 短窗口等 `L_Data.con`，**收不到按成功**、收到且 error 位置位才判 `protocol`——而 error 位是**总线级故障**，不是「这个地址有没有人在听」（组地址是广播语义，写没人订阅的地址在链路层是成功的）；源地址三级优先 `labels.sourceAddress` > CRD > `0.0.0`；心跳 60s（1s..60s）、`ackTimeout` 1s 且必须 ≤ `device.timeout`；三层测试含真实 UDP 回环、1 位 APCI 归一化回归、序号 8 位回绕边界、丢 ACK 重传、序号错乱后重建、通道被回收、槽位满判可重试、网关不回 con 时写仍成功 |
 | KNXnet/IP 的边界 | ⚠️ | 不做 ROUTING 组播（需要网络侧组播配合与去重策略）、设备管理连接（属性/内存下载，是另一套服务与权限模型）、KNX Secure（证书与密钥分发是独立运维域）、raw/busmon（抓总线报文不是采集语义）；不做订阅——KNX 隧道客户端只能「读一次」，`Subscribe` 诚实声明 unsupported，不把周期性 `GroupValueRead` 伪装成推送；不做写完自动回读（多花一个事务是调用方的决定）；不支持「任意 DPT 自动推导」，几百个 DPT 编号里猜错的代价是一条合法但错误的读数，未收录的 DPT 明确报「不支持」；一轮采集耗时约等于「点位数 × 单次事务」，KNX 没有批量读的标准手段，这个代价是协议本身的 |
+| IEC 61850（MMS）主站 + 内置 IED | ✅ | `internal/codec/iec61850`（`tpkt.go`/`cotp.go`/`session.go`/`presentation.go`/`acse.go`/`mms.go`/`data.go`/`address.go`）+ `internal/driver/iec61850` + `internal/sim/iec61850` + `uic iec61850read` + `examples/iec61850.json`；只做 **ACSE + MMS 初始化 + 读/写变量 + getNameList 浏览**（不做 GOOSE/SV、报告控制块、文件传输、定值组、数据集读写、TLS）；封套五段，**会话层 LI 与 BER 长度是两套编码**（`0xFF` 后跟恰好两字节大端长度，不是 BER 长形式——用通用 BER 解析器读 LI，短帧能过、长帧错位），且**封套归属不对称**（COTP CR/CC 自带 TPKT 可直接发，会话 CN/AC/DT/FIN 与 MMS 请求必须先 `WrapData` 再 `BuildCOTPData`）；**FC 是名字的一段**（`LD/LN.FC.DO[.DA]`）：`GGIO1$Ind1$stVal` 与 `GGIO1$ST$Ind1$stVal` 是两个对象，点表要么写全、要么由 `labels.defaultFC` 补，驱动不从属性名反推（那需要完整 SCL 模型）；FC 白名单 ST/MX/CO/SP/CF/DC/SG/SE（`MOD` 不是标准 FC）；**类型在装置侧**，所以 `PolicyFor("iec61850")` 是 `WidthNone + AllowSymbol`、点表不写 length，`dataType` 只决定平台侧怎么存（`-raw` 打印装置回的类型）；读写请求体里 `listOfVariable` 与 `listOfData` 都编码成 `[0]`（同为 `0xA0`），只能按出现顺序区分；invokeID 严格配对、迟到响应丢弃（不校验会把 A 的值写给 B）；整条关联一把锁串行（MMS 是请求/应答协议，并发只有乱序风险）；单项数据访问错误逐条映射（10/4/5/6→`address`、3→`permission`、2/1→`protocol` 可重试）；`Browse` 能力位 unsupported（整棵模型枚举是运维动作，不是采集路径），一次性枚举走包级 `Browse` 按页收齐（continueAfter 用上一页最后一项做游标，256 页上限）；内置 IED 的 getNameList **只回项名**（剥掉域前缀，域由 objectScope 携带——整键回出去会让客户端拼成 `LD/LD.…`）；三层测试含真实 TCP 回环、分页、关联被拒、读超时后恢复、有序释放 |
+| IEC 61850 的边界 | ⚠️ | 不做 GOOSE/SV（二层/三层组播，独立生命周期与采样率）、报告控制块（服务端主动推，与调度式采集语义冲突）、文件传输、定值组、数据集读写、TLS（证书与密钥分发是独立运维域）；不做 SCL 模型解析（需要完整工程文件与命名空间处理，而驱动只有点表）；`Probe` 读不到探针对象时降级为「仅关联成功」而不是判离线——对象名拼错不等于链路坏；一轮采集 = 点位数 × 单次事务，MMS 虽然有批量读但跨逻辑设备合并会让一个坏对象拖成整批失败，本实现按点位逐项、错误逐项返回；浏览结果不缓存，模型变更后需重新枚举；端口默认 102 是特权端口，内置 IED 因此用 10202 |
 | CoAP 主站 + 内置服务端 | ✅ | `internal/codec/coap` + `internal/codec/textval` + `internal/driver/coap` + `internal/sim/coap` + `uic coapread` + `examples/coap.json`；只做明文 UDP 主站 + GET/PUT/POST + Block2 分块接收 + `/.well-known/core` 资源发现（不做 DTLS、Observe 订阅、Block1 分块发送、CBOR）；点位 `kind=symbol`，`path` 是资源、`selector` 取 JSON 字段、`length` 限接收字节；读取严格按响应 `Content-Format` 解码，不猜；Block2 首请求默认不带选项、由服务端决定块大小，`4.02` 时退回一次；`ackTimeout` 指数翻倍且不越过设备级 timeout，空 ACK 后只等分离响应，分离响应的 CON 回空 ACK，无关 CON 回 RST；PUT 是替换整个资源，JSON 带 selector 只发子树、数组下标写入拒绝；写成功标 good；不做响应缓存与隐藏读-改-写 |
 | CoAP 的边界 | ⚠️ | 不做 DTLS、Observe 订阅、Block1 分块发送、DELETE/FETCH/iPATCH、CBOR/SenML、组播发现；`Subscribe` 诚实声明 unsupported——一次性 GET 不伪装成推送；CoAP 没有批量读，一轮采集耗时约等于「点位数 × 单次事务」，同路径多点位也不合并；JSON 写入只支持「替换整个资源或字段子树」，不做读-改-写，数组元素写入直接拒绝 |
 | DL/T 645-2007 主站 + 内置从站 | ✅ | `internal/codec/dlt645` + `internal/driver/dlt645` + `internal/sim/dlt645` + `uic dlt645read` + `examples/dlt645.json`；`serial`（共享串口层总线锁）与 `tcp`（串口服务器/DTU 透传，每连接互斥）双承载；逐点读 + 后续帧重组（上限 64 帧）、链路故障短路、非数据块长度校验、数据块按 `bytes` 交付；写权限四道闸门（`allow-write` / `allow-control` / DI 可写 / 设备密码），只读 DI 本地拒绝，广播命令不提供入口；点表 `WidthProtocol` + `DIBits` 让「宽度由 DI 表决定」与「长度必须写清楚」各自归位；三层测试含真实 TCP 回环 |

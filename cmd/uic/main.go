@@ -27,6 +27,7 @@
 //	uic adsread -addr 127.0.0.1:48898 -probe   # ADS/AMS 自检（设备信息握手）
 //	uic secsread -addr 127.0.0.1:5000 -probe  # SECS/GEM 自检（HSMS Linktest）
 //	uic sim -protocol secs -listen 127.0.0.1:5000  # 内置 HSMS 设备
+//	uic sim -protocol iec61850 -listen 127.0.0.1:10202 # 内置 IEC 61850（MMS）IED
 //	uic sim -protocol knx -listen 127.0.0.1:13671  # 内置 KNXnet/IP 网关（UDP 3671）
 //	uic uaread -addr 127.0.0.1:4840 -nodes ns=2;s=site/dev/point  # OPC UA 读写自检
 //	uic s7blocks -addr 127.0.0.1:15102   # S7 块目录（-type db / -num 1 可细看）
@@ -74,6 +75,7 @@ import (
 	hlsim "uic/internal/sim/hostlink"
 	iec101sim "uic/internal/sim/iec101"
 	iec104sim "uic/internal/sim/iec104"
+	iecsim "uic/internal/sim/iec61850"
 	knxsim "uic/internal/sim/knx"
 	mcsim "uic/internal/sim/mc"
 	mewsim "uic/internal/sim/mewtocol"
@@ -124,6 +126,8 @@ func main() {
 		coapreadCmd(args)
 	case "knxread":
 		knxreadCmd(args)
+	case "iec61850read":
+		iec61850readCmd(args)
 	case "dlt645read":
 		dlt645readCmd(args)
 	case "cjt188read":
@@ -197,6 +201,12 @@ func usage() {
   uic knxread -addr 127.0.0.1:3671 -group 1/1/1@1.001 -write on
   uic knxread -addr 127.0.0.1:3671 -probe
   uic knxread -list
+  uic iec61850read -addr 127.0.0.1:102 -object simpleIO/GGIO1.ST.Ind1.stVal -type bool [-json] [-raw]
+  uic iec61850read -addr 127.0.0.1:102 -object simpleIO/GGIO1.MX.PhV.mag.f -type float32
+  uic iec61850read -addr 127.0.0.1:102 -object simpleIO/GGIO1.ST.Ind1.stVal -type bool -write true
+  uic iec61850read -addr 127.0.0.1:102 -probe
+  uic iec61850read -addr 127.0.0.1:102 -browse -domain simpleIO
+  uic iec61850read -list
   uic dlt645read -addr 127.0.0.1:14001 -address 000000000042 -di 00000000,02010100
   uic dlt645read -transport serial -port /dev/ttyUSB0 -baud 2400 -address 0042 -probe
   uic dlt645read -addr 127.0.0.1:14001 -address 42 -di 04000101 -write 20261107120000
@@ -529,7 +539,7 @@ func simCmd(args []string) {
 	fs := flag.NewFlagSet("sim", flag.ExitOnError)
 	addr := fs.String("listen", "127.0.0.1:15020", "监听地址")
 	size := fs.Int("size", 1024, "寄存器数量")
-	proto := fs.String("protocol", "modbus", "从站协议：modbus | s7 | opcua | mqtt | mc | fins | enip | bacnet | iec104 | iec101 | mewtocol | hostlink | dnp3 | coap | knx | dlt645 | cjt188 | snmp | ads | secs")
+	proto := fs.String("protocol", "modbus", "从站协议：modbus | s7 | opcua | mqtt | mc | fins | enip | bacnet | iec104 | iec101 | mewtocol | hostlink | dnp3 | coap | knx | dlt645 | cjt188 | snmp | ads | secs | iec61850")
 	pdu := fs.Int("pdu", 480, "S7 协商 PDU 长度（240/480/960）")
 	fs.Parse(args)
 
@@ -591,9 +601,12 @@ func simCmd(args []string) {
 	case "secs":
 		simSECS(*addr)
 		return
+	case "iec61850":
+		simIEC61850(*addr)
+		return
 	case "modbus":
 	default:
-		fmt.Fprintf(os.Stderr, "未知协议 %q（支持 modbus | s7 | opcua | mqtt | mc | fins | enip | bacnet | iec104 | iec101 | mewtocol | hostlink | dnp3 | coap | knx | dlt645 | cjt188 | snmp | ads | secs）\n", *proto)
+		fmt.Fprintf(os.Stderr, "未知协议 %q（支持 modbus | s7 | opcua | mqtt | mc | fins | enip | bacnet | iec104 | iec101 | mewtocol | hostlink | dnp3 | coap | knx | dlt645 | cjt188 | snmp | ads | secs | iec61850）\n", *proto)
 		os.Exit(2)
 	}
 
@@ -1366,6 +1379,59 @@ func simBACnet(addr string) {
 	fmt.Println("  binary-input:1.present-value=1（active）  character-string:1=\"PUMP-01\"（可写）")
 	fmt.Println("  analog-value:3 每秒自增，可用于观察 SSE")
 	fmt.Println("  Ctrl+C 停止")
+
+	<-ctx.Done()
+	_ = srv.Close()
+	slog.Info("sim_stopped")
+}
+
+// simIEC61850 启动内置 IEC 61850（MMS over TCP）IED。
+//
+// 初始值与 examples/iec61850.json 一一对应：先起这个从站，再跑
+// `./uic -config examples/iec61850.json`，就能看到对象引用被正常采集。
+//
+// 它模拟的是一台「最小可用」的 IED：COTP/会话/表示/ACSE/MMS 五段握手、
+// 读/写变量、getNameList 模型浏览、有序释放。不做 GOOSE/SV、报告控制块、
+// 文件传输、定值组、数据集读写、TLS——这些是独立的子系统，不是「多写几个
+// 分支」能覆盖的。
+//
+// 默认端口 10202 而不是标准的 102：102 是特权端口，普通用户起不了；同时
+// 示例配置也用 10202，避免与真实 IED 端口打架。
+func simIEC61850(addr string) {
+	srv, err := iecsim.NewServer(addr)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "启动 IEC 61850 从站失败: %v\n", err)
+		os.Exit(1)
+	}
+	defer func() { _ = srv.Close() }()
+
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	fmt.Printf("iec 61850 (mms) ied listening on %s\n", srv.Addr())
+	fmt.Println("  逻辑设备 simpleIO（MMS 域）")
+	for _, name := range srv.Names() {
+		domain, item, ok := strings.Cut(name, "$")
+		if !ok {
+			continue
+		}
+		parts := strings.Split(item, "$")
+		obj := domain + "/" + parts[0]
+		if len(parts) > 1 {
+			obj += "." + parts[1]
+		}
+		if len(parts) > 2 {
+			obj += "." + strings.Join(parts[2:], ".")
+		}
+		fmt.Printf("  %-42s %s\n", obj, name)
+	}
+	fmt.Println("  行为：读未知对象回 object-non-existent；写只落在已存在的对象上；")
+	fmt.Println("        getNameList 每页 3 项，用最后一项做 continueAfter 续读")
+	fmt.Println("  Ctrl+C 停止")
+	fmt.Printf("  自检：   uic iec61850read -addr %s -probe\n", srv.Addr())
+	fmt.Printf("  读点位： uic iec61850read -addr %s -object simpleIO/GGIO1.ST.Ind1.stVal -type bool\n", srv.Addr())
+	fmt.Printf("  写点位： uic iec61850read -addr %s -object simpleIO/GGIO1.CO.SPCs.stVal -type bool -write true\n", srv.Addr())
+	fmt.Printf("  浏览：   uic iec61850read -addr %s -browse -domain simpleIO\n", srv.Addr())
 
 	<-ctx.Done()
 	_ = srv.Close()

@@ -278,6 +278,24 @@ func PolicyFor(protocol string) AddressPolicy {
 		// Width 用 WidthNone：宽度由 DPT 决定（1 位在 APCI 字节里，2 字节
 		// 浮点是 2 字节），点表层不该再要求一个 length。
 		return AddressPolicy{Width: WidthNone, AllowSymbol: true, AllowDPT: true}
+	case "iec61850":
+		// 对象引用型寻址：`LD/LN.FC.DO[.DA...]`，例如
+		// `simpleIO/GGIO1.ST.Ind1.stVal`。
+		//
+		// 为什么是符号地址而不是对象地址：IEC 61850 的 MMS 层把一个变量
+		// 寻址成「域 = 逻辑设备，项 = LN$FC$DO$DA」，逻辑设备与逻辑节点之间
+		// 没有数字偏移关系——`simpleIO/GGIO1` 与 `simpleIO/GGIO2` 不是相邻
+		// 对象。用区域:偏移表达会诱导人写出不存在的位置算术。
+		//
+		// 为什么 FC 必须出现（或提供 labels.defaultFC）：MMS 的项名里 FC 是
+		// 名字的一段而不是元数据，缺了它 `GGIO1$Ind1$stVal` 与
+		// `GGIO1$ST$Ind1$stVal` 是两个不同对象，只有一个存在。默认值由设备标签
+		// 给出，不从数据属性名反推——反推需要完整 SCL 模型，而驱动手上只有
+		// 一份点表。
+		//
+		// Width 用 WidthNone：值有多宽由数据对象的 MMS 类型决定（布尔、整型、
+		// 浮点、结构体的某个叶子），点表里写 length 没有意义。
+		return AddressPolicy{Width: WidthNone, AllowSymbol: true}
 	}
 	// 未知协议：不拦地址种类（驱动可能在外部注册），但 length 必须显式，
 	// 避免用一个猜出来的宽度去读真实设备。

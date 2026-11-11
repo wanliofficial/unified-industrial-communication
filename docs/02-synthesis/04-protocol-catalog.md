@@ -127,7 +127,7 @@
 |---|---|---|---|---|---|---|---|---|
 | **IEC 60870-5-104** | M/S/B | TCP | 信息对象地址（IOA） | 5 | PA-06、PA-09、PA-11 | 4 | P1 | APCI 三帧格式（I/S/U）；总召唤；突发上送；CP56Time2a 时标；k/w 窗口 |
 | **IEC 60870-5-101** | M/S | 串口 | IOA | 少 | PA-06 | 4 | P1（已落地） | FT1.2 三种帧；长度只计「控制域+链路地址+ASDU」；FCB 去重；ACD；主站轮询（从站不主动开口）；剖面宽度是工程参数 |
-| **IEC 61850 (MMS)** | C | TCP | 逻辑设备/逻辑节点/数据对象 | 6 | PA-06、PA-08、PA-11 | 5 | P2 | SCL 模型解析、DataSet、报告控制块（RCB）、GOOSE/SV 需 L2 |
+| **IEC 61850 (MMS)** | C | TCP | 逻辑设备/逻辑节点/数据对象 | 6 | PA-06、PA-08、PA-11 | 5 | P2（已落地） | SCL 模型解析、DataSet、报告控制块（RCB）、GOOSE/SV 需 L2。本仓库已实现 ACSE + MMS 初始化 + 读/写变量 + getNameList 浏览，GOOSE/SV、报告、文件、定值组、TLS 不做 |
 | **DNP3** | M/S/B | TCP/串口 | 点索引（Point Index） | 6 | PA-06、PA-34 | 4 | P2 | 链路层分片、应用层分片、事件缓冲、unsolicited 响应、Class 0/1/2/3 |
 | **DL/T 645-2007** | M | 串口 | 数据标识（DI，4 字节） | 6 | PA-06、PA-34 | 2 | P1 | 前导字节 FE、地址域 6 字节 BCD、加 0x33 偏移、DI 表巨大 |
 | **CJ/T 188-2004/2018** | M | 串口 | 表号 + 数据标识 | 4 | PA-34 | 3 | P1 | 两版本帧结构不同；水/气/热表差异 |
@@ -295,7 +295,7 @@ IEC 61850、SECS/GEM、KNX、Mewtocol、Host Link、MTConnect。
 | **Host Link** | 主站 / 串口（RS-232/422/485）或串口服务器 TCP | 上位链接是欧姆龙小型 PLC 的默认串口协议；它有两种命令集，选错等于重写一遍驱动 | 只做 **FINS 帧（头码 `FA`）**，命令语义与 FINS/TCP 共用；不做 C 模式、跨网长格式、自动重试 |
 | **MTConnect** | 客户端 / HTTP | 机床数据采集的事实标准；纯 REST + XML，无二进制编解码 | HTTP GET 取 `probe`/`current`/`sample`，XML 解析，不做资产/事件完整模型 |
 
-> 截至当前实现：DNP3、CoAP、SECS/GEM、IEC 101、Mewtocol、Host Link、KNXnet/IP 已落地。
+> 截至当前实现：DNP3、CoAP、SECS/GEM、IEC 101、Mewtocol、Host Link、KNXnet/IP、IEC 61850（MMS）已落地。
 >
 > **DNP3**（编解码 + 主站 + 内置从站 + `uic dnp3read` + `examples/dnp3.json`）：只做
 > TCP 主站、类 0 总召唤、类 1/2/3 事件轮询、CROB 与组 41 直接控制、未请求响应的接收
@@ -421,6 +421,43 @@ IEC 61850、SECS/GEM、KNX、Mewtocol、Host Link、MTConnect。
 > **只更新已有的组地址**（给未知地址凭空造对象，会让「点表地址写错」这个最常见的
 > 故障从测试里消失），读未知地址时只回 ACK 与 con、不回 `GroupValueResponse`，让
 > 客户端正常超时——那个超时正是它该报告给运维的事实。
+
+> **IEC 61850（MMS）**（编解码 + 主站 + 内置 IED + `uic iec61850read` + `examples/iec61850.json`）：
+> 只做 **ACSE + MMS 初始化 + 读/写变量 + getNameList 模型浏览**；不做 GOOSE/SV（二层/
+> 三层组播，独立生命周期与采样率）、报告控制块（服务端主动推，与调度式采集是两种语义）、
+> 文件传输、定值组、数据集读写、TLS。它是全仓库封套最长的一条链路：TPKT → COTP → 会话层
+> → 表示层 → ACSE → MMS，五段各有自己的长度与编号。两处必须分开处理，否则**短帧全过、
+> 长帧错位**：其一，**会话层 LI 与 BER 长度是两套编码**——`0x00..0xFE` 是单字节长度，
+> `0xFF` 后跟**恰好两字节**大端长度，而 BER 长形式「后面跟几个字节」由低 7 位决定；
+> 拿通用 BER 解析器读 LI，短帧能过、长帧从错误的偏移继续，症状是「小响应正常、一读大
+> 结构就断链」。其二，**封套归属不对称**——COTP 的 CR/CC 自带 TPKT、可以直接发；会话的
+> CN/AC/DT/FIN 与所有 MMS 请求必须先套「会话 DT + 表示层」，再由 COTP 补 TPKT 与 COTP
+> 头。少套一层对端只会断链，没有任何更具体的提示，所以「谁的帧带谁的壳」必须用单测钉死。
+> 地址模型是对象引用 `LD/LN.FC.DO[.DA]`，**FC 是名字的一段而不是元数据**：
+> `GGIO1$Ind1$stVal` 与 `GGIO1$ST$Ind1$stVal` 是两个对象，只有一个存在；点表要么写全
+> FC，要么由 `labels.defaultFC` 补，**绝不从数据属性名反推**（反推需要完整 SCL 模型，
+> 而驱动只有一份点表），FC 白名单严格限定 ST/MX/CO/SP/CF/DC/SG/SE（`MOD` 不是标准 FC）。
+> 与 KNX 正好相反，**类型在装置侧**：一个对象是布尔、整型还是浮点由 IED 的 MMS 模型
+> 决定，读回来才知道，因此 `PolicyFor("iec61850")` 是 `WidthNone + AllowSymbol`、点表
+> 不写 length，`dataType` 只决定平台侧怎么存——把浮点标成 `int32` 不会变成「读四个字节
+> 的整数」，只会把浮点按整数入账；`uic iec61850read -raw` 打印的是装置回的类型而不是
+> `-type`。第三处坑在报文结构：**读写请求体里 `listOfVariable` 与 `listOfData` 都编码成
+> `[0]`（同为 `0xA0`）**，没有任何标签可区分，只能按出现顺序解析（第一个是变量名列表、
+> 第二个是数据列表）；把「按标签找」的习惯带进来会静默拿到错位的值。事务层：一条关联上
+> 可以有多个在途请求，靠 **invokeID** 分回对应关系，驱动严格配对、迟到响应按 invokeID
+> 丢弃——不校验就会在「A 超时、B 复用同一条链路」时把 A 的值写给 B；整条关联仍用一把
+> 锁串行化（请求/应答协议，并发只有乱序风险）。错误必须分开：单项数据访问错误不是网络
+> 错误，`object-non-existent`/`object-undefined`/`invalid-address`/`type-unsupported` →
+> `address`（改点表，不计入熔断）、`access-denied` → `permission`、
+> `temporarily-unavailable`/`hardware-fault` → `protocol` 且可重试；混成一类会让运维在
+> 「点位配错」与「装置重启」之间两边都查。浏览（`getNameList`）协议支持，但 `Browse`
+> 能力位诚实声明为 `unsupported`——整棵模型枚举是一次性运维动作，混进 `Read` 只会让采集
+> 多一条难以解释的慢路径；自检命令走包级 `Browse` 按页收齐（continueAfter 用上一页最后
+> 一项做游标，256 页上限防「永远说还有、游标却不前进」的畸形对端）。内置 IED 刻意复现
+> 四件事：**getNameList 只回项名**（剥掉域前缀——域由 objectScope 单独携带，整键回出去
+> 会让客户端拼成 `LD/LD.…`，本仓库实现时真踩到并用 `-browse` 输出钉死）、未知对象回
+> `object-non-existent` 而不是默认值、关联可被拒（验证「关联被拒」与「读超时」是两类
+> 事故）、读超时注入后连接仍可用。
 
 **明确不做**：PROFINET IO、PROFIBUS、CANopen、CC-Link、FOCAS、DALI、LonWorks、DDS、EtherCAT、HART、GB/T 28181、Euromap、Matter、LoRaWAN、OCPP、Redfish。
 
