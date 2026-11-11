@@ -18,6 +18,7 @@ using Uic.Driver;
 using Uic.Driver.Modbus;
 using Uic.Driver.Mqtt;
 using Uic.Driver.Virtual;
+using Uic.Engine;
 using Uic.Northbound;
 using Uic.Obs;
 using Uic.Runtime;
@@ -58,6 +59,7 @@ internal static class ContractTests
         tests.Add(new TestCase("contract/plaintext_credentials_are_rejected", PlaintextCredentialsAreRejected));
         tests.Add(new TestCase("contract/write_returns_per_point_results", WriteReturnsPerPointResults));
         tests.Add(new TestCase("contract/single_point_write_is_idempotent", SinglePointWriteIsIdempotent));
+        tests.Add(new TestCase("contract/idempotency_window_ignores_a_clock_jump", IdempotencyWindowIgnoresAClockJump));
         tests.Add(new TestCase("contract/template_instantiates_and_applies_devices", TemplateInstantiatesAndApplies));
         tests.Add(new TestCase("contract/points_csv_import_previews_and_applies", PointsCsvImportPreviewsAndApplies));
         tests.Add(new TestCase("contract/config_export_import_round_trip", ConfigExportImportRoundTrip));
@@ -100,7 +102,8 @@ internal static class ContractTests
         public static async Task<Host> StartAsync(
             TestContext t,
             Func<ConfigDocument>? config = null,
-            bool tls = false)
+            bool tls = false,
+            TimeProvider? clock = null)
         {
             // 配置里只有 ${env:UIC_CONTRACT_TOKEN}，真实值放进程环境：
             // 与现场「环境注入」走同一条解析路径，也让用例无法绕过明文校验。
@@ -160,6 +163,7 @@ internal static class ContractTests
                 DataDir = t.TempDir,
                 GatewayVersion = "0.0.0-test",
                 Fallback = config ?? BuildConfig,
+                SchedulerOptions = clock is null ? null : new SchedulerOptions { Time = clock },
             };
 
             var runtime = await GatewayRuntime.CreateAsync(options, Drivers(), logs, ring, t.Ct);
@@ -981,6 +985,52 @@ internal static class ContractTests
                 "the repeat is marked as a replay");
             t.Equal(firstBody, await second.Content.ReadAsStringAsync(t.Ct),
                 "the cached response is returned verbatim");
+        });
+    }
+
+    /// <summary>
+    /// 写入幂等窗口必须用单调时钟算，绝不能用墙钟。
+    ///
+    /// 它回答的是「这次重投离第一次写入过了多久」。用墙钟算，一次 NTP 校时前跳一小时
+    /// 就会让客户端重投的同一个 key 被当成新请求，对设备把同一个物理动作再执行一遍
+    /// ——现场最怕的正是这种重复动作；后跳则让缓存永不过期，一次真正的新写入会被
+    /// 当成重放而根本不执行。
+    /// </summary>
+    private static Task IdempotencyWindowIgnoresAClockJump(TestContext t)
+    {
+        return RunAsync(async () =>
+        {
+            var clock = new FakeClock();
+            await using var host = await Host.StartAsync(t, clock: clock);
+            await WaitForPointAsync(host, "v1", "temp", t);
+
+            const string body = """
+                                { "value": { "type": "float64", "num": 12.5 } }
+                                """;
+            const string key = "clock-jump-write-1";
+
+            var first = await host.Client.SendAsync(
+                PostWithKey("/api/v1/points/v1/temp/write", body, key), t.Ct);
+            t.Equal("false", first.Headers.GetValues("X-Idempotent-Replay").Single(),
+                "the first write is executed");
+
+            // 只拨墙钟一小时、单调时钟不动：真实上只过了几毫秒，重投必须仍被判成重放。
+            // 否则客户端那次超时重试会真的再写一次设备。
+            clock.Advance(TimeSpan.FromHours(1), TimeSpan.Zero);
+
+            var afterJump = await host.Client.SendAsync(
+                PostWithKey("/api/v1/points/v1/temp/write", body, key), t.Ct);
+            t.Equal(HttpStatusCode.OK, afterJump.StatusCode, "the repeat after a clock jump is accepted");
+            t.Equal("true", afterJump.Headers.GetValues("X-Idempotent-Replay").Single(),
+                "a wall-clock jump must not make a retry look like a new write");
+
+            // 单调时间真的越过窗口，这时同一 key 才应该被当作新请求重新执行。
+            clock.Advance(TimeSpan.Zero, TimeSpan.FromMinutes(6));
+
+            var afterWindow = await host.Client.SendAsync(
+                PostWithKey("/api/v1/points/v1/temp/write", body, key), t.Ct);
+            t.Equal("false", afterWindow.Headers.GetValues("X-Idempotent-Replay").Single(),
+                "past the real window the same key is executed again");
         });
     }
 

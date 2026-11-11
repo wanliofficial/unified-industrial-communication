@@ -93,5 +93,11 @@ public sealed class ApiException : Exception
 /// <summary>健康检查里的一项依赖。</summary>
 public sealed record DependencyCheck(string Name, bool Ok, string? Detail = null);
 
-/// <summary>写入幂等结果：同一 key 在窗口内重复提交返回首次结果。</summary>
-public sealed record IdempotentResponse(string Body, DateTimeOffset At);
+/// <summary>
+/// 写入幂等结果：同一 key 在窗口内重复提交返回首次结果。
+/// <para>
+/// <c>MonoAt</c> 是写入时刻的单调时刻（归一化到 ticks），不是墙钟：窗口问的是
+/// 「过了多久」，一次校时跳变不能让重投的写请求被当成新请求、对设备重复执行。
+/// </para>
+/// </summary>
+public sealed record IdempotentResponse(string Body, long MonoAt);

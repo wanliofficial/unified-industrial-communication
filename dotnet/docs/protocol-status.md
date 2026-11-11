@@ -151,7 +151,7 @@ validate/apply/versions/diff/rollback/export/import、模板 CRUD 与批量实�
 | 主题 | 前缀 + `{site}` + `{device}` + `{point}` 模板；`$birth`/`$state`/`$death` 固定后缀 |
 | 重连 | 固定退避（≥500 ms，可配）；重连后重发 `$birth` 与全部 `$state`，并重订阅 |
 | 设备下线 | 清 `$state` 的 retained（空载荷 + retain），并从重连补发集合中移除 |
-| 下行命令 | 请求/结果双主题，按 `id` 做 5 分钟进程内幂等；只放行 `driver.restart`、`device.selftest`、`outbox.flush`、`log.level`、`diag.bundle` |
+| 下行命令 | 请求/结果双主题，按 `id` 做 5 分钟进程内幂等（按单调时钟计时，校时跳变不影响窗口）；只放行 `driver.restart`、`device.selftest`、`outbox.flush`、`log.level`、`diag.bundle` |
 | 传输 | 明文 TCP 或 TLS（`northbound.mqtt.tls`，校验服务端证书链与主机名，支持自定义 CA）；WebSocket 未内置 |
 
 MQTT 3.1.1 的报文实现放在协议层 `Uic.Codec.Mqtt`：北向发布与南向订阅各持有一个

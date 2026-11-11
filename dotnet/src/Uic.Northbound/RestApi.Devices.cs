@@ -147,10 +147,14 @@ public static partial class RestApi
         }
 
         var cacheKey = device + "\u001f" + scope + "\u001f" + key;
-        var now = DateTimeOffset.UtcNow;
+
+        // 窗口是「过了多久」：只能用单调时钟算。用墙钟算，一次 NTP 前跳一小时就会让
+        // 客户端重投的同一个 key 被当成新请求，对设备把同一个物理动作再执行一遍；
+        // 后跳则让缓存永不过期，下一次真正的写入反而被当成重放而不执行。
+        var monoNow = MonoNow(ctx);
 
         if (Idempotency.TryGetValue(cacheKey, out var cached) &&
-            now - cached.At < TimeSpan.FromMinutes(5))
+            monoNow - cached.MonoAt < IdempotencyWindowTicks)
         {
             http.Response.Headers["X-Idempotent-Replay"] = "true";
             return Results.Content(cached.Body, "application/json; charset=utf-8");
@@ -158,20 +162,28 @@ public static partial class RestApi
 
         var fresh = await ExecuteWritesAsync(http, ctx, device, items, ct).ConfigureAwait(false);
         var body = JsonSerializer.Serialize(fresh, ApiJson.Options);
-        Idempotency[cacheKey] = new IdempotentResponse(body, now);
+        Idempotency[cacheKey] = new IdempotentResponse(body, monoNow);
 
         // 键的数量由调用方决定，长期运行的网关必须有上限；超过就把过窗的条目清掉。
-        if (Idempotency.Count > 1024) PruneIdempotency(now);
+        if (Idempotency.Count > 1024) PruneIdempotency(monoNow);
 
         http.Response.Headers["X-Idempotent-Replay"] = "false";
         return Results.Content(body, "application/json; charset=utf-8");
     }
 
-    private static void PruneIdempotency(DateTimeOffset now)
+    /// <summary>幂等窗口长度。5 分钟足够覆盖客户端超时重试，又不会让缓存无限增长。</summary>
+    private static readonly long IdempotencyWindowTicks = TimeSpan.FromMinutes(5).Ticks;
+
+    /// <summary>当前单调时刻，归一化到 <see cref="TimeSpan.Ticks"/>（与 <c>Sample.MonoAt</c> 同单位）。</summary>
+    private static long MonoNow(NorthboundContext ctx)
+        => (long)(ctx.Engine.Time.GetTimestamp() / (double)ctx.Engine.Time.TimestampFrequency
+                  * TimeSpan.TicksPerSecond);
+
+    private static void PruneIdempotency(long monoNow)
     {
         foreach (var (key, entry) in Idempotency)
         {
-            if (now - entry.At >= TimeSpan.FromMinutes(5)) Idempotency.TryRemove(key, out _);
+            if (monoNow - entry.MonoAt >= IdempotencyWindowTicks) Idempotency.TryRemove(key, out _);
         }
     }
 

@@ -41,6 +41,14 @@ public sealed class Scheduler : IAsyncDisposable
     public PointCache Cache => _cache;
     public ConfigDocument Config => _config;
 
+    /// <summary>
+    /// 单调时钟。北向那些「窗口还剩多久」的判定（写入幂等窗口、命令去重窗口）
+    /// 要拿它算时长，不能改用墙钟：一次 NTP 校时就能让客户端重投的写请求
+    /// 被当成新请求，对设备重复执行同一个物理动作。
+    /// 与 <see cref="Uptime"/> 同一个来源，注入后一并可控。
+    /// </summary>
+    public TimeProvider Time => _options.Time;
+
     /// <summary>已注册的驱动。北向的 /drivers 端点直接读它，不另存一份元数据。</summary>
     public DriverRegistry Drivers => _drivers;
 
