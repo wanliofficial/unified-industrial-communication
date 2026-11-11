@@ -1,6 +1,7 @@
 package pointtable
 
 import (
+	"errors"
 	"fmt"
 	"sort"
 	"strconv"
@@ -93,6 +94,14 @@ type AddressPolicy struct {
 	// 是一组字段的容器（901F 里同时有累积流量、结算日流量、时间、状态），
 	// 只能按字段定位。两种语义不能共用一个开关。
 	DIField bool
+
+	// AllowDPT 表示符号地址后面必须带数据点类型：`1/2/3@9.001`。
+	//
+	// 只有 KNX 走这条：组地址只回答「哪个对象」，不回答「值有多宽」，
+	// 类型信息不在总线上，只在工程的组地址表里。因此点表的 DPT 列不是
+	// 可选的元数据，而是地址的一部分——缺了它，驱动连该读几个字节都
+	// 不知道。
+	AllowDPT bool
 }
 
 var (
@@ -253,6 +262,22 @@ func PolicyFor(protocol string) AddressPolicy {
 		// offset 位置而不是另造语法，是为了让点表、规划层、北向的地址展示
 		// 保持同一种形状；字段含义由驱动按 (DI, 表类型) 的 schema 解析。
 		return AddressPolicy{Width: WidthProtocol, AllowRegister: true, DIBits: 4, DIField: true}
+	case "knx":
+		// 组地址型寻址：`<组地址>@<DPT>`，例如 `1/2/3@9.001`。
+		//
+		// 为什么必须是符号地址而不是寄存器地址：KNX 的寻址单位不是「某个
+		// 区里的第 n 个字」，而是一个 16 位组地址（主组/中组/子组各几位），
+		// 组地址之间没有算术关系——`1/2/3` 与 `1/2/4` 不一定是相邻对象。
+		// 用 offset 表达会诱导人写出 `1/2/3` + 长度 2 这种不存在的概念。
+		//
+		// 为什么必须带 DPT：组地址不携带类型。同一个 `1/2/3` 在 A 工程里
+		// 是 1 位开关、在 B 工程里是 2 字节浮点温度，由 dataType 反推会
+		// 得到「f32 到底是 9.xxx 还是 14.xxx」这种无法回答的问题——猜错
+		// 不报错，只会把温度读成 3.7e-41。DPT 因此做成必填。
+		//
+		// Width 用 WidthNone：宽度由 DPT 决定（1 位在 APCI 字节里，2 字节
+		// 浮点是 2 字节），点表层不该再要求一个 length。
+		return AddressPolicy{Width: WidthNone, AllowSymbol: true, AllowDPT: true}
 	}
 	// 未知协议：不拦地址种类（驱动可能在外部注册），但 length 必须显式，
 	// 避免用一个猜出来的宽度去读真实设备。
@@ -338,6 +363,30 @@ func ParseAddressWithLength(expr string, dt model.DataType, protocol string, len
 	if !pol.AllowSymbol {
 		return model.Address{}, fmt.Errorf("protocol %q does not accept symbol addresses (got %q)", protocol, expr)
 	}
+	// 数据点类型：`1/2/3@9.001`。必须在符号解析之前切掉，否则 `@9.001`
+	// 会变成路径的一部分——组地址表里不会有这个字符串，驱动查不到。
+	dpt := ""
+	if pol.AllowDPT {
+		if strings.ContainsRune(expr, '#') {
+			// 先把 selector 拦下来：`1/2/3@9.001#temp` 会被当成「DPT 是
+			// 9.001#temp」，报出「不是数据点类型」——那是一条把人引向
+			// DPT 写法的错误，而真正的问题是协议没有载荷字段这个概念。
+			return model.Address{}, fmt.Errorf(
+				"protocol %q does not accept selector addresses (got %q)", protocol, expr)
+		}
+		body, typ, err := splitDPT(expr)
+		if err != nil {
+			return model.Address{}, err
+		}
+		dpt, expr = typ, body
+		if length > 0 {
+			// 宽度由 DPT 决定，length 在这里没有含义：1 位 DPT 的值在
+			// APCI 字节里，2 字节 DPT 就 2 字节。允许写 length 只会让人
+			// 以为可以「多读几个字节」。
+			return model.Address{}, fmt.Errorf(
+				"length is not expressed by this protocol (the width comes from the datapoint type), got %d", length)
+		}
+	}
 	// 符号地址的显式长度：`NAME:81`。只在协议允许时切分；否则冒号
 	// 属于符号名（虽然极少见），不能擅自截断。
 	if pol.AllowSymbolLength {
@@ -351,7 +400,7 @@ func ParseAddressWithLength(expr string, dt model.DataType, protocol string, len
 			}
 		}
 	}
-	a, err := parseSymbolAddress(expr, pol.SymbolIndexInPath)
+	a, err := parseSymbolAddress(expr, pol.SymbolIndexInPath, dpt)
 	if err != nil {
 		return model.Address{}, err
 	}
@@ -637,7 +686,7 @@ func deriveLength(area string, dt model.DataType, mode WidthMode) (int, error) {
 	return width, nil
 }
 
-func parseSymbolAddress(expr string, keepIndexInPath bool) (model.Address, error) {
+func parseSymbolAddress(expr string, keepIndexInPath bool, dpt string) (model.Address, error) {
 	path, selector := expr, ""
 	if i := strings.IndexByte(expr, '#'); i >= 0 {
 		path, selector = expr[:i], expr[i+1:]
@@ -658,11 +707,42 @@ func parseSymbolAddress(expr string, keepIndexInPath bool) (model.Address, error
 			path, index = path[:i], n
 		}
 	}
-	a := model.Address{Kind: model.AddressSymbol, Path: path, Index: index, Selector: selector}
+	a := model.Address{Kind: model.AddressSymbol, Path: path, Index: index, Selector: selector, DPT: dpt}
 	if err := a.Validate(); err != nil {
 		return model.Address{}, err
 	}
 	return a, nil
+}
+
+// splitDPT 从符号地址里切出 `@<DPT>`。
+//
+// DPT 必填：没有它，驱动不知道这条点位该读几个字节。空组地址、空 DPT
+// 都在这里给出明确错误，而不是留到驱动 Open 阶段才炸出「不支持的地址」。
+//
+// 组地址文本里的空白会被去掉：`1 / 2 / 3` 与 `1/2/3` 是同一个组地址，
+// 协议 codec 也按这个规则解析。留着空白不会让地址更清楚，只会让两处
+// 相同的地址在点表里显示成两个不同的字符串。
+func splitDPT(expr string) (body, dpt string, err error) {
+	i := strings.LastIndexByte(expr, '@')
+	if i < 0 {
+		return "", "", errors.New(
+			"dpt is required (e.g. 1/2/3@9.001): group addresses carry no type information")
+	}
+	body = strings.Join(strings.Fields(expr[:i]), "")
+	dpt = strings.TrimSpace(expr[i+1:])
+	if body == "" {
+		return "", "", fmt.Errorf("group address before '@' is empty (got %q)", expr)
+	}
+	if dpt == "" {
+		return "", "", fmt.Errorf("dpt after '@' is empty (got %q)", expr)
+	}
+	if strings.ContainsRune(dpt, ':') {
+		// `1/2/3@9.001:2`：长度在这里没有含义，宽度由 DPT 决定。单独报
+		// 这一条，否则会被当成「DPT 写错了」，让人去改一个本来对的类型。
+		return "", "", fmt.Errorf(
+			"length is not expressed by this protocol (the width comes from the datapoint type): %q", expr)
+	}
+	return body, dpt, nil
 }
 
 func parseObjectAddress(expr string) (model.Address, bool, error) {

@@ -788,3 +788,126 @@ func TestOtherProtocolsRejectFinsAreas(t *testing.T) {
 		}
 	}
 }
+
+// KNX 的组地址必须带数据点类型：组地址本身不携带「值有多宽」，缺了 DPT
+// 驱动连该读几个字节都不知道，因此它是必填项而不是可选元数据。
+func TestPolicyForKNX(t *testing.T) {
+	p := PolicyFor("knx")
+	if p.Width != WidthNone {
+		t.Fatalf("width = %v, want WidthNone (the DPT decides the width)", p.Width)
+	}
+	if !p.AllowSymbol || !p.AllowDPT {
+		t.Fatalf("knx must accept symbol addresses with a DPT: %+v", p)
+	}
+	if p.AllowRegister || p.AllowObject || p.AllowFile || p.AllowComputed || p.AllowSelector {
+		t.Fatalf("knx accepts non-symbol kinds: %+v", p)
+	}
+	if p.DIBits != 0 || p.DIField || p.AllowSymbolLength || p.SymbolIndexInPath {
+		t.Fatalf("knx policy leaked DI/symbol-length flags: %+v", p)
+	}
+	// 别的协议不能借用 DPT：`1/2/3@9.001` 在 MQTT 里只是一个奇怪的主题。
+	for _, proto := range []string{"modbus-tcp", "mqtt", "opcua", "snmp"} {
+		if PolicyFor(proto).AllowDPT {
+			t.Fatalf("%s must not accept DPT addresses", proto)
+		}
+	}
+}
+
+func TestParseAddressKNX(t *testing.T) {
+	cases := []struct {
+		name string
+		expr string
+		dt   model.DataType
+		path string
+		dpt  string
+	}{
+		{"three-level temperature", "1/1/45@9.001", model.TypeFloat32, "1/1/45", "9.001"},
+		{"switch", "0/0/1@1.001", model.TypeBool, "0/0/1", "1.001"},
+		{"percent", "2/3/4@5.001", model.TypeFloat32, "2/3/4", "5.001"},
+		// 只写主类型也接受：线格式对同一主类型是一样的，具体子类型由
+		// 工程的组地址表决定。
+		{"main type only", "1/2/3@9", model.TypeFloat32, "1/2/3", "9"},
+		// 现场的原始 16 位写法与两级写法都保留原文本：它们是同一批组地址
+		// 的另一种记法，归一化成三级形式会让点表与工程文档对不上。
+		{"two-level", "1/300@9.001", model.TypeFloat32, "1/300", "9.001"},
+		{"raw decimal", "2350@9.001", model.TypeFloat32, "2350", "9.001"},
+		// 前后空白由解析器吃掉。
+		{"padded", "  1 / 2 / 3 @ 9.001  ", model.TypeFloat32, "1/2/3", "9.001"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			a, err := ParseAddress(tc.expr, tc.dt, "knx")
+			if err != nil {
+				t.Fatalf("parse: %v", err)
+			}
+			if a.Kind != model.AddressSymbol {
+				t.Fatalf("kind = %q, want symbol", a.Kind)
+			}
+			if a.Path != tc.path || a.DPT != tc.dpt {
+				t.Fatalf("address = %+v, want path %q dpt %q", a, tc.path, tc.dpt)
+			}
+			// length 不表达任何东西：宽度由 DPT 决定。
+			if a.Length != 0 {
+				t.Fatalf("length = %d, want 0", a.Length)
+			}
+			if got, want := a.Canonical(), tc.path+"@"+tc.dpt; got != want {
+				t.Fatalf("canonical = %q, want %q", got, want)
+			}
+			// 往返：Canonical 的文本必须能重新解析成同一个地址。
+			b, err := ParseAddress(a.Canonical(), tc.dt, "knx")
+			if err != nil {
+				t.Fatalf("reparse %q: %v", a.Canonical(), err)
+			}
+			if b != a {
+				t.Fatalf("round trip: %+v != %+v", b, a)
+			}
+		})
+	}
+}
+
+func TestParseAddressKNXRejects(t *testing.T) {
+	cases := []struct {
+		name string
+		expr string
+		dt   model.DataType
+		hint int
+		want string
+	}{
+		// 缺 DPT 是最常见的错法：从其它点表模板复制过来只填了组地址。
+		{"missing dpt", "1/2/3", model.TypeFloat32, 0, "dpt is required"},
+		{"empty dpt", "1/2/3@", model.TypeFloat32, 0, "dpt after '@' is empty"},
+		{"empty address", "@9.001", model.TypeFloat32, 0, "address before '@' is empty"},
+		// 宽度由 DPT 决定，两种 length 写法都要拒。
+		{"length in address", "1/2/3@9.001:2", model.TypeFloat32, 0, "length is not expressed"},
+		{"length column", "1/2/3@9.001", model.TypeFloat32, 2, "length is not expressed"},
+		// 寄存器/对象/文件写法：KNX 只有组地址。
+		{"register", "holding:0", model.TypeUint16, 0, "does not accept register"},
+		{"object", "analogInput:1.presentValue", model.TypeFloat32, 0, "does not accept object"},
+		{"computed", "expr:1/2/3", model.TypeFloat32, 0, "does not accept computed"},
+		// 组地址本身不是寄存器地址：`1/2/3:1` 这种写法多半是把别的协议
+		// 抄了过来。
+		{"register style group", "holding:1/2/3", model.TypeFloat32, 0, "does not accept register"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := ParseAddressWithLength(tc.expr, tc.dt, "knx", tc.hint)
+			if err == nil {
+				t.Fatalf("expected an error for %q", tc.expr)
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("error = %v, want substring %q", err, tc.want)
+			}
+		})
+	}
+}
+
+// 组地址的语法校验（`1/8/1` 的中组越界、`0/0/0` 无效）不在点表层做：
+// 那里没有组地址的结构知识，复制一份规则只会漂移。点表层只保证 DPT 在，
+// 具体地址由驱动在 Open 阶段用协议 codec 校验。
+func TestParseAddressKNXLeavesGroupSyntaxToDriver(t *testing.T) {
+	for _, expr := range []string{"1/8/1@1.001", "0/0/0@1.001", "1/2/3/4@1.001"} {
+		if _, err := ParseAddress(expr, model.TypeBool, "knx"); err != nil {
+			t.Fatalf("%q must parse at the point-table layer (the driver rejects it): %v", expr, err)
+		}
+	}
+}

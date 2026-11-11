@@ -186,6 +186,19 @@ type Address struct {
 	// 载荷里哪一段」是两件独立的事，混在一个字符串里无法分别校验。
 	Selector string `json:"selector,omitempty"`
 
+	// DPT 是 KNX 数据点类型（"9.001"、"1.001"、"5.001"…）。其他协议留空。
+	//
+	// KNX 的组地址只回答「哪个对象」，不回答「这个对象的值有多宽、怎么
+	// 解释」：同一个 `1/2/3` 在 A 工程里是 1 位开关，在 B 工程里是 2 字节
+	// 浮点温度。类型信息不在总线上，只在工程的组地址表里，因此必须随
+	// 点位显式给出——由 dataType 反推会得到「f32 到底是 9.xxx 还是 14.xxx」
+	// 这种无法回答的问题，而猜错不会报错，只会把温度读成 3.7e-41。
+	//
+	// 单开一个字段而不是复用 Selector：Selector 的语义是「载荷里的
+	// 哪一段」（MQTT 的 JSON 字段路径），DPT 是「怎么解释整段字节」。
+	// 混用会让 `1/2/3#9.001` 看起来像「取 JSON 的 9.001 字段」。
+	DPT string `json:"dpt,omitempty"`
+
 	// object
 	ObjectType string `json:"objectType,omitempty"`
 	Instance   int    `json:"instance,omitempty"`
@@ -209,6 +222,13 @@ var pathRe = regexp.MustCompile(`^[^\x00-\x1f\s]+$`)
 // 但合法），只禁止控制字符。空选择器由调用方视为「整个载荷」。
 var selectorRe = regexp.MustCompile(`^[^\x00-\x1f]+$`)
 
+// dptRe 只拦「明显不是 DPT」的字符串，不做归一化。
+//
+// 归一化（`9.1` → `9.001`、`DPT9` → `9`）与「这个子类型存不存在」的判断
+// 都归协议 codec：那里有唯一一份类型表，模型再抄一份一定会漂移。模型这一
+// 层只需要保证 DPT 字段里不是别的什么东西（例如把 selector 写进来了）。
+var dptRe = regexp.MustCompile(`^[0-9]+(\.[0-9]+)?$`)
+
 // Validate 校验地址自身的一致性与范围。
 func (a Address) Validate() error {
 	if !validAddressKinds[a.Kind] {
@@ -228,7 +248,8 @@ func (a Address) Validate() error {
 		if a.Bit < -1 || a.Bit > 15 {
 			return fmt.Errorf("address.bit: must be -1..15, got %d", a.Bit)
 		}
-		if a.Path != "" || a.ObjectType != "" || a.FileID != 0 || a.Selector != "" || a.Expr != "" {
+		if a.Path != "" || a.ObjectType != "" || a.FileID != 0 || a.Selector != "" ||
+			a.Expr != "" || a.DPT != "" {
 			return errors.New("address: mixed fields for register kind")
 		}
 		if a.DB < 0 {
@@ -254,6 +275,9 @@ func (a Address) Validate() error {
 		if a.Selector != "" && !selectorRe.MatchString(a.Selector) {
 			return errors.New("address.selector: must not contain spaces/control chars")
 		}
+		if a.DPT != "" && !dptRe.MatchString(a.DPT) {
+			return fmt.Errorf("address.dpt: %q is not a datapoint type (want e.g. 9.001)", a.DPT)
+		}
 		if a.Area != "" || a.ObjectType != "" || a.FileID != 0 || a.Expr != "" {
 			return errors.New("address: mixed fields for symbol kind")
 		}
@@ -264,14 +288,16 @@ func (a Address) Validate() error {
 		if a.Instance < 0 {
 			return errors.New("address.instance: must be >= 0")
 		}
-		if a.Area != "" || a.Path != "" || a.FileID != 0 || a.Selector != "" || a.Expr != "" {
+		if a.Area != "" || a.Path != "" || a.FileID != 0 || a.Selector != "" ||
+			a.Expr != "" || a.DPT != "" {
 			return errors.New("address: mixed fields for object kind")
 		}
 	case AddressFile:
 		if a.FileID < 0 || a.RecordID < 0 || a.Offset < 0 {
 			return errors.New("address.file: fileId/recordId/offset must be >= 0")
 		}
-		if a.Area != "" || a.Path != "" || a.ObjectType != "" || a.Selector != "" || a.Expr != "" {
+		if a.Area != "" || a.Path != "" || a.ObjectType != "" || a.Selector != "" ||
+			a.Expr != "" || a.DPT != "" {
 			return errors.New("address: mixed fields for file kind")
 		}
 	case AddressComputed:
@@ -288,7 +314,8 @@ func (a Address) Validate() error {
 		}
 		if a.Area != "" || a.Path != "" || a.ObjectType != "" || a.FileID != 0 ||
 			a.Selector != "" || a.Offset != 0 || a.Length != 0 || a.Bit != 0 || a.DB != 0 ||
-			a.Index != 0 || a.Instance != 0 || a.PropIndex != 0 || a.RecordID != 0 {
+			a.Index != 0 || a.Instance != 0 || a.PropIndex != 0 || a.RecordID != 0 ||
+			a.DPT != "" {
 			return errors.New("address: mixed fields for computed kind")
 		}
 	}
@@ -312,6 +339,12 @@ func (a Address) Canonical() string {
 		base := a.Path
 		if a.Index >= 0 {
 			base = fmt.Sprintf("%s[%d]", a.Path, a.Index)
+		}
+		if a.DPT != "" {
+			// DPT 是地址的一部分而不是点位属性：同一个组地址在不同工程里
+			// 可以是开关也可以是温度，两个点位必须能被区分开——否则点表
+			// 的重复地址检查会把它们当成同一个数据项。
+			base += "@" + a.DPT
 		}
 		if a.Selector != "" {
 			// 用 `#` 分隔：主题里不会出现 `#`（MQTT 通配符在点位的
