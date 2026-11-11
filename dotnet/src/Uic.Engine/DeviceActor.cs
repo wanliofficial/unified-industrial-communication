@@ -424,6 +424,8 @@ public sealed class DeviceActor : IAsyncDisposable
 
                 var generation = Volatile.Read(ref _generation);
                 var now = DateTimeOffset.UtcNow;
+                // 采集发生的单调时刻（归一化到 ticks）：变化率死区算 Δt 用它，墙钟会被校时拨动。
+                var monoNow = MonoNow();
 
                 foreach (var sample in raw)
                 {
@@ -434,7 +436,7 @@ public sealed class DeviceActor : IAsyncDisposable
                     if (!point.Enabled) continue;
 
                     var seq = _cache.NextSeq(_device.Id, sample.PointId);
-                    var processed = Pipeline.Process(_device, point, sample, seq, now);
+                    var processed = Pipeline.Process(_device, point, sample, seq, now, monoNow);
                     _cache.PublishConfigured(processed, point);
                 }
 
@@ -521,6 +523,17 @@ public sealed class DeviceActor : IAsyncDisposable
         => quality is Quality.Timeout or Quality.CommError;
 
     /// <summary>
+    /// 当前单调时刻，归一化到 <see cref="TimeSpan.Ticks"/>。
+    ///
+    /// 归一化放在这里而不是判定处，是因为时间戳的频率由 <see cref="SchedulerOptions.Time"/>
+    /// 决定：生产用系统时钟，用例注入的可拨时钟频率可能不同。把「差多少 tick」换算成
+    /// 秒数必须与提供方频率一致，否则 Δt 会整体算错——这条边界已经踩过一次。
+    /// </summary>
+    private long MonoNow()
+        => (long)(_options.Time.GetTimestamp() / (double)_options.Time.TimestampFrequency
+                  * TimeSpan.TicksPerSecond);
+
+    /// <summary>
     /// 失败时把本轮点位全部标成对应质量。
     /// 不这么做，界面上会保留上一次的好值，看起来一切正常——这是最危险的假象。
     ///
@@ -542,6 +555,7 @@ public sealed class DeviceActor : IAsyncDisposable
             .ToHashSet(StringComparer.Ordinal);
 
         var now = DateTimeOffset.UtcNow;
+        var monoNow = MonoNow();
         foreach (var point in _device.Points.Where(p => p.Enabled && failed.Contains(p.Id)))
         {
             var seq = _cache.NextSeq(_device.Id, point.Id);
@@ -555,7 +569,8 @@ public sealed class DeviceActor : IAsyncDisposable
                 previous?.DeviceTime,
                 now,
                 seq,
-                message);
+                message,
+                monoNow);
 
             _cache.PublishConfigured(sample, point);
         }

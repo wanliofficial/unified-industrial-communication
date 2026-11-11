@@ -24,6 +24,7 @@ internal static class PipelineTests
         tests.Add(new TestCase("pipeline/deadband_compares_non_numeric_by_equality", DeadbandComparesNonNumeric));
         tests.Add(new TestCase("pipeline/deadband_percent_uses_range_span", DeadbandPercentUsesRangeSpan));
         tests.Add(new TestCase("pipeline/deadband_rate_uses_elapsed_time", DeadbandRateUsesElapsedTime));
+        tests.Add(new TestCase("pipeline/deadband_rate_ignores_a_clock_jump", DeadbandRateIgnoresAClockJump));
         tests.Add(new TestCase("pipeline/array_scales_element_wise", ArrayScalesElementWise));
         tests.Add(new TestCase("pipeline/deadband_array_uses_largest_change", DeadbandArrayUsesLargestChange));
         tests.Add(new TestCase("cache/publish_configured_applies_point_rule", CachePublishConfiguredAppliesRule));
@@ -232,6 +233,34 @@ internal static class PipelineTests
     }
 
     /// <summary>
+    /// 变化率死区的 Δt 必须用单调时刻，绝不能用墙钟。
+    ///
+    /// rate 死区本质是「单位时间涨多少」。用墙钟算 Δt，一次 NTP 校时就能伪造结论：
+    /// 前跳一小时，1 秒的 2.1 单位涨幅被算成 1 小时，速率趋近 0、尖峰被抹平；
+    /// 后跳则把 1 小时压成 1 秒，凭空造出一个尖峰。判定本身不该依赖墙钟有没有被拨过。
+    /// </summary>
+    private static Task DeadbandRateIgnoresAClockJump(TestContext t)
+    {
+        var point = Point("rate", DataType.Float64, deadband: 2, deadbandMode: DeadbandMode.Rate);
+        var t0 = new DateTimeOffset(2026, 11, 6, 8, 0, 0, TimeSpan.Zero);
+
+        // 单调上真实只过了 1 秒，墙钟却被前跳了一小时。
+        var previous = SampleAtMono(10, t0, monoSeconds: 0);
+        var next = SampleAtMono(12.1, t0.AddHours(1), monoSeconds: 1);
+
+        t.Ok(Pipeline.ExceedsDeadband(previous, next, point),
+            "a forward wall-clock jump must not flatten the rate below threshold");
+
+        // 单调真实过了 1 秒、涨幅只有 0.5，即便墙钟显示「同一时刻」，也不该误报。
+        var slow = SampleAtMono(10.5, t0, monoSeconds: 0);
+        var slowNext = SampleAtMono(11.0, t0, monoSeconds: 1);
+        t.Ok(!Pipeline.ExceedsDeadband(slow, slowNext, point),
+            "a sub-threshold move over a real second stays suppressed despite a flat wall clock");
+
+        return Task.CompletedTask;
+    }
+
+    /// <summary>
     /// 数组点位的缩放逐元素进行：每个元素各自乘 scale 再落回整数/浮点。
     /// 如果只缩第一个元素（把数组当标量处理的典型退化），其余元素会以原始工程量出现，
     /// 趋势图上看起来仍然「合理」，只有对着设备本地显示才能发现差了一个系数。
@@ -401,4 +430,13 @@ internal static class PipelineTests
 
     private static Sample SampleAt(double value, Quality quality, DateTimeOffset at) => new(
         "d", "p", DataValue.Number(DataType.Float64, value), quality, null, null, at, 1);
+
+    /// <summary>
+    /// 同时指定墙钟与单调时刻的样本：验证「Δt 用单调、墙钟可随意跳」。
+    /// <paramref name="monoSeconds"/> 是单调秒数，乘上 <see cref="TimeSpan.TicksPerSecond"/>
+    /// 归一化到 ticks——与生产侧 <c>Sample.MonoAt</c> 的单位一致。
+    /// </summary>
+    private static Sample SampleAtMono(double value, DateTimeOffset wall, double monoSeconds) => new(
+        "d", "p", DataValue.Number(DataType.Float64, value), Quality.Good, null, null, wall, 1,
+        null, (long)(monoSeconds * TimeSpan.TicksPerSecond));
 }

@@ -10,7 +10,16 @@ public sealed record Sample(
     DateTimeOffset? DeviceTime,
     DateTimeOffset CollectedAt,
     ulong Seq,
-    string? Error = null);
+    string? Error = null,
+    /// <summary>
+    /// 采集发生的单调时刻，已归一化到 <see cref="TimeSpan.Ticks"/>（<c>null</c> 表示未知）。
+    /// 变化率死区要用它算 Δt：墙钟会被 NTP 校时拨动，用 <see cref="CollectedAt"/> 算速率
+    /// 会让一次校时凭空造出尖峰或把尖峰抹平。
+    /// 归一化到固定单位而不是存原始 <c>GetTimestamp()</c>，是因为时间戳的频率由具体
+    /// <see cref="TimeProvider"/> 决定（注入的可拨时钟频率可以和系统不同），下游若按系统频率
+    /// 换算就会算错 Δt。为 null 时判定回退到墙钟（见 Pipeline.ExceedsRate）。
+    /// </summary>
+    long? MonoAt = null);
 
 /// <summary>一次写入请求。</summary>
 public sealed record WriteRequest(string PointId, DataValue Value, bool Confirm = false);

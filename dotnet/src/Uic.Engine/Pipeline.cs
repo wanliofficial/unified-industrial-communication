@@ -9,7 +9,7 @@ namespace Uic.Engine;
 /// </summary>
 public static class Pipeline
 {
-    public static Sample Process(Device device, Point point, RawSample raw, ulong seq, DateTimeOffset now)
+    public static Sample Process(Device device, Point point, RawSample raw, ulong seq, DateTimeOffset now, long? monoAt = null)
     {
         if (raw.Value is null || raw.Quality != Quality.Good)
         {
@@ -22,7 +22,8 @@ public static class Pipeline
                 raw.DeviceTime,
                 now,
                 seq,
-                raw.Error);
+                raw.Error,
+                monoAt);
         }
 
         var value = raw.Value;
@@ -37,7 +38,7 @@ public static class Pipeline
         }
 
         return new Sample(device.Id, raw.PointId, value, Quality.Good, point.Unit,
-            raw.DeviceTime, now, seq);
+            raw.DeviceTime, now, seq, null, monoAt);
     }
 
     /// <summary>
@@ -141,7 +142,15 @@ public static class Pipeline
 
     private static bool ExceedsRate(Sample previous, Sample next, double delta, double perSecond)
     {
-        var seconds = (next.CollectedAt - previous.CollectedAt).TotalSeconds;
+        // Δt 优先用单调时刻：墙钟会被 NTP 校时拨动，rate 死区用 CollectedAt 算速率，
+        // 一次前跳会把 1 秒的涨幅压成 1 小时（尖峰被抹平），后跳则把 1 小时压成 1 秒（凭空造峰）。
+        // 两条样本都带单调戳时才用它；否则回退墙钟，保持「构造样本没填 MonoAt」的旧语义。
+        // MonoAt 已归一化到 TimeSpan.Ticks，因此这里除的是常量，与具体 TimeProvider 频率无关。
+        double seconds;
+        if (previous.MonoAt is { } prevMono && next.MonoAt is { } nextMono)
+            seconds = (nextMono - prevMono) / (double)TimeSpan.TicksPerSecond;
+        else
+            seconds = (next.CollectedAt - previous.CollectedAt).TotalSeconds;
 
         // 时间没有前进（时钟回拨、同一时刻的两条样本）时算不出速率。
         // 宁可上报一条，也不要把变化吞掉。
