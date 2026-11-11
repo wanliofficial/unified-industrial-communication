@@ -156,6 +156,24 @@ func BuildLData(msgCode byte, src, dest uint16, isGroup bool, apci uint16, data 
 	return out, nil
 }
 
+// BuildLDataCon 构造一条链路层确认（L_Data.con）。
+//
+// 与本端请求的差别只有控制字段 1 的 bit0：置位表示「确认有错」，即帧已经
+// 发到总线但没有任何设备应答。单开一个函数而不是让调用方改字节：并发地
+// 拼字节会把「第几个字节是控制字段」这个知识散到每个调用点，改一次格式就
+// 要改全部（这个位置已经错过一次：附加信息段让控制字段从 2 变成了 2+n）。
+func BuildLDataCon(src, dest uint16, isGroup bool, apci uint16, data []byte, bit, failed bool) ([]byte, error) {
+	out, err := BuildLData(MsgLDataCon, src, dest, isGroup, apci, data, bit)
+	if err != nil {
+		return nil, err
+	}
+	if failed {
+		// 0 = 消息码、1 = 附加信息长度（本函数只产生 0）、2 = 控制字段 1。
+		out[2] |= ctrl1Error
+	}
+	return out, nil
+}
+
 // ParseLData 解析一条 cEMI L_Data 报文。
 func ParseLData(b []byte) (LData, error) {
 	var out LData
@@ -199,12 +217,34 @@ func ParseLData(b []byte) (LData, error) {
 	}
 	out.APCI = uint16(tpci&0x03)<<8 | uint16(tpdu[1])
 	if length == 1 {
-		// 只有 APCI 低字节，没有数据：1 位 DPT，值在 bit0。
+		// 只有 APCI 低字节，没有数据域：这是 1 位 DPT，值就放在 APCI 低
+		// 字节的 bit0。
+		//
+		// 因此 APCI 必须把这一位摘掉再报给调用方。不摘的话，一个「开」
+		// 的 GroupValueWrite 会解析成 0x0081 而不是 0x0080，调用方按服务
+		// 码 switch 时落到 default 分支——报文被静默丢弃，看上去像「写入
+		// 成功但设备没反应」。
 		out.Bit = tpdu[1]&0x01 != 0
+		out.APCI &^= 0x01
 	} else {
 		out.Data = append([]byte(nil), tpdu[2:1+length]...)
 	}
 	return out, nil
+}
+
+// ConfirmationError 判断一条 L_Data.con 的「确认有错」位。
+//
+// 这一位是隧道客户端唯一能拿到的总线级反馈：帧已经发到总线，但没有任何
+// 设备应答（组地址上没有执行器、设备掉线、地址写错）。它与「网关没收到
+// 我们的帧」是两件事——后者由 TUNNELLING_ACK 反映，前者由这里反映。
+// 把两者混成一句「写入失败」，现场就只能靠拔线复现。
+//
+// 对 L_Data.ind/req 这一位没有意义，返回 false。
+func (m LData) ConfirmationError() bool {
+	if m.MsgCode != MsgLDataCon {
+		return false
+	}
+	return m.Control1&ctrl1Error != 0
 }
 
 // DecodeGroupValue 从一条 L_Data 中取出组值载荷，并按 DPT 解释。

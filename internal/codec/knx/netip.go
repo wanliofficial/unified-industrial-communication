@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"strconv"
+	"strings"
 )
 
 // KNXnet/IP 信封的固定部分。
@@ -84,7 +86,7 @@ func ServiceName(svc uint16) string {
 const (
 	// ConnTypeTunnel 是隧道连接（采集与下发走的正是这一种）。
 	ConnTypeTunnel = 0x04
-	// ConnTypeDeviceMgmt 是设备管理连接（ETS 下载），本包不做。
+	// ConnTypeDeviceMgmt 是设备管理连接（工程组态工具的下载通道），本包不做。
 	ConnTypeDeviceMgmt = 0x03
 
 	// LayerLink 是链路层隧道：收发 L_Data.*。
@@ -145,6 +147,34 @@ func StatusName(s uint8) string {
 		return "不支持的隧道层"
 	}
 	return fmt.Sprintf("未知状态 0x%02X", s)
+}
+
+// DefaultPort 是 KNXnet/IP 的注册端口。
+//
+// 3671 是标准端口，但现场一定会有「同一个网关开多个隧道端点」或「一台
+// 网关同时被组态工具与另一台采集机占用，于是把隧道挪到 3672」的情况，因此配置里
+// 端口永远可覆盖。
+const DefaultPort = 3671
+
+// HostPort 把 `host[:port]` 归一成 `host:port`，缺端口时补 3671。
+//
+// 不做「顺便校验 IP 字面量」：现场常用主机名或 `/etc/hosts` 里的别名，
+// 真正的解析交给 DialUDP。但 HPAI 需要 IP 字面量（它是协议字段，不是
+// 名字），所以驱动在 CONNECT 阶段用本端套接字的实际地址，而不是配置值。
+func HostPort(addr string) (string, error) {
+	s := strings.TrimSpace(addr)
+	if s == "" {
+		return "", errors.New("knx: address is empty (want host:port, e.g. 192.168.1.10:3671)")
+	}
+	if _, _, err := net.SplitHostPort(s); err == nil {
+		return s, nil
+	}
+	// 没有端口：只要不是 IPv6 字面量就直接补默认端口。IPv6 必须显式写
+	// 方括号与端口，否则 `fe80::1` 与 `fe80` + 端口无法区分。
+	if strings.Contains(s, ":") && !strings.HasPrefix(s, "[") {
+		return "", fmt.Errorf("knx: address %q looks like an IPv6 literal; write [addr]:port", addr)
+	}
+	return net.JoinHostPort(strings.Trim(s, "[]"), strconv.Itoa(DefaultPort)), nil
 }
 
 // HPAI 是 Host Protocol Address Information：告诉对端「往哪个 IP:端口 回包」。
@@ -533,4 +563,17 @@ type DisconnectResponse struct {
 // Encode 组装载荷。
 func (d DisconnectResponse) Encode() []byte {
 	return []byte{d.Channel, d.Status}
+}
+
+// ParseDisconnectResponse 解析 DISCONNECT_RESPONSE。
+//
+// 与其它响应一样是 2 字节定长，没有结构长度字段：DISCONNECT_RESPONSE 的
+// 载荷就是「通道号 + 状态」，多写一个长度字节会让网关把状态当成别的东西。
+func ParseDisconnectResponse(b []byte) (DisconnectResponse, error) {
+	var d DisconnectResponse
+	if len(b) < 2 {
+		return d, fmt.Errorf("knx: DISCONNECT_RESPONSE too short (%d bytes)", len(b))
+	}
+	d.Channel, d.Status = b[0], b[1]
+	return d, nil
 }

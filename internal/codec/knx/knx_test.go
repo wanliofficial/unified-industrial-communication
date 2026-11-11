@@ -531,6 +531,40 @@ func TestParseLDataSkipsInfo(t *testing.T) {
 	}
 }
 
+// 1 位值的载荷位在 APCI 字节里，因此 APCI 必须归一化后再报给调用方。
+//
+// 不归一化时，一个「开」的 GroupValueWrite 解析成 0x0081 而不是 0x0080，
+// 调用方按服务码 switch 会落到 default 分支：报文被静默丢弃，现场看到的是
+// 「写返回成功，但设备没动」。
+func TestParseLDataNormalizesOneBitAPCI(t *testing.T) {
+	off := mustHex("2900" + "86e0" + "1101" + "0a03" + "01" + "0080")
+	on := mustHex("2900" + "86e0" + "1101" + "0a03" + "01" + "0081")
+	for _, tc := range []struct {
+		hex  []byte
+		want bool
+	}{{off, false}, {on, true}} {
+		m, err := ParseLData(tc.hex)
+		if err != nil {
+			t.Fatalf("ParseLData(%X): %v", tc.hex, err)
+		}
+		if m.APCI != APCIGroupValueWrite {
+			t.Fatalf("APCI = 0x%04X, want 0x%04X (the value bit must not leak into the service code)",
+				m.APCI, APCIGroupValueWrite)
+		}
+		if m.Bit != tc.want {
+			t.Fatalf("bit = %v, want %v", m.Bit, tc.want)
+		}
+	}
+	// 2 字节 DPT 的数据字节里允许出现 0x01 的末位，不能被当成 1 位值。
+	m, err := ParseLData(mustHex("2900" + "86e0" + "1101" + "0a03" + "03" + "0080" + "0001"))
+	if err != nil {
+		t.Fatalf("ParseLData: %v", err)
+	}
+	if m.APCI != APCIGroupValueWrite || len(m.Data) != 2 || m.Bit {
+		t.Fatalf("2-byte frame = %+v", m)
+	}
+}
+
 func TestDecodeGroupValue(t *testing.T) {
 	d9, _ := ParseDPT("9.001")
 	frame := LData{APCI: APCIGroupValueResponse, Data: []byte{0x0C, 0x33}}

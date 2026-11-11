@@ -61,6 +61,20 @@ func (c *udpConn) Read() ([]byte, error) {
 	return append([]byte(nil), buf[:n]...), nil
 }
 
+// LocalAddr 返回本端地址（IP:端口）。
+//
+// 只有 KNXnet/IP 用得上：它的 CONNECT_REQUEST 里要带 HPAI，明确告诉网关
+// 「往哪个 UDP 端点回包」。已连接套接字经过 connect 之后内核已经选好了
+// 源地址与端口，这里直接把它取出来即可——比在驱动里发 route-back（全零
+// HPAI，让网关按报文的源地址回）更可靠：一部分网关会把全零地址当成
+// 「客户端不会接收」而拒绝建立隧道。
+func (c *udpConn) LocalAddr() string {
+	if a := c.conn.LocalAddr(); a != nil {
+		return a.String()
+	}
+	return ""
+}
+
 func (c *udpConn) SetDeadline(t time.Time) error {
 	if err := c.conn.SetDeadline(t); err != nil {
 		return fmt.Errorf("udp: set deadline: %w", err)

@@ -544,6 +544,60 @@ CoAP 的数据模型是 **URI 资源**，不是寄存器：点位用 `kind=symbo
 `text` 与 `octets` 的宽度规则与读取一致。不做 DTLS、不做 Observe 订阅、不做 Block1
 分块发送——能力声明里 `Subscribe` 是 `unsupported`，不把「一次性 GET」伪装成推送。
 
+KNXnet/IP 隧道主站 + 内置网关（楼宇自控，UDP 3671）：
+
+```bash
+./uic sim -protocol knx -listen 127.0.0.1:13671 &   # 内置 KNX 网关
+./uic -config examples/knx.json
+curl -s -H 'Authorization: Bearer dev-token-0123456789' localhost:8099/api/v1/points
+#   7 点：1/1/1 与 1/1/2 开关、2/1/1 温度 21.5、2/1/2 湿度 45、
+#         3/1/1 调光 50.196、4/1/1 功率（每秒 +10）、5/1/1 有符号计数 8888
+#   自检（不需要网关）：./uic knxread -list
+#   只验隧道：./uic knxread -addr 127.0.0.1:13671 -probe
+#   读温度：  ./uic knxread -addr 127.0.0.1:13671 -group 2/1/1 -dpt 9.001 -raw
+#   开灯：    ./uic knxread -addr 127.0.0.1:13671 -group 1/1/1@1.001 -write on
+```
+
+KNX 与其它协议的根本差别是**组地址不携带类型**。同一个 `2/1/1` 在工程 A 里是 1 位
+开关、在工程 B 里是 2 字节浮点温度、在工程 C 里是 4 字节浮点功率。所以驱动不做
+「按平台类型猜 DPT」：点位地址必须显式声明 DPT（`"path": "2/1/1", "dpt": "9.001"`），
+`Address.Canonical()` 把它拼进符号地址参与去重，`PolicyFor("knx")` 缺了它直接在配置
+期拒绝（`uic import` 阶段就报，不是等网关起来后每个周期返回 `address_error`）。
+
+这不是形式主义的严格，而是**猜错的代价是「合法但错误」的值**：2 字节半精度被当 4 字节
+单精度解，得到 `3.7e-41` 这样的 float32——不报错、质量还是 good、画在曲线上是一条贴着
+零轴的噪声。明确报「不支持 99.9」反而安全得多。同理 `DPT.Accepts` 在 `Open` 就拒掉
+`9.001` 配 `bool`：把 21.5 塞进布尔不会报错，只会变成 `true`。
+
+隧道语义有三处必须记住的细节。其一，**1 位 DPT 的值在 APCI 字节的 bit0、不在数据域**：
+`0x0080` 表示 1.001 = 关、`0x0081` 表示 1.001 = 开；解析时若把这一位当成数据保留，
+调用方按服务码 `switch` 会落空，报文被**静默丢弃**（症状是「写返回成功，设备没动」，
+日志里什么都没有）。其二，**TPDU 长度不含 TPCI 字节与 APCI 高 2 位**：当成整个 APDU
+的字节数，网关会把最后一个数据字节当成下一条报文的开头，症状同样是「写成功了但值不对」。
+其三，序号是 8 位、每通道一个：**收到 TUNNELLING_ACK 之后才加一**；超时重传必须用
+**同一个序号**（换号会被当新帧，同一次写执行两遍）；序号错乱时唯一可靠的复位是
+**重建隧道**（通道号与序号是一体的，任何「+1 试试」都在猜）。因此整条会话用一把锁串行化
+——一条隧道只有一个通道号 + 一个序号，总线 9600 波特，并发没有收益只有乱序风险。
+
+写路径的 `L_Data.con` 有一个容易读反的语义：它的 error 位表示**总线级**故障（总线忙、
+冲突、链路发送失败），**不是**「这个组地址有没有设备在听」。组地址是广播语义，写一个
+没人订阅的地址在链路层是**成功**的。所以驱动在 300ms 短窗口里等 con：**收不到按成功**
+（部分网关不给隧道客户端回 con，硬等会把一半的写判成失败），收到且 error 位置位才判
+`protocol`。把这两件事混在一起，「写了但没生效」与「网络断了」就会变成同一个错误。
+
+承载是 UDP 单播（TUNNELING 请求 + 组地址读写）。`Open` 只做 `net.Dial`，CONNECT 延迟
+到首次 `Probe`/`Read`/`Write`——这样「网关隧道槽位满」这个几分钟后会自愈的状态不会被
+判成驱动加载失败。`Probe` 定义为「建隧道 + CONNECTIONSTATE 往返」，**不读任何组地址**：
+排障时经常需要把「网关连得上吗」与「工程组地址配得对吗」拆开看。心跳默认 60s
+（限制 1s..60s），`ackTimeout` 默认 1s 且必须 ≤ `device.timeout`。
+
+内置网关的对象表**只更新已存在的组地址**；读未知组地址时只回 ACK 与 `L_Data.con`、
+不回 `GroupValueResponse`，让客户端正常超时——那个超时正是它该报告给运维的事实（给未知
+地址凭空造对象，会让「点表地址写错」这个最常见的故障从测试里消失）。它刻意复现四件真机
+会发生的事：序号严格校验（宽松一点，驱动里的重传路径永远测不到）、8 位回绕后「新帧 vs
+重传」的边界、槽位满时回明确的 `StatusNoMoreConnections` 而不是静默丢弃、以及
+`FailNextConfirms(n)` 显式注入总线级故障（默认 con 正常）。
+
 DL/T 645-2007 多功能电能表（RS-485 / 串口服务器）：
 
 ```bash
@@ -848,7 +902,7 @@ go test -race -count=1 ./...
 
 | 路径 | 内容 |
 |---|---|
-| `cmd/uic/` | 单入口：`run` / `sim`（Modbus / S7 / OPC UA / MQTT / MC / FINS / Host Link / EtherNet-IP / BACnet-IP / IEC 104 / IEC 101 / Mewtocol / DNP3 / CoAP / 645 / 188 / SNMP / ADS / SECS）/ `mbread` / `mcread` / `finsread` / `hostlinkread` / `enipread` / `bacread` / `iec104read` / `iec101read` / `mewtocolread` / `dnp3read` / `coapread` / `dlt645read` / `cjt188read` / `snmpread` / `adsread` / `secsread` / `uaread` / `s7blocks` / `s7upload` / `instantiate` / `import` / `token` / `-check` / `version` |
+| `cmd/uic/` | 单入口：`run` / `sim`（Modbus / S7 / OPC UA / MQTT / MC / FINS / Host Link / KNX / EtherNet-IP / BACnet-IP / IEC 104 / IEC 101 / Mewtocol / DNP3 / CoAP / 645 / 188 / SNMP / ADS / SECS）/ `mbread` / `mcread` / `finsread` / `hostlinkread` / `enipread` / `bacread` / `iec104read` / `iec101read` / `mewtocolread` / `dnp3read` / `coapread` / `knxread` / `dlt645read` / `cjt188read` / `snmpread` / `adsread` / `secsread` / `uaread` / `s7blocks` / `s7upload` / `instantiate` / `import` / `token` / `-check` / `version` |
 | `internal/model` | 通道 / 设备 / 点位 / 地址 / 采样 / 质量码 |
 | `internal/driver` | 驱动契约（Codec / Transport / Driver）、错误分类、注册表、只读 `Lookup` 注入 |
 | `internal/calc` | 零依赖表达式引擎（编译期类型检查、短路求值、引用 `device:point`） |
@@ -883,6 +937,9 @@ go test -race -count=1 ./...
 | `internal/codec/textval` | 文本/JSON 标量 → 平台值（MQTT 与 CoAP 共用的类型规则；selector 取字段） |
 | `internal/driver/coap` | CoAP 主站（GET/PUT/POST、Block2 续读与降级、分离响应、指数重传、资源发现、坏包跳过） |
 | `internal/sim/coap` | CoAP 内置服务端（CON/NON / MID 去重 / Block2 / 分离响应 / RST / link-format 发现） |
+| `internal/codec/knx` | KNXnet/IP 纯函数编解码（组地址 4/4/8 与物理地址 4/4/8 / DPT 切片表与编解码 / cEMI `L_Data.req/ind/con` / 信封与全部服务报文 / HPAI） |
+| `internal/driver/knx` | KNXnet/IP 隧道主站（建隧道/心跳/断链重建、8 位序号与重传、组地址读写、`L_Data.con` 短窗口确认、源地址三级优先） |
+| `internal/sim/knx` | KNXnet/IP 内置网关（隧道分配与回收、序号严格校验与 8 位回绕、组地址对象表、`L_Data.con`、四种故障注入） |
 | `internal/codec/dlt645` | 645-2007 纯函数编解码（帧/校验和 / 数据标识 DI 表 / 压缩 BCD 与小数位 / 时间与地址 / 收帧扫描 / 后续帧序号） |
 | `internal/driver/dlt645` | 645 主站（RS-485 与串口服务器双承载、总线锁、逐点读 + 后续帧、写权限四道闸门、错误分类） |
 | `internal/sim/dlt645` | 645 内置从站（按标准宽度回数据 / 地址过滤 / 后续帧拆分 / 写权限与密码 / 广播校时静默生效 / 拉合闸） |

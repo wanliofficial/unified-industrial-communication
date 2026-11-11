@@ -3288,7 +3288,7 @@ curl -s -X POST -H 'Authorization: Bearer dev-token-0123456789' \
 | `codec/snmp` | GET/应答金帧、INTEGER 最短编码与负数、无符号前导零（`0x80000000`）、OID base-128（`2.39.1`→`77 01`）、OID 排序与前缀、非法 OID、版本解析（v3 拒绝）、异常标记只允许出现在应答、GetBulk 线格式、错误码分类、字符串/字节值、截断错误可识别 |
 | `driver/snmp` | 五种线类型解码、MultiRead 一条 GET、按 maxOids 与字节预算分批（顺序不变、每条 ≤1400 字节）、v1 `noSuchName` 逐点重发、写类型映射与回显校验、类型/范围拒绝不发包、9 种 error-status 分类、SET 回显被收敛、Probe 接受异常标记/超时提示、request-id 陈旧应答丢弃、链路失败停止后续批次、坏地址与线类型不符、Counter64 精度边界、`GetRaw`/`Walk`（子树边界、max、v1 表尾） |
 | `sim/snmp` | 真实 UDP 回环：GET 与计数器、错 community 静默、v1/v2c 缺 OID 差异、GETNEXT 遍历与表尾、GETBULK 三行递增、SET 可写与回读、只读/类型错/不存在、SET 原子性、坏报文与非请求丢弃、`Set`/`SetWritable`/`Close` 幂等 |
-| 点表/规划 | `PolicyFor("snmp")` 只允许 symbol、selector/寄存器/对象地址在导入期拒绝、`examples/snmp.json` 通过 `-check`（21 个驱动） |
+| 点表/规划 | `PolicyFor("snmp")` 只允许 symbol、selector/寄存器/对象地址在导入期拒绝、`examples/snmp.json` 通过 `-check`（当时 21 个驱动） |
 | `cmd/uic` | `-set` 值解析（bool/int/uint/string/bytes、进制、越界、float/BCD 拒绝）、`snmpRow` 的 raw/error 显示 |
 
 ### 3.10.13 ADS/AMS（TCP 48898）
@@ -3604,7 +3604,7 @@ result，没有回显），但缓存里的值要等下一轮采集才刷新；�
 | `codec/ads` | AMS/TCP 与 AMS 头金帧（HandleByName `MAIN.nCounter`）、两层长度一致性、reserved 非零拒绝、NetID 解析（6 段/0..255/非法）、7 类请求构造、Read/Write/ReadWrite/DeviceInfo/State/Control 应答解析、错误码分类与临时性、Command/State 字符串 |
 | `driver/ads` | 真实 TCP 回环：9 种类型读写、数组与字符串、地址/权限/宽度错误逐点隔离、坏 NetId/端口、握手超时、Close 幂等、句柄失效重解析（读与写）、类型范围/小数/BCD/字符串 NUL 拒绝、脚本化服务端：临时 AMS 错误重试、通知帧与陈旧 invoke 丢弃、畸形帧、句柄 0/短句柄、设备信息/状态/控制的 AMS 错误与短载荷、ctx 超时、拨号失败 |
 | `sim/ads` | 真实 TCP 回环：默认变量表、GET/PUT 夹具、句柄分配/释放/失效、只读与宽度校验、数组仅 `[2]` 可写、字符串/浮点、错误 NetId/端口、未知命令、通知不应答、畸形载荷、坏帧断链后仍可服务、Close 幂等 |
-| 点表/规划 | `PolicyFor("ads")` 只允许 symbol、`NAME:81` 与 length 列、`MAIN.arr[2]` 保留在 path、寄存器/selector 在导入期拒绝、`examples/ads.json` 通过 `-check`（21 个驱动） |
+| 点表/规划 | `PolicyFor("ads")` 只允许 symbol、`NAME:81` 与 length 列、`MAIN.arr[2]` 保留在 path、寄存器/selector 在导入期拒绝、`examples/ads.json` 通过 `-check`（当时 21 个驱动） |
 | `cmd/uic` | `-symbol` 声明解析（类型/长度/错误写法）、`-set` 值解析（bool/int/uint/float/string/bytes、进制、越界、BCD 拒绝）、`-control` 映射、行显示与错误质量 |
 
 ### 3.10.14 DNP3（IEEE 1815：三层链路 + 类轮询 + 直接控制，TCP 20000）
@@ -5852,7 +5852,330 @@ DM、当前 EM 区 `em`、以及 13 个 bank（`em0`..`em12`）。写错的区�
 | `examples/hostlink.json` | 6 点示例（DM 字、float32、CIO 可写位、可写计数） |
 | `internal/pointtable/address.go` | `PolicyFor("fins", "hostlink")`、`finsAreas`、`finsAliases`、`splitRegisterPrefix` 的 FINS 区名与 EM bank 归一 |
 
+### 3.10.20 KNXnet/IP（UDP 隧道 + 组地址读写 + DPT，端口 3671）
+
+KNX 是楼宇自控里覆盖最广的一条总线（照明、遮阳、暖通、能耗计量都跑在同一条
+双绞线上）。它对上位机暴露的接口不是「读一个地址拿到一个值」，而是网关上的
+一条**隧道**：客户端先建连接拿到通道号，之后每帧带一个 8 位序号，网关确认之后
+这帧才算发出去。因此这个驱动的难点不在字段编码，而在**隧道的生命周期**与
+**类型的缺失**。
+
+本仓库只做一种形态：**TUNNELING（UDP 单播隧道）+ 组地址读写**。不做 ROUTING
+组播、不做设备管理连接（属性/内存下载）、不做 KNX Secure、不做 raw/busmon。
+
+#### 3.10.20.1 为什么 DPT 必须显式声明，而且必须是地址的一部分
+
+这是整个协议最容易做错、也最容易被「聪明」地做错的地方。
+
+组地址（`1/2/3`）在总线上**不携带类型**。同一条 `GroupValueWrite` 只说明「把这
+几个字节写进这个组地址」，字节怎么解释完全由工程的组地址表决定。所以：
+
+| 做法 | 结果 |
+|---|---|
+| 由 `dataType: float32` 反推 DPT | **得不到答案**：`float32` 既可能是 9.xxx（2 字节半精度）也可能是 14.xxx（4 字节单精度），编码方式完全不同 |
+| 猜一个，读回来不对就报错 | **不会报错**：2 字节半精度被当 4 字节单精度解，得到 `3.7e-41` 这种「合法的 float32」 |
+| 显式声明 `1/2/3@9.001` | 宽度、编码、取值范围、单位全部确定 |
+
+第三行是本仓库的选择，而且做了三件事让它不可能被绕过：
+
+1. **`pointtable.PolicyFor("knx")` 要求 DPT**：策略是
+   `WidthNone + AllowSymbol + AllowDPT`。`WidthNone` 表示「宽度不由平台类型
+   决定」（DPT 说了算），`AllowDPT` 表示符号地址**必须**带 `@<DPT>`。缺了它
+   在 `uic import` 阶段就被拒，而不是等网关起来后每周期返回 `address_error`。
+2. **`Address.DPT` 是模型字段**，不是标签、不是 `labels` 里的自由文本。它参与
+   `Validate()`（`^[0-9]+(\.[0-9]+)?$`）、参与 `Canonical()`、参与重复地址检查。
+3. **`Address.Canonical()` 把 `@DPT` 拼回去**。这一点看似细节，实际是必须的：
+   如果规范化时丢掉 DPT，`1/2/3` 与 `1/2/3@9.001` 会被当成两条不同地址，
+   重复地址检查会漏判；更糟的是「同一点位改 DPT」不会被视为冲突，而是被当成
+   两个点位并存，两份采样互相覆盖。
+
+驱动的 `Open` 还把 DPT 与 `dataType` 做一次静态匹配（`DPT.Accepts`）：`9.001`
+配 `bool` 直接拒。把 21.5 塞进布尔不会报错，只会变成 `true`——一个看起来完全
+正常、实际毫无意义的读数。
+
+#### 3.10.20.2 DPT 表是切片，不是 map
+
+`9.001` 与 `9.1` 是**同一个类型**。用 `map[string]DPT` 做查表时，键必须先把
+`9.1` 补零成 `9.001` 才能命中，而「补零」这件事要在三个地方各写一遍（解析、
+规范化、错误提示里的「支持列表」），迟早漏一处。
+
+因此 `ParseDPT` 用切片 + 两段数字匹配（`main` / `sub`）：
+
+```go
+type DPT struct {
+    Main, Sub uint16   // 9.001 → Main=9, Sub=1
+    Bits      int      // 线宽：1 / 8 / 16 / 32
+    Kind      DPTKind  // Bool / Unsigned / Signed / Float16 / Float32 / Scaled / …
+    Name      string
+    Unit      string
+    Min, Max  float64
+}
+```
+
+`String()` 输出规范化形式（`9.1` → `9.001`），错误提示里打印的是切片遍历结果
+——「支持哪些 DPT」因此只有一个事实来源。
+
+支持的 DPT 只覆盖现场最常用的那批（1.001/1.002/1.003/1.009、5.001/5.003/5.004/
+5.010、6.001/6.010、7.001/7.012、8.001/8.010、9.001..9.028、12.001、13.001/
+13.010/13.013、14.001/14.007/14.019/14.027/14.031/14.033/14.056、20.102）。不做
+「任意 DPT 自动推导」：DPT 编号有几百个，猜错的代价是一条「合法但错误」的读数，
+比明确报「不支持 99.9」危险得多。
+
+#### 3.10.20.3 1 位 DPT 的值在 APCI 字节里，不在数据域
+
+这是 cEMI 最反直觉的一处，也是本仓库在这次实现里**真的踩到并修掉**的一个 bug。
+
+一条 2 字节 DPT 的 `GroupValueWrite`，TPDU 是「TPCI 字节 + APCI 低字节 + 数据」：
+
+```
+TPCI(00)  APCI 低(80)  数据(0C 33)     ← 9.001 = 21.5
+```
+
+而 1 位 DPT **没有数据域**，值放在 APCI 低字节的 bit0：
+
+```
+TPCI(00)  APCI 低(80 | 01)             ← 1.001 = 开
+```
+
+于是解析时 `APCI` 会算成 `0x0081` 而不是 `0x0080`，调用方按服务码
+`switch m.APCI` 直接落到 `default` 分支——报文被**静默丢弃**。现场看到的症状是
+「写返回成功，但设备没动」，而日志里什么都没有。修复是解析时把这一位摘掉：
+
+```go
+out.APCI = uint16(tpci&0x03)<<8 | uint16(tpdu[1])
+if length == 1 {
+    out.Bit = tpdu[1]&0x01 != 0
+    out.APCI &^= 0x01          // 关键：值位不能泄漏进服务码
+}
+```
+
+对应的编码侧细节：**长度字段是 `len(apdu)-1`**，即「APCI 低字节 + 数据」，
+**不含 TPCI 字节本身、也不含 APCI 的高 2 位**（那两位在 TPCI 字节里）。把它当成
+「整个 APDU 的字节数」会让网关把最后一个数据字节当成下一条报文的一部分，症状
+同样是「写成功了，但值不对」。
+
+回归测试 `TestParseLDataNormalizesOneBitAPCI` 同时钉住三件事：`00` 与 `01` 都
+归一化成 `APCIGroupValueWrite`、`Bit` 正确、以及「2 字节帧的数据末位是 `0x01`
+时不会被误判成 1 位值」。
+
+#### 3.10.20.4 序号：确认之后才加一，重传用同一个号
+
+KNX 隧道的序号是 **8 位、每通道一个、双向独立**。规则只有三条，但三条都必须对：
+
+| 情况 | 客户端行为 | 为什么 |
+|---|---|---|
+| 收到 `TUNNELLING_ACK` 且状态为 0 | 序号 +1 | 序号推进的唯一依据是「网关确认了」，不是「我发出去了」 |
+| `ackTimeout` 内没收到 ACK | **用同一个序号重发** | 换号会被网关当成新帧，同一次写被执行两遍 |
+| 收到「序号错乱」状态 | 丢掉整条隧道、重新 CONNECT | 通道号与序号是一体的，单独「调序号」在真网关上没有对应服务 |
+
+第三条是刻意的：序号错乱意味着从站期望的号与客户端认为的号不一致，而这个
+差值**无法可靠推断**（可能是网关重启、可能是另一条隧道占用了同一个通道号、
+也可能是中途有帧被网关内部丢弃）。任何「+1 试试 / 跳到期望值试试」的做法都在
+猜，而猜错的代价是「写成功但设备没动」或「同一个写执行两遍」。重建隧道的代价
+只有一次 CONNECT 往返，而且它把状态**确定性地**归零。
+
+重传次数由 `labels.maxRetries` 控制（默认 2，范围 0..5）。超过上限后返回
+`ErrTimeout`，可重试。
+
+#### 3.10.20.5 整条会话一把锁，不做并发
+
+KNX 隧道只有一个通道号、一个 8 位序号，底层总线 9600 波特。并发发帧不但没有
+收益，还会让序号竞争，把「重传」与「新帧」搅在一起。因此驱动的整条会话用一把
+`sync.Mutex` 串行化，`Read` 的多点位也是逐点串行。
+
+代价是「100 点一轮」在 KNX 上确实慢（0.5s × 100 = 50s）。但这个代价是协议本身
+的，不是驱动的：总线就是这个速度，批量读也没有标准手段（`GroupValueRead` 只能
+点名一个组地址）。把并发加进来只会把「慢」变成「慢 + 偶发错乱」。
+
+#### 3.10.20.6 `Open` 只 dial，不建隧道
+
+`Open` 完成的事情只有一件：把 UDP 的 `net.Dial` 做完（顺带补默认端口 3671）。
+CONNECT 延迟到首次 `Probe`/`Read`/`Write`。
+
+理由不是「懒加载省时间」，而是**错误分类**：
+
+| 时机 | 失败意味着 | 应该报什么 |
+|---|---|---|
+| `Open` 失败 | 地址写错、端口不通、协议名不支持 | 配置错误，`ErrConfig`/`ErrUnsupported`，不该重试 |
+| `Probe`/首次读写失败 | 网关隧道槽位满、网关重启中、网关拒绝连接 | 拓扑/临时问题，`ErrDisconnected`，**必须可重试** |
+
+如果 CONNECT 放在 `Open` 里，「网关隧道槽位满」（一个完全正常、几分钟后会自己
+恢复的状态）就会表现成**驱动加载失败**，进而让整台设备在配置里被判成坏设备。
+内置网关的 `MaxTunnels` 测试正是钉住这一点：第二条隧道被拒时，
+`KindOf(err) == ErrDisconnected` 且 `IsRetryable(err) == true`。
+
+`Probe` 的定义是「建隧道 + CONNECTIONSTATE 往返」，**不读任何组地址**。排障时
+经常需要把「网关连得上吗」与「这个工程的组地址配得对吗」拆开看：前者失败的
+处理动作在网关侧（槽位、网段、防火墙），后者在点表侧。
+
+#### 3.10.20.7 写：`L_Data.con` 的 error 位是总线级故障，不是「有没有人在听」
+
+这是本节最需要强调的语义区分，也直接决定了驱动在写路径上的行为。
+
+`L_Data.con` 是**链路层确认**：它说「这一帧有没有成功地发到总线上」。它的
+error 位表示总线级问题——总线忙、冲突、链路发送失败。它**不表示**「这个组地址
+上有没有设备在听」：
+
+> 组地址是广播语义。写一个没人订阅的组地址，在链路层是**成功**的：帧确实上了
+> 总线，没有任何设备需要为它改变状态。
+
+把这两件事混在一起，会让「写了但没生效」与「网络断了」变成同一个错误——而
+它们的处理方式完全不同（前者是点表问题、后者是网络问题）。
+
+驱动的写路径因此是：
+
+1. 发 `L_Data.req`，等 `TUNNELLING_ACK`（必需）。
+2. 在 `confirmWindow = 300ms` 的短窗口里等同一条报文的 `L_Data.con`。
+   - **没收到** → 按成功。部分网关不给隧道客户端回 con，硬等会把一半的写判成失败。
+   - 收到且 error 位**未**置位 → 成功。
+   - 收到且 error 位**置位** → `ErrProtocol`（帧到网关但总线级发送失败）。
+3. 写操作不做「写完回读」：那是调用方（调度器/上层）的决定，驱动不该偷偷多花
+   一个事务。
+
+内置网关因此默认把 con 报成正常；只有 `FailNextConfirms(n)` 显式注入时，才把
+这一位置起来。两边的测试各钉一头：`TestWriteUnknownGroupAddressSucceeds`（写
+未知地址成功）与 `TestWriteFailsWhenLinkLayerConfirmReportsAnError`（总线故障
+失败）。
+
+#### 3.10.20.8 内置网关的语义：只更新已有的对象
+
+`internal/sim/knx` 的对象表**只更新已经存在的组地址**，不会给未知组地址凭空
+造一个对象。这一点是刻意的：
+
+如果模拟器「写什么就存什么」，那「写一个不存在的组地址」在测试里会变成一次
+可见的成功，而这个成功在真机上不存在——它会把「点表里地址写错了」这个最常见
+的故障从测试里抹掉。真实网关不存组对象，写报文只是被转发到总线，由「拥有该
+组地址的执行器」接收。
+
+同理，读一个未知组地址时模拟器**只回 ACK 与 `L_Data.con`、不回
+`GroupValueResponse`**，让客户端正常超时。那个超时正是它应该报告给运维的事实。
+
+从站还刻意复现四件真机会发生的事：
+
+1. **序号严格校验**（三种情况分开：期望值 → 处理；上一条 → 只重发 ACK；其它 →
+   回序号错乱状态）。宽松一点会让驱动里的重传路径永远测不到。
+2. **8 位回绕**（255 → 0 是新帧，不是重传）——这条边界最容易在测试里写成
+   「重传」，从而掩盖掉一个真实的重复执行风险。
+3. **隧道槽位满时回 `StatusNoMoreConnections`**，而不是静默丢弃：静默会让客户端
+   等满一个超时，还以为是网络问题。
+4. **非隧道 CRI 明确拒绝**（`StatusConnectionType`）：设备管理连接本仓库不做，
+   回一个明确的码比让客户端猜要好。
+
+#### 3.10.20.9 源地址：三级优先
+
+| 优先级 | 来源 | 说明 |
+|---|---|---|
+| 1 | `labels.sourceAddress` | 工程要求固定源地址（比如网关的白名单按源地址放行）时用 |
+| 2 | `CONNECT_RESPONSE` 的 CRD | 网关分配的地址，最省事 |
+| 3 | `0.0.0` | 交给网关替换。真实网关通常会把 0.0.0 换成自己的地址 |
+
+`sourceAddress` 显式拒绝 `0.0.0`（等于「不指定」，写成配置只会误导）与非法
+四段（`15.15`、`gateway`）。
+
+#### 3.10.20.10 心跳与超时
+
+`CONNECTIONSTATE_REQUEST` 默认 60s（限制 1s..60s）。网关侧的隧道超时通常是
+120s，60s 留了一半余量。
+
+`ackTimeout` 默认 1s（100ms..10s），且**必须 ≤ `device.timeout`**：心跳窗口比
+设备超时还长时，一轮采集会被心跳拖长，表现为「设备响应变慢」而不是「心跳配错
+了」。这条约束在 `Open` 时就检查，报错文案里直接点出 `device.timeout`。
+
+#### 3.10.20.11 自检与内置网关
+
+`uic knxread` 不依赖点表，回答「这条隧道建得起来吗、这个组地址现在是什么值」：
+
+```bash
+uic knxread -addr 192.168.1.10:3671 -probe
+uic knxread -addr 192.168.1.10:3671 -group 2/1/1 -dpt 9.001
+uic knxread -addr 192.168.1.10:3671 -group 2/1/1 -dpt 9.001 -raw
+uic knxread -addr 192.168.1.10:3671 -group 1/1/1@1.001 -write on
+uic knxread -addr 192.168.1.10:3671 -group 3/1/1 -dpt 5.001 -write 75 -json
+uic knxread -list
+```
+
+`-group` 支持把 DPT 内联写成 `组地址@DPT`，与点表走同一条解析路径——两处语法
+漂移是这类 CLI 最常见的腐化方式。
+
+`-probe` 不需要合法的组地址与 DPT：探测往往发生在还不知道工程组地址分配的时候。
+
+`-raw` 会把解码后的值**重新编码**成线格式打印。它不是「保存收到的字节」：这条
+命令只看到值，把值再编回去恰好验证了「编码-解码是自洽的」——两边不一致会立刻
+在输出里看出来。
+
+`uic sim -protocol knx -listen 127.0.0.1:13671` 起内置网关，默认对象表与
+`examples/knx.json` 一一对应：
+
+| 组地址 | DPT | 初值 | 说明 |
+|---|---|---|---|
+| `1/1/1` | 1.001 | 关 | 照明开关 |
+| `1/1/2` | 1.001 | 开 | 第二路开关 |
+| `2/1/1` | 9.001 | 21.5 | 室内温度 °C |
+| `2/1/2` | 9.007 | 45 | 相对湿度 % |
+| `3/1/1` | 5.001 | 50 | 调光/阀门位置 % |
+| `4/1/1` | 14.056 | 1234.5 | 有功功率 W（每秒 +10） |
+| `5/1/1` | 13.010 | 8888 | 有符号计数 |
+
+对象表只有一份（`sim/knx.DefaultObjects()`）：安装初始值、`uic knxread -list`
+打印清单、`uic sim -protocol knx` 启动横幅都从它读，避免「文档里写的地址」与
+「实际配的地址」各说一套。
+
+#### 3.10.20.12 点表这一层：`WidthNone` + `AllowDPT`
+
+| 写法 | 解析结果 | 说明 |
+|---|---|---|
+| `1/2/3@9.001` | 符号 `1/2/3` + DPT `9.001` | 规范形式 |
+| `1/2/3@9.1` | 规范化成 `1/2/3@9.001` | `9.1` 与 `9.001` 同一类型 |
+| `1/2/3` | **导入期拒绝** | 缺 DPT，组地址不携带类型 |
+| `50/1/1@9.001` | 拒绝 | 主组只有 0..31 |
+| `1/9/1@9.001` | 拒绝 | 中间组只有 0..7 |
+| `1/2/3@abc` | 拒绝 | DPT 语法 |
+| `1/2/3@9.001` + `selector` | 拒绝 | 符号地址不接受别的字段 |
+
+组地址自身的语法（主组 0..31 / 中间组 0..7 / 子组 0..255）由 `codec/knx` 报，
+点表层不重复实现一份「差不多的」校验——两份校验迟早会不一致，而不一致的那一侧
+通常是宽松的那一份。
+
+#### 3.10.20.13 测试矩阵
+
+| 层 | 用例 |
+|---|---|
+| `codec/knx` | 组地址 4/4/8 与物理地址 4/4/8 的往返与越界；DPT 解析与规范化（`9.1` ≡ `9.001`）、`Accepts` 的位宽/类型校验、`Encode`/`Decode` 各 Kind（Bool 接受 on/off/1/0 且拒绝其它数值、Unsigned/Signed/Float16/Float32/Scaled）；cEMI 的黄金字节（1 位 2 字节 TPDU 长度 = 1、2 字节 = 3）；`ParseLData` 跳过附加信息段；**1 位 APCI 归一化回归**；`DecodeGroupValue` 拒绝位宽不符与 `GroupValueRead`；KNXnet/IP 信封往返、HPAI 编解码、全部服务报文的 Parse/Build 对称、`ParseDisconnectResponse` |
+| `driver/knx` | `Meta`（能力/地址类型/`address.dpt` 必填）；`Open` 补默认端口、保留显式端口、拒绝非 UDP、九类非法 settings（心跳过长/为零/不可解析、ack 过短/超过设备超时、重传过多/不可解析、源地址非法/为 0）；缺 DPT 与 DPT-类型不符都在 `Open` 拒；`planPoint` 拒绝 selector/index/length/组地址语法错/DPT 语法错；`Probe` 建隧道且**不读组地址**；1 位/2 字节/4 字节/百分比读；未知组地址超时（`ErrTimeout` + `QualityTimeout`）；错误 DPT 读按 `ErrAddress`；首个链路错误后**中止剩余点位**（不逐个等超时）；写开关并回读、写浮点、写未知地址成功、con 报错报 `ErrProtocol`；丢 2 个 ACK 后重传成功且序号仍同步；序号错乱后重建隧道并恢复；隧道被网关回收后心跳发现并重连；网关不回 con 时写仍成功；槽位满判可重试、释放后可连；`Close` 归还槽位；源地址三级优先 |
+| `sim/knx` | 手写最小客户端（**不复用驱动**）：建连分配通道与 CRD、槽位满拒绝、非隧道 CRI 拒绝且不占槽位、DISCONNECT 释放槽位、未知通道拒绝、通道状态存活与回收；序号严格校验（拒绝后不推进期望值）、重传只重发 ACK 不重复执行、8 位回绕后「新帧 vs 重传」边界、未知通道拒绝、畸形数据报计数；读返回存储载荷（含 `L_Data.con` 正常）、未知组地址只有 ACK + con、写 1 位/2 字节落地、写未知地址被转发但不落地、`FailNextConfirms` 只影响一条、`DisableConfirm` 抑制 con；`DropNextACKs` 后重传、`FailNextSequence` 只失败一次；对象表覆盖与**宽度与 DPT 一致**（`4/1/1` 必须 4 字节）、`SetValue`/`SetNumber` 越界拒绝、`SetPayload` 拒绝非法组地址、每秒自增、`Close` 幂等 |
+| `pointtable` | `PolicyFor("knx")` 是 `WidthNone + AllowSymbol + AllowDPT` 且不泄漏 DI/length 标志；正向（`@9.001`、`@9.1` 规范化）× 往返（`Canonical()` 能重新解析成同一地址且保留 DPT）；反向（缺 DPT、DPT 语法、主组/中间组越界、符号地址带 selector） |
+
+覆盖率（`go test -count=1 -cover`）：
+
+| 包 | 覆盖率 | 说明 |
+|---|---|---|
+| `codec/knx` | 77.5% | 未覆盖的主要是各畸形输入分支与少量 DPT 条目 |
+| `driver/knx` | 67.7% | I/O 路径由 `sim/knx` 的真实 UDP 回环覆盖；包内单测只能碰到纯函数 |
+| `sim/knx` | 85.2% | |
+
+跨包统计（`-coverpkg`）下 `driver/knx` 的 I/O 路径覆盖率显著更高。这与 Host Link
+一节的处理一致：驱动的价值在「一帧一帧地走线」，本仓库选择「跨包统计 + 在文档里
+写清楚」，而不是为了数字造重复用例。
+
+#### 3.10.20.14 位置
+
+| 文件 | 内容 |
+|---|---|
+| `internal/codec/knx/group.go` | 组地址（4/4/8）与物理地址（4/4/8）的解析、`String()`、`Main/Middle/Sub`、`NewGroupAddress` |
+| `internal/codec/knx/dpt.go` | DPT 切片表、`ParseDPT`、`String`（规范化）、`Accepts`、`Encode`/`Decode`、`Payload{Bit,Data}`、`Kind*`、`DPTNames` |
+| `internal/codec/knx/cemi.go` | `BuildLData`（TPDU 长度不含 TPCI 与 APCI 高位）、`BuildLDataCon`、`ParseLData`（1 位 APCI 归一化）、`DecodeGroupValue`、`LData.ConfirmationError()`、APCI 常量 |
+| `internal/codec/knx/netip.go` | KNXnet/IP 信封（`BuildFrame`/`ParseFrame`）、HPAI（`NewHPAI`/`AppendHPAI`/`ParseHPAI`）、全部服务报文（CONNECT / CONNECTIONSTATE / DISCONNECT / TUNNELLING / ACK）、状态码、`DefaultPort`/`HostPort`、`ParseDisconnectResponse` |
+| `internal/driver/knx/driver.go` | 主站：`Dialer`/`New`/`NewWithDialer`、`Meta`、`parseSettings`（心跳/ackTimeout/maxRetries/sourceAddress 边界）、`buildPlans`/`planPoint`（DPT 必填且与 dataType 匹配）、`Probe`/`Close`、`ensure`/`redial`/`localHPAI`/`connect`/`establish`/`connectStatusError`/`checkState`/`disconnect`/`dropTunnel`/`dropLink`、`writeFrame`/`readFrame`/`acceptInbound`/`answerStateRequest`/`answerServerDisconnect`、`exchange`/`sendLast`/`awaitACK`/`ackError`/`awaitValue`、`Read`/`readOne`/`Write`/`writeOne` |
+| `internal/sim/knx/server.go` | 内置网关：`Options{MaxTunnels,DisableConfirm,DisableAutoIncrement}`、`NewServer`/`NewServerWithOptions`/`Addr`/`Close`、观测（`Connects`/`Refusals`/`Tunnels`/`Reads`/`Writes`/`Retransmits`/`SeqErrors`/`BadPackets`/`Requests`）、激励（`DropNextACKs`/`FailNextSequence`/`FailNextConfirms`/`ExpireTunnels`）、对象表（`SetPayload`/`Payload`/`SetValue`/`SetBool`/`SetNumber`/`Objects`）、`DefaultObjects`/`DefaultObject` |
+| `internal/model/model.go` | `Address.DPT`、`dptRe`、`Canonical()` 的 `@DPT` 拼接 |
+| `internal/pointtable/address.go` | `AllowDPT`、`PolicyFor("knx")`（`WidthNone + AllowSymbol + AllowDPT`）、`splitDPT` |
+| `cmd/uic/knxread.go` | 自检命令（`-addr`/`-group`/`-dpt`/`-type`/`-timeout`/`-heartbeat`/`-retries`/`-source`/`-probe`/`-write`/`-list`/`-json`/`-raw`，`组地址@DPT` 内联写法） |
+| `cmd/uic/main.go` | `knxread` 分派、`sim -protocol knx`、`simKNX` 启动横幅 |
+| `examples/knx.json` | 7 点示例（开关 ×2、2 字节浮点 ×2、1 字节百分比、4 字节浮点、2 字节有符号计数） |
+| `internal/runtime/runtime.go` | `RegisterBuiltins()` 注册 `knxdrv.New()` |
+
 ### 3.11 计算点（`computed`）
+
 
 这是全项目**唯一没有物理链路**的驱动：点位不从任何设备读取，而是由其他点位的值
 经表达式算出——能耗合计、温差、效率、简单的阈值判定。它存在的理由不是「省一次

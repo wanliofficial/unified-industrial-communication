@@ -1,4 +1,4 @@
-// Command uic 是单一可执行入口：run（默认）/ sim / mbread / mcread / finsread / enipread / bacread / iec104read / iec101read / dnp3read / uaread / s7blocks / s7upload / instantiate / import / token / version。
+// Command uic 是单一可执行入口：run（默认）/ sim / mbread / mcread / finsread / hostlinkread / enipread / bacread / iec104read / iec101read / dnp3read / coapread / knxread / uaread / s7blocks / s7upload / instantiate / import / token / version。
 //
 //	uic -config config.json            # 前台运行
 //	uic run -config config.json        # 同上
@@ -21,11 +21,13 @@
 //	uic iec101read -addr 127.0.0.1:4001        # IEC 60870-5-101 自检（轮询 + 上送对象）
 //	uic dnp3read -addr 127.0.0.1:20000 -probe   # DNP3 自检（链路复位 + 总召唤 + 对象清单）
 //	uic coapread -addr 127.0.0.1:5683 -discover # CoAP 自检（资源发现 / 读写）
+//	uic knxread -addr 127.0.0.1:3671 -group 2/1/1 -dpt 9.001  # KNXnet/IP 自检（隧道 + 组地址）
 //	uic sim -protocol coap -listen 127.0.0.1:5683  # 内置 CoAP 服务端（UDP）
 //	uic snmpread -addr 127.0.0.1:16161 -oid 1.3.6.1.2.1.1.1.0   # SNMP v1/v2c 自检
 //	uic adsread -addr 127.0.0.1:48898 -probe   # ADS/AMS 自检（设备信息握手）
 //	uic secsread -addr 127.0.0.1:5000 -probe  # SECS/GEM 自检（HSMS Linktest）
 //	uic sim -protocol secs -listen 127.0.0.1:5000  # 内置 HSMS 设备
+//	uic sim -protocol knx -listen 127.0.0.1:13671  # 内置 KNXnet/IP 网关（UDP 3671）
 //	uic uaread -addr 127.0.0.1:4840 -nodes ns=2;s=site/dev/point  # OPC UA 读写自检
 //	uic s7blocks -addr 127.0.0.1:15102   # S7 块目录（-type db / -num 1 可细看）
 //	uic s7upload -addr 127.0.0.1:15102 -type db -num 1 -out db1.bin  # 块上传备份
@@ -72,6 +74,7 @@ import (
 	hlsim "uic/internal/sim/hostlink"
 	iec101sim "uic/internal/sim/iec101"
 	iec104sim "uic/internal/sim/iec104"
+	knxsim "uic/internal/sim/knx"
 	mcsim "uic/internal/sim/mc"
 	mewsim "uic/internal/sim/mewtocol"
 	sim "uic/internal/sim/modbus"
@@ -119,6 +122,8 @@ func main() {
 		dnp3readCmd(args)
 	case "coapread":
 		coapreadCmd(args)
+	case "knxread":
+		knxreadCmd(args)
 	case "dlt645read":
 		dlt645readCmd(args)
 	case "cjt188read":
@@ -158,7 +163,7 @@ func usage() {
 用法:
   uic [run] -config config.json [-listen :8080] [-token TOKEN]
   uic -check -config config.json
-  uic sim [-listen 127.0.0.1:15020] [-protocol modbus|s7|opcua|mqtt|mc|fins|hostlink|enip|bacnet|iec104|iec101|mewtocol|dnp3|coap|dlt645|cjt188|snmp|ads|secs]
+  uic sim [-listen 127.0.0.1:15020] [-protocol modbus|s7|opcua|mqtt|mc|fins|hostlink|enip|bacnet|iec104|iec101|mewtocol|dnp3|coap|knx|dlt645|cjt188|snmp|ads|secs]
   uic mbread -addr 127.0.0.1:1502 -unit 1 -area holding -offset 0 -qty 2
   uic mbread -addr 127.0.0.1:1502 -area holding -offset 5 -write 777
   uic mcread -addr 127.0.0.1:5000 -area d -offset 100 -qty 2
@@ -188,6 +193,10 @@ func usage() {
   uic coapread -addr 127.0.0.1:5683 -discover
   uic coapread -addr 127.0.0.1:5683 -path /actuator/setpoint -write 42
   uic coapread -addr 127.0.0.1:5683 -path /config -selector mode -write manual -content-format json
+  uic knxread -addr 127.0.0.1:3671 -group 2/1/1 -dpt 9.001 [-json] [-raw]
+  uic knxread -addr 127.0.0.1:3671 -group 1/1/1@1.001 -write on
+  uic knxread -addr 127.0.0.1:3671 -probe
+  uic knxread -list
   uic dlt645read -addr 127.0.0.1:14001 -address 000000000042 -di 00000000,02010100
   uic dlt645read -transport serial -port /dev/ttyUSB0 -baud 2400 -address 0042 -probe
   uic dlt645read -addr 127.0.0.1:14001 -address 42 -di 04000101 -write 20261107120000
@@ -520,7 +529,7 @@ func simCmd(args []string) {
 	fs := flag.NewFlagSet("sim", flag.ExitOnError)
 	addr := fs.String("listen", "127.0.0.1:15020", "监听地址")
 	size := fs.Int("size", 1024, "寄存器数量")
-	proto := fs.String("protocol", "modbus", "从站协议：modbus | s7 | opcua | mqtt | mc | fins | enip | bacnet | iec104 | iec101 | mewtocol | hostlink | dnp3 | coap | dlt645 | cjt188 | snmp | ads | secs")
+	proto := fs.String("protocol", "modbus", "从站协议：modbus | s7 | opcua | mqtt | mc | fins | enip | bacnet | iec104 | iec101 | mewtocol | hostlink | dnp3 | coap | knx | dlt645 | cjt188 | snmp | ads | secs")
 	pdu := fs.Int("pdu", 480, "S7 协商 PDU 长度（240/480/960）")
 	fs.Parse(args)
 
@@ -564,6 +573,9 @@ func simCmd(args []string) {
 	case "coap":
 		simCoAP(*addr)
 		return
+	case "knx":
+		simKNX(*addr)
+		return
 	case "dlt645":
 		simDLT645(*addr)
 		return
@@ -581,7 +593,7 @@ func simCmd(args []string) {
 		return
 	case "modbus":
 	default:
-		fmt.Fprintf(os.Stderr, "未知协议 %q（支持 modbus | s7 | opcua | mqtt | mc | fins | enip | bacnet | iec104 | iec101 | mewtocol | hostlink | dnp3 | coap | dlt645 | cjt188 | snmp | ads | secs）\n", *proto)
+		fmt.Fprintf(os.Stderr, "未知协议 %q（支持 modbus | s7 | opcua | mqtt | mc | fins | enip | bacnet | iec104 | iec101 | mewtocol | hostlink | dnp3 | coap | knx | dlt645 | cjt188 | snmp | ads | secs）\n", *proto)
 		os.Exit(2)
 	}
 
@@ -1119,6 +1131,42 @@ func simCoAP(addr string) {
 	fmt.Println("  /reset（回 RST）  /.well-known/core（资源发现）")
 	fmt.Printf("  自检：   uic coapread -addr %s -discover\n", srv.Addr())
 	fmt.Printf("           uic coapread -addr %s -path /actuator/setpoint -write 42\n", srv.Addr())
+	fmt.Println("  Ctrl+C 停止")
+
+	<-ctx.Done()
+	slog.Info("sim_stopped")
+}
+
+// simKNX 启动内置 KNXnet/IP 网关（TUNNELING over UDP 3671）。
+//
+// 它不模拟整条总线，只模拟「一台网关 + 若干组地址对象」：收到
+// TUNNELLING_REQUEST 就回 TUNNELLING_ACK，再按组地址对象回 GroupValueResponse，
+// 或者把写入落到对象上并广播一条 GroupValueWrite。
+//
+// 初始值与 examples/knx.json 一一对应。注意每个点位都带 `@DPT`：组地址在
+// 总线上不携带类型，21.5 到底是 9.001（温度）还是 14.056（功率）只能由
+// 点表声明，猜错不会报错，只会读出一个荒谬的数。
+func simKNX(addr string) {
+	srv, err := knxsim.NewServer(addr)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "启动 KNX 网关失败: %v\n", err)
+		os.Exit(1)
+	}
+	defer func() { _ = srv.Close() }()
+
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	fmt.Printf("knxnet/ip gateway listening on %s (tunnelling, 组地址读写)\n", srv.Addr())
+	for _, o := range knxsim.DefaultObjects() {
+		fmt.Printf("  %-7s @%-7s %s\n", o.Group, o.DPT, o.Label)
+	}
+	fmt.Println("  行为：GroupValueRead → GroupValueResponse；GroupValueWrite → 更新对象并广播；")
+	fmt.Println("        未知组地址读静默（客户端超时），写被转发但不落地")
+	fmt.Println("  序号：8 位严格校验；重传只重发 ACK，不重复执行")
+	fmt.Printf("  自检：   uic knxread -addr %s -group 2/1/1 -dpt 9.001\n", srv.Addr())
+	fmt.Printf("           uic knxread -addr %s -group 1/1/1@1.001 -write on\n", srv.Addr())
+	fmt.Printf("           uic knxread -addr %s -probe\n", srv.Addr())
 	fmt.Println("  Ctrl+C 停止")
 
 	<-ctx.Done()

@@ -1,0 +1,137 @@
+{
+  "schemaVersion": 1,
+  "site": "knx-lab",
+  "server": {
+    "listen": "127.0.0.1:8099",
+    "token": "dev-token-0123456789"
+  },
+  "storage": {
+    "dir": "./data-knx",
+    "journal": true,
+    "outboxMaxRecords": 5000,
+    "outboxTtl": "10m"
+  },
+  "logging": {
+    "level": "info"
+  },
+  "northbound": {
+    "webhook": {
+      "enabled": false,
+      "url": "http://127.0.0.1:9999/ingest",
+      "timeout": "3s"
+    }
+  },
+  "channels": [
+    {
+      "id": "ch-knx",
+      "protocol": "knx",
+      "transport": {
+        "kind": "udp",
+        "address": "127.0.0.1:13671"
+      },
+      "concurrency": 1,
+      "timeout": "5s"
+    }
+  ],
+  "devices": [
+    {
+      "id": "knx-gateway",
+      "name": "内置 KNX 网关（隧道，组地址读写）",
+      "channel": "ch-knx",
+      "interval": "2s",
+      "timeout": "5s",
+      "enabled": true,
+      "labels": {
+        "heartbeat": "60s",
+        "maxRetries": "2",
+        "ackTimeout": "1s"
+      },
+      "points": [
+        {
+          "id": "lamp",
+          "name": "照明开关（1 位）",
+          "address": {
+            "kind": "symbol",
+            "path": "1/1/1",
+            "dpt": "1.001"
+          },
+          "dataType": "bool",
+          "writable": true,
+          "enabled": true
+        },
+        {
+          "id": "lamp2",
+          "name": "第二路开关（1 位，初始为开）",
+          "address": {
+            "kind": "symbol",
+            "path": "1/1/2",
+            "dpt": "1.001"
+          },
+          "dataType": "bool",
+          "writable": true,
+          "enabled": true
+        },
+        {
+          "id": "temperature",
+          "name": "室内温度（2 字节浮点）",
+          "address": {
+            "kind": "symbol",
+            "path": "2/1/1",
+            "dpt": "9.001"
+          },
+          "dataType": "float32",
+          "unit": "degC",
+          "enabled": true
+        },
+        {
+          "id": "humidity",
+          "name": "相对湿度（2 字节浮点）",
+          "address": {
+            "kind": "symbol",
+            "path": "2/1/2",
+            "dpt": "9.007"
+          },
+          "dataType": "float32",
+          "unit": "%RH",
+          "enabled": true
+        },
+        {
+          "id": "dimming",
+          "name": "调光/阀门位置（1 字节百分比）",
+          "address": {
+            "kind": "symbol",
+            "path": "3/1/1",
+            "dpt": "5.001"
+          },
+          "dataType": "float32",
+          "unit": "%",
+          "writable": true,
+          "enabled": true
+        },
+        {
+          "id": "power",
+          "name": "有功功率（4 字节浮点，每秒自增）",
+          "address": {
+            "kind": "symbol",
+            "path": "4/1/1",
+            "dpt": "14.056"
+          },
+          "dataType": "float32",
+          "unit": "W",
+          "enabled": true
+        },
+        {
+          "id": "counter",
+          "name": "有符号计数（2 字节整数）",
+          "address": {
+            "kind": "symbol",
+            "path": "5/1/1",
+            "dpt": "13.010"
+          },
+          "dataType": "int32",
+          "enabled": true
+        }
+      ]
+    }
+  ]
+}
