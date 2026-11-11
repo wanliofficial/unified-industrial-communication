@@ -411,9 +411,12 @@ public static partial class RestApi
         var actor = ctx.Engine.Find(deviceId);
         var cadence = actor is null ? TimeSpan.FromMilliseconds(250) : point.EffectiveInterval(actor.Device);
         var window = TimeSpan.FromMilliseconds(Math.Min(2000, Math.Max(300, cadence.TotalMilliseconds * 2)));
-        var deadline = DateTimeOffset.UtcNow + window;
+        // 等待确认是一段时长：必须用单调时钟。墙钟在这里会出现两个方向的问题——
+        // 后跳会让循环多等一个钟差（NTP 回拨一小时，这一个写点位的请求就挂一小时），
+        // 前跳则会让确认提前被判失败。到期时刻本身仍用墙钟，但「过了多久」只看 Stopwatch。
+        var started = System.Diagnostics.Stopwatch.GetTimestamp();
 
-        while (DateTimeOffset.UtcNow < deadline)
+        while (System.Diagnostics.Stopwatch.GetElapsedTime(started) < window)
         {
             var sample = ctx.Engine.Cache.Get(deviceId, point.Id);
 
