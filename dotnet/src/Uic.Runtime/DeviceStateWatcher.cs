@@ -60,6 +60,12 @@ public sealed class DeviceStateWatcher : IAsyncDisposable
     /// </summary>
     public TimeProvider Time { get; init; } = TimeProvider.System;
 
+    /// <summary>
+    /// 当前被观测的设备数。用例据此确认「下线设备确实被遗忘了」——
+    /// 没有这个口子就只能靠反射或间接行为去猜。
+    /// </summary>
+    public int TrackedDeviceCount => _lastState.Count;
+
     public void Start()
     {
         if (_disposed != 0) return;
@@ -98,8 +104,12 @@ public sealed class DeviceStateWatcher : IAsyncDisposable
         var wallNow = Time.GetUtcNow();
         var monoNow = Time.GetTimestamp();
 
-        foreach (var actor in _engine.Actors)
+        var actors = _engine.Actors;
+        var live = new HashSet<string>(actors.Count, StringComparer.Ordinal);
+
+        foreach (var actor in actors)
         {
+            live.Add(actor.DeviceId);
             var state = JsonEnum.ToWire(actor.State);
             var previous = _lastState.TryGetValue(actor.DeviceId, out var prev) ? prev : null;
 
@@ -128,6 +138,35 @@ public sealed class DeviceStateWatcher : IAsyncDisposable
 
             if (actor.State == RuntimeState.Collecting) CheckStale(actor, wallNow, monoNow);
         }
+
+        // 热更新删掉的设备必须一并遗忘：三个字典都按 deviceId 建条目，
+        // 不清就一直攒着（反复改配置的部署会持续增长）。更要紧的是两条错语义：
+        // 设备删了又原样加回来时，_lastState 里还是旧状态，等于「状态没变」，
+        // $state 不会被重推；_staleWarned 里还是旧的告警时刻，
+        // 会让新一轮停滞在 5 分钟去重窗口内被吞掉。
+        var gone = _lastState.Keys.Where(k => !live.Contains(k)).ToArray();
+        if (gone.Length > 0)
+        {
+            foreach (var device in gone) _lastState.Remove(device);
+            Prune(_staleWarned, live);
+            Prune(_firstSeen, live);
+
+            // broker 上还留着这台设备的 retained $state：不清掉，新订阅者会读到
+            // 一台配置里已经不存在的设备的最后状态。
+            if (sink is not null)
+            {
+                foreach (var device in gone)
+                {
+                    await sink.ForgetStateAsync(device, ct).ConfigureAwait(false);
+                    _log.LogInformation("device {Device} was removed; its retained state is cleared", device);
+                }
+            }
+        }
+    }
+
+    private static void Prune<T>(Dictionary<string, T> map, HashSet<string> live)
+    {
+        foreach (var key in map.Keys.Where(k => !live.Contains(k)).ToArray()) map.Remove(key);
     }
 
     private void CheckStale(DeviceActor actor, DateTimeOffset wallNow, long monoNow)

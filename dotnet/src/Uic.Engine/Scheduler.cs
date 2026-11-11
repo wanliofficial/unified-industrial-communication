@@ -19,7 +19,7 @@ public sealed class Scheduler : IAsyncDisposable
     private readonly SchedulerOptions _options;
     private readonly ConcurrentDictionary<string, DeviceActor> _actors = new(StringComparer.Ordinal);
     private readonly ConcurrentDictionary<string, ChannelGate> _gates = new(StringComparer.Ordinal);
-    private readonly DateTimeOffset _startedAt = DateTimeOffset.UtcNow;
+    private readonly long _startedStamp;
     private readonly SemaphoreSlim _applyLock = new(1, 1);
     private ConfigDocument _config = new();
     private int _disposed;
@@ -35,6 +35,7 @@ public sealed class Scheduler : IAsyncDisposable
         _logs = logs;
         _log = logs.CreateLogger("uic.scheduler");
         _options = options ?? new SchedulerOptions();
+        _startedStamp = _options.Time.GetTimestamp();
     }
 
     public PointCache Cache => _cache;
@@ -42,7 +43,17 @@ public sealed class Scheduler : IAsyncDisposable
 
     /// <summary>已注册的驱动。北向的 /drivers 端点直接读它，不另存一份元数据。</summary>
     public DriverRegistry Drivers => _drivers;
-    public TimeSpan Uptime => DateTimeOffset.UtcNow - _startedAt;
+
+    /// <summary>
+    /// 进程已运行时长。
+    ///
+    /// 用单调时钟算，不用 <c>UtcNow - 启动时刻</c>：NTP 校时往前跳一小时，
+    /// 墙钟算法会让 uptime 瞬间变成 3600 秒；往后跳甚至可能算出负数。
+    /// <c>/health</c> 里的 uptime 是排障时判断「是不是刚重启过」的依据，
+    /// 它不能跟着系统时钟一起撒谎。
+    /// </summary>
+    public TimeSpan Uptime => _options.Time.GetElapsedTime(_startedStamp);
+
     public IReadOnlyList<DeviceActor> Actors => _actors.Values.OrderBy(a => a.DeviceId, StringComparer.Ordinal).ToArray();
 
     public DeviceActor? Find(string deviceId) => _actors.TryGetValue(deviceId, out var a) ? a : null;

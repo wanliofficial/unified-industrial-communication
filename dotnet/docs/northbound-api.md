@@ -192,6 +192,9 @@ MQTT 的 TLS 是独立开关（`northbound.mqtt.tls`），语义见
 | GET | `/api/v1/health` | 设备/点位/队列汇总与问题清单 |
 | GET | `/api/v1/metrics` | Prometheus 文本格式 |
 
+`uptimeSeconds` 用单调时钟度量，不受 NTP 校时影响：系统时钟被拨动时它不会凭空多出一小时，
+也不会变成负数——排障时它要能如实回答「是不是刚重启过」。
+
 `/api/v1/health` 的形状：
 
 ```json
@@ -845,6 +848,9 @@ MQTT 的 TLS 是独立开关（`northbound.mqtt.tls`），语义见
 - 值主题由 `northbound.mqtt.topic` 模板决定，必须含 `{device}` 与 `{point}`；
 - `$state` 在设备运行态变化时发一次，`$birth` 在每次连上（含重连）后补发，
   因为 broker 重启会清空 retained；
+- 设备被热更新删掉时，往它的 `$state` 主题发一个**空载荷 + retained**把保留消息清掉，
+  并在后续重连中不再补发：retained 是 broker 上的副本，只删内存里的记录，
+  新订阅者仍会读到一台配置里已经不存在的设备的「最后状态」；
 - 停机时发 `$death` 并把遗嘱（LWT）也指向它，这样「进程被 kill」与「正常退出」
   在订阅端看起来一致；
 - 投递失败直接抛给 `Outbox` 保留位点重试 —— 这一层只负责「发出去并拿到 PUBACK」，不负责「不丢」；

@@ -21,6 +21,37 @@ internal static class ScheduleTests
         tests.Add(new TestCase("schedule/monotonic_arithmetic", MonotonicArithmetic));
         tests.Add(new TestCase("schedule/scheduler_assigns_phases", SchedulerAssignsPhases));
         tests.Add(new TestCase("schedule/phase_follows_fastest_point", PhaseFollowsFastestPoint));
+        tests.Add(new TestCase("schedule/uptime_ignores_a_clock_jump", UptimeIgnoresClockJump));
+    }
+
+    /// <summary>
+    /// uptime 必须用单调时钟算。
+    ///
+    /// <c>/health</c> 里的 uptime 是排障时判断「是不是刚重启过」的依据。用墙钟算，
+    /// 一次 NTP 校时前跳会让它凭空多出一小时，后跳甚至可能算出负数——
+    /// 那比没有这个字段更糟。
+    /// </summary>
+    private static async Task UptimeIgnoresClockJump(TestContext t)
+    {
+        var clock = new FakeClock();
+        var engine = new Scheduler(
+            new DriverRegistry(), new PointCache(), NullLoggerFactory.Instance,
+            new SchedulerOptions { Time = clock });
+
+        await using (engine)
+        {
+            t.Equal(TimeSpan.Zero, engine.Uptime, "a fresh scheduler has not been up yet");
+
+            // 只拨墙钟：这正是校时跳变的形状，单调时钟没有跟着走。
+            clock.Advance(TimeSpan.FromHours(1), TimeSpan.Zero);
+            t.Equal(TimeSpan.Zero, engine.Uptime,
+                "a wall-clock jump must not inflate uptime");
+
+            // 真实流逝才应改变 uptime。
+            clock.Advance(TimeSpan.Zero, TimeSpan.FromSeconds(42));
+            t.Equal(TimeSpan.FromSeconds(42), engine.Uptime,
+                "uptime follows the monotonic clock");
+        }
     }
 
     private static Task PhaseSpreadsDevices(TestContext t)

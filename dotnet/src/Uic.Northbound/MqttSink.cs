@@ -116,6 +116,29 @@ public sealed class MqttSink : IOutboxSink, IAsyncDisposable
         }
     }
 
+    /// <summary>
+    /// 设备被热更新删掉：清 retained 的 $state，并停止在重连时补发它。
+    ///
+    /// 只删内存不够——retained 是 broker 上的副本，新订阅者一上来就会读到
+    /// 一台已经不存在的设备的「最后状态」，运维会去查一个配置里没有的设备。
+    /// 清 retained 的协议动作是往同一主题发一个**空载荷 + retain**。
+    /// </summary>
+    public async Task ForgetStateAsync(string device, CancellationToken ct)
+    {
+        _lastStates.TryRemove(device, out _);
+
+        try
+        {
+            var topic = $"{_options.TopicPrefix}/{MqttClient.Segment(_site)}/{MqttClient.Segment(device)}/$state";
+            await _client.PublishAsync(topic, ReadOnlyMemory<byte>.Empty, retain: true, ct).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            // 清不掉不是数据问题，broker 上会留一条过期的 retained；下次重连不会再补发它。
+            _log.LogDebug("clearing retained state failed for {Device}: {Error}", device, ex.Message);
+        }
+    }
+
     private Task PublishStateRawAsync(string device, string payload, CancellationToken ct)
     {
         var topic = $"{_options.TopicPrefix}/{MqttClient.Segment(_site)}/{MqttClient.Segment(device)}/$state";

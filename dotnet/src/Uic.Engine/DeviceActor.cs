@@ -88,6 +88,13 @@ public sealed record SchedulerOptions
     /// 而不是去读进程的当前目录——驱动的输入必须全部来自显式参数。
     /// </summary>
     public string? DataDir { get; init; }
+
+    /// <summary>
+    /// 时间来源，只用于 <see cref="Scheduler.Uptime"/> 这类「走了多久」的度量。
+    /// 采集节奏用的是 <c>Stopwatch</c> 单调时间，不受这里影响；
+    /// 用例注入可拨时钟来验证校时跳变不会污染 uptime。
+    /// </summary>
+    public TimeProvider Time { get; init; } = TimeProvider.System;
 }
 
 /// <summary>
@@ -252,12 +259,45 @@ public sealed class DeviceActor : IAsyncDisposable
         var loop = Interlocked.Exchange(ref _loop, null);
         if (loop is not null)
         {
-            try { await loop.ConfigureAwait(false); } catch { /* 关闭期异常忽略 */ }
+            // 采集循环可能卡在一个**不响应取消**的驱动调用里（协议栈死锁、串口假死）。
+            // 无限等下去会让热更新和关机一起挂住：配置应用的上限是 2 秒，
+            // 而这里等的是一条不知道什么时候才会回来的读。
+            //
+            // 放弃等待是安全的：代次在 CloseConnAsync 里已经递增，飞行中的读结果
+            // 会被丢弃；循环回来后会看到 ct 已取消而退出。极端情况下泄漏一个
+            // 卡死的状态机，比让整个进程关不掉要好。
+            try
+            {
+                await loop.WaitAsync(StopGrace).ConfigureAwait(false);
+            }
+            catch (TimeoutException)
+            {
+                _log.LogWarning(
+                    "device {Device} did not stop within {Grace}s; abandoning a hung read",
+                    _device.Id, StopGrace.TotalSeconds);
+            }
+            catch { /* 关闭期异常忽略 */ }
         }
 
         cts?.Dispose();
         await CloseConnAsync().ConfigureAwait(false);
         SetState(RuntimeState.Disabled);
+    }
+
+    /// <summary>
+    /// 停止时等待采集循环的上限。
+    ///
+    /// 取读超时的 3 倍且不低于 5 秒：正常路径（读遵守取消令牌）远在这之内返回，
+    /// 而真卡死的驱动不应该把「改个配置」变成一次无限等待。
+    /// </summary>
+    private TimeSpan StopGrace
+    {
+        get
+        {
+            var readTimeout = _device.Timeout ?? _channel.Timeout;
+            var triple = readTimeout * 3;
+            return triple > TimeSpan.FromSeconds(5) ? triple : TimeSpan.FromSeconds(5);
+        }
     }
 
     private async Task LoopAsync(CancellationToken ct)

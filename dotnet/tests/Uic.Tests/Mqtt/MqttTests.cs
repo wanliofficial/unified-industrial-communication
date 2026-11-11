@@ -32,6 +32,47 @@ internal static class MqttTests
         tests.Add(new TestCase("mqtt/refused_connack_keeps_retrying_without_connecting", RefusedConnackKeepsRetrying));
         tests.Add(new TestCase("mqtt/idle_connection_sends_pingreq", IdleConnectionSendsPingreq));
         tests.Add(new TestCase("mqtt/subscribe_receives_inbound_and_sends_puback", SubscribeReceivesInboundAndSendsPuback));
+        tests.Add(new TestCase("mqtt/forgets_removed_device_state", ForgetsRemovedDeviceState));
+    }
+
+    /// <summary>
+    /// 设备下线后，broker 上那条 retained 的 <c>$state</c> 必须被清掉，
+    /// 并且重连时不再补发它。
+    ///
+    /// 只删内存里的副本是不够的：retained 是 broker 上的东西，新订阅者一上来
+    /// 就会读到一台配置里已经不存在的设备的「最后状态」。清它的协议动作是
+    /// 往同一主题发一个空载荷并置 retain。
+    /// </summary>
+    private static async Task ForgetsRemovedDeviceState(TestContext t)
+    {
+        await using var broker = new FakeMqttBroker();
+        await using var sink = new MqttSink(Options(broker.Port), "site-a", NullLogger.Instance);
+
+        sink.Start();
+        await WaitUntil(t, () => sink.Client.IsConnected, "the sink connects");
+
+        // 等 $birth 落地再发状态：IsConnected 只表示 CONNACK 已收到，
+        // 此时 $birth 可能还在路上；PublishStateAsync 会把发送异常吞掉，
+        // 抢跑会表现为「等了 8 秒也没等到」，而不是一条清楚的失败。
+        await WaitUntil(t, () => Count(broker, "uic/site-a/$birth") == 1, "the first $birth is published");
+
+        await sink.PublishStateAsync("d1", "online", previous: null, error: null, t.Ct);
+        await WaitUntil(t, () => Count(broker, "uic/site-a/d1/$state") == 1, "the state is published");
+
+        await sink.ForgetStateAsync("d1", t.Ct);
+
+        var clearing = broker.Published.Last(p => p.Topic == "uic/site-a/d1/$state");
+        t.Equal(string.Empty, clearing.Payload, "an empty payload with retain clears the topic");
+        t.Equal(true, clearing.Retain, "the clearing message must itself be retained");
+
+        // 重连后不能把已删设备的状态又补发回去。
+        var before = Count(broker, "uic/site-a/d1/$state");
+        broker.DropConnections();
+        await WaitUntil(t, () => broker.Connects.Count >= 2, "the client reconnects");
+        await WaitUntil(t, () => Count(broker, "uic/site-a/$birth") >= 2, "the reconnect republishes $birth");
+
+        t.Equal(before, Count(broker, "uic/site-a/d1/$state"),
+            "a forgotten device is not republished after a reconnect");
     }
 
     private static MqttOptions Options(int port, int qos = 1, string? username = null, string? password = null, int keepAliveSeconds = 30) => new()
