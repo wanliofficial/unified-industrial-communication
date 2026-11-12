@@ -12,8 +12,8 @@ PRD 中 M 级的采集协议已全部落地，FR-CFG-01 的四类寻址模型也
 可自动跑的用例（见 §7），唯一剩下的延期项是 object/file 寻址的实际驱动，
 见 [protocol-status.md](protocol-status.md) §4.1。
 
-当前测试基线：**310 passed / 0 failed / 3 skipped**（跳过的是需要 `--opcua` 的 OPC UA 端到端用例）；
-加 `-- --opcua` 跑全量是 **313 passed / 0 failed / 0 skipped**。
+当前测试基线：**313 passed / 0 failed / 3 skipped**（跳过的是需要 `--opcua` 的 OPC UA 端到端用例）；
+加 `-- --opcua` 跑全量是 **316 passed / 0 failed / 0 skipped**。
 
 ## 1. 采集（FR-COL）
 
@@ -29,7 +29,7 @@ PRD 中 M 级的采集协议已全部落地，FR-CFG-01 的四类寻址模型也
 | FR-COL-08 | 驱动能力四态声明 | 已实现 | `GET /api/v1/drivers` 暴露 `Capabilities`；控制台「驱动」页渲染八项四态徽标、设备页显示读写/订阅/浏览四项；`contract/drivers_expose_capability_states` 锁住四态线上名字 |
 | FR-COL-09 | 批量读规划（合并 / 非法跨越拒绝） | 已实现 | `planner/*` 八条：相邻合并、跨空洞不合并、按寄存器与位上限切分、按区域分离、每点恰好覆盖一次 |
 | FR-COL-10 | 每点位独立采集周期 | 已实现 | `Point.interval` 覆盖设备周期（空/0 表示继承，非 0 时 100ms..24h）；`DeviceActor` 按有效周期分桶，每轮只读到期的桶并合并成一次串行读取，快慢变量互不拖累。证据 `engine/point_interval_overrides_device_period`（1s 设备 + 100ms 点位）、`engine/point_interval_failure_is_scoped_to_due_bucket`、`csv/imports_point_interval`、`schedule/phase_follows_fastest_point`、`contract/points_expose_effective_interval`；看门狗阈值取设备内最慢周期，启动相位取最快周期，点位 DTO 暴露 `interval` 与 `effectiveInterval` |
-| FR-COL-11 | 写入（单点/多点），写后校验与超时 | 已实现 | 单点/多点、逐点裁决、超时三态（`ok`/`disabled`/`timeout`）已实现：`contract/write_returns_per_point_results`。`confirm: true` 在同一个通道租约内立即回读并比较，结果带 `verified`；不一致返回 `ok=false` + `uncertain` + `verify.mismatch`：`engine/write_confirmation_reads_back`、`engine/write_confirmation_detects_mismatch`、`engine/write_without_confirmation_skips_readback`。数组点位的元素个数在**建链前**校验，不符直接拒绝而不是交给驱动：`engine/array_write_shape_is_validated_before_the_device` |
+| FR-COL-11 | 写入（单点/多点），写后校验与超时 | 已实现 | 单点/多点、逐点裁决、超时三态（`ok`/`disabled`/`timeout`）已实现：`contract/write_returns_per_point_results`。`confirm: true` 在同一个通道租约内立即回读并比较，结果带 `verified`；不一致返回 `ok=false` + `uncertain` + `verify.mismatch`：`engine/write_confirmation_reads_back`、`engine/write_confirmation_detects_mismatch`、`engine/write_without_confirmation_skips_readback`。数组点位的元素个数在**建链前**校验，不符直接拒绝而不是交给驱动：`engine/array_write_shape_is_validated_before_the_device`。值越界（如 70000 写 uint16）与超长文本直接逐点拒绝，不静默取模/截断：`codec/encode_rejects_out_of_range`、`codec/encode_rejects_overlong_text` |
 | FR-COL-12 | 订阅型协议（COV/事件/通知） | 刻意没做（C） | 路线图 Wave 2。`Capabilities.Subscribe` 是四态声明，OPC UA 客户端已声明 `supported` 并通过 `ISubscriptionConn` 提供真实的 MonitoredItem 订阅（`opcua/client_read_write_subscribe`），但**采集主路径仍是按周期轮询**，与 Modbus/S7 一致：把订阅接到调度器需要另一套「推送驱动的重试/熔断/死区」语义，不在本版范围内 |
 
 ## 2. 数据模型与配置（FR-CFG）
@@ -70,7 +70,7 @@ PRD 中 M 级的采集协议已全部落地，FR-CFG-01 的四类寻址模型也
 
 | 编号 | 需求 | 状态 | 证据 / 说明 |
 |---|---|---|---|
-| FR-PROC-01 | 线性缩放与偏移 | 已实现 | `pipeline/scale_and_offset`、`pipeline/rounding_for_integer_types` |
+| FR-PROC-01 | 线性缩放与偏移 | 已实现 | 读方向 `raw × scale + offset`，整型四舍五入：`pipeline/scale_and_offset`、`pipeline/rounding_for_integer_types`。写方向按同一组参数**反算**回寄存器原始值（否则「写 10、读回 1」，且 confirm 回读在原始值域里比较会把错误写入报成 `verified: true`）：`contract/write_values_are_engineering_units` |
 | FR-PROC-02 | 死区（绝对值/百分比/变化率） | 已实现 | `pipeline/deadband_percent_uses_range_span`、`pipeline/deadband_rate_uses_elapsed_time`、`cache/publish_configured_applies_point_rule`、`csv/imports_deadband_mode_and_range`；`Point.DeadbandMode` 与 `Pipeline.ExceedsDeadband` 三种模式，语义见 [configuration.md](configuration.md#死区) |
 | FR-PROC-03 | 质量传播（Bad/Stale 不参与计算与上报） | 已实现 | `pipeline/bad_quality_skips_scaling`、`pipeline/bad_quality_preserves_reason`、`pipeline/deadband_reports_quality_transitions` |
 | FR-PROC-04 | 单位与量程元数据 | 已实现 | `unit` 贯穿配置与北向；`rangeMin`/`rangeMax` 进入 `Point`、配置校验、CSV 导入与点位 JSON，证据 `config/deadband_and_range_rules`、`csv/imports_deadband_mode_and_range` |

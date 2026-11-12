@@ -184,48 +184,58 @@ public static class ValueCodec
     /// <summary>把单个元素写进 <paramref name="buf"/>（大端，尚未套字节序变换）。</summary>
     private static void EncodeElement(Span<byte> buf, DataValue value, DataType type)
     {
+        var number = value.AsNumber();
+
         switch (type)
         {
             case DataType.Bool:
                 BinaryPrimitives.WriteUInt16BigEndian(buf, value.AsBool() ? (ushort)1 : (ushort)0);
                 break;
             case DataType.Int16:
-                BinaryPrimitives.WriteInt16BigEndian(buf, (short)value.AsNumber());
+                BinaryPrimitives.WriteInt16BigEndian(buf, (short)Signed(type, number, short.MinValue, short.MaxValue));
                 break;
             case DataType.UInt16:
-                BinaryPrimitives.WriteUInt16BigEndian(buf, (ushort)value.AsNumber());
+                BinaryPrimitives.WriteUInt16BigEndian(buf, (ushort)Unsigned(type, number, ushort.MaxValue));
                 break;
             case DataType.Int32:
-                BinaryPrimitives.WriteInt32BigEndian(buf, (int)value.AsNumber());
+                BinaryPrimitives.WriteInt32BigEndian(buf, (int)Signed(type, number, int.MinValue, int.MaxValue));
                 break;
             case DataType.UInt32:
-                BinaryPrimitives.WriteUInt32BigEndian(buf, (uint)value.AsNumber());
+                BinaryPrimitives.WriteUInt32BigEndian(buf, (uint)Unsigned(type, number, uint.MaxValue));
                 break;
             case DataType.Int64:
-                BinaryPrimitives.WriteInt64BigEndian(buf, (long)value.AsNumber());
+                BinaryPrimitives.WriteInt64BigEndian(buf, Signed(type, number, long.MinValue, long.MaxValue));
                 break;
             case DataType.UInt64:
-                BinaryPrimitives.WriteUInt64BigEndian(buf, (ulong)value.AsNumber());
+                BinaryPrimitives.WriteUInt64BigEndian(buf, Unsigned(type, number, ulong.MaxValue));
                 break;
             case DataType.Float32:
-                BinaryPrimitives.WriteSingleBigEndian(buf, (float)value.AsNumber());
+                BinaryPrimitives.WriteSingleBigEndian(buf, (float)Real(type, number, float.MaxValue));
                 break;
             case DataType.Float64:
-                BinaryPrimitives.WriteDoubleBigEndian(buf, value.AsNumber());
+                BinaryPrimitives.WriteDoubleBigEndian(buf, Real(type, number, double.MaxValue));
                 break;
             case DataType.Bcd16:
-                EncodeBcd(buf[..2], (long)value.AsNumber());
+                // 先按 BCD 的十进制位宽校验再转换：(long)NaN 在 .NET 上得到 0，
+                // 会静默写一个「0000」出去，看起来就像一个合法的读数。
+                EncodeBcd(buf[..2], Signed(type, number, 0, 9_999));
                 break;
             case DataType.Bcd32:
-                EncodeBcd(buf[..4], (long)value.AsNumber());
+                EncodeBcd(buf[..4], Signed(type, number, 0, 99_999_999));
                 break;
             case DataType.String:
                 var bytes = System.Text.Encoding.ASCII.GetBytes(value.Text ?? string.Empty);
-                bytes.AsSpan(0, Math.Min(bytes.Length, buf.Length)).CopyTo(buf);
+                if (bytes.Length > buf.Length)
+                    throw new FormatException(
+                        $"text is {bytes.Length} bytes but the point holds {buf.Length}; shorten it or grow the point length");
+                bytes.CopyTo(buf);
                 break;
             case DataType.Bytes:
                 var raw = Convert.FromBase64String(value.Text ?? string.Empty);
-                raw.AsSpan(0, Math.Min(raw.Length, buf.Length)).CopyTo(buf);
+                if (raw.Length > buf.Length)
+                    throw new FormatException(
+                        $"{raw.Length} bytes but the point holds {buf.Length}; sending a truncated payload would silently rewrite it");
+                raw.CopyTo(buf);
                 break;
             case DataType.DateTime:
                 // 写不出去的时间宁可报错也不写 0：0 是 1970-01-01，
@@ -237,6 +247,51 @@ public static class ValueCodec
             default:
                 throw new NotSupportedException($"type {type} is not encodable");
         }
+    }
+
+    /// <summary>
+    /// 有符号整数的范围检查。不做检查的后果是静默取模：70000 写进 uint16 会变成
+    /// 4464，设备收到一个用户从未输入过的值，而 API 报 ok——现场只会表现为
+    /// 「设备不听话」，几乎不可能联想到写入值越界。小数按整数部分截断是既有语义
+    /// （scale 换算后常带小数），越界与 NaN/Inf 必须拒绝。
+    /// </summary>
+    private static long Signed(DataType type, double value, long min, long max)
+    {
+        var whole = Math.Truncate(value);
+        if (!double.IsFinite(whole) || whole < min || whole > max)
+            throw new FormatException($"value {value:R} does not fit in {type}");
+
+        // long.MaxValue 转成 double 正好是 2^63，「不超过上限」的比较会放它过去，
+        // 但 (long)2^63 会回绕成负数。回代一次才能确认取到的真是同一个数。
+        var cast = (long)whole;
+        if ((double)cast != whole)
+            throw new FormatException($"value {value:R} does not fit in {type}");
+        return cast;
+    }
+
+    /// <summary>无符号整数的范围检查；2^64 与 ulong.MaxValue 在 double 上是同一个数，只能按开区间拒绝。</summary>
+    private static ulong Unsigned(DataType type, double value, ulong max)
+    {
+        var whole = Math.Truncate(value);
+        if (!double.IsFinite(whole) || whole < 0 || whole > max ||
+            whole >= 18446744073709551616d)
+            throw new FormatException($"value {value:R} does not fit in {type}");
+
+        var cast = (ulong)whole;
+        if ((double)cast != whole)
+            throw new FormatException($"value {value:R} does not fit in {type}");
+        return cast;
+    }
+
+    /// <summary>
+    /// 浮点的可写性检查。double → float 的越界转换不抛异常，而是变成 Infinity：
+    /// 设备会收到「正无穷」这个特殊值，回读比对也因 NaN 语义一律判不等。
+    /// </summary>
+    private static double Real(DataType type, double value, double max)
+    {
+        if (!double.IsFinite(value) || Math.Abs(value) > max)
+            throw new FormatException($"value {value:R} does not fit in {type}");
+        return value;
     }
 
     private static double DecodeBcd(ReadOnlySpan<byte> raw)

@@ -18,6 +18,8 @@ internal static class CodecTests
         tests.Add(new TestCase("codec/byte_order_encodes_as_expected", ByteOrderEncodesAsExpected));
         tests.Add(new TestCase("codec/byte_order_roundtrip", ByteOrderRoundtrip));
         tests.Add(new TestCase("codec/byte_order_does_not_scramble_text", ByteOrderDoesNotScrambleText));
+        tests.Add(new TestCase("codec/encode_rejects_out_of_range", EncodeRejectsOutOfRange));
+        tests.Add(new TestCase("codec/encode_rejects_overlong_text", EncodeRejectsOverlongText));
         tests.Add(new TestCase("codec/bcd_roundtrip", BcdRoundtrip));
         tests.Add(new TestCase("codec/datetime_is_unix_milliseconds", DateTimeIsUnixMilliseconds));
         tests.Add(new TestCase("codec/window_rejects_invalid_spans", WindowRejectsInvalidSpans));
@@ -123,6 +125,63 @@ internal static class CodecTests
             t.Equal(Hex(blob), Hex(Convert.FromBase64String(decoded.Text!)),
                 $"{order}: a byte blob keeps its byte order");
         }
+
+        return Task.CompletedTask;
+    }
+
+    /// <summary>
+    /// 写入值超出类型范围必须报错，不能静默取模。70000 写进 uint16 会变成 4464，
+    /// 设备收到的是用户从未输入过的值，API 却报 ok——现场只会表现为「设备不听话」。
+    /// 小数截断是允许的：点位 scale 换算后本来就常带小数。
+    /// </summary>
+    private static Task EncodeRejectsOutOfRange(TestContext t)
+    {
+        static byte[] Encode(DataType type, double value, int registers)
+            => ValueCodec.Encode(DataValue.Number(type, value), type, ByteOrder.ABCD, registers);
+
+        t.Throws<FormatException>(() => Encode(DataType.UInt16, 70_000, 1), "uint16 overflow must not wrap");
+        t.Throws<FormatException>(() => Encode(DataType.Int16, -40_000, 1), "int16 underflow must not wrap");
+        t.Throws<FormatException>(() => Encode(DataType.UInt32, -1, 2), "negative into uint32");
+        t.Throws<FormatException>(() => Encode(DataType.UInt64, 1.9e19, 4), "uint64 overflow");
+        t.Throws<FormatException>(() => Encode(DataType.Int64, 9.3e18, 4), "int64 overflow");
+        t.Throws<FormatException>(() => Encode(DataType.Float32, 1e300, 2), "double too large for float32");
+        t.Throws<FormatException>(() => Encode(DataType.Float64, double.NaN, 4), "nan is not a writable value");
+        t.Throws<FormatException>(() => Encode(DataType.Float32, double.PositiveInfinity, 2), "infinity is not writable");
+        // BCD 的位宽由寄存器数决定：(long)NaN 在 .NET 上得 0，不先校验就会静默写一个「0000」。
+        t.Throws<FormatException>(() => Encode(DataType.Bcd16, 10_000, 1), "bcd16 overflow");
+        t.Throws<FormatException>(() => Encode(DataType.Bcd16, -1, 1), "bcd16 cannot hold negatives");
+        t.Throws<FormatException>(() => Encode(DataType.Bcd32, 100_000_000, 2), "bcd32 overflow");
+        t.Throws<FormatException>(() => Encode(DataType.Bcd16, double.NaN, 1), "nan into bcd");
+
+        // 边界值本身要能写：范围检查不能把合法的最大值一起挡掉。
+        t.Equal("FFFF", Hex(Encode(DataType.UInt16, 65_535, 1)), "uint16 max");
+        t.Equal("7FFF", Hex(Encode(DataType.Int16, 32_767, 1)), "int16 max");
+        t.Equal("FFFFFFFF", Hex(Encode(DataType.UInt32, 4_294_967_295d, 2)), "uint32 max");
+        t.Equal("000A", Hex(Encode(DataType.UInt16, 10.9, 1)), "fraction truncates");
+
+        return Task.CompletedTask;
+    }
+
+    /// <summary>
+    /// 文本/字节串比点位长时必须报错。截断会安静地写半截，回读看起来仍然「有值」；
+    /// 现场的后果是配方名、序列号被悄悄改短，直到对账才发现。
+    /// </summary>
+    private static Task EncodeRejectsOverlongText(TestContext t)
+    {
+        t.Throws<FormatException>(
+            () => ValueCodec.Encode(DataValue.String("ABCDE"), DataType.String, ByteOrder.ABCD, 2),
+            "5 chars into 2 registers");
+        t.Throws<FormatException>(
+            () => ValueCodec.Encode(DataValue.Bytes(new byte[5]), DataType.Bytes, ByteOrder.ABCD, 2),
+            "5 bytes into 2 registers");
+
+        // 恰好装满与不足（补 0）都仍然合法。
+        t.Equal("41424344",
+            Hex(ValueCodec.Encode(DataValue.String("ABCD"), DataType.String, ByteOrder.ABCD, 2)),
+            "exact fit");
+        t.Equal("41420000",
+            Hex(ValueCodec.Encode(DataValue.String("AB"), DataType.String, ByteOrder.ABCD, 2)),
+            "short text is padded");
 
         return Task.CompletedTask;
     }

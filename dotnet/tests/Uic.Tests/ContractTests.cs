@@ -58,6 +58,7 @@ internal static class ContractTests
         tests.Add(new TestCase("contract/config_validate_reports_problems", ConfigValidateReportsProblems));
         tests.Add(new TestCase("contract/plaintext_credentials_are_rejected", PlaintextCredentialsAreRejected));
         tests.Add(new TestCase("contract/write_returns_per_point_results", WriteReturnsPerPointResults));
+        tests.Add(new TestCase("contract/write_values_are_engineering_units", WriteValuesAreEngineeringUnits));
         tests.Add(new TestCase("contract/single_point_write_is_idempotent", SinglePointWriteIsIdempotent));
         tests.Add(new TestCase("contract/idempotency_window_ignores_a_clock_jump", IdempotencyWindowIgnoresAClockJump));
         tests.Add(new TestCase("contract/template_instantiates_and_applies_devices", TemplateInstantiatesAndApplies));
@@ -951,6 +952,90 @@ internal static class ContractTests
             var readOnly = await host.Client.SendAsync(Post("/api/v1/points/nope/temp/write", body), t.Ct);
             t.Equal(HttpStatusCode.NotFound, readOnly.StatusCode, "unknown device is a 404");
         });
+    }
+
+    /// <summary>
+    /// 写入值必须是工程量，与读方向共用同一组 scale/offset。
+    ///
+    /// 读方向做了「原始值 × scale + offset」，写方向不做反算的话，同一个点位
+    /// 「写 10、读回 1」——现场只会以为设备不接受设定值；更糟的是 confirm 回读
+    /// 比的是原始值，会给出 verified=true，把错误的写入伪装成成功。
+    /// </summary>
+    private static Task WriteValuesAreEngineeringUnits(TestContext t)
+    {
+        return RunAsync(async () =>
+        {
+            // 配置模型是 init-only，改配置走「序列化 → 改 JSON → 解析」，
+            // 顺带验证 scale/offset 的线上写法能被读回来。
+            var node = JsonNode.Parse(JsonDefaults.ToJson(BuildConfig()))!.AsObject();
+            var points = node["devices"]![0]!["points"]!.AsArray();
+            points[0]!["scale"] = 0.1;
+            points.Add(JsonNode.Parse("""
+                {
+                  "id": "level", "name": "液位",
+                  "address": { "area": "holding", "offset": 20 },
+                  "dataType": "uint16", "scale": 0.5, "offset": 1
+                }
+                """)!);
+
+            await using var host = await Host.StartAsync(t, () => ConfigStore.Parse(node.ToJsonString()));
+
+            var initial = await WaitForPointAsync(host, "v1", "temp", t);
+            t.Close(4.2, initial.GetProperty("value").GetProperty("num").GetDouble(), 1e-9,
+                "read side scales the raw baseline");
+
+            const string body = """
+                                {
+                                  "writes": [
+                                    { "point": "temp",  "value": { "type": "float64", "num": 10 }, "confirm": true },
+                                    { "point": "level", "value": { "type": "uint16",  "num": 11 }, "confirm": true }
+                                  ]
+                                }
+                                """;
+
+            var response = await host.Client.SendAsync(Post("/api/v1/points/v1/write", body), t.Ct);
+            t.Equal(HttpStatusCode.OK, response.StatusCode, "batch write is accepted");
+
+            using (var document = await ReadJsonAsync(t, response))
+            {
+                foreach (var result in document.RootElement.GetProperty("results").EnumerateArray())
+                {
+                    t.Equal(true, result.GetProperty("ok").GetBoolean(),
+                        $"{result.GetProperty("point").GetString()} writes in engineering units");
+                    t.Equal(true, result.GetProperty("verified").GetBoolean(),
+                        $"{result.GetProperty("point").GetString()} readback matches the requested value");
+                }
+            }
+
+            // 下一轮采集就能看到设备里的原始值被读方向重新换算回工程量。
+            t.Close(10, await WaitForNumberAsync(host, "v1", "temp", 10, t), 1e-9,
+                "a float point round-trips its engineering value");
+            t.Close(11, await WaitForNumberAsync(host, "v1", "level", 11, t), 1e-9,
+                "an integer point applies scale and offset the other way round");
+        });
+    }
+
+    private static async Task<double> WaitForNumberAsync(
+        Host host, string device, string point, double expected, TestContext t)
+    {
+        var deadline = Stopwatch.StartNew();
+        var last = double.NaN;
+
+        while (deadline.Elapsed < TimeSpan.FromSeconds(10))
+        {
+            using var document = await ReadJsonAsync(
+                t, await host.Client.SendAsync(Get($"/api/v1/points/{device}/{point}"), t.Ct));
+
+            var value = document.RootElement.GetProperty("value");
+            last = value.GetProperty("num").GetDouble();
+
+            if (Math.Abs(last - expected) < 1e-9) return last;
+
+            await Task.Delay(100, t.Ct);
+        }
+
+        t.Fail($"{device}/{point} never settled on {expected} (last value: {last})");
+        return last;
     }
 
     /// <summary>

@@ -124,7 +124,11 @@ public sealed record PointRef(
     public bool IsArray => Count > 1;
 }
 
-/// <summary>驱动层写入命令。与 API 层的写入请求分开，避免协议细节泄漏到接口层。</summary>
+/// <summary>
+/// 驱动层写入命令。与 API 层的写入请求分开，避免协议细节泄漏到接口层。
+/// <see cref="Value"/> 永远是**寄存器原始值**：scale/offset 的反算在调度器里完成，
+/// 驱动不该知道点位表里的工程量口径。
+/// </summary>
 public sealed record WriteCommand(PointRef Point, DataValue Value, bool Confirm = false);
 
 /// <summary>原始采样：驱动只负责「值 + 质量 + 设备时标」，缩放与死区在上层。</summary>

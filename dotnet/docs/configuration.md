@@ -263,7 +263,7 @@ Broker 侧用 TLS + 网络 ACL 把订阅方限定到固定网段，与 OPC UA �
 | `address` | 必填 | 见下 |
 | `dataType` | `uint16` | 见下 |
 | `byteOrder` | 继承设备 | 32/64 位值的排列；`string`/`bytes` 是原样字节流，不参与重排 |
-| `scale` / `offset` | `1` / `0` | 线性变换 `值 × scale + offset` |
+| `scale` / `offset` | `1` / `0` | 线性变换 `值 × scale + offset`；读写双向都用这组参数（写入时反算成原始值） |
 | `deadband` | 不启用 | 死区阈值；含义由 `deadbandMode` 决定，`>= 0` |
 | `deadbandMode` | `absolute` | `absolute` / `percent` / `rate`，见下 |
 | `rangeMin` / `rangeMax` | — | 量程下限 / 上限；必须成对出现且 `rangeMin < rangeMax` |

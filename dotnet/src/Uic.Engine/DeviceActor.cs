@@ -702,6 +702,18 @@ public sealed class DeviceActor : IAsyncDisposable
             accepted.Add(command);
         }
 
+        // 形状校验通过后立刻把工程量换算回寄存器原始值：驱动层只认识线上值。
+        // 放在这里而不是驱动里，是为了让「写」与「读」共用同一组 scale/offset，
+        // 并且写后确认（在原始值域里比较）也拿到同一份期望值。
+        for (var i = 0; i < accepted.Count; i++)
+        {
+            var point = _device.Points.FirstOrDefault(p =>
+                string.Equals(p.Id, accepted[i].Point.Id, StringComparison.Ordinal));
+
+            if (point is not null)
+                accepted[i] = accepted[i] with { Value = Pipeline.ToRaw(point, accepted[i].Value) };
+        }
+
         if (accepted.Count == 0)
             return results.Select(r => r!).ToArray();
 

@@ -56,6 +56,31 @@ public static class Pipeline
             : Math.Round(scaled, MidpointRounding.AwayFromZero);
     }
 
+    /// <summary>
+    /// 写入方向的反算：北向传来的是工程量，驱动要的是寄存器原始值。
+    ///
+    /// 读方向是 <c>raw × scale + offset</c>，写方向若原样下发，同一个点位就会
+    /// 「写 10、读回 1」——现场只会以为设备不接受设定值。更隐蔽的是写后确认：
+    /// 回读比较在原始值域里做，两边都错得一样，于是报 <c>verified: true</c>，
+    /// 把一个错误的写入伪装成成功。整型点位按四舍五入落回整数，与读方向同一种舍入。
+    /// </summary>
+    public static DataValue ToRaw(Point point, DataValue value)
+    {
+        if (!value.Type.IsNumeric() || (point.Scale == 1 && point.Offset == 0)) return value;
+
+        double Convert(double engineered)
+        {
+            var raw = (engineered - point.Offset) / point.Scale;
+            return point.DataType is DataType.Float32 or DataType.Float64
+                ? raw
+                : Math.Round(raw, MidpointRounding.AwayFromZero);
+        }
+
+        return value.Array is { } array
+            ? DataValue.Numbers(point.DataType, array.Select(Convert).ToArray())
+            : DataValue.Number(point.DataType, Convert(value.AsNumber()));
+    }
+
     /// <summary>死区判定。返回 true 表示「变化超过阈值，应当上报」。</summary>
     public static bool ExceedsDeadband(Sample? previous, Sample next, double? deadband)
         => ExceedsDeadband(previous, next, deadband, DeadbandMode.Absolute, null, null);
