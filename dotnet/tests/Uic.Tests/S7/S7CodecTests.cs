@@ -145,6 +145,25 @@ internal static class S7CodecTests
         var items = S7Read.ParseResponse(pdu, 1);
         t.Equal("12345678", Hex(items[0].Data), "32 bits means 4 bytes, not 32");
 
+        // 同一条规则必须覆盖 0x05/0x06/0x07：PLC 按变量的原生类型回传输尺寸时，
+        // 只有 0x04 走对、其余三种按字节解释，会把 4 字节的 REAL 当成 32 字节。
+        var integer = S7Frame.Parse(Convert.FromHexString(
+            "3203000000030002000600 00".Replace(" ", "") + "0401" + "FF0500101234"));
+        t.Equal("1234", Hex(S7Read.ParseResponse(integer, 1)[0].Data), "0x05 INTEGER is also in bits");
+
+        var dint = S7Frame.Parse(Convert.FromHexString(
+            "3203000000030002000600 00".Replace(" ", "") + "0401" + "FF0600101234"));
+        t.Equal("1234", Hex(S7Read.ParseResponse(dint, 1)[0].Data), "0x06 DINTEGER is also in bits");
+
+        var real = S7Frame.Parse(Convert.FromHexString(
+            "3203000000030002000800 00".Replace(" ", "") + "0401" + "FF07002012345678"));
+        t.Equal("12345678", Hex(S7Read.ParseResponse(real, 1)[0].Data), "0x07 REAL is also in bits");
+
+        // 0x09 OCTET STRING 是唯一按**字节**计数的传输尺寸。
+        var octets = S7Frame.Parse(Convert.FromHexString(
+            "3203000000030002000800 00".Replace(" ", "") + "0401" + "FF09000412345678"));
+        t.Equal("12345678", Hex(S7Read.ParseResponse(octets, 1)[0].Data), "0x09 counts bytes");
+
         return Task.CompletedTask;
     }
 

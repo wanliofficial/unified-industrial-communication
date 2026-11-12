@@ -517,11 +517,14 @@ public static class S7Read
             var transport = pdu.Data[offset + 1];
             var length = BinaryPrimitives.ReadUInt16BigEndian(pdu.Data.AsSpan(offset + 2, 2));
 
-            // 长度字段的单位由传输尺寸决定：0x04/0x05 是位，0x06/0x07/0x09 是字节。
+            // 长度字段的单位由传输尺寸决定：0x03/0x04/0x05/0x06/0x07 是位，0x09 是字节。
             // 拿位当字节会读出 8 倍长度的「数据」，而且后面每一项的偏移全错。
+            // 0x05/0x06/0x07 不是当前请求会用到的档位（我们统一按 BYTE 请求），
+            // 但 PLC 按变量原生类型回传输尺寸时就会出现——不能只认 0x04。
             var byteCount = transport switch
             {
                 S7Constants.DataBit or S7Constants.DataByteWordDword or S7Constants.DataInteger
+                    or S7Constants.DataDint or S7Constants.DataReal
                     => (length + 7) / 8,
                 _ => length,
             };
