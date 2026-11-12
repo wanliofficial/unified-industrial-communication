@@ -463,16 +463,26 @@ public readonly record struct S7ReadItem(S7Address Address, int ByteCount, bool 
 /// <summary>读请求 / 读响应的编解码。</summary>
 public static class S7Read
 {
+    /// <summary>
+    /// 一次请求最多多少项。S7 参数头的项数字段只有 8 位（见 <see cref="S7Constants"/>）。
+    /// 这是一个**线格式**上限，与协商出的 PDU 大小无关：PDU 240 时实际能放不到 20 项，
+    /// 但编解码层不能依赖驱动一定切过片。
+    /// </summary>
+    public const int MaxItemsPerRequest = 255;
+
     public static byte[] BuildRequest(ushort pduReference, IReadOnlyList<S7ReadItem> items)
     {
         if (items.Count == 0)
             throw DriverException.ProtocolError("s7", "encode", "empty read request");
 
-        // 项数上限由 PDU 长度决定，不在这里写死：驱动会按协商出的 PDU 切片。
-        // 这里只拦住参数长度会溢出 16 位的病态输入。
-        if (items.Count > 5000)
+        // 请求里的项数是**一个字节**（参数头第 2 字节）。超过 255 时那个字段会
+        // 截断：256 项写成 0，257 写成 1——PLC 只按截断后的个数读取，
+        // 多出来的项被静默丢掉，而返回值仍然是「成功」，调用方拿到的是错位的值。
+        // 因此在上限处直接失败，不靠「PDU 预算会先拦住」这种间接保证：
+        // 这是公开的编解码 API，PDU 预算只在驱动里成立。
+        if (items.Count > MaxItemsPerRequest)
             throw DriverException.ProtocolError("s7", "encode",
-                $"{items.Count} items in one request do not fit in a 16-bit parameter length");
+                $"{items.Count} items in one request exceed the 1-byte item count (max {MaxItemsPerRequest})");
 
         var param = new byte[2 + items.Count * 12];
         param[0] = S7Constants.FuncReadVar;
@@ -558,6 +568,13 @@ public static class S7Write
     {
         if (items.Count == 0)
             throw DriverException.ProtocolError("s7", "encode", "empty write request");
+
+        // 与读请求同一个线格式上限：项数字段是 8 位，截断后 PLC 只写前 N 项，
+        // 剩下的点位「写成功」但设备上根本没变。
+        if (items.Count > S7Read.MaxItemsPerRequest)
+            throw DriverException.ProtocolError("s7", "encode",
+                $"{items.Count} items in one request exceed the 1-byte item count " +
+                $"(max {S7Read.MaxItemsPerRequest})");
 
         var param = new byte[2 + items.Count * 12];
         param[0] = S7Constants.FuncWriteVar;

@@ -32,6 +32,7 @@ internal static class S7CodecTests
         tests.Add(new TestCase("s7/address_rejects_bad_input", AddressRejectsBadInput));
         tests.Add(new TestCase("s7/tpkt_rejects_bad_version", TpktRejectsBadVersion));
         tests.Add(new TestCase("s7/cotp_rejects_fragmented_pdu", CotpRejectsFragmentedPdu));
+        tests.Add(new TestCase("s7/item_count_fits_in_one_byte", ItemCountFitsInOneByte));
     }
 
     private static Task TpktRoundTrip(TestContext t)
@@ -315,6 +316,58 @@ internal static class S7CodecTests
         var refused = t.Throws<DriverException>(
             () => Cotp.ExpectConnectConfirm(Convert.FromHexString("06800000000000")), "disconnect");
         t.Equal(ErrorKind.Connection, refused.Kind, "a refused COTP connection is a connection error");
+
+        return Task.CompletedTask;
+    }
+
+    /// <summary>
+    /// 请求里的项数是一个字节。255 项要能编出来，256 项必须**当场失败**。
+    ///
+    /// 静默截断的后果比报错难查得多：256 项写成 0，PLC 一项都不读，
+    /// 但整帧仍然是合法请求，返回码看着正常；257 项写成 1，PLC 只读第一项，
+    /// 其余项拿到的是错位的数据。两种都表现为「部分点位读不到值/值不对」，
+    /// 而帧本身没有任何报错迹象。
+    /// </summary>
+    private static Task ItemCountFitsInOneByte(TestContext t)
+    {
+        var address = S7Address.Parse(Address.Register("db1", 0));
+
+        static S7ReadItem ReadItem(S7Address address) => new(address, ByteCount: 2, IsBit: false);
+
+        var max = Enumerable.Range(0, S7Read.MaxItemsPerRequest)
+            .Select(_ => ReadItem(address)).ToArray();
+
+        var frame = S7Read.BuildRequest(0x1234, max);
+        var pdu = S7Frame.Parse(frame);
+
+        t.Equal(S7Read.MaxItemsPerRequest, pdu.Parameter[1],
+            "255 items still fit the 1-byte count field");
+        t.Equal(2 + S7Read.MaxItemsPerRequest * 12, pdu.Parameter.Length,
+            "the parameter block holds one 12-byte item spec per item");
+
+        var tooManyRead = t.Throws<DriverException>(
+            () => S7Read.BuildRequest(0x1234, Enumerable.Range(0, S7Read.MaxItemsPerRequest + 1)
+                .Select(_ => ReadItem(address)).ToArray()),
+            "256 read items");
+
+        t.Equal(ErrorKind.Protocol, tooManyRead.Kind, "an unencodable item count is a protocol error");
+        t.Contains(tooManyRead.Message, "255", "the message names the wire limit");
+
+        var writeItem = new S7WriteItem(address, IsBit: false, Data: new byte[] { 0, 1 });
+        var writes = Enumerable.Range(0, S7Read.MaxItemsPerRequest)
+            .Select(_ => writeItem).ToArray();
+
+        var writeFrame = S7Write.BuildRequest(0x1234, writes);
+        t.Equal(S7Read.MaxItemsPerRequest, S7Frame.Parse(writeFrame).Parameter[1],
+            "255 write items still fit the 1-byte count field");
+
+        var tooManyWrites = t.Throws<DriverException>(
+            () => S7Write.BuildRequest(0x1234, Enumerable.Range(0, S7Read.MaxItemsPerRequest + 1)
+                .Select(_ => writeItem).ToArray()),
+            "256 write items");
+
+        t.Equal(ErrorKind.Protocol, tooManyWrites.Kind,
+            "the write path shares the same 1-byte limit");
 
         return Task.CompletedTask;
     }
