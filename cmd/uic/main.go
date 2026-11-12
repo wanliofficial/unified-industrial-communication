@@ -60,6 +60,7 @@ import (
 	"syscall"
 	"time"
 
+	mb "uic/internal/codec/mbus"
 	ua "uic/internal/codec/opcua"
 	snmpcodec "uic/internal/codec/snmp"
 	"uic/internal/config"
@@ -81,6 +82,7 @@ import (
 	iec104sim "uic/internal/sim/iec104"
 	iecsim "uic/internal/sim/iec61850"
 	knxsim "uic/internal/sim/knx"
+	mbussim "uic/internal/sim/mbus"
 	mcsim "uic/internal/sim/mc"
 	mewsim "uic/internal/sim/mewtocol"
 	sim "uic/internal/sim/modbus"
@@ -139,6 +141,8 @@ func main() {
 		dlt645readCmd(args)
 	case "cjt188read":
 		cjt188readCmd(args)
+	case "mbusread":
+		mbusreadCmd(args)
 	case "snmpread":
 		snmpreadCmd(args)
 	case "mtconnectread":
@@ -176,7 +180,7 @@ func usage() {
 用法:
   uic [run] -config config.json [-listen :8080] [-token TOKEN]
   uic -check -config config.json
-  uic sim [-listen 127.0.0.1:15020] [-protocol modbus|s7|opcua|mqtt|mc|fins|hostlink|enip|bacnet|bacnet-mstp|iec104|iec101|mewtocol|dnp3|coap|knx|dlt645|cjt188|snmp|ads|secs]
+  uic sim [-listen 127.0.0.1:15020] [-protocol modbus|s7|opcua|mqtt|mc|fins|hostlink|enip|bacnet|bacnet-mstp|iec104|iec101|mewtocol|dnp3|coap|knx|dlt645|cjt188|mbus|snmp|ads|secs]
   uic mbread -addr 127.0.0.1:1502 -unit 1 -area holding -offset 0 -qty 2
   uic mbread -addr 127.0.0.1:1502 -area holding -offset 5 -write 777
   uic mcread -addr 127.0.0.1:5000 -area d -offset 100 -qty 2
@@ -225,6 +229,11 @@ func usage() {
   uic cjt188read -addr 127.0.0.1:14001 -address 00000805000001 -type 10 -di 901F:0,901F:5,901F:10,901F:17
   uic cjt188read -transport serial -port /dev/ttyUSB0 -baud 2400 -address 00000805000001 -probe
   uic cjt188read -addr 127.0.0.1:14001 -address 00000805000001 -di A017 -write close -allow-control
+  uic mbusread -addr 127.0.0.1:4001 -address 1 -probe
+  uic mbusread -addr 127.0.0.1:4001 -address 1
+  uic mbusread -addr 127.0.0.1:4001 -address 1 -records q:energy,q:volume,q:power-max
+  uic mbusread -transport serial -port /dev/ttyUSB0 -baud 2400 -scan 1-20
+  uic mbusread -transport serial -port /dev/ttyUSB0 -baud 2400 -address 5 -raw
   uic snmpread -addr 127.0.0.1:16161 -oid 1.3.6.1.2.1.1.1.0,1.3.6.1.2.1.1.5.0 [-raw|-json]
   uic snmpread -addr 127.0.0.1:16161 -walk 1.3.6.1.2.1.1 -max-walk 16
   uic snmpread -addr 127.0.0.1:16161 -oid 1.3.6.1.2.1.1.6.0 -set lab-2 -setType string
@@ -556,8 +565,9 @@ func simCmd(args []string) {
 	fs := flag.NewFlagSet("sim", flag.ExitOnError)
 	addr := fs.String("listen", "127.0.0.1:15020", "监听地址")
 	size := fs.Int("size", 1024, "寄存器数量")
-	proto := fs.String("protocol", "modbus", "从站协议：modbus | s7 | opcua | mqtt | mc | fins | enip | bacnet | bacnet-mstp | iec104 | iec101 | mewtocol | hostlink | dnp3 | coap | knx | dlt645 | cjt188 | snmp | ads | secs | iec61850 | mtconnect")
+	proto := fs.String("protocol", "modbus", "从站协议：modbus | s7 | opcua | mqtt | mc | fins | enip | bacnet | bacnet-mstp | iec104 | iec101 | mewtocol | hostlink | dnp3 | coap | knx | dlt645 | cjt188 | mbus | snmp | ads | secs | iec61850 | mtconnect")
 	pdu := fs.Int("pdu", 480, "S7 协商 PDU 长度（240/480/960）")
+	busAddr := fs.Int("busAddr", 1, "M-Bus：虚拟表计的主地址 0..250")
 
 	// SNMP v3/USM 专用（只在 -protocol snmp 时生效）
 	v3 := fs.Bool("v3", false, "SNMP：启用 v3/USM（默认只开 community）")
@@ -620,6 +630,9 @@ func simCmd(args []string) {
 	case "cjt188":
 		simCJT188(*addr)
 		return
+	case "mbus":
+		simMBus(*addr, *busAddr)
+		return
 	case "snmp":
 		simSNMP(*addr, snmpsim.Options{
 			V3: simSNMPV3(*v3, *user, *authProto, *authPass, *privProto, *privPass),
@@ -639,7 +652,7 @@ func simCmd(args []string) {
 		return
 	case "modbus":
 	default:
-		fmt.Fprintf(os.Stderr, "未知协议 %q（支持 modbus | s7 | opcua | mqtt | mc | fins | enip | bacnet | bacnet-mstp | iec104 | iec101 | mewtocol | hostlink | dnp3 | coap | knx | dlt645 | cjt188 | snmp | ads | secs | iec61850 | mtconnect）\n", *proto)
+		fmt.Fprintf(os.Stderr, "未知协议 %q（支持 modbus | s7 | opcua | mqtt | mc | fins | enip | bacnet | bacnet-mstp | iec104 | iec101 | mewtocol | hostlink | dnp3 | coap | knx | dlt645 | cjt188 | mbus | snmp | ads | secs | iec61850 | mtconnect）\n", *proto)
 		os.Exit(2)
 	}
 
@@ -1281,6 +1294,37 @@ func simCJT188(addr string) {
 	fmt.Println("  D120..D12B=上 1..12 月结算日量（1200-n*10 m³）")
 	fmt.Println("  可写：A017 阀门（0x55 开 / 0x99 关）  A018 表地址（14 位）")
 	fmt.Println("  注意：只应答本表地址；读地址用 T/地址全 AA；其余 DI 回异常应答")
+	fmt.Println("  Ctrl+C 停止")
+
+	<-ctx.Done()
+	_ = srv.Close()
+	slog.Info("sim_stopped")
+}
+
+// simMBus 启动内置 M-Bus 虚拟表计。
+//
+// 初始值与 examples/mbus.json 对应：一台典型热表，8 条记录覆盖 Wh/m³/°C/W/s
+// 五类单位与 1/2/4 字节整数 + 日期四种数据域。默认主地址 1，可用 -busAddr 改，
+// 用于自检「地址配错」这条路径。
+func simMBus(addr string, primary int) {
+	if primary < 0 || primary > int(mb.MaxPrimaryAddr) {
+		fmt.Fprintf(os.Stderr, "M-Bus 主地址 %d 越界（0..%d）\n", primary, mb.MaxPrimaryAddr)
+		os.Exit(2)
+	}
+	srv, err := mbussim.NewServer(addr, mbussim.WithAddress(byte(primary)))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "启动 M-Bus 从站失败: %v\n", err)
+		os.Exit(1)
+	}
+	defer func() { _ = srv.Close() }()
+
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	fmt.Printf("mbus meter slave listening on %s (主地址 %d)\n", srv.Addr(), srv.Address())
+	fmt.Println("  能量 12345678 Wh   累计量 456.789 m³   供水 90.5 °C   回水 56.1 °C")
+	fmt.Println("  瞬时流量 2.5 m³/h  瞬时功率 24.5 kW   运行时间 86400 s   结算日 2024-03-15")
+	fmt.Println("  SND_NKE → E5（清零 FCB）；REQ_UD2 → CI=72h 整表；同 FCB 重传回放上一帧")
 	fmt.Println("  Ctrl+C 停止")
 
 	<-ctx.Done()

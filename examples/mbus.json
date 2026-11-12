@@ -1,0 +1,138 @@
+{
+  "schemaVersion": 1,
+  "site": "mbus-lab",
+  "server": {
+    "listen": "127.0.0.1:8095",
+    "token": "dev-token-0123456789"
+  },
+  "storage": {
+    "dir": "./data-mbus",
+    "journal": true,
+    "outboxMaxRecords": 5000,
+    "outboxTtl": "10m"
+  },
+  "logging": {
+    "level": "info"
+  },
+  "northbound": {
+    "webhook": {
+      "enabled": false,
+      "url": "http://127.0.0.1:9999/ingest",
+      "timeout": "3s"
+    }
+  },
+  "channels": [
+    {
+      "id": "ch-mbus",
+      "protocol": "mbus",
+      "transport": {
+        "kind": "tcp",
+        "address": "127.0.0.1:8401"
+      },
+      "concurrency": 1,
+      "timeout": "5s"
+    }
+  ],
+  "devices": [
+    {
+      "id": "heat01",
+      "name": "一号热表（内置 M-Bus 从站，主地址 1）",
+      "channel": "ch-mbus",
+      "interval": "2s",
+      "timeout": "3s",
+      "enabled": true,
+      "labels": {
+        "address": "1",
+        "options": "retries=2,gap=30ms"
+      },
+      "points": [
+        {
+          "id": "energy",
+          "name": "累计热量（VIF 03h：能量，单位 Wh）",
+          "address": { "kind": "symbol", "path": "q:energy" },
+          "dataType": "float64",
+          "unit": "Wh",
+          "enabled": true
+        },
+        {
+          "id": "volume",
+          "name": "累计流量（VIF 13h：体积，单位 m³）",
+          "address": { "kind": "symbol", "path": "q:volume" },
+          "dataType": "float64",
+          "unit": "m³",
+          "enabled": true
+        },
+        {
+          "id": "t-flow",
+          "name": "供水温度（VIF 5Ah：流量温度，单位 °C）",
+          "address": { "kind": "symbol", "path": "q:flow-temperature" },
+          "dataType": "float64",
+          "unit": "°C",
+          "enabled": true
+        },
+        {
+          "id": "t-return",
+          "name": "回水温度（VIF 5Eh：回水温度，单位 °C）",
+          "address": { "kind": "symbol", "path": "q:return-temperature" },
+          "dataType": "float64",
+          "unit": "°C",
+          "enabled": true
+        },
+        {
+          "id": "flow",
+          "name": "瞬时流量（VIF 3Bh：体积流量，单位 m³/h）",
+          "address": { "kind": "symbol", "path": "q:volume-flow" },
+          "dataType": "float64",
+          "unit": "m³/h",
+          "enabled": true
+        },
+        {
+          "id": "power",
+          "name": "瞬时功率（VIF 2Bh：功率，单位 W）",
+          "address": { "kind": "symbol", "path": "q:power" },
+          "dataType": "float64",
+          "unit": "W",
+          "enabled": true
+        },
+        {
+          "id": "on-time",
+          "name": "累计运行时间（VIF 20h：运行时间，单位 s）",
+          "address": { "kind": "symbol", "path": "q:on-time" },
+          "dataType": "float64",
+          "unit": "s",
+          "enabled": true
+        },
+        {
+          "id": "billing-date",
+          "name": "结算日期（VIF 6Ch：Type G 日期，文本记录）",
+          "address": { "kind": "symbol", "path": "q:date" },
+          "dataType": "string",
+          "enabled": true
+        },
+        {
+          "id": "energy-max",
+          "name": "最大功率（功能位=1 的记录在量名后加 -max；本从站没有，示例说明寻址语法）",
+          "address": { "kind": "symbol", "path": "q:power-max" },
+          "dataType": "float64",
+          "unit": "W",
+          "enabled": false
+        },
+        {
+          "id": "volume-last",
+          "name": "上期累计流量（存储号 1，DIFE 表达的 historical 记录；本从站没有，示例说明语法）",
+          "address": { "kind": "symbol", "path": "q:volume@1" },
+          "dataType": "float64",
+          "unit": "m³",
+          "enabled": false
+        },
+        {
+          "id": "raw-first",
+          "name": "原始第 0 条记录（r: 逃生口：量名不认识时按报文顺序取）",
+          "address": { "kind": "symbol", "path": "r:0" },
+          "dataType": "float64",
+          "enabled": false
+        }
+      ]
+    }
+  ]
+}

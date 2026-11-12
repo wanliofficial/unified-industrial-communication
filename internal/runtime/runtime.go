@@ -49,6 +49,7 @@ import (
 	"uic/internal/driver/iec104"
 	iec61850drv "uic/internal/driver/iec61850"
 	knxdrv "uic/internal/driver/knx"
+	mbusdrv "uic/internal/driver/mbus"
 	mcdrv "uic/internal/driver/mc"
 	mewtocoldrv "uic/internal/driver/mewtocol"
 	"uic/internal/driver/modbus"
@@ -185,6 +186,7 @@ func RegisterBuiltins() error {
 			iec61850drv.New(),
 			secsdrv.New(),
 			mtconndrv.New(),
+			mbusdrv.New(),
 		} {
 			if err := driver.Register(d); err != nil {
 				registerErr = err

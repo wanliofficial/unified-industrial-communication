@@ -34,11 +34,11 @@ cmd/ + internal/            可运行的最小骨架（不是伪代码，能采�
 
 ### 1.2 它不是什么
 
-- 不是协议库大杂烩。当前实现了 27 个驱动（Modbus TCP / RTU / ASCII 主站、S7、OPC UA、MQTT 南向订阅、
+- 不是协议库大杂烩。当前实现了 28 个驱动（Modbus TCP / RTU / ASCII 主站、S7、OPC UA、MQTT 南向订阅、
   MC 3E、FINS、Host Link FINS、EtherNet/IP CIP、BACnet/IP、BACnet MS/TP、IEC 60870-5-104、IEC 60870-5-101、Mewtocol、DNP3、CoAP、KNXnet/IP、IEC 61850（MMS）、DL/T 645、
-  CJ/T 188、SNMP v1/v2c/v3、ADS/AMS、SECS/GEM、MTConnect、计算点、virtual），外加
-  Modbus 从站（TCP / RTU / ASCII）、二十二个内置模拟从站/Broker（Modbus TCP、S7、MC 3E、FINS、Host Link FINS、CIP、BACnet/IP、BACnet MS/TP、
-  IEC 104、IEC 101、Mewtocol、DNP3、CoAP、KNXnet/IP、IEC 61850、DL/T 645、CJ/T 188、SNMP v1/v2c、ADS/AMS、HSMS/SECS-II、MTConnect Agent、MQTT）与一个内置 OPC UA 服务端、一个零依赖报警引擎与一个有界历史采样日志；其余协议在
+  CJ/T 188、M-Bus（EN 13757）、SNMP v1/v2c/v3、ADS/AMS、SECS/GEM、MTConnect、计算点、virtual），外加
+  Modbus 从站（TCP / RTU / ASCII）、二十三个内置模拟从站/Broker（Modbus TCP、S7、MC 3E、FINS、Host Link FINS、CIP、BACnet/IP、BACnet MS/TP、
+  IEC 104、IEC 101、Mewtocol、DNP3、CoAP、KNXnet/IP、IEC 61850、DL/T 645、CJ/T 188、M-Bus、SNMP v1/v2c、ADS/AMS、HSMS/SECS-II、MTConnect Agent、MQTT）与一个内置 OPC UA 服务端、一个零依赖报警引擎与一个有界历史采样日志；其余协议在
   `04-protocol-catalog.md` 里按工作量排了三波，没有假装已经支持。
   注意 MQTT 出现了两次且**互不相干**：北向是「网关把数据发出去」（sink），南向是「网关订阅别人发来的数据」（driver）。
 - 不是组态软件。不做画面、不做报表、不做自研时序库——理由见 `02-synthesis/01-capability-matrix.md` §6.4。
@@ -596,6 +596,75 @@ m³ / m³/h / GJ / kW；未知单位代号直接报错，不默认成基准单�
 （`A018`，`allow-write` + 完整 14 位）；写地址成功后驱动自动切到新地址，配置仍需
 人工同步。188 的 `AA` 只属于读地址命令，因此表地址不支持缩位——带通配的读数据会
 变成一次多表广播。
+
+M-Bus 表计（EN 13757-2/3，热量表 / 水表 / 气表 / 电表，RS-485 或串口服务器）：
+
+```bash
+./uic sim -protocol mbus -listen 127.0.0.1:8401 -busAddr 1 &   # 内置热表从站（主地址 1）
+./uic -config examples/mbus.json
+curl -s -H 'Authorization: Bearer dev-token-0123456789' localhost:8095/api/v1/points
+#   11 点：energy 12345678 Wh、volume 456.789 m³、供/回水温度 90.5/56.1 °C、
+#          瞬时流量 2.5 m³/h、瞬时功率 24.5 kW、运行时间 86400 s、结算日期 2024-03-15
+#          （另 3 点是 q:power-max / q:volume@1 / r:0 的语法示例，默认不采集）
+#   只验链路：./uic mbusread -addr 127.0.0.1:8401 -address 1 -probe
+#   读整表：  ./uic mbusread -addr 127.0.0.1:8401 -address 1
+#   原始字节：./uic mbusread -addr 127.0.0.1:8401 -address 1 -raw
+#   扫描总线：./uic mbusread -port /dev/ttyUSB0 -baud 2400 -scan 1-20
+```
+
+M-Bus 的链路层有四种帧：单字符 ACK（`E5`）、短帧（`10 C A CS 16`）、长帧
+（`68 L L 68 C A CI DATA CS 16`）与控制帧（`L=3`、无数据域）。分帧要同时校验起始符、
+**两个相等的 L**、校验和与结束符；校验和是 `C+A+CI+DATA` 的模 256 和，**不覆盖** L 与
+起止符——按帧长算会在每个长帧上固定差 3，这是这个协议最容易写错的一处。四种帧共用两个
+起始符（`0x68` 既是长帧头也是控制帧头），而 `E5` 只有 1 字节：串口服务器把 ACK 与紧随的
+应答粘在一次 read 里返回时，扫描器必须能先把 `E5` 单独切出来，否则「链路正常」会被判成
+「帧结构错」。
+
+可变数据结构（CI=`72h`）是 12 字节固定头（表号 BCD + 厂商 + 版本 + 介质 + 访问号 +
+状态 + 签名）之后的一串**自描述记录**：每条记录先有 DIF（+DIFE 链）说明长度、功能位
+（瞬时/最大/最小/故障）与存储号/费率/子单元，再有 VIF（+VIFE 链）说明物理量与 10 的幂，
+最后才是数据。没有「第 n 个寄存器」这种东西——偏移取决于前一条记录的长度，换一块表
+就会错位。这是点表模型必须长出符号寻址的真实原因，而不是设计偏好。
+
+因此点表用 `kind=symbol`，`path` 是归一化物理量名：
+
+| 写法 | 含义 |
+|---|---|
+| `q:energy` | 第 1 条 `energy` 记录（VIF `03h` → Wh；`07h` 也是 Wh，但倍率 1e4） |
+| `q:volume@1` | 存储号 1 的 `volume`（DIFE 表达的上一期历史值） |
+| `q:power-max` | 功能位=1 的记录：同一物理量的「最大值」加 `-max` 后缀（`-min`/`-error` 同理） |
+| `q:energy/1` | 同一量名第 2 次出现（多费率表常见），`/0` 可省略 |
+| `r:0` | 报文里第 0 条记录，语义无关——厂商自定义 VIF 不认识时的逃生口 |
+
+单位与倍率由 VIF 表统一换算到工程值（`energy` 恒为 Wh、`volume` 恒为 m³、温度按 °C），
+点表不需要知道这块表用了 0.001 Wh 还是 10000 Wh 的刻度。数值宽度按 DIF 解：整数
+1/2/3/4/6/8 字节、BCD 2/4/6/8/12 位（最高半字节 `Fh` 是负号）、REAL 4 字节 IEEE754、
+变长（`DIF=0Dh`）带 LVAR。类型 G 日期（2 字节）与类型 F/I 日期时间（4/6 字节）按位域解，
+**时间无效位**置位时明确报文本 `(时间无效)` 而不是把 `0xFF` 解成 2159 年。
+
+一条 `REQ_UD2` 让从站把**当前整张表**打包上送，所以点位多少都只发一次请求，
+`MultiRead` 声明 `supported`；同一条报文里的点位天然一致（同一次快照），这是它与
+「每点一次读」的驱动在语义上的关键差别。`FCB/FCV` 是重传语义的核心：**同一轮重试保持
+FCB 不变、跨轮才翻转**，从站据此回放上一次应答（访问号不重复累加、存储值不被重读）。
+写错的表现是「偶尔读到上一次的值」，极难发现，因此测试直接锁住「同 FCB 重放的访问号
+不变」。读取失败后驱动发一次 `SND_NKE` 复位从站的 FCB 状态再重试——长期运行的电池表
+忘记 FCB 是现场最常见的「隔几轮才读通一次」。
+
+`Probe` 用 `SND_NKE` 的**单字节应答**，它不依赖任何数据结构，因此能把「完全没字节
+回来」（物理层/波特率/站号错）与「有字节但解析不了」（参数错）分开。反过来，若驱动
+发现「收到字节流但一帧都没成」，会明确报协议错误并提示查波特率/校验位（标准
+2400 8E1）与终端电阻，而不是笼统报超时——这两种故障的处置方式完全不同。
+
+边界：只做**主地址**寻址（0..250），251 保留、253 次级、254 网络层、255 广播都在配置期
+拒绝。次级地址需要先 `SND_UD(CI=52h)` 选中且地址域变 8 字节、校验范围随之变化，混合
+实现比不支持更难排查，因此编解码层显式拒绝 `FDh` 地址。不做 `SND_UD` 写入（CI=`51h`
+发数据 / `5Eh` 改地址 / `50h` 校时）：写什么完全由表厂剖面决定，写错会改变计费参数，
+改地址/速率还会让表从当前站号「消失」——`Write` 诚实声明 `unsupported`。固定数据结构
+（CI=`73h`，16 字节、两个计数器）能解但不推荐使用，它是老式紧凑表的形态。
+
+承载支持 `serial`（真实 RS-485，走共享串口层总线级互斥）与 `tcp`（串口服务器/DTU
+透传，锁退化为每连接互斥）；两者分帧与命令序列完全相同，所以内置 TCP 从站能直接当
+自检目标。串口协议 `concurrency` 必须为 1。
 
 SNMP v1/v2c（交换机 / UPS / 服务器 / 带网管的仪表，UDP 161）：
 
@@ -1364,6 +1433,9 @@ obs  ← 所有包（不依赖任何内部包）
 | `internal/codec/cjt188` | 188-2004 纯函数编解码（单 `68` 定界/地址 BCD 低字节先传/无 `0x33`/校验和/2 字节 DI/按表类型分派的字段 schema/压缩 BCD/7 字节时间/单位代号/收帧扫描） | 无 I/O、无时钟、无可变状态；前导不计入长度与校验和，CS 从 `0x68` 到 DATA 末；帧总长恒为 `13+L`；901F 水/气/其他与热量表两套布局（19/43 字节），D120..D12B 为 5 字节；字段 offset 是 DI 数据域内字节偏移；单位是显式字节并统一到 m³/m³/h/GJ/kW，未知代号报错；时间 7 字节、年份 2000..2099，日期本地校验；读地址报文标识固定字面量 `81 0A` | 64.5% |
 | `internal/driver/cjt188` | 188 主站（serial/tcp 双承载、总线锁、探针 0x03、按 DI 缓存字段、阀门/写地址两道闸门、错误分类） | 同一 DI 的多个字段在一次 Read 内复用一次事务，跨 DI 不合并、`MultiRead` 声明 unsupported；resolved 字段必须与 schema 宽度一致；应答地址/DI/SER/长度四项校验；链路级故障后本轮剩余点快速失败；表地址取 `labels.address`（完整 14 位，含 AA 通配即拒绝）、类型取 `labels.type`；写阀门需 `allow-control`，写地址需 `allow-write` 且成功后自动切到新地址；其余 DI 写本地拒绝；不提供广播 | 77.6% |
 | `internal/sim/cjt188` | 188 内置从站（TCP + `ServeStream`、水/热两套 901F、D120..D12B、读地址、阀门写、写地址、时钟刷新、地址过滤） | 与主站共用 codec/schema；地址不匹配静默；读地址应答用实际地址而非回显全 `AA`；时间与状态字每次读都从内部时钟/阀门状态现场生成；写地址后新地址可读、旧地址静默；未知命令回异常应答而不是让主站等超时；`Close` 幂等 | 88.2% |
+| `internal/codec/mbus` | M-Bus（EN 13757-2/3）纯函数编解码（`E5` 单字符 / 短帧 / 长帧 / 控制帧四类分帧、`C+A+CI+DATA` 模 256 校验、双 `L` 一致性与整帧长 `L+6`、显式拒绝 `FDh` 次级地址；DIF/DIFE 与 VIF/VIFE 记录解析、整数/BCD/REAL/变长 LVAR、Type G/F/I 日期时间与无效位、固定数据结构、统一 VIF 表与幂次换算、`q:`/`r:` 反查与记录编码） | 无 I/O、无时钟、无可变状态；校验和**只覆盖** `C+A+CI+DATA`，不覆盖 L 与起止符（按整帧算会固定差 3）；长帧两个 `L` 必须相等、整帧长恒为 `L+6`；`0x68` 既是长帧头也是控制帧头，`E5` 只有 1 字节，扫描器必须能把它从粘包中单独切出；`FDh` 次级地址在编解码层直接拒绝（`ErrFrame`）；可变结构固定头恒 12 字节，少读一字节会让全部 VIF 错位；VIF 表按区间 + 幂次生成而不是手抄；时间无效位 → 文本 `(时间无效)`，不把 `0xFF` 解成 2159 年；`DIF=1Fh` 后续报文标志必须暴露 | 93.2% |
+| `internal/driver/mbus` | M-Bus 主站（SND_NKE 初始化、REQ_UD2 整表上送、FCB 跨轮翻转与同轮重放、失败后 NKE 复位再试、后续报文跟随上限、状态字降质量、`q:` 物理量寻址 + `r:` 逃生口、坏帧计数区分「无字节」与「有字节不成帧」；自检 `Table`） | 只做主地址 0..250 的单一主站轮询，251/253/254/255 配置期拒绝；`MultiRead` 声明 supported（一条 RSP_UD 覆盖整表，同报文内点位天然同快照）；同一轮重试**保持 FCB 不变**、跨轮才翻转（从站据此回放上次应答，访问号不累加）；读取失败后补发一次 `SND_NKE` 复位再重试；`Write`（SND_UD）声明 unsupported 并逐项返回 `ErrUnsupported`；状态字只有 bit0-1 非零才降质量为 uncertain（电源低/永久错误不影响读数可信度）；点表 `AddressPolicy{Width: WidthNone, AllowSymbol: true}`，`q:<物理量>[@存储号][/第几条]` 与 `r:<index>` 才算合法；`Reader.BadFrames()` 非零而好帧为零时报协议错并提示查波特率/校验位/终端电阻，而不是笼统超时；串口 `concurrency` 必须为 1 | 86.7% |
+| `internal/sim/mbus` | M-Bus 内置表计（虚拟热表 8 条记录 / FCB 重放不改访问号 / 访问号自增 / 地址过滤静默 / 校时与坏校验注入 / 静默模式 / 状态位与后续报文标志 / 值可变） | 与主站共用 codec/mbus；同一 FCB 重放回放上一次应答且**不增加访问号**（这是「同轮重传不重复读数」唯一可测的方式）；地址不符完全沉默（替别人应答会让主站张冠李戴）；坏校验只改校验和、结构保持完好（验证主站真的靠校验和发现问题）；`DIF=1Fh` 后续报文标志用于验证驱动的 follow 上限；`defaultRecords()` 与 `examples/mbus.json` 一一对应，`RecordNames` 的输出能被 `FindRecord` 直接吃回去 | 80.6% |
 | `internal/codec/snmp` | SNMP v1/v2c/v3 纯函数编解码（BER TLV / 整数最短补码 / OID base-128 / 7 类 PDU / varbind / 异常标记 / error-status 分类；v3 另有 USM 安全参数、`BuildV3`/`ParseV3`、口令本地化、HMAC 摘要、DES/AES 加解密、Report 分类、时间窗口判定） | 无 I/O、无时钟、无可变状态；长度短/长形式必须按内容长度选；无符号值最高位为 1 必须补前导 `00`；OID 首两弧合并、`2.39.1`→`77 01`；异常标记只允许出现在应答，请求里出现即拒绝；v1 Trap PDU 识别后显式拒绝；v3 空 engineID 只允许出现在发现报文，带 auth/priv 时空 engineID 拒绝；摘要截断长度 = 摘要长度的一半 | 77.7% |
 | `internal/driver/snmp` | SNMP 主站（v1/v2c 批量 GET、v1 `noSuchName` 退化、单 OID SET、类型映射与回显校验、错误分类、request-id 配对、自检 `GetRaw`/`Walk`；v3 引擎发现、时间同步、密钥派生与缓存、Report 驱动的自愈重试） | 只做 v1/v2c 的读/写路径不变；通道必须是 UDP，地址省略端口补 161；读按 `maxOids` 与 1400 字节双预算分批，顺序不变；v1 批量 `noSuchName` 逐点重发；写不合并 varbind，逐点错误隔离；只接受与请求 request-id 相同的 Response；float/BCD 与 >2^32-1 的无符号写本地拒绝；地址错误不进入整轮 `firstErr`；v3 加密口令缺省回退认证口令、USM 口令 8..64 字节、AES-192/256 需 SHA-256+；固定 engineID 与代理不一致时同时报出两个 engineID 并拒绝连接 | 73.0% |
 | `internal/sim/snmp` | SNMP 内置代理（system 组 + 两块网卡、GET/GETNEXT/GETBULK/SET、community 静默丢弃、v1/v2 差异、SET 原子性；v3 真做 HMAC 验签与 DES/AES 解密、6 类 Report、引擎身份可切换、故障注入） | 与主站共用 codec/snmp；community 不匹配不回任何报文（不做口令预言机）；v1 缺 OID 回 `noSuchName` 带 `error-index`，v2c 回 `noSuchObject`；SET 先全量校验再落地；`sysUpTime` 固定值（测试要稳定）；`Close` 幂等；v3 对 USM 失败默认回 Report，`Faults.DropPercent` 模拟真机静默丢弃 | 85.1% | 85.1% | 85.1% |
@@ -1409,8 +1481,9 @@ go test -race -count=1 ./...                    # 竞态 + 全量测试
 go test -coverprofile=c.out ./... && go tool cover -func=c.out | tail -1
 ```
 
-当前状态：`go build` / `go vet` / `gofmt` 全部干净，`go test -race ./...` 覆盖 70 个包，其中 69 个
-有测试文件且全部通过（仅 `internal/mqtt/mqtttest` 是纯测试辅助包，没有自己的测试文件）。
+当前状态：`go build` / `go vet` / `gofmt` 全部干净，`go test ./...` 覆盖 106 个包，其中 104 个
+有测试文件且全部通过（`internal/mqtt/mqtttest` 是纯测试辅助包，`internal/sim/finsmem` 由
+`sim/fins` 与 `sim/hostlink` 跨包覆盖）。
 
 ### 9.3 源码阅读建议顺序
 
@@ -1441,6 +1514,7 @@ go test -coverprofile=c.out ./... && go tool cover -func=c.out | tail -1
 24. internal/codec/enip + driver/enip + sim/enip EtherNet/IP 三层：三层封装、标签寻址、多服务合包（80 分钟）
 25. internal/codec/snmp + driver/snmp + sim/snmp SNMP 三层：BER、OID 编码、双预算分批、v1 退化（80 分钟）
 26. internal/codec/snmp/v3.go + usm.go + driver/snmp/v3session.go + sim/snmp/usm.go：USM v3 认证加密、引擎发现与时间同步、密钥派生与自愈重试、真做 HMAC/解密的仿真代理（180 分钟）
+27. internal/codec/mbus + driver/mbus + sim/mbus M-Bus 三层：四类帧与校验范围、DIF/VIF 自描述记录、FCB 重传语义与整表上送（100 分钟）
 ```
 
 ---
@@ -1534,6 +1608,8 @@ OPC UA 服务端（同一份点位表的另一个出口）：
 | DL/T 645 的边界 | ⚠️ | 不做 97 版、广播校时/广播冻结、厂商扩展的主动上报、合并读（一次一 DI）、位寻址（状态字按 uint16 整体读）、DI 自动发现、表地址扫描；`MultiRead` 诚实声明 unsupported——一轮采集耗时等于「点数 × 单次事务」，300 点挂 2400bps 总线要几十秒，这个代价必须让配点表的人看见 |
 | CJ/T 188-2004 主站 + 内置从站 | ✅ | `internal/codec/cjt188` + `internal/driver/cjt188` + `internal/sim/cjt188` + `uic cjt188read` + `examples/cjt188.json`；`serial`（共享串口层总线锁）与 `tcp`（串口服务器/DTU 透传，每连接互斥）双承载；单 `68`、数据域无 `0x33`、7 字节 BCD 地址；一个 DI 一组字段，按 `labels.type`（10 水/20 热/30 气/40 其他）分派 schema，同一 DI 多字段复用一次事务；单位显式字节统一到规范单位、未知代号报错；阀门（`allow-control`）与表地址（`allow-write` + 完整 14 位）两个写入口，写地址后驱动自动切换；不提供广播与缩位地址；三层测试含真实 TCP 回环 |
 | CJ/T 188 的边界 | ⚠️ | 只做 2004 版（2018 版配置期显式拒绝）；只收录 901F 与 D120..D12B，价格/金额/密钥/机电同步等未收录 DI 直接报错；不做位寻址、DI 自动发现、跨 DI 合并读、表地址扫描；`MultiRead` 诚实声明 unsupported——一轮采集耗时约等于「DI 数 × 单次事务」，这个代价必须让配点表的人看见 |
+| M-Bus（EN 13757）主站 + 内置从站 | ✅ | `internal/codec/mbus` + `internal/driver/mbus` + `internal/sim/mbus` + `uic mbusread` + `examples/mbus.json`；`serial`（共享串口总线锁）与 `tcp`（串口服务器/DTU 透传，每连接互斥）双承载；四种帧（`E5` / 短帧 / 长帧 / `L=3` 控制帧）、校验只覆盖 `C+A+CI+DATA`、双 `L` 与 `L+6` 整帧长；可变结构 12 字节固定头 + DIF/DIFE/VIF/VIFE 自描述记录（整数/BCD/REAL/变长 LVAR/Type G-F-I 时间）；点表 `WidthNone` + 符号地址 `q:<物理量>[@存储号][/第几条]` 与 `r:<index>`；一条 `REQ_UD2` 覆盖整表（`MultiRead` supported）、同报文内点位同快照；FCB 同轮重放 / 跨轮翻转、失败后 `SND_NKE` 复位再试；`BadFrames` 把「无字节」与「有字节不成帧」分开报；三层测试含真实 TCP 回环 |
+| M-Bus 的边界 | ⚠️ | 只做**主地址**（0..250）单主站轮询：次级地址需 `SND_UD(CI=52h)` 选中、地址域变 8 字节，编解码层显式拒绝 `FDh`；不做 `SND_UD` 写入（发数据 `51h` / 改地址 `5Eh` / 校时 `50h`——写错会改变计费参数、改地址会让表从站号上消失），`Write` 声明 unsupported；不做 2 类数据（ACD）上送与多主站仲裁；固定数据结构（`73h`）能解但按老式紧凑表处理，不推荐；不做多表并行（一条总线一次只能有一个主站在说话）|
 | 共享串口层 | ✅ | `internal/transport/serialport`：`Acquire` 按路径引用计数复用、同路径不同参数显式报错（不静默复用）、`Ref.Lock` 总线级互斥覆盖「排空 → 发送 → 收完帧」、`Drain` 必须早于 `SetDeadline`（反序会让每次写都 i/o timeout）；`modbus-rtu` / `modbus-ascii` / `dlt645` / `cjt188` / `iec101` / `mewtocol` 共用 |
 | IEC 104 的边界 | ⚠️ | 不做非平衡式（101 串口）、文件传输、驱动侧时钟同步、冗余通道切换、带时标命令、组召唤；没有「列举 IOA」这种协议动作，点表发现只能靠驱动旁路表（被动观察），设备不发就永远看不到；`Subscribe` 声明 supported 但对外仍是 `Read` 拉取契约 |
 | DNP3 的边界 | ⚠️ | 不做串口、Secure Authentication、文件传输（组 70）、时间同步写路径、SBO 两段式控制、事件缓冲区重配（组 50 写）、类 0 单组召唤、主动触发非请求响应；没有「列举点索引」这种协议动作，点表发现同样只能靠旁路表（被动观察）；总召唤与事件轮询都是整类扫描，点位数的增加不会增加单次事务数，但会增加响应体积 |

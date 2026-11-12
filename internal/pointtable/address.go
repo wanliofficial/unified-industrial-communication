@@ -296,6 +296,21 @@ func PolicyFor(protocol string) AddressPolicy {
 		// Width 用 WidthNone：值有多宽由数据对象的 MMS 类型决定（布尔、整型、
 		// 浮点、结构体的某个叶子），点表里写 length 没有意义。
 		return AddressPolicy{Width: WidthNone, AllowSymbol: true}
+	case "mbus":
+		// 记录名型寻址：`q:<物理量>[@存储号][/第几条]` 或 `r:<记录序号>`。
+		//
+		// 为什么是符号地址而不是寄存器偏移：M-Bus 的可变数据结构是**自描述
+		// 记录串**——每条记录先用 DIF/VIF 说明自己多长、是什么量，数据才跟在
+		// 后面。没有"第 n 个寄存器"这种东西：偏移取决于前一条记录的长度，
+		// 换一块表（甚至同一块表换了固件）就会整体错位。用 offset 表达会
+		// 诱导人写出「寄存器 0 长 4 字节」这种在协议里不存在的概念，而读错
+		// 位不会报错，只会把热量读成流量。
+		//
+		// Width 用 WidthNone：值有多宽由报文的 DIF 决定，点表里写 length
+		// 只会与表实际声明的宽度冲突。selector/index 同样无意义——`@` 与
+		// `/` 已经在 path 里表达了"第几条"，拆成符号下标反而表达不了
+		// 「同一物理量的第二次出现」这种协议事实。
+		return AddressPolicy{Width: WidthNone, AllowSymbol: true}
 	case "mtconnect":
 		// 数据项 ID 寻址：`/probe` 给出的 `dataItemId`（如 `Xabs`、`avail`），
 		// 由 `/current` 的 XML 文档按 id 查值。
