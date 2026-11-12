@@ -99,5 +99,9 @@ public sealed record DependencyCheck(string Name, bool Ok, string? Detail = null
 /// <c>MonoAt</c> 是写入时刻的单调时刻（归一化到 ticks），不是墙钟：窗口问的是
 /// 「过了多久」，一次校时跳变不能让重投的写请求被当成新请求、对设备重复执行。
 /// </para>
+/// <para>
+/// <c>Fingerprint</c> 是首次请求体的规范化 JSON：同一个 key 配上另一份请求体时
+/// 必须报冲突，不能把首次结果重放给一个从未执行过的写入。
+/// </para>
 /// </summary>
-public sealed record IdempotentResponse(string Body, long MonoAt);
+public sealed record IdempotentResponse(string Body, long MonoAt, string Fingerprint);

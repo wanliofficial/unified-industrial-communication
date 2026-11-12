@@ -61,6 +61,7 @@ internal static class ContractTests
         tests.Add(new TestCase("contract/write_returns_per_point_results", WriteReturnsPerPointResults));
         tests.Add(new TestCase("contract/write_values_are_engineering_units", WriteValuesAreEngineeringUnits));
         tests.Add(new TestCase("contract/single_point_write_is_idempotent", SinglePointWriteIsIdempotent));
+        tests.Add(new TestCase("contract/idempotency_key_rejects_a_different_body", IdempotencyKeyRejectsADifferentBody));
         tests.Add(new TestCase("contract/idempotency_window_ignores_a_clock_jump", IdempotencyWindowIgnoresAClockJump));
         tests.Add(new TestCase("contract/template_instantiates_and_applies_devices", TemplateInstantiatesAndApplies));
         tests.Add(new TestCase("contract/points_csv_import_previews_and_applies", PointsCsvImportPreviewsAndApplies));
@@ -1175,6 +1176,65 @@ internal static class ContractTests
                 PostWithKey("/api/v1/points/v1/temp/write", body, key), t.Ct);
             t.Equal("false", afterWindow.Headers.GetValues("X-Idempotent-Replay").Single(),
                 "past the real window the same key is executed again");
+        });
+    }
+
+    /// <summary>
+    /// 同一个幂等键配另一份请求体必须报冲突（409），不能把首次结果重放出来。
+    ///
+    /// 重放的话，调用方拿到的是 <c>ok: true</c> / <c>verified: true</c>，
+    /// 会以为新值已经写进设备——而那次写入从未发生。这类「静默丢写 + 假成功」
+    /// 在现场极难追查：日志、审计、接口返回值三者都说写成功了。
+    /// 键被复用到另一个请求上通常是调用方拼接 id 的 bug，必须让它立刻暴露。
+    /// </summary>
+    private static Task IdempotencyKeyRejectsADifferentBody(TestContext t)
+    {
+        return RunAsync(async () =>
+        {
+            await using var host = await Host.StartAsync(t);
+            await WaitForPointAsync(host, "v1", "temp", t);
+
+            const string key = "conflict-1";
+            const string first = """
+                                 { "value": { "type": "float64", "num": 33.5 }, "confirm": true }
+                                 """;
+            const string second = """
+                                  { "value": { "type": "float64", "num": 44.5 }, "confirm": true }
+                                  """;
+
+            var accepted = await host.Client.SendAsync(
+                PostWithKey("/api/v1/points/v1/temp/write", first, key), t.Ct);
+
+            t.Equal(HttpStatusCode.OK, accepted.StatusCode, "the first write succeeds");
+            t.Equal("false", accepted.Headers.GetValues("X-Idempotent-Replay").Single(),
+                "the first response is not a replay");
+
+            // 原样重投仍然允许（这是幂等键存在的意义）。
+            var repeat = await host.Client.SendAsync(
+                PostWithKey("/api/v1/points/v1/temp/write", first, key), t.Ct);
+
+            t.Equal(HttpStatusCode.OK, repeat.StatusCode, "an identical retry is still accepted");
+            t.Equal("true", repeat.Headers.GetValues("X-Idempotent-Replay").Single(),
+                "an identical retry is a replay");
+
+            // 换了值却复用同一个键：必须拒绝，且不能把 33.5 的结果当成 44.5 的答复。
+            var conflict = await host.Client.SendAsync(
+                PostWithKey("/api/v1/points/v1/temp/write", second, key), t.Ct);
+
+            t.Equal(HttpStatusCode.Conflict, conflict.StatusCode,
+                "the same key with a different body is a conflict");
+
+            using var error = await ReadJsonAsync(t, conflict);
+            t.Equal("request.idempotency_conflict",
+                error.RootElement.GetProperty("error").GetProperty("code").GetString(),
+                "the error code says why the write was refused");
+
+            t.Ok(conflict.Headers.Contains("X-Idempotent-Replay") == false,
+                "a conflict is not reported as a replay");
+
+            // 设备上的值必须还是第一次写入的那个：冲突的请求没有下发任何写入。
+            t.Close(33.5, await WaitForNumberAsync(host, "v1", "temp", 33.5, t), 1e-9,
+                "the refused write never reached the device");
         });
     }
 

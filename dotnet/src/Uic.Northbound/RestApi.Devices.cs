@@ -152,17 +152,37 @@ public static partial class RestApi
         // 客户端重投的同一个 key 被当成新请求，对设备把同一个物理动作再执行一遍；
         // 后跳则让缓存永不过期，下一次真正的写入反而被当成重放而不执行。
         var monoNow = MonoNow(ctx);
+        var fingerprint = Fingerprint(items);
 
         if (Idempotency.TryGetValue(cacheKey, out var cached) &&
             monoNow - cached.MonoAt < IdempotencyWindowTicks)
         {
+            // 同一个 key 配另一份请求体：绝不能重放首次结果。调用方会拿到
+            // ok:true / verified:true，以为新值已经写进设备，而实际上那次写入
+            // 从未发生——这是「静默丢写 + 假成功」，比直接报错危险得多。
+            // 键被复用到另一个请求上通常是调用方拼接 id 的 bug，必须让它暴露。
+            if (!string.Equals(cached.Fingerprint, fingerprint, StringComparison.Ordinal))
+            {
+                WriteAudit(ctx, http, "point.write", "failed", target: device,
+                    detail: new
+                    {
+                        device,
+                        scope,
+                        reason = "idempotency_conflict",
+                        points = items.Select(i => i.Point).ToArray(),
+                    });
+
+                throw ApiException.Conflict("request.idempotency_conflict",
+                    "X-Idempotency-Key was already used for a different write; use a new key for a new request");
+            }
+
             http.Response.Headers["X-Idempotent-Replay"] = "true";
             return Results.Content(cached.Body, "application/json; charset=utf-8");
         }
 
         var fresh = await ExecuteWritesAsync(http, ctx, device, items, ct).ConfigureAwait(false);
         var body = JsonSerializer.Serialize(fresh, ApiJson.Options);
-        Idempotency[cacheKey] = new IdempotentResponse(body, monoNow);
+        Idempotency[cacheKey] = new IdempotentResponse(body, monoNow, fingerprint);
 
         // 键的数量由调用方决定，长期运行的网关必须有上限；超过就把过窗的条目清掉。
         if (Idempotency.Count > 1024) PruneIdempotency(monoNow);
@@ -406,6 +426,16 @@ public static partial class RestApi
 
         return new WriteResponseDto(results);
     }
+
+    /// <summary>
+    /// 请求体指纹（幂等键只能对应一份请求体）。
+    ///
+    /// 用规范化 JSON 而不是哈希：条数上限 100，字符串比较已经足够，也不必担心
+    /// 哈希碰撞把两份不同的写入当成同一份。字段顺序由序列化器固定，因此
+    /// 「同样的重投」必然得到同样的串。
+    /// </summary>
+    private static string Fingerprint(IReadOnlyList<WriteItemDto> items)
+        => JsonSerializer.Serialize(items, JsonDefaults.Options);
 
     /// <summary>
     /// confirm=true 时回读一次。窗口取 min(2×点位有效周期, 2s)：

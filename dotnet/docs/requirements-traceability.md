@@ -12,8 +12,8 @@ PRD 中 M 级的采集协议已全部落地，FR-CFG-01 的四类寻址模型也
 可自动跑的用例（见 §7），唯一剩下的延期项是 object/file 寻址的实际驱动，
 见 [protocol-status.md](protocol-status.md) §4.1。
 
-当前测试基线：**315 passed / 0 failed / 3 skipped**（跳过的是需要 `--opcua` 的 OPC UA 端到端用例）；
-加 `-- --opcua` 跑全量是 **318 passed / 0 failed / 0 skipped**。
+当前测试基线：**316 passed / 0 failed / 3 skipped**（跳过的是需要 `--opcua` 的 OPC UA 端到端用例）；
+加 `-- --opcua` 跑全量是 **319 passed / 0 failed / 0 skipped**。
 
 ## 1. 采集（FR-COL）
 
@@ -82,7 +82,7 @@ PRD 中 M 级的采集协议已全部落地，FR-CFG-01 的四类寻址模型也
 | 编号 | 需求 | 状态 | 证据 / 说明 |
 |---|---|---|---|
 | FR-NOR-01 | REST：当前值、历史、配置、状态 | 已实现 | 当前值/配置/状态：`contract/devices_and_points_are_listed`；历史：`GET /api/v1/history`，证据 `contract/history_query_reads_journal`。列表分页的 `cursor` 是不透明串，只接受服务端发出的形式；解不出非负整数或被改写一律 `400 request.invalid_cursor`，不会静默回到第一页（否则客户端只看到「整页重复」而状态码是 200）：`contract/pagination_cursor_is_validated` |
-| FR-NOR-02 | REST：写入点位（需权限，三态结果） | 已实现 | 三态结果与逐点裁决：`contract/write_returns_per_point_results`；写端点要求 `point.write`，只读角色与审计员被拒并记 `auth.forbidden`：`contract/auth_roles_are_enforced`。单点与批量都支持 `X-Idempotency-Key`：`contract/single_point_write_is_idempotent`，窗口按**单调时钟**算，校时跳变既不把重投当成新写入重复执行、也不会让缓存永不失效：`contract/idempotency_window_ignores_a_clock_jump` |
+| FR-NOR-02 | REST：写入点位（需权限，三态结果） | 已实现 | 三态结果与逐点裁决：`contract/write_returns_per_point_results`；写端点要求 `point.write`，只读角色与审计员被拒并记 `auth.forbidden`：`contract/auth_roles_are_enforced`。单点与批量都支持 `X-Idempotency-Key`：`contract/single_point_write_is_idempotent`，窗口按**单调时钟**算，校时跳变既不把重投当成新写入重复执行、也不会让缓存永不失效：`contract/idempotency_window_ignores_a_clock_jump`。幂等键绑定请求体，同一个 key 配另一份请求体返回 `409 request.idempotency_conflict`（重放会把从未执行的写入报成 `ok: true`）：`contract/idempotency_key_rejects_a_different_body` |
 | FR-NOR-03 | SSE 实时推送（按订阅表达式） | 已实现 | `contract/*` 起真实 Kestrel；按 `device.point` / 通配过滤、质量过滤、心跳、50 路并发上限。已知边界：`_lastQuality` 记的是「历史上出现过的质量」，设备下线后不回收；因为只影响「质量是否变化」的判定，而删了又加回来时旧值恰巧就是正确的前值，不构成语义错误 |
 | FR-NOR-04 | MQTT 上报（Topic 模板、QoS、保留） | 已实现 | `mqtt/sink_renders_topic_and_injects_schema_version`、`mqtt/publish_qos1_waits_for_puback`、`mqtt/reconnect_republishes_birth_and_state`；设备下线时清 retained `$state` 且重连不再补发：`mqtt/forgets_removed_device_state`；`scripts/mqtt-interop.sh` 用真实 broker 验一遍 |
 | FR-NOR-05 | OPC UA 服务端 | 已实现 | `opcua/anonymous_session_read_write_subscribe`（需 `--opcua`） |
