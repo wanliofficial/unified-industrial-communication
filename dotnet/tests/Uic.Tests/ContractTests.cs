@@ -50,6 +50,7 @@ internal static class ContractTests
         tests.Add(new TestCase("contract/resource_pressure_degrades_health", ResourcePressureDegradesHealth));
         tests.Add(new TestCase("contract/apply_keeps_redacted_secrets", ApplyKeepsRedactedSecrets));
         tests.Add(new TestCase("contract/history_query_reads_journal", HistoryQueryReadsJournal));
+        tests.Add(new TestCase("contract/pagination_cursor_is_validated", PaginationCursorIsValidated));
         tests.Add(new TestCase("contract/api_requires_bearer_token", ApiRequiresBearerToken));
         tests.Add(new TestCase("contract/devices_and_points_are_listed", DevicesAndPointsAreListed));
         tests.Add(new TestCase("contract/drivers_expose_capability_states", DriversExposeCapabilityStates));
@@ -549,6 +550,64 @@ internal static class ContractTests
             t.Equal("request.invalid_parameter",
                 badTimeError.RootElement.GetProperty("error").GetProperty("code").GetString(),
                 "the error code names the malformed parameter");
+        });
+    }
+
+    /// <summary>
+    /// 分页游标必须被严格校验：合法 base64 但内容不是非负整数、或被改写过的形式，
+    /// 一律 400，不能「当成 offset=0」从第一页重来。
+    ///
+    /// 静默回到第一页是最糟的失败方式：HTTP 200，客户端只会看到整页重复，
+    /// 或者按自己的去重逻辑跳过一页；两种都表现为「数据少了/多了」，而日志里一片正常。
+    /// 游标本身是不透明串，服务端只认自己发出的那个形式。
+    /// </summary>
+    private static Task PaginationCursorIsValidated(TestContext t)
+    {
+        static string B64(string text) => Convert.ToBase64String(Encoding.UTF8.GetBytes(text));
+
+        return RunAsync(async () =>
+        {
+            await using var host = await Host.StartAsync(t);
+
+            // 正常翻页：游标原样传回即可，第二页不能重复第一页。
+            using var first = await ReadJsonAsync(t, await host.Client.SendAsync(
+                Get("/api/v1/points?device=v1&limit=1"), t.Ct));
+
+            var firstPage = first.RootElement.GetProperty("items").EnumerateArray().ToArray();
+            t.Equal(1, firstPage.Length, "limit caps the page size");
+
+            var cursor = first.RootElement.GetProperty("nextCursor").GetString();
+            t.Ok(!string.IsNullOrWhiteSpace(cursor), "two points produce a next cursor");
+
+            using var second = await ReadJsonAsync(t, await host.Client.SendAsync(
+                Get($"/api/v1/points?device=v1&limit=1&cursor={Uri.EscapeDataString(cursor!)}"), t.Ct));
+
+            var secondPage = second.RootElement.GetProperty("items").EnumerateArray().ToArray();
+            t.Equal(1, secondPage.Length, "the cursor returns the second page");
+            t.Ok(secondPage[0].GetProperty("point").GetString() !=
+                 firstPage[0].GetProperty("point").GetString(),
+                "the second page does not repeat the first page");
+
+            // 合法 base64、内容不是非负整数：不能当成 offset=0 从头再来。
+            foreach (var text in new[] { "not-a-number", "-1", "1.5" })
+            {
+                var bad = await host.Client.SendAsync(Get(
+                    $"/api/v1/points?device=v1&limit=1&cursor={Uri.EscapeDataString(B64(text))}"), t.Ct);
+
+                t.Equal(HttpStatusCode.BadRequest, bad.StatusCode, $"cursor '{text}' is rejected");
+
+                using var error = await ReadJsonAsync(t, bad);
+                t.Equal("request.invalid_cursor",
+                    error.RootElement.GetProperty("error").GetProperty("code").GetString(),
+                    "the error code names the cursor problem");
+            }
+
+            // 游标对调用方是不透明串。能解开、但不是服务端发出的形式（这里是补零后的
+            // "010"）同样拒绝：对方在自行解析/重建游标，替它猜一个偏移猜错了也是 200。
+            var rewritten = await host.Client.SendAsync(Get(
+                $"/api/v1/points?device=v1&limit=1&cursor={Uri.EscapeDataString("MDEw")}"), t.Ct);
+            t.Equal(HttpStatusCode.BadRequest, rewritten.StatusCode,
+                "a rewritten cursor that decodes to a number is rejected");
         });
     }
 

@@ -516,21 +516,44 @@ public static partial class RestApi
 
     /// <summary>游标就是不透明化的偏移量。用 base64 是为了让调用方不要依赖它的语义。</summary>
     private static string EncodeCursor(int offset)
-        => Convert.ToBase64String(Encoding.UTF8.GetBytes(offset.ToString()));
+        => Convert.ToBase64String(Encoding.UTF8.GetBytes(
+            offset.ToString(System.Globalization.CultureInfo.InvariantCulture)));
 
+    /// <summary>
+    /// 游标解析。不合法一律 400，**绝不「当成 0」**：静默回到第一页会让翻页客户端
+    /// 反复读同一段数据，而 HTTP 仍然是 200，调用方没有任何线索（只会看到「数据重复」，
+    /// 或者更糟——按自己的去重逻辑跳过整页）。
+    ///
+    /// 合法形式只有一种：服务端发出的那个串（十进制、无前导零、不变量格式）。
+    /// 解析成功但与发出的形式不同（补零、夹空白）同样拒绝：游标对调用方是不透明串，
+    /// 出现「能解开但长得不一样」的输入说明对方在自行解析/重建它，此时替它猜一个
+    /// 偏移比直接报错更危险——猜错了也仍是 200。数字固定用不变量格式，
+    /// 避免换进程区域设置后同一串游标解出不同结果。
+    /// </summary>
     private static int ParseCursor(string? cursor)
     {
         if (string.IsNullOrWhiteSpace(cursor)) return 0;
 
+        var parsed = -1;
+
         try
         {
             var text = Encoding.UTF8.GetString(Convert.FromBase64String(cursor));
-            return int.TryParse(text, out var v) && v >= 0 ? v : 0;
+
+            // NumberStyles.None 不接受正负号与空白：游标里只有十进制数字。
+            if (int.TryParse(text, System.Globalization.NumberStyles.None,
+                    System.Globalization.CultureInfo.InvariantCulture, out var value))
+                parsed = value;
         }
         catch (FormatException)
         {
-            throw ApiException.BadRequest("request.invalid_cursor", "cursor is not valid");
+            parsed = -1;
         }
+
+        if (parsed < 0 || !string.Equals(EncodeCursor(parsed), cursor, StringComparison.Ordinal))
+            throw ApiException.BadRequest("request.invalid_cursor", "cursor is not valid");
+
+        return parsed;
     }
 }
 
