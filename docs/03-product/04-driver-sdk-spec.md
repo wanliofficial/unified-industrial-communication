@@ -2899,10 +2899,11 @@ curl -s -H 'Authorization: Bearer dev-token-0123456789' localhost:8094/api/v1/po
 - **报文跑在 UDP 上。** 没有连接、没有序号确认，只能靠 request-id 配对；超过 MTU
   的报文会被分片，而现场大量设备与防火墙直接丢分片。
 
-这三件事决定了本节的三个核心设计：**只做 v1/v2c**（§3.10.12.1）、**读按字节预算
-分批**（§3.10.12.5）、**v1 的 `noSuchName` 逐点重发**（§3.10.12.6）。
+这三件事决定了本节的两个核心设计：**读按字节预算分批**（§3.10.12.5）、
+**v1 的 `noSuchName` 逐点重发**（§3.10.12.6）。v3 的安全层单独成节（§3.10.22），
+它与 v1/v2c 共用同一套 OID 地址模型与批量策略，只是外面多了一层 USM 封套。
 
-#### 3.10.12.1 只做 v1/v2c，v3 在配置期拒绝
+#### 3.10.12.1 版本矩阵与 v3 的边界
 
 | 能力 | v1 | v2c | v3 |
 |---|---|---|---|
@@ -2915,19 +2916,16 @@ curl -s -H 'Authorization: Bearer dev-token-0123456789' localhost:8094/api/v1/po
 | 认证 / 加密 | ✗ | ✗ | ✓（USM） |
 | 团体名（community） | ✓ 明文 | ✓ 明文 | ✗ |
 
-v3 不做，不是「优先级低」，而是它需要另一套完整的子系统：引擎发现、时间同步窗口、
-认证与加密密钥的本地化、密钥轮换。把它塞进现有驱动，要么做成半成品（只支持
-`noAuthNoPriv`，安全上等价于 v2c 却让人以为已经加密），要么把连接层改成一个带状态
-的 USM 会话机。两者都会让「配置一份 SNMP 设备」这件事的复杂度翻倍。
-
-因此 `ParseVersion` 只接受 `1` 与 `2c`，遇到 `3` / `3h` / `v3` 直接报
-`unsupported`，并在错误信息里写明「v3/USM 未实现」。**不退回 v2c 碰运气**——用
-v2c 的报文去连一个只开 v3 的代理，得到的是超时；现场会把它误判成「网络不通」，
-而真正的原因是版本配错。
+v3 的外层报文与 v1/v2c 完全不同（`HeaderData` + `msgSecurityParameters` + 数据部分），
+因此 `Build` / `Parse` 仍只处理 v1/v2c：`ParseVersion` 接受 `1` 与 `2c`，遇到 `3` 报
+`unsupported` 并把调用方指向 `BuildV3`/`ParseV3`。**不退回 v2c 碰运气**——用 v2c 的
+报文去连一个只开 v3 的代理，得到的是超时；现场会把它误判成「网络不通」，而真正的
+原因是版本配错。
 
 团体名按凭据对待：`labels.community` 在配置表单里是 `password` 类型（界面掩码），
 默认值 `public` 只是「第一次接通最少配置」，不是安全默认。文档与失败提示都要求
-现场显式确认它。
+现场显式确认它。v3 的用户名/认证口令/加密口令同样按凭据处理，且口令只从环境变量
+或配置的 Secret 字段读，不落日志（见 §3.10.22）。
 
 #### 3.10.12.2 报文结构：三层 TLV
 
@@ -6552,6 +6550,157 @@ uic iec61850read -list
 | `cmd/uic/main.go` | `iec61850read` 分派、`sim -protocol iec61850`、`simIEC61850` 启动横幅 |
 | `examples/iec61850.json` | 8 点示例（健康/状态/位置/电压/电流/两个可写点） |
 | `internal/runtime/runtime.go` | `RegisterBuiltins()` 注册 `iec61850drv.New()` |
+
+### 3.10.22 SNMP v3（USM 认证 + 加密：引擎发现 + 时间窗口 + 密钥本地化，UDP 161）
+
+v3 与 v1/v2c 的差别只在**外层**：PDU、OID 地址模型、批量预算、类型映射、v1 退化
+策略全部沿用（§3.10.12）。变的是报文外面多了一层封套：
+
+```
+Message ::= SEQUENCE {
+    version        INTEGER (2),
+    msgGlobalSys:  HeaderData      -- msgID / msgMaxSize / msgFlags / msgSecurityModel
+    msgSecurityParameters   -- OCTET STRING 包裹 BER 的 USMSecurityParameters
+    msgData          -- 明文时 ScopedPDU；加密时 OCTET STRING 包裹的 ScopedPDU
+}
+```
+
+`msgSecurityParameters` 是 `OCTET STRING` 包裹的 BER——这一层包裹本身是协议要求，
+但**加密时 `msgData` 也套一层 `OCTET STRING`**，这是最容易漏的一处：漏了它，代理解密
+后拿到的字节多一个头，`ScopedPDU` 解析失败，症状是「authPriv 一律超时、authNoPriv
+正常」。
+
+三件事必须做，且全部用标准库实现（无 CGO、无第三方依赖）：**口令本地化**、**HMAC
+认证**、**加密**。
+
+#### 3.10.22.1 口令本地化：密钥是口令与 engineID 的函数
+
+USM 的密钥不是口令本身：
+
+```
+Ku  = passwordToKey(authProto, authPassword)          -- 1 MiB 扩展 + 哈希
+Kul = localize(Ku, engineID) = H(Ku ‖ engineID ‖ Ku)  -- 绑定引擎身份
+```
+
+- **1 MiB 扩展**：把口令循环扩展成 1 MiB 再哈希（RFC 3414 A.2.2）。直接对口令做
+  哈希会把搜索空间限制在口令字典上，且不同口令若前缀相同会碰撞。
+- **本地化**：`H(Ku ‖ engineID ‖ Ku)`。engineID 一变密钥就变——这正是「代理重装后
+  必须重做发现」的根因，也是下面 `setEngine` 把 `keysReady` 打回未就绪的原因。
+- **加密密钥从认证算法的哈希派生**（`localizedPrivKey` = 用认证算法哈希本地化的
+  口令取前 16/24/32 字节）。因此 **AES-192/256 必须配 SHA-256 及以上**——不是运维
+  选择，是密钥派生的数学约束。这条在 `newV3Session` 里硬校验。
+
+口令 8..64 字节，过短在配置期（`newV3Session`）就拒绝，不让它伪装成认证失败。空
+用户名只在 `noAuthNoPriv` 档位允许（匿名用户是合法的最弱档）。
+
+#### 3.10.22.2 认证与加密的字节级细节
+
+| 环节 | 做法 | 为什么 |
+|---|---|---|
+| 摘要计算 | 对「`authParameters` 原地清零」的**原始字节**算 HMAC，不重新编码 | 重新编码会产生不同的 TLV 字节（长度前缀、空串 vs 缺失），摘要必然不匹配 |
+| 摘要比对 | `subtle.ConstantTimeCompare` | 非常量时间比较会泄露摘要前缀匹配长度，等于给口令预言机开门 |
+| 摘要长度 | 截断到摘要长度的一半（MD5/SHA-1=12，SHA-256=16，SHA-512=32） | USM 规定 |
+| DES | `privParameters = engineBoots(4) ‖ salt(4)`，IV = `preIV(key[8:16]) XOR privParameters`，CBC 补齐到 8 的倍数 | 3DES 以外唯一被 USM 承认的对称加密 |
+| AES | `privParameters = salt(8)`，IV = `engineBoots(4) ‖ engineTime(4) ‖ salt(8)`，CFB **不补齐** | CFB 是流模式，补齐会破坏对齐 |
+| 解密后截断 | 按外层 `SEQUENCE` 长度 `trimBERSequence` | CBC 补齐的字节要剥掉，否则 ScopedPDU 解析失败 |
+
+DES/AES 的 IV 差异固化到签名：`encryptScoped`/`decryptScoped` 直接收
+`engineBoots/engineTime` 整数与 `salt`，不传拼接字节——传拼接字节会让「IV 拼错」
+这类错误在编译期不可见。
+
+#### 3.10.22.3 引擎发现：只有一条路
+
+```
+发空 engineID、无认证、无加密、带 UserName 的 GetRequest
+  → 代理回 unknownEngineIDs 的 Report（带 engineID/boots/time，一次拿全三件事）
+有了 engineID → 派生密钥 → 用真密钥重发请求
+  → 代理若认为时间不在窗口内，回 notInTimeWindow（带新的 boots/time）
+    → 刷新缓存后再试一次
+```
+
+三条不能省的理由：
+
+- **为什么始终发空 engineID，哪怕配置里固定写了？** 「身份已知」不等于「时间基准
+  已知」，而 `engineBoots/engineTime` 只能问出来。跳过它的症状是第一条请求必然吃
+  一个 `notInTimeWindow`，重试一轮还是 0/0，最后报「时间窗口不同步」——而真正的原因
+  是我们从没问过。
+- **为什么不用「已知 engineID + 无认证请求」这条捷径？** 那条报文带了用户名却没有
+  摘要，配了 auth 的代理回 `unsupportedSecLevel`；配了 authPriv 的更常见的是直接
+  丢弃。两条路都可能拿不到时间基准。
+- **探测包为什么要带 UserName？** 空 engineID + 空用户名会被部分代理当垃圾包静默
+  丢弃，连 Report 都不回，症状是「首包必超时」。
+
+**engineID 写错不静默纠正**：发现时若代理报的 engineID 与配置里的固定值不一致，
+返回 `ErrProtocol`，错误信息里**同时打印两个 engineID** 并建议「删掉 engineID 让
+驱动自动发现」。静默改用代理的值会让「配置写错」变成「看起来一切正常」，还会掩盖
+那次拓扑变更。
+
+#### 3.10.22.4 时间窗口与自愈
+
+- 时间窗口 150 秒；`engineBoots` 必须相等（代理重启会让 boots 变化）；`engineTime`
+  用「学到值 + elapsed」估算。
+- 收到 `unknownEngineIDs` → `resetEngine()`（丢掉缓存身份回空 engineID 重发现）；
+  收到 `notInTimeWindow` → 保留 engineID 只重学时间。
+- **密钥是 engineID 的函数**：`setEngine` 统一把 `keysReady` 打回未就绪，绝不让调用
+  方记得手动清标志。漏清一次的后果是「代理重装后一直认证失败，重启进程才好」。
+- request-id 配对必须在**解密之后**——加密应答的 id 在密文里。`readV3Datagram`
+  只判「结构上是不是 v3」，配对交给 `v3Round`。把配对放在读层会让所有加密应答被当
+  不匹配丢掉，症状是「authPriv 永远超时、authNoPriv 正常」。
+- `transact` 最多两轮；认证前 Report 不签名（密钥不一致签了也验不过），验签之后的
+  解密失败 Report 必须签名。
+
+Report 签名策略一句话：**认证前不签，验签后签**。
+
+#### 3.10.22.5 错误映射
+
+USM 的 6 类 Report 各有明确的现场含义：
+
+| Report | 驱动判定 | 含义 |
+|---|---|---|
+| `usmStatsUnknownEngineIDs` | `ErrProtocol`（自愈：重发现） | 代理不认识我们的 engineID |
+| `usmStatsNotInTimeWindows` | `ErrProtocol`（自愈：重学时间） | 时间基准过期或代理重启 |
+| `usmStatsWrongDigests` | `ErrPermission` | 摘要错，通常是口令错 |
+| `usmStatsUnknownUserNames` | `ErrPermission` | 用户不存在 |
+| `usmStatsUnsupportedSecLevels` | `ErrPermission` | 代理不允许这个安全级别 |
+| `usmStatsDecryptionErrors` | `ErrProtocol`（Report 已签名） | 解密失败 |
+
+关键坑：**认证/用户/安全级别问题重试无意义，直接判权限错误**；而时间/引擎状态
+值得多一轮。把这两类混在一个重试循环里，会让「口令错」表现为两次超时而不是一次
+权限拒绝，排障方向完全错。
+
+#### 3.10.22.6 配置形态
+
+```json
+{
+  "id": "ch-snmp3",
+  "protocol": "snmp",
+  "transport": { "kind": "udp", "address": "127.0.0.1:16161" },
+  "labels": {
+    "version": "3",
+    "username": "monitor",
+    "authProtocol": "sha256",
+    "authPassword": "authpass123",
+    "privProtocol": "aes",
+    "privPassword": "privpass123",
+    "engineID": "80001f888000000002",
+    "options": "retries=2,maxOids=16"
+  }
+}
+```
+
+`engineID` 可选：留空则自动发现；填了则固定（省一次发现往返，但写错会明确报错）。
+`privPassword` 留空回退到 `authPassword`（USM 允许两者不同，回退是显式的）。所有
+口令在配置里是 Secret（界面掩码），CLI 侧走环境变量（`UIC_SNMP_AUTH_PASSWORD` /
+`UIC_SNMP_PRIV_PASSWORD`），不落日志。
+
+#### 3.10.22.7 测试矩阵
+
+| 层 | 用例 |
+|---|---|
+| `codec/snmp` | RFC 3414 A.3.1 的 SHA-1/MD5 派生向量逐字节通过；6 种认证算法摘要截断；DES/AES 加密→解密往返；空 engineID 只允许发现报文、带 auth/priv 拒绝；`BuildV3`/`ParseV3`/`VerifyV3` 往返；`ScopedPDU` 加解密往返 |
+| `driver/snmp` | `TestV3EndToEnd`（发现 → 认证 → 加密 → 读 → 写 → 读回）；口令错 → `permission`；未知用户 → `permission`；安全级别不匹配 → `permission`；`TestV3FixedEngineID`（读写成功 + 全程只有 1 次 Report）；`TestV3FixedEngineIDMismatch`（错误含两个 engineID + `protocol`）；`TestV3EngineResetRecovers`（代理换身份后会话自愈）；`TestV3FixedEngineIDNoAuth` |
+| `sim/snmp` | 真做 HMAC 验签与 DES/AES 解密（两侧互为对端，杜绝「自己骗自己」）；6 类 Report；引擎身份可切换；`Faults.DropPercent` 模拟真机静默丢弃 |
+| `cmd/uic` | v3 flag 折参、`secret()`、`securityLevelLabel()` |
 
 ### 3.11 计算点（`computed`）
 

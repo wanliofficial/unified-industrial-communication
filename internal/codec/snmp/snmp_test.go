@@ -235,15 +235,12 @@ func TestOIDDecodeRejects(t *testing.T) {
 }
 
 func TestParseVersion(t *testing.T) {
-	ok := map[string]Version{"": V2c, "2c": V2c, "v2c": V2c, "2": V2c, "1": V1, "v1": V1}
+	ok := map[string]Version{"": V2c, "2c": V2c, "v2c": V2c, "2": V2c, "1": V1, "v1": V1, "3": V3, "v3": V3}
 	for in, want := range ok {
 		got, err := ParseVersion(in)
 		if err != nil || got != want {
 			t.Fatalf("%q = %v, %v", in, got, err)
 		}
-	}
-	if _, err := ParseVersion("3"); err == nil || !strings.Contains(err.Error(), "USM") {
-		t.Fatalf("v3 error = %v, want a USM hint", err)
 	}
 	if _, err := ParseVersion("4"); err == nil {
 		t.Fatal("unknown version must fail")

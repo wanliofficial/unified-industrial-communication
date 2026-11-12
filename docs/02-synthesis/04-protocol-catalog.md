@@ -151,7 +151,7 @@
 | **MQTT 3.1.1/5.0** | C/V/B | TCP/TLS/WS | Topic | 27 | PA-06、PA-08 | 2 | **P0** | QoS 1/2 语义、会话保持、遗嘱消息、主题通配符、5.0 属性 |
 | **Sparkplug B** | C | MQTT | Topic + Protobuf | 3 | PA-06、PA-08 | 3 | P1 | 生命周期（NBIRTH/NDEATH/DBIRTH/DDATA）；状态管理；序列号与重生 |
 | **CoAP** | C/S | UDP/DTLS | URI 路径 | 4 | PA-06 | 3 | P2 | 分块传输、观察（Observe）、确认/非确认消息；本仓库已实现明文 UDP 主站 + GET/PUT/POST + Block2 接收 + 资源发现，Observe/DTLS/Block1 发送不做 |
-| **SNMP v1/v2c/v3** | M | UDP | OID | 2 | PA-06、PA-34 | 2 | P2 | v1 无 per-varbind 异常（批量 `noSuchName` 需逐点重发）；v3 的 USM 认证加密；表遍历（Walk）；OID 语义需 MIB |
+| **SNMP v1/v2c/v3** | M | UDP | OID | 2 | PA-06、PA-34 | 2 | P2 | v1 无 per-varbind 异常（批量 `noSuchName` 需逐点重发）；v3 的 USM 认证加密——固定 engineID ≠ 已知时间基准，跳过发现会卡 `notInTimeWindow`；表遍历（Walk）；OID 语义需 MIB |
 | **HTTP/REST** | C/V | TCP/TLS | URL + JSON | 12 | PA-06、PA-34、PA-37 | 1 | **P0** | 幂等性、分页、限流、鉴权、错误码规范 |
 | **Roblox/Redfish（BMC）** | C | HTTPS | 资源路径 | 1 | PA-08 | 2 | X | 服务器带外管理，非工业现场 |
 | **OCPP 1.6/2.0** | C | WebSocket | 充电桩 ID | 1 | PA-08 | 3 | X | 充电桩行业；消息类型多 |
@@ -242,7 +242,7 @@
 MC 3E、FINS、EtherNet/IP + CIP、BACnet/IP、IEC 104、DL/T 645、CJ/T 188、ADS、OPC DA 桥接、Sparkplug B、SNMP。
 
 > 截至当前实现：MC 3E、FINS、EtherNet/IP + CIP、BACnet/IP、IEC 104、DL/T 645、
-> CJ/T 188、SNMP v1/v2c、ADS/AMS 已落地（各含编解码、主站、内置从站/服务端与自检 CLI）；
+> CJ/T 188、SNMP v1/v2c/v3、ADS/AMS 已落地（各含编解码、主站、内置从站/服务端与自检 CLI）；
 > Sparkplug B 作为 MQTT 北向的第二种载荷格式落地（编解码 + 生命周期状态机 + 集成测试）；
 > OPC DA 桥接归入「不做/独立 Windows 桥接进程」（需要 DCOM/COM，零依赖 Go 不可实现）。
 > 645 与 188 都是「表计语义寻址 + 压缩 BCD」，但帧层与字段模型不同：
@@ -251,9 +251,11 @@ MC 3E、FINS、EtherNet/IP + CIP、BACnet/IP、IEC 104、DL/T 645、CJ/T 188、A
 > `DIBits`/`DIField`：DI 位数随协议变化，字段偏移只在 188 上允许非 0。
 >
 > SNMP 补的是「IT/基础设施」这一层：OID 寻址、一条 GET 带多个 varbind、协议自带的
-> error-status / 异常标记。v3 的 USM 不做（配置期显式拒绝，不退回 v2c）；Trap 不做
-> （轮询主站的采集语义与设备主动推不同）；Walk 只作为自检接口，生产点表必须写明确
-> OID。一个坏 OID 在 v1 下会毁掉整批返回值，因此驱动对 `noSuchName` 逐点重发。
+> error-status / 异常标记。v3 的 USM 认证加密（MD5/SHA-1/SHA-2 系列 + DES/AES）已落地，
+> 引擎发现、时间同步与密钥本地化全部用标准库实现；固定 engineID 只是省一次发现往返，
+> 时间基准仍必须问一次。Trap 不做（轮询主站的采集语义与设备主动推不同）；Walk 只作为
+> 自检接口，生产点表必须写明确 OID。一个坏 OID 在 v1 下会毁掉整批返回值，因此驱动对
+> `noSuchName` 逐点重发。
 >
 > ADS 补的是「PLC 工程变量」这一层：地址不是寄存器号而是符号名，一次取值要先按名字
 > 取句柄再按句柄读值，句柄随 PLC 重启失效。只做 AMS/TCP 上的符号读写；通知订阅、

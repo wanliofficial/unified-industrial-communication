@@ -607,18 +607,42 @@ func TestParseOptions(t *testing.T) {
 	}
 
 	bad := []map[string]string{
-		{"version": "3"},
 		{"version": "9"},
 		{"community": "  "},
 		{"options": "retries=11"},
 		{"options": "retries"},
 		{"options": "maxOids=0"},
 		{"options": "unknown=1"},
+		// v3 少了用户名：USM 的用户名不能猜。
+		{"version": "3"},
+		// 只配加密不配认证是非法的。
+		{"version": "3", "username": "u", "authProtocol": "none", "privProtocol": "aes",
+			"privPassword": "12345678"},
+		// 未知算法名。
+		{"version": "3", "username": "u", "authProtocol": "md4"},
+		{"version": "3", "username": "u", "authProtocol": "sha", "privProtocol": "aes", "privPassword": "12345678", "engineID": "zz"},
 	}
 	for _, labels := range bad {
 		if _, err := parseOptions(dev(labels)); err == nil {
 			t.Fatalf("labels %v must fail", labels)
 		}
+	}
+
+	got, err := parseOptions(dev(map[string]string{
+		"version": "3", "username": "monitor",
+		"authProtocol": "SHA-256", "authPassword": "authpass123",
+		"privProtocol": "AES", "privPassword": "privpass123",
+		"engineID": "80:00:1f:88:80:00:00:00:01",
+	}))
+	if err != nil {
+		t.Fatalf("v3 options: %v", err)
+	}
+	if got.Version != snmpcodec.V3 || got.Username != "monitor" ||
+		got.AuthProtocol != snmpcodec.AuthSHA256 || got.PrivProtocol != snmpcodec.PrivAES {
+		t.Fatalf("v3 parsed = %+v", got)
+	}
+	if len(got.FixedEngineID) != 9 {
+		t.Fatalf("fixed engine ID = %x", got.FixedEngineID)
 	}
 }
 
@@ -648,9 +672,16 @@ func TestOpenValidationAndDefaultPort(t *testing.T) {
 		t.Fatal("empty address must fail")
 	}
 
+	// v3 缺用户名时仍必须在 Open 阶段拒绝（不是等到第一条请求）。
 	cfg = testConfig(map[string]string{"version": "3"})
 	if _, err := d.Open(context.Background(), cfg); err == nil {
-		t.Fatal("v3 must be refused")
+		t.Fatal("v3 without username must be refused")
+	}
+	// 口令不足 8 字节也是配置期错误。
+	cfg = testConfig(map[string]string{"version": "3", "username": "u",
+		"authProtocol": "sha", "authPassword": "short"})
+	if _, err := d.Open(context.Background(), cfg); err == nil {
+		t.Fatal("short auth password must be refused")
 	}
 }
 

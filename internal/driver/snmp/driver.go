@@ -1,13 +1,16 @@
-// Package snmp 实现 SNMP v1/v2c 主站驱动（UDP 161）。
+// Package snmp 实现 SNMP 主站驱动（UDP 161），支持 v1/v2c 与 v3（USM）。
 //
 // 这一层只做三件事：把点位的 OID 组织成 GET / SET 事务、把 varbind 的
 // 线类型翻译成平台数据类型、把 error-status 与 v2c 异常标记翻译成驱动
-// 错误分类。报文结构本身在 codec/snmp 里。
+// 错误分类。报文结构本身在 codec/snmp 里；v3 的引擎发现、时间同步与密钥
+// 管理在 v3session.go 里。
 //
 // 三条设计取舍：
 //
-//  1. **只做 v1/v2c。** v3 的 USM 认证与加密是另一套报文结构与密钥管理，
-//     在配置期显式拒绝（见 codec.ParseVersion），而不是退回 v2c 碰运气。
+//  1. **v1/v2c 与 v3 共用同一套地址模型与批量预算**，只是 v3 外面多了一层
+//     USM 封套。v1/v2c 的 `Build`/`Parse` 遇到版本 3 明确拒绝并把调用方指向
+//     `BuildV3`/`ParseV3`，不会退回 v2c 去连只开 v3 的代理（那只会得到
+//     超时，现场会误判成网络不通）。
 //  2. **读用一条 GET 带多个 varbind**，并按**编码后的字节预算**分批
 //     （不是只按个数）。SNMP 跑在 UDP 上，超过 MTU 的报文会被分片；现场
 //     大量设备与防火墙直接丢分片，症状是「OID 少的时候能读，点表一多就
@@ -62,7 +65,7 @@ const (
 // Dialer 允许测试注入内存数据报链路。
 type Dialer func(ctx context.Context, addr string, timeout time.Duration) (transport.Datagram, error)
 
-// Driver 是 SNMP v1/v2c 主站驱动。
+// Driver 是 SNMP 主站驱动（v1/v2c/v3）。
 type Driver struct {
 	dial Dialer
 }
@@ -118,7 +121,7 @@ func (d *Driver) Meta() driver.Meta {
 				Enum: []string{"bool", "int16", "uint16", "int32", "uint32", "int64", "uint64", "string", "bytes"},
 				Help: "决定 varbind 的线类型如何翻译：数值型接受 INTEGER/Counter/Gauge/TimeTicks，string/bytes 接受 OCTET STRING"},
 		},
-		Description: "SNMP v1/v2c 主站：按 OID 批量 GET 与单点 SET，写 unsigned 用 Gauge32、写 string 用 OCTET STRING",
+		Description: "SNMP 主站（v1/v2c/v3）：按 OID 批量 GET 与单点 SET，写 unsigned 用 Gauge32、写 string 用 OCTET STRING；v3 支持 USM 认证与加密",
 	}
 }
 
@@ -128,6 +131,16 @@ type Options struct {
 	Version   snmpcodec.Version
 	Retries   int
 	MaxOids   int
+
+	// v3 字段。只在 Version==V3 时使用；非 v3 时这些字段被忽略，
+	// 这样同一份配置切换版本不会「残留的 v3 参数影响 v2c」。
+	Username     string
+	AuthProtocol snmpcodec.AuthProtocol
+	AuthPassword string
+	PrivProtocol snmpcodec.PrivProtocol
+	PrivPassword string
+	// FixedEngineID 非空时跳过引擎发现（运维已知 engineID）。
+	FixedEngineID []byte
 }
 
 // Open 建立 UDP 套接字并解析设备参数。
@@ -153,6 +166,15 @@ func (d *Driver) Open(ctx context.Context, cfg driver.OpenConfig) (driver.Conn, 
 	if err != nil {
 		return nil, err
 	}
+	// v3 的口令长度与算法组合在**拨号之前**校验：配置错了就不该占用
+	// 一个套接字，更不该让 Probe 去撞一个永远对不上的摘要。
+	var v3 *v3Session
+	if opt.Version == snmpcodec.V3 {
+		v3, err = newV3Session(cfg.Device, opt)
+		if err != nil {
+			return nil, driver.E(driver.ErrUnsupported, "open", cfg.Device.ID, err.Error(), false, err)
+		}
+	}
 	conn, err := d.dial(ctx, addr, cfg.Channel.EffectiveTimeout())
 	if err != nil {
 		return nil, driver.E(driver.ErrDisconnected, "dial", cfg.Device.ID,
@@ -166,6 +188,8 @@ func (d *Driver) Open(ctx context.Context, cfg driver.OpenConfig) (driver.Conn, 
 		version:   opt.Version,
 		retries:   opt.Retries,
 		maxOids:   opt.MaxOids,
+		maxSize:   maxRequestBytes,
+		v3:        v3,
 	}, nil
 }
 
@@ -232,16 +256,104 @@ func parseOptions(dev model.Device) (Options, error) {
 			opt.MaxOids = n
 		default:
 			return opt, driver.E(driver.ErrUnsupported, "open", dev.ID,
-				fmt.Sprintf("未知的 options 项 %q（支持 retries / maxOids）", key), false, nil)
+				fmt.Sprintf("未知的 options 项 %q（支持 retries / maxOids / engineID）", key), false, nil)
+		}
+	}
+
+	// v3 参数：用户名/认证/加密。放在 labels 顶层而不是 options 里，因为
+	// 它们是安全参数（不是调优参数），配置页需要把它们标成 Secret 单独渲染。
+	if opt.Version == snmpcodec.V3 {
+		opt.Username = strings.TrimSpace(dev.Labels["username"])
+		if opt.Username == "" {
+			// USM 允许空用户名（代理上的匿名用户），但空用户名几乎总是
+			// 配置漏了。在这里拒绝，避免「用户名忘填」被误诊成「认证失败」。
+			return opt, driver.E(driver.ErrUnsupported, "open", dev.ID,
+				"version 3 requires labels.username (USM security name)", false, nil)
+		}
+		opt.AuthPassword = dev.Labels["authPassword"]
+		opt.PrivPassword = dev.Labels["privPassword"]
+		authName := strings.TrimSpace(dev.Labels["authProtocol"])
+		privName := strings.TrimSpace(dev.Labels["privProtocol"])
+		a, err := snmpcodec.ParseAuthProtocol(authName)
+		if err != nil {
+			return opt, driver.E(driver.ErrUnsupported, "open", dev.ID, err.Error(), false, err)
+		}
+		p, err := snmpcodec.ParsePrivProtocol(privName)
+		if err != nil {
+			return opt, driver.E(driver.ErrUnsupported, "open", dev.ID, err.Error(), false, err)
+		}
+		opt.AuthProtocol = a
+		opt.PrivProtocol = p
+		// 只在给了加密算法时要求加密口令；authPriv 缺 privPassword 时
+		// newV3Session 会回退到 authPassword，这是常见做法（很多代理只
+		// 配一个口令）。但「配了 priv 却两个口令都空」必须在这里拒绝。
+		if p != snmpcodec.PrivNone && a == snmpcodec.AuthNone {
+			return opt, driver.E(driver.ErrUnsupported, "open", dev.ID,
+				"privProtocol 需要 authProtocol（USM 不允许只加密不认证）", false, nil)
+		}
+		if s, ok := dev.Labels["engineID"]; ok {
+			s = strings.TrimSpace(s)
+			if s != "" {
+				id, err := parseEngineID(s)
+				if err != nil {
+					return opt, driver.E(driver.ErrUnsupported, "open", dev.ID, err.Error(), false, err)
+				}
+				opt.FixedEngineID = id
+			}
 		}
 	}
 	return opt, nil
+}
+
+// parseEngineID 解析配置里的 engineID 写法：十六进制，可用 `0x` 前缀与
+// 冒号/空格分隔（运维通常从代理的配置页或抓包里抄一段十六进制）。
+//
+// 拒绝奇数长度的十六进制：任何一半字节的 engineID 都是抄漏了一位。
+func parseEngineID(s string) ([]byte, error) {
+	t := strings.TrimSpace(s)
+	t = strings.TrimPrefix(t, "0x")
+	t = strings.TrimPrefix(t, "0X")
+	t = strings.NewReplacer(":", "", " ", "", "-", "").Replace(t)
+	if len(t) < 10 || len(t) > 64 {
+		return nil, fmt.Errorf("engineID %q: hex length %d, must be 10..64 chars (5..32 bytes)", s, len(t))
+	}
+	if len(t)%2 != 0 {
+		return nil, fmt.Errorf("engineID %q: odd number of hex digits", s)
+	}
+	out := make([]byte, len(t)/2)
+	for i := 0; i < len(out); i++ {
+		hi, ok1 := hexVal(t[i*2])
+		lo, ok2 := hexVal(t[i*2+1])
+		if !ok1 || !ok2 {
+			return nil, fmt.Errorf("engineID %q: %q is not hexadecimal", s, t[i*2:i*2+2])
+		}
+		out[i] = hi<<4 | lo
+	}
+	return out, nil
+}
+
+func hexVal(c byte) (byte, bool) {
+	switch {
+	case c >= '0' && c <= '9':
+		return c - '0', true
+	case c >= 'a' && c <= 'f':
+		return c - 'a' + 10, true
+	case c >= 'A' && c <= 'F':
+		return c - 'A' + 10, true
+	}
+	return 0, false
 }
 
 // ---------------------------------------------------------------------------
 // 连接
 // ---------------------------------------------------------------------------
 
+// connState 是一条链路上的会话状态。
+//
+// v1/v2c 的所有状态就是 community；v3 需要一整套 USM 状态（engineID、
+// engineBoots/engineTime、本地化密钥、salt 计数器），所以 v3 的状态单独放在
+// v3 子结构里——两个版本的字段分开，才不会在「只需要 community」的路径上
+// 误用密钥。
 type connState struct {
 	cfg       driver.OpenConfig
 	conn      transport.Datagram
@@ -250,11 +362,15 @@ type connState struct {
 	version   snmpcodec.Version
 	retries   int
 	maxOids   int
+	// maxSize 是我们在 msgMaxSize 里声明的接收能力。v1/v2c 不用它；
+	// v3 必须有（代理按它裁剪响应），取与请求预算相同的 1400。
+	maxSize int
 
-	// mu 串行化整条会话：request-id 配对在 UDP 上必须唯一，交错事务
-	// 会让迟到的应答被错误地当成当前事务的结果。
 	mu    sync.Mutex
 	reqID int32
+
+	// v3 只在 version==V3 时非 nil。discover() 负责初始化。
+	v3 *v3Session
 }
 
 func (c *connState) Close() error { return c.conn.Close() }
@@ -273,10 +389,16 @@ func (c *connState) nextID() int32 {
 // 为什么 noSuchObject 也算通：它证明报文到达了代理、community 被接受、
 // 代理回了应答。真正失败只有两种——没有任何报文（超时）或报文结构错，
 // 两者都会在 exchange 里变成分类错误。
+//
+// v3 的 Probe 顺带完成引擎发现：发现是链路的一部分，不做的话第一条真
+// 请求必然吃一个 Report 往返。
 func (c *connState) Probe(ctx context.Context) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
+	if c.version == snmpcodec.V3 {
+		return c.probeV3(ctx)
+	}
 	id := c.nextID()
 	req, err := snmpcodec.GetRequest(c.version, c.community, id, []snmpcodec.OID{sysDescrOID})
 	if err != nil {
@@ -292,7 +414,28 @@ func (c *connState) Probe(ctx context.Context) error {
 	return nil
 }
 
+func (c *connState) deadline(ctx context.Context) time.Time {
+	d := time.Now().Add(c.cfg.Channel.EffectiveTimeout())
+	if dl, ok := ctx.Deadline(); ok && dl.Before(d) {
+		return dl
+	}
+	return d
+}
+
+func (c *connState) readError(op string, err error, ctx context.Context) error {
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return driver.E(driver.ErrTimeout, op, c.cfg.Device.ID, "context done", true, ctxErr)
+	}
+	if isTimeout(err) {
+		return driver.E(driver.ErrTimeout, op, c.cfg.Device.ID,
+			"no response within timeout", true, err)
+	}
+	return driver.E(driver.ErrDisconnected, op, c.cfg.Device.ID, "udp read failed", true, err)
+}
+
 // exchange 发送一条报文并等待 request-id 相同的 Response。
+//
+// v1/v2c 用这条：报文结构由 community 承载，无需额外处理。
 func (c *connState) exchange(ctx context.Context, payload []byte, id int32, op string) (snmpcodec.Message, error) {
 	var lastErr error
 	for attempt := 0; attempt <= c.retries; attempt++ {
@@ -333,23 +476,270 @@ func (c *connState) exchange(ctx context.Context, payload []byte, id int32, op s
 	return snmpcodec.Message{}, lastErr
 }
 
-func (c *connState) deadline(ctx context.Context) time.Time {
-	d := time.Now().Add(c.cfg.Channel.EffectiveTimeout())
-	if dl, ok := ctx.Deadline(); ok && dl.Before(d) {
-		return dl
+// readV3Datagram 读一条可解析为 v3 的报文，直到超时或读满重试次数。
+//
+// 只做「结构上是不是 v3」的判断，**不做 request-id 配对**：加密应答的
+// request-id 在密文里，读这一层还没解密。配对交给调用方在解密之后做
+// （见 v3Round 的 matchID）。把配对放在这里会导致「所有加密应答都被
+// 当成不匹配的报文丢掉」，症状是「authPriv 永远超时、authNoPriv 正常」。
+func (c *connState) readV3Datagram(ctx context.Context, op string) ([]byte, error) {
+	var lastErr error
+	for attempt := 0; attempt <= c.retries; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return nil, driver.E(driver.ErrTimeout, op, c.cfg.Device.ID, "context done", true, err)
+		}
+		for {
+			datagram, err := c.conn.Read()
+			if err != nil {
+				lastErr = c.readError(op, err, ctx)
+				break
+			}
+			if _, perr := snmpcodec.ParseV3(datagram); perr != nil {
+				// 可能是 v1/v2c 应答：给一个更明确的诊断（「代理说的不是
+				// v3」比「malformed v3」有用）。
+				if _, cperr := snmpcodec.Parse(datagram); cperr == nil {
+					return nil, driver.E(driver.ErrProtocol, op, c.cfg.Device.ID,
+						"agent replied with a v1/v2c message, but v3 was configured", false, nil)
+				}
+				return nil, driver.E(driver.ErrProtocol, op, c.cfg.Device.ID,
+					"malformed v3 datagram: "+perr.Error(), false, perr)
+			}
+			return datagram, nil
+		}
+		if driver.KindOf(lastErr) != driver.ErrTimeout || ctx.Err() != nil {
+			return nil, lastErr
+		}
 	}
-	return d
+	return nil, lastErr
 }
 
-func (c *connState) readError(op string, err error, ctx context.Context) error {
-	if ctxErr := ctx.Err(); ctxErr != nil {
-		return driver.E(driver.ErrTimeout, op, c.cfg.Device.ID, "context done", true, ctxErr)
+// sendDatagram 设置期限并发出一个报文。
+func (c *connState) sendDatagram(ctx context.Context, payload []byte, op string) error {
+	if err := ctx.Err(); err != nil {
+		return driver.E(driver.ErrTimeout, op, c.cfg.Device.ID, "context done", true, err)
 	}
-	if isTimeout(err) {
-		return driver.E(driver.ErrTimeout, op, c.cfg.Device.ID,
-			"no response within timeout", true, err)
+	if err := c.conn.SetDeadline(c.deadline(ctx)); err != nil {
+		return driver.E(driver.ErrDisconnected, op, c.cfg.Device.ID, "set udp deadline", true, err)
 	}
-	return driver.E(driver.ErrDisconnected, op, c.cfg.Device.ID, "udp read failed", true, err)
+	if err := c.conn.Write(payload); err != nil {
+		return driver.E(driver.ErrDisconnected, op, c.cfg.Device.ID, "udp write failed", true, err)
+	}
+	return nil
+}
+
+// transact 是 v3 的请求入口：处理发现、认证/加密、Report 分类与重试。
+//
+// op 是 PDU 类型（GetRequestPDU/SetRequestPDU 等构造好的 PDU 传进来）。
+// 返回的 PDU 是应答或 nil（Report 已被处理）。
+func (c *connState) transact(ctx context.Context, pdu snmpcodec.PDU, op string) (snmpcodec.PDU, error) {
+	if c.v3 == nil {
+		return snmpcodec.PDU{}, driver.E(driver.ErrInternal, op, c.cfg.Device.ID, "v3 session not initialized", false, nil)
+	}
+	s := c.v3
+	if err := s.ensureReady(ctx, c); err != nil {
+		return snmpcodec.PDU{}, err
+	}
+	keys := s.currentKeys()
+	if keys == nil {
+		return snmpcodec.PDU{}, driver.E(driver.ErrInternal, op, c.cfg.Device.ID, "v3 keys not ready", false, nil)
+	}
+	// 最多两轮：第一轮可能拿到 Report（时间窗口/重启），刷新后再试一次。
+	var lastErr error
+	for round := 0; round < 2; round++ {
+		resp, err := c.v3Round(ctx, pdu, keys, op)
+		if err != nil {
+			return snmpcodec.PDU{}, err
+		}
+		if resp.pdu != nil {
+			return *resp.pdu, nil
+		}
+		// Report：分类处理。
+		kind := snmpcodec.ClassifyReport(*resp.report)
+		switch kind {
+		case snmpcodec.ReportNotInTimeWindow, snmpcodec.ReportUnknownEngineID:
+			// 时间/引擎状态失效：重新发现（会刷新 boots/time 或 engineID），
+			// 下一轮重试。这是唯一「值得多一轮」的 Report。
+			if round == 1 {
+				return snmpcodec.PDU{}, driver.E(driver.ErrProtocol, op, c.cfg.Device.ID,
+					"agent still reports time/engine mismatch after re-discovery", false, nil)
+			}
+			// 两种失效的重发现起点不同：
+			//
+			//   - notInTimeWindow：引擎身份还是对的，只是时间基准过期。
+			//     保留 engineID，只重学 boots/time。
+			//   - unknownEngineID：代理明确说不认识我们手里的 engineID
+			//     （它重启/重装/恢复了旧配置）。必须先丢掉旧身份回到空
+			//     engineID 重做发现——拿旧身份再算一遍密钥，代理只会再回
+			//     一次同一个 Report，两次之后我们报「re-discovery 也没用」，
+			//     而真正要做的事是重新问一遍「你是谁」。
+			if kind == snmpcodec.ReportUnknownEngineID {
+				s.resetEngine()
+			}
+			s.keysReady.Store(false)
+			if err := s.ensureReady(ctx, c); err != nil {
+				return snmpcodec.PDU{}, err
+			}
+			keys = s.currentKeys()
+			lastErr = nil
+			continue
+		case snmpcodec.ReportWrongDigest, snmpcodec.ReportUnknownUserName, snmpcodec.ReportUnsupportedSecLevel:
+			// 认证/用户/安全级别问题：重试无意义，直接判权限错误。
+			return snmpcodec.PDU{}, driver.E(driver.ErrPermission, op, c.cfg.Device.ID, kind.Hint(), false, nil)
+		case snmpcodec.ReportDecryptionError:
+			return snmpcodec.PDU{}, driver.E(driver.ErrPermission, op, c.cfg.Device.ID, kind.Hint(), false, nil)
+		default:
+			return snmpcodec.PDU{}, driver.E(driver.ErrProtocol, op, c.cfg.Device.ID,
+				"unrecognized Report PDU", false, nil)
+		}
+	}
+	return snmpcodec.PDU{}, lastErr
+}
+
+// v3RoundResult 是一次 v3 往返的结果。
+//
+// pdu 与 report 二选一：成功时 pdu 非 nil；收到 Report 时 report 非 nil。
+// 分成两个字段而不是用「PDU.Type == Report」判断，是因为 Report 的 varbind
+// 是 usmStats 计数器，与应答 varbitd 的语义完全不同，混用一个字段容易在
+// 上层误把计数器当业务值。
+type v3RoundResult struct {
+	pdu    *snmpcodec.PDU
+	report *snmpcodec.PDU
+}
+
+// v3Round 发一条 v3 请求并解析应答。
+//
+// 配对（request-id）放在解密之后：加密应答的 request-id 在密文里，
+// 读这一层只能看到密文。这条顺序是 v3 与 v1/v2c 最容易搞错的地方——
+// 先把报文读出来、解密、再配对，才既不会漏掉 authPriv 的应答，也不会
+// 把迟到的旧应答当成当前结果。
+func (c *connState) v3Round(ctx context.Context, pdu snmpcodec.PDU, keys *snmpcodec.V3Keys, op string) (v3RoundResult, error) {
+	s := c.v3
+	id := c.nextID()
+	pdu.RequestID = id
+	hdr := snmpcodec.HeaderData{
+		MsgID:    s.nextMsgID(),
+		MaxSize:  c.maxSize,
+		Flags:    s.flags(),
+		SecModel: snmpcodec.SecurityModelUSM,
+	}
+	sec := snmpcodec.USMSecurityParameters{
+		EngineID:    append([]byte(nil), s.engineID...),
+		EngineBoots: s.engineBoots,
+		EngineTime:  s.estimatedEngineTime(),
+		UserName:    s.user,
+	}
+	scoped, err := snmpcodec.BuildScopedPDU(s.engineID, "", pdu)
+	if err != nil {
+		return v3RoundResult{}, driver.E(driver.ErrInternal, op, c.cfg.Device.ID, err.Error(), false, err)
+	}
+	raw, err := snmpcodec.BuildV3(hdr, sec, scoped, keys)
+	if err != nil {
+		return v3RoundResult{}, driver.E(driver.ErrInternal, op, c.cfg.Device.ID, err.Error(), false, err)
+	}
+	for attempt := 0; attempt <= c.retries; attempt++ {
+		if err := c.sendDatagram(ctx, raw, op); err != nil {
+			return v3RoundResult{}, err
+		}
+		res, err := c.readV3Round(ctx, id, keys, op)
+		if err != nil {
+			return v3RoundResult{}, err
+		}
+		if res != nil {
+			return *res, nil
+		}
+		// 收到了报文但都不是这次请求的应答：重发。
+	}
+	return v3RoundResult{}, driver.E(driver.ErrTimeout, op, c.cfg.Device.ID,
+		"only stale or mismatched v3 messages arrived", true, nil)
+}
+
+// readV3Round 读一条属于本次请求的 v3 报文；返回 nil 表示只收到无关报文。
+func (c *connState) readV3Round(ctx context.Context, id int32, keys *snmpcodec.V3Keys, op string) (*v3RoundResult, error) {
+	for {
+		datagram, err := c.readV3Datagram(ctx, op)
+		if err != nil {
+			return nil, err
+		}
+		msg, perr := snmpcodec.ParseV3(datagram)
+		if perr != nil {
+			return nil, driver.E(driver.ErrProtocol, op, c.cfg.Device.ID,
+				"malformed v3 datagram: "+perr.Error(), false, perr)
+		}
+		// 认证校验必须放在解密与配对之前：伪造的 Report 可以随便填
+		// request-id，只要签名不对就应当直接拒绝。
+		//
+		// 判据用「应答自己带了认证」而不是「本端请求带了认证」：代理回
+		// Report 时通常不带认证（发现阶段、摘要失败都如此），而带认证的
+		// 应答必须验签。反过来用本端 flags 判断会把不带认证的 Report 也
+		// 拿去验签，得到「auth parameters are 0 bytes」的假失败。
+		if msg.Header.Flags.HasAuth() {
+			if err := snmpcodec.VerifyV3(datagram, msg.Security, keys.Auth, keys.AuthKey); err != nil {
+				return nil, driver.E(driver.ErrPermission, op, c.cfg.Device.ID, err.Error(), false, err)
+			}
+		}
+		// 解密（若是密文）。
+		if msg.Encrypted {
+			if err := msg.DecryptScoped(keys.Priv, keys.PrivKey); err != nil {
+				return nil, driver.E(driver.ErrProtocol, op, c.cfg.Device.ID,
+					"decrypt response: "+err.Error(), false, err)
+			}
+		}
+		// 现在是明文 PDU，可以配对。
+		//
+		// Report 的 request-id 可能是 0：加密请求在认证/解密失败时，
+		// 代理读不到我们的 request-id（它在密文里），RFC 3412 §7.1 允许
+		// 此时填 0。拒收这种 Report 会让「认证配错」表现为超时。
+		if msg.PDU.Type == snmpcodec.PDUReport {
+			if msg.PDU.RequestID != id && msg.PDU.RequestID != 0 {
+				continue
+			}
+			p := msg.PDU
+			return &v3RoundResult{report: &p}, nil
+		}
+		if msg.PDU.Type != snmpcodec.PDUResponse || msg.PDU.RequestID != id {
+			// 迟到的旧应答 / Trap：继续读。
+			continue
+		}
+		p := msg.PDU
+		return &v3RoundResult{pdu: &p}, nil
+	}
+}
+
+// flags 返回本次请求的安全级别标志。
+func (s *v3Session) flags() snmpcodec.MsgFlags {
+	f := snmpcodec.FlagReportable
+	if s.auth != snmpcodec.AuthNone {
+		f |= snmpcodec.FlagAuth
+	}
+	if s.priv != snmpcodec.PrivNone {
+		f |= snmpcodec.FlagPriv
+	}
+	return f
+}
+
+// do 是**唯一**的请求入口：按版本分派到 community 报文或 v3 事务。
+//
+// 收敛成一个入口的理由：v3 与 v1/v2c 的差别不只在报文封装，还在「一条请求
+// 可能要额外往返几次」（发现、时间窗口修复）。若 7 处请求构造各自判断版本，
+// 迟早会有一处忘记走 v3 分支，症状是「v3 设备大部分 OID 能读、某一类操作
+// 永远超时」——那种问题极难归因。这里只要 pdu 组好，版本差异全部消化掉。
+func (c *connState) do(ctx context.Context, pdu snmpcodec.PDU, op string) (snmpcodec.PDU, error) {
+	if c.version == snmpcodec.V3 {
+		return c.transact(ctx, pdu, op)
+	}
+	payload, err := snmpcodec.Build(snmpcodec.Message{
+		Version:   c.version,
+		Community: c.community,
+		PDU:       pdu,
+	})
+	if err != nil {
+		return snmpcodec.PDU{}, driver.E(driver.ErrInternal, op, c.cfg.Device.ID, err.Error(), false, err)
+	}
+	m, err := c.exchange(ctx, payload, pdu.RequestID, op)
+	if err != nil {
+		return snmpcodec.PDU{}, err
+	}
+	return m.PDU, nil
 }
 
 func isTimeout(err error) bool {
@@ -471,11 +861,11 @@ func (c *connState) readBatch(ctx context.Context, points []driver.PointRef, bat
 		oids[i] = it.oid
 	}
 	id := c.nextID()
-	req, err := snmpcodec.GetRequest(c.version, c.community, id, oids)
+	req, err := snmpcodec.NewRequestPDU(snmpcodec.PDUGet, id, oids)
 	if err != nil {
 		return nil, driver.E(driver.ErrInternal, "read", c.cfg.Device.ID, err.Error(), false, err)
 	}
-	resp, err := c.exchange(ctx, req, id, "read")
+	resp, err := c.do(ctx, req, "read")
 	if err != nil {
 		switch driver.KindOf(err) {
 		case driver.ErrTimeout, driver.ErrDisconnected:
@@ -489,20 +879,20 @@ func (c *connState) readBatch(ctx context.Context, points []driver.PointRef, bat
 		return res, nil
 	}
 
-	if st := snmpcodec.ErrorStatus(resp.PDU.ErrorStatus); st != snmpcodec.ErrNoError {
+	if st := snmpcodec.ErrorStatus(resp.ErrorStatus); st != snmpcodec.ErrNoError {
 		if c.version == snmpcodec.V1 && st == snmpcodec.ErrNoSuchName {
 			return c.readOneByOne(ctx, points, batch)
 		}
-		e := c.statusError("read", st, nil, resp.PDU.ErrorIndex)
+		e := c.statusError("read", st, nil, resp.ErrorIndex)
 		res := make([]batchResult, len(batch))
 		for i, it := range batch {
 			res[i] = batchResult{pos: it.pos, err: e}
 		}
 		return res, nil
 	}
-	if len(resp.PDU.Varbinds) != len(batch) {
+	if len(resp.Varbinds) != len(batch) {
 		e := driver.E(driver.ErrProtocol, "read", c.cfg.Device.ID,
-			fmt.Sprintf("agent returned %d varbinds for %d OIDs", len(resp.PDU.Varbinds), len(batch)), false, nil)
+			fmt.Sprintf("agent returned %d varbinds for %d OIDs", len(resp.Varbinds), len(batch)), false, nil)
 		res := make([]batchResult, len(batch))
 		for i, it := range batch {
 			res[i] = batchResult{pos: it.pos, err: e}
@@ -511,7 +901,7 @@ func (c *connState) readBatch(ctx context.Context, points []driver.PointRef, bat
 	}
 	res := make([]batchResult, len(batch))
 	for i, it := range batch {
-		res[i] = c.decodeVarbind(points[it.pos], it.pos, it.oid, resp.PDU.Varbinds[i])
+		res[i] = c.decodeVarbind(points[it.pos], it.pos, it.oid, resp.Varbinds[i])
 	}
 	return res, nil
 }
@@ -529,12 +919,12 @@ func (c *connState) readOneByOne(ctx context.Context, points []driver.PointRef, 
 			return res, nil
 		}
 		id := c.nextID()
-		req, err := snmpcodec.GetRequest(c.version, c.community, id, []snmpcodec.OID{it.oid})
+		req, err := snmpcodec.NewRequestPDU(snmpcodec.PDUGet, id, []snmpcodec.OID{it.oid})
 		if err != nil {
 			res = append(res, batchResult{pos: it.pos, err: driver.E(driver.ErrInternal, "read", c.cfg.Device.ID, err.Error(), false, err)})
 			continue
 		}
-		resp, err := c.exchange(ctx, req, id, "read")
+		resp, err := c.do(ctx, req, "read")
 		if err != nil {
 			if driver.KindOf(err) == driver.ErrTimeout || driver.KindOf(err) == driver.ErrDisconnected {
 				for _, rest := range batch[i:] {
@@ -545,16 +935,16 @@ func (c *connState) readOneByOne(ctx context.Context, points []driver.PointRef, 
 			res = append(res, batchResult{pos: it.pos, err: err})
 			continue
 		}
-		if st := snmpcodec.ErrorStatus(resp.PDU.ErrorStatus); st != snmpcodec.ErrNoError {
-			res = append(res, batchResult{pos: it.pos, err: c.statusError("read", st, it.oid, resp.PDU.ErrorIndex)})
+		if st := snmpcodec.ErrorStatus(resp.ErrorStatus); st != snmpcodec.ErrNoError {
+			res = append(res, batchResult{pos: it.pos, err: c.statusError("read", st, it.oid, resp.ErrorIndex)})
 			continue
 		}
-		if len(resp.PDU.Varbinds) != 1 {
+		if len(resp.Varbinds) != 1 {
 			res = append(res, batchResult{pos: it.pos, err: driver.E(driver.ErrProtocol, "read", c.cfg.Device.ID,
-				fmt.Sprintf("single-OID GET returned %d varbinds", len(resp.PDU.Varbinds)), false, nil)})
+				fmt.Sprintf("single-OID GET returned %d varbinds", len(resp.Varbinds)), false, nil)})
 			continue
 		}
-		res = append(res, c.decodeVarbind(points[it.pos], it.pos, it.oid, resp.PDU.Varbinds[0]))
+		res = append(res, c.decodeVarbind(points[it.pos], it.pos, it.oid, resp.Varbinds[0]))
 	}
 	return res, nil
 }
@@ -691,31 +1081,31 @@ func (c *connState) writeOne(ctx context.Context, req driver.WriteRequest) drive
 		return res
 	}
 	id := c.nextID()
-	payload, err := snmpcodec.SetRequest(c.version, c.community, id, []snmpcodec.Varbind{{OID: oid, Value: val}})
+	pdu, err := snmpcodec.NewSetPDU(id, []snmpcodec.Varbind{{OID: oid, Value: val}})
 	if err != nil {
 		res.Err = driver.E(driver.ErrInternal, "write", c.cfg.Device.ID, err.Error(), false, err)
 		return res
 	}
-	resp, err := c.exchange(ctx, payload, id, "write")
+	resp, err := c.do(ctx, pdu, "write")
 	if err != nil {
 		res.Err = err
 		return res
 	}
-	if st := snmpcodec.ErrorStatus(resp.PDU.ErrorStatus); st != snmpcodec.ErrNoError {
-		res.Err = c.statusError("write", st, oid, resp.PDU.ErrorIndex)
+	if st := snmpcodec.ErrorStatus(resp.ErrorStatus); st != snmpcodec.ErrNoError {
+		res.Err = c.statusError("write", st, oid, resp.ErrorIndex)
 		return res
 	}
-	if len(resp.PDU.Varbinds) != 1 || resp.PDU.Varbinds[0].OID.Compare(oid) != 0 {
+	if len(resp.Varbinds) != 1 || resp.Varbinds[0].OID.Compare(oid) != 0 {
 		res.Err = driver.E(driver.ErrProtocol, "write", c.cfg.Device.ID,
 			"SET response does not echo the written OID", false, nil)
 		return res
 	}
 	// 标准要求 SET 应答回显写入后的值。校验它能把「设备接受了请求
 	// 但按自己的解释改了值」（例如把 1 写成 100）当场暴露出来。
-	if !valueEqual(resp.PDU.Varbinds[0].Value, val) {
+	if !valueEqual(resp.Varbinds[0].Value, val) {
 		res.Err = driver.E(driver.ErrProtocol, "write", c.cfg.Device.ID,
 			fmt.Sprintf("SET echoed %s, want %s (device may have coerced the value)",
-				resp.PDU.Varbinds[0].Value, val), false, nil)
+				resp.Varbinds[0].Value, val), false, nil)
 		return res
 	}
 	res.OK = true
@@ -916,11 +1306,11 @@ func (c *connState) GetRaw(ctx context.Context, oids []snmpcodec.OID) ([]GetResu
 
 func (c *connState) getRawBatch(ctx context.Context, oids []snmpcodec.OID) ([]GetResult, error) {
 	id := c.nextID()
-	req, err := snmpcodec.GetRequest(c.version, c.community, id, oids)
+	req, err := snmpcodec.NewRequestPDU(snmpcodec.PDUGet, id, oids)
 	if err != nil {
 		return nil, driver.E(driver.ErrInternal, "read", c.cfg.Device.ID, err.Error(), false, err)
 	}
-	resp, err := c.exchange(ctx, req, id, "read")
+	resp, err := c.do(ctx, req, "read")
 	if err != nil {
 		switch driver.KindOf(err) {
 		case driver.ErrTimeout, driver.ErrDisconnected:
@@ -932,18 +1322,18 @@ func (c *connState) getRawBatch(ctx context.Context, oids []snmpcodec.OID) ([]Ge
 		}
 		return out, nil
 	}
-	if st := snmpcodec.ErrorStatus(resp.PDU.ErrorStatus); st != snmpcodec.ErrNoError {
+	if st := snmpcodec.ErrorStatus(resp.ErrorStatus); st != snmpcodec.ErrNoError {
 		if c.version == snmpcodec.V1 && st == snmpcodec.ErrNoSuchName {
 			// 自检时逐点重发，才能把「哪个 OID 不存在」说清楚。
 			out := make([]GetResult, 0, len(oids))
 			for i, o := range oids {
 				id := c.nextID()
-				one, err := snmpcodec.GetRequest(c.version, c.community, id, []snmpcodec.OID{o})
+				one, err := snmpcodec.NewRequestPDU(snmpcodec.PDUGet, id, []snmpcodec.OID{o})
 				if err != nil {
 					out = append(out, GetResult{OID: o, Err: err})
 					continue
 				}
-				r, err := c.exchange(ctx, one, id, "read")
+				r, err := c.do(ctx, one, "read")
 				if err != nil {
 					if driver.KindOf(err) == driver.ErrTimeout || driver.KindOf(err) == driver.ErrDisconnected {
 						for _, rest := range oids[i:] {
@@ -954,29 +1344,29 @@ func (c *connState) getRawBatch(ctx context.Context, oids []snmpcodec.OID) ([]Ge
 					out = append(out, GetResult{OID: o, Err: err})
 					continue
 				}
-				if st := snmpcodec.ErrorStatus(r.PDU.ErrorStatus); st != snmpcodec.ErrNoError {
-					out = append(out, GetResult{OID: o, Err: c.statusError("read", st, o, r.PDU.ErrorIndex)})
+				if st := snmpcodec.ErrorStatus(r.ErrorStatus); st != snmpcodec.ErrNoError {
+					out = append(out, GetResult{OID: o, Err: c.statusError("read", st, o, r.ErrorIndex)})
 					continue
 				}
-				if len(r.PDU.Varbinds) != 1 {
+				if len(r.Varbinds) != 1 {
 					out = append(out, GetResult{OID: o, Err: driver.E(driver.ErrProtocol, "read", c.cfg.Device.ID,
 						"single-OID GET returned a different varbind count", false, nil)})
 					continue
 				}
-				out = append(out, GetResult{OID: r.PDU.Varbinds[0].OID, Value: r.PDU.Varbinds[0].Value})
+				out = append(out, GetResult{OID: r.Varbinds[0].OID, Value: r.Varbinds[0].Value})
 			}
 			return out, nil
 		}
-		e := c.statusError("read", st, nil, resp.PDU.ErrorIndex)
+		e := c.statusError("read", st, nil, resp.ErrorIndex)
 		out := make([]GetResult, len(oids))
 		for i, o := range oids {
 			out[i] = GetResult{OID: o, Err: e}
 		}
 		return out, nil
 	}
-	if len(resp.PDU.Varbinds) != len(oids) {
+	if len(resp.Varbinds) != len(oids) {
 		e := driver.E(driver.ErrProtocol, "read", c.cfg.Device.ID,
-			fmt.Sprintf("agent returned %d varbinds for %d OIDs", len(resp.PDU.Varbinds), len(oids)), false, nil)
+			fmt.Sprintf("agent returned %d varbinds for %d OIDs", len(resp.Varbinds), len(oids)), false, nil)
 		out := make([]GetResult, len(oids))
 		for i, o := range oids {
 			out[i] = GetResult{OID: o, Err: e}
@@ -985,7 +1375,7 @@ func (c *connState) getRawBatch(ctx context.Context, oids []snmpcodec.OID) ([]Ge
 	}
 	out := make([]GetResult, len(oids))
 	for i := range oids {
-		out[i] = GetResult{OID: resp.PDU.Varbinds[i].OID, Value: resp.PDU.Varbinds[i].Value}
+		out[i] = GetResult{OID: resp.Varbinds[i].OID, Value: resp.Varbinds[i].Value}
 	}
 	return out, nil
 }
@@ -1014,26 +1404,26 @@ func (c *connState) Walk(ctx context.Context, prefix snmpcodec.OID, max int) ([]
 			return out, driver.E(driver.ErrTimeout, "walk", c.cfg.Device.ID, "context done", true, err)
 		}
 		id := c.nextID()
-		req, err := snmpcodec.GetNextRequest(c.version, c.community, id, []snmpcodec.OID{cur})
+		req, err := snmpcodec.NewRequestPDU(snmpcodec.PDUGetNext, id, []snmpcodec.OID{cur})
 		if err != nil {
 			return out, driver.E(driver.ErrInternal, "walk", c.cfg.Device.ID, err.Error(), false, err)
 		}
-		resp, err := c.exchange(ctx, req, id, "walk")
+		resp, err := c.do(ctx, req, "walk")
 		if err != nil {
 			return out, err
 		}
-		if st := snmpcodec.ErrorStatus(resp.PDU.ErrorStatus); st != snmpcodec.ErrNoError {
+		if st := snmpcodec.ErrorStatus(resp.ErrorStatus); st != snmpcodec.ErrNoError {
 			// v1 的表尾就是 noSuchName；这不是错误，是遍历结束。
 			if c.version == snmpcodec.V1 && st == snmpcodec.ErrNoSuchName {
 				return out, nil
 			}
-			return out, c.statusError("walk", st, cur, resp.PDU.ErrorIndex)
+			return out, c.statusError("walk", st, cur, resp.ErrorIndex)
 		}
-		if len(resp.PDU.Varbinds) != 1 {
+		if len(resp.Varbinds) != 1 {
 			return out, driver.E(driver.ErrProtocol, "walk", c.cfg.Device.ID,
-				fmt.Sprintf("GETNEXT returned %d varbinds", len(resp.PDU.Varbinds)), false, nil)
+				fmt.Sprintf("GETNEXT returned %d varbinds", len(resp.Varbinds)), false, nil)
 		}
-		vb := resp.PDU.Varbinds[0]
+		vb := resp.Varbinds[0]
 		if vb.Value.Type == snmpcodec.TypeEndOfMibView {
 			return out, nil
 		}

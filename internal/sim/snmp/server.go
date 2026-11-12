@@ -40,6 +40,57 @@ type Options struct {
 	// 真实代理用 tooBig 兜底；这里直接截断，避免测试用例为「大响应」
 	// 准备几十个 OID。
 	MaxBulk int
+
+	// V3 非 nil 时启用 USM（v3）；nil 时只认 community（v1/v2c）。
+	//
+	// 为什么不是一个「都支持」的开关：真实代理通常两种都接受，但测试
+	// 需要能构造「只开 v3」的场景来验证 v1/v2c 的报文确实被拒绝，
+	// 反过来也一样。显式打开比隐式猜测更好测。
+	V3 *USMConfig
+}
+
+// USMConfig 是内置代理的 USM 用户表与引擎参数。
+type USMConfig struct {
+	// EngineID 为空时用 engineID（内置的固定值）。
+	EngineID []byte
+	// EngineBoots/EngineTime 是引擎启动次数与运行秒数（默认 1/100）。
+	// 固定值而不是随墙上时钟走：与 sysUpTime 的理由相同，测试需要
+	// 稳定的断言。
+	EngineBoots int
+	EngineTime  int
+	// Users 是用户表：名字 → 口令与算法。
+	Users map[string]USMUser
+
+	// Faults 是故障注入（用于验证驱动的错误分类）。
+	Faults USMFaults
+}
+
+// USMUser 是一个 USM 用户的凭据。
+type USMUser struct {
+	// Name 是 securityName（与 Users 的键一致，冗余保存便于组应答）。
+	Name         string
+	Auth         snmpcodec.AuthProtocol
+	AuthPassword string
+	Priv         snmpcodec.PrivProtocol
+	PrivPassword string
+}
+
+// USMFaults 是 USM 的故障注入开关。
+type USMFaults struct {
+	// WrongDigest 让代理对所有带认证的报文回 wrongDigest Report（模拟
+	// 口令配错）。真实代理对摘要错误**静默丢弃**，这里回 Report 是为了
+	// 让测试不必等满超时——回 Report 也是协议允许的（RFC 3414 §3.2
+	// 允许代理在解密/认证失败时报 usmStatsWrongDigests）。
+	WrongDigest bool
+	// NotInTimeWindow 让代理始终认为时间窗口不对（模拟代理重启后的
+	// 状态或时钟漂移）。驱动应当重新发现一次后仍失败，最终判协议错误。
+	NotInTimeWindow bool
+	// UnsupportedSecLevel 让代理回 unsupportedSecurityLevels（模拟
+	// 「代理只允许 authNoPriv」）。
+	UnsupportedSecLevel bool
+	// DropRate 是静默丢弃报文的概率（0..100）。模拟真机上「摘要错了
+	// 代理不回任何东西」的行为。
+	DropPercent int
 }
 
 // Server 是内置 SNMP 代理。
@@ -48,12 +99,28 @@ type Server struct {
 	community string
 	maxBulk   int
 
+	// usm 非 nil 时启用 v3/USM。
+	usm *usmState
+
 	mu       sync.Mutex
 	table    map[string]entry
 	sorted   []snmpcodec.OID
 	requests int
 	writes   int
 	closed   bool
+}
+
+// usmState 是 v3 的引擎与用户表状态。
+type usmState struct {
+	cfg    USMConfig
+	engine []byte
+	boots  int
+	etime  int
+	faults USMFaults
+	// dropped/malformed 用于测试断言「确实走了丢弃路径」。
+	dropped   int
+	reports   int
+	decrypted int
 }
 
 // NewServer 在 addr（如 "127.0.0.1:0"）上监听 UDP。
@@ -80,9 +147,74 @@ func NewServerWithOptions(addr string, opt Options) (*Server, error) {
 		maxBulk = 64
 	}
 	s := &Server{conn: conn, community: community, maxBulk: maxBulk, table: map[string]entry{}}
+	if opt.V3 != nil {
+		u := &usmState{cfg: *opt.V3}
+		u.engine = append([]byte(nil), opt.V3.EngineID...)
+		if len(u.engine) == 0 {
+			u.engine = append([]byte(nil), defaultEngineID...)
+		}
+		u.boots = opt.V3.EngineBoots
+		if u.boots == 0 {
+			u.boots = 1
+		}
+		u.etime = opt.V3.EngineTime
+		if u.etime == 0 {
+			u.etime = 100
+		}
+		u.faults = opt.V3.Faults
+		s.usm = u
+	}
 	s.loadDefaults()
 	go s.serve()
 	return s, nil
+}
+
+// defaultEngineID 是内置代理的引擎标识（9 字节，0x80 开头的企业自定格式）。
+var defaultEngineID = []byte{0x80, 0x00, 0x1F, 0x88, 0x80, 0x00, 0x00, 0x00, 0x02}
+
+// EngineID 返回内置代理的引擎标识（v3 未启用时为 nil）。
+func (s *Server) EngineID() []byte {
+	if s.usm == nil {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]byte(nil), s.usm.engine...)
+}
+
+// SetEngineID 替换内置代理的引擎标识（v3 未启用时无效果）。
+//
+// 用于模拟「同一地址背后换了一个引擎」：代理重装、恢复出厂、换主控板。
+// engineBoots/engineTime 刻意保持不变——这样主站那边的失效信号就只剩
+// unknownEngineIDs 一种，测试能精确地只钉住「重发现」这条路，而不会
+// 被 notInTimeWindow 一并触发。
+func (s *Server) SetEngineID(id []byte) {
+	if s.usm == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.usm.engine = append([]byte(nil), id...)
+}
+
+// Reports 返回内置代理发出的 Report 数（v3 未启用时为 0）。
+func (s *Server) Reports() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.usm == nil {
+		return 0
+	}
+	return s.usm.reports
+}
+
+// Dropped 返回被静默丢弃的报文数。
+func (s *Server) Dropped() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.usm == nil {
+		return 0
+	}
+	return s.usm.dropped
 }
 
 // Addr 返回实际监听地址（端口 0 时用得到）。
@@ -215,7 +347,26 @@ func (s *Server) serve() {
 }
 
 // handle 处理一条报文；返回 nil 表示静默丢弃。
+//
+// 版本判定靠报文本身，不靠配置：v3 的外层是 SEQUENCE{INTEGER 3, ...}，
+// v1/v2c 是 SEQUENCE{INTEGER 0|1, OCTET STRING community, ...}。先读版本号
+// 再决定走哪条路径，这样同一个端口可以同时服务两种客户端（真实代理就是
+// 这样）。
 func (s *Server) handle(datagram []byte) []byte {
+	ver, err := snmpcodec.PeekVersion(datagram)
+	if err != nil {
+		return nil
+	}
+	if ver == snmpcodec.V3 {
+		return s.handleV3(datagram)
+	}
+	if s.usm != nil && !s.allowCommunity() {
+		// 只开了 v3 的代理：v1/v2c 一律静默丢弃。
+		s.mu.Lock()
+		s.usm.dropped++
+		s.mu.Unlock()
+		return nil
+	}
 	msg, err := snmpcodec.Parse(datagram)
 	if err != nil {
 		return nil
@@ -231,21 +382,43 @@ func (s *Server) handle(datagram []byte) []byte {
 	}
 
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	s.requests++
+	s.mu.Unlock()
+	vbs, status, index := s.dispatch(msg.Version, msg.PDU)
+	return s.buildCommunityResponse(msg, vbs, status, index)
+}
 
-	var vbs []snmpcodec.Varbind
-	status, index := 0, 0
-	switch msg.PDU.Type {
-	case snmpcodec.PDUGet:
-		vbs, status, index = s.get(msg)
-	case snmpcodec.PDUGetNext:
-		vbs, status, index = s.getNext(msg)
-	case snmpcodec.PDUGetBulk:
-		vbs = s.getBulk(msg)
-	case snmpcodec.PDUSet:
-		vbs, status, index = s.set(msg)
+// allowCommunity 表示 v3 与 v1/v2c 是否共存。
+//
+// 内置代理在启用 USM 时仍然接受 v1/v2c（真实代理的常见默认）。
+func (s *Server) allowCommunity() bool { return true }
+
+// dispatch 按 PDU 类型执行读/写，返回应答 varbind 与错误状态。
+//
+// ver 决定错误码风格：v1 没有 per-varbind 异常（noSuchName + error-index），
+// v2c 与 v3 用 noSuchObject/noSuchInstance/endOfMibView。v3 在这一层与 v2c
+// 完全一致——这正是 PDU 层没有被 v3 改动的原因。
+//
+// 调用方必须持锁。
+func (s *Server) dispatch(ver snmpcodec.Version, pdu snmpcodec.PDU) ([]snmpcodec.Varbind, int, int) {
+	if ver == snmpcodec.V3 {
+		ver = snmpcodec.V2c
 	}
+	msg := snmpcodec.Message{Version: ver, PDU: pdu}
+	switch pdu.Type {
+	case snmpcodec.PDUGet:
+		return s.get(msg)
+	case snmpcodec.PDUGetNext:
+		return s.getNext(msg)
+	case snmpcodec.PDUSet:
+		return s.set(msg)
+	case snmpcodec.PDUGetBulk:
+		return s.getBulk(msg), 0, 0
+	}
+	return nil, 0, 0
+}
+
+func (s *Server) buildCommunityResponse(msg snmpcodec.Message, vbs []snmpcodec.Varbind, status, index int) []byte {
 	resp, err := snmpcodec.Build(snmpcodec.Message{
 		Version: msg.Version, Community: msg.Community,
 		PDU: snmpcodec.PDU{

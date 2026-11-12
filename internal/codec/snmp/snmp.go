@@ -40,7 +40,7 @@ const (
 	MaxVarbinds = 2048
 )
 
-// Version 是 SNMP 版本。v3 不做（见 ParseVersion 的注释）。
+// Version 是 SNMP 版本。
 type Version int
 
 const (
@@ -48,6 +48,10 @@ const (
 	V1 Version = 0
 	// V2c 是 SNMPv2c：有 GetBulk 与 noSuchObject/noSuchInstance/endOfMibView。
 	V2c Version = 1
+	// V3 是 SNMPv3：报文外层换成 msgGlobalData + msgSecurityParameters，
+	// PDU 被包进 ScopedPDU；认证与加密由 USM 提供。它与 v2c 的**共同点
+	// 只有 PDU 内部结构**，所以 Build 仍然只服务 v1/v2c，v3 走 BuildV3。
+	V3 Version = 3
 )
 
 func (v Version) String() string {
@@ -56,15 +60,13 @@ func (v Version) String() string {
 		return "1"
 	case V2c:
 		return "2c"
+	case V3:
+		return "3"
 	}
 	return fmt.Sprintf("version(%d)", int(v))
 }
 
-// ParseVersion 解析配置里的版本写法（`1` / `v1` / `2c` / `v2c`）。
-//
-// v3 在这里显式拒绝而不是「当 v2c 试一下」：v3 的报文结构（msgGlobalData、
-// 认证/加密参数）与 v1/v2c 完全不同，退回 v2c 只会让现场看到「发了报文但
-// 没有应答」，把配置问题伪装成网络问题。
+// ParseVersion 解析配置里的版本写法（`1` / `v1` / `2c` / `v2c` / `3` / `v3`）。
 func ParseVersion(s string) (Version, error) {
 	switch strings.ToLower(strings.TrimSpace(s)) {
 	case "", "2c", "v2c", "2", "v2":
@@ -72,9 +74,9 @@ func ParseVersion(s string) (Version, error) {
 	case "1", "v1":
 		return V1, nil
 	case "3", "v3":
-		return 0, errors.New("snmp: v3 (USM 认证/加密) is not implemented; use 1 or 2c")
+		return V3, nil
 	}
-	return 0, fmt.Errorf("snmp: unknown version %q (want 1 or 2c)", s)
+	return 0, fmt.Errorf("snmp: unknown version %q (want 1, 2c or 3)", s)
 }
 
 // PDUType 是 PDU 的上下文标签。
@@ -155,10 +157,14 @@ type Varbind struct {
 	Value Value
 }
 
-// Build 组一条完整报文。
+// Build 组一条完整报文（仅 v1/v2c）。
+//
+// v3 的报文外层完全不同（msgGlobalData + msgSecurityParameters + 加密后的
+// ScopedPDU），不能在这条路径上加分支：分了支的编码器迟早会在「v3 却走
+// 了 community 分支」时发出一条结构合法的错报文。v3 走 BuildV3。
 func Build(m Message) ([]byte, error) {
 	if m.Version != V1 && m.Version != V2c {
-		return nil, fmt.Errorf("snmp: unsupported version %v", m.Version)
+		return nil, fmt.Errorf("snmp: version %v is not a community-based message (use BuildV3)", m.Version)
 	}
 	if m.Community == "" {
 		return nil, errors.New("snmp: community is empty")
@@ -166,16 +172,33 @@ func Build(m Message) ([]byte, error) {
 	if m.PDU.Type == PDUGetBulk && m.Version != V2c {
 		return nil, errors.New("snmp: GetBulk requires v2c")
 	}
-	if len(m.PDU.Varbinds) > MaxVarbinds {
-		return nil, fmt.Errorf("snmp: %d varbinds exceeds the %d limit", len(m.PDU.Varbinds), MaxVarbinds)
+	pdu, err := encodePDU(m.PDU)
+	if err != nil {
+		return nil, err
 	}
 
-	vbs := make([]byte, 0, 64*len(m.PDU.Varbinds))
-	for i, vb := range m.PDU.Varbinds {
+	msg := make([]byte, 0, 32+len(pdu))
+	msg = appendTLV(msg, tagInteger, encodeInt(int64(m.Version)))
+	msg = appendTLV(msg, tagOctetString, []byte(m.Community))
+	msg = append(msg, pdu...)
+	return appendTLV(nil, tagSequence, msg), nil
+}
+
+// encodePDU 编码一个 PDU（不含版本/community 那一层）。
+//
+// 抽出来是为了让 v3 复用：v3 的 ScopedPDU 里装的就是**逐字节相同**的 PDU。
+// 两份实现会让「v2c 能读、v3 读同一个 OID 报错」这种问题变得极难定位。
+func encodePDU(p PDU) ([]byte, error) {
+	if len(p.Varbinds) > MaxVarbinds {
+		return nil, fmt.Errorf("snmp: %d varbinds exceeds the %d limit", len(p.Varbinds), MaxVarbinds)
+	}
+
+	vbs := make([]byte, 0, 64*len(p.Varbinds))
+	for i, vb := range p.Varbinds {
 		// 异常标记只属于应答：请求里出现 noSuchObject 之类，说明调用方把
 		// 「读回来的结果」当成「要写的东西」传了进来；编码出去会让设备
 		// 侧看到一条无意义的值。
-		if m.PDU.Type.IsRequest() && vb.Value.IsException() {
+		if p.Type.IsRequest() && vb.Value.IsException() {
 			return nil, fmt.Errorf("snmp: varbind %d: %s is not valid in a request", i, vb.Value.Type)
 		}
 		enc, err := encodeVarbind(vb)
@@ -187,23 +210,54 @@ func Build(m Message) ([]byte, error) {
 	vbList := appendTLV(nil, tagSequence, vbs)
 
 	body := make([]byte, 0, 16+len(vbList))
-	body = appendTLV(body, tagInteger, encodeInt(int64(m.PDU.RequestID)))
-	switch m.PDU.Type {
+	body = appendTLV(body, tagInteger, encodeInt(int64(p.RequestID)))
+	switch p.Type {
 	case PDUGetBulk:
-		body = appendTLV(body, tagInteger, encodeInt(int64(m.PDU.NonRepeaters)))
-		body = appendTLV(body, tagInteger, encodeInt(int64(m.PDU.MaxRepetitions)))
+		body = appendTLV(body, tagInteger, encodeInt(int64(p.NonRepeaters)))
+		body = appendTLV(body, tagInteger, encodeInt(int64(p.MaxRepetitions)))
 	default:
-		body = appendTLV(body, tagInteger, encodeInt(int64(m.PDU.ErrorStatus)))
-		body = appendTLV(body, tagInteger, encodeInt(int64(m.PDU.ErrorIndex)))
+		body = appendTLV(body, tagInteger, encodeInt(int64(p.ErrorStatus)))
+		body = appendTLV(body, tagInteger, encodeInt(int64(p.ErrorIndex)))
 	}
 	body = append(body, vbList...)
-	pdu := appendTLV(nil, byte(m.PDU.Type), body)
+	return appendTLV(nil, byte(p.Type), body), nil
+}
 
-	msg := make([]byte, 0, 32+len(pdu))
-	msg = appendTLV(msg, tagInteger, encodeInt(int64(m.Version)))
-	msg = appendTLV(msg, tagOctetString, []byte(m.Community))
-	msg = append(msg, pdu...)
-	return appendTLV(nil, tagSequence, msg), nil
+// PeekVersion 只读出报文最外层的版本号，不做完整解析。
+//
+// 为什么需要它：一个代理/网关在同一条 UDP 端口上可能同时收到 v1、v2c 与
+// v3 报文，而三者的外层结构不同（v3 的第二个元素是 SEQUENCE，v1/v2c 是
+// OCTET STRING）。先看版本再选解析器，比「先试 Parse 再试 ParseV3」可靠：
+// 后者会把「v3 报文被 v1 解析器读出一堆垃圾」当成合法报文。
+func PeekVersion(b []byte) (Version, error) {
+	if len(b) == 0 {
+		return 0, errors.New("snmp: empty datagram")
+	}
+	r := &reader{buf: b}
+	tag, content, err := r.tlv()
+	if err != nil {
+		return 0, err
+	}
+	if tag != tagSequence {
+		return 0, fmt.Errorf("snmp: top-level tag 0x%02X, want SEQUENCE", tag)
+	}
+	inner := &reader{buf: content}
+	t, c, err := inner.tlv()
+	if err != nil {
+		return 0, err
+	}
+	if t != tagInteger {
+		return 0, fmt.Errorf("snmp: version tag 0x%02X, want INTEGER", t)
+	}
+	v, err := decodeInt(c)
+	if err != nil {
+		return 0, err
+	}
+	switch Version(v) {
+	case V1, V2c, V3:
+		return Version(v), nil
+	}
+	return 0, fmt.Errorf("snmp: unsupported wire version %d", v)
 }
 
 // Parse 解析一条完整报文。
@@ -400,6 +454,33 @@ func encodeVarbind(vb Varbind) ([]byte, error) {
 		return nil, err
 	}
 	return appendTLV(nil, tagSequence, append(name, val...)), nil
+}
+
+// NewRequestPDU 组一个只带 OID 的请求 PDU（Get / GetNext），供 v3 复用。
+//
+// 与 GetRequest/GetNextRequest 的分工：后者组完整 v1/v2c 报文；v3 的 PDU 要
+// 放进 ScopedPDU 再套 msgGlobalData，所以只需要 PDU 本体。两者共用同一套
+// varbind 构造，保证「v3 与 v2c 对同一 OID 生成同一个 PDU」。
+func NewRequestPDU(t PDUType, requestID int32, oids []OID) (PDU, error) {
+	if t != PDUGet && t != PDUGetNext {
+		return PDU{}, fmt.Errorf("snmp: %s is not an OID-list request", t)
+	}
+	if len(oids) == 0 {
+		return PDU{}, errors.New("snmp: at least one OID is required")
+	}
+	vbs := make([]Varbind, len(oids))
+	for i, o := range oids {
+		vbs[i] = Varbind{OID: o, Value: Null()}
+	}
+	return PDU{Type: t, RequestID: requestID, Varbinds: vbs}, nil
+}
+
+// NewSetPDU 组一个 SetRequest PDU（无外层），供 v3 复用。
+func NewSetPDU(requestID int32, vbs []Varbind) (PDU, error) {
+	if len(vbs) == 0 {
+		return PDU{}, errors.New("snmp: at least one varbind is required")
+	}
+	return PDU{Type: PDUSet, RequestID: requestID, Varbinds: vbs}, nil
 }
 
 // GetRequest 组一条 GetRequest。

@@ -1,0 +1,176 @@
+{
+  "schemaVersion": 1,
+  "site": "snmp-v3-lab",
+  "server": {
+    "listen": "127.0.0.1:8096",
+    "token": "dev-token-0123456789"
+  },
+  "storage": {
+    "dir": "./data-snmp-v3",
+    "journal": true,
+    "outboxMaxRecords": 5000,
+    "outboxTtl": "10m"
+  },
+  "logging": {
+    "level": "info"
+  },
+  "northbound": {
+    "webhook": {
+      "enabled": false,
+      "url": "http://127.0.0.1:9999/ingest",
+      "timeout": "3s"
+    }
+  },
+  "channels": [
+    {
+      "id": "ch-snmp",
+      "protocol": "snmp",
+      "transport": {
+        "kind": "udp",
+        "address": "127.0.0.1:16161"
+      },
+      "concurrency": 1,
+      "timeout": "3s"
+    }
+  ],
+  "devices": [
+    {
+      "id": "switch01",
+      "name": "接入交换机（内置代理，USM authPriv：SHA-256 + AES-128）",
+      "channel": "ch-snmp",
+      "interval": "2s",
+      "timeout": "3s",
+      "enabled": true,
+      "labels": {
+        "version": "3",
+        "username": "monitor",
+        "authProtocol": "sha256",
+        "authPassword": "authpass123",
+        "privProtocol": "aes",
+        "privPassword": "privpass123",
+        "options": "retries=2,maxOids=16"
+      },
+      "points": [
+        {
+          "id": "sys-descr",
+          "name": "设备描述（sysDescr.0）",
+          "address": { "kind": "symbol", "path": "1.3.6.1.2.1.1.1.0" },
+          "dataType": "string",
+          "enabled": true
+        },
+        {
+          "id": "sys-uptime",
+          "name": "运行时长（sysUpTime.0，TimeTicks，单位 10ms）",
+          "address": { "kind": "symbol", "path": "1.3.6.1.2.1.1.3.0" },
+          "dataType": "uint32",
+          "unit": "ticks",
+          "enabled": true
+        },
+        {
+          "id": "sys-name",
+          "name": "设备名（sysName.0）",
+          "address": { "kind": "symbol", "path": "1.3.6.1.2.1.1.5.0" },
+          "dataType": "string",
+          "enabled": true
+        },
+        {
+          "id": "sys-services",
+          "name": "协议栈服务位（sysServices.0）",
+          "address": { "kind": "symbol", "path": "1.3.6.1.2.1.1.7.0" },
+          "dataType": "int32",
+          "enabled": true
+        },
+        {
+          "id": "sys-contact",
+          "name": "联系人（sysContact.0，可写）",
+          "address": { "kind": "symbol", "path": "1.3.6.1.2.1.1.4.0" },
+          "dataType": "string",
+          "writable": true,
+          "enabled": true
+        },
+        {
+          "id": "sys-location",
+          "name": "位置（sysLocation.0，可写）",
+          "address": { "kind": "symbol", "path": "1.3.6.1.2.1.1.6.0" },
+          "dataType": "string",
+          "writable": true,
+          "enabled": true
+        },
+        {
+          "id": "if-number",
+          "name": "接口数量（ifNumber.0）",
+          "address": { "kind": "symbol", "path": "1.3.6.1.2.1.2.1.0" },
+          "dataType": "int32",
+          "enabled": true
+        },
+        {
+          "id": "if1-in-octets",
+          "name": "eth0 入方向字节数（ifInOctets.1，Counter32 会回绕）",
+          "address": { "kind": "symbol", "path": "1.3.6.1.2.1.2.2.1.10.1" },
+          "dataType": "uint64",
+          "unit": "B",
+          "enabled": true
+        },
+        {
+          "id": "if1-admin-status",
+          "name": "eth0 管理状态（ifAdminStatus.1，1=up 2=down，可写）",
+          "address": { "kind": "symbol", "path": "1.3.6.1.2.1.2.2.1.7.1" },
+          "dataType": "int32",
+          "writable": true,
+          "enabled": true
+        }
+      ]
+    },
+    {
+      "id": "switch01-pinned",
+      "name": "同一代理，engineID 固定（验证免发现路径；engineID 写错会明确报不一致）",
+      "channel": "ch-snmp",
+      "interval": "5s",
+      "enabled": false,
+      "timeout": "3s",
+      "labels": {
+        "version": "3",
+        "username": "monitor",
+        "authProtocol": "sha256",
+        "authPassword": "authpass123",
+        "privProtocol": "aes",
+        "privPassword": "privpass123",
+        "engineID": "80001f888000000002",
+        "options": "retries=1,maxOids=8"
+      },
+      "points": [
+        {
+          "id": "sys-name",
+          "name": "设备名（sysName.0）",
+          "address": { "kind": "symbol", "path": "1.3.6.1.2.1.1.5.0" },
+          "dataType": "string",
+          "enabled": true
+        }
+      ]
+    },
+    {
+      "id": "switch01-noauth",
+      "name": "同一代理，noAuthNoPriv（仅限隔离调试网，无认证无加密）",
+      "channel": "ch-snmp",
+      "interval": "5s",
+      "enabled": false,
+      "timeout": "3s",
+      "labels": {
+        "version": "3",
+        "username": "guest",
+        "authProtocol": "none",
+        "privProtocol": "none",
+        "options": "retries=1"
+      },
+      "points": [
+        {
+          "id": "sys-descr",
+          "name": "设备描述（sysDescr.0）",
+          "address": { "kind": "symbol", "path": "1.3.6.1.2.1.1.1.0" },
+          "dataType": "string",
+          "enabled": true
+        }
+      ]
+    }
+  ]
+}

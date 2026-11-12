@@ -745,12 +745,49 @@ SNMP 是唯一「按对象名寻址」的协议：点位用 `kind=symbol`，`pat
 约束——超 MTU 会被分片，而现场设备/防火墙常直接丢分片。v1 没有 per-varbind 异常，
 批量 GET 遇 `noSuchName` 时驱动逐点重发，否则一个坏 OID 会让同批所有点位都变地址错误。
 
-只做 v1/v2c：v3 的 USM 认证加密是另一套子系统，配置期显式拒绝，不退回 v2c 碰运气。
 写是单 OID SET（不合并 varbind，避免一条只读对象回滚整批）：`uint16/uint32`→Gauge32、
 `int*`→INTEGER、`string/bytes`→OCTET STRING；float/BCD 没有标准线类型，显式拒绝。
 应答同时校验错误码与回显值，设备「接受但改了值」会在写入当场暴露。Counter64 经
 平台 `float64` 承载，超过 2^53 会丢精度；Counter32 会回绕，时间序列侧要做回绕检测。
 团体名按凭据处理（界面掩码），默认 `public` 只是最少配置。
+
+SNMP v3（USM 认证 + 加密，同一 UDP 通道，同一套 OID 地址模型）：
+
+```bash
+# 内置代理带 v3/USM：口令走环境变量，避免出现在进程列表与 shell 历史里
+UIC_SNMP_AUTH_PASSWORD=authpass123 UIC_SNMP_PRIV_PASSWORD=privpass123 \
+  ./uic sim -protocol snmp -v3 -listen 127.0.0.1:16161 \
+            -user monitor -auth sha256 -priv aes
+# 网关侧：examples/snmp-v3.json，9 个点（sysDescr/UpTime/Name/Services、
+#   可写 sysContact/sysLocation、ifNumber、ifInOctets、ifAdminStatus）
+./uic -config examples/snmp-v3.json
+
+# 不启网关，直接自检 v3 全链路（发现 → 认证 → 加密 → 读 → 写 → 读回）
+./uic snmpread -addr 127.0.0.1:16161 -version 3 -user monitor \
+  -auth sha256 -authPassword authpass123 -priv aes -privPassword privpass123 -probe
+```
+
+v3 的三件事全部用标准库实现，没有 CGO 也没有第三方依赖：USM 口令本地化为密钥
+（1 MiB 扩展 + `H(Ku||engineID||Ku)`）、HMAC 认证（MD5/SHA-1/SHA-224/256/384/512，
+截断长度 = 摘要长度的一半）、DES/AES-128/192/256 加密（含 3DES 之外的 CFB/CBC 与
+SNMPv3 特有的 salt-IV 构造）。认证摘要对「authParameters 清零后的原始字节」计算，
+比对用 `subtle.ConstantTimeCompare`；加密时 `msgData` 外面还套一层 OCTET STRING，
+解密后按外层 SEQUENCE 长度截断以抵消 CBC 补齐。
+
+发现流程只有一条路：始终发空 engineID 的无认证探测包（带用户名，代理才会回 Report
+而不是静默丢弃），从 Report 一次拿全 engineID/boots/time。即便配置里固定写了
+engineID 也照做——「身份已知」不等于「时间基准已知」，而时间基准只能问出来；跳过
+它的症状是第一条请求必然吃一个 `notInTimeWindow`，重试一轮还是 0/0，最后报「时间
+窗口不同步」。engineID 写错时不静默改用代理的值，而是把两个 engineID 都报出来并
+给出处置建议（删掉 engineID 让驱动自动发现）——静默纠正会让「配置写错」变成
+「看起来一切正常」，还会掩盖那次拓扑变更。engineID 变更（代理重装/换主控板）时
+缓存身份作废、回到空 engineID 重发现，会话自愈；两种失效 Report 走不同起点：
+`notInTimeWindow` 只重学时间，`unknownEngineIDs` 才丢身份重发现。
+
+加密口令缺省回退到认证口令（USM 允许两者不同，回退是显式的）。加密强度与认证算法
+绑定：AES-192/256 要求 SHA-256 及以上，因为加密密钥是从认证算法的哈希派生的——
+这是协议本身的要求，不是实现选择。USM 口令 8..64 字节，过短在配置期就拒绝，
+不让它伪装成认证失败。空用户名只在 `noAuthNoPriv` 档位允许。
 
 ADS/AMS（PLC 运行时，TCP 48898）：
 
@@ -1008,9 +1045,9 @@ go test -race -count=1 ./...
 | `internal/codec/cjt188` | 188-2004 纯函数编解码（单 `68` / 7 字节 BCD 地址 / 无 `0x33` / 2 字节 DI / 按表类型分派的字段 schema / 单位代号 / 7 字节时间 / 收帧扫描） |
 | `internal/driver/cjt188` | 188 主站（RS-485 与串口服务器双承载、总线锁、按 DI 缓存字段、阀门/写地址两道闸门、错误分类） |
 | `internal/sim/cjt188` | 188 内置从站（水/热两套 901F / D120..D12B / 读地址 / 阀门写 / 写地址 / 地址过滤） |
-| `internal/codec/snmp` | SNMP v1/v2c 纯函数编解码（BER TLV / 整数最短补码 / OID base-128 / 7 类 PDU / varbind / 异常标记 / error-status 分类） |
-| `internal/driver/snmp` | SNMP v1/v2c 主站（批量 GET / v1 `noSuchName` 退化 / 单 OID SET / 类型映射与回显校验 / request-id 配对 / 自检 `GetRaw`、`Walk`） |
-| `internal/sim/snmp` | SNMP v1/v2c 内置代理（system 组 + 两块网卡 / GET、GETNEXT、GETBULK、SET / community 静默丢弃 / v1 与 v2c 差异 / SET 原子性） |
+| `internal/codec/snmp` | SNMP v1/v2c/v3 纯函数编解码（BER TLV / 整数最短补码 / OID base-128 / 7 类 PDU / varbind / 异常标记 / error-status 分类；v3 另有 USM 安全参数、`BuildV3`/`ParseV3`、HMAC 摘要、DES/AES CBC-CFB 加解密、口令本地化、Report 分类、时间窗口判定） |
+| `internal/driver/snmp` | SNMP 主站（v1/v2c 批量 GET / v1 `noSuchName` 退化 / 单 OID SET / 类型映射与回显校验 / request-id 配对；v3 引擎发现、时间同步、密钥派生与缓存、Report 驱动的自愈重试；自检 `GetRaw`、`Walk`） |
+| `internal/sim/snmp` | SNMP 内置代理（system 组 + 两块网卡 / GET、GETNEXT、GETBULK、SET / community 静默丢弃 / v1 与 v2c 差异 / SET 原子性；v3 真做 HMAC 验签与解密、6 类 Report、引擎身份可切换、故障注入） |
 | `internal/codec/ads` | ADS/AMS 纯函数编解码（6 字节 AMS/TCP 头 / 32 字节 AMS 头 / 7 类命令 / 两层长度一致性 / NetId 解析 / 错误码分类） |
 | `internal/driver/ads` | ADS/AMS 主站（符号名→句柄→值 / 句柄缓存与失效重解析 / 逐点事务 / 类型范围检查 / AMS 与 ADS 错误分类 / 自检 `DeviceInfo`、`DeviceState`、`WriteControl`） |
 | `internal/sim/ads` | ADS/AMS 内置服务端（默认变量表 / 按名分配句柄 / 只读标记 / 宽度校验 / 状态控制 / 句柄失效模拟） |

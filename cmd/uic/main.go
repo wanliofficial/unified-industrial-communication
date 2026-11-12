@@ -9,6 +9,7 @@
 //	uic sim -protocol mqtt -listen 127.0.0.1:18830  # 内置 MQTT Broker（南向演示）
 //	uic sim -protocol dlt645 -listen 127.0.0.1:14001 # 内置电能表从站（645-2007）
 //	uic sim -protocol snmp -listen 127.0.0.1:16161   # 内置 SNMP v1/v2c 代理（UDP）
+//	uic sim -protocol snmp -v3 -user monitor -auth sha256 -authPassword <pw> -priv aes -privPassword <pw>  # 同上 + USM
 //	uic sim -protocol ads -listen 127.0.0.1:48898    # 内置 ADS/AMS 服务端（TCP）
 //	uic mbread -addr 127.0.0.1:1502    # 不依赖第三方工具的从站读写自检（TCP）
 //	uic mbread -transport rtu -port /dev/ttyUSB0 -unit 1   # 串口从站自检
@@ -24,6 +25,7 @@
 //	uic knxread -addr 127.0.0.1:3671 -group 2/1/1 -dpt 9.001  # KNXnet/IP 自检（隧道 + 组地址）
 //	uic sim -protocol coap -listen 127.0.0.1:5683  # 内置 CoAP 服务端（UDP）
 //	uic snmpread -addr 127.0.0.1:16161 -oid 1.3.6.1.2.1.1.1.0   # SNMP v1/v2c 自检
+//	uic snmpread -addr 127.0.0.1:16161 -version 3 -user monitor -auth sha256 -authPassword <pw> -probe  # SNMP v3/USM 自检
 //	uic adsread -addr 127.0.0.1:48898 -probe   # ADS/AMS 自检（设备信息握手）
 //	uic secsread -addr 127.0.0.1:5000 -probe  # SECS/GEM 自检（HSMS Linktest）
 //	uic sim -protocol secs -listen 127.0.0.1:5000  # 内置 HSMS 设备
@@ -59,6 +61,7 @@ import (
 	"time"
 
 	ua "uic/internal/codec/opcua"
+	snmpcodec "uic/internal/codec/snmp"
 	"uic/internal/config"
 	"uic/internal/driver"
 	"uic/internal/model"
@@ -541,6 +544,14 @@ func simCmd(args []string) {
 	size := fs.Int("size", 1024, "寄存器数量")
 	proto := fs.String("protocol", "modbus", "从站协议：modbus | s7 | opcua | mqtt | mc | fins | enip | bacnet | iec104 | iec101 | mewtocol | hostlink | dnp3 | coap | knx | dlt645 | cjt188 | snmp | ads | secs | iec61850")
 	pdu := fs.Int("pdu", 480, "S7 协商 PDU 长度（240/480/960）")
+
+	// SNMP v3/USM 专用（只在 -protocol snmp 时生效）
+	v3 := fs.Bool("v3", false, "SNMP：启用 v3/USM（默认只开 community）")
+	user := fs.String("user", "monitor", "SNMP v3 用户名")
+	authProto := fs.String("auth", "sha256", "SNMP v3 认证算法：none|md5|sha1|sha224|sha256|sha384|sha512")
+	authPass := fs.String("authPassword", "", "SNMP v3 认证口令（≥8 字节；也可用环境变量 UIC_SNMP_AUTH_PASSWORD）")
+	privProto := fs.String("priv", "none", "SNMP v3 加密算法：none|des|aes|aes192|aes256")
+	privPass := fs.String("privPassword", "", "SNMP v3 加密口令（≥8 字节；留空回退到认证口令）")
 	fs.Parse(args)
 
 	switch *proto {
@@ -593,7 +604,9 @@ func simCmd(args []string) {
 		simCJT188(*addr)
 		return
 	case "snmp":
-		simSNMP(*addr)
+		simSNMP(*addr, snmpsim.Options{
+			V3: simSNMPV3(*v3, *user, *authProto, *authPass, *privProto, *privPass),
+		})
 		return
 	case "ads":
 		simADS(*addr)
@@ -1255,7 +1268,7 @@ func simCJT188(addr string) {
 	slog.Info("sim_stopped")
 }
 
-// simSNMP 启动内置 SNMP v1/v2c 代理（UDP）。
+// simSNMP 启动内置 SNMP 代理（UDP）。
 //
 // 默认监听 16161 而不是 161：161 是特权端口，非 root 起不来；改成
 // 16161 后，下面的自检命令与 examples/snmp.json 都能在开发机上直接跑。
@@ -1265,8 +1278,11 @@ func simCJT188(addr string) {
 // 只读，sysContact/sysLocation 可写，ifTable 里有两块网卡，ifAdminStatus
 // 可写。community 不匹配时静默丢弃——这条语义与真实代理一致，也正是
 // 「超时先查 community」这条排查建议的依据。
-func simSNMP(addr string) {
-	srv, err := snmpsim.NewServer(addr)
+//
+// 传了 v3 配置时同时开启 USM：真实代理通常两者都接受，只在需要验证
+// 「v1/v2c 被拒绝」时才单独关掉其一。
+func simSNMP(addr string, opt snmpsim.Options) {
+	srv, err := snmpsim.NewServerWithOptions(addr, opt)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "启动 SNMP 代理失败: %v\n", err)
 		os.Exit(1)
@@ -1276,7 +1292,15 @@ func simSNMP(addr string) {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	fmt.Printf("snmp v1/v2c agent listening on %s (community %q)\n", srv.Addr(), snmpsim.DefaultCommunity)
+	if opt.V3 == nil {
+		fmt.Printf("snmp v1/v2c agent listening on %s (community %q)\n", srv.Addr(), snmpsim.DefaultCommunity)
+	} else {
+		fmt.Printf("snmp v1/v2c/v3 agent listening on %s (community %q, v3/USM on)\n", srv.Addr(), snmpsim.DefaultCommunity)
+		fmt.Printf("  engineID：%x（boots=%d time=%d）\n", srv.EngineID(), 1, 100)
+		for name, u := range opt.V3.Users {
+			fmt.Printf("  USM 用户：%s（认证 %v，加密 %v）\n", name, u.Auth, u.Priv)
+		}
+	}
 	fmt.Println("  system 组：1.3.6.1.2.1.1.1.0=sysDescr  1.3.6.1.2.1.1.3.0=sysUpTime(TimeTicks)")
 	fmt.Println("            1.3.6.1.2.1.1.5.0=sysName  1.3.6.1.2.1.1.7.0=sysServices(INTEGER 72)")
 	fmt.Println("  可写：    1.3.6.1.2.1.1.4.0=sysContact  1.3.6.1.2.1.1.6.0=sysLocation")
@@ -1285,10 +1309,66 @@ func simSNMP(addr string) {
 	fmt.Println("  v1 差异： 缺 OID 回 noSuchName（无 per-varbind 异常），SET 错误码映射到 v1 子集")
 	fmt.Println("  Ctrl+C 停止")
 	fmt.Println("  自检：   uic snmpread -addr " + srv.Addr() + " -probe")
+	if opt.V3 != nil {
+		fmt.Println("  v3 自检：uic snmpread -addr " + srv.Addr() + " -version 3 -user <用户> -auth <算法> -authPassword <口令> -probe")
+	}
 
 	<-ctx.Done()
 	_ = srv.Close()
 	slog.Info("sim_stopped")
+}
+
+// simSNMPV3 把命令行参数折成 USM 配置；enable 为 false 时返回 nil
+// （不开 v3）。
+//
+// 校验放在这里而不是交给 NewServerWithOptions：参数错时应当给出一条
+// 「哪个参数写错了」的中文提示并退出，而不是让代理起不来、客户端
+// 超时后再去猜。
+func simSNMPV3(enable bool, user, authProto, authPass, privProto, privPass string) *snmpsim.USMConfig {
+	if !enable {
+		return nil
+	}
+	fatal := func(format string, a ...any) {
+		fmt.Fprintf(os.Stderr, "SNMP v3 参数错误: "+format+"\n", a...)
+		os.Exit(2)
+	}
+	user = strings.TrimSpace(user)
+	if user == "" {
+		fatal("-user 不能为空")
+	}
+	a, err := snmpcodec.ParseAuthProtocol(strings.TrimSpace(authProto))
+	if err != nil {
+		fatal("%v", err)
+	}
+	p, err := snmpcodec.ParsePrivProtocol(strings.TrimSpace(privProto))
+	if err != nil {
+		fatal("%v", err)
+	}
+	if p != snmpcodec.PrivNone && a == snmpcodec.AuthNone {
+		fatal("USM 不允许只加密不认证；-priv %s 需要 -auth 是非 none 的算法", privProto)
+	}
+	ap := secret(strings.TrimSpace(authPass), "UIC_SNMP_AUTH_PASSWORD")
+	pp := secret(strings.TrimSpace(privPass), "UIC_SNMP_PRIV_PASSWORD")
+	if a != snmpcodec.AuthNone {
+		if err := snmpcodec.ValidateSecret("authPassword", ap); err != nil {
+			fatal("认证：%v（可用 -authPassword 或环境变量 UIC_SNMP_AUTH_PASSWORD）", err)
+		}
+	}
+	if p != snmpcodec.PrivNone {
+		if pp == "" {
+			// 与驱动侧一致：加密口令留空时回退到认证口令。
+			pp = ap
+		}
+		if err := snmpcodec.ValidateSecret("privPassword", pp); err != nil {
+			fatal("加密：%v", err)
+		}
+		if need, have := p.KeyLen(), a.KeyLen(); need > have {
+			fatal("加密算法 %v 需要 %d 字节密钥，但认证算法 %v 只能给出 %d 字节；请改用 sha256 及以上", p, need, a, have)
+		}
+	}
+	return &snmpsim.USMConfig{Users: map[string]snmpsim.USMUser{
+		user: {Name: user, Auth: a, AuthPassword: ap, Priv: p, PrivPassword: pp},
+	}}
 }
 
 // simADS 启动内置 ADS/AMS 服务端（TCP）。
