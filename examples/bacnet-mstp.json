@@ -1,0 +1,139 @@
+{
+  "schemaVersion": 1,
+  "site": "bacnet-mstp-lab",
+  "server": {
+    "listen": "127.0.0.1:8103",
+    "token": "dev-token-0123456789"
+  },
+  "storage": {
+    "dir": "./data-bacnet-mstp",
+    "journal": true,
+    "outboxMaxRecords": 5000,
+    "outboxTtl": "10m"
+  },
+  "logging": {
+    "level": "info"
+  },
+  "northbound": {
+    "webhook": {
+      "enabled": false,
+      "url": "http://127.0.0.1:9999/ingest",
+      "timeout": "3s"
+    }
+  },
+  "channels": [
+    {
+      "id": "ch-mstp",
+      "protocol": "bacnet-mstp",
+      "transport": {
+        "kind": "tcp",
+        "address": "127.0.0.1:24001"
+      },
+      "concurrency": 1,
+      "timeout": "1s"
+    }
+  ],
+  "devices": [
+    {
+      "id": "ahu-01",
+      "name": "一号空调机组（MS/TP 从站 MAC 128）",
+      "channel": "ch-mstp",
+      "unitId": 128,
+      "interval": "5s",
+      "timeout": "1s",
+      "enabled": true,
+      "labels": {
+        "master": "0",
+        "presilence": "5ms"
+      },
+      "points": [
+        {
+          "id": "supply-air-temp",
+          "name": "送风温度",
+          "address": {
+            "kind": "object",
+            "objectType": "analog-input",
+            "instance": 1,
+            "property": "present-value"
+          },
+          "dataType": "float32",
+          "unit": "°C",
+          "enabled": true
+        },
+        {
+          "id": "supply-air-name",
+          "name": "送风传感器名称",
+          "address": {
+            "kind": "object",
+            "objectType": "analog-input",
+            "instance": 1,
+            "property": "object-name"
+          },
+          "dataType": "string",
+          "enabled": true
+        },
+        {
+          "id": "supply-air-units",
+          "name": "送风单位",
+          "address": {
+            "kind": "object",
+            "objectType": "analog-input",
+            "instance": 1,
+            "property": "units"
+          },
+          "dataType": "uint32",
+          "enabled": true
+        },
+        {
+          "id": "run-status",
+          "name": "运行状态",
+          "address": {
+            "kind": "object",
+            "objectType": "binary-input",
+            "instance": 1,
+            "property": "present-value"
+          },
+          "dataType": "bool",
+          "enabled": true
+        },
+        {
+          "id": "setpoint",
+          "name": "送风设定",
+          "address": {
+            "kind": "object",
+            "objectType": "analog-value",
+            "instance": 2,
+            "property": "present-value"
+          },
+          "dataType": "float32",
+          "unit": "°C",
+          "enabled": true
+        },
+        {
+          "id": "counter",
+          "name": "每秒自增计数（AV-3）",
+          "address": {
+            "kind": "object",
+            "objectType": "analog-value",
+            "instance": 3,
+            "property": "present-value"
+          },
+          "dataType": "float32",
+          "enabled": true
+        },
+        {
+          "id": "pump-name",
+          "name": "水泵名称",
+          "address": {
+            "kind": "object",
+            "objectType": "character-string",
+            "instance": 1,
+            "property": "present-value"
+          },
+          "dataType": "string",
+          "enabled": true
+        }
+      ]
+    }
+  ]
+}

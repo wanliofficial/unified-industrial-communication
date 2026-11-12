@@ -69,6 +69,7 @@ import (
 	uicruntime "uic/internal/runtime"
 	adssim "uic/internal/sim/ads"
 	bacnetsim "uic/internal/sim/bacnet"
+	bacnetmstpsim "uic/internal/sim/bacnetmstp"
 	cjt188sim "uic/internal/sim/cjt188"
 	coapsim "uic/internal/sim/coap"
 	dlt645sim "uic/internal/sim/dlt645"
@@ -116,6 +117,8 @@ func main() {
 		enipreadCmd(args)
 	case "bacread":
 		bacreadCmd(args)
+	case "mstpread":
+		mstpreadCmd(args)
 	case "iec104read":
 		iec104readCmd(args)
 	case "iec101read":
@@ -173,7 +176,7 @@ func usage() {
 用法:
   uic [run] -config config.json [-listen :8080] [-token TOKEN]
   uic -check -config config.json
-  uic sim [-listen 127.0.0.1:15020] [-protocol modbus|s7|opcua|mqtt|mc|fins|hostlink|enip|bacnet|iec104|iec101|mewtocol|dnp3|coap|knx|dlt645|cjt188|snmp|ads|secs]
+  uic sim [-listen 127.0.0.1:15020] [-protocol modbus|s7|opcua|mqtt|mc|fins|hostlink|enip|bacnet|bacnet-mstp|iec104|iec101|mewtocol|dnp3|coap|knx|dlt645|cjt188|snmp|ads|secs]
   uic mbread -addr 127.0.0.1:1502 -unit 1 -area holding -offset 0 -qty 2
   uic mbread -addr 127.0.0.1:1502 -area holding -offset 5 -write 777
   uic mcread -addr 127.0.0.1:5000 -area d -offset 100 -qty 2
@@ -184,6 +187,9 @@ func usage() {
   uic enipread -addr 127.0.0.1:44818 -tag BOOL_TAG -type bool -write on
   uic bacread -addr 127.0.0.1:47808 -type analog-input -instance 1
   uic bacread -addr 127.0.0.1:47808 -type analog-value -instance 2 -write 55.5
+  uic mstpread -addr 127.0.0.1:4001 -mac 128 -type analog-input -instance 1
+  uic mstpread -transport serial -port /dev/ttyUSB0 -baud 38400 -mac 128 -probe
+  uic mstpread -addr 127.0.0.1:4001 -mac 128 -type analog-value -instance 2 -write 55.5
   uic iec104read -addr 127.0.0.1:2404 -ca 1 [-ioa 1001,1002] [-json]
   uic iec104read -addr 127.0.0.1:2404 -area single-command -cmd-ioa 4001 -write on
   uic iec101read -addr 127.0.0.1:4001 [-link-addr 1] [-ca 1] [-ioa-size 2] [-json] [-raw]
@@ -550,7 +556,7 @@ func simCmd(args []string) {
 	fs := flag.NewFlagSet("sim", flag.ExitOnError)
 	addr := fs.String("listen", "127.0.0.1:15020", "监听地址")
 	size := fs.Int("size", 1024, "寄存器数量")
-	proto := fs.String("protocol", "modbus", "从站协议：modbus | s7 | opcua | mqtt | mc | fins | enip | bacnet | iec104 | iec101 | mewtocol | hostlink | dnp3 | coap | knx | dlt645 | cjt188 | snmp | ads | secs | iec61850 | mtconnect")
+	proto := fs.String("protocol", "modbus", "从站协议：modbus | s7 | opcua | mqtt | mc | fins | enip | bacnet | bacnet-mstp | iec104 | iec101 | mewtocol | hostlink | dnp3 | coap | knx | dlt645 | cjt188 | snmp | ads | secs | iec61850 | mtconnect")
 	pdu := fs.Int("pdu", 480, "S7 协商 PDU 长度（240/480/960）")
 
 	// SNMP v3/USM 专用（只在 -protocol snmp 时生效）
@@ -583,6 +589,9 @@ func simCmd(args []string) {
 		return
 	case "bacnet":
 		simBACnet(*addr)
+		return
+	case "bacnet-mstp":
+		simBACnetMSTP(*addr)
 		return
 	case "iec104":
 		simIEC104(*addr)
@@ -630,7 +639,7 @@ func simCmd(args []string) {
 		return
 	case "modbus":
 	default:
-		fmt.Fprintf(os.Stderr, "未知协议 %q（支持 modbus | s7 | opcua | mqtt | mc | fins | enip | bacnet | iec104 | iec101 | mewtocol | hostlink | dnp3 | coap | knx | dlt645 | cjt188 | snmp | ads | secs | iec61850 | mtconnect）\n", *proto)
+		fmt.Fprintf(os.Stderr, "未知协议 %q（支持 modbus | s7 | opcua | mqtt | mc | fins | enip | bacnet | bacnet-mstp | iec104 | iec101 | mewtocol | hostlink | dnp3 | coap | knx | dlt645 | cjt188 | snmp | ads | secs | iec61850 | mtconnect）\n", *proto)
 		os.Exit(2)
 	}
 
@@ -1532,8 +1541,41 @@ func simBACnet(addr string) {
 	slog.Info("sim_stopped")
 }
 
-// simIEC61850 启动内置 IEC 61850（MMS over TCP）IED。
+// simBACnetMSTP 启动内置 BACnet MS/TP 从站（TCP 透传）。
 //
+// 初始值与 examples/bacnet-mstp.json 对应：先起这个从站，再跑
+// `./uic -config examples/bacnet-mstp.json`，就能看到点位被正常采集。
+//
+// 它模拟的是**从站**（MAC 128），不是主站：不产生令牌、不参与令牌环、
+// 不应答 PollForMaster。这与驱动的「单主站轮询从站」定位配套——若这里
+// 也开始维护令牌，两边就会在一条假总线上互相等令牌，自检反而更难。
+func simBACnetMSTP(addr string) {
+	srv, err := bacnetmstpsim.NewServer(addr)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "启动 BACnet MS/TP 从站失败: %v\n", err)
+		os.Exit(1)
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	fmt.Printf("bacnet mstp slave listening on %s\n", srv.Addr())
+	for _, mac := range srv.MACs() {
+		fmt.Printf("  从站 MAC %d（不应答 Token/PollForMaster，只应答发给本机的数据帧）\n", mac)
+	}
+	fmt.Println("  analog-input:1.present-value=42.5  object-name=\"AI-1\"  units=62")
+	fmt.Println("  analog-value:2.present-value=0（可写）  priority-array 16 级")
+	fmt.Println("  binary-input:1.present-value=1（active）  character-string:1=\"PUMP-01\"（可写）")
+	fmt.Println("  analog-value:3 每秒自增，可用于观察 SSE")
+	fmt.Println("  Ctrl+C 停止")
+	fmt.Printf("  自检：   uic mstpread -addr %s -mac 128 -probe\n", srv.Addr())
+	fmt.Printf("           uic mstpread -addr %s -mac 128 -type analog-input -instance 1\n", srv.Addr())
+
+	<-ctx.Done()
+	_ = srv.Close()
+	slog.Info("sim_stopped")
+}
+
 // 初始值与 examples/iec61850.json 一一对应：先起这个从站，再跑
 // `./uic -config examples/iec61850.json`，就能看到对象引用被正常采集。
 //

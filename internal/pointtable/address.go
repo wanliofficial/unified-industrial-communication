@@ -308,6 +308,18 @@ func PolicyFor(protocol string) AddressPolicy {
 		// 写 length 没有意义。selector / index / length 也一律无意义：一条
 		// `/current` 已经覆盖全设备，不需要按字段下钻，也不需要下标。
 		return AddressPolicy{Width: WidthNone, AllowSymbol: true}
+	case "bacnet", "bacnet-mstp":
+		// 对象属性寻址：`analog-input:1.present-value`、`analog-value:2.priority-array[3]`。
+		//
+		// BACnet 的两层地址（设备地址 + 对象属性）里，设备地址属于设备/链路
+		// 配置（IP 与端口，或 MS/TP 的 MAC），点表只表达对象这一层。这与
+		// Modbus 的「单元号在设备上、寄存器在点表上」是同一种分工。
+		//
+		// Width 用 WidthProtocol：值有多宽由对象的属性类型决定（REAL、
+		// ENUMERATED、CHARACTER STRING），点表里写 length 只会诱导出
+		// 「读 4 个字节的 present-value」这种说法。BACnet/IP 与 MS/TP 共用
+		// 同一条策略，因为两者只差承载层，对象寻址完全一致。
+		return AddressPolicy{Width: WidthProtocol, AllowObject: true}
 	}
 	// 未知协议：不拦地址种类（驱动可能在外部注册），但 length 必须显式，
 	// 避免用一个猜出来的宽度去读真实设备。
@@ -781,7 +793,7 @@ func parseObjectAddress(expr string) (model.Address, bool, error) {
 		return model.Address{}, false, nil
 	}
 	typ := expr[:colon]
-	if !isIdent(typ) {
+	if !isObjectIdent(typ) {
 		return model.Address{}, false, nil
 	}
 	rest := expr[colon+1:]
@@ -835,17 +847,20 @@ func parseFileAddress(expr string) (model.Address, error) {
 	return a, nil
 }
 
-func isIdent(s string) bool {
+// isObjectIdent 校验对象类型那一段：允许字母、数字、下划线与连字符，且允许以数字开头。
+//
+// 为什么不用 isIdent（禁止首字符为数字、禁止连字符）：BACnet 的对象类型
+// 有 `analog-input` 这种带连字符的规范名，也允许直接写类型编号（`0` 就是
+// Analog Input）。真正的合法性（这个名字到底对应哪个类型编号、编号是否在
+// 0..4194303 内）由 codec/bacnet 的 ObjectTypeFromName 在驱动层判定；这里只
+// 保证点表文本结构能被拆出来，不越权替协议做语义校验。
+func isObjectIdent(s string) bool {
 	if s == "" {
 		return false
 	}
-	for i, r := range s {
+	for _, r := range s {
 		switch {
-		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r == '_':
-		case r >= '0' && r <= '9':
-			if i == 0 {
-				return false
-			}
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '_', r == '-':
 		default:
 			return false
 		}

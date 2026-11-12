@@ -355,6 +355,44 @@ BACnet/IP 只做 ReadProperty（0x0C）/ WriteProperty（0x0F），不做 Who-Is
 决定；可写性同样由对象决定——`analog-input` 的 `present-value` 永远只读。
 UDP 无连接，驱动用 8 位 invoke ID 配对，并把整条会话串行化，迟到应答直接丢弃。
 
+BACnet MS/TP 对象属性（RS-485 串行总线，单主站轮询从站）：
+
+```bash
+./uic sim -protocol bacnet-mstp -listen 127.0.0.1:24001 &   # 内置 MS/TP 从站（MAC 128，TCP 透传）
+./uic -config examples/bacnet-mstp.json
+curl -s -H 'Authorization: Bearer dev-token-0123456789' localhost:8103/api/v1/points
+#   7 点：analog-input:1 的 present-value/object-name/units、binary-input:1、
+#         analog-value:2 的 present-value、analog-value:3 每秒自增、character-string:1
+#   自检（不需要网关）：
+./uic mstpread -transport serial -port /dev/ttyUSB0 -baud 38400 -mac 128 -probe
+./uic mstpread -addr 127.0.0.1:24001 -mac 128 -type analog-input -instance 1
+./uic mstpread -addr 127.0.0.1:24001 -mac 128 -type analog-value -instance 2 -write 55.5
+```
+
+MS/TP 与 BACnet/IP 共用同一套 NPDU/APDU、对象属性寻址（`analog-input:1.present-value`）
+与 ReadProperty（0x0C）/ WriteProperty（0x0F）语义，只换了承载层：IP 上是 UDP 数据报，
+MS/TP 上是加了两条 CRC 的串行帧。分帧为
+`55 FF | type | dest | src | len(2,大端) | hdrCRC | data | dataCRC(2,小端)`，
+头 CRC 用标准给出的特殊移位展开（有效帧残差 `0x55`），数据 CRC 是 CRC-16/X-25
+（残差 `0xF0B8`）；同一帧里长度大端、数据 CRC 小端，是标准原文如此，也是二手实现
+最容易抄错的地方。
+
+**定位是「单一主站轮询从站」**：本机占主站地址段 0..127（默认 0），被采集设备是
+MAC 128..254 的从站（`labels.address`，回退 `device.unitId`）。主站用
+DataExpectingReply 点名问、从站回 DataNotExpectingReply，令牌不发生转移——从站不持有
+令牌。驱动**刻意不做**多主站令牌环的建立与维护（Tslot 抢占、NextStation 探活、
+Tno_token 等毫秒级定时器在 TCP 透传/串口服务器上都不可靠）、不做 Who-Is 发现、不做
+COBS 扩展帧、不做波特率自适应、不做 ReplyPostponed 的后续上送（直接映射为协议错误，
+让上层重试）、不轮询主站设备。**空闲时不监听总线**是 sole-master 拓扑的明确前提，不是
+遗漏；现场若确有第二个主站，应换驱动而不是靠 `labels.nextStation` 勉强维持令牌环。
+
+在等待从站应答的窗口内，驱动会**被动配合**令牌环：收到发给本机的 Token 就记住并在事务
+结束后交还（优先 `labels.nextStation`，否则按 PollForMaster 从本机地址之后现场探测下一站），
+收到 PollForMaster/TestRequest 立即应答。每次发送前留 `labels.presilence`（默认 5ms）
+线路静默，给 RS-485 收发器方向切换与 `Tturnaround` 留时间；过短会在长线上表现为
+「随机首字节丢失 → 整帧被当噪声 → 随机超时」。串口按物理路径共享、事务由总线锁串行，
+`concurrency` 必须为 1。
+
 IEC 60870-5-104 调度主站（TCP 2404）：
 
 ```bash
@@ -1045,7 +1083,7 @@ go test -race -count=1 ./...
 
 | 路径 | 内容 |
 |---|---|
-| `cmd/uic/` | 单入口：`run` / `sim`（Modbus / S7 / OPC UA / MQTT / MC / FINS / Host Link / KNX / IEC 61850 / EtherNet-IP / BACnet-IP / IEC 104 / IEC 101 / Mewtocol / DNP3 / CoAP / 645 / 188 / SNMP / ADS / SECS / MTConnect）/ `mbread` / `mcread` / `finsread` / `hostlinkread` / `enipread` / `bacread` / `iec104read` / `iec101read` / `mewtocolread` / `dnp3read` / `coapread` / `knxread` / `iec61850read` / `dlt645read` / `cjt188read` / `snmpread` / `adsread` / `secsread` / `mtconnectread` / `uaread` / `s7blocks` / `s7upload` / `instantiate` / `import` / `token` / `-check` / `version` |
+| `cmd/uic/` | 单入口：`run` / `sim`（Modbus / S7 / OPC UA / MQTT / MC / FINS / Host Link / KNX / IEC 61850 / EtherNet-IP / BACnet-IP / BACnet MS/TP / IEC 104 / IEC 101 / Mewtocol / DNP3 / CoAP / 645 / 188 / SNMP / ADS / SECS / MTConnect）/ `mbread` / `mcread` / `finsread` / `hostlinkread` / `enipread` / `bacread` / `mstpread` / `iec104read` / `iec101read` / `mewtocolread` / `dnp3read` / `coapread` / `knxread` / `iec61850read` / `dlt645read` / `cjt188read` / `snmpread` / `adsread` / `secsread` / `mtconnectread` / `uaread` / `s7blocks` / `s7upload` / `instantiate` / `import` / `token` / `-check` / `version` |
 | `internal/model` | 通道 / 设备 / 点位 / 地址 / 采样 / 质量码 |
 | `internal/driver` | 驱动契约（Codec / Transport / Driver）、错误分类、注册表、只读 `Lookup` 注入 |
 | `internal/calc` | 零依赖表达式引擎（编译期类型检查、短路求值、引用 `device:point`） |
@@ -1063,9 +1101,11 @@ go test -race -count=1 ./...
 | `internal/codec/enip` | EtherNet/IP 纯函数编解码（封装头 / CPF / SendRRData / CIP 请求应答 / 符号路径 / Read/Write Tag / 多服务合包 / 类型表） |
 | `internal/driver/enip` | CIP 显式报文主站（标签读写、数组 offset、STRING、bytes 两阶段读、位 RMW、多服务合包与自动退回） |
 | `internal/sim/enip` | EtherNet/IP 内置从站（RegisterSession / Read/Write Tag / 多服务合包 / 默认标签表） |
-| `internal/codec/bacnet` | BACnet/IP 纯函数编解码（BVLC / NPDU / APDU / 标签 / 对象属性名表 / Read-WriteProperty） |
+| `internal/codec/bacnet` | BACnet/IP 与 MS/TP 共享纯函数编解码（BVLC / NPDU / APDU / 标签 / 对象属性名表 / Read-WriteProperty；MS/TP 分帧与双 CRC） |
 | `internal/driver/bacnet` | BACnet/IP 主站（对象属性读写、UDP invoke ID 配对、按对象语义选写标签、错误类映射） |
 | `internal/sim/bacnet` | BACnet/IP 内置从站（对象表 / 属性读写 / 数组下标 / 写权限 / 类型收敛） |
+| `internal/driver/bacnetmstp` | BACnet MS/TP 主站（单主站轮询从站、滚动字节扫描切帧、被动配合令牌环与 PollForMaster 现场探测、`presilence` 静默、串口/串口服务器 TCP 双承载） |
+| `internal/sim/bacnetmstp` | BACnet MS/TP 内置从站（MAC 128 / 镜像 sim/bacnet 对象表 / 属性读写与数组下标 / 写权限与类型收敛 / 每秒自增 / 垃圾帧重扫） |
 | `internal/codec/iec60870` | IEC 60870-5 共享应用层（ASDU 头与元素 / 剖面 `Profile` / `HasIOA` / CP56Time2a / 品质位 / 请求构造 / 点位语义：对象类别、值转换、命令构造 / 类型与原因名表） |
 | `internal/codec/iec104` | IEC 60870-5-104 纯函数编解码（APCI 三种帧型、序号与 k/w）+ 对共享应用层的别名转发 |
 | `internal/driver/iec104` | IEC 104 主站（STARTDT 建链、站总召唤、电能量召唤、按点位 ID 的最新值表、五种命令、否定确认分类、旁路表） |

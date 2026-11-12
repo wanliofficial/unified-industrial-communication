@@ -30,9 +30,11 @@ const (
 	BVLCOriginalUnicast = 0x0A
 	BVLCForwardedNPDU   = 0x0B
 
-	// NPDU control 字段：bit3=期望应答，bit2=净优先级，bit1=复杂 ACK ，
-	// bit0=有目的端。我们只发「期望应答、无目的端」这一种，固定 0x04。
+	// NPDU control 字段：bit7=网络层报文，bit5=有目的端，bit3=有源端，
+	// bit2=期望应答，bit1=高优先级，bit0=保留。我们只发「期望应答、无
+	// 路由」这一种，固定 0x04；应答帧用 0x00。
 	NPDUControlExpectReply = 0x04
+	NPDUControlNone        = 0x00
 
 	// APDU 类型（首字节高 4 位）。
 	APDUConfirmedRequest   = 0x00 // 0000
@@ -254,13 +256,71 @@ func proto(format string, args ...any) error {
 // BVLC + NPDU 层
 // ---------------------------------------------------------------------------
 
+// BuildNPDU 构造 NPDU：version + control + APDU。
+//
+// MS/TP 帧的数据段就是 NPDU，BACnet/IP 的 BVLC 负载也是 NPDU，两者只差
+// 外层封装。把它抽出来是为了让 MS/TP 与 BACnet/IP 共用同一套网络层构造，
+// 而不是在 MS/TP 里再手写一遍 version/control 两个字节。
+func BuildNPDU(npduVersion byte, npduControl byte, apdu []byte) []byte {
+	out := make([]byte, 2+len(apdu))
+	out[0] = npduVersion
+	out[1] = npduControl
+	copy(out[2:], apdu)
+	return out
+}
+
+// ParseNPDU 解析 NPDU，跳过可选路由字段后返回 APDU 与 control 字节。
+//
+// 路由字段的跳过逻辑与标准一致：control bit5 (0x20) 表示带目的地址，
+// 格式为 DNET(1) + DADR(len-1)；bit3 (0x08) 表示带源地址，格式为
+// SNET(1) + SADR(len-1) + hop count(1)。本平台不生成路由报文，但真实
+// 设备可能经过路由器回包，因此解析侧必须能跳过而不是报错。注意 bit1
+// (0x02) 是网络优先级、不是目的地址标志——按 0x02 跳过 DNET/DADR 会让
+// 经路由器回包的应答整体错位。
+func ParseNPDU(npdu []byte) (apdu []byte, npduControl byte, err error) {
+	if len(npdu) < 2 {
+		return nil, 0, proto("NPDU too short")
+	}
+	if npdu[0] != 1 {
+		return nil, 0, proto("unsupported NPDU version %d", npdu[0])
+	}
+	npduControl = npdu[1]
+	// NPDU 头：version(1) + control(1)，之后才是 APDU。
+	apduStart := 2
+	// 跳过 DNET/DADR（有目的端时）：1 字节 DNET + (len-1) 字节 DADR。
+	if npduControl&0x20 != 0 {
+		if len(npdu) < apduStart+1 {
+			return nil, 0, proto("NPDU with destination truncated")
+		}
+		dlen := int(npdu[apduStart])
+		if len(npdu) < apduStart+1+dlen {
+			return nil, 0, proto("NPDU destination address truncated")
+		}
+		apduStart += 1 + dlen
+	}
+	// 跳过 SNET/SADR（有源路由时）：1 字节 SNET + (len-1) 字节 SADR + 1 字节 hops。
+	if npduControl&0x08 != 0 {
+		if len(npdu) < apduStart+1 {
+			return nil, 0, proto("NPDU with source route truncated")
+		}
+		slen := int(npdu[apduStart])
+		if len(npdu) < apduStart+1+slen+1 {
+			return nil, 0, proto("NPDU source route truncated")
+		}
+		apduStart += 1 + slen + 1
+	}
+	if apduStart >= len(npdu) {
+		return nil, 0, proto("NPDU consumed entire message, no APDU")
+	}
+	return npdu[apduStart:], npduControl, nil
+}
+
 // BuildMessage 构造一条完整的 BACnet/IP 报文：BVLC(4) + NPDU(2..) + APDU。
 //
 // BVLC 的长度字段（大端 2 字节）只算 NPDU + APDU，不含 BVLC 自身的 4 字节头。
 // 这是 BACnet/IP 与很多其它协议「长度含头」习惯相反的一点，最容易写错。
 func BuildMessage(npduVersion byte, npduControl byte, apdu []byte) []byte {
-	npdu := []byte{npduVersion, npduControl}
-	body := append(npdu, apdu...)
+	body := BuildNPDU(npduVersion, npduControl, apdu)
 	msg := make([]byte, 4+len(body))
 	msg[0] = 0x81 // BVLC 类型
 	msg[1] = BVLCOriginalUnicast
@@ -297,44 +357,7 @@ func ParseMessage(msg []byte) (apdu []byte, npduControl byte, err error) {
 	default:
 		return nil, 0, proto("unsupported BVLC function 0x%02X", msg[1])
 	}
-	if len(body) < 2 {
-		return nil, 0, proto("NPDU too short")
-	}
-	if body[0] != 1 {
-		return nil, 0, proto("unsupported NPDU version %d", body[0])
-	}
-	npduControl = body[1]
-	// NPDU 头：version(1) + control(1)，之后才是 APDU。
-	apduStart := 2
-	// 跳过 DNET/DADR（有目的端时）：1 字节 DNET + (len-1) 字节 DADR。
-	// control bit1 (0x02) = 有目的路由。
-	if npduControl&0x02 != 0 {
-		if len(body) < apduStart+1 {
-			return nil, 0, proto("NPDU with destination truncated")
-		}
-		dlen := int(body[apduStart])
-		if len(body) < apduStart+1+dlen {
-			return nil, 0, proto("NPDU destination address truncated")
-		}
-		apduStart += 1 + dlen
-	}
-	// 跳过 SNET/SADR（有源路由时）：1 字节 SNET + (len-1) 字节 SADR + 1 字节 hops。
-	// control bit3 (0x08) = 源路由。
-	if npduControl&0x08 != 0 {
-		if len(body) < apduStart+1 {
-			return nil, 0, proto("NPDU with source route truncated")
-		}
-		slen := int(body[apduStart])
-		if len(body) < apduStart+1+slen+1 {
-			return nil, 0, proto("NPDU source route truncated")
-		}
-		apduStart += 1 + slen + 1
-	}
-	if apduStart >= len(body) {
-		return nil, 0, proto("NPDU consumed entire message, no APDU")
-	}
-	// body[apduStart:] 是 APDU。
-	return body[apduStart:], npduControl, nil
+	return ParseNPDU(body)
 }
 
 // ---------------------------------------------------------------------------

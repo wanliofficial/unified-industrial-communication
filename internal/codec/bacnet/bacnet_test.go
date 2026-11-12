@@ -60,8 +60,8 @@ func TestParseMessageErrors(t *testing.T) {
 		{"short forwarded", []byte{0x81, BVLCForwardedNPDU, 0, 2, 1, 0x04}},
 		{"npdu too short", []byte{0x81, BVLCOriginalUnicast, 0, 1, 1}},
 		{"bad npdu version", []byte{0x81, BVLCOriginalUnicast, 0, 2, 2, 0x04}},
-		{"destination truncated", []byte{0x81, BVLCOriginalUnicast, 0, 3, 1, 0x02, 9}},
-		{"destination address truncated", []byte{0x81, BVLCOriginalUnicast, 0, 4, 1, 0x02, 2, 5}},
+		{"destination truncated", []byte{0x81, BVLCOriginalUnicast, 0, 3, 1, 0x20, 9}},
+		{"destination address truncated", []byte{0x81, BVLCOriginalUnicast, 0, 4, 1, 0x20, 2, 5}},
 		{"source route truncated", []byte{0x81, BVLCOriginalUnicast, 0, 3, 1, 0x08, 9}},
 		{"source address truncated", []byte{0x81, BVLCOriginalUnicast, 0, 5, 1, 0x08, 2, 5, 0}},
 		{"no apdu", []byte{0x81, BVLCOriginalUnicast, 0, 2, 1, 0x04}},
@@ -75,7 +75,7 @@ func TestParseMessageErrors(t *testing.T) {
 
 func TestParseMessageDestinationRoute(t *testing.T) {
 	apdu := []byte{APDUComplexACK, ServiceReadProperty, 1}
-	npdu := []byte{1, 0x02, 0x02, 0x01, 0xAA} // version, control(有目的端), DNET, dlen, DADR
+	npdu := []byte{1, 0x20, 0x02, 0x01, 0xAA} // version, control(bit5=有目的端), DNET, dlen, DADR
 	body := append(npdu, apdu...)
 	msg := []byte{0x81, BVLCOriginalUnicast, byte(len(body) >> 8), byte(len(body))}
 	msg = append(msg, body...)
@@ -85,6 +85,19 @@ func TestParseMessageDestinationRoute(t *testing.T) {
 	}
 	if !bytes.Equal(got, apdu) {
 		t.Fatalf("apdu = % X", got)
+	}
+}
+
+// control bit1（0x02）是网络优先级，不是「带目的地址」。按 0x02 去跳过
+// DNET/DADR 会让经路由器回包的应答整体错位——这条用例把这个位锁住。
+func TestParseNPDUPriorityBitIsNotRouting(t *testing.T) {
+	apdu := []byte{APDUComplexACK, ServiceReadProperty, 1}
+	got, ctrl, err := ParseNPDU(append([]byte{1, 0x02}, apdu...))
+	if err != nil {
+		t.Fatalf("ParseNPDU: %v", err)
+	}
+	if ctrl != 0x02 || !bytes.Equal(got, apdu) {
+		t.Fatalf("ctrl = 0x%02X, apdu = % X", ctrl, got)
 	}
 }
 

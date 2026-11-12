@@ -115,7 +115,7 @@
 | 协议 | 角色 | 传输 | 寻址 | 提及 | 最佳参照 | 难度 | 优先级 | 关键坑 |
 |---|---|---|---|---|---|---|---|---|
 | **BACnet/IP** | M/S/B | UDP | 对象/属性/实例 | 11 | PA-06（最完整）、PA-27 | 4 | P1 | BVLC/NPDU/APDU 三层；分段响应；COV 订阅；BBMD 跨网段；Who-Is/I-Am |
-| **BACnet MS/TP** | M/S | 串口（RS-485） | 同上 | 少 | PA-06 | 4 | P2 | 令牌传递、主站/从站角色、波特率自适应 |
+| **BACnet MS/TP** | M/S | 串口（RS-485） | 同上 | 少 | PA-06 | 4 | P2（已落地） | 令牌传递、主站/从站角色、波特率自适应。本仓库已实现单主站轮询从站（MAC 128..254）+ 内置从站 + `mstpread`，复用 `codec/bacnet` 与对象寻址；被动配合令牌环、串口/TCP 透传双承载；多主站令牌环维护、Who-Is、COBS 扩展帧、波特率自适应不做 |
 | **BACnet/SC** | M/S | TLS WebSocket | 同上 | 少 | PA-06 | 5 | P2 | 需证书、Hub 角色、节点切换 |
 | **KNXnet/IP** | M | UDP | 组地址（GA） | 4 | PA-06 | 3 | P2（已落地） | 组地址 vs 物理地址；tunneling/routing 两种模式；DPT。本仓库已实现 TUNNELING 主站 + 组地址读写 + DPT 显式声明，routing/设备管理/安全不做 |
 | **LonWorks** | M | 专有 | 网络变量 | 0 | — | 5 | X | 需专用收发器 |
@@ -298,7 +298,7 @@ IEC 61850、SECS/GEM、KNX、Mewtocol、Host Link、MTConnect。
 | **MTConnect** | 客户端 / HTTP | 机床数据采集的事实标准；纯 REST + XML，无二进制编解码 | HTTP GET 取 `probe`/`current`/`sample`，XML 解析，不做资产/事件完整模型 |
 
 > 截至当前实现：MC 3E、FINS、EtherNet/IP + CIP、BACnet/IP、IEC 104、DL/T 645、
-> CJ/T 188、SNMP v1/v2c/v3、ADS/AMS、SECS/GEM、KNXnet/IP、Mewtocol、Host Link、IEC 61850（MMS）、IEC 101、DNP3、CoAP、MTConnect 已落地（各含编解码、主站、内置从站/服务端/Agent 与自检 CLI）；
+> CJ/T 188、SNMP v1/v2c/v3、ADS/AMS、SECS/GEM、KNXnet/IP、Mewtocol、Host Link、IEC 61850（MMS）、IEC 101、DNP3、CoAP、MTConnect、BACnet MS/TP 已落地（各含编解码、主站、内置从站/服务端/Agent 与自检 CLI）；
 >
 > **DNP3**（编解码 + 主站 + 内置从站 + `uic dnp3read` + `examples/dnp3.json`）：只做
 > TCP 主站、类 0 总召唤、类 1/2/3 事件轮询、CROB 与组 41 直接控制、未请求响应的接收
@@ -384,6 +384,37 @@ IEC 61850、SECS/GEM、KNX、Mewtocol、Host Link、MTConnect。
 > 可靠事务号，重发一次写可能把同一个字写两遍，对「加计数」点位是真实数据错误），重连交给
 > 调度器。内置从站在单元号不匹配时**完全沉默**（真 PLC 只回应点名到自己的帧），FCS 错回
 > `0x13`、格式错回 `0x14`、认不出的头码回 `0x16`。
+
+> **BACnet MS/TP**（编解码 + 主站 + 内置从站 + `uic mstpread` + `examples/bacnet-mstp.json`）：
+> 与 BACnet/IP 共用 `codec/bacnet`（`BuildNPDU`/`ParseNPDU` 抽成公共层）与对象属性寻址，
+> 只换承载：NPDU 外再套一层 MS/TP 帧，头尾两条 CRC。最值得单独记录的是**双 CRC 的形态**
+> ——头 CRC 用标准给出的特殊移位展开（不是常见的 CRC-8/0x8C 反射式），校验有效帧（含 CRC
+> 字节）时残差必须是 `0x55`；数据 CRC 是 CRC-16/X-25（反射多项式 0x8408、初值 0xFFFF、
+> 结果取反），残差必须是 `0xF0B8`。同一帧里**长度字段大端、数据 CRC 小端**，是标准原文如此，
+> 也是二手资料最容易抄错的地方。头 CRC 还有一个只在单字节向量上暴露的陷阱：所有移位项必须
+> 由「异或数据后的原始值」一次算出，写成 `c ^= c<<1; c ^= c<<2` 会得到另一条 CRC，但整体
+> 残差有时仍碰巧「不对但不报错」——测试因此直接对拍 `crcHeaderByte(0,1)=0xFE`。
+>
+> **定位是单主站轮询从站**：本机占主站段 0..127（默认 0），被采集设备是 MAC 128..254 的从站
+> （`labels.address`，回退 `unitId`）；主站用 DataExpectingReply 点名问、从站回
+> DataNotExpectingReply，令牌不发生转移——从站不持有令牌，这正是单主站能成立的原因。驱动
+> **刻意不做**多主站令牌环的建立与维护：Tslot 抢占、NextStation 探活、Tno_token/Tusage_timeout
+> 这些毫秒级定时器要求常驻状态机，而现场常见的「串口服务器把 RS-485 透传到以太网」会被
+> TCP 往返与缓冲抖动破坏时序，一个只在请求时才醒来的节点伪装成令牌环成员只会把别人的环拖垮。
+> 同理不做 Who-Is 发现、COBS 扩展帧、波特率自适应、ReplyPostponed 后续上送（直接映射为协议
+> 错误，让上层重试），也不轮询主站设备；**空闲时不监听总线**是 sole-master 拓扑的明确前提，
+> 不是遗漏。
+>
+> 在等待从站应答的窗口内会**被动配合**令牌环：收到发给本机的 Token 就记住、事务结束后交还
+> （优先 `labels.nextStation`，否则按 PollForMaster 从本机地址之后现场探测下一站），收到
+> PollForMaster/TestRequest 立即应答。发送前留 `labels.presilence`（默认 5ms）线路静默，给
+> RS-485 收发器方向切换与 `Tturnaround` 留时间；过短会在长线上表现为「随机首字节 0x55 丢失
+> → 整帧被当噪声 → 随机超时」。分帧用**滚动缓冲逐字节重扫**：坏头只丢 1 字节而不是丢整段
+> 候选头，否则紧跟假 preamble 后的真帧会被一起吞掉，症状是随机丢一帧。半双工纪律里还有一条
+> 与其它串口协议相同的硬性顺序：**先 `Drain` 再 `SetDeadline` 再发送**——`link.tcpLink.Drain`
+> 会把 deadline 临时压到 `now+1ms` 且不恢复，反序会让每次写都立刻超时。串口按物理路径共享、
+> 事务由总线锁串行，`concurrency` 必须为 1。点表层 `PolicyFor("bacnet","bacnet-mstp")` 共用
+> `WidthProtocol + AllowObject`，对象地址允许带连字符与纯数字的对象类型。
 
 > **KNXnet/IP**（编解码 + 隧道主站 + 内置网关 + `uic knxread` + `examples/knx.json`）：
 > 只做 **TUNNELING（UDP 单播隧道）+ 组地址读写**（`GroupValueRead` /

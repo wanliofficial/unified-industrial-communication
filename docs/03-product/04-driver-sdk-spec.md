@@ -1593,6 +1593,11 @@ S7 是「区域 + 字节偏移」，CIP 是「标签名」，而 BACnet 是「�
 再把 APDU 拆成 `(kind, service, invokeID, payload)`。所有上层代码只面对
 「应用值字节」，不再关心封装的三种长度字段。
 
+路由位的编号需要单独记：**bit5（`0x20`）才是「带目的地址」，bit1（`0x02`）是
+网络优先级**。按 `0x02` 去跳过 DNET/DADR，会把「优先级被置位」的普通报文误
+当成路由报文、也会让真正经路由器回包的应答整体错位——两者都表现为「探测能通、
+读值必错」。
+
 #### 3.10.8.2 事务：8 位 invoke ID 与 UDP 串行化
 
 BACnet/IP 跑在 UDP 上，没有连接、没有请求序号：
@@ -6785,6 +6790,214 @@ HTML / 延迟 / 省略数据项 / 全 `UNAVAILABLE` / 条件）各自独立，�
 | `driver/mtconnect` | 一条 `/current` 覆盖多点的 `MultiRead`；单点 `UNAVAILABLE`→bad、ID 不存在/类型解析失败→address_error 都只写该点；条件级别即质量；多设备未选报地址错误并列可选设备；省略端口补 5000；拒绝凭据/query/fragment；`/probe` 404 退回 `/current`；文档上限 32 MiB；`/sample` count 越界报 `unsupported`；对接真实 sim 的集成测试 |
 | `sim/mtconnect` | 三轴 Agent；`/probe`/`/current`/`/sample` 序号窗口；两层条件渲染；`toolOffset` 初始 `UNAVAILABLE`；gzip 与子路径；七类故障注入各自独立 |
 | `cmd/uic` | `-id` 折参、CSV→索引；自检命令三入口（probe/current/sample） |
+
+### 3.10.24 BACnet MS/TP（RS-485 串行总线：单主站轮询从站，双 CRC 分帧）
+
+BACnet MS/TP（Master-Slave/Token-Passing，ASHRAE 135 clause 9）与 BACnet/IP 共用
+NPDU、APDU、对象模型与 ReadProperty（0x0C）/ WriteProperty（0x0F）服务，差别只在
+承载：IP 上是 UDP 数据报，MS/TP 上是「preamble + MAC + 长度 + 两条 CRC」的串行帧。
+因此这一节不重复对象语义（见 §3.10.8），只讲承载层与由此产生的取舍。
+
+```
+55 FF | type(1) | dest(1) | src(1) | len(2,大端) | hdrCRC(1) | data(len) | dataCRC(2,小端)
+```
+
+#### 3.10.24.1 定位：单一主站轮询从站，不做令牌环维护
+
+标准里的 MS/TP 是一个令牌环：主站之间传递 Token，只有持牌者可以发帧。本驱动
+**只做其中一种拓扑**——一条总线上只有本机一个主站，其余节点都是从站：
+
+| 角色 | MAC 段 | 本驱动的行为 |
+|---|---|---|
+| 本机主站 | 0..127（默认 0） | 用 DataExpectingReply 点名问从站 |
+| 被采集从站 | 128..254 | 回 DataNotExpectingReply，**不持有令牌** |
+| 广播 | 255 | 只用于 TestRequest 的目的地址 |
+
+从站不持有令牌，这正是「单主站轮询」能成立的原因：主站发问、从站回答，令牌
+自始至终没有转移。驱动**刻意不做**多主站令牌环的建立与维护：
+
+- Tslot 抢占、`NextStation` 周期探活、`Tno_token` / `Tusage_timeout` 这些定时器
+  要求毫秒级常驻状态机；
+- 现场最常见的接法是「串口服务器把 RS-485 透传到以太网」，TCP 往返与缓冲抖动
+  会直接破坏这些时序；
+- 一个只在收到请求时才醒来的驱动伪装成令牌环成员，只会把别人的环拖垮。
+
+同理不做 Who-Is 发现、不做 Router（NPDU 的路由字段能解析，因为真实设备可能经
+路由器回包，但不生成）、不做 COBS 扩展帧、不做波特率自适应、不做 ReplyPostponed
+的后续上送（直接映射为协议错误，让上层重试），也不轮询主站设备（问主站要数据
+需要把令牌交给它、等它用完再要回来，属于令牌环语义）。
+
+**空闲时不监听总线**是这条拓扑的明确前提，不是遗漏。若现场确实有第二个主站，
+正确做法是更换驱动，而不是打开 `labels.nextStation` 指望它维持令牌环。
+
+但在等待从站应答的窗口内，驱动会**被动配合**，否则一个「碰巧被别的总线成员把
+令牌递过来」的节点会直接卡住别人的环：
+
+| 收到 | 条件 | 动作 |
+|---|---|---|
+| Token | `dest == 本机` | 记住，事务结束后交还 |
+| PollForMaster | `dest == 本机` | 立即回 ReplyToPollForMaster |
+| TestRequest | `dest == 本机` 或广播 | 立即回 TestResponse |
+| TestResponse | 任意 | 忽略（可能是别人对别人的测试） |
+| ReplyPostponed | 来自目标从站 | 报 `ErrProtocol`，不猜「过一会儿会送哪一帧」 |
+
+交还令牌时优先用 `labels.nextStation`；没配就现场扫——从本机地址之后按环形顺序
+发 PollForMaster，第一个回 ReplyToPollForMaster 的地址就是下一站。扫不到说明
+总线上只有本机一个主站，此时保留令牌即可，这正是 sole-master 的稳态。单个
+PollForMaster 的等待被压到 100ms，否则扫完 127 个地址会把一轮采集拖成几分钟。
+
+#### 3.10.24.2 双 CRC：两条残差是最快的自检
+
+同一帧里存在两种字节序（长度大端、数据 CRC 小端）与两套 CRC，是标准原文如此，
+也是二手实现最容易抄错的地方：
+
+| 项 | 算法 | 有效帧残差 |
+|---|---|---|
+| 头 CRC（8 位，覆盖 `type..len` 共 6 字节） | 标准给出的特殊移位展开 | `0x55` |
+| 数据 CRC（16 位，覆盖 `data`） | CRC-16/X-25（反射多项式 `0x8408`、初值 `0xFFFF`、结果取反） | `0xF0B8` |
+
+头 CRC 不是常见的 CRC-8/0x8C 反射式，也不能用「`c ^= c<<1; c ^= c<<2` 逐项累加」
+的写法替代——所有移位项必须由**异或数据后的原始值**一次算出，否则会得到另一条
+CRC，而且整体残差有时仍碰巧「不对但不报错」。因此编解码层直接对拍单字节向量：
+`crcHeaderByte(0, 1) == 0xFE`、`crcDataByte(0, 1) == 0x1189`。
+
+早期实现常犯的另一个错是把头 CRC 的算法套到数据上：结果是 Token 帧（数据段为空
+或极短）能收，一收真正的数据帧就丢，症状看起来像「从站只应答探测」。`MSTPMaxData`
+取 501，超过就视为非法长度——不是「先收下来再看」，因为长度字段本身就是帧同步的
+一部分。
+
+#### 3.10.24.3 一次事务的形状：排空 → 设限 → 静默 → 发 → 扫帧
+
+```
+bus.Lock()                        // 整段持有总线锁
+  Drain()                         // 清掉上一轮迟到的字节
+  SetDeadline(now + timeout)      // 必须重新设，Drain 不恢复原值
+  wait(presilence)                // 默认 5ms
+  Write(frame)
+  for { frame := scan.next(); dispatch }
+bus.Unlock()
+```
+
+四条硬性顺序，每一条都对应一个现场症状：
+
+1. **`Drain` 必须在 `SetDeadline` 之前**。`link.tcpLink.Drain` 会把 deadline 临时
+   压到 `now+1ms` 且**不恢复**；反序会让每一次写都立刻超时，表现为「永远连不上」。
+2. **发送前留 `presilence`**（`labels.presilence`，默认 5ms）。RS-485 收发器从接收
+   切到发送需要时间，主站与从站之间还要留 `Tturnaround`。设得太短在长线/多分支
+   现场表现为「偶发首字节 0x55 丢失」→ 整帧被当噪声 → 随机超时。
+3. **总线锁覆盖「排空 → 发送 → 收完应答」整段**，不是只包住 `Write`。同一条
+   RS-485 上多台从站共用一个 fd，交错会让两边的字节互相污染。
+4. **分帧用滚动缓冲逐字节重扫**。任何一层校验失败只丢**一个**字节再重扫，而不是
+   丢掉整段候选头——后者会把紧跟在假 preamble 后面的真帧一起吞掉，症状是
+   「偶发丢一帧」，在 1s 采集周期里看起来就是随机超时。
+
+扫描器（`frameScanner`）跨事务保留缓冲：上一次超时后迟到的一帧必须留在缓冲里
+继续凑，而不是每轮清空——清空会让「总线上有一帧正在路上」变成永远读不到。
+
+重试只对超时生效，共 2 次；断链、协议错、地址错都不重试。如果窗口内收到过令牌，
+则**不重试**：令牌已经还回去了，再发帧会撞上别人的发送窗口。重试发生在总线锁
+之内，因此重试期间不会插进别的从站事务。
+
+#### 3.10.24.4 寻址与配置
+
+对象地址与 BACnet/IP 完全一致（`kind=object`：`objectType` / `instance` /
+`property` / `propIndex`），点表策略共用 `WidthProtocol + AllowObject`。区别只在
+「设备」这一层——MS/TP 多了一个 MAC：
+
+| 配置 | 含义 | 默认 |
+|---|---|---|
+| `device.labels.address` | 从站 MAC，**必须 128..254** | 回退 `device.unitId` |
+| `device.labels.master` | 本机主站 MAC，0..127 | 0 |
+| `device.labels.nextStation` | 交还令牌的目标主站；不配则现场探测 | 无 |
+| `device.labels.presilence` | 发送前静默 | 5ms |
+| `transport.kind` | `serial`（RS-485）或 `tcp`（串口服务器/DTU 透传） | — |
+
+从站 MAC 落在 0..127 时在**配置期**就把 `Open` 打回。理由不是洁癖：`address=3`
+会被总线上真正的 3 号主站认领，症状是「读到的值属于另一台设备」，现场能查三天。
+`pointtable` 侧对 `bacnet` / `bacnet-mstp` 共用同一套策略，对象类型允许连字符与
+纯数字写法（`analog-input`、`0`），真正的合法性（名字对应哪个编号、编号是否在
+0..4194303 内）交给 `codec/bacnet` 判定，点表层不越权。
+
+TCP 承载省略端口时补 4001（本平台与串口服务器的约定，与 IEC 101、DL/T 645 等
+串口协议一致）；串口按物理路径共享、事务由总线锁串行，因此 `concurrency` 必须是
+1——写 2 不会更快，只会让两个事务在同一个 fd 上交错。
+
+#### 3.10.24.5 与 BACnet/IP 的分工
+
+| 维度 | BACnet/IP | BACnet MS/TP |
+|---|---|---|
+| 承载 | UDP（connected socket） | RS-485 串口 / 串口服务器 TCP 透传 |
+| 分帧 | BVLC 长度 + NPDU | preamble + MAC + 双 CRC |
+| 事务配对 | 8 位 invoke ID（UDP 无连接） | 8 位 invoke ID + 目的/源 MAC 双过滤 |
+| 多读 | `MultiRead` 仍为 `unsupported`（逐条） | 同左 |
+| 地址 | `kind=object` | 同左，另加设备 MAC |
+| 传输故障 | 迟到应答丢弃、超时重发 2 次 | 同左，另加坏帧重扫与令牌让行 |
+
+两者共用 `codec/bacnet`（`BuildNPDU`/`ParseNPDU` 被抽成公共层），所以同一份点表
+只要改 `protocol` 与设备 MAC 就能换线；对象语义、写标签选择、错误类映射逐字节
+相同，测试也复用同一批金帧。
+
+#### 3.10.24.6 错误分类与失败传播
+
+APDU 层错误类映射与 BACnet/IP 一致：类 1（OBJECT）→`address`；类 2（PROPERTY）
+里 `unknown-property` / `invalid-array-index` / `value-out-of-range` /
+`invalid-data-type`→`address`，`read/write-access-denied`→`permission`；类 3
+（RESOURCES）→`disconnected` 且标记可重试；类 5（SECURITY）→`permission`；其余
+类→`protocol`。Reject / Abort / 认不出的 APDU 一律 `protocol`，不猜语义。
+
+承载层的分类是 MS/TP 独有的部分：
+
+| 现象 | 分类 | 可重试 |
+|---|---|---|
+| 读超时 / ctx 到期 | `timeout` | 是（同一事务内 2 次） |
+| `Write`/`ReadFull` 失败 | `disconnected` | 是（留给下一轮） |
+| 头 CRC / 长度 / NPDU 解析失败 | `protocol` | 否 |
+| 从站回 ReplyPostponed | `protocol` | 否 |
+| 设备回 RESOURCES 错误类 | `disconnected` | 是 |
+
+质量码由分类直接推出：`timeout`→`QualityTimeout`、`address`→`QualityAddressError`、
+`disconnected`→`QualityCommError`、其余→`QualityBad`。
+
+失败传播上有一条与其它轮询驱动相同的规则：**链路级失败时剩余点一并失败**。
+一轮里第 2 个点超时，第 3..N 个点不可能成功；继续逐个等超时只会把一轮采集拖成
+N 倍时长，让「设备掉线」看起来像「网关卡死」。总线上的重试留给下一轮调度。
+
+`Probe` 读 `device:1` 的 `object-name`：返回 ComplexACK 说明「总线 + 从站 + BACnet
+层」三段全通；返回 Error/Reject/Abort 说明帧能到设备、只是没有 `device:1`，同样
+算链路可用——只有超时与非法报文才算失败。这与 BACnet/IP 的探测判据相同，避免
+「设备型号不同 → 自检永远红」的误报。
+
+#### 3.10.24.7 自检与内置从站
+
+`uic mstpread` 是不装第三方客户端即可自证链路的工具，与 `bacread` 同构，多了
+MAC 与承载参数：
+
+```bash
+uic mstpread -transport serial -port /dev/ttyUSB0 -baud 38400 -mac 128 -probe
+uic mstpread -addr 127.0.0.1:24001 -mac 128 -type analog-input -instance 1
+uic mstpread -addr 127.0.0.1:24001 -mac 128 -type analog-value -instance 2 -write 55.5
+```
+
+对象类型/属性/下标的解析被抽成纯函数 `resolveMSTPPoint`，因此「命令行文本 →
+结构化地址 + 平台类型」这层逻辑可以在不连串口的前提下被单测覆盖；报文往返仍由
+`driver/bacnetmstp` 与 `sim/bacnetmstp` 负责，CLI 不再造第二个客户端。
+
+内置从站（`internal/sim/bacnetmstp`）**只模拟从站**：不产生令牌、不参与令牌环、
+不应答 PollForMaster，只应答发给本机的数据帧与 TestRequest。对象表与
+`sim/bacnet` 的默认表逐项一致（AI-1 只读温度 42.5/名称 `AI-1`/单位 62、
+AV-2 可写设定值与 16 级优先级数组、BI-1 二进制状态、CS-1 可写标牌、
+AV-3 每秒自增），所以同一份点表换承载不用改地址。MAC 默认 128，越界在启动期
+拒绝；帧扫描同样逐字节找 preamble、坏帧重扫。
+
+#### 3.10.24.8 测试矩阵
+
+| 层 | 用例 |
+|---|---|
+| `codec/bacnet/mstp.go` | 头 CRC 与数据 CRC 的有效帧残差（`0x55` / `0xF0B8`）；单字节向量 `crcHeaderByte(0,1)=0xFE`、`crcDataByte(0,1)=0x1189`；长度大端与数据 CRC 小端；帧往返；坏 preamble / 坏头 CRC / 坏数据 CRC / 超长数据段；地址分段（`IsMasterMAC` / `IsSlaveMAC`） |
+| `driver/bacnetmstp` | 真实 TCP 回环读写；`Open` 对 0..127 的从站地址、越界主站、非法 `presilence` 报错；超时重试与最终超时；迟到/重发 invoke 丢弃；垃圾字节跳过与半帧续读；被动 Token 应答与事务后交还；无 `nextStation` 时 PollForMaster 现场探测下一主站；ReplyPostponed→protocol；错误来源 MAC 不匹配时忽略；错误类映射（object/property/resources/security/未知）；写标签分支（present-value 由对象决定、其它属性由 dataType 推断）与本地类型/范围拒绝；链路失败时剩余点一并失败 |
+| `sim/bacnetmstp` | 镜像对象表；数组下标与越界；写权限与类型收敛；未知对象/属性回 Error；畸形 ConfirmedRequest 回 Reject 且不 panic；每秒自增与停止；`SetAnalog`/`SetAnalogValue`/`SetBinary`/`SetString`/`SetValue` 各值类型；垃圾帧重扫 |
+| `pointtable` | `bacnet` / `bacnet-mstp` 共用 `WidthProtocol + AllowObject`；`analog-input:1.present-value` 与 `0:1.present-value` 都能解析；非法类型/实例/下标被拒 |
+| `cmd/uic` | `resolveMSTPPoint` 的对象类型/属性/下标/dtype 组合与拒绝路径；数值写法保留原始文本、标签用规范名 |
 
 ### 3.11 计算点（`computed`）
 

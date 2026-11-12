@@ -36,6 +36,7 @@ import (
 	"uic/internal/driver"
 	adsdrv "uic/internal/driver/ads"
 	bacnetdrv "uic/internal/driver/bacnet"
+	bacnetmstpdrv "uic/internal/driver/bacnetmstp"
 	cjt188drv "uic/internal/driver/cjt188"
 	coapdrv "uic/internal/driver/coap"
 	"uic/internal/driver/computed"
@@ -169,6 +170,7 @@ func RegisterBuiltins() error {
 			finsdrv.New(),
 			enipdrv.New(),
 			bacnetdrv.New(),
+			bacnetmstpdrv.New(),
 			iec104.New(),
 			iec101drv.New(),
 			mewtocoldrv.New(),

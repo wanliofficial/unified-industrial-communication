@@ -1119,3 +1119,79 @@ func TestParseAddressMTConnectLeavesIDSyntaxToDriver(t *testing.T) {
 		}
 	}
 }
+
+// ---------------------------------------------------------------------------
+// BACnet：对象属性寻址（BACnet/IP 与 MS/TP 共用）
+// ---------------------------------------------------------------------------
+
+func TestPolicyForBACnet(t *testing.T) {
+	for _, proto := range []string{"bacnet", "bacnet-mstp"} {
+		p := PolicyFor(proto)
+		if p.Width != WidthProtocol {
+			t.Fatalf("%s: width = %v, want WidthProtocol (the property type decides)", proto, p.Width)
+		}
+		if !p.AllowObject {
+			t.Fatalf("%s must accept object addresses: %+v", proto, p)
+		}
+		if p.AllowRegister || p.AllowSymbol || p.AllowFile || p.AllowComputed ||
+			p.AllowSelector || p.AllowDPT || p.AllowSymbolLength {
+			t.Fatalf("%s accepts other address kinds: %+v", proto, p)
+		}
+		if p.DIBits != 0 || p.DIField || p.SymbolIndexInPath {
+			t.Fatalf("%s policy leaked DI/symbol flags: %+v", proto, p)
+		}
+	}
+}
+
+func TestParseAddressBACnet(t *testing.T) {
+	cases := []struct {
+		name     string
+		expr     string
+		dt       model.DataType
+		objType  string
+		instance int
+		property string
+		index    int
+	}{
+		{"analog input", "analog-input:1.present-value", model.TypeFloat32,
+			"analog-input", 1, "present-value", 0},
+		{"object name", "analog-input:1.object-name", model.TypeString,
+			"analog-input", 1, "object-name", 0},
+		{"priority element", "analog-value:2.priority-array[3]", model.TypeFloat32,
+			"analog-value", 2, "priority-array", 3},
+		{"numeric object type", "0:1.present-value", model.TypeFloat32,
+			"0", 1, "present-value", 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			for _, proto := range []string{"bacnet", "bacnet-mstp"} {
+				a, err := ParseAddress(tc.expr, tc.dt, proto)
+				if err != nil {
+					t.Fatalf("%s: parse: %v", proto, err)
+				}
+				if a.Kind != model.AddressObject || a.ObjectType != tc.objType ||
+					a.Instance != tc.instance || a.Property != tc.property ||
+					a.PropIndex != tc.index {
+					t.Fatalf("%s: address = %+v", proto, a)
+				}
+				b, err := ParseAddress(a.Canonical(), tc.dt, proto)
+				if err != nil {
+					t.Fatalf("%s: reparse %q: %v", proto, a.Canonical(), err)
+				}
+				if b != a {
+					t.Fatalf("%s: round trip: %+v != %+v", proto, b, a)
+				}
+			}
+		})
+	}
+}
+
+func TestParseAddressBACnetRejectsNonObject(t *testing.T) {
+	for _, proto := range []string{"bacnet", "bacnet-mstp"} {
+		for _, expr := range []string{"holding:0", "SOME_SYMBOL", "db1:0"} {
+			if _, err := ParseAddress(expr, model.TypeFloat32, proto); err == nil {
+				t.Fatalf("%s accepted non-object address %q", proto, expr)
+			}
+		}
+	}
+}
