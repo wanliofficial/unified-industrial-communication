@@ -12,14 +12,14 @@ PRD 中 M 级的采集协议已全部落地，FR-CFG-01 的四类寻址模型也
 可自动跑的用例（见 §7），唯一剩下的延期项是 object/file 寻址的实际驱动，
 见 [protocol-status.md](protocol-status.md) §4.1。
 
-当前测试基线：**313 passed / 0 failed / 3 skipped**（跳过的是需要 `--opcua` 的 OPC UA 端到端用例）；
-加 `-- --opcua` 跑全量是 **316 passed / 0 failed / 0 skipped**。
+当前测试基线：**314 passed / 0 failed / 3 skipped**（跳过的是需要 `--opcua` 的 OPC UA 端到端用例）；
+加 `-- --opcua` 跑全量是 **317 passed / 0 failed / 0 skipped**。
 
 ## 1. 采集（FR-COL）
 
 | 编号 | 需求 | 状态 | 证据 / 说明 |
 |---|---|---|---|
-| FR-COL-01 | Modbus TCP 主站，FC1/2/3/4/5/6/15/16 | 已实现 | `golden/read_coils_10`、`golden/write_multiple_regs_float32`、`loopback/*`；编解码覆盖 0x01–0x06/0x0F/0x10 |
+| FR-COL-01 | Modbus TCP 主站，FC1/2/3/4/5/6/15/16 | 已实现 | `golden/read_coils_10`、`golden/write_multiple_regs_float32`、`loopback/*`；编解码覆盖 0x01–0x06/0x0F/0x10；写响应回显（地址/值/数量）逐字节比对，不一致报协议错：`codec/write_echo_must_match_request` |
 | FR-COL-02 | Modbus RTU/ASCII 主站，含串口参数与帧间延时 | 已实现 | `serial/rtu_golden_frame_over_pty`、`serial/ascii_golden_frame_over_pty`、`serial/half_duplex_does_not_cross_responses`；波特率 300–921600 可配，半双工由通道闸门 + 发送前清空输入缓冲保证。帧间静默按 3.5 字符时间（>19200 bps 固定 1.75 ms），计时挂在物理串口上，多从站共享：`serial/rtu_waits_between_frames` |
 | FR-COL-03 | Modbus TCP 从站 | 已实现 | 内置从站被主站回环读写：`loopback/write_then_read_back`、`loopback/write_to_missing_register_is_rejected` |
 | FR-COL-04 | S7comm 主站 | 已实现 | `Uic.Codec.S7`（TPKT/COTP/S7 PDU 纯函数）+ `Uic.Driver.S7`（会话与驱动）+ `Uic.Sim.S7`（进程内从站）。DB/IB/QB/MB 区、位地址、PDU 自动协商（240/480/960 以 PLC 回应为准）与按 PDU 自动切片；`address.offset` 是字节偏移。证据：`s7/connect_request_frame`、`s7/setup_response_takes_plc_pdu`、`s7/read_response_length_is_in_bits`、`s7/address_parses_areas`、`s7/address_rejects_bad_input`（16 条黄金帧与地址解析；偏移超过 3 字节位偏移字段直接报 `address_error`，不静默截断）、`s7/probe_establishes_full_session`、`s7/read_mixed_areas_and_types`、`s7/write_bit_toggles_only_that_bit`、`s7/read_beyond_block_is_address_error`、`s7/negotiated_pdu_limits_the_window`、`s7/silent_plc_times_out`、`s7/reconnect_after_peer_closes`（14 条主站↔从站回环）。明确不支持并明确报错：符号寻址（0xB2）、S7Plus、TPDU 分片重组、多连接并发 |

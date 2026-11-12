@@ -25,6 +25,7 @@ internal static class CodecTests
         tests.Add(new TestCase("codec/window_rejects_invalid_spans", WindowRejectsInvalidSpans));
         tests.Add(new TestCase("codec/window_merges_and_measures", WindowMergesAndMeasures));
         tests.Add(new TestCase("codec/write_rejects_readonly_and_bit_mismatch", WriteRejectsReadOnlyAndBitMismatch));
+        tests.Add(new TestCase("codec/write_echo_must_match_request", WriteEchoMustMatchRequest));
         tests.Add(new TestCase("codec/exception_codes_map_to_kinds", ExceptionCodesMapToKinds));
         tests.Add(new TestCase("codec/decode_rejects_inconsistent_frames", DecodeRejectsInconsistentFrames));
         tests.Add(new TestCase("codec/framing_rejects_corruption", FramingRejectsCorruption));
@@ -310,6 +311,40 @@ internal static class CodecTests
         var wide = new PointRef("p", Address.Register("holding", 4), DataType.UInt64, ByteOrder.ABCD, 4);
         t.Equal("1000040004", Hex(codec.EncodeWrite(new WriteCommand(wide, DataValue.Number(DataType.UInt64, 1)))[..5]),
             "64-bit write uses FC16");
+
+        return Task.CompletedTask;
+    }
+
+    /// <summary>
+    /// 写响应必须逐字节回显请求：FC05 回显地址与线圈值，FC06 回显地址与寄存器值，
+    /// FC16 回显地址与数量。只比地址的话，「写 1 却回显 0」会被当成写入成功——
+    /// CRC 只能挡住线路噪声，挡不住从站回错值或单元号配错。
+    /// </summary>
+    private static Task WriteEchoMustMatchRequest(TestContext t)
+    {
+        var codec = new ModbusCodec("t");
+
+        var register = new PointRef("p", Address.Register("holding", 100), DataType.UInt16, ByteOrder.ABCD, 1);
+        var single = new WriteCommand(register, DataValue.Number(DataType.UInt16, 1234));
+
+        // 正确的回显要通过，别把正常响应一起挡掉。
+        t.Equal("p", codec.DecodeWrite(single, Convert.FromHexString("06006404D2")).PointId, "FC06 echo matches");
+
+        var valueMismatch = t.Throws<DriverException>(
+            () => codec.DecodeWrite(single, Convert.FromHexString("06006404D3")), "FC06 value echo differs");
+        t.Equal(ErrorKind.Protocol, valueMismatch.Kind, "a wrong value echo is a protocol error, not an address error");
+
+        var coil = new PointRef("p", Address.Register("coil", 3), DataType.Bool, ByteOrder.ABCD, 1);
+        codec.DecodeWrite(new WriteCommand(coil, DataValue.Boolean(true)), Convert.FromHexString("050003FF00"));
+        t.Throws<DriverException>(
+            () => codec.DecodeWrite(new WriteCommand(coil, DataValue.Boolean(true)),
+                Convert.FromHexString("0500030000")), "FC05 coil echo says off");
+
+        var wide = new PointRef("p", Address.Register("holding", 4), DataType.Float32, ByteOrder.ABCD, 2);
+        var multi = new WriteCommand(wide, DataValue.Number(DataType.Float32, 1.5));
+        t.Equal("p", codec.DecodeWrite(multi, Convert.FromHexString("1000040002")).PointId, "FC16 echo matches");
+        t.Throws<DriverException>(
+            () => codec.DecodeWrite(multi, Convert.FromHexString("1000040003")), "FC16 quantity echo differs");
 
         return Task.CompletedTask;
     }

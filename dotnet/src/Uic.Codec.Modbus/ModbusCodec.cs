@@ -292,11 +292,14 @@ public sealed class ModbusCodec
         if (response.Length < 5)
             throw DriverException.ProtocolError("modbus", "decode-write", "truncated write response");
 
-        // 回显的地址与值必须与请求一致；不一致说明响应串了事务。
-        var addr = BinaryPrimitives.ReadUInt16BigEndian(response.Slice(1, 2));
-        if (addr != (ushort)cmd.Point.Address.Offset)
+        // 回显必须与请求逐字节一致：FC05/FC06 回显地址与值，FC16 回显地址与数量。
+        // 只比地址的话，「写 1 却回显 0」会被当成成功——CRC 挡得住线路噪声，
+        // 挡不住从站回错值或单元号配错。重新编码一次请求即可拿到全部期望字节。
+        var sent = EncodeWrite(cmd);
+        var echo = Math.Min(sent.Length, response.Length);
+        if (!response[..echo].SequenceEqual(sent.AsSpan(0, echo)))
             throw DriverException.ProtocolError("modbus", "decode-write",
-                $"address echo {addr}, want {cmd.Point.Address.Offset}");
+                $"echo {Convert.ToHexString(response[..echo])} does not match request {Convert.ToHexString(sent.AsSpan(0, echo))}");
 
         return new WriteResult(cmd.Point.Id, true, Quality.Good, DateTimeOffset.UtcNow);
     }
