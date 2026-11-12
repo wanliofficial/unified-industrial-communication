@@ -13,6 +13,17 @@ namespace Uic.Driver;
 /// </summary>
 public static class ValueCodec
 {
+    /// <summary>
+    /// 哪些类型真的受字节序影响。
+    ///
+    /// 只有「由多个 16 位寄存器拼出来的数值」需要重排：Int32/Float64/DateTime 这类。
+    /// String、Bytes 是**原样字节流**，字节序对它们没有意义——但设备级 byteOrder 常常
+    /// 只是为 float32 设成 cdab，一设上去该设备上所有字符串点位就会错位（"ABCD" 读成
+    /// "CDAB"），而且读回来仍然「像是有值」，比直接报错难发现得多；写方向则更危险，
+    /// 错位的字节会真的下发给设备。
+    /// </summary>
+    public static bool ReordersBytes(DataType type) => type is not (DataType.String or DataType.Bytes);
+
     /// <summary>把线上寄存器顺序重排成大端连续字节。自反操作：编码方向再调一次即还原。</summary>
     public static void Normalize(Span<byte> raw, ByteOrder order)
     {
@@ -59,10 +70,14 @@ public static class ValueCodec
     {
         var elements = Math.Max(1, count);
 
+        // 字符串/字节流不受字序影响：设备级 byteOrder 为 float32 设成 cdab 时，
+        // 这里的顺序必须是「不重排」，否则整台设备的文本点位会逐字符错位。
+        var reorder = ReordersBytes(type);
+
         if (elements == 1)
         {
             var single = raw.ToArray();
-            Normalize(single, order);
+            if (reorder) Normalize(single, order);
             return DecodeElement(single, type);
         }
 
@@ -78,7 +93,7 @@ public static class ValueCodec
         for (var i = 0; i < elements; i++)
         {
             var slice = raw.Slice(i * unitBytes, unitBytes).ToArray();
-            Normalize(slice, order);
+            if (reorder) Normalize(slice, order);
             values[i] = DecodeElement(slice, type).AsNumber();
         }
 
@@ -135,7 +150,8 @@ public static class ValueCodec
         EncodeElement(buf, value, type);
 
         // 编码方向要逆变换：Normalize 把线上顺序转成大端，这里把大端转回线上顺序。
-        Normalize(buf, order);
+        // 字符串/字节流按原样下发——重排等于把内容改成了另一个值。
+        if (ReordersBytes(type)) Normalize(buf, order);
         return buf;
     }
 

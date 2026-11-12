@@ -231,7 +231,7 @@ Broker 侧用 TLS + 网络 ACL 把订阅方限定到固定网段，与 OPC UA �
 | `timeout` | 通道超时 | 本设备的单次请求超时 |
 | `retries` | `0` | 0..10，仅对**临时性失败**（超时、链路断开）重试；地址错、协议错不重试 |
 | `unitId` | `1` | Modbus 从站地址 1..255 |
-| `byteOrder` | `abcd` | `abcd` / `cdab` / `badc` / `dcba`，点位可覆盖 |
+| `byteOrder` | `abcd` | `abcd` / `cdab` / `badc` / `dcba`，点位可覆盖；只影响 32/64 位数值，`string`/`bytes` 不重排 |
 | `failureThreshold` | `3` | 连续失败多少次进入降级 |
 | `recoverInterval` | `30s` | 降级后探活间隔 |
 | `labels` | `{}` | 驱动私有参数 |
@@ -262,7 +262,7 @@ Broker 侧用 TLS + 网络 ACL 把订阅方限定到固定网段，与 OPC UA �
 | `name` | — | 显示名 |
 | `address` | 必填 | 见下 |
 | `dataType` | `uint16` | 见下 |
-| `byteOrder` | 继承设备 | 32/64 位值的排列 |
+| `byteOrder` | 继承设备 | 32/64 位值的排列；`string`/`bytes` 是原样字节流，不参与重排 |
 | `scale` / `offset` | `1` / `0` | 线性变换 `值 × scale + offset` |
 | `deadband` | 不启用 | 死区阈值；含义由 `deadbandMode` 决定，`>= 0` |
 | `deadbandMode` | `absolute` | `absolute` / `percent` / `rate`，见下 |
@@ -500,6 +500,12 @@ Broker 侧用 TLS + 网络 ACL 把订阅方限定到固定网段，与 OPC UA �
 | `cdab` | 字交换 |
 | `badc` | 字节交换 |
 | `dcba` | 完全反转 |
+
+字序只在「多个 16 位寄存器拼成一个 32/64 位数值」时才有意义。`string`、`bytes` 是
+**原样字节流**，任何字序下都按字节顺序读写：设备级 `byteOrder` 常常只是为某个
+`float32` 设成 `cdab`，如果连字符串也跟着重排，该设备上所有文本点位都会逐字符错位
+（`ABCD` 读成 `CDAB`）——读回来仍然「像是有值」，比直接报错更难发现；写方向的
+错位字节还会真的下发给设备。因此重排只对 32/64 位数值类型生效。
 
 ## 北向 `northbound`
 

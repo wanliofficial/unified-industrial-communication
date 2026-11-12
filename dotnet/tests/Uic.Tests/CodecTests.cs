@@ -17,6 +17,7 @@ internal static class CodecTests
         tests.Add(new TestCase("codec/lrc_known_vectors", Lrc));
         tests.Add(new TestCase("codec/byte_order_encodes_as_expected", ByteOrderEncodesAsExpected));
         tests.Add(new TestCase("codec/byte_order_roundtrip", ByteOrderRoundtrip));
+        tests.Add(new TestCase("codec/byte_order_does_not_scramble_text", ByteOrderDoesNotScrambleText));
         tests.Add(new TestCase("codec/bcd_roundtrip", BcdRoundtrip));
         tests.Add(new TestCase("codec/datetime_is_unix_milliseconds", DateTimeIsUnixMilliseconds));
         tests.Add(new TestCase("codec/window_rejects_invalid_spans", WindowRejectsInvalidSpans));
@@ -89,6 +90,38 @@ internal static class CodecTests
                 t.Equal(type, decoded.Type, $"{order}/{type}: type");
                 t.Close(value.AsNumber(), decoded.AsNumber(), 1e-6, $"{order}/{type}: value");
             }
+        }
+
+        return Task.CompletedTask;
+    }
+
+    /// <summary>
+    /// 字节序只对「寄存器里拼出来的 32/64 位数值」有意义。字符串与字节序列是原样字节流，
+    /// 套用字序会把相邻字符互换：设备级 byteOrder 常为 float32 设成 cdab，一设上去
+    /// 整台设备的字符串点位就全变成乱码，而且读回来「像是有值」，比报错更难发现。
+    /// 写方向更危险——错位的字节会真的发给设备。
+    /// </summary>
+    private static Task ByteOrderDoesNotScrambleText(TestContext t)
+    {
+        // "ABCD" 在寄存器里就是 4 个字节的字节流，任何字序下都必须原样读回。
+        var raw = Encoding.ASCII.GetBytes("ABCD");
+
+        foreach (var order in Enum.GetValues<ByteOrder>())
+        {
+            t.Equal("ABCD", ValueCodec.Decode(raw, DataType.String, order).Text,
+                $"{order}: a string is a raw byte sequence, not a word-ordered number");
+
+            t.Equal("41424344", Hex(ValueCodec.Encode(DataValue.String("ABCD"), DataType.String, order, 2)),
+                $"{order}: writing a string must not reorder its bytes");
+        }
+
+        // bytes 类型同理：它是二进制载荷，重排会把它变成另一个值。
+        var blob = Convert.FromHexString("0102030405060708");
+        foreach (var order in Enum.GetValues<ByteOrder>())
+        {
+            var decoded = ValueCodec.Decode(blob, DataType.Bytes, order);
+            t.Equal(Hex(blob), Hex(Convert.FromBase64String(decoded.Text!)),
+                $"{order}: a byte blob keeps its byte order");
         }
 
         return Task.CompletedTask;
