@@ -116,6 +116,25 @@
 - **South 与 North 不共用 `Uic.OpcUa`。** 客户端驱动只引用 `Uic.Domain` + `Uic.Driver`。
   一旦让它认识 `PointCache`，驱动层就会反向依赖采集侧，「一个驱动能被单独测」这条边界就没了。
   同名协议栈依赖是两回事：一边用 `.Server`，一边用 `.Client`。
+- **配置态与运行态是两个字段，不能合并成一个 `state`。** 「运维主动停采」和「设备出故障」
+  是两种完全不同的处境：前者不该报警、不该派人去查链路，后者必须。合成一个字段后，界面上
+  两者长得一样，运维只能靠经验猜。因此 `configuredState`（来自配置的 `enabled`）与
+  `runtimeState`（`configured/connecting/collecting/degraded/faulted/disabled`）各自透出，
+  停用的设备仍然出现在设备列表里、点表也照旧可读——配置还在，只是不采。
+  用例 `contract/disabled_device_shows_both_states` 用「一台停用 + 一台启用」的对照来钉：
+  单看一台停用设备时两个字段都是 `disabled`，把一边抄成另一边照样能过。
+- **驱动注册是「不匹配就拒绝」，不是「尽力兼容」。** `DriverRegistry.Register` 校验
+  `DriverMeta.SdkVersion`：版本对不上意味着接口形状可能已经变了（宿主没实现的方法、
+  驱动不认识的上下文），运行时才炸会变成「跑了几小时才在某个分支上出错」，
+  启动时炸出来便宜得多。拒绝后不留半注册状态，重复 id 也不覆盖先注册的驱动。
+  用例 `sdk/register_rejects_sdk_version_mismatch`、`sdk/register_rejects_duplicate_id`。
+- **优雅退出的顺序本身是一条验收项，不是「DisposeAsync 不抛异常」。** 停机时
+  队列里还没投走的记录必须被 flush 干净，且发生在发 `$death` 之前——否则 retained 的
+  `$death` 一落地，订阅者就以为数据到此为止，而实际上还有一批排在盘上没送走。
+  反向也要钉：flush 有 3 秒上限，对端一直不可用时停机不能无限等，未投完的记录留在盘上
+  下次重放。用真实进程内 runtime + 可脚本化的 sink 验证顺序与副作用，而不是只断言「没抛异常」。
+  用例 `shutdown/flush_runs_before_death_and_clears_the_queue`、
+  `shutdown/flush_gives_up_after_the_deadline`。
 - **订阅不进采集主路径。** `Capabilities.Subscribe = supported` 说的是「这个驱动能提供订阅」，
   不是「采集走订阅」。device actor 的看门狗、熔断、重试、死区全建立在「有周期」的前提上；
   推送驱动的采集需要另一套语义，半接进去比不接更危险（会出现「有时候收不到但没人知道」）。

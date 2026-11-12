@@ -401,6 +401,17 @@ MQTT 的 TLS 是独立开关（`northbound.mqtt.tls`），语义见
 
 设备列表另支持 `q`（按 id / 名称过滤）；点位列表支持 `device`、`quality`、`q`。
 
+设备摘要里 `configuredState` 与 `runtimeState` 是**两件事**，必须分开看：
+
+| 字段 | 取值 | 含义 |
+|---|---|---|
+| `configuredState` | `enabled` / `disabled` | 配置里的 `enabled`。运维主动停采就是 `disabled` |
+| `runtimeState` | `configured` / `connecting` / `collecting` / `degraded` / `faulted` / `disabled` | 采集循环的实际状态 |
+
+只报一个 `state` 的话，「我把它关了」和「它坏了」在界面上长得一样：运维会把主动停用
+当成故障去查链路，或者更糟——把真故障当成人为停用而不去处理。停用的设备**仍然出现**
+在列表里、点表也仍然可读（配置还在，只是不采），但不会产生新样本。
+
 点位当前值：
 
 ```json

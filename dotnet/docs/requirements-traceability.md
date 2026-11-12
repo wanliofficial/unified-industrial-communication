@@ -12,8 +12,8 @@ PRD 中 M 级的采集协议已全部落地，FR-CFG-01 的四类寻址模型也
 可自动跑的用例（见 §7），唯一剩下的延期项是 object/file 寻址的实际驱动，
 见 [protocol-status.md](protocol-status.md) §4.1。
 
-当前测试基线：**324 passed / 0 failed / 3 skipped**（跳过的是需要 `--opcua` 的 OPC UA 端到端用例）；
-加 `-- --opcua` 跑全量是 **327 passed / 0 failed / 0 skipped**。
+当前测试基线：**330 passed / 0 failed / 3 skipped**（跳过的是需要 `--opcua` 的 OPC UA 端到端用例）；
+加 `-- --opcua` 跑全量是 **333 passed / 0 failed / 0 skipped**。
 
 ## 1. 采集（FR-COL）
 
@@ -62,9 +62,9 @@ PRD 中 M 级的采集协议已全部落地，FR-CFG-01 的四类寻址模型也
 | FR-RUN-06 | 代次隔离（旧结果丢弃） | 已实现 | `engine/actor_reports_state_and_generation`；`CollectOnceAsync` 逐样本比对代次 |
 | FR-RUN-07 | 质量码 ≥8 态 + 时间戳三分离 | 已实现 | 9 态 `Quality`；`Sample` 含 `DeviceTime`/`CollectedAt`/`AppliedAt`，见 `json/datavalue_wire_shape_is_stable` |
 | FR-RUN-08 | 单调时钟用于调度与超时 | 已实现 | `nextDue` 与等待都基于 `Stopwatch.GetTimestamp()` + `ScheduleMath`；NTP 校时/手工改钟不会推迟或提前采集。样本时间戳仍用墙上时钟：`schedule/monotonic_arithmetic`。同一原则贯彻到「走了多久」的度量：`/health` 的 uptime 用单调时钟，校时跳变不会让它凭空多出一小时：`schedule/uptime_ignores_a_clock_jump`；**写命令的去重窗口**也用单调时钟，否则一次校时前跳会让同一条命令再执行一遍（对一个写点位的命令就是重复物理动作）：`mqtt/command_dedup_ignores_clock_jump`。限流桶的配额恢复与空闲清扫同样按单调时钟（前跳会让攻击者瞬间拿回全额配额，后跳会让正常客户端被永久 429）：`limits/wall_clock_jump_does_not_refill`、`limits/prune_drops_idle_buckets` |
-| FR-RUN-09 | 运行态与配置态分离 | 已实现 | `ConfiguredState` / `RuntimeState` 两套枚举，API 同时返回 |
+| FR-RUN-09 | 运行态与配置态分离 | 已实现 | `ConfiguredState` / `RuntimeState` 两套枚举，`GET /api/v1/devices` 同时返回 `configuredState` 与 `runtimeState`。验收用两台设备对照：停用的仍出现在列表里（配置与点表都在）、两个字段都是 `disabled` 且不产生样本；启用的那台 `configuredState` 恒为 `enabled` 而 `runtimeState` 走`configured/collecting` 这套词汇表——把任一边抄成另一边会立刻露出来：`contract/disabled_device_shows_both_states` |
 | FR-RUN-10 | 看门狗（采集心跳 + 资源水位降级） | 已实现 | 采集心跳：`DeviceStateWatcher` 检测「超过 max(10 周期, 30 s) 无新样本」并记 `uic_watchdog_stale_total`；恢复由 `DeviceActor` 的读超时与重连完成，进程级僵死交给外部 supervisor（NFR 故障矩阵）。资源水位：`ResourceMonitor` 按 `storage.minFreeBytes/resumeFreeBytes/maxMemoryBytes` 判定，磁盘告急时暂停文件日志与 journal、健康转 `degraded`、`problems` 标 `$resources`，恢复后自动重启；证据 `resources/disk_pressure_has_hysteresis`、`resources/memory_pressure_has_hysteresis`、`resources/unreadable_probe_is_not_pressure`、`resources/file_log_pauses_during_pressure`、`contract/resource_pressure_degrades_health` |
-| FR-RUN-11 | 优雅退出（停调度、flush 队列、关连接） | 已实现 | `GatewayRuntime.DisposeAsync` 先 flush（3 s）再发 `$death`；SIGTERM 由 Kestrel 的 `RunAsync` 触发生命周期 |
+| FR-RUN-11 | 优雅退出（停调度、flush 队列、关连接） | 已实现 | `GatewayRuntime.DisposeAsync` 先 flush（3 s）再发 `$death`；SIGTERM 由 Kestrel 的 `RunAsync` 触发生命周期。验收进程内真实 runtime：停机时队列里三条待投记录全部送达且队列清空（flush 在 `$death` 之前），以及 sink 一直失败时停机仍有界返回、未投完的记录留在盘上重放：`shutdown/flush_runs_before_death_and_clears_the_queue`、`shutdown/flush_gives_up_after_the_deadline` |
 
 ## 4. 数据处理（FR-PROC）
 
@@ -113,12 +113,12 @@ PRD 中 M 级的采集协议已全部落地，FR-CFG-01 的四类寻址模型也
 | 编号 | 需求 | 状态 | 证据 / 说明 |
 |---|---|---|---|
 | FR-SDK-01 | 驱动三层：Codec / Transport / Driver | 已实现 | 项目切分即边界：`Uic.Codec.Modbus` 不依赖 `net`，`Uic.Transport` 只管字节流，`Uic.Driver.Modbus` 组装 |
-| FR-SDK-02 | 能力与地址类型声明 | 已实现 | `DriverMeta.Capabilities` / `ConfigFields`；加载时不匹配直接拒绝 |
-| FR-SDK-03 | 驱动契约语义化版本 | 已实现 | `DriverRegistry.Register` 校验 `DriverSdk.Version`，不匹配抛出并说明原因 |
+| FR-SDK-02 | 能力与地址类型声明 | 已实现 | `DriverMeta.Capabilities`（八项四态，禁止在不确定时声明 Supported）/ `ConfigFields`；`GET /api/v1/drivers` 原样透出：`contract/drivers_expose_capability_states`。注册时能力与传输声明随 `Meta` 一起进入注册表、不做二次推断：`sdk/register_accepts_matching_version` |
+| FR-SDK-03 | 驱动契约语义化版本 | 已实现 | `DriverRegistry.Register` 校验 `DriverMeta.SdkVersion == DriverSdk.Version`，不匹配抛 `InvalidOperationException`，错误消息同时给出驱动声明版本与宿主要求版本，且不留下半注册状态；重复 `meta.id` 同样拒绝、不覆盖先注册的驱动：`sdk/register_rejects_sdk_version_mismatch`、`sdk/register_rejects_duplicate_id` |
 | FR-SDK-04 | 虚拟设备（按协议实现从站） | 已实现 | `Uic.Host/Simulator.cs` 起 Modbus TCP 从站；`loopback/*` 全链路 |
 | FR-SDK-05 | 故障注入（丢包/延迟/错帧/异常码/连接重置） | 已实现 | `Uic.Driver.Virtual` 的五类故障；`loopback/probe_times_out`、`loopback/silent_slave_times_out` |
 | FR-SDK-06 | 金报文测试套件 | 已实现 | `testdata/golden/*.json` 20 份，`golden/*` 逐字节比对（TCP/RTU/ASCII），含 4 份数组帧（读、写、逐元素字节序） |
-| FR-SDK-07 | 一致性测试套件（连接/超时/重连/并发/取消） | 已实现 | T1–T18 全部有对应用例，映射表见 [testing.md](testing.md)；单个驱动跑完约 30 s |
+| FR-SDK-07 | 一致性测试套件（连接/超时/重连/并发/取消） | 已实现 | T1–T18 全部有对应用例，映射表见 [testing.md](testing.md)；`sdk/*` 另覆盖注册期契约（版本不匹配、重复 id） |
 | FR-SDK-08 | 进程外驱动（gRPC） | 刻意没做（C） | Wave 3；需要先有稳定的 IPC 契约与进程生命周期管理 |
 
 ## 8. 非功能需求（NFR）

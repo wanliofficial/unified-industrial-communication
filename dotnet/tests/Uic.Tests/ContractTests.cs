@@ -53,6 +53,7 @@ internal static class ContractTests
         tests.Add(new TestCase("contract/pagination_cursor_is_validated", PaginationCursorIsValidated));
         tests.Add(new TestCase("contract/api_requires_bearer_token", ApiRequiresBearerToken));
         tests.Add(new TestCase("contract/devices_and_points_are_listed", DevicesAndPointsAreListed));
+        tests.Add(new TestCase("contract/disabled_device_shows_both_states", DisabledDeviceShowsBothStates));
         tests.Add(new TestCase("contract/drivers_expose_capability_states", DriversExposeCapabilityStates));
         tests.Add(new TestCase("contract/unknown_device_returns_error_envelope", UnknownDeviceReturnsEnvelope));
         tests.Add(new TestCase("contract/config_is_redacted", ConfigIsRedacted));
@@ -673,6 +674,108 @@ internal static class ContractTests
             t.Close(42, good.GetProperty("value").GetProperty("num").GetDouble(), 1e-9, "const waveform uses the baseline");
             t.Equal("°C", good.GetProperty("unit").GetString(), "unit comes from the config");
             t.Ok(good.GetProperty("seq").GetUInt64() > 0, "seq is assigned");
+        });
+    }
+
+    /// <summary>
+    /// 配置态与运行态是两件事，必须分别可见。
+    ///
+    /// 「设备配置里 enabled:false」不等于「设备出故障了」：前者是运维主动停采，
+    /// 后者要报警、要查链路。只报一个 <c>state</c> 字段的话，这两种情况在界面上
+    /// 长得一样——运维会把「我关了它」当成「它坏了」，或者反过来把真故障当成人为停用
+    /// 而不去处理。所以 API 同时给出 configuredState 与 runtimeState：
+    /// 停用的设备仍然出现在列表里（配置还在、点位还在，只是不采），
+    /// 两个 state 都是 disabled，且不会产生样本。
+    /// </summary>
+    private static Task DisabledDeviceShowsBothStates(TestContext t)
+    {
+        return RunAsync(async () =>
+        {
+            var source = BuildConfig();
+
+            // 两台设备：一台停用、一台启用。只有这样才能证明 configuredState 真的
+            // 来自配置——单看一台停用设备，两个字段都是 disabled，把 configuredState
+            // 写成 runtimeState 也照样"通过"。
+            var template = source.Devices[0];
+
+            // Device 是可变类而不是 record：逐字段复制，只改要改的字段。
+            Device Copy(string id, bool enabled, string name) => new()
+            {
+                Id = id,
+                Name = name,
+                ChannelId = template.ChannelId,
+                Enabled = enabled,
+                Interval = template.Interval,
+                Timeout = template.Timeout,
+                Retries = template.Retries,
+                UnitId = template.UnitId,
+                ByteOrder = template.ByteOrder,
+                FailureThreshold = template.FailureThreshold,
+                RecoverInterval = template.RecoverInterval,
+                Labels = template.Labels,
+                Points = template.Points.Select(p => new Point
+                {
+                    Id = p.Id,
+                    Name = p.Name,
+                    Address = p.Address,
+                    DataType = p.DataType,
+                    Unit = p.Unit,
+                }).ToList(),
+            };
+
+            var config = new ConfigDocument
+            {
+                SchemaVersion = source.SchemaVersion,
+                Site = source.Site,
+                Description = source.Description,
+                Channels = source.Channels,
+                Devices = new List<Device>
+                {
+                    Copy("v1", enabled: false, "停用设备"),
+                    Copy("v2", enabled: true, "启用设备"),
+                },
+                Northbound = source.Northbound,
+                Logging = source.Logging,
+                Storage = source.Storage,
+            };
+
+            await using var host = await Host.StartAsync(t, () => config);
+
+            using var devices = await ReadJsonAsync(t, await host.Client.SendAsync(Get("/api/v1/devices"), t.Ct));
+            var items = devices.RootElement.GetProperty("items");
+
+            t.Equal(2, items.GetArrayLength(), "a disabled device is still listed: it exists in the config");
+
+            var byId = new Dictionary<string, JsonElement>(StringComparer.Ordinal);
+            foreach (var item in items.EnumerateArray())
+                byId[item.GetProperty("id").GetString()!] = item.Clone();
+
+            t.Equal("disabled", byId["v1"].GetProperty("configuredState").GetString(),
+                "configuredState reflects the config");
+            t.Equal("disabled", byId["v1"].GetProperty("runtimeState").GetString(),
+                "a disabled device is not collecting");
+
+            // 启用设备的配置态是 enabled，而运行态是 Connecting/Collecting 之类：
+            // 这两个字段不是同一件事，任何一边抄另一边都会在这里露出来。
+            t.Equal("enabled", byId["v2"].GetProperty("configuredState").GetString(),
+                "configuredState stays enabled regardless of the runtime state");
+            t.Ok(byId["v2"].GetProperty("runtimeState").GetString() != "enabled",
+                "runtimeState is a separate vocabulary (configured/connecting/collecting/…)");
+
+            // 点位仍在契约里：上位机按点表建订阅，设备停用不该让点表消失
+            // （那会让「先把设备停掉再改点表」的操作直接失败）。
+            using var points = await ReadJsonAsync(t,
+                await host.Client.SendAsync(Get("/api/v1/devices/v1/points"), t.Ct));
+            t.Equal(2, points.RootElement.GetProperty("items").GetArrayLength(),
+                "a disabled device keeps its point table");
+
+            // 停用的设备不采集：等一会儿也拿不到 good 样本。
+            await Task.Delay(600, t.Ct);
+
+            using var point = await ReadJsonAsync(t,
+                await host.Client.SendAsync(Get("/api/v1/points/v1/temp"), t.Ct));
+            t.Ok(point.RootElement.GetProperty("quality").GetString() != "good",
+                "a disabled device must not produce samples");
         });
     }
 
