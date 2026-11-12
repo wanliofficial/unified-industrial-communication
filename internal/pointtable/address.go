@@ -296,6 +296,18 @@ func PolicyFor(protocol string) AddressPolicy {
 		// Width 用 WidthNone：值有多宽由数据对象的 MMS 类型决定（布尔、整型、
 		// 浮点、结构体的某个叶子），点表里写 length 没有意义。
 		return AddressPolicy{Width: WidthNone, AllowSymbol: true}
+	case "mtconnect":
+		// 数据项 ID 寻址：`/probe` 给出的 `dataItemId`（如 `Xabs`、`avail`），
+		// 由 `/current` 的 XML 文档按 id 查值。
+		//
+		// 为什么是纯符号地址：MTConnect 的点位是 Agent 侧的数据项定义，没有
+		// 「基址 + 偏移」的线性结构——`Xabs` 与 `Yabs` 是两个独立 id，不是相邻
+		// 位置。用区域:偏移表达会诱导人去猜不存在的地址算术。
+		//
+		// Width 用 WidthNone：值有多宽由数据项的文本与点表 dataType 决定，点表里
+		// 写 length 没有意义。selector / index / length 也一律无意义：一条
+		// `/current` 已经覆盖全设备，不需要按字段下钻，也不需要下标。
+		return AddressPolicy{Width: WidthNone, AllowSymbol: true}
 	}
 	// 未知协议：不拦地址种类（驱动可能在外部注册），但 length 必须显式，
 	// 避免用一个猜出来的宽度去读真实设备。

@@ -5,9 +5,9 @@
 | 项 | 数字 |
 |---|---|
 | 分析的参考方案 | 38 份（PA-01 … PA-38，其中 PA-06 合并了两个完全相同的仓库） |
-| 文档总量 | 55 份 Markdown / 24,149 行（含 3 份 ADR） |
-| 代码总量 | 342 个 Go 文件 / 146,625 行（其中测试 169 个文件 / 63,523 行 / 2,145 个测试函数） |
-| Go 包 | 92 个（1 个入口 + 91 个内部包；89 个内部包有测试，`internal/mqtt/mqtttest` 与 `internal/sim/finsmem` 无独立测试文件） |
+| 文档总量 | 55 份 Markdown / 25,413 行（含 3 份 ADR） |
+| 代码总量 | 387 个 Go 文件 / 171,057 行（其中测试 186 个文件 / 71,685 行 / 2,446 个测试函数） |
+| Go 包 | 101 个（1 个入口 + 100 个内部包；98 个内部包有测试，`internal/mqtt/mqtttest` 与 `internal/sim/finsmem` 无独立测试文件） |
 | 第三方依赖 | 0（仅标准库，零 CGO） |
 
 ---
@@ -34,11 +34,11 @@ cmd/ + internal/            可运行的最小骨架（不是伪代码，能采�
 
 ### 1.2 它不是什么
 
-- 不是协议库大杂烩。当前实现了 25 个驱动（Modbus TCP / RTU / ASCII 主站、S7、OPC UA、MQTT 南向订阅、
+- 不是协议库大杂烩。当前实现了 26 个驱动（Modbus TCP / RTU / ASCII 主站、S7、OPC UA、MQTT 南向订阅、
   MC 3E、FINS、Host Link FINS、EtherNet/IP CIP、BACnet/IP、IEC 60870-5-104、IEC 60870-5-101、Mewtocol、DNP3、CoAP、KNXnet/IP、IEC 61850（MMS）、DL/T 645、
-  CJ/T 188、SNMP v1/v2c/v3、ADS/AMS、SECS/GEM、计算点、virtual），外加
-  Modbus 从站（TCP / RTU / ASCII）、二十个内置模拟从站/Broker（Modbus TCP、S7、MC 3E、FINS、Host Link FINS、CIP、BACnet/IP、
-  IEC 104、IEC 101、Mewtocol、DNP3、CoAP、KNXnet/IP、IEC 61850、DL/T 645、CJ/T 188、SNMP v1/v2c、ADS/AMS、HSMS/SECS-II、MQTT）与一个内置 OPC UA 服务端、一个零依赖报警引擎与一个有界历史采样日志；其余协议在
+  CJ/T 188、SNMP v1/v2c/v3、ADS/AMS、SECS/GEM、MTConnect、计算点、virtual），外加
+  Modbus 从站（TCP / RTU / ASCII）、二十一个内置模拟从站/Broker（Modbus TCP、S7、MC 3E、FINS、Host Link FINS、CIP、BACnet/IP、
+  IEC 104、IEC 101、Mewtocol、DNP3、CoAP、KNXnet/IP、IEC 61850、DL/T 645、CJ/T 188、SNMP v1/v2c、ADS/AMS、HSMS/SECS-II、MTConnect Agent、MQTT）与一个内置 OPC UA 服务端、一个零依赖报警引擎与一个有界历史采样日志；其余协议在
   `04-protocol-catalog.md` 里按工作量排了三波，没有假装已经支持。
   注意 MQTT 出现了两次且**互不相干**：北向是「网关把数据发出去」（sink），南向是「网关订阅别人发来的数据」（driver）。
 - 不是组态软件。不做画面、不做报表、不做自研时序库——理由见 `02-synthesis/01-capability-matrix.md` §6.4。
@@ -733,6 +733,52 @@ TCP 48898 与 AMS 端口是两层：`labels.netid` 是 6 段 NetId，`labels.por
 AMS 路由发现、多句柄合并读写都显式声明 `unsupported`——它们各自是另一套模型，半成品
 比不做更难排查。
 
+MTConnect（机床数据采集，HTTP + XML，默认端口 5000）：
+
+```bash
+./uic sim -protocol mtconnect -listen 127.0.0.1:15000 &   # 内置 Agent（三轴立式加工中心）
+./uic -config examples/mtconnect.json
+curl -s -H 'Authorization: Bearer dev-token-0123456789' localhost:8097/api/v1/points
+#   13 点：avail/exec/program/mode（事件）、alm（报警条件）、Xabs/Yabs/Zabs、
+#          Xload、Sspeed/Sload、temp（采样）、toolOffset（初始 UNAVAILABLE）
+#   自检：./uic mtconnectread -addr 127.0.0.1:15000 -probe    # 设备模型与数据项 ID
+#         ./uic mtconnectread -addr 127.0.0.1:15000 -current   # 整台当前快照
+#         ./uic mtconnectread -addr 127.0.0.1:15000 -id Xabs,exec
+#         ./uic mtconnectread -addr 127.0.0.1:15000 -sample -from 1 -count 20
+```
+
+MTConnect 是唯一「一条请求覆盖整台设备」的协议：`/current` 一次返回全部数据项的当前
+值，所以点位数不影响请求数（`MultiRead` 声明 `supported`）。点位用 `kind=symbol`，
+`path` 是 Agent 的 `dataItemId`（如 `Xabs`），不是显示名；寻址不带宽度、不带下标、不带
+二级选择器——值有多宽由数据项文本与点表 `dataType` 决定。
+
+**单点问题不升级为链路错误**是这套驱动的核心取舍：`/current` 一条请求覆盖全设备，若把
+「某个点 `UNAVAILABLE`」「点表里的 ID 不存在」当成 `Read` 的错误返回，上层会按错误分类
+丢掉整条 HTTP 连接——一个本来就不可用的点会让整台设备每周期重连一次。因此 `Read` 只在
+「文档拿不到 / 解析不了 / 设备选不出来」时返回错误；`UNAVAILABLE` 折成 `bad` 质量、ID
+不存在与文本按 `dataType` 解析失败都折成地址错误，且只写进该点。`toolOffset` 初始即
+`UNAVAILABLE`，用来验证「数据项存在但此刻无值」显示为坏质量而不是 0。
+
+值是文本，按 `dataType` 解释，`UNAVAILABLE` 是保留字（不是一个数）。条件是两层结构——
+外层元素是条件类型（`System`/`Actuator`…），内层 `Normal/Warning/Fault/Unavailable` 是
+级别——同时兼容「元素名即级别、`type` 属性是条件类型」的平铺写法。条件点的值就是级别，
+级别即质量：`FAULT`→`bad`、`WARNING`→`uncertain`、`NORMAL`→`good`，同一 ID 多条条件按
+`FAULT > WARNING > UNAVAILABLE > NORMAL` 合并。
+
+多设备 Agent（一条产线多台机床）必须显式选设备：`labels.deviceUuid` 优先，其次
+`labels.deviceName`；多台且未选就报地址错误并列出可选设备——否则「A 机床的 `Xabs` 覆盖
+B 机床的 `Xabs`」不会报错，只会让两台设备的坐标互相串。`Probe` 先 GET `/probe`，遇
+404/405 退回 `/current`（裁剪版 Agent 可能只实现后者）；`/sample?from=&count=` 按序号翻
+历史窗口，`count` 上限 10000。
+
+地址规范化接受 `host:port`、`http://`、`https://`，省略端口一律 5000；支持反向代理的
+基址子路径（`http://host:5000/mtconnect`），拒绝 URL 内凭据、query、fragment。文档上限
+32 MiB，gzip 由 `net/http` 自动解压并按魔数兜底；XML 按本地名匹配、忽略命名空间，
+兼容 ISO-8859-1/latin-1/windows-1252 与 UTF-8 BOM，不校验 MTConnect 版本。只读协议：
+`Write` 声明 `unsupported` 并对每项返回 `ErrUnsupported`（标准没有写数据项的服务）；
+`Subscribe`/`Browse`/`Discovery` 都标 `unsupported`——能解析 `/sample` 不等于能订阅，
+`/probe` 是一次性诊断而不是调度式浏览。
+
 OPC UA（二进制，SecurityPolicy None / 匿名）：
 
 ```bash
@@ -1231,7 +1277,7 @@ obs  ← 所有包（不依赖任何内部包）
 | `internal/history` | 有界采样日志：NDJSON 分段、整段淘汰、原始查询、定步长聚合与窗口摘要 | 一条记录不跨段；永远保留至少一段；末尾半行触发新段；查询升序、桶对齐、桶质量取最差；非数值点位不产出 `min/max/avg`；`WindowStats` 只统计 good 的数值样本，空窗口返回 `Count=0` 而非错误 | 84% |
 | `internal/calc` | 零依赖表达式引擎（编译期类型检查、短路求值、历史窗口聚合） | 无 `eval`；引用是 `device:point`；除零/NaN/Inf/溢出都报错而不是降级；窗口只允许 1s..24h，且只在第二个参数是时长时生效；窗口引用不进 `Refs()` | 92.7% |
 | `internal/template` | 设备模板：参数校验、字符串字面量替换、实例化后完整校验 | 占位符只替换字符串字面量且不做算术；整字面量是占位符时 int/float/bool 落成 JSON 数字/布尔；未知字段/参数/占位符与键里的占位符一律报错；必填缺失一次列全 | 92.5% |
-| `internal/pointtable` | 点表 CSV：列别名、地址表达式、按协议推导宽度、合并动作 | 列名大小写/空格/下划线不敏感；未知列报错；行错误带行号列名并聚合；重复 ID 是错误、重复地址是警告；`length` 先于地址解析；`#selector` 只允许 MQTT；SNMP 只允许 OID；远动用 `WidthNone`（不表达长度、布尔量无位号，`length` 列与 `ioa:1.3` 在导入期拒绝）；默认拒绝静默覆盖 | 90.7% |
+| `internal/pointtable` | 点表 CSV：列别名、地址表达式、按协议推导宽度、合并动作 | 列名大小写/空格/下划线不敏感；未知列报错；行错误带行号列名并聚合；重复 ID 是错误、重复地址是警告；`length` 先于地址解析；`#selector` 只允许 MQTT；SNMP 只允许 OID；远动用 `WidthNone`（不表达长度、布尔量无位号，`length` 列与 `ioa:1.3` 在导入期拒绝）；MTConnect 同样用 `WidthNone`（值宽度由数据项文本与 `dataType` 决定，`dataItemId` 里的点号是 Agent 命名习惯而不是下标，`length`/selector/index 在导入期拒绝）；默认拒绝静默覆盖 | 91.3% |
 | `internal/codec/mc` | 三菱 MC 3E 纯函数编解码（帧头/设备码表/位打包/结束码/24 位设备号） | 无 I/O、无时钟、无可变状态；起始设备号 3 字节小端；位软元件按位打包（首点 bit0）；`Lookup`/`ByCode` 大小写不敏感；结束代码表 `0xC052/53/54/56`→地址错 | 86.5% |
 | `internal/driver/mc` | MC 3E 主站驱动（字/位读写、字软元件 bool 的 RMW、字序归一化、结束码分类） | 只做 3E 二进制帧 + TCP；字软元件 bool 必须显式 `address.bit`，驱动读整字→改位→写整字不清零邻位；字序归一化后按 `byteOrder` 解码默认 CDAB；结束码映射质量码 | 56.9% |
 | `internal/sim/mc` | MC 3E 内置从站（内存字/位表、按区读写、越界/未知设备结束码） | 一问一答；未配置编号读返回 0、写落表；越界返回 0xC054；设备码反查 | 89.8% |
@@ -1287,6 +1333,9 @@ obs  ← 所有包（不依赖任何内部包）
 | `internal/codec/secs` | SECS 纯函数编解码（12 字节 HSMS 帧头、控制消息 Stream/Function=0xFF、SECS-II 项编解码、`MaxPayload` 上限、SxFy 消息体语义） | 无 I/O、无时钟、无可变状态；格式字节低 2 位是长度字节数（`00` 视同 1）不是长度值；L 项长度是子项个数；整数定宽大端，宽度不符即报错而不是补零；BOOLEAN 非 0 即 true；数据长度上限 16 MiB，读、解、编三处都校验；L 项声明数超过剩余字节数直接报错，不按声明数预分配 | 94.6% |
 | `internal/driver/secs` | HSMS 主站（Select 握手、SystemBytes + Stream + Function+1 + W 位清零四条件配对、按对象分组批量读、S2F15 写常数、Linktest 探活、`Describe`/`RawRead` 自检扩展） | 只做 TCP 主站；Object 地址 `svid:<id>.value`（只读）/ `ecid:<id>.value`（可写）；读按对象类型分组，svid+ecid 混排是两次事务；未匹配的消息（异步 S6F11、迟到应答）丢弃继续读而不是判失败；写只认点表内的点，按地址临时构造的写请求一律 `permission`（读允许按地址解析）；ACKC7≠0 表示整批被拒；`attemptDeadline` 取设备超时与 ctx 的更早者 | 89.1% |
 | `internal/sim/secs` | HSMS 内置设备（SVID/ECID 双编号空间、Select 门控、常数写拒绝未知编号、事件与报警推送） | 与主站共用 codec/secs；SVID 与 ECID 用 `(对象类型, 编号)` 作键，同号互不干扰；未选中时 DATA 回 Reject；写未知 ECID 回 ACKC7≠0（不新建）；S1F11 空列表=全部 SVID；设备侧只设写截止时间（`SetDeadline` 会让空闲连接被判超时） | 95.1% |
+| `internal/codec/mtconnect` | MTConnect 纯函数编解码（按本地名匹配、忽略命名空间；Header 序号与 `nextSequence` 补齐；Samples/Events/Conditions 三类观测；两层与平铺条件写法及按严重度合并；`/probe` 设备模型；`MTConnectError` 文档；ISO-8859-1/latin-1/windows-1252 与 UTF-8 BOM） | 无 I/O、无时钟、无可变状态；只按本地名匹配（带 `mt:` 前缀的文档照样解析）；两层条件的外层元素名是条件类型、内层是级别，平铺写法用 `type` 属性承载类型，两种写法必须归一到同一个 `ConditionLevel`；同一 ID 多条条件按 `FAULT > WARNING > UNAVAILABLE > NORMAL` 合并而不是「后者覆盖」；`UNAVAILABLE` 是保留字不是数值；不支持的字符集显式报错，不静默产出乱码 | 80.3% |
+| `internal/driver/mtconnect` | MTConnect 主站（一条 `/current` 覆盖全设备、单点问题只降该点质量、`/probe` 失败退回 `/current`、多设备按 uuid/name 选择、基址子路径与 gzip、只读边界；自检 `ProbeDevices`/`Current`/`Sample`） | 只做 HTTP + XML 只读；地址必须是 `symbol` 且只含一个 `dataItemId`（拒绝 selector/index/length）；`Read` 只在「文档拿不到 / 解析不了 / 设备选不出来」时返回错误，`UNAVAILABLE`→bad、ID 不存在或类型解析失败→address_error，一律只写进该点；条件点级别即质量（FAULT→bad、WARNING→uncertain）；多设备未选时报地址错误并列可选设备；省略端口补 5000，拒绝 URL 内凭据/query/fragment；文档上限 32 MiB | 81.3% |
+| `internal/sim/mtconnect` | MTConnect 内置 Agent（三轴加工中心、`/probe`/`/current`/`/sample` 序号窗口、两层条件渲染、`toolOffset` 初始 UNAVAILABLE、gzip 与子路径、七类故障注入） | 与主站共用 codec/mtconnect；`toolOffset` 初始 UNAVAILABLE（真实机床最常见的「数据项存在但无值」）；条件用规范两层写法渲染；`/sample` 按环形缓冲的序号窗口返回，旧观测被顶掉；`/probe` 只列组件下的数据项，不重复平铺；故障注入（状态码/探针失败/畸形 XML/HTML/延迟/省略数据项/全 UNAVAILABLE/条件）各自独立，测试只打开自己关心的那一个 | 92.9% |
 | `internal/driver/link` | 表计协议的承载层：串口与串口服务器（TCP 透传）统一成一条带总线锁的链路 | 锁覆盖「排空 → 发送 → 收完帧」整段；TCP 上 Drain 退化为读掉残留字节（分帧同步仍由 codec 扫描兜底）；`host` 省略端口时补默认端口；参数错误 `ErrUnsupported`、打开/连接失败 `ErrDisconnected`；`Drain` 必须早于 `SetDeadline` | 91.2% |
 
 | `internal/planner` | 点位 → 批量读请求（ReadSpan） | 协议无关；按连续性/上限合并；按 `area:db` 分组；计算点合成单个 `expr` span（漏组会表现为全坏且无日志） | 92.6% |
@@ -1305,7 +1354,7 @@ obs  ← 所有包（不依赖任何内部包）
 | `internal/mqtt` | MQTT 3.1.1 客户端（北向发布 + 南向订阅共用，纯 Go 零依赖） | 单 goroutine 读 socket；QoS1 必须等到 PUBACK；`Ping` 必须等到 PINGRESP（写成功不算活着）；断线立即失败而非超时；`Epoch` 暴露连接代数，供订阅方区分「新会话的第一条消息」 | 70.3% |
 | `internal/mqtt/mqtttest` | 测试封装：`internal/sim/mqtt` 的 `*testing.T` 生命周期 + 等待断言 | 不另写 Broker（两份实现必然长歪）；开关一律走 setup 函数而非直接赋字段 | — |
 | `internal/runtime` | 唯一编排层 + 后端实现 + 看门狗 + 审计埋点 + 窗口缓存 | 启动/关闭顺序（失败逆序收口）；`configuredState` 与 `runtimeState` 分离；协议/传输匹配在装配期校验；只向驱动与报警引擎注入只读 `cache.Get` 与窗口数据源；北向 OPC UA 启停与热重建；凭据表热替换后旧用户立即失效；MQTT 北向以 `northboundSink` 接口隔离 json 与 sparkplug-b | 81.1% |
-| `cmd/uic` | 单入口：run / sim / mbread / mcread / finsread / hostlinkread / enipread / bacread / iec104read / iec101read / mewtocolread / dnp3read / coapread / knxread / iec61850read / uaread / dlt645read / cjt188read / snmpread / adsread / s7blocks / s7upload / instantiate / import / token / check / version | 关闭预算 10 秒；`uaread`、`mbread`、`mcread`、`finsread`、`enipread`、`bacread`、`iec104read`、`iec101read`、`mewtocolread`、`dnp3read`、`coapread`、`knxread`、`iec61850read`、`dlt645read`、`cjt188read`、`snmpread`、`adsread` 是不装第三方客户端即可自证链路的自检工具；块服务放在 CLI 而不是北向 API（动作重、数据大、归操作系统账号管）；模板实例化与点表导入只产出文件，不在运行期动态生成设备 | — |
+| `cmd/uic` | 单入口：run / sim / mbread / mcread / finsread / hostlinkread / enipread / bacread / iec104read / iec101read / mewtocolread / dnp3read / coapread / knxread / iec61850read / uaread / dlt645read / cjt188read / snmpread / adsread / secsread / mtconnectread / s7blocks / s7upload / instantiate / import / token / check / version | 关闭预算 10 秒；`uaread`、`mbread`、`mcread`、`finsread`、`enipread`、`bacread`、`iec104read`、`iec101read`、`mewtocolread`、`dnp3read`、`coapread`、`knxread`、`iec61850read`、`dlt645read`、`cjt188read`、`snmpread`、`adsread`、`secsread`、`mtconnectread` 是不装第三方客户端即可自证链路的自检工具；块服务放在 CLI 而不是北向 API（动作重、数据大、归操作系统账号管）；模板实例化与点表导入只产出文件，不在运行期动态生成设备 | — |
 
 覆盖率一列是 `go test -cover ./<包>/` 的语句覆盖率（只统计包内测试，不做跨包交叉覆盖），
 随测试增删会有 1% 级的漂移；要看当前值请按 §9.2 的命令重跑。

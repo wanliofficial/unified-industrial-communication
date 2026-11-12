@@ -52,6 +52,7 @@ import (
 	mewtocoldrv "uic/internal/driver/mewtocol"
 	"uic/internal/driver/modbus"
 	mqttdriver "uic/internal/driver/mqtt"
+	mtconndrv "uic/internal/driver/mtconnect"
 	opcuadriver "uic/internal/driver/opcua"
 	"uic/internal/driver/s7"
 	secsdrv "uic/internal/driver/secs"
@@ -181,6 +182,7 @@ func RegisterBuiltins() error {
 			knxdrv.New(),
 			iec61850drv.New(),
 			secsdrv.New(),
+			mtconndrv.New(),
 		} {
 			if err := driver.Register(d); err != nil {
 				registerErr = err

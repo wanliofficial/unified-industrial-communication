@@ -1,0 +1,151 @@
+{
+  "schemaVersion": 1,
+  "site": "mtconnect-lab",
+  "server": {
+    "listen": "127.0.0.1:8097",
+    "token": "dev-token-0123456789"
+  },
+  "storage": {
+    "dir": "./data-mtconnect",
+    "journal": true,
+    "outboxMaxRecords": 5000,
+    "outboxTtl": "10m"
+  },
+  "logging": {
+    "level": "info"
+  },
+  "northbound": {
+    "webhook": {
+      "enabled": false,
+      "url": "http://127.0.0.1:9999/ingest",
+      "timeout": "3s"
+    }
+  },
+  "channels": [
+    {
+      "id": "ch-mtconnect",
+      "protocol": "mtconnect",
+      "transport": {
+        "kind": "tcp",
+        "address": "127.0.0.1:15000"
+      },
+      "concurrency": 1,
+      "timeout": "3s"
+    }
+  ],
+  "devices": [
+    {
+      "id": "vmc-3axis",
+      "name": "三轴立式加工中心（内置 MTConnect Agent）",
+      "channel": "ch-mtconnect",
+      "interval": "1s",
+      "timeout": "3s",
+      "enabled": true,
+      "labels": {
+        "deviceUuid": "VMC-3AXIS-001",
+        "timeout": "3s"
+      },
+      "points": [
+        {
+          "id": "avail",
+          "name": "设备可用性（AVAILABILITY，AVAILABLE/UNAVAILABLE）",
+          "address": { "kind": "symbol", "path": "avail" },
+          "dataType": "string",
+          "enabled": true
+        },
+        {
+          "id": "exec",
+          "name": "执行状态（EXECUTION，ACTIVE/READY/STOPPED…）",
+          "address": { "kind": "symbol", "path": "exec" },
+          "dataType": "string",
+          "enabled": true
+        },
+        {
+          "id": "program",
+          "name": "当前程序（PROGRAM）",
+          "address": { "kind": "symbol", "path": "program" },
+          "dataType": "string",
+          "enabled": true
+        },
+        {
+          "id": "mode",
+          "name": "控制器模式（CONTROLLER_MODE，AUTOMATIC/MANUAL…）",
+          "address": { "kind": "symbol", "path": "mode" },
+          "dataType": "string",
+          "enabled": true
+        },
+        {
+          "id": "alarm",
+          "name": "报警条件（CONDITION，值为级别 NORMAL/WARNING/FAULT）",
+          "address": { "kind": "symbol", "path": "alm" },
+          "dataType": "string",
+          "enabled": true
+        },
+        {
+          "id": "x-abs",
+          "name": "X 轴实际位置（POSITION，mm）",
+          "address": { "kind": "symbol", "path": "Xabs" },
+          "dataType": "float64",
+          "unit": "mm",
+          "enabled": true
+        },
+        {
+          "id": "y-abs",
+          "name": "Y 轴实际位置（POSITION，mm）",
+          "address": { "kind": "symbol", "path": "Yabs" },
+          "dataType": "float64",
+          "unit": "mm",
+          "enabled": true
+        },
+        {
+          "id": "z-abs",
+          "name": "Z 轴实际位置（POSITION，mm）",
+          "address": { "kind": "symbol", "path": "Zabs" },
+          "dataType": "float64",
+          "unit": "mm",
+          "enabled": true
+        },
+        {
+          "id": "x-load",
+          "name": "X 轴负载（LOAD，%）",
+          "address": { "kind": "symbol", "path": "Xload" },
+          "dataType": "float64",
+          "unit": "%",
+          "enabled": true
+        },
+        {
+          "id": "spindle-speed",
+          "name": "主轴转速（ROTARY_VELOCITY，rpm）",
+          "address": { "kind": "symbol", "path": "Sspeed" },
+          "dataType": "float64",
+          "unit": "rpm",
+          "enabled": true
+        },
+        {
+          "id": "spindle-load",
+          "name": "主轴负载（ROTARY_LOAD，%）",
+          "address": { "kind": "symbol", "path": "Sload" },
+          "dataType": "float64",
+          "unit": "%",
+          "enabled": true
+        },
+        {
+          "id": "temperature",
+          "name": "温度（TEMPERATURE，℃）",
+          "address": { "kind": "symbol", "path": "temp" },
+          "dataType": "float64",
+          "unit": "degC",
+          "enabled": true
+        },
+        {
+          "id": "tool-offset",
+          "name": "刀具偏置（TOOL_OFFSET；初始为 UNAVAILABLE，应显示坏质量而不是 0）",
+          "address": { "kind": "symbol", "path": "toolOffset" },
+          "dataType": "float64",
+          "unit": "mm",
+          "enabled": true
+        }
+      ]
+    }
+  ]
+}

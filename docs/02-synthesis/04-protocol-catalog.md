@@ -297,7 +297,8 @@ IEC 61850、SECS/GEM、KNX、Mewtocol、Host Link、MTConnect。
 | **Host Link** | 主站 / 串口（RS-232/422/485）或串口服务器 TCP | 上位链接是欧姆龙小型 PLC 的默认串口协议；它有两种命令集，选错等于重写一遍驱动 | 只做 **FINS 帧（头码 `FA`）**，命令语义与 FINS/TCP 共用；不做 C 模式、跨网长格式、自动重试 |
 | **MTConnect** | 客户端 / HTTP | 机床数据采集的事实标准；纯 REST + XML，无二进制编解码 | HTTP GET 取 `probe`/`current`/`sample`，XML 解析，不做资产/事件完整模型 |
 
-> 截至当前实现：DNP3、CoAP、SECS/GEM、IEC 101、Mewtocol、Host Link、KNXnet/IP、IEC 61850（MMS）已落地。
+> 截至当前实现：MC 3E、FINS、EtherNet/IP + CIP、BACnet/IP、IEC 104、DL/T 645、
+> CJ/T 188、SNMP v1/v2c/v3、ADS/AMS、SECS/GEM、KNXnet/IP、Mewtocol、Host Link、IEC 61850（MMS）、IEC 101、DNP3、CoAP、MTConnect 已落地（各含编解码、主站、内置从站/服务端/Agent 与自检 CLI）；
 >
 > **DNP3**（编解码 + 主站 + 内置从站 + `uic dnp3read` + `examples/dnp3.json`）：只做
 > TCP 主站、类 0 总召唤、类 1/2/3 事件轮询、CROB 与组 41 直接控制、未请求响应的接收
@@ -460,6 +461,37 @@ IEC 61850、SECS/GEM、KNX、Mewtocol、Host Link、MTConnect。
 > 会让客户端拼成 `LD/LD.…`，本仓库实现时真踩到并用 `-browse` 输出钉死）、未知对象回
 > `object-non-existent` 而不是默认值、关联可被拒（验证「关联被拒」与「读超时」是两类
 > 事故）、读超时注入后连接仍可用。
+>
+> **MTConnect**（编解码 + 主站 + 内置 Agent + `uic mtconnectread` + `examples/mtconnect.json`）：
+> 只做 **HTTP + XML 只读**，三个端点 `/probe`（设备模型与数据项清单）、`/current`（整台设备
+> 当前快照）、`/sample`（按序号翻历史窗口）；不做资产/事件完整模型、不校验 MTConnect
+> 版本、不做 `/asset`、`/streams`。它的形态与前面所有协议都不同：没有事务、没有请求-应答
+> 的配对方程式，一条 GET 就覆盖全设备，所以 `MultiRead` 声明 `supported`、点位数不影响
+> 请求数——**「多一个点」与「多一百个点」成本相同**，这在驱动里是独一份。寻址用
+> `kind=symbol`，`path` 是 Agent 的 `dataItemId`（如 `Xabs`）；值有多宽由数据项文本与点表
+> `dataType` 共同决定，因此点表用 `WidthNone`（与 IEC 61850 同类、`dataItemId` 里的点号是
+> Agent 命名习惯而不是下标，selector/index/length 在导入期就拒绝）。四个真正会踩的坑：
+> **① 单点问题不升级为链路错误**——`/current` 一条请求覆盖全设备，若把「某个点 `UNAVAILABLE`
+> 」「ID 不存在」当 `Read` 错误返回，上层会按错误分类丢掉整条连接，一个本来不可用的点
+> 会让整台设备每周期重连；因此 `Read` 只在「文档拿不到 / 解析不了 / 设备选不出来」时返
+> 错，`UNAVAILABLE`→`bad`、ID 不存在或类型解析失败→`address_error`，一律只写进该点。
+> **② 条件是两层结构**——外层元素是条件类型（`System`），内层 `Normal/Warning/Fault/
+> Unavailable` 是级别；同时兼容「元素名即级别、`type` 属性是条件类型」的平铺写法，两种
+> 写法归一到同一个级别。条件点的**值就是级别，级别即质量**：`FAULT`→`bad`、
+> `WARNING`→`uncertain`、`NORMAL`→`good`，同一 ID 多条条件按 `FAULT > WARNING >
+> UNAVAILABLE > NORMAL` 合并（不是「后者覆盖」）。**③ 多设备 Agent 必须显式选设备**——
+> `labels.deviceUuid` 优先、其次 `deviceName`；多台且未选就报地址错误并列出可选设备，
+> 否则「A 机床的 `Xabs` 覆盖 B 机床的 `Xabs`」不会报错，只会让两台坐标互相串。**④ 地址
+> 规范化与探测顺序**——接受 `host:port`/`http://`/`https://`、省略端口一律补 5000、支持
+> 反向代理基址子路径、拒绝 URL 内凭据/query/fragment；`Probe` 先 GET `/probe`、遇 404/405
+> 退回 `/current`（裁剪版 Agent 可能只实现后者）；`net/http` 自动解 gzip 且按魔数兜底；
+> XML 按**本地名**匹配（带 `mt:` 前缀照样解析）、兼容 ISO-8859-1/latin-1/windows-1252 与
+> UTF-8 BOM；文档上限 32 MiB，`/sample` 的 `count` 上限 10000。只读是协议边界不是取舍：
+> `Write` 声明 `unsupported` 且逐项返回 `ErrUnsupported`（标准没有写数据项的服务），
+> `Subscribe`/`Browse`/`Discovery` 都标 `unsupported`——能解析 `/sample` 不等于能订阅，
+> `/probe` 是一次性诊断而不是调度式浏览。内置 Agent 复现三件事：**`toolOffset` 初始
+> UNAVAILABLE**（数据项存在但此刻无值——真机最常见的常态，用来验证显示为坏质量而不是 0）、
+> 条件用规范两层写法渲染、`/sample` 按环形缓冲序号窗口返回（旧观测被顶掉）。
 
 **明确不做**：PROFINET IO、PROFIBUS、CANopen、CC-Link、FOCAS、DALI、LonWorks、DDS、EtherCAT、HART、GB/T 28181、Euromap、Matter、LoRaWAN、OCPP、Redfish。
 

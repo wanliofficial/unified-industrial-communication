@@ -84,6 +84,7 @@ import (
 	mewsim "uic/internal/sim/mewtocol"
 	sim "uic/internal/sim/modbus"
 	simmqtt "uic/internal/sim/mqtt"
+	mtconnetsim "uic/internal/sim/mtconnect"
 	sims7 "uic/internal/sim/s7"
 	secssim "uic/internal/sim/secs"
 	snmpsim "uic/internal/sim/snmp"
@@ -137,6 +138,8 @@ func main() {
 		cjt188readCmd(args)
 	case "snmpread":
 		snmpreadCmd(args)
+	case "mtconnectread":
+		runMTConnectRead(args)
 	case "secsread":
 		secsreadCmd(args)
 	case "adsread":
@@ -229,6 +232,11 @@ func usage() {
   uic secsread -addr 127.0.0.1:5000 -describe -id 1,2,3
   uic secsread -addr 127.0.0.1:5000 -object ecid -id 10 -write 350
   uic secsread -addr 127.0.0.1:5000 -probe
+  uic sim -protocol mtconnect -listen 127.0.0.1:15000  # 内置 MTConnect Agent（HTTP + XML）
+  uic mtconnectread -addr 127.0.0.1:15000 -probe       # MTConnect 自检（设备模型）
+  uic mtconnectread -addr 127.0.0.1:15000 -current      # MTConnect 自检（当前快照）
+  uic mtconnectread -addr 127.0.0.1:15000 -id Xabs,exec # 指定数据项
+  uic mtconnectread -addr 127.0.0.1:15000 -sample -from 1 -count 20  # 序号窗口
   uic mbread -transport rtu|ascii -port /dev/ttyUSB0 [-baud 19200] [-parity even]
   uic uaread -addr 127.0.0.1:4840 -nodes ns=2;s=site/dev/point [-type float64]
   uic uaread -addr 127.0.0.1:4840 -nodes ns=2;s=site/dev/setpoint -write 42.5
@@ -542,7 +550,7 @@ func simCmd(args []string) {
 	fs := flag.NewFlagSet("sim", flag.ExitOnError)
 	addr := fs.String("listen", "127.0.0.1:15020", "监听地址")
 	size := fs.Int("size", 1024, "寄存器数量")
-	proto := fs.String("protocol", "modbus", "从站协议：modbus | s7 | opcua | mqtt | mc | fins | enip | bacnet | iec104 | iec101 | mewtocol | hostlink | dnp3 | coap | knx | dlt645 | cjt188 | snmp | ads | secs | iec61850")
+	proto := fs.String("protocol", "modbus", "从站协议：modbus | s7 | opcua | mqtt | mc | fins | enip | bacnet | iec104 | iec101 | mewtocol | hostlink | dnp3 | coap | knx | dlt645 | cjt188 | snmp | ads | secs | iec61850 | mtconnect")
 	pdu := fs.Int("pdu", 480, "S7 协商 PDU 长度（240/480/960）")
 
 	// SNMP v3/USM 专用（只在 -protocol snmp 时生效）
@@ -617,9 +625,12 @@ func simCmd(args []string) {
 	case "iec61850":
 		simIEC61850(*addr)
 		return
+	case "mtconnect":
+		simMTConnect(*addr)
+		return
 	case "modbus":
 	default:
-		fmt.Fprintf(os.Stderr, "未知协议 %q（支持 modbus | s7 | opcua | mqtt | mc | fins | enip | bacnet | iec104 | iec101 | mewtocol | hostlink | dnp3 | coap | knx | dlt645 | cjt188 | snmp | ads | secs | iec61850）\n", *proto)
+		fmt.Fprintf(os.Stderr, "未知协议 %q（支持 modbus | s7 | opcua | mqtt | mc | fins | enip | bacnet | iec104 | iec101 | mewtocol | hostlink | dnp3 | coap | knx | dlt645 | cjt188 | snmp | ads | secs | iec61850 | mtconnect）\n", *proto)
 		os.Exit(2)
 	}
 
@@ -1369,6 +1380,62 @@ func simSNMPV3(enable bool, user, authProto, authPass, privProto, privPass strin
 	return &snmpsim.USMConfig{Users: map[string]snmpsim.USMUser{
 		user: {Name: user, Auth: a, AuthPassword: ap, Priv: p, PrivPassword: pp},
 	}}
+}
+
+// simMTConnect 启动内置 MTConnect Agent（HTTP + XML，默认端口 5000）。
+//
+// 用一个定时器模拟「设备侧采样循环」：每秒推进一次主轴位置与温度，压入
+// `/sample` 环形缓冲。这样 `mtconnectread -sample` 能看到真实的变化，
+// 而不是每次读到的都是同一份快照。工具（Ctrl+C 停止前）通过 SIGINT 退出。
+func simMTConnect(addr string) {
+	srv, err := mtconnetsim.NewServer(addr)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "启动 MTConnect Agent 失败: %v\n", err)
+		os.Exit(1)
+	}
+	defer func() { _ = srv.Close() }()
+
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	fmt.Printf("mtconnect agent listening on %s\n", srv.URL())
+	fmt.Println("  设备：VMC-3AXIS (uuid VMC-3AXIS-001) — 三轴立式加工中心（模拟）")
+	fmt.Println("  资源：/probe（模型）  /current（当前快照）  /sample（序号窗口）")
+	fmt.Println("  数据项：avail exec program mode | alm(条件) | Xabs..Zload | Sspeed/Sload | temp | toolOffset")
+	fmt.Println("  toolOffset 初始 UNAVAILABLE；主轴位置/温度由定时器每秒推进")
+	fmt.Println("  Ctrl+C 停止")
+	fmt.Printf("  自检：   uic mtconnectread -addr %s -probe\n", srv.Addr())
+	fmt.Printf("           uic mtconnectread -addr %s -current\n", srv.Addr())
+
+	// 模拟设备侧采样：让 /sample 的序号窗口与 /current 随时间变化。
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+	go func() {
+		pos := 12.3
+		temp := 24.5
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				pos += 0.05
+				if pos > 20 {
+					pos = 0
+				}
+				temp += 0.1
+				if temp > 30 {
+					temp = 20
+				}
+				_ = srv.SetValue("Xabs", strconv.FormatFloat(pos, 'f', 4, 64))
+				_ = srv.SetValue("temp", strconv.FormatFloat(temp, 'f', 1, 64))
+				srv.Tick()
+			}
+		}
+	}()
+
+	<-ctx.Done()
+	_ = srv.Close()
+	slog.Info("sim_stopped")
 }
 
 // simADS 启动内置 ADS/AMS 服务端（TCP）。

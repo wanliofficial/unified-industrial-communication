@@ -6702,6 +6702,90 @@ USM 的 6 类 Report 各有明确的现场含义：
 | `sim/snmp` | 真做 HMAC 验签与 DES/AES 解密（两侧互为对端，杜绝「自己骗自己」）；6 类 Report；引擎身份可切换；`Faults.DropPercent` 模拟真机静默丢弃 |
 | `cmd/uic` | v3 flag 折参、`secret()`、`securityLevelLabel()` |
 
+### 3.10.23 MTConnect（HTTP + XML：`/probe`、`/current`、`/sample`，默认端口 5000）
+
+MTConnect 是唯一「HTTP + XML、只读、一条请求覆盖整台设备」的协议：没有事务、没有
+请求-应答的配对方程式，`/current` 一次 GET 就把全设备的所有数据项都带回来了。它的
+形态与前面所有协议都不同，因此单独立一节。
+
+```
+HTTP GET /probe    → XML：设备清单 + 每台的 Component/Controller/DataItem
+HTTP GET /current  → XML：DeviceStream 的 Samples/Events/Conditions
+HTTP GET /sample?from=<seq>&count=<n>  → XML：按序号翻历史窗口
+```
+
+#### 3.10.23.1 寻址：只有 `symbol`，且必须只有一个
+
+点位 `kind=symbol`，`path` 是 Agent 的 `dataItemId`（如 `Xabs`）。值有多宽
+由数据项文本与点表 `dataType` 共同决定，所以点表用 `WidthNone`——与 IEC 61850
+同类。四者在导入期就拒绝，不让它伪装成可读写：
+
+- `selector`（`#`）一律拒绝——`/current` 一次就覆盖全设备，没有「子树」可言；
+- `index` / `length` 拒绝——`dataItemId` 里的点号是 Agent 的命名习惯
+  （`avail`、`Xabs`…），不是数组下标；
+- 只读协议：`Write` 声明 `unsupported` 且每项都返回 `ErrUnsupported`（标准没有
+  写数据项的服务）。`Subscribe`/`Browse`/`Discovery` 也一并标 `unsupported`——
+  能解析 `/sample` 不等于能订阅，`/probe` 是一次性诊断，不是调度式浏览。
+
+#### 3.10.23.2 单点问题不升级为链路错误（整套驱动的核心取舍）
+
+`/current` 一条请求覆盖全设备，因此**「多一个点」和「多一百个点」成本相同**——
+`MultiRead` 声明 `supported`。正因为一条请求扛全设备，最容易被写坏的地方是：把
+「某个点此刻 `UNAVAILABLE`」「点表里这个 ID 根本不存在」当成 `Read` 的错误返回。
+那样上层会按错误分类丢掉整条连接，一个本来不可用的点会让整台设备每周期
+重连一次。所以规则是：
+
+| 单点现象 | 落点 | `Read` 是否报错 |
+|---|---|---|
+| 数据项存在但此刻 `UNAVAILABLE` | `QualityBad` | 否，写进该点 |
+| ID 不在本次快照里 / 文本按 `dataType` 解析失败 | `QualityAddressError` | 否，写进该点 |
+| 文档拿不到 / 解析失败 / 设备选不出来 | `ErrProtocol`/`ErrAddress` | 是，`Read` 才返回错误 |
+
+#### 3.10.23.3 条件两层结构，级别即质量
+
+MTConnect 的条件是两层：**外层元素是条件类型**（`System`/`Actuator`…），
+**内层 `Normal/Warning/Fault/Unavailable` 是级别**。同时要兼容「元素名即级别、
+`type` 属性承载条件类型」的平铺写法，两种写法归一到同一个级别枚举。条件点的
+**值就是级别，级别即质量**，因此质量位不来自某个独立的 quality 字段，而是从
+级别直接映射：`FAULT`→`bad`、`WARNING`→`uncertain`、`NORMAL`→`good`。同一 ID
+多条条件按 `FAULT > WARNING > UNAVAILABLE > NORMAL` 合并，不是「后者覆盖前者」。
+
+#### 3.10.23.4 多设备 Agent 必须显式选设备
+
+一条产线常挂多台机床。若都当单设备读，`A` 机床的 `Xabs` 会覆盖 `B` 机床的
+`Xabs`，且不报错。因此 `labels.deviceUuid` 优先、其次 `labels.deviceName`；
+多台且未选就报地址错误并列出可选设备，绝不静默选第一台。`Probe` 先 GET
+`/probe`，遇 404/405 退回 `/current`（裁剪版 Agent 可能只实现后者）。
+
+#### 3.10.23.5 地址规范化与探测顺序
+
+接受 `host:port` / `http://` / `https://`，省略端口一律补 5000，支持反向代理的
+基址子路径（`http://host:5000/mtconnect`），拒绝 URL 内的凭据、query、fragment。
+`net/http` 自动解 gzip 并按魔数兜底；XML 按**本地名**匹配（带 `mt:` 前缀照样
+解析），兼容 ISO-8859-1/latin-1/windows-1252 与 UTF-8 BOM，不支持的字符集显式报错，
+不静默产出乱码。文档上限 32 MiB，`/sample` 的 `count` 上限 10000。
+
+#### 3.10.23.6 自检与内置 Agent
+
+`uic mtconnectread` 是不装第三方客户端即可自证链路的工具，依次跑：设备模型
+（`/probe`）、整台快照（`/current`）、按 ID 列表（`-id Xabs,exec`）、按序号翻窗口
+（`-sample -from 1 -count 20`）。自检 `ProbeDevices` 的 version 优先取 XML Header，
+Header 没有 `version` 属性才回落响应头 `X-MTConnect-Version`。内置 Agent 刻意
+复现三件事：`toolOffset` 初始即 `UNAVAILABLE`（数据项存在但无值，真机最常见
+的常态，用来验证显示为坏质量而不是 0）、条件用规范两层写法渲染、`/sample` 按
+环形缓冲序号窗口返回（旧观测被顶掉）；故障注入（状态码 / 探针失败 / 畸形 XML /
+HTML / 延迟 / 省略数据项 / 全 `UNAVAILABLE` / 条件）各自独立，测试只打开自己
+关心的那一个，绝不两个一起开。
+
+#### 3.10.23.7 测试矩阵
+
+| 层 | 用例 |
+|---|---|
+| `codec/mtconnect` | 按本地名匹配忽略命名空间；Header 序号与 `nextSequence` 补齐；Samples/Events/Conditions 三类观测；两层与平铺条件写法归一到同一级别并按严重度合并；`/probe` 设备模型；`MTConnectError` 文档；ISO-8859-1/latin-1/windows-1252 与 UTF-8 BOM 往返 |
+| `driver/mtconnect` | 一条 `/current` 覆盖多点的 `MultiRead`；单点 `UNAVAILABLE`→bad、ID 不存在/类型解析失败→address_error 都只写该点；条件级别即质量；多设备未选报地址错误并列可选设备；省略端口补 5000；拒绝凭据/query/fragment；`/probe` 404 退回 `/current`；文档上限 32 MiB；`/sample` count 越界报 `unsupported`；对接真实 sim 的集成测试 |
+| `sim/mtconnect` | 三轴 Agent；`/probe`/`/current`/`/sample` 序号窗口；两层条件渲染；`toolOffset` 初始 `UNAVAILABLE`；gzip 与子路径；七类故障注入各自独立 |
+| `cmd/uic` | `-id` 折参、CSV→索引；自检命令三入口（probe/current/sample） |
+
 ### 3.11 计算点（`computed`）
 
 

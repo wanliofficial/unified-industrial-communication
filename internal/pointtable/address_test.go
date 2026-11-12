@@ -1017,3 +1017,105 @@ func TestParseAddressIEC61850LeavesRefSyntaxToDriver(t *testing.T) {
 		}
 	}
 }
+
+// ---------------------------------------------------------------------------
+// MTConnect：数据项 ID 寻址
+// ---------------------------------------------------------------------------
+
+func TestPolicyForMTConnect(t *testing.T) {
+	p := PolicyFor("mtconnect")
+	if p.Width != WidthNone {
+		t.Fatalf("width = %v, want WidthNone (the data item's text + dataType decide)", p.Width)
+	}
+	if !p.AllowSymbol {
+		t.Fatalf("mtconnect must accept symbol addresses: %+v", p)
+	}
+	if p.AllowRegister || p.AllowObject || p.AllowFile || p.AllowComputed ||
+		p.AllowSelector || p.AllowDPT {
+		t.Fatalf("mtconnect accepts other address kinds: %+v", p)
+	}
+	if p.DIBits != 0 || p.DIField || p.AllowSymbolLength || p.SymbolIndexInPath {
+		t.Fatalf("mtconnect policy leaked DI/symbol-length flags: %+v", p)
+	}
+}
+
+func TestParseAddressMTConnect(t *testing.T) {
+	cases := []struct {
+		name string
+		expr string
+		dt   model.DataType
+		path string
+	}{
+		{"axis position", "Xabs", model.TypeFloat64, "Xabs"},
+		{"execution", "exec", model.TypeString, "exec"},
+		{"availability", "avail", model.TypeString, "avail"},
+		// 数据项 ID 允许点（Agent 侧的命名习惯），也允许下划线与连字符。
+		{"with underscore", "Sload", model.TypeFloat64, "Sload"},
+		// 前后空白由解析器吃掉。
+		{"padded", "  toolOffset  ", model.TypeString, "toolOffset"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			a, err := ParseAddress(tc.expr, tc.dt, "mtconnect")
+			if err != nil {
+				t.Fatalf("parse: %v", err)
+			}
+			if a.Kind != model.AddressSymbol || a.Path != tc.path {
+				t.Fatalf("address = %+v, want symbol %q", a, tc.path)
+			}
+			if a.Length != 0 {
+				t.Fatalf("length = %d, want 0", a.Length)
+			}
+			// 往返：Canonical 的文本必须能重新解析成同一个地址。
+			b, err := ParseAddress(a.Canonical(), tc.dt, "mtconnect")
+			if err != nil {
+				t.Fatalf("reparse %q: %v", a.Canonical(), err)
+			}
+			if b != a {
+				t.Fatalf("round trip: %+v != %+v", b, a)
+			}
+		})
+	}
+}
+
+func TestParseAddressMTConnectRejects(t *testing.T) {
+	cases := []struct {
+		name string
+		expr string
+		dt   model.DataType
+		hint int
+		want string
+	}{
+		// 宽度由数据项决定，length 列没有含义。
+		{"length column", "Xabs", model.TypeFloat64, 2, "length is only valid for register addresses"},
+		{"register", "holding:0", model.TypeUint16, 0, "does not accept register"},
+		{"object", "analogInput:1.presentValue", model.TypeFloat32, 0, "does not accept object"},
+		{"computed", "expr:Xabs", model.TypeFloat64, 0, "does not accept computed"},
+		{"empty", "   ", model.TypeString, 0, "address is required"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := ParseAddressWithLength(tc.expr, tc.dt, "mtconnect", tc.hint)
+			if err == nil {
+				t.Fatalf("expected an error for %q", tc.expr)
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("error = %v, want substring %q", err, tc.want)
+			}
+		})
+	}
+}
+
+// dataItemId 的结构知识（是不是合法 ID、Agent 侧到底有没有这个 id）属于
+// codec / 驱动，点表层只保证「是一个非空的符号地址」。
+func TestParseAddressMTConnectLeavesIDSyntaxToDriver(t *testing.T) {
+	for _, expr := range []string{
+		"Xabs",
+		"avail",
+		"system.1", // 带点：Agent 的命名习惯，驱动不拦
+	} {
+		if _, err := ParseAddress(expr, model.TypeFloat64, "mtconnect"); err != nil {
+			t.Fatalf("%q must parse at the point-table layer (the driver validates it): %v", expr, err)
+		}
+	}
+}

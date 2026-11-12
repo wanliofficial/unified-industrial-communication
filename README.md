@@ -977,6 +977,53 @@ ASCII，7 位数据位完全够用——「FINS 必须 8 位数据位」是错�
 错误信息分两层：信封层结束码（`0x13` FCS 错 / `0x14` 格式错 / `0x15` 数据错 / `0x18`
 帧长错，修一次永久消失）与 FINS 层结束码（越界、写保护等，与 FINS/TCP 同一张表）。
 
+MTConnect（机床数据采集，HTTP + XML，默认端口 5000）：
+
+```bash
+./uic sim -protocol mtconnect -listen 127.0.0.1:15000 &   # 内置 Agent（三轴加工中心）
+./uic -config examples/mtconnect.json
+curl -s -H 'Authorization: Bearer dev-token-0123456789' localhost:8097/api/v1/points
+#   13 点：avail/exec/program/mode（事件）、alm（报警条件）、
+#          Xabs/Yabs/Zabs、Xload、Sspeed/Sload、temp（采样）、toolOffset（初始 UNAVAILABLE）
+#   自检：./uic mtconnectread -addr 127.0.0.1:15000 -probe    # 列设备模型与数据项 ID
+#         ./uic mtconnectread -addr 127.0.0.1:15000 -current   # 整台当前快照
+#         ./uic mtconnectread -addr 127.0.0.1:15000 -id Xabs,exec
+#         ./uic mtconnectread -addr 127.0.0.1:15000 -sample -from 1 -count 20
+```
+
+MTConnect 是唯一「一条请求覆盖整台设备」的协议：`/current` 一次返回所有数据项的
+当前值，所以点位多少都不影响请求数（`MultiRead` 声明 `supported`）。点位用
+`kind=symbol`，`path` 是 Agent 的 `dataItemId`（如 `Xabs`），不是显示名。寻址不带
+宽度、不带下标、不带二级选择器——值有多宽由数据项文本与点表 `dataType` 决定。
+
+**单点问题不升级为链路错误**是这套驱动的核心取舍：`/current` 一条请求覆盖全设备，
+若把「某个点 `UNAVAILABLE`」「点表里的 ID 不存在」当成 `Read` 的错误返回，上层会按
+错误分类丢掉整条 HTTP 连接——一个本来就不可用的点会让整台设备每周期重连一次。因此
+`Read` 只在「文档拿不到 / 解析不了 / 设备选不出来」时返回错误；`UNAVAILABLE` 折成
+`bad` 质量、ID 不存在折成地址错误、文本按 `dataType` 解析失败折成地址错误，都只写进
+该点。`toolOffset` 初始即 `UNAVAILABLE`，用来验证「数据项存在但此刻无值」显示为坏
+质量而不是 0。
+
+值是文本，按 `dataType` 解释；`UNAVAILABLE` 是保留字（不是一个数）。条件（报警）是
+两层结构——外层元素是条件类型（`System`/`Actuator`…），内层 `Normal/Warning/Fault/
+Unavailable` 是级别——同时也兼容「元素名即级别、`type` 属性是条件类型」的平铺写法。
+条件点的值就是级别，级别即质量：`FAULT`→`bad`、`WARNING`→`uncertain`、`NORMAL`→`good`，
+同一 ID 多条条件按 `FAULT > WARNING > UNAVAILABLE > NORMAL` 合并。
+
+多设备 Agent（一条产线多台机床）必须显式选设备：`labels.deviceUuid` 优先，其次
+`labels.deviceName`；多台且未选就报地址错误并列出可选设备——否则「A 机床的 Xabs 覆盖
+B 机床的 Xabs」不会报错，只会让两台设备的坐标互相串。`Probe` 先 GET `/probe`，遇到
+404/405 退回 `/current`（裁剪版 Agent 可能只实现后者）；`/sample?from=&count=` 按序号
+翻历史窗口，`count` 上限 10000。
+
+地址规范化接受 `host:port`、`http://`、`https://`，省略端口一律 5000；支持反向代理的
+基址子路径（`http://host:5000/mtconnect`），拒绝 URL 内凭据、query、fragment。文档上限
+32 MiB，gzip 由 `net/http` 自动解压、按魔数兜底畸形响应；XML 按本地名匹配、忽略命名
+空间，兼容 ISO-8859-1/latin-1/windows-1252 与 UTF-8 BOM，不校验 MTConnect 版本。只读
+协议：`Write` 声明 `unsupported` 并对每项返回 `ErrUnsupported`（标准没有写数据项的
+服务）；`Subscribe`/`Browse`/`Discovery` 都标 `unsupported`——能解析 `/sample` 不等于
+能订阅，`/probe` 是一次性诊断而不是调度式浏览。
+
 ## 文档
 
 - **[docs/00-README.md](docs/00-README.md)** — 总索引：阅读路径、38 个参考方案总览、结论速查、代码地图、接口速查、实现边界
@@ -998,7 +1045,7 @@ go test -race -count=1 ./...
 
 | 路径 | 内容 |
 |---|---|
-| `cmd/uic/` | 单入口：`run` / `sim`（Modbus / S7 / OPC UA / MQTT / MC / FINS / Host Link / KNX / IEC 61850 / EtherNet-IP / BACnet-IP / IEC 104 / IEC 101 / Mewtocol / DNP3 / CoAP / 645 / 188 / SNMP / ADS / SECS）/ `mbread` / `mcread` / `finsread` / `hostlinkread` / `enipread` / `bacread` / `iec104read` / `iec101read` / `mewtocolread` / `dnp3read` / `coapread` / `knxread` / `iec61850read` / `dlt645read` / `cjt188read` / `snmpread` / `adsread` / `secsread` / `uaread` / `s7blocks` / `s7upload` / `instantiate` / `import` / `token` / `-check` / `version` |
+| `cmd/uic/` | 单入口：`run` / `sim`（Modbus / S7 / OPC UA / MQTT / MC / FINS / Host Link / KNX / IEC 61850 / EtherNet-IP / BACnet-IP / IEC 104 / IEC 101 / Mewtocol / DNP3 / CoAP / 645 / 188 / SNMP / ADS / SECS / MTConnect）/ `mbread` / `mcread` / `finsread` / `hostlinkread` / `enipread` / `bacread` / `iec104read` / `iec101read` / `mewtocolread` / `dnp3read` / `coapread` / `knxread` / `iec61850read` / `dlt645read` / `cjt188read` / `snmpread` / `adsread` / `secsread` / `mtconnectread` / `uaread` / `s7blocks` / `s7upload` / `instantiate` / `import` / `token` / `-check` / `version` |
 | `internal/model` | 通道 / 设备 / 点位 / 地址 / 采样 / 质量码 |
 | `internal/driver` | 驱动契约（Codec / Transport / Driver）、错误分类、注册表、只读 `Lookup` 注入 |
 | `internal/calc` | 零依赖表达式引擎（编译期类型检查、短路求值、引用 `device:point`） |
@@ -1054,6 +1101,9 @@ go test -race -count=1 ./...
 | `internal/codec/secs` | SECS 纯函数编解码（12 字节 HSMS 帧头 / 控制消息 / SECS-II 项编解码 / `MaxPayload` 上限 / SxFy 消息体语义） |
 | `internal/driver/secs` | HSMS 主站（Select 握手、SystemBytes 配对、按对象分组批量读、S2F15 写常数、Linktest 探活、自检 `Describe`/`RawRead`） |
 | `internal/sim/secs` | HSMS 内置设备（SVID/ECID 双编号空间 / Select 门控 / 常数写拒绝未知编号 / 事件与报警推送） |
+| `internal/codec/mtconnect` | MTConnect 纯函数编解码（按本地名匹配、忽略命名空间 / Header 序号与 nextSequence 补齐 / Samples、Events、Conditions 三类观测 / 两层与平铺条件写法与按严重度合并 / `/probe` 设备模型 / MTConnectError 文档 / ISO-8859-1、latin-1、windows-1252 与 UTF-8 BOM 字符集） |
+| `internal/driver/mtconnect` | MTConnect 主站（一条 `/current` 覆盖全设备、单点问题只降该点质量、`/probe` 失败退回 `/current`、多设备按 uuid/name 选择、基址子路径与 gzip、只读边界；自检 `ProbeDevices`、`Current`、`Sample`） |
+| `internal/sim/mtconnect` | MTConnect 内置 Agent（三轴加工中心 / `/probe`、`/current`、`/sample` 序号窗口 / 两层条件渲染 / `toolOffset` 初始 UNAVAILABLE / gzip 与子路径 / 七类故障注入） |
 | `internal/codec/mewtocol` | Mewtocol 纯函数编解码（ASCII 帧 / BCC 含 `%` / 站号十进制 / 接点编号「十进制字 + 十六进制位」/ RD/WD/RCC/WCC/RCS/RCP/WCS/WCP/RS/WS/RK/WK 组帧 / 字内低字节在前 / 错误码四类 / 流式收帧） |
 | `internal/driver/mewtocol` | Mewtocol 主站（区拆分与 24 字切分、T/C 按点读 RCS/RCP、布尔量 WCS 单点写、字区布尔量拒绝、站号与回显校验、串口/TCP 双承载） |
 | `internal/sim/mewtocol` | Mewtocol 内置从站（站位图 / 两套接点编号 / RCC 按字与 RCS/RCP 按点 / WCS/WCP / 错误码 / 站号过滤） |
