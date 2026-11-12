@@ -37,6 +37,7 @@ JsonTests.Register(tests);
 ObsTests.Register(tests);
 AuditTests.Register(tests);
 AuthTests.Register(tests);
+LimiterTests.Register(tests);
 LoopbackTests.Register(tests);
 S7CodecTests.Register(tests);
 S7LoopbackTests.Register(tests);

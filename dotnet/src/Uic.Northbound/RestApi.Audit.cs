@@ -208,6 +208,40 @@ public static partial class RestApi
     /// <summary>用例需要在同一进程里连续验证 401 审计；去重窗口会跨用例生效。</summary>
     internal static void ResetAuthFailureThrottleForTests() => AuthFailureSeen.Clear();
 
+    /// <summary>
+    /// 用例需要在同一进程里验证限流；两个限流器是静态的，配额与桶都会跨用例生效。
+    /// 不清理的话，某条用例刚打满的桶会带着「还剩 0 个令牌」进入下一条。
+    /// </summary>
+    internal static void ResetRateLimitersForTests()
+    {
+        ReadLimiter.Clear();
+        WriteLimiter.Clear();
+    }
+
+    /// <summary>
+    /// 换一套限流参数，返回 IDisposable 用于换回生产参数。
+    /// 只为「确定性地把配额打满」：100 次/秒的读配额在本地回环上跑不出一秒就过去了。
+    /// </summary>
+    internal static IDisposable UseTestRateLimiters(double readCapacity, double writeCapacity)
+    {
+        var originalRead = ReadLimiter;
+        var originalWrite = WriteLimiter;
+
+        ReadLimiter = new RateLimiter(readCapacity, readCapacity);
+        WriteLimiter = new RateLimiter(writeCapacity, writeCapacity);
+
+        return new Restore(() =>
+        {
+            ReadLimiter = originalRead;
+            WriteLimiter = originalWrite;
+        });
+    }
+
+    private sealed class Restore(Action action) : IDisposable
+    {
+        public void Dispose() => action();
+    }
+
     // ------------------------------------------------------------------
     // 授权失败
     // ------------------------------------------------------------------

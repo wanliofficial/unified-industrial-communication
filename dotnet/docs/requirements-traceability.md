@@ -12,8 +12,8 @@ PRD 中 M 级的采集协议已全部落地，FR-CFG-01 的四类寻址模型也
 可自动跑的用例（见 §7），唯一剩下的延期项是 object/file 寻址的实际驱动，
 见 [protocol-status.md](protocol-status.md) §4.1。
 
-当前测试基线：**316 passed / 0 failed / 3 skipped**（跳过的是需要 `--opcua` 的 OPC UA 端到端用例）；
-加 `-- --opcua` 跑全量是 **319 passed / 0 failed / 0 skipped**。
+当前测试基线：**323 passed / 0 failed / 3 skipped**（跳过的是需要 `--opcua` 的 OPC UA 端到端用例）；
+加 `-- --opcua` 跑全量是 **326 passed / 0 failed / 0 skipped**。
 
 ## 1. 采集（FR-COL）
 
@@ -61,7 +61,7 @@ PRD 中 M 级的采集协议已全部落地，FR-CFG-01 的四类寻址模型也
 | FR-RUN-05 | 熔断（连续失败降级 + 定期探活） | 已实现 | `DeviceActor` 状态机 + `ProbeInterval`；`engine/actor_reports_state_and_generation`。`address` 类错误不参与熔断（点表问题不该把设备判离线）：`engine/permanent_failure_is_not_retried` |
 | FR-RUN-06 | 代次隔离（旧结果丢弃） | 已实现 | `engine/actor_reports_state_and_generation`；`CollectOnceAsync` 逐样本比对代次 |
 | FR-RUN-07 | 质量码 ≥8 态 + 时间戳三分离 | 已实现 | 9 态 `Quality`；`Sample` 含 `DeviceTime`/`CollectedAt`/`AppliedAt`，见 `json/datavalue_wire_shape_is_stable` |
-| FR-RUN-08 | 单调时钟用于调度与超时 | 已实现 | `nextDue` 与等待都基于 `Stopwatch.GetTimestamp()` + `ScheduleMath`；NTP 校时/手工改钟不会推迟或提前采集。样本时间戳仍用墙上时钟：`schedule/monotonic_arithmetic`。同一原则贯彻到「走了多久」的度量：`/health` 的 uptime 用单调时钟，校时跳变不会让它凭空多出一小时：`schedule/uptime_ignores_a_clock_jump`；**写命令的去重窗口**也用单调时钟，否则一次校时前跳会让同一条命令再执行一遍（对一个写点位的命令就是重复物理动作）：`mqtt/command_dedup_ignores_clock_jump` |
+| FR-RUN-08 | 单调时钟用于调度与超时 | 已实现 | `nextDue` 与等待都基于 `Stopwatch.GetTimestamp()` + `ScheduleMath`；NTP 校时/手工改钟不会推迟或提前采集。样本时间戳仍用墙上时钟：`schedule/monotonic_arithmetic`。同一原则贯彻到「走了多久」的度量：`/health` 的 uptime 用单调时钟，校时跳变不会让它凭空多出一小时：`schedule/uptime_ignores_a_clock_jump`；**写命令的去重窗口**也用单调时钟，否则一次校时前跳会让同一条命令再执行一遍（对一个写点位的命令就是重复物理动作）：`mqtt/command_dedup_ignores_clock_jump`。限流桶的配额恢复与空闲清扫同样按单调时钟（前跳会让攻击者瞬间拿回全额配额，后跳会让正常客户端被永久 429）：`limits/wall_clock_jump_does_not_refill`、`limits/prune_drops_idle_buckets` |
 | FR-RUN-09 | 运行态与配置态分离 | 已实现 | `ConfiguredState` / `RuntimeState` 两套枚举，API 同时返回 |
 | FR-RUN-10 | 看门狗（采集心跳 + 资源水位降级） | 已实现 | 采集心跳：`DeviceStateWatcher` 检测「超过 max(10 周期, 30 s) 无新样本」并记 `uic_watchdog_stale_total`；恢复由 `DeviceActor` 的读超时与重连完成，进程级僵死交给外部 supervisor（NFR 故障矩阵）。资源水位：`ResourceMonitor` 按 `storage.minFreeBytes/resumeFreeBytes/maxMemoryBytes` 判定，磁盘告急时暂停文件日志与 journal、健康转 `degraded`、`problems` 标 `$resources`，恢复后自动重启；证据 `resources/disk_pressure_has_hysteresis`、`resources/memory_pressure_has_hysteresis`、`resources/unreadable_probe_is_not_pressure`、`resources/file_log_pauses_during_pressure`、`contract/resource_pressure_degrades_health` |
 | FR-RUN-11 | 优雅退出（停调度、flush 队列、关连接） | 已实现 | `GatewayRuntime.DisposeAsync` 先 flush（3 s）再发 `$death`；SIGTERM 由 Kestrel 的 `RunAsync` 触发生命周期 |

@@ -18,8 +18,11 @@ public static partial class RestApi
     public const string ApiVersion = "1";
     public const string SchemaVersion = "1";
 
-    private static readonly RateLimiter ReadLimiter = new(capacity: 100, refillPerSecond: 100);
-    private static readonly RateLimiter WriteLimiter = new(capacity: 10, refillPerSecond: 10);
+    // 可换（而不是 readonly）只为测试：100 次/秒的读配额在本地回环上很难在 1 秒内
+    // 确定性地打满，靠 sleep 等令牌恢复又会让用例变慢、还受机器负载影响。
+    // 生产只有下面这两处构造点，测试结束后必须换回来。
+    private static volatile RateLimiter ReadLimiter = new(capacity: 100, refillPerSecond: 100);
+    private static volatile RateLimiter WriteLimiter = new(capacity: 10, refillPerSecond: 10);
 
     /// <summary>写入幂等窗口：key → 首次响应。5 分钟足够覆盖「客户端超时重试」，又不会无限增长。</summary>
     private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, IdempotentResponse> Idempotency =

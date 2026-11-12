@@ -78,6 +78,7 @@ internal static class ContractTests
         tests.Add(new TestCase("contract/auth_users_require_manage", AuthUsersRequireManage));
         tests.Add(new TestCase("contract/auth_login_is_rate_limited", AuthLoginIsRateLimited));
         tests.Add(new TestCase("contract/auth_logout_revokes_session", AuthLogoutRevokesSession));
+        tests.Add(new TestCase("contract/rate_limit_returns_429_with_the_shared_code", RateLimitReturns429));
     }
 
     // ------------------------------------------------------------------
@@ -2084,6 +2085,54 @@ internal static class ContractTests
             using var body = await ReadJsonAsync(t, locked);
             t.Equal("request.rate_limited", body.RootElement.GetProperty("error")
                 .GetProperty("code").GetString(), "the error code is the contract's rate-limit code");
+        });
+    }
+
+    /// <summary>
+    /// 限流的端到端形状：走真实 Kestrel 中间件，确认「超配额 → 429 + 同一个 code」，
+    /// 并且读/写配额各算各的、非 <c>/api/</c> 路径不计数。
+    ///
+    /// 用可替换的限流器（容量 3）而不是打满 100 次/秒：后者在本地回环上一秒就跑完，
+    /// 结果完全取决于机器有多快。
+    /// </summary>
+    private static Task RateLimitReturns429(TestContext t)
+    {
+        return RunAsync(async () =>
+        {
+            RestApi.ResetRateLimitersForTests();
+
+            using var limiters = RestApi.UseTestRateLimiters(readCapacity: 3, writeCapacity: 3);
+            await using var host = await Host.StartAsync(t);
+
+            // 静态资源与探活路径不计配额：WASM 首屏会并行拉几百个程序集，
+            // 把它们算进读配额会让控制台在加载阶段就被自己打回 429。
+            for (var i = 0; i < 20; i++)
+            {
+                var probe = await host.Client.GetAsync("/healthz", t.Ct);
+                t.Equal(HttpStatusCode.OK, probe.StatusCode, "non-/api paths are not rate limited");
+            }
+
+            for (var i = 0; i < 3; i++)
+            {
+                var ok = await host.Client.GetAsync("/api/v1/version", t.Ct);
+                t.Equal(HttpStatusCode.OK, ok.StatusCode, $"read {i} is within the burst");
+            }
+
+            var limited = await host.Client.GetAsync("/api/v1/version", t.Ct);
+            t.Equal((HttpStatusCode)429, limited.StatusCode, "the read over the burst is a 429");
+
+            using var body = await ReadJsonAsync(t, limited);
+            t.Equal("request.rate_limited",
+                body.RootElement.GetProperty("error").GetProperty("code").GetString(),
+                "the limiter uses the same wire code as the login lockout");
+
+            // 写配额是另一个桶：读被打回 429 不代表写也被打回。
+            var write = await host.Client.SendAsync(
+                PostWith("/api/v1/auth/login",
+                    JsonSerializer.Serialize(new { username = "nobody", password = "nope" }), null), t.Ct);
+
+            t.Ok(write.StatusCode != (HttpStatusCode)429,
+                $"the write bucket is separate from the read bucket, got {(int)write.StatusCode}");
         });
     }
 

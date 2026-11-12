@@ -139,7 +139,8 @@ MQTT 的 TLS 是独立开关（`northbound.mqtt.tls`），语义见
 | 读（GET / HEAD） | 100 次/秒，突发 100 |
 | 写（POST / PUT / PATCH / DELETE） | 10 次/秒，突发 10 |
 
-超过返回 `429` + `request.too_many_requests`。
+超过返回 `429` + `request.rate_limited`（与登录锁定的 code 相同：调用方只写一套
+「我被限流了」的分支就够，不需要为两个 429 来源各判一次）。
 
 ### 错误信封
 
@@ -168,7 +169,7 @@ MQTT 的 TLS 是独立开关（`northbound.mqtt.tls`），语义见
 | 404 | `device.not_found` / `point.not_found` / `resource.not_found` / `user.not_found` | 找不到对象 |
 | 409 | `user.exists` / `user.last_admin` / `user.cannot_delete_self` | 账号重名、要停用或降级最后一个管理员、删除自己 |
 | 422 | `config.invalid` | 配置语法或语义非法，`details` 里是逐条问题 |
-| 429 | `request.too_many_requests` | 限流或 SSE 连接数超限 |
+| 429 | `request.rate_limited` | 限流、SSE 连接数超限、登录失败锁定（三者同一个 code） |
 | 500 | `internal.error` | 未预期异常 |
 
 响应头 `X-Request-Id` 会回显客户端传入的值（没传就生成一个），日志里也用同一个 id。
