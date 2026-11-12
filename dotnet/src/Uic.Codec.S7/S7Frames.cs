@@ -122,6 +122,13 @@ public readonly record struct S7Address(byte Area, int Db, int ByteOffset, int B
         if (address.Offset < 0)
             throw DriverException.Address(protocol, "encode", $"negative byte offset {address.Offset}");
 
+        // 线上地址字段是 3 字节的**位**偏移，上限 0xFFFFFF。超限后写帧时高字节被
+        // (byte) 截断，地址会绕回到另一处：点位质量仍是 good，读到的却是另一个变量。
+        const int maxByteOffset = 0xFFFFFF / 8;
+        if (address.Offset > maxByteOffset)
+            throw DriverException.Address(protocol, "encode",
+                $"byte offset {address.Offset} exceeds the S7 address field (max {maxByteOffset})");
+
         // S7 的位只有 0..7。平台层的 address.bit 允许到 15（Modbus 的 16 位字），
         // 直接把 8..15 当作 S7 位号会静默跳到下一个字节，读出错位的值。
         if (address.Bit > 7)

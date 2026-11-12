@@ -113,7 +113,7 @@
 | 会话 | COTP 连接请求/确认 → Setup Communication 协商 PDU；两者都在连接建立时完成，之后每个 Job 带 PDU 引用号 |
 | PDU 协商 | 请求 480，以 PLC 回应为准（240/480/960）。协商值决定**读请求自动切片**：请求项 12 字节 + 响应项 `4+data+偶对齐` 都计入预算 |
 | 区域 | `db<N>` / `i`(`e`) / `q`(`a`) / `m`(`merker`) / `l` / `p`(`pe`) / `c` / `t`；DB 号嵌在区名里 |
-| 寻址 | `address.offset` 是**字节偏移**（不是寄存器序号），`address.bit` 限 0..7；bool 点位必须带 bit |
+| 寻址 | `address.offset` 是**字节偏移**（不是寄存器序号），上限 2 097 151（3 字节位偏移字段）；`address.bit` 限 0..7；bool 点位必须带 bit |
 | 读写 | Read Var / Write Var，位访问用 BIT 传输尺寸（长度单位是位）；写输入区由 PLC 拒绝 |
 | 返回码 | `0x05` 越界 / `0x0A` 对象不存在 → `address_error`（不参与熔断）；`0x03` → `disabled`；其余 `bad` |
 | 数据类型 | 与 Modbus 共用 `Uic.Driver/ValueCodec.cs`：字节序四位、有/无符号 16/32/64、float32/64、bool、BCD16/32、string、bytes、定长数组 |

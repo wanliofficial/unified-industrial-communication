@@ -231,6 +231,9 @@ internal static class S7CodecTests
         t.Equal("DB12.DBX8.3", Parse("db12", 8, 3).Describe(), "bit addresses are described the way STEP 7 shows them");
         t.Equal("MB4", Parse("m", 4).Describe(), "byte addresses too");
 
+        // 边界本身必须合法：2 097 151 字节 + 第 7 位正好是 0xFFFFFF。
+        t.Equal(0xFFFFFF, Parse("db1", 2_097_151, 7).BitOffset, "the last addressable byte still fits the field");
+
         return Task.CompletedTask;
     }
 
@@ -256,6 +259,14 @@ internal static class S7CodecTests
         var symbol = t.Throws<DriverException>(
             () => S7Address.Parse(Address.Symbol("Motor.Speed")), "symbol addressing");
         t.Equal(ErrorKind.Unsupported, symbol.Kind, "symbol addressing is explicitly unsupported, not silently wrong");
+
+        // 线上地址字段是 3 字节的位偏移，最大 0xFFFFFF 位 = 2 097 151 字节。
+        // 超过后写帧时的 (byte) 截断会把地址绕回到另一处，点位质量仍然是 good，
+        // 读到的却是另一个变量的值——比直接报错难发现得多。
+        var tooFar = t.Throws<DriverException>(
+            () => S7Address.Parse(Address.Register("db1", 2_097_152)), "offset beyond the wire field");
+        t.Equal(ErrorKind.Address, tooFar.Kind, "an offset outside the address field is an address error");
+        t.Contains(tooFar.Message, "2097151", "the message names the largest byte offset");
 
         return Task.CompletedTask;
     }
