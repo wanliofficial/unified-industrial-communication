@@ -12,8 +12,8 @@ PRD 中 M 级的采集协议已全部落地，FR-CFG-01 的四类寻址模型也
 可自动跑的用例（见 §7），唯一剩下的延期项是 object/file 寻址的实际驱动，
 见 [protocol-status.md](protocol-status.md) §4.1。
 
-当前测试基线：**330 passed / 0 failed / 3 skipped**（跳过的是需要 `--opcua` 的 OPC UA 端到端用例）；
-加 `-- --opcua` 跑全量是 **333 passed / 0 failed / 0 skipped**。
+当前测试基线：**331 passed / 0 failed / 3 skipped**（跳过的是需要 `--opcua` 的 OPC UA 端到端用例）；
+加 `-- --opcua` 跑全量是 **334 passed / 0 failed / 0 skipped**。
 
 ## 1. 采集（FR-COL）
 
@@ -86,7 +86,7 @@ PRD 中 M 级的采集协议已全部落地，FR-CFG-01 的四类寻址模型也
 | FR-NOR-03 | SSE 实时推送（按订阅表达式） | 已实现 | `contract/*` 起真实 Kestrel；按 `device.point` / 通配过滤、质量过滤、心跳、50 路并发上限。已知边界：`_lastQuality` 记的是「历史上出现过的质量」，设备下线后不回收；因为只影响「质量是否变化」的判定，而删了又加回来时旧值恰巧就是正确的前值，不构成语义错误 |
 | FR-NOR-04 | MQTT 上报（Topic 模板、QoS、保留） | 已实现 | `mqtt/sink_renders_topic_and_injects_schema_version`、`mqtt/publish_qos1_waits_for_puback`、`mqtt/reconnect_republishes_birth_and_state`；设备下线时清 retained `$state` 且重连不再补发：`mqtt/forgets_removed_device_state`；`scripts/mqtt-interop.sh` 用真实 broker 验一遍 |
 | FR-NOR-05 | OPC UA 服务端 | 已实现 | `opcua/anonymous_session_read_write_subscribe`（需 `--opcua`） |
-| FR-NOR-06 | Outbox 持久补发（至少一次） | 已实现 | `outbox/advances_only_on_success`、`outbox/replays_after_restart`、`outbox/tolerates_a_torn_last_line`；`mqtt/command_*` 验证重连后的位点 |
+| FR-NOR-06 | Outbox 持久补发（至少一次） | 已实现 | `outbox/advances_only_on_success`、`outbox/replays_after_restart`、`outbox/tolerates_a_torn_last_line`；`outbox/compaction_does_not_reuse_ids` 钉住「压缩清空数据文件后发号器不得回退」；`mqtt/command_*` 验证重连后的位点 |
 | FR-NOR-07 | 北向多目标并行 | 已实现 | `Outbox` 按 sink 分区，一个分区失败不拖住其他分区：`outbox/partitions_are_independent` |
 | FR-NOR-08 | 历史查询（时间范围/降采样/分页） | 已实现 | `GET /api/v1/history` 从 journal NDJSON 两段式扫描：先按字节取「时间 + 设备 + 点位 + 序号」做过滤、去重与选桶，扫描结束后按文件偏移回读胜出行才做完整 JSON 解析。`from`/`to` 时间范围、`interval` 每点位每桶保留最后一条、`limit`+`cursor` 分页；按 `(device, point, seq)` 去重并跳过坏行。证据 `history/filters_by_time_and_identity`、`history/downsamples_each_point_per_bucket`、`history/downsamples_across_read_buffer_boundary`、`history/dedupes_redelivered_lines`、`history/skips_malformed_lines`、`history/handles_lines_across_read_buffer`、`history/falls_back_on_escaped_names`、`history/skips_impossible_calendar_dates`、`contract/history_query_reads_journal`。**性能达标**：本机 100 万行 / 152 MB 单文件，全范围 + `5m` 降采样约 1.0–1.3 s（PRD 目标 < 2 s），单设备 + `1m` 约 0.4 s，最近 30 分钟约 0.3 s；不降采样返回 100 万行约 5–8 s（受输出规模限制）。仍是全文扫描，没有时间索引；再上一个量级应换时序库，接口形状不变 |
 | FR-NOR-09 | Sparkplug B | 刻意没做（C） | Wave 2；可作为新的 MQTT sink 接入 |

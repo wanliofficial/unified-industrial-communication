@@ -268,6 +268,13 @@ public sealed class Outbox : IAsyncDisposable
                 long.TryParse(File.ReadAllText(_ackFile), NumberStyles.Integer, CultureInfo.InvariantCulture, out var acked))
             {
                 _acked = acked;
+                // 发号器的下界必须不低于「已确认位点 + 1」。压缩会在队列清空时把
+                // 数据文件整体重写为空，但位点文件保留着最后一条 id；若只看数据文件
+                // 里的记录来定下一号，清空之后就从 1 重新开始。重启加载时这些「新」
+                // 记录的 id 都 ≤ 位点，会被 rec.Id > _acked 判成早已投递的行而跳过——
+                // 调用方收到了受理、数据也落过盘，重启后却什么都不剩，且没有任何计数。
+                // 因此确认位点本身就是发号下界的来源之一。
+                _nextId = Math.Max(_nextId, _acked + 1);
             }
 
             if (!File.Exists(_dataFile)) return;

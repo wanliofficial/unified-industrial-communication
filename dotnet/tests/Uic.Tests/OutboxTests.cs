@@ -22,6 +22,7 @@ internal static class OutboxTests
         tests.Add(new TestCase("outbox/tolerates_a_torn_last_line", ToleratesTornLastLine));
         tests.Add(new TestCase("outbox/stats_report_pending_and_delivered", StatsReportPendingAndDelivered));
         tests.Add(new TestCase("outbox/disk_full_keeps_records_pending", DiskFullKeepsRecordsPending));
+        tests.Add(new TestCase("outbox/compaction_does_not_reuse_ids", CompactionDoesNotReuseIds));
     }
 
     /// <summary>可编程的投递目标：按脚本成功或失败，并记录每次拿到的批次。</summary>
@@ -306,6 +307,55 @@ internal static class OutboxTests
             t.Equal(2, lines.Length, "the journal has exactly the two records");
             t.Equal("j1", lines[0], "order is preserved");
             t.Equal("j2", lines[1], "order is preserved");
+        });
+    }
+
+    /// <summary>
+    /// 压缩过的分区在重启后必须继续往上发号。
+    ///
+    /// 压缩会把 <c>records.ndjson</c> 清空，而确认位点 <c>acked.id</c> 保留着。
+    /// 若发号器只从数据文件里的记录恢复，清空后它就从 1 重新开始；重启加载时
+    /// 这些「新」记录的 id 都小于等于已确认位点，会被当成早就投递过的行直接跳过——
+    /// <c>Enqueue</c> 明明成功写入磁盘，重启后却什么都不剩。
+    ///
+    /// 这是最糟的一类丢失：调用方收到了受理，数据也落过盘，却在重启时凭 id 被判死刑，
+    /// 没有任何错误或计数。所以发号器的下界必须同时考虑确认位点。
+    /// </summary>
+    private static Task CompactionDoesNotReuseIds(TestContext t)
+    {
+        return RunAsync(t, async () =>
+        {
+            var dir = t.TempDir;
+            var options = FastOptions() with { CompactThresholdBytes = 0 };
+
+            await using (var first = new OutboxQueue(dir, options))
+            {
+                var sink = new RecordingSink("journal");
+                first.RegisterSink(sink);
+
+                for (var i = 1; i <= 3; i++) first.Enqueue("journal", "r" + i);
+                await first.FlushAsync(t.Ct);
+
+                t.Equal(3L, sink.Delivered().Length, "the first three records are delivered");
+                t.Equal(0L, first.Stats().Pending, "the queue is empty");
+            }
+
+            // 压缩后数据文件为空、位点是 3。此时入队一条，然后模拟掉电（不 Flush）。
+            await using (var second = new OutboxQueue(dir, options))
+            {
+                second.Enqueue("journal", "after-compaction");
+            }
+
+            await using var third = new OutboxQueue(dir, options);
+            var replay = new RecordingSink("journal");
+            third.RegisterSink(replay);
+
+            t.Equal(1L, third.Stats().Pending,
+                "a record enqueued after compaction survives a restart");
+
+            await third.FlushAsync(t.Ct);
+            t.Equal("after-compaction", replay.Delivered()[0],
+                "the record is delivered instead of being filtered out as already-acked");
         });
     }
 
