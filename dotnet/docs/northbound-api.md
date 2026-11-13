@@ -22,6 +22,14 @@ Authorization: Bearer <token>
 
 以及所有非 `/api/` 的静态资源（否则 WASM 首屏拉不到程序集）。
 
+上面这些前缀判定**一律忽略大小写**，与 ASP.NET Core 的路由匹配保持一致。
+这一条不是多余的谨慎：路由本身不区分大小写，`/API/v1/devices` 会命中同一个端点；
+如果鉴权按大小写敏感判前缀，大写变体就会被当成「静态资源」直接放行——
+一次大小写改写就是完整的鉴权绕过，而这正是扫描器最先试探的路径。
+限流同理：按大小写敏感判前缀，改个大小写就等于免费拿到无限配额。
+用例 `contract/api_requires_bearer_token`（未认证 + 已认证两个方向）与
+`contract/rate_limit_returns_429_with_the_shared_code` 各钉一条。
+
 系统始终存在本地账号库（`data/security/users.json`），**没有「不配令牌就不鉴权」这条路径**：
 
 - 会话 Token：`POST /api/v1/auth/login` 用账号口令换取，12 小时有效，进程重启即失效；

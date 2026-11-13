@@ -66,7 +66,7 @@ public static partial class RestApi
                             "the initial password must be changed before using the API");
                     }
 
-                    if (path.StartsWith("/api/", StringComparison.Ordinal) && !IsAuthPath(path))
+                    if (IsApiPath(path) && !IsAuthPath(path))
                     {
                         // 默认拒绝：端点没声明权限就是配置错误，不能当作「公开」。
                         var required = http.GetEndpoint()?.Metadata.GetMetadata<RequirePermissionAttribute>();
@@ -156,17 +156,34 @@ public static partial class RestApi
     /// <summary>
     /// 无需认证的路径：存活/就绪/版本/指标/健康。这些端点是给探针与抓取器用的，
     /// 不含凭据，也不改变任何状态。登录本身当然不能要求先登录。
+    ///
+    /// 比较**必须**不区分大小写：ASP.NET Core 的路由匹配本身就不区分，
+    /// <c>/API/v1/devices</c> 会命中同一个端点。这里若按 Ordinal 判定，大写变体
+    /// 会被当成「非 /api/ 的静态资源」直接放行——一次大小写改写就是完整的鉴权绕过
+    /// （这是扫描器试探的第一条路径）。
     /// </summary>
     private static bool IsPublicPath(string path) =>
-        path is "/healthz" or "/readyz" or "/api/v1/version" or "/api/v1/metrics" or
-            "/api/v1/health" or "/api/v1/auth/login" ||
-        !path.StartsWith("/api/", StringComparison.Ordinal);
+        path.Equals("/healthz", StringComparison.OrdinalIgnoreCase) ||
+        path.Equals("/readyz", StringComparison.OrdinalIgnoreCase) ||
+        path.Equals("/api/v1/version", StringComparison.OrdinalIgnoreCase) ||
+        path.Equals("/api/v1/metrics", StringComparison.OrdinalIgnoreCase) ||
+        path.Equals("/api/v1/health", StringComparison.OrdinalIgnoreCase) ||
+        path.Equals("/api/v1/auth/login", StringComparison.OrdinalIgnoreCase) ||
+        !IsApiPath(path);
+
+    /// <summary>
+    /// 是否为需要鉴权/限流的 API 路径。与路由一致地忽略大小写，理由见 <see cref="IsPublicPath"/>。
+    /// </summary>
+    private static bool IsApiPath(string path)
+        => path.StartsWith("/api/", StringComparison.OrdinalIgnoreCase);
 
     private static bool IsAuthPath(string path)
-        => path.StartsWith("/api/v1/auth/", StringComparison.Ordinal);
+        => path.StartsWith("/api/v1/auth/", StringComparison.OrdinalIgnoreCase);
 
     private static bool IsPasswordChangePath(string path)
-        => path is "/api/v1/auth/me" or "/api/v1/auth/password" or "/api/v1/auth/logout";
+        => path.Equals("/api/v1/auth/me", StringComparison.OrdinalIgnoreCase) ||
+           path.Equals("/api/v1/auth/password", StringComparison.OrdinalIgnoreCase) ||
+           path.Equals("/api/v1/auth/logout", StringComparison.OrdinalIgnoreCase);
 
     /// <summary>
     /// 解析调用者。两条来源：配置里的静态 API Token（运维脚本，全权限、不过期）
@@ -215,7 +232,7 @@ public static partial class RestApi
         // 若把静态资源也算进读配额，控制台会在加载阶段就被自己打回 429
         // （浏览器那边表现为一堆 ERR_NETWORK_CHANGED，很难看出真实原因）。
         var path = http.Request.Path.Value ?? "/";
-        if (!path.StartsWith("/api/", StringComparison.Ordinal)) return true;
+        if (!IsApiPath(path)) return true;
 
         var ip = http.Connection.RemoteIpAddress?.ToString() ?? "unknown";
         var write = HttpMethods.IsPost(http.Request.Method) || HttpMethods.IsPut(http.Request.Method) ||

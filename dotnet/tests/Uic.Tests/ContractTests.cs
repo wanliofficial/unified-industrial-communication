@@ -650,6 +650,18 @@ internal static class ContractTests
 
             var authorized = await host.Client.SendAsync(Get("/api/v1/devices"), t.Ct);
             t.Equal(HttpStatusCode.OK, authorized.StatusCode, "the right token is accepted");
+
+            // 路由匹配不区分大小写，鉴权判定必须跟着不区分：
+            // 用大小写变体绕过鉴权是扫描器的第一条试探（/API/v1/devices）。
+            var upper = await host.Client.SendAsync(Get("/API/v1/devices", auth: false), t.Ct);
+            t.Equal(HttpStatusCode.Unauthorized, upper.StatusCode,
+                "a case-variant path must not skip authentication");
+
+            // 带令牌但权限不够时，大小写变体同样不能跳过权限检查。
+            // 只堵住「未认证」不够：权限判定也基于同一个路径前缀。
+            var upperWithToken = await host.Client.SendAsync(Get("/API/v1/devices"), t.Ct);
+            t.Equal(HttpStatusCode.OK, upperWithToken.StatusCode,
+                "a case-variant path with a valid token still works (routing is case-insensitive)");
         });
     }
 
@@ -2223,6 +2235,12 @@ internal static class ContractTests
 
             var limited = await host.Client.GetAsync("/api/v1/version", t.Ct);
             t.Equal((HttpStatusCode)429, limited.StatusCode, "the read over the burst is a 429");
+
+            // 大小写变体也必须计数：路由不区分大小写，限流若按 Ordinal 判前缀，
+            // 改个大小写就等于免费拿到无限配额。
+            var limitedUpper = await host.Client.GetAsync("/API/v1/version", t.Ct);
+            t.Equal((HttpStatusCode)429, limitedUpper.StatusCode,
+                "a case-variant path is not exempt from the rate limiter");
 
             using var body = await ReadJsonAsync(t, limited);
             t.Equal("request.rate_limited",
