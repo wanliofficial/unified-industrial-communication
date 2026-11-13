@@ -361,6 +361,20 @@ func PolicyFor(protocol string) AddressPolicy {
 		// structure），点表写 length 只会与应答冲突。selector / index /
 		// DPT 一律无意义：DLMS 没有「载荷字段」也没有「数据点类型」。
 		return AddressPolicy{Width: WidthNone, AllowSymbol: true}
+	case "sl651":
+		// 要素标识符寻址：附录 C 表 C.1 的引导符，写成 ASCII 简称（`Z`、
+		// `PT`、`VT`）或两位十六进制（`39`、`26`、`38`）。
+		//
+		// 为什么不接受 register:offset：SL 651 的报文是**要素信息组**，
+		// 每个要素自带「引导符 + 数据定义字节」说明自己是什么、多长，
+		// 没有「第 n 个字节」这种线性结构。数据定义字节由要素自身携带，
+		// 点表里写 length 只会与报文声明的宽度冲突；读错位不会报错，
+		// 只会把降水量记到水位上。
+		//
+		// 为什么允许符号地址：引导符是规约定义的**常量**（39H 永远是
+		// 瞬时河道水位），所以这里与 M-Bus/DLMS 同类——地址是名字，不是
+		// 算术。规律性强的点位（多站同构点表）由 labels.address 表达站号。
+		return AddressPolicy{Width: WidthNone, AllowSymbol: true}
 	}
 	// 未知协议：不拦地址种类（驱动可能在外部注册），但 length 必须显式，
 	// 避免用一个猜出来的宽度去读真实设备。

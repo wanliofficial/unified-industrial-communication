@@ -1,0 +1,124 @@
+{
+  "schemaVersion": 1,
+  "site": "sl651-lab",
+  "server": {
+    "listen": "127.0.0.1:8097",
+    "token": "dev-token-0123456789"
+  },
+  "storage": {
+    "dir": "./data-sl651",
+    "journal": true,
+    "outboxMaxRecords": 5000,
+    "outboxTtl": "10m"
+  },
+  "logging": {
+    "level": "info"
+  },
+  "northbound": {
+    "webhook": {
+      "enabled": false,
+      "url": "http://127.0.0.1:9999/ingest",
+      "timeout": "3s"
+    }
+  },
+  "channels": [
+    {
+      "id": "ch-sl651",
+      "protocol": "sl651",
+      "transport": {
+        "kind": "tcp",
+        "address": "127.0.0.1:4001"
+      },
+      "concurrency": 1,
+      "timeout": "5s"
+    }
+  ],
+  "devices": [
+    {
+      "id": "station31234567",
+      "name": "31234567 号河道站（内置 SL 651 遥测站）",
+      "channel": "ch-sl651",
+      "interval": "30s",
+      "timeout": "4s",
+      "enabled": true,
+      "labels": {
+        "address": "31234567",
+        "options": "retries=2,gap=30ms,center=1,password=1234"
+      },
+      "points": [
+        {
+          "id": "stage",
+          "name": "瞬时河道水位（要素 39H，N(7,3)，单位 m）",
+          "address": { "kind": "symbol", "path": "Z" },
+          "dataType": "float64",
+          "unit": "m",
+          "enabled": true
+        },
+        {
+          "id": "rain-1h",
+          "name": "1h 时段降水量（要素 1AH，N(5,1)，单位 mm）",
+          "address": { "kind": "symbol", "path": "P1" },
+          "dataType": "float64",
+          "unit": "mm",
+          "enabled": true
+        },
+        {
+          "id": "rain-total",
+          "name": "降水量累计值（要素 26H，N(6,1)，单位 mm）",
+          "address": { "kind": "symbol", "path": "PT" },
+          "dataType": "float64",
+          "unit": "mm",
+          "enabled": true
+        },
+        {
+          "id": "flow",
+          "name": "瞬时流量（要素 27H，N(9,3)，单位 m³/s）",
+          "address": { "kind": "symbol", "path": "Q" },
+          "dataType": "float64",
+          "unit": "m3/s",
+          "enabled": true
+        },
+        {
+          "id": "voltage",
+          "name": "电源电压（要素 38H，N(4,2)，单位 V；报文里独立编报，不在要素组内）",
+          "address": { "kind": "symbol", "path": "VT" },
+          "dataType": "float64",
+          "unit": "V",
+          "enabled": true
+        },
+        {
+          "id": "gate-1-stage",
+          "name": "取（排）水口水位 1（要素 3CH）——本从站整组缺测，用于验证缺测降级",
+          "address": { "kind": "symbol", "path": "Z1" },
+          "dataType": "float64",
+          "unit": "m",
+          "enabled": false
+        },
+        {
+          "id": "stage-hex",
+          "name": "同一要素用两位十六进制写法（39 = 0x39 = 瞬时河道水位）",
+          "address": { "kind": "symbol", "path": "39" },
+          "dataType": "float64",
+          "unit": "m",
+          "enabled": false
+        },
+        {
+          "id": "water-temp",
+          "name": "瞬时水温（要素 03H）——本从站不上送，用于验证「报文里没有该要素」的地址错误",
+          "address": { "kind": "symbol", "path": "C" },
+          "dataType": "float64",
+          "unit": "°C",
+          "enabled": false
+        },
+        {
+          "id": "soil-10cm",
+          "name": "10cm 土壤含水量（要素 10H）——本从站不上送",
+          "address": { "kind": "symbol", "path": "M10" },
+          "dataType": "float64",
+          "unit": "%",
+          "enabled": false
+        }
+      ]
+    }
+  ]
+}

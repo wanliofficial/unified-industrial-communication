@@ -59,6 +59,7 @@ import (
 	opcuadriver "uic/internal/driver/opcua"
 	"uic/internal/driver/s7"
 	secsdrv "uic/internal/driver/secs"
+	sl651drv "uic/internal/driver/sl651"
 	snmpdrv "uic/internal/driver/snmp"
 	"uic/internal/driver/virtual"
 	"uic/internal/history"
@@ -189,6 +190,7 @@ func RegisterBuiltins() error {
 			mtconndrv.New(),
 			mbusdrv.New(),
 			dlmsdrv.New(),
+			sl651drv.New(),
 		} {
 			if err := driver.Register(d); err != nil {
 				registerErr = err

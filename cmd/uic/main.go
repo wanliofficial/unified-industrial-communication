@@ -31,6 +31,8 @@
 //	uic sim -protocol secs -listen 127.0.0.1:5000  # 内置 HSMS 设备
 //	uic sim -protocol dlms -listen 127.0.0.1:4051 # 内置 DLMS/COSEM 电表（HDLC over TCP）
 //	uic dlmsread -addr 127.0.0.1:4051 -probe      # DLMS 自检（SNRM + AARQ 建链）
+//	uic sim -protocol sl651 -listen 127.0.0.1:4001 # 内置 SL 651 遥测站（水文，中心站侧查询）
+//	uic sl651read -addr 127.0.0.1:4001 -station 31234567 -probe  # SL 651 自检（37H 查询）
 //	uic sim -protocol iec61850 -listen 127.0.0.1:10202 # 内置 IEC 61850（MMS）IED
 //	uic sim -protocol knx -listen 127.0.0.1:13671  # 内置 KNXnet/IP 网关（UDP 3671）
 //	uic uaread -addr 127.0.0.1:4840 -nodes ns=2;s=site/dev/point  # OPC UA 读写自检
@@ -93,6 +95,7 @@ import (
 	mtconnetsim "uic/internal/sim/mtconnect"
 	sims7 "uic/internal/sim/s7"
 	secssim "uic/internal/sim/secs"
+	sl651sim "uic/internal/sim/sl651"
 	snmpsim "uic/internal/sim/snmp"
 )
 
@@ -148,6 +151,8 @@ func main() {
 		mbusreadCmd(args)
 	case "dlmsread":
 		dlmsreadCmd(args)
+	case "sl651read":
+		sl651readCmd(args)
 	case "snmpread":
 		snmpreadCmd(args)
 	case "mtconnectread":
@@ -185,7 +190,7 @@ func usage() {
 用法:
   uic [run] -config config.json [-listen :8080] [-token TOKEN]
   uic -check -config config.json
-  uic sim [-listen 127.0.0.1:15020] [-protocol modbus|s7|opcua|mqtt|mc|fins|hostlink|enip|bacnet|bacnet-mstp|iec104|iec101|mewtocol|dnp3|coap|knx|dlt645|cjt188|mbus|snmp|ads|secs]
+  uic sim [-listen 127.0.0.1:15020] [-protocol modbus|s7|opcua|mqtt|mc|fins|hostlink|enip|bacnet|bacnet-mstp|iec104|iec101|mewtocol|dnp3|coap|knx|dlt645|cjt188|mbus|dlms|sl651|snmp|ads|secs]
   uic mbread -addr 127.0.0.1:1502 -unit 1 -area holding -offset 0 -qty 2
   uic mbread -addr 127.0.0.1:1502 -area holding -offset 5 -write 777
   uic mcread -addr 127.0.0.1:5000 -area d -offset 100 -qty 2
@@ -244,6 +249,11 @@ func usage() {
   uic dlmsread -addr 127.0.0.1:4051 -obis 1.0.1.8.0.255,1.0.32.7.0.255:3:2
   uic dlmsread -addr 127.0.0.1:4051 -scan
   uic dlmsread -list
+  uic sim -protocol sl651 -listen 127.0.0.1:4001  # 内置 SL 651 遥测站（水文）
+  uic sl651read -addr 127.0.0.1:4001 -station 31234567 -probe
+  uic sl651read -addr 127.0.0.1:4001 -station 31234567
+  uic sl651read -addr 127.0.0.1:4001 -station 31234567 -points Z,PT,VT
+  uic sl651read -list
   uic snmpread -addr 127.0.0.1:16161 -oid 1.3.6.1.2.1.1.1.0,1.3.6.1.2.1.1.5.0 [-raw|-json]
   uic snmpread -addr 127.0.0.1:16161 -walk 1.3.6.1.2.1.1 -max-walk 16
   uic snmpread -addr 127.0.0.1:16161 -oid 1.3.6.1.2.1.1.6.0 -set lab-2 -setType string
@@ -575,7 +585,7 @@ func simCmd(args []string) {
 	fs := flag.NewFlagSet("sim", flag.ExitOnError)
 	addr := fs.String("listen", "127.0.0.1:15020", "监听地址")
 	size := fs.Int("size", 1024, "寄存器数量")
-	proto := fs.String("protocol", "modbus", "从站协议：modbus | s7 | opcua | mqtt | mc | fins | enip | bacnet | bacnet-mstp | iec104 | iec101 | mewtocol | hostlink | dnp3 | coap | knx | dlt645 | cjt188 | mbus | dlms | snmp | ads | secs | iec61850 | mtconnect")
+	proto := fs.String("protocol", "modbus", "从站协议：modbus | s7 | opcua | mqtt | mc | fins | enip | bacnet | bacnet-mstp | iec104 | iec101 | mewtocol | hostlink | dnp3 | coap | knx | dlt645 | cjt188 | mbus | dlms | sl651 | snmp | ads | secs | iec61850 | mtconnect")
 	pdu := fs.Int("pdu", 480, "S7 协商 PDU 长度（240/480/960）")
 	busAddr := fs.Int("busAddr", 1, "M-Bus：虚拟表计的主地址 0..250")
 
@@ -646,6 +656,9 @@ func simCmd(args []string) {
 	case "dlms":
 		simDLMS(*addr)
 		return
+	case "sl651":
+		simSL651(*addr)
+		return
 	case "snmp":
 		simSNMP(*addr, snmpsim.Options{
 			V3: simSNMPV3(*v3, *user, *authProto, *authPass, *privProto, *privPass),
@@ -665,7 +678,7 @@ func simCmd(args []string) {
 		return
 	case "modbus":
 	default:
-		fmt.Fprintf(os.Stderr, "未知协议 %q（支持 modbus | s7 | opcua | mqtt | mc | fins | enip | bacnet | bacnet-mstp | iec104 | iec101 | mewtocol | hostlink | dnp3 | coap | knx | dlt645 | cjt188 | mbus | dlms | snmp | ads | secs | iec61850 | mtconnect）\n", *proto)
+		fmt.Fprintf(os.Stderr, "未知协议 %q（支持 modbus | s7 | opcua | mqtt | mc | fins | enip | bacnet | bacnet-mstp | iec104 | iec101 | mewtocol | hostlink | dnp3 | coap | knx | dlt645 | cjt188 | mbus | dlms | sl651 | snmp | ads | secs | iec61850 | mtconnect）\n", *proto)
 		os.Exit(2)
 	}
 
@@ -1380,6 +1393,57 @@ func simDLMS(addr string) {
 	<-ctx.Done()
 	_ = srv.Close()
 	slog.Info("sim_stopped")
+}
+
+// simSL651 启动内置 SL 651 遥测站（水文监测数据通信规约）。
+//
+// 初始值与 examples/sl651.json 对应：一台河道站的定时报要素——瞬时水位
+// （Z）、1h 时段降水量（P1）、降水量累计值（PT）、瞬时流量（Q）、状态字
+// （ZT）、1h 内每 5min 时段雨量（DRP，批量 HEX）、取排水口水位 1（Z1，
+// 整组缺测），外加电源电压（VT）。要素值刻意覆盖了 BCD / HEX / 状态字 /
+// 缺测四种编码分支，自检一次就能验证编解码的主要路径。
+//
+// 默认监听 4001，与仓库里 M-Bus / IEC 101 的内置从站默认端口一致——都是
+// 「串口服务器透传」的常见端口。真实站点的端口由 DTU 决定，驱动不写死。
+//
+// 打印的说明刻意写出「本从站不模拟什么」（配置表、控制命令、图片报、
+// M3 多包），因为自检最容易被误读成"协议全部实现了"。
+func simSL651(addr string) {
+	srv, err := sl651sim.NewServer(addr)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "启动 SL 651 遥测站失败: %v\n", err)
+		os.Exit(1)
+	}
+	defer func() { _ = srv.Close() }()
+
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	st := srv.Station()
+	fmt.Printf("sl651 station slave listening on %s (站号 %s，中心站地址 1，密码 1234)\n",
+		srv.Addr(), bcdStation(st))
+	fmt.Println("  水位 Z=0.127m  时段雨量 P1=0.5mm  累计雨量 PT=123.4mm  流量 Q=1234.567m³/s")
+	fmt.Println("  状态字 ZT=0x00000001  5min 雨量 DRP=2.5/5.0/缺测…  取排水位 Z1=缺测  电压 VT=12.10V")
+	fmt.Println("  37H 查询全部 → 同形应答；38H 查询时段 → 同形应答；3AH 查询指定要素 → 只回点名要素")
+	fmt.Println("  不模拟：配置表（40~43H）、控制命令（4C~4FH）、图片报（36H）、M3 多包、ASCII 帧")
+	fmt.Println("  Ctrl+C 停止")
+	fmt.Printf("  自检：   uic sl651read -addr %s -station %s -probe\n", srv.Addr(), bcdStation(st))
+
+	<-ctx.Done()
+	_ = srv.Close()
+	slog.Info("sim_stopped")
+}
+
+// bcdStation 把 5 字节 BCD 站号转成可打印的十进制数（A5 为高位字节）。
+//
+// 单独写一个是因为 cmd 包不该依赖驱动包内部的 bcdToInt：这条命令只是
+// 打印提示，用 strconv 手工拼一次比引一个未导出函数更清楚。
+func bcdStation(addr [5]byte) string {
+	var n int64
+	for _, b := range addr {
+		n = n*100 + int64(b>>4)*10 + int64(b&0x0F)
+	}
+	return strconv.FormatInt(n, 10)
 }
 
 // simSNMP 启动内置 SNMP 代理（UDP）。

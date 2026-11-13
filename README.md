@@ -1211,6 +1211,94 @@ selective access 与分块写，半成品比不做更难排查，`Write` 诚实�
 配成 8E1 会收到全错位的字节——若驱动发现「有字节回来但一帧都没成」，会报协议错误并
 提示查波特率/校验位与终端电阻，而不是笼统报超时。
 
+水文遥测站 SL 651（《水文监测数据通信规约》SL 651—2014，中心站侧查询 + 应答）：
+
+```bash
+./uic sim -protocol sl651 -listen 127.0.0.1:4001 &   # 内置遥测站（站号 31234567）
+./uic -config examples/sl651.json
+curl -s -H 'Authorization: Bearer dev-token-0123456789' localhost:8097/api/v1/points
+#   9 点（5 启用）：瞬时水位 Z=0.127m、1h 时段雨量 P1=0.5mm、累计雨量 PT=123.4mm、
+#          瞬时流量 Q=1234.567m³/s、电源电压 VT=12.1V
+#          （另有 4 点是地址语法/缺测/地址错误的演示，默认不采集）
+#   只验链路：./uic sl651read -addr 127.0.0.1:4001 -station 31234567 -probe
+#   整帧要素：./uic sl651read -addr 127.0.0.1:4001 -station 31234567
+#   按点表读：./uic sl651read -addr 127.0.0.1:4001 -station 31234567 -points Z,PT,VT
+#   批量要素：./uic sl651read -addr 127.0.0.1:4001 -station 31234567 -points DRP,DRP[3]
+#   要素表：  ./uic sl651read -list
+#   串口实机：./uic sl651read -transport serial -port /dev/ttyUSB0 -baud 2400 -station 31234567
+```
+
+SL 651 与仓库里其它表计协议（645 / 188 / M-Bus / DLMS）的差别不在字段多少，而在三条
+「凭印象写就会当场错」的实现事实：
+
+**① 分帧不能扫标志字节。** 帧以 `7E 7E` 开头，但正文与 CRC 里可以合法出现 `0x7E`——
+本仓库的金向量第一帧正文首字节就是 `7E`。任何「读到 `0x7E` 就当帧尾」的写法都会把
+一帧切成两半。只能先读长度字段再按长度收，整帧 = **17 + 长度**。
+
+**② 长度字段数的是「报文起始符之后、结束符之前」的字节数**，不含 STX、不含 ETX/ETB、
+也不含 `7E 7E`；高 4 位是上下行标识（0000 上行 / 1000 下行），低 12 位才是长度。
+M3 多包时「包总数 + 包序号」那 3 字节**计入**长度（规约这么定，不是实现选择）。
+
+**③ CRC 是 CRC-16/MODBUS 变体，但结果不取反。** 初值 `FFFF`、右移、多项式 `A001`、
+**xorout 0000**，覆盖 `7E 7E` 起至结束符止，**高位字节在前**。仓库里其它协议多用
+X-25（结果取反）且低字节在前，照抄会得到 `3C51` 而不是 `C3AE`。链路维持报的完整金帧：
+
+```
+7E 7E 00 9876543210 1234 2F 0008 02 7E08221011100747 03 C3AE     (25 字节)
+                                               ↑ 正文首字节就是 7E
+```
+
+还有一条只看上行帧永远发现不了的差别：**上下行帧的地址字段顺序相反**（表 11 上行
+2=中心站/3=遥测站，表 12 下行 2=遥测站/3=中心站），而密码、功能码、长度字段的偏移
+不变。只做被动收包的实现看不出问题，一旦主动发查询就会把站号写进中心站字段。
+
+站号是 **5 字节 BCD，装 10 位十进制**。现场用的测站编码普遍是 8 位（如 `31234567`），
+所以驱动按 `0..9999999999` 校验而不是按「5 位数」——按 5 位卡会把合法站号判成配置错误。
+
+正文是**要素信息组**，不是固定偏移的寄存器：每个要素自带「引导符(1) + 数据定义字节(1)」，
+数据定义字节 = `(字节数 << 3) | 小数位数`。也就是说报文自己说明每个值有多宽、有几位
+小数，接收方不需要预先协商点表格式。附录 C 表 C.1 的 131 项可解释引导符（水位 Z、
+时段/累计雨量 P1/PT、流量 Q、电压 VT、闸位 GH、含水率 M10…）就是协议的数据模型本身，
+`internal/codec/sl651/tables.go` 把它写死在代码里——同一台终端送来的 `39H` 在任何工程
+里都是「瞬时河道水位、潮位」，做成配置项只会让同一份报文在不同站点解出不同含义。
+
+例外是「引导符类」：观测时间（`F0H`）、测站编码（`F1H`）、人工置数（`F2H`）、图片
+（`F3H`）、批量雨量/水位（`F4H..FCH`）的数据定义字节被规约**写死**成固定值，因此它们的
+宽度**不能**从高 5 位读出来——按高 5 位读会把「观测时间 5 字节」当成「30 字节」，
+当场错位。规约原文就是这么定的，不是可推导量。
+
+**DRP / DRZ 是最容易解错的一类。** `F4H`（1h 内每 5min 时段雨量）在报文里是**一个
+12 字节数据**，语义上却是 12 段 × 1 字节 5min 值；`F5H..FCH`（相对水位）是 24 字节 =
+12 段 × 2 字节。把它们当一个 HEX 整数解，会得到 `1844674407370955300` 这种溢出值——
+**不报错、值域看着像大数**，是最危险的一类错。本仓库用 `Guide.Slot` 显式声明段宽
+（DRP=1、DRZ=2），点表地址写成 `<要素>[<段号>]`（`DRP[0]`..`DRP[11]`，段号从 0 开始），
+段号只能用在批量要素上——`Z[1]` 会报地址错而不是让 `SlotNumber` 返回「越界」。
+
+DRP/DRZ/ZT 的数据是 **HEX 整数不是 BCD**：DRP 1 字节 × 0.1mm（`0x19` = 2.5mm），DRZ
+2 字节 × 0.01m（`0x01F4` = 500cm = 5.00m）。按 BCD 解 `0x01F4` 会得到 194，正好落在
+「看起来合理的 194cm」上——这类错值比报错难查得多，所以换算按引导符分派而不是按数据
+定义字节。ZT（遥测站状态及报警信息）是 4 字节 HEX 状态字，没有尺度，按原始 HEX 输出。
+
+缺测的表示是「与数据位数一样的 `F`」，不是 9999。驱动把它降级为 `quality=bad` 而不是
+报地址错误——规约允许某个时段没有数据；若当成 9999 解出来会直接污染数据库。
+
+查询侧：中心站发 `37H`（查询实时数据）/ `38H`（查询时段数据）/ `3AH`（查询指定
+要素），**应答沿用查询的功能码**（不是另有一套应答码）。这一点必须和「自报帧」分开判：
+`2F/30/31/32/33/34` 是遥测站主动上送，而 `37/38/3A` 既有下行查询也有上行应答，方向只能
+从长度字段高 4 位看。驱动的 read 路径按「一次查询取整帧全部要素」设计——37H 的应答与
+32H 定时报同形，逐点发 37H 不但慢，还会让同一设备的点位落在不同快照上。
+
+电压 `VT`（`38H`）在报文里**独立编报**，位于要素组之后，不是要素组的一项。codec 因此
+把它放在 `Report.Voltage` 而不是 `Report.Fields`——少这一处兜底，`VT` 点位会「永远读不
+到」，而 CRC 与其它要素都正常，极难发现。
+
+边界：只做中心站侧查询（`37H` / `38H` / `3AH`）与上行报文解析。不做 ASCII 字符编码帧
+（长度字段是 4 个 ASCII 字符、数值是文本，分帧/校验/宽度全不同，遇到返回
+`ErrUnsupported`）；不做 M3 多包重组（重组要会话状态机，本包只如实标出 ETB「后面还有
+包」）；不做配置表读写（`40H~43H`）、控制命令（`4CH~4FH`）、人工置数（`35H`）、图片报
+（`36H`）——这些是写/控制类，`Write` 声明 `unsupported`；不做 `FFXXH` 自定义扩展（`XX`
+的含义只有设备方知道，报 `ErrUnknownGuide`）。
+
 ## 文档
 
 - **[docs/00-README.md](docs/00-README.md)** — 总索引：阅读路径、38 个参考方案总览、结论速查、代码地图、接口速查、实现边界
@@ -1232,7 +1320,7 @@ go test -race -count=1 ./...
 
 | 路径 | 内容 |
 |---|---|
-| `cmd/uic/` | 单入口：`run` / `sim`（Modbus / S7 / OPC UA / MQTT / MC / FINS / Host Link / KNX / IEC 61850 / EtherNet-IP / BACnet-IP / BACnet MS/TP / IEC 104 / IEC 101 / Mewtocol / DNP3 / CoAP / 645 / 188 / M-Bus / SNMP / ADS / SECS / MTConnect / DLMS）/ `mbread` / `mcread` / `finsread` / `hostlinkread` / `enipread` / `bacread` / `mstpread` / `iec104read` / `iec101read` / `mewtocolread` / `dnp3read` / `coapread` / `knxread` / `iec61850read` / `dlt645read` / `cjt188read` / `mbusread` / `snmpread` / `adsread` / `secsread` / `mtconnectread` / `dlmsread` / `uaread` / `s7blocks` / `s7upload` / `instantiate` / `import` / `token` / `-check` / `version` |
+| `cmd/uic/` | 单入口：`run` / `sim`（Modbus / S7 / OPC UA / MQTT / MC / FINS / Host Link / KNX / IEC 61850 / EtherNet-IP / BACnet-IP / BACnet MS/TP / IEC 104 / IEC 101 / Mewtocol / DNP3 / CoAP / 645 / 188 / M-Bus / SNMP / ADS / SECS / MTConnect / DLMS / SL 651）/ `mbread` / `mcread` / `finsread` / `hostlinkread` / `enipread` / `bacread` / `mstpread` / `iec104read` / `iec101read` / `mewtocolread` / `dnp3read` / `coapread` / `knxread` / `iec61850read` / `dlt645read` / `cjt188read` / `mbusread` / `snmpread` / `adsread` / `secsread` / `mtconnectread` / `dlmsread` / `sl651read` / `uaread` / `s7blocks` / `s7upload` / `instantiate` / `import` / `token` / `-check` / `version` |
 | `internal/model` | 通道 / 设备 / 点位 / 地址 / 采样 / 质量码 |
 | `internal/driver` | 驱动契约（Codec / Transport / Driver）、错误分类、注册表、只读 `Lookup` 注入 |
 | `internal/calc` | 零依赖表达式引擎（编译期类型检查、短路求值、引用 `device:point`） |
@@ -1293,6 +1381,9 @@ go test -race -count=1 ./...
 | `internal/codec/dlms` | DLMS/COSEM 纯函数编解码（HDLC 类型 3 帧按长度字段定界、HCS/FCS 两段 CRC-16/X-25、1/2/4 字节 7 位地址域、LLC 头请求/应答区分、I/RR/RNR/U 帧控制域；A-XDR 全标签编解码含 `date_time` 12 字节布局与时区偏差；AARQ/AARE 的 BER 逐段解析、xDLMS-Initiate 协商、`Get-Request-Normal`/`Get-Response`（normal/datablock/list 三分支）、`data-access-result` 2 字节形态；OBIS 六段解析与 `SplitRef` 地址切分、内置常见对象表、COSEM 类号/单位枚举、`ApplyScaler` 单次乘除） |
 | `internal/driver/dlms` | DLMS/COSEM 主站（LN 引用 + 无安全 + HDLC；SNRM→AARQ→GET→DISC 四步建链与断链、I 帧序号维护、`<OBIS>[:class[:attr]]` 地址推导（查不到报 `ErrAddress` 不猜）、scaler 自动应用与进程内缓存、`data-access-result` 分类到 `ErrAddress`、坏帧归 `ErrProtocol` 并提示查波特率、链路错误缓存避免逐点等超时；自检 `Scan`、`Association`） |
 | `internal/sim/dlms` | DLMS 内置电表（三相表 40+ 项：电能/费率/瞬时量/表号/固件/厂商/时钟，值带 scaler_unit；SNRM/DISC 应答、AARQ 接受或拒绝、Get-Request 分派、未建关联读回 `read-write-denied`、对象未定义与类号不一致两种结果码、静默/坏校验/拒绝关联三种故障注入） |
+| `internal/codec/sl651` | SL 651 纯函数编解码（按长度字段分帧而非扫 `7E` / 长度字段语义与 `17+长度` / CRC-16/MODBUS 变体不取反且高位在前 / 上下行地址字段反序 / 附录 C 131 项引导符全表 / 引导符类固定宽度与固定定义字节 / 数据定义字节 `(字节数<<3)|小数位` / 批量要素 `Slot` 段宽与 `DRP[11]` 段寻址 / DRP·DRZ·ZT 按 HEX 解并填缺测而非 9999 / 均匀时段报 31H 与小时报 34H / 查询帧 37H·38H·3AH 构造 / ASCII 帧与 M3 多包显式拒绝） |
+| `internal/driver/sl651` | SL 651 中心站驱动（一次 37H 取整帧全部要素、应答沿用查询功能码、`<要素>` 与 `<要素>[<段号>]` 地址、`VT` 走 `Report.Voltage` 兜底、缺测降 `quality=bad`、坏帧计数区分「无字节」与「有字节不成帧」、链路错误缓存；自检 `Report`） |
+| `internal/sim/sl651` | SL 651 内置遥测站（7 要素覆盖 BCD/HEX/状态字/整组缺测四分支、37H·38H·3AH 分派、自报帧 2F·30·32·34、密码与站号过滤静默、坏校验注入、值可变） |
 | `internal/codec/secs` | SECS 纯函数编解码（12 字节 HSMS 帧头 / 控制消息 / SECS-II 项编解码 / `MaxPayload` 上限 / SxFy 消息体语义） |
 | `internal/driver/secs` | HSMS 主站（Select 握手、SystemBytes 配对、按对象分组批量读、S2F15 写常数、Linktest 探活、自检 `Describe`/`RawRead`） |
 | `internal/sim/secs` | HSMS 内置设备（SVID/ECID 双编号空间 / Select 门控 / 常数写拒绝未知编号 / 事件与报警推送） |
