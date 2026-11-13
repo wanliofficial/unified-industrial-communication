@@ -7,7 +7,8 @@ namespace Uic.Config;
 /// <summary>
 /// 脱敏占位符的还原。
 ///
-/// <c>GET /api/v1/config</c> 与默认导出会把 <c>token</c>/<c>password</c>/<c>secret</c>
+/// <c>GET /api/v1/config</c> 与默认导出会把凭据字段（见 <see cref="SecretKeys"/>：
+/// <c>token</c>/<c>password</c>/<c>secret</c>/<c>certificatePassword</c>）
 /// 替换成 <c>"***"</c>。客户端把读到的配置原样改一处再提交时，占位符必须还原成
 /// 当前值——否则一次与安全无关的编辑（比如加一台设备）会把 API 令牌改成字面量
 /// <c>"***"</c>，等于把所有人锁在门外。
@@ -19,10 +20,25 @@ public static class RedactedSecrets
 {
     public const string Placeholder = "***";
 
+    /// <summary>
+    /// 凭据字段的唯一清单。**读侧脱敏与写侧还原必须共用它**。
+    ///
+    /// 两份清单分开维护过一次，代价是：读接口漏了 <c>certificatePassword</c>
+    /// （key 名是组合词，不是字面 <c>password</c>），PFX 口令原样出现在
+    /// <c>GET /api/v1/config</c> 里；而因为还原侧同样漏了它，读到明文再原样提交
+    /// 也不会触发任何「占位符」分支——明文就被直接写进配置版本。
+    /// 两侧都漏等于没有任何一处报错，这类缺陷只能靠「清单只有一份」来防。
+    ///
+    /// 新增凭据字段时同时改这里和 <see cref="Secrets"/> 的三处调用；
+    /// 用例 <c>contract/every_credential_field_is_redacted</c> 会盯着读侧。
+    /// </summary>
     private static readonly HashSet<string> SecretKeys = new(StringComparer.Ordinal)
     {
-        "token", "password", "secret",
+        "token", "password", "secret", "certificatePassword",
     };
+
+    /// <summary>这个 key 名是否是凭据。脱敏侧按 key 名判定，与还原侧共用同一份清单。</summary>
+    public static bool IsSecretKey(string key) => SecretKeys.Contains(key);
 
     /// <summary>
     /// 返回还原后的 JSON 文本。当前配置未知、提交的是非法 JSON 或根不是对象时

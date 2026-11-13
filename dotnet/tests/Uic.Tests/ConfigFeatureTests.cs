@@ -981,11 +981,22 @@ internal static class ConfigFeatureTests
         node["northbound"]!["mqtt"]!["username"] = "mqtt-user";
         node["northbound"]!["mqtt"]!["password"] = "mqtt-secret";
 
+        // PFX 口令也是凭据：它的 key 是组合词，最容易在「按字面 password 匹配」的实现里漏掉。
+        node["northbound"]!["rest"]!["tls"] = new JsonObject
+        {
+            ["enabled"] = false,
+            ["certificateFile"] = "server.pfx",
+            ["certificatePassword"] = "pfx-secret",
+        };
+
         var current = ConfigStore.Parse(node.ToJsonString());
 
         var redacted = RestApi.Redact(current);
         t.Equal(RedactedSecrets.Placeholder, redacted["northbound"]!["rest"]!["token"]!.GetValue<string>(),
             "the read-back token is a placeholder");
+        t.Equal(RedactedSecrets.Placeholder,
+            redacted["northbound"]!["rest"]!["tls"]!["certificatePassword"]!.GetValue<string>(),
+            "the PFX password is a placeholder too");
 
         // 模拟控制台改一个与安全无关的字段，其余（含占位符）原样提交。
         redacted["devices"]![0]!["name"] = "改过的设备名";
@@ -995,6 +1006,10 @@ internal static class ConfigFeatureTests
 
         t.Equal("api-token", restored.Northbound.Rest.Token, "the API token is restored");
         t.Equal("mqtt-secret", restored.Northbound.Mqtt.Password, "the MQTT password is restored");
+        t.Equal("pfx-secret", restored.Northbound.Rest.Tls.CertificatePassword,
+            "the PFX password is restored instead of becoming a literal '***'");
+        t.Equal("server.pfx", restored.Northbound.Rest.Tls.CertificateFile,
+            "the certificate path is not treated as a credential");
         t.Equal("mqtt-user", restored.Northbound.Mqtt.Username, "non-secret fields are untouched");
         t.Equal("改过的设备名", restored.Devices[0].Name, "the intended edit survives");
 

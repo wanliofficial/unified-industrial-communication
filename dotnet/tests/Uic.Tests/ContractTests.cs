@@ -59,6 +59,7 @@ internal static class ContractTests
         tests.Add(new TestCase("contract/config_is_redacted", ConfigIsRedacted));
         tests.Add(new TestCase("contract/config_validate_reports_problems", ConfigValidateReportsProblems));
         tests.Add(new TestCase("contract/plaintext_credentials_are_rejected", PlaintextCredentialsAreRejected));
+        tests.Add(new TestCase("contract/every_credential_field_is_redacted", EveryCredentialFieldIsRedacted));
         tests.Add(new TestCase("contract/write_returns_per_point_results", WriteReturnsPerPointResults));
         tests.Add(new TestCase("contract/write_values_are_engineering_units", WriteValuesAreEngineeringUnits));
         tests.Add(new TestCase("contract/single_point_write_is_idempotent", SinglePointWriteIsIdempotent));
@@ -1047,6 +1048,121 @@ internal static class ContractTests
             // 语法错误走的是另一条路径（JSON 解析），必须是 422 而不是 500。
             var broken = await host.Client.SendAsync(Post("/api/v1/config/validate", "{ nope"), t.Ct);
             t.Equal((HttpStatusCode)422, broken.StatusCode, "malformed JSON is an unprocessable entity");
+        });
+    }
+
+    /// <summary>
+    /// 读接口必须把**每一个**凭据字段都替换成占位符，不能只认字面叫 `password` 的那个。
+    ///
+    /// `Secrets` 认定的凭据有三个：`rest.token`、`mqtt.password`、
+    /// `rest.tls.certificatePassword`。脱敏原本按 key 名精确匹配
+    /// `password`/`token`/`secret`，而 PFX 口令的 key 是 `certificatePassword`，
+    /// 于是它原样出现在 `GET /api/v1/config` 的响应里——运维投屏、诊断包、
+    /// 浏览器缓存都会带着它，而文档写的是「读接口统一显示 `***`」。
+    ///
+    /// 更要命的是它同时骗过了 `RedactedSecrets.Restore`：客户端读到明文再原样提交，
+    /// 就不需要「还原」，明文被直接写进配置版本。所以这一条得从读侧堵死。
+    /// 断言用「三个字段一起看」而不是逐个单测：只补 `certificatePassword` 一个特例，
+    /// 下次新增凭据字段还会漏，而这条用例会跟着 `Secrets` 的清单一起提醒。
+    /// </summary>
+    private static Task EveryCredentialFieldIsRedacted(TestContext t)
+    {
+        return RunAsync(async () =>
+        {
+            const string pfxVariable = "UIC_CONTRACT_PFX_PASSWORD";
+            const string mqttVariable = "UIC_CONTRACT_MQTT_PASSWORD";
+            const string pfxSecret = "pfx-super-secret";
+            const string mqttSecret = "mqtt-super-secret";
+
+            Environment.SetEnvironmentVariable(pfxVariable, pfxSecret);
+            Environment.SetEnvironmentVariable(mqttVariable, mqttSecret);
+
+            ConfigDocument WithCredentials()
+            {
+                var doc = BuildConfig();
+
+                return new ConfigDocument
+                {
+                    SchemaVersion = doc.SchemaVersion,
+                    Site = doc.Site,
+                    Description = doc.Description,
+                    Channels = doc.Channels,
+                    Devices = doc.Devices,
+                    Northbound = new NorthboundOptions
+                    {
+                        Rest = doc.Northbound.Rest with
+                        {
+                            Tls = new RestTlsOptions
+                            {
+                                // 只填引用、不真的开 TLS：这条用例验的是「读出来的形状」，
+                                // 与能不能握手无关，开 TLS 会额外引入证书依赖。
+                                Enabled = false,
+                                CertificateFile = "server.pfx",
+                                CertificatePassword = "${env:" + pfxVariable + "}",
+                            },
+                        },
+                        Mqtt = doc.Northbound.Mqtt with
+                        {
+                            Password = "${env:" + mqttVariable + "}",
+                            Username = "gateway",
+                        },
+                        OpcUa = doc.Northbound.OpcUa,
+                    },
+                    Storage = doc.Storage,
+                    Logging = doc.Logging,
+                };
+            }
+
+            await using var host = await Host.StartAsync(t, WithCredentials);
+
+            var response = await host.Client.SendAsync(Get("/api/v1/config"), t.Ct);
+            var raw = await response.Content.ReadAsStringAsync(t.Ct);
+
+            t.Equal(HttpStatusCode.OK, response.StatusCode, "the config is readable");
+
+            // 明文无论如何都不能出现在响应体里，这是最直接的那条断言。
+            t.Ok(!raw.Contains(pfxSecret, StringComparison.Ordinal),
+                "the PFX password must never appear in the config response");
+            t.Ok(!raw.Contains(mqttSecret, StringComparison.Ordinal),
+                "the MQTT password must never appear in the config response");
+
+            using var document = JsonDocument.Parse(raw);
+            var tls = document.RootElement.GetProperty("config")
+                .GetProperty("northbound").GetProperty("rest").GetProperty("tls");
+
+            t.Equal("***", tls.GetProperty("certificatePassword").GetString(),
+                "certificatePassword is a credential, so it is redacted like the others");
+
+            // 证书路径不是凭据，不能被顺手抹掉：抹掉了客户端就没法把配置改一处再提交。
+            t.Equal("server.pfx", tls.GetProperty("certificateFile").GetString(),
+                "the certificate path stays readable");
+
+            // diff 会展示字段值，凭据字段同样只能看到占位符。
+            var version = document.RootElement.GetProperty("version").GetString()!;
+            var edited = JsonNode.Parse(document.RootElement.GetProperty("config").GetRawText())!.AsObject();
+            edited["northbound"]!["rest"]!["tls"]!["certificatePassword"] = "${env:UIC_CONTRACT_PFX_ROTATED}";
+            Environment.SetEnvironmentVariable("UIC_CONTRACT_PFX_ROTATED", "pfx-rotated-secret");
+
+            using (var applied = await ReadJsonAsync(t, await host.Client.SendAsync(
+                       Post("/api/v1/config/apply", edited.ToJsonString()), t.Ct)))
+            {
+                t.Equal(true, applied.RootElement.GetProperty("applied").GetBoolean(),
+                    "the rotated reference applies");
+                t.Ok(!applied.RootElement.GetRawText().Contains("pfx-rotated-secret", StringComparison.Ordinal),
+                    "the apply response never carries the plaintext");
+            }
+
+            using var diff = await ReadJsonAsync(t, await host.Client.SendAsync(
+                Get($"/api/v1/config/diff?from={version}"), t.Ct));
+
+            var entry = diff.RootElement.GetProperty("entries").EnumerateArray()
+                .Single(e => e.GetProperty("path").GetString()
+                             == "northbound.rest.tls.certificatePassword");
+
+            t.Equal("***", entry.GetProperty("before").GetString(),
+                "the previous PFX password is not leaked through diff");
+            t.Equal("***", entry.GetProperty("after").GetString(),
+                "the new PFX password is not leaked through diff");
         });
     }
 

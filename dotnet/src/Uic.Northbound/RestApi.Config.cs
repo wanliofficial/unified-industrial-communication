@@ -281,7 +281,13 @@ public static partial class RestApi
         _ => null,
     };
 
-    /// <summary>脱敏：口令与 token 一律替换，配置本身照常可读。</summary>
+    /// <summary>
+    /// 脱敏：凭据一律替换，配置本身照常可读。
+    ///
+    /// 判定走 <see cref="RedactedSecrets.IsSecretKey"/> 而不是在这里再写一份 key 清单：
+    /// 脱敏侧和还原侧各维护一份清单时，`certificatePassword` 被两边同时漏掉，
+    /// 明文既会被读出去、又会被原样写回来，全程没有任何一处报错。
+    /// </summary>
     internal static JsonObject Redact(ConfigDocument config)
     {
         var node = JsonNode.Parse(JsonSerializer.Serialize(config, JsonDefaults.Options)) as JsonObject
@@ -298,9 +304,9 @@ public static partial class RestApi
             case JsonObject obj:
                 foreach (var key in obj.Select(kv => kv.Key).ToArray())
                 {
-                    if (key is "password" or "token" or "secret")
+                    if (RedactedSecrets.IsSecretKey(key))
                     {
-                        if (obj[key] is not null) obj[key] = "***";
+                        if (obj[key] is not null) obj[key] = RedactedSecrets.Placeholder;
                         continue;
                     }
                     RedactNode(obj[key]);

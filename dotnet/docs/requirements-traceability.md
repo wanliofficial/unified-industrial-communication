@@ -12,8 +12,8 @@ PRD 中 M 级的采集协议已全部落地，FR-CFG-01 的四类寻址模型也
 可自动跑的用例（见 §7），唯一剩下的延期项是 object/file 寻址的实际驱动，
 见 [protocol-status.md](protocol-status.md) §4.1。
 
-当前测试基线：**331 passed / 0 failed / 3 skipped**（跳过的是需要 `--opcua` 的 OPC UA 端到端用例）；
-加 `-- --opcua` 跑全量是 **334 passed / 0 failed / 0 skipped**。
+当前测试基线：**332 passed / 0 failed / 3 skipped**（跳过的是需要 `--opcua` 的 OPC UA 端到端用例）；
+加 `-- --opcua` 跑全量是 **335 passed / 0 failed / 0 skipped**。
 
 ## 1. 采集（FR-COL）
 
@@ -104,7 +104,7 @@ PRD 中 M 级的采集协议已全部落地，FR-CFG-01 的四类寻址模型也
 | FR-OPS-06 | 健康检查三级（live/ready/business） | 已实现 | `/healthz`、`/readyz`、`/api/v1/health`；`contract/health_and_version_are_public` |
 | FR-OPS-07 | 诊断包（脱敏配置 + 日志 + 指标 + 版本） | 已实现 | `GET /api/v1/diagnostics/bundle` 与命令 `diag.bundle` 共用 `DiagnosticsBundle.Build`；`mqtt/command_diag_bundle_is_whitelisted` |
 | FR-OPS-08 | 远程命令白名单 | 已实现 | `contract/*` 与 `mqtt/command_unknown_action_returns_error`、`mqtt/command_privileged_action_is_forbidden`；REST/MQTT 共用 `CommandExecutor` |
-| FR-OPS-09 | 凭据加密存储 | 已实现 | 凭据字段（`northbound.rest.token` / `northbound.mqtt.password`）只接受引用：`${env:NAME}`、`${file:PATH}`、`enc:v1:...`（AES-256-GCM，密钥来自 `UIC_SECRET_KEY` / `UIC_SECRET_KEY_FILE`）。明文在 `uic check`、启动、`config/validate`、`config/apply` 四处被拒并指出字段路径；落盘版本、diff、导出、诊断包与 `GET /api/v1/config` 只有引用或 `***`。`uic secret keygen|seal` 提供密钥与密封；`secret/*`（9 条）与 `contract/plaintext_credentials_are_rejected` 覆盖解析失败硬失败、篡改拒绝与明文拒绝 |
+| FR-OPS-09 | 凭据加密存储 | 已实现 | 凭据字段（`northbound.rest.token` / `northbound.mqtt.password` / `northbound.rest.tls.certificatePassword`）只接受引用：`${env:NAME}`、`${file:PATH}`、`enc:v1:...`（AES-256-GCM，密钥来自 `UIC_SECRET_KEY` / `UIC_SECRET_KEY_FILE`）。明文在 `uic check`、启动、`config/validate`、`config/apply` 四处被拒并指出字段路径；落盘版本、diff、导出、诊断包与 `GET /api/v1/config` 只有引用或 `***`。`uic secret keygen|seal` 提供密钥与密封；`secret/*`（9 条）与 `contract/plaintext_credentials_are_rejected` 覆盖解析失败硬失败、篡改拒绝与明文拒绝；`contract/every_credential_field_is_redacted` 断言三个凭据字段在 `GET /api/v1/config` 里**全部**变成 `***`（读侧脱敏与写侧还原共用同一份清单，`certificatePassword` 曾两侧同时漏掉） |
 | FR-OPS-10 | TLS（API 与北向） | 已实现 | REST：`northbound.rest.tls` 打开后 Kestrel 按 HTTPS 监听，证书支持 PFX（`certificateFile` + `certificatePassword`）与 PEM（`certificateFile` + `keyFile`），口令仍是凭据引用；装载失败按配置非法退出（码 2）。MQTT：`northbound.mqtt.tls` 用 `SslStream` 包裹连接，校验服务端证书链与主机名，自签 Broker 通过 `caFile` 走 `CustomRootTrust`，`insecureSkipVerify` 只能联调且启动告警。REST 的证书/监听变更需重启（热更新只告警），MQTT 的 TLS/CA 变更在 `config/apply` 重建客户端后生效。证据：`tls/*`（3 条配置与装载）、`contract/tls_rest_serves_https`、`mqtt/tls_publishes_over_custom_ca`、`mqtt/tls_rejects_untrusted_broker` |
 | FR-OPS-11 | 日志（结构化、分级、轮转） | 已实现 | 控制台 + 内存环形缓冲 + 可选 JSON 行文件日志：字段 `ts/level/category/msg/device/exception`，按 `logging.file.maxBytes` 轮转、保留 `retain` 份；支持热更新开关：`logs/json_line_fields_are_complete`、`logs/file_rotates_without_losing_lines`、`logs/retention_prunes_old_archives`、`logs/reconfigure_stops_writing` |
 

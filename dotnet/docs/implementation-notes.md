@@ -248,6 +248,17 @@
   `S7Read.BuildRequest` 是公开的编解码 API，不能依赖调用方一定切过片；
   这类「越界就截断、截断后看起来仍然成功」的写死上限是同一类缺陷
   （地址字段超过 3 字节时也一样）。用例 `s7/item_count_fits_in_one_byte`。
+- **凭据清单只能有一份，读侧脱敏与写侧还原必须共用它。** `RestApi.Redact` 原本按
+  key 名精确匹配 `password`/`token`/`secret`，而 `RedactedSecrets` 里有另一份同样的
+  清单。PFX 口令的 key 是组合词 `certificatePassword`，于是两侧同时漏掉：读接口把它
+  原样返回（运维投屏、诊断包、浏览器缓存都带着它，而文档写的是「读接口统一显示 `***`」），
+  客户端再原样提交时也不会命中「占位符还原」分支，明文被直接写进配置版本。
+  两份清单同时漏掉是一种特别难发现的形态——没有任何一处会报错，两侧还互相「印证」
+  了对方是对的。现在清单收在 `RedactedSecrets.SecretKeys`，脱敏侧通过
+  `IsSecretKey` 复用；`IsSecretPath`/`MaskIfSecret`（diff 用）本来就吃这份清单，一起修好。
+  用例 `contract/every_credential_field_is_redacted`（读、diff、apply 响应三处都验，
+  修复前 FAIL：`expected <"***">, got <"${env:UIC_CONTRACT_PFX_PASSWORD}">`）与
+  扩充后的 `config/redacted_secrets_are_restored`（还原不得把 `***` 写成字面量）。
 - **压缩之后发号器不能回退，否则重启会把新数据当旧数据丢掉。** `Partition.Load`
   原本只从 `records.ndjson` 里的记录推进 `_nextId`，完全不看 `acked.id`。而
   `CompactIfEmpty` 会在队列清空且文件超阈值时把数据文件重写成空文件（位点文件保留）。

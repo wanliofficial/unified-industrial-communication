@@ -629,6 +629,12 @@ printf '%s' '...' | uic secret seal  # 输出 enc:v1:...，把它填进配置
 里只有引用（读接口统一显示 `***`）；解析出的明文只存在进程内存中，`GET /api/v1/config`
 返回的 `***` 在提交时会被还原成原来的引用，而不是明文。
 
+「凭据」是一份**唯一清单**（`RedactedSecrets` 里的 `token` / `password` / `secret` /
+`certificatePassword`），读侧脱敏与写侧还原共用它。不要按「key 名里有没有 `password`」
+去猜：PFX 口令的 key 是组合词 `certificatePassword`，按字面匹配会两侧同时漏掉——
+明文既被读出去、又被原样写回来，全程没有一处报错。新增凭据字段时两处一起改，
+`contract/every_credential_field_is_redacted` 会盯着读侧。
+
 旧配置里的明文令牌仍能被**读**（为了迁移），但任何一条生效路径都会拒绝它。
 迁移方式：改成 `${env:...}` / `${file:...}`，或用 `uic secret seal` 加密。
 
