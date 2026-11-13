@@ -1,0 +1,204 @@
+{
+  "schemaVersion": 1,
+  "site": "dlms-lab",
+  "server": {
+    "listen": "127.0.0.1:8096",
+    "token": "dev-token-0123456789"
+  },
+  "storage": {
+    "dir": "./data-dlms",
+    "journal": true,
+    "outboxMaxRecords": 5000,
+    "outboxTtl": "10m"
+  },
+  "logging": {
+    "level": "info"
+  },
+  "northbound": {
+    "webhook": {
+      "enabled": false,
+      "url": "http://127.0.0.1:9999/ingest",
+      "timeout": "3s"
+    }
+  },
+  "channels": [
+    {
+      "id": "ch-dlms",
+      "protocol": "dlms",
+      "transport": {
+        "kind": "tcp",
+        "address": "127.0.0.1:4051"
+      },
+      "concurrency": 1,
+      "timeout": "5s"
+    }
+  ],
+  "devices": [
+    {
+      "id": "meter01",
+      "name": "一号电表（内置 DLMS/COSEM 从站，逻辑设备 1，客户端 16）",
+      "channel": "ch-dlms",
+      "interval": "5s",
+      "timeout": "4s",
+      "enabled": true,
+      "labels": {
+        "address": "1",
+        "options": "client=16,server=1,addr-size=1,retries=2,gap=20ms,max-pdu=512"
+      },
+      "points": [
+        {
+          "id": "energy-active-import",
+          "name": "正向有功电能（OBIS 1.0.1.8.0.255，class 3 Register，uint32）",
+          "address": { "kind": "symbol", "path": "1.0.1.8.0.255" },
+          "dataType": "float64",
+          "unit": "Wh",
+          "enabled": true
+        },
+        {
+          "id": "energy-active-export",
+          "name": "反向有功电能（OBIS 1.0.2.8.0.255）",
+          "address": { "kind": "symbol", "path": "1.0.2.8.0.255" },
+          "dataType": "float64",
+          "unit": "Wh",
+          "enabled": true
+        },
+        {
+          "id": "energy-reactive-import",
+          "name": "正向无功电能（OBIS 1.0.3.8.0.255）",
+          "address": { "kind": "symbol", "path": "1.0.3.8.0.255" },
+          "dataType": "float64",
+          "unit": "varh",
+          "enabled": true
+        },
+        {
+          "id": "voltage-a",
+          "name": "A 相电压（uint16 + scaler_unit，工程值 = 原始值 × 10^-1）",
+          "address": { "kind": "symbol", "path": "1.0.32.7.0.255" },
+          "dataType": "float64",
+          "unit": "V",
+          "enabled": true
+        },
+        {
+          "id": "voltage-b",
+          "name": "B 相电压（OBIS 1.0.52.7.0.255）",
+          "address": { "kind": "symbol", "path": "1.0.52.7.0.255" },
+          "dataType": "float64",
+          "unit": "V",
+          "enabled": true
+        },
+        {
+          "id": "voltage-c",
+          "name": "C 相电压（OBIS 1.0.72.7.0.255）",
+          "address": { "kind": "symbol", "path": "1.0.72.7.0.255" },
+          "dataType": "float64",
+          "unit": "V",
+          "enabled": true
+        },
+        {
+          "id": "current-a",
+          "name": "A 相电流（uint16 + scaler_unit，工程值 = 原始值 × 10^-2）",
+          "address": { "kind": "symbol", "path": "1.0.31.7.0.255" },
+          "dataType": "float64",
+          "unit": "A",
+          "enabled": true
+        },
+        {
+          "id": "current-b",
+          "name": "B 相电流（OBIS 1.0.51.7.0.255）",
+          "address": { "kind": "symbol", "path": "1.0.51.7.0.255" },
+          "dataType": "float64",
+          "unit": "A",
+          "enabled": true
+        },
+        {
+          "id": "current-c",
+          "name": "C 相电流（OBIS 1.0.71.7.0.255）",
+          "address": { "kind": "symbol", "path": "1.0.71.7.0.255" },
+          "dataType": "float64",
+          "unit": "A",
+          "enabled": true
+        },
+        {
+          "id": "power-active-total",
+          "name": "总有功功率（int32 + scaler_unit，注意带符号）",
+          "address": { "kind": "symbol", "path": "1.0.1.7.0.255" },
+          "dataType": "float64",
+          "unit": "W",
+          "enabled": true
+        },
+        {
+          "id": "power-factor",
+          "name": "功率因数（int16 + scaler_unit，无量纲）",
+          "address": { "kind": "symbol", "path": "1.0.13.7.0.255" },
+          "dataType": "float64",
+          "enabled": true
+        },
+        {
+          "id": "frequency",
+          "name": "电网频率（uint16 + scaler_unit，工程值 = 原始值 × 10^-2）",
+          "address": { "kind": "symbol", "path": "1.0.14.7.0.255" },
+          "dataType": "float64",
+          "unit": "Hz",
+          "enabled": true
+        },
+        {
+          "id": "meter-serial",
+          "name": "表号（OBIS 0.0.96.1.0.255，class 1 Data，octet-string）",
+          "address": { "kind": "symbol", "path": "0.0.96.1.0.255" },
+          "dataType": "string",
+          "enabled": true
+        },
+        {
+          "id": "firmware",
+          "name": "固件版本（OBIS 0.0.96.1.2.255，visible-string）",
+          "address": { "kind": "symbol", "path": "0.0.96.1.2.255" },
+          "dataType": "string",
+          "enabled": true
+        },
+        {
+          "id": "vendor",
+          "name": "厂商名称（OBIS 0.0.96.1.3.255，visible-string）",
+          "address": { "kind": "symbol", "path": "0.0.96.1.3.255" },
+          "dataType": "string",
+          "enabled": false
+        },
+        {
+          "id": "clock",
+          "name": "电表时钟（OBIS 0.0.1.0.0.255，class 8 Clock，date_time 12 字节）",
+          "address": { "kind": "symbol", "path": "0.0.1.0.0.255" },
+          "dataType": "string",
+          "enabled": false
+        },
+        {
+          "id": "voltage-a-logical-name",
+          "name": "A 相电压的 logical_name（attribute 1，octet-string 形态的 OBIS：01 00 20 07 00 FF）",
+          "address": { "kind": "symbol", "path": "1.0.32.7.0.255:3:1" },
+          "dataType": "string",
+          "enabled": false
+        },
+        {
+          "id": "voltage-a-scaler",
+          "name": "A 相电压的 scaler_unit（attribute 3，structure{integer, enum}；驱动用它把原始值换算成工程值）",
+          "address": { "kind": "symbol", "path": "1.0.32.7.0.255:3:3" },
+          "dataType": "string",
+          "enabled": false
+        },
+        {
+          "id": "extended-register-demo",
+          "name": "扩展寄存器寻址示例（class 4 ExtendedRegister；本从站没有该对象，示例说明地址语法）",
+          "address": { "kind": "symbol", "path": "1.0.1.8.0.255:4:2" },
+          "dataType": "float64",
+          "enabled": false
+        },
+        {
+          "id": "historical-block-demo",
+          "name": "历史块寻址示例（OBIS 第 6 段 = 历史块号；本从站只有 255=当前值，示例说明语法）",
+          "address": { "kind": "symbol", "path": "1.0.1.8.0.1" },
+          "dataType": "float64",
+          "unit": "Wh",
+          "enabled": false
+        }
+      ]
+    }
+  ]
+}

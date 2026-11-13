@@ -335,6 +335,32 @@ func PolicyFor(protocol string) AddressPolicy {
 		// 「读 4 个字节的 present-value」这种说法。BACnet/IP 与 MS/TP 共用
 		// 同一条策略，因为两者只差承载层，对象寻址完全一致。
 		return AddressPolicy{Width: WidthProtocol, AllowObject: true}
+	case "dlms":
+		// 对象属性寻址：OBIS 逻辑名 + 类号 + 属性号。
+		//
+		// 为什么用符号地址而不是 object/register：DLMS 的三层寻址里没有任何
+		// 一层是「线性偏移」。OBIS 是六个独立索引（介质/通道/物理量/费率/
+		// 存储号），既不是进制位也不能相加；类号决定这个 OBIS 落在哪个
+		// COSEM 对象上；属性号决定读对象的哪一项（value / scaler_unit /
+		// logical_name）。用 register:offset:length 表达会诱导人写
+		// 「OBIS 加 1 就是下一个费率」这种在协议里不存在的东西，而读错
+		// 地址不会报错，只会把费率 2 的电量记到费率 1 上。
+		//
+		// 语法：`<OBIS>` 或 `<OBIS>:<class>:<attribute>`。
+		//   `1.0.1.8.0.255`          类号与属性号从内置常见 OBIS 表推导
+		//   `1.0.1.8.1.255:3:2`      显式指定 class 3、attribute 2
+		//   `0-0-42-0-0-255:1:2`     标准连字符写法同样接受
+		//
+		// 为什么允许只写 OBIS：现场点表 90% 是标准对象，由驱动补全类号能
+		// 少写两列；但厂商私有对象（不在表里）**必须**显式给类号，否则
+		// 驱动报地址错误而不是猜一个类去读——猜错的表现是
+		// object-class-inconsistent(9)，比直接说"这个 OBIS 我不认识"难查。
+		//
+		// Width 用 WidthNone：值有多宽由 Get-Response 里的 A-XDR 标签决定
+		// （同一个 OBIS 可能返回 long-unsigned、double-long-unsigned，甚至
+		// structure），点表写 length 只会与应答冲突。selector / index /
+		// DPT 一律无意义：DLMS 没有「载荷字段」也没有「数据点类型」。
+		return AddressPolicy{Width: WidthNone, AllowSymbol: true}
 	}
 	// 未知协议：不拦地址种类（驱动可能在外部注册），但 length 必须显式，
 	// 避免用一个猜出来的宽度去读真实设备。

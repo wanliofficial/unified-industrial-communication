@@ -7283,6 +7283,411 @@ VIF 换算）三个注入点，测试只打开自己关心的那一个。
 | `pointtable` | `mbus` 走 `WidthNone + AllowSymbol`；`length`/`selector`/`index` 在导入期拒绝 |
 | `cmd/uic` | `parsePrimaryAddr`（253/255 的拒绝文案）、`parseScanRange`、`mbusRefs` 列拆分、`rowOf` 可粘贴地址 |
 
+### 3.10.26 DLMS/COSEM（IEC 62056：LN 引用 + 无安全，HDLC 三层承载）
+
+DLMS/COSEM 是电表行业的标准（IEC 62056 系列，对应 EN 13757-1 之外的欧洲电能表
+规范），也是一个**被三层协议叠起来**的协议族：
+
+```
+应用层   COSEM 对象模型 + xDLMS 服务（GET / SET / ACTION / EVENT）
+         A-XDR 编码（IEC 61334-6），APDU 由 AARQ/AARE 协商
+会话层   ACSE 关联（application-context + authentication + user-information）
+链路层   HDLC（IEC 62056-46）：类型 3 帧、HCS/FCS 两段 CRC、7 位地址域
+物理层   RS-485 / 光纤 / 串口服务器，8N1
+```
+
+它与前面所有协议的最大差别不是层数，而是**地址是标准固定的六段码**：`1.0.1.8.0.255`
+在任何厂商的表上都是正向有功电能。这一节讲的是这条事实带来的全部后果，以及三层叠加
+之后每一层各自最容易写错的那一处。
+
+#### 3.10.26.1 定位：LN 引用 + 无安全 + HDLC
+
+DLMS 有两条寻址路线、两种安全等级、两种承载封装。三条选择各自独立，但只有一种组合
+能做到「离线写出点表」，本驱动只做这一种：
+
+| 维度 | 选项 | 本驱动 | 理由 |
+|---|---|---|---|
+| 引用方式 | **LN**（logical name，6 字节 OBIS） | ✅ | 地址是标准固定的，点表可离线书写、跨表复用 |
+| | SN（short name，厂商分配的 1..2 字节编号） | ❌ | 编号由厂商在 `object_list` 里分配，同一 OBIS 在不同表上编号不同，必须先「发现再寻址」 |
+| 安全 | **Lowest Level Security**（无认证） | ✅ | 只需要建链 + 读，不涉及密钥分发 |
+| | HLS（High Level Security，口令挑战） | ❌ | 各厂商密钥分发方式不同，且需帧计数器 |
+| | GMAC（AES-GCM 加密 + 签名） | ❌ | 同上，另有帧计数器与密钥轮换 |
+| 承载 | **HDLC**（IEC 62056-46） | ✅ | 串口/RS-485 上最常见，TCP 串口服务器也走它 |
+| | COSEM wrapper（TCP/UDP，version + wrapper 头） | ❌ | 另一套封装，长度语义与 HDLC 完全不同 |
+
+**不做 SN 引用**的理由值得展开：SN 引用的地址是一个 `base_name + index` 的小整数，
+看起来比 6 字节 OBIS 简单。但它不是标准固定的——同一个 OBIS 在 A 厂表上可能是
+`0x0D 0x0A`，在 B 厂表上是 `0x21 0x00`。要用它必须先读 `object_list`
+（`0.0.40.0.0.255` 的 attribute 2），那是一个嵌套结构，逐条解出 class/version/OBIS，
+再在本地建立映射。也就是说 SN 引用必然带一套「先发现再寻址」的运行时模型，与「点表
+直接写地址、离线可审」的采集方式不兼容。半成品（只支持某些厂的 SN 编号）比不支持更
+难排查，因此这里直接不做，`Browse` 也诚实声明 `unsupported`。
+
+**不做 HLS/GMAC** 的理由同样是「区分故障」：加了认证之后，「密码错」与「地址错」
+在现场都表现为「建链失败」，而这两件事的处置方式完全不同（一个找运维要密钥，一个查
+点表）。不加安全时，建链失败的原因只可能是地址、波特率、线序——这三件事都能靠
+`-probe` 一次问清。
+
+**不做 TCP/UDP 的 COSEM wrapper**：wrapper 是另一套封装（`version=1` + `wrapper`
+头 + 长度字段语义全不同），实现它等于再写一套链路层，而现场串口服务器/DTU 绝大多数
+是 HDLC 透传。
+
+#### 3.10.26.2 HDLC 类型 3 帧：长度字段定界，两段 CRC
+
+```
+7E | A0 | LL | dest | src | ctl | [HCS] | [LLC | APDU] | [FCS] | 7E
+```
+
+`A0` 是格式字段的高字节：高 4 位是格式类型 3，bit11 是分段位，低 11 位是长度。
+长度字段**跨两字节**：`int(b[0]&0x07)<<8 | int(b[1])`。
+
+四处必须一次做对的地方：
+
+| 要点 | 事实 | 写错的症状 |
+|---|---|---|
+| **长度语义** | 长度 = **两标志之间全部字节数**，含 2 字节格式字段与末尾 FCS，**不含**标志；整帧 = `len(body)+2` | 少算 2 字节 → 接收方永远等不到结束标志，「第一帧之后就超时」 |
+| **HCS 覆盖范围** | HCS 覆盖 `format + dest + src + ctl`，因此**必须先算长度再算 HCS** | 先占位后回填 → 头校验与格式字段不一致，接收方判定「头校验失败」并丢弃整帧 |
+| **不做透明转义** | 类型 3 帧的 info 与 FCS 里**可以合法出现 `0x7E`** | 按标志扫帧尾 → 某些应答被切成两半，且只有特定数值才触发 |
+| **CRC 算法** | CRC-16/X-25：初值 `0xFFFF`、反射多项式 `0x8408`、结果取反、小端 | 用 CRC-16/CCITT-FALSE → 每个帧都差固定值 |
+
+长度字段的第二条推论是：**有 info 时 HCS 与 FCS 都在；无 info 时长度恒为 7**
+（格式 2 + 地址 2 + 控制 1 + FCS 2）。`SNRM` 的金帧 `7E A0 07 03 21 93 0F 01 7E`
+就是「无 info、HCS 与 FCS 合一」的形态——它只有 9 个字节，其中 2 个是校验序列
+（`HCS` 与 `FCS` 在无 info 时覆盖同一段字节，因此值相同）。
+
+「不做透明转义」这一条是本轮修出的真实 bug：最初的 `ParseRaw` 按 `0x7E` 找帧尾，
+在 `1.0.13.7.0.255` 的应答上失败——那个点的 FCS 恰好是 `7E 64`。改成按长度字段
+定界 + 校验结束标志之后通过，并且 `FrameLen` 同时接受「带起始标志」与「不带起始
+标志」两种视角（内部按偏移算，外部调用者不该被迫记住自己传没传标志）。
+
+CRC 的**固定余数**性质（把整帧含校验序列再算一遍，结果恒为 `0xF0B8`）是两个独立的
+校验点：`FCS(data)` 返回校验序列，`GoodFCS(frame)` 返回布尔。测试里两者都要锁：
+`FCS(A0 07 03 21 93)` 必须等于 `0F 01`，顺手改一个比特之后 `GoodFCS` 必须失效。
+
+#### 3.10.26.3 地址域与 LLC 头
+
+HDLC 地址域是**每字节 7 位 + 1 个扩展位**（bit0 = 1 表示最后一个字节），支持
+1/2/4 字节三种宽度：
+
+| 宽度 | 编码 | 客户端 | 服务端上限 |
+|---|---|---|---|
+| 1 字节 | `addr << 1 \| 1` | ✅ 恒 1 字节 | `0x7F` |
+| 2 字节 | 低 7 位 + 高 7 位 | — | `0x3FFF` |
+| 4 字节 | 「高 7 位组 + 低 7 位组」各左移一位 | — | `0x3FFFFFFF` |
+
+4 字节的编码最容易写反：正确的顺序是**先放高 7 位组、再放低 7 位组**
+（`48 68 FE FF` 表示两个 28 位地址），而不是「低字节先传」。具体是
+`(addr >> 21) & 0x7F`、`(addr >> 14) & 0x7F` … 每段左移一位并置扩展位。
+
+**客户端地址恒为 1 字节**（标准规定），服务端地址可以是 1/2/4 字节。两者宽度不必相同
+——这是地址域唯一允许不对称的地方，写反会让应答永远被地址过滤掉。
+
+LLC 头固定 3 字节：
+
+```
+E6 E6 00   请求（主站 → 表）
+E6 E7 00   应答（表 → 主站）
+```
+
+`E7` 是「这一帧是应答」的**唯一**信号。缺了它说明收到的是服务端主动上报
+（EventNotification / 数据块传输）——本驱动不做这两者，会明确报协议错，而不是把
+一段对不上号的字节当成 Get-Response 硬解。
+
+#### 3.10.26.4 应用层：AARQ/AARE 协商与 A-XDR
+
+建链两步，缺一不可：
+
+```
+SNRM → UA      HDLC 层进入正常响应模式（表才回 I 帧）
+AARQ → AARE    应用层关联（表才允许 GET）
+```
+
+少 `SNRM` 的症状是「AARQ 发出去表不回」（它还在断开模式里）；少 `AARQ` 的症状是
+「Get-Request 回 Data-Access-Result = read-write-denied 或直接被拒」。
+
+**U 帧控制域是固定常量，不携带可变的 P/F 位**。这一点极易写错：`UA = 0x63`，它的
+bit4 是 0；如果驱动按「请求带 P/F=1，则应答也必须 P/F=1」去校验，建链会永远等不到
+应答（或把合法的 UA 判成非法）。I 帧的 P/F 才是可变的（bit4），U 帧的 P/F 由常量
+自身决定。
+
+APDU 是 BER 编码的 ASN.1，user-information 里嵌 A-XDR：
+
+```
+AARQ = 60 <len> A1 09 <app-context OID> BE <len> 04 <len> <xDLMS-Initiate>
+AARE = 61 <len> A1 09 <app-context OID> A2 03 02 01 <result> A3 05 A1 03 02 01 <diag> BE ...
+```
+
+两个金向量（测试逐字节锁死）：
+
+```
+AARQ: 60 1D A1 09 06 07 60 85 74 05 08 01 01 BE 10 04 0E
+      01 00 00 00 06 5F 1F 04 00 00 7E 1F 04 B0
+AARE: 61 29 A1 09 06 07 60 85 74 05 08 01 01 A2 03 02 01 00
+      A3 05 A1 03 02 01 00 BE 10 04 0E 08 00 06 5F 1F 04 00 00 50 1F 01 F4 00 07
+```
+
+应用上下文 OID `60 85 74 05 08 01 01` 是 LN + 无安全；末位 `02` 是 SN 引用
+（本驱动不做，配置期拒绝）。
+
+`Conformance` 是 `[APPLICATION 31] IMPLICIT BIT STRING (SIZE(24))`，线上 3 字节
+大端，编码为 `5F 1F 04 00 <3 字节>`。位值是 `1 << (23 - bit)`（**位号从 0 数、
+从左往右**），因此：
+
+| 位 | 含义 | 掩码 |
+|---|---|---|
+| 3 | read | `1<<20` |
+| 4 | write | `1<<19` |
+| 8 | attribute0-set | `1<<15` |
+| 10 | attribute0-get | `1<<13` |
+| 11 | block-get | `1<<12` |
+| 14 | multiple-references | `1<<9` |
+| 19 | get | `1<<4` |
+| 20 | set | `1<<3` |
+| 21 | selective-access | `1<<2` |
+| 22 | event-notification | `1<<1` |
+| 23 | action | `1<<0` |
+
+驱动的 AARQ 只声明真正会用的两位：`get`（读属性）与 `attribute0-get`（读
+`object_list` 需要）。**`Probe` 打印的是协商后**的 conformance，不是请求的那份：
+标准允许服务端砍掉一半能力，按请求值判断会得出错误结论。实测内置从站回
+`00 20 10`（`attribute0-get | get`），AARE 里的 `0x00501F` **不含** `attribute0-get`
+——断言必须按应答值而不是请求值。
+
+A-XDR 标签表（IEC 62056-53 §8.6.4）：
+
+| 标签 | 类型 | 标签 | 类型 |
+|---|---|---|---|
+| `00` | null | `13` | compact-array |
+| `01` | array | `14` | long64 |
+| `02` | structure | `15` | long64-unsigned |
+| `03` | boolean | `16` | enum |
+| `04` | bit-string | `17` | float32 |
+| `05` | double-long（i32） | `18` | float64 |
+| `06` | double-long-unsigned（u32） | `19` | date_time（12B） |
+| `09` | octet-string | `1A` | date（5B） |
+| `0A` | visible-string | `1B` | time（4B） |
+| `0D` | bcd | `FF` | don't-care |
+| `0F` | integer（i8） | `10` | long（i16） |
+| `11` | unsigned（u8） | `12` | long-unsigned（u16） |
+
+`07`/`08`/`0B`/`0C`/`0E` 是**空号**——不认识的标签必须报错而不是跳过，否则一个
+标签读错会让后面整段数据结构错位成「合法但错误」的值。
+
+**`date_time` 的 12 字节布局是最容易错位的一处**（IEC 62056-62 §4.1.6.1）：
+
+```
+年(2) 月 日 星期 时 分 秒 百分秒(2) 偏差(2) 状态
+```
+
+注意**星期在日月之后、时分之前**。写错一位会把「日」当成「时」、「星期」当成
+「分」——解出来的时间看起来完全合法，只是全错。本轮就是这个 bug：最初按
+`年月日时分秒星期` 解，结果时钟点显示的时间与从站放的不一致。时区偏差是**带符号
+分钟**，`0x8000` 表示未指定（不能用 0 代替，0 意味着 UTC）。`date`（5 字节）是
+`年(2) 月 日 星期`，`time`（4 字节）是 `时 分 秒 百分秒`。
+
+#### 3.10.26.5 OBIS 与 `SplitRef`：唯一地址切分点
+
+点表地址（`kind=symbol`，`AddressPolicy{Width: WidthNone, AllowSymbol: true}`）是
+`<OBIS>[:<class>[:<attribute>]]`：
+
+| 写法 | 含义 |
+|---|---|
+| `1.0.1.8.0.255` | 按内置表推导（Register(3) / attribute 2） |
+| `1.0.1.8.0.255:3` | 显式类号，属性号默认 2（value） |
+| `1.0.1.8.0.255:3:3` | 显式类号与属性号（这里是 scaler_unit） |
+| `1-0:1-8-0-255:3:2` | 标准正文写法：OBIS 内部自带冒号 |
+
+**只写 OBIS 时类号与属性号从内置表推导，查不到就报 `ErrAddress` 而不是猜。** 猜错的
+类号会让表回 `object-class-inconsistent(9)`（这是一个**好**错误，明确指向类号错）；
+而「猜了一个看起来能读的类」会读到另一个对象的**合法数字**，数值一切正常，永远发现
+不了。`CommonObjects()` 里的 29 条是跨厂商一致的条目（电能、瞬时量、表号、逻辑设备
+名、时钟…），厂商私有扩展不在表内。
+
+OBIS 六段是**十进制**：`1.0.32.7.0.255` → `01 00 20 07 00 FF`。写成 `01 00 32 07
+00 FF` 是 50 号对象，不是 32——这个错误在十六进制与十进制之间来回换算时最容易发生，
+且读出来的是另一个真实对象的合法值。分隔符 `.`、`-`、`:`、空格都接受，但**段数必须
+恰为 6**。
+
+`SplitRef` 是**唯一**的地址切分点，驱动与自检命令都必须走它。原因不是「复用代码」，
+而是「标准正文写法 `1-0:1-8-0-255` 自带冒号」：如果按「最后一个冒号」切分，会把
+OBIS 内部的冒号当成类号分隔符；如果按「第一个冒号」切分，`1-0:1-8-0-255:3:2` 会被
+切成 `1-0` + `1-8-0-255:3:2`。正确做法是**枚举每个冒号位置，看前缀能不能解析成
+6 段 OBIS**，第一个能的位置就是切点。这条路只有一条，两边都走它，才不会出现
+「自检通过、采集失败」——那是最难查的一类问题。
+
+#### 3.10.26.6 scaler 与单位：一次乘除，不猜单位
+
+Register 家族（Class 3/4/5）的 attribute 2 是**原始整数**，attribute 3 是
+`structure { integer scaler, enum unit }`：
+
+```
+工程值 = 原始值 × 10^scaler          scaler 为负是除
+```
+
+驱动读完 attribute 2 之后再读一次 attribute 3 并应用，带**进程内缓存**
+（`c.scalers map[string]scalerEntry`，key = `class/obis`）。缓存的理由是：scaler 是
+对象的**静态配置参数**，不随测量值变化，而每轮每点多读一次会让往返数翻倍——在
+9600bps 的串口上这是十几秒与几十秒的差别。缓存失效面写在文档里：表在运行中被重新
+配置（改 register 的 scaler_unit）后，驱动不会自己发现，需要重连。
+
+`ApplyScaler` 必须**一次**乘除 `10^|scaler|`：
+
+```go
+p := 1.0
+for i := 0; i < abs(scaler); i++ { p *= 10 }
+if scaler > 0 { return raw * p }
+return raw / p
+```
+
+不能逐次乘 10（或乘 `math.Pow(10, -scaler)`）：`5001 / 10 / 10` 得到
+`50.010000000000005`，屏幕上就是一串尾数，写进时序库还会污染聚合值（求和/平均）。
+`math.Pow(10, -2)` 返回的是 `0.01` 这个**不精确的 double**，`5001 * 0.01` 同样得到
+`50.010000000000005`。本轮的第三个真实 bug 就是逐次除，自检时打印出
+`50.010000000000005 Hz`。现在驱动层有一条 `TestReadScaledValuesExact` 用五个点
+锁死「每一位都对」，比较用 `!=` 而不是近似。
+
+单位枚举只认标准表（IEC 62056-62 Annex A 的常用项）：
+
+| 码 | 单位 | 码 | 单位 |
+|---|---|---|---|
+| 26 | W | 32 | A |
+| 27 | V·A | 33 | C（库仑） |
+| 28 | var | 34 | V |
+| **29** | **Wh** | 35 | V/m |
+| **30** | **VAh** | 43 | Hz |
+| **31** | **varh** | 44 | 1/(Wh) |
+
+Wh = 29 这一条被写错过：sim 里三处电能点用了 30（VAh），自检显示「数值 12345678
+一切正常」但量纲是视在电能。**这类错误不会报错**，只会让报表里的电量口径全错，
+是最难发现的一类。`UnitName` 对未列出的码返回 `unit(N)` 而不是空串——空串会让自检
+表格少一列，而少一列比给错单位安全。
+
+#### 3.10.26.7 错误分类：三类「读不到」必须分开
+
+| 现象 | 诊断 | 错误类别 | 可重试 |
+|---|---|---|---|
+| 一个字节都没回来 | 波特率 / 线序 / 从站地址 / 表未上电 | `ErrTimeout` | ✅ |
+| 有字节回来，但一帧都没成 | 波特率/校验位配错（标准 8N1）、终端电阻缺失 | `ErrProtocol` + 排查提示 | ✅ |
+| 帧成了但 HCS/FCS 错 | 线路干扰 | `ErrProtocol` | ✅ |
+| `data-access-result` = object-undefined / class-inconsistent | **点表写错** | `ErrAddress` | ❌ |
+| `data-access-result` = read-write-denied / 未建关联 | 关联或权限问题 | `ErrPermission` | ❌ |
+| AARE `result != 0` | 应用关联被拒（上下文不支持 / 需认证） | `ErrProtocol` | ❌ |
+| 帧成了但 LLC 不是 `E7` | 收到服务端主动上报（本驱动不做） | `ErrProtocol` | ❌ |
+| 应答超过 max-PDU，走数据块 | 需调大 `max-pdu` | `ErrUnsupported` | ❌ |
+| 串口读/写本身失败 | 转换器掉线 | `ErrDisconnected` | ✅ |
+
+第二行与第三行的区分靠 `Reader.BadFrames()`：只有「确实像帧、但校验或结构不对」才
+计数，起始符之前的噪声不算（上电瞬态本来就会有几字节垃圾）。驱动在「有坏帧且从未
+收到好帧」时报 `ErrProtocol` 并**明确提示查波特率/校验位与终端电阻**，而不是笼统的
+超时——现场拿着「超时」去查线是白费时间。
+
+**`data-access-result` 归 `ErrAddress` 而不是 `ErrProtocol`** 是有意的：object-undefined
+与 object-class-inconsistent 都指向「点表写错了」，重试一万次也不会好。归到协议错会
+让调度器一直重试，而运维看到「协议错」会去查线路。
+
+链路级失败（超时/断连）会记住 `c.linkErr`，同一轮里剩下的点位直接整批标坏，不再逐点
+各等一次超时。单点失败（OBIS 写错、类号不匹配）**不**升级为链路失败：其它点位仍然
+读到了，说明链路是通的。
+
+#### 3.10.26.8 `data-access-result` 只有一种合法形态
+
+这是本轮第四个真实 bug，值得单独一节：
+
+在 A-XDR 里 `data-access-result` 是 `[1] IMPLICIT ENUMERATED`，**定长 8 位、无长度
+前缀**，线上只有两个字节：
+
+```
+01 <结果码>
+```
+
+不是 `01 01 <结果码>`。最初的实现按「带长度」编码，解析端又去「兼容两种形态」，结果
+在结果码为 `hardware-fault(1)` 时灾难性出错：
+
+```
+标准 hardware-fault:  01 01
+带长度的错误形态:     01 01 xx
+        ↑ 前两字节完全相同
+```
+
+「兼容」的结果是把所有 hardware-fault 读成「数据不完整」，于是硬件故障全部报成
+超时或协议错。修法是**只认标准形态，删掉兼容分支**：宁可让非标实现明确报错，也不要
+让标准实现在某一个结果码上静默错判。测试用 `hardware-fault(1)` 做向量正是为了锁住
+这个「前两字节相同」的陷阱。
+
+#### 3.10.26.9 配置与承载
+
+| 配置 | 含义 | 默认 |
+|---|---|---|
+| `device.labels.address` | 服务端逻辑设备地址，优先于 `options` 的 `server=`（能区分「地址就是 0」与「未配置」） | `1` |
+| `device.labels.options` | `client=16,server=1,addr-size=1,retries=2,gap=20ms,max-pdu=512` | 见左 |
+| `transport.kind` | `serial`（RS-485，走共享串口层总线锁）或 `tcp`（串口服务器/DTU 透传） | — |
+| `transport.baud` | 典型 `9600 8N1`，也有 `2400` / `19200` / `115200` | `9600` |
+| `transport.parity` | **必须 none**：IEC 62056-46 的 HDLC profile 是 8N1 | `none` |
+| `concurrency` | **必须为 1**：半双工总线由总线锁串行 | 1 |
+
+`client` 上限 `0x7F`（1 字节地址）、`server` 上限 `0x3FFF`（2 字节）；`addr-size`
+只能是 1/2/4，配成 3 在 `Open` 时就被拒（HDLC 没有 3 字节地址域）。越界或写错的
+关键字一律**忽略并保留默认**，而不是猜一个近似值——猜错的表现是「地址不对」，比
+「忽略了你的配置」更难查。
+
+`max-pdu` 范围 64..4096。表在应答超过 max-PDU 时**必然**走数据块传输，驱动能识别
+（解出 `last-block` 与 `block-number`）并报 `ErrUnsupported` + 提示调大到能装下该
+属性，但**不去拼块**——拼块要处理块号连续性、重传与超时重取，是一套独立状态机。
+
+半双工纪律与其它串口协议相同：**先 `Drain` 再 `SetDeadline` 再发送**。
+`link.tcpLink.Drain` 会把 deadline 临时压到 `now+1ms` 且不恢复，反序会让每次写都
+立刻超时。
+
+#### 3.10.26.10 自检与内置从站
+
+`uic dlmsread` 六个入口：
+
+```bash
+uic dlmsread -addr 127.0.0.1:4051 -probe                     # SNRM + AARQ，只验链路
+uic dlmsread -addr 127.0.0.1:4051                            # 默认 7 点
+uic dlmsread -addr 127.0.0.1:4051 -obis 1.0.1.8.0.255:3:2    # 指定地址
+uic dlmsread -addr 127.0.0.1:4051 -raw                       # 附 A-XDR 原始字节
+uic dlmsread -addr 127.0.0.1:4051 -scan                      # 试读内置 29 条常见表
+uic dlmsread -list                                           # 打印内置 OBIS 表
+uic dlmsread -transport serial -port /dev/ttyUSB0 -baud 9600 -address 1
+```
+
+`-scan` 不是「全表扫描」：真正的全表扫描必须读 `object_list`
+（`0.0.40.0.0.255` 的 attribute 2）并解嵌套结构，本驱动没有内置这套语义
+（`Browse` 声明 `unsupported`）。它只回答「库里的常见量这台表有没有」，并如实标注
+`✗` 与原因——现场拿到这份输出时，最想知道的就是「这张表到底有什么、为什么这个点读
+不出来」。
+
+`-probe` 打印三行（HDLC 地址 / ACSE 协商结果 / COSEM conformance），并明确写出
+「上面是服务端协商后的位块，不是本端请求的那份」。默认 7 点是电能、三相电压电流、
+总功率、功率因数、频率、表号——覆盖 uint32 / uint16+scaler / int16+scaler /
+octet-string 四种值形态。
+
+内置从站（`internal/sim/dlms`）是一块虚拟三相电表，40+ 项对象与
+`examples/dlms.json` 的 20 个点位一一对应（15 启用 + 5 个语法示例）。它刻意复现
+五件事：
+
+1. **未建关联就读回 `read-write-denied`**（而不是 DM 或不回）——自检能拿到明确原因；
+2. **对象未定义与类号不一致两种结果码分开**（后者用于验证 `ErrAddress` 的分类）；
+3. **坏校验只改 FCS 前一字节**、结构保持完好（验证主站真的靠校验序列发现问题，而不
+   是靠内容）；
+4. **地址不符完全沉默**（总线串扰时替别人应答会让主站张冠李戴）；
+5. **时钟点是固定 12 字节**（`2026-11-13T08:30:00`），不用它断言「当前时间」。
+
+`SetRejectAssociation` 让 AARE 带 `rejected-permanent`，用于验证「认证失败」的路径；
+`SetSilent` 用于验证超时路径。测试只打开自己关心的那一个，因为「同时坏两处」会让
+断言失去诊断力。
+
+#### 3.10.26.11 测试矩阵
+
+| 层 | 用例 |
+|---|---|
+| `codec/dlms` | `SNRM` 金帧 `7E A0 07 03 21 93 0F 01 7E`；`FCS(A0 07 03 21 93) == 0F 01` 与 `GoodFCS` 的固定余数 `0xF0B8`；长度字段跨两字节与 bit11 分段位；info 与 FCS 里出现 `0x7E` 时仍按长度定界（FCS `7E 64` 的回归）；截断 → `ErrIncomplete`、指针前移 1 字节重同步；1/2/4 字节地址域（含 `48 68 FE FF`）；LLC `E6 E6 00` vs `E6 E7 00`；I/RR/RNR/U 帧控制域与 `NS`/`NR` 回绕；AARQ/AARE 逐字节向量与拒绝诊断；conformance 位值与 `5F 1F 04 00` 编码；A-XDR 全标签（含 `0x07`/`0x0E` 空号必须报错）；`date_time` 12 字节布局（星期位置、`0x8000` 时区）与 `date`/`time`；`data-access-result` 只认 2 字节形态（用 `hardware-fault(1)` 锁「前两字节相同」的陷阱）；Get-Response 三分支（normal / datablock / list）；OBIS 十进制六段与 `.`/`-`/`:`/空格分隔；`SplitRef` 对 `1-0:1-8-0-255:3:2` 的切点；`ApplyScaler` 单次乘除（`50.01` 精确）；`UnitName`/`ClassName` 全扫 |
+| `driver/dlms` | 真实 TCP 回环：SNRM→AARQ→逐点 GET→DISC；`Probe` 复用已建关联；拒绝关联 → `ErrProtocol`；静默 → `ErrTimeout`；坏校验 → `ErrProtocol` 且文案含「坏帧」与波特率提示；`linkErr` 缓存后第二轮不再发包且立即返回；object-undefined → `ErrAddress`；类号不一致 → `ErrAddress`；分块 → `ErrUnsupported` 且提示调大 `max-pdu`；scaler 五个点逐位精确（`50.01`/`0.985`/`220.1`/`5.12`/`345.6`）；`Scan` 条数等于内置表条数且带 scaler_unit 文本；`Association` 采用服务端较小的 max-PDU；`Write`/`MultiRead`/`Browse` 逐项 `ErrUnsupported`；`parseOptions` 越界全忽略；`addressOf` 的 `labels.address` 优先级与 `addr-size=3` 拒绝；空 span 返回 `(nil, nil)`；关闭后所有入口 → `ErrDisconnected` |
+| `sim/dlms` | 默认对象表覆盖 40+ 项且 `examples/dlms.json` 能全部读到；AARQ 接受/拒绝两分支；未建关联读 → `read-write-denied`；对象未定义 / 类号不一致两种结果码；地址与客户端地址过滤静默；`SetSilent`/`SetBadChecksum`/`SetRejectAssociation`；`SetValue`/`Value` 的坏定位报错；TCP `acceptLoop`→`serveConn`→`tcpStream` 真实 socket 路径；`Close` 幂等且能清理连接；`isClosed` 对 `net.ErrClosed`/`io.EOF`/超时的分类 |
+| `pointtable` | `dlms` 走 `WidthNone + AllowSymbol`；`length`/`bit` 在导入期拒绝 |
+| `cmd/uic` | `dlmsSplitAddr` 走 `dl.SplitRef`（标准写法与只给 OBIS 两种）；`dlmsRefs` 列拆分；`dlmsRowOf` 的「可粘贴地址」带类号与属性号；默认 7 点列表 |
+
 ### 3.11 计算点（`computed`）
 
 

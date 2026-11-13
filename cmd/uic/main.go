@@ -29,6 +29,8 @@
 //	uic adsread -addr 127.0.0.1:48898 -probe   # ADS/AMS 自检（设备信息握手）
 //	uic secsread -addr 127.0.0.1:5000 -probe  # SECS/GEM 自检（HSMS Linktest）
 //	uic sim -protocol secs -listen 127.0.0.1:5000  # 内置 HSMS 设备
+//	uic sim -protocol dlms -listen 127.0.0.1:4051 # 内置 DLMS/COSEM 电表（HDLC over TCP）
+//	uic dlmsread -addr 127.0.0.1:4051 -probe      # DLMS 自检（SNRM + AARQ 建链）
 //	uic sim -protocol iec61850 -listen 127.0.0.1:10202 # 内置 IEC 61850（MMS）IED
 //	uic sim -protocol knx -listen 127.0.0.1:13671  # 内置 KNXnet/IP 网关（UDP 3671）
 //	uic uaread -addr 127.0.0.1:4840 -nodes ns=2;s=site/dev/point  # OPC UA 读写自检
@@ -73,6 +75,7 @@ import (
 	bacnetmstpsim "uic/internal/sim/bacnetmstp"
 	cjt188sim "uic/internal/sim/cjt188"
 	coapsim "uic/internal/sim/coap"
+	dlmssim "uic/internal/sim/dlms"
 	dlt645sim "uic/internal/sim/dlt645"
 	dnp3sim "uic/internal/sim/dnp3"
 	enipsim "uic/internal/sim/enip"
@@ -143,6 +146,8 @@ func main() {
 		cjt188readCmd(args)
 	case "mbusread":
 		mbusreadCmd(args)
+	case "dlmsread":
+		dlmsreadCmd(args)
 	case "snmpread":
 		snmpreadCmd(args)
 	case "mtconnectread":
@@ -234,6 +239,11 @@ func usage() {
   uic mbusread -addr 127.0.0.1:4001 -address 1 -records q:energy,q:volume,q:power-max
   uic mbusread -transport serial -port /dev/ttyUSB0 -baud 2400 -scan 1-20
   uic mbusread -transport serial -port /dev/ttyUSB0 -baud 2400 -address 5 -raw
+  uic dlmsread -addr 127.0.0.1:4051 -probe
+  uic dlmsread -addr 127.0.0.1:4051
+  uic dlmsread -addr 127.0.0.1:4051 -obis 1.0.1.8.0.255,1.0.32.7.0.255:3:2
+  uic dlmsread -addr 127.0.0.1:4051 -scan
+  uic dlmsread -list
   uic snmpread -addr 127.0.0.1:16161 -oid 1.3.6.1.2.1.1.1.0,1.3.6.1.2.1.1.5.0 [-raw|-json]
   uic snmpread -addr 127.0.0.1:16161 -walk 1.3.6.1.2.1.1 -max-walk 16
   uic snmpread -addr 127.0.0.1:16161 -oid 1.3.6.1.2.1.1.6.0 -set lab-2 -setType string
@@ -565,7 +575,7 @@ func simCmd(args []string) {
 	fs := flag.NewFlagSet("sim", flag.ExitOnError)
 	addr := fs.String("listen", "127.0.0.1:15020", "监听地址")
 	size := fs.Int("size", 1024, "寄存器数量")
-	proto := fs.String("protocol", "modbus", "从站协议：modbus | s7 | opcua | mqtt | mc | fins | enip | bacnet | bacnet-mstp | iec104 | iec101 | mewtocol | hostlink | dnp3 | coap | knx | dlt645 | cjt188 | mbus | snmp | ads | secs | iec61850 | mtconnect")
+	proto := fs.String("protocol", "modbus", "从站协议：modbus | s7 | opcua | mqtt | mc | fins | enip | bacnet | bacnet-mstp | iec104 | iec101 | mewtocol | hostlink | dnp3 | coap | knx | dlt645 | cjt188 | mbus | dlms | snmp | ads | secs | iec61850 | mtconnect")
 	pdu := fs.Int("pdu", 480, "S7 协商 PDU 长度（240/480/960）")
 	busAddr := fs.Int("busAddr", 1, "M-Bus：虚拟表计的主地址 0..250")
 
@@ -633,6 +643,9 @@ func simCmd(args []string) {
 	case "mbus":
 		simMBus(*addr, *busAddr)
 		return
+	case "dlms":
+		simDLMS(*addr)
+		return
 	case "snmp":
 		simSNMP(*addr, snmpsim.Options{
 			V3: simSNMPV3(*v3, *user, *authProto, *authPass, *privProto, *privPass),
@@ -652,7 +665,7 @@ func simCmd(args []string) {
 		return
 	case "modbus":
 	default:
-		fmt.Fprintf(os.Stderr, "未知协议 %q（支持 modbus | s7 | opcua | mqtt | mc | fins | enip | bacnet | bacnet-mstp | iec104 | iec101 | mewtocol | hostlink | dnp3 | coap | knx | dlt645 | cjt188 | mbus | snmp | ads | secs | iec61850 | mtconnect）\n", *proto)
+		fmt.Fprintf(os.Stderr, "未知协议 %q（支持 modbus | s7 | opcua | mqtt | mc | fins | enip | bacnet | bacnet-mstp | iec104 | iec101 | mewtocol | hostlink | dnp3 | coap | knx | dlt645 | cjt188 | mbus | dlms | snmp | ads | secs | iec61850 | mtconnect）\n", *proto)
 		os.Exit(2)
 	}
 
@@ -1325,6 +1338,43 @@ func simMBus(addr string, primary int) {
 	fmt.Println("  能量 12345678 Wh   累计量 456.789 m³   供水 90.5 °C   回水 56.1 °C")
 	fmt.Println("  瞬时流量 2.5 m³/h  瞬时功率 24.5 kW   运行时间 86400 s   结算日 2024-03-15")
 	fmt.Println("  SND_NKE → E5（清零 FCB）；REQ_UD2 → CI=72h 整表；同 FCB 重传回放上一帧")
+	fmt.Println("  Ctrl+C 停止")
+
+	<-ctx.Done()
+	_ = srv.Close()
+	slog.Info("sim_stopped")
+}
+
+// simDLMS 启动内置 DLMS/COSEM 虚拟电表（HDLC 三层承载 over TCP）。
+//
+// 初始值与 examples/dlms.json 对应：一台三相电表的常见对象——正向/反向
+// 有功电能（uint32）、三相电压/电流（uint16 + scaler=-1/-2）、总有功功率
+// （int32）、功率因数（int16）、电网频率（uint16 + scaler=-2）、表号与
+// 固件版本（octet-string / visible-string）、时钟（date_time），外加
+// 每个 Register 的 scaler_unit 与 logical_name。
+//
+// 监听 4051 而不是 4059：真实表的 TCP 端口由串口服务器/DTU 决定，驱动与
+// 示例都不写死端口，这里只是给开发机一个不会与其它内置从站冲突的默认值。
+//
+// 打印的说明刻意写出「本从站不模拟什么」（HLS/GMAC、SET/ACTION、分块读），
+// 因为自检最容易被误读成"协议全部实现了"。
+func simDLMS(addr string) {
+	srv, err := dlmssim.NewServer(addr)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "启动 DLMS 从站失败: %v\n", err)
+		os.Exit(1)
+	}
+	defer func() { _ = srv.Close() }()
+
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	fmt.Printf("dlms meter slave listening on %s (逻辑设备 1，客户端 16，地址域 1 字节)\n", srv.Addr())
+	fmt.Println("  电能 12345678 Wh   反向 234567 Wh   无功 987654 varh")
+	fmt.Println("  电压 220.1/219.8/220.5 V   电流 5.12/4.98/5.07 A   功率 345.6 W")
+	fmt.Println("  功率因数 0.985   频率 50.01 Hz   表号 12345678   固件 V1.0.4")
+	fmt.Println("  SNRM → UA；AARQ → AARE（LN + 无安全）；Get-Request → Get-Response")
+	fmt.Println("  不模拟：HLS/GMAC 认证、SET/ACTION、分块读")
 	fmt.Println("  Ctrl+C 停止")
 
 	<-ctx.Done()

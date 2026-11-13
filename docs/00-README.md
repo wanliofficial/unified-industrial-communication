@@ -34,11 +34,11 @@ cmd/ + internal/            可运行的最小骨架（不是伪代码，能采�
 
 ### 1.2 它不是什么
 
-- 不是协议库大杂烩。当前实现了 28 个驱动（Modbus TCP / RTU / ASCII 主站、S7、OPC UA、MQTT 南向订阅、
+- 不是协议库大杂烩。当前实现了 29 个驱动（Modbus TCP / RTU / ASCII 主站、S7、OPC UA、MQTT 南向订阅、
   MC 3E、FINS、Host Link FINS、EtherNet/IP CIP、BACnet/IP、BACnet MS/TP、IEC 60870-5-104、IEC 60870-5-101、Mewtocol、DNP3、CoAP、KNXnet/IP、IEC 61850（MMS）、DL/T 645、
-  CJ/T 188、M-Bus（EN 13757）、SNMP v1/v2c/v3、ADS/AMS、SECS/GEM、MTConnect、计算点、virtual），外加
-  Modbus 从站（TCP / RTU / ASCII）、二十三个内置模拟从站/Broker（Modbus TCP、S7、MC 3E、FINS、Host Link FINS、CIP、BACnet/IP、BACnet MS/TP、
-  IEC 104、IEC 101、Mewtocol、DNP3、CoAP、KNXnet/IP、IEC 61850、DL/T 645、CJ/T 188、M-Bus、SNMP v1/v2c、ADS/AMS、HSMS/SECS-II、MTConnect Agent、MQTT）与一个内置 OPC UA 服务端、一个零依赖报警引擎与一个有界历史采样日志；其余协议在
+  CJ/T 188、M-Bus（EN 13757）、DLMS/COSEM（IEC 62056）、SNMP v1/v2c/v3、ADS/AMS、SECS/GEM、MTConnect、计算点、virtual），外加
+  Modbus 从站（TCP / RTU / ASCII）、二十四个内置模拟从站/Broker（Modbus TCP、S7、MC 3E、FINS、Host Link FINS、CIP、BACnet/IP、BACnet MS/TP、
+  IEC 104、IEC 101、Mewtocol、DNP3、CoAP、KNXnet/IP、IEC 61850、DL/T 645、CJ/T 188、M-Bus、DLMS、SNMP v1/v2c、ADS/AMS、HSMS/SECS-II、MTConnect Agent、MQTT）与一个内置 OPC UA 服务端、一个零依赖报警引擎与一个有界历史采样日志；其余协议在
   `04-protocol-catalog.md` 里按工作量排了三波，没有假装已经支持。
   注意 MQTT 出现了两次且**互不相干**：北向是「网关把数据发出去」（sink），南向是「网关订阅别人发来的数据」（driver）。
 - 不是组态软件。不做画面、不做报表、不做自研时序库——理由见 `02-synthesis/01-capability-matrix.md` §6.4。
@@ -665,6 +665,89 @@ FCB 不变、跨轮才翻转**，从站据此回放上一次应答（访问号�
 承载支持 `serial`（真实 RS-485，走共享串口层总线级互斥）与 `tcp`（串口服务器/DTU
 透传，锁退化为每连接互斥）；两者分帧与命令序列完全相同，所以内置 TCP 从站能直接当
 自检目标。串口协议 `concurrency` 必须为 1。
+
+DLMS/COSEM 电表（IEC 62056-46/-53/-62，LN 逻辑名引用 + 无安全，HDLC 三层承载）：
+
+```bash
+./uic sim -protocol dlms -listen 127.0.0.1:4051 &   # 内置三相电表从站（逻辑设备 1，客户端 16）
+./uic -config examples/dlms.json
+curl -s -H 'Authorization: Bearer dev-token-0123456789' localhost:8095/api/v1/points
+#   20 点（15 启用）：正向/反向有功电能、无功电能、三相电压/电流、总功率、功率因数、
+#          频率、表号、逻辑设备名、固件版本、厂商、电表时钟（另 5 点是语法示例）
+#   只验链路：./uic dlmsread -addr 127.0.0.1:4051 -probe
+#   默认点表：./uic dlmsread -addr 127.0.0.1:4051
+#   指定 OBIS：./uic dlmsread -addr 127.0.0.1:4051 -obis 1.0.1.8.0.255:3:2
+#   试读全表：./uic dlmsread -addr 127.0.0.1:4051 -scan
+#   内置 OBIS 表：./uic dlmsread -list
+#   串口实机：./uic dlmsread -transport serial -port /dev/ttyUSB0 -baud 9600 -address 1
+```
+
+DLMS 是唯一「地址是标准固定的六段码」的协议：`1.0.1.8.0.255` 在任何厂商的表上都是
+正向有功电能。这是点表能离线书写、跨表复用的原因，也是本驱动只做 **LN 引用**的理由
+——SN（short name）引用要厂商在 `object_list` 里分配编号，同一个 OBIS 在不同表上编号
+不同，必须先「发现再寻址」，与「点表直接写地址」的模型不兼容。
+
+点表 `path` 是 `<OBIS>[:<class>[:<attribute>]]`。只写 OBIS 时类号与属性号从内置表推导；
+**查不到就报 `ErrAddress` 而不是猜**——猜错的类号会让表回 `object-class-inconsistent(9)`，
+而「猜了一个看起来能读的类」会读到另一个对象的合法数字，且数值一切正常。
+
+| 写法 | 含义 |
+|---|---|
+| `1.0.1.8.0.255` | 按内置表推导（Register(3) / attribute 2） |
+| `1.0.1.8.0.255:3` | 显式类号，属性号默认 2（value） |
+| `1.0.1.8.0.255:3:3` | 显式类号与属性号（这里是 scaler_unit） |
+| `1-0:1-8-0-255:3:2` | 标准正文写法：OBIS 内部自带冒号，必须能正确切分 |
+
+HDLC 承载有四件事必须一次做对：**① 长度字段是两标志之间的全部字节数**（含 2 字节格式
+字段与末尾 FCS，不含标志），整帧 = `len(body)+2`，11 位跨两字节且 bit11 是分段位；
+**② HCS 覆盖 `format+dest+src+ctl`**，所以必须先算长度再算 HCS——先占位后回填会让头
+校验与格式字段不一致，接收方判定「头校验失败」并丢弃整帧，症状是第一帧之后就超时；
+**③ 类型 3 帧不做透明转义**，`0x7E` 可以合法出现在 info 与 FCS 里，分帧必须按长度字段
+定界而不是扫标志——按标志扫会在某些应答上把一帧切成两半，而且只有特定数值才触发
+（本仓库用 `1.0.13.7.0.255` 的 FCS `7E 64` 做回归）；**④ 地址域是 7 位/字节 + 扩展位**，
+1/2/4 字节，客户端恒 1 字节，4 字节按「高 7 位组 + 低 7 位组」各左移一位。
+
+应用层是 A-XDR（IEC 61334-6）编码的 APDU。建链 `SNRM → UA`、`AARQ → AARE`，读
+`Get-Request-Normal → Get-Response-Normal`，断链 `DISC → UA`。`SNRM` 的金帧是
+`7E A0 07 03 21 93 0F 01 7E`，AARQ/AARE 的逐字节向量在测试里锁死。**U 帧控制域是固定
+常量、不携带可变的 P/F 位**（UA=0x63 的 bit4 为 0），要求往返保持 P/F 会让建链永远等
+不到应答。LLC 头 `E6 E6 00`（请求）/ `E6 E7 00`（应答），`E7` 是「这一帧是应答」的唯一
+信号；缺了它说明收到的是服务端主动上报（本驱动不做，报协议错）。
+
+**scaler 是 DLMS 最容易写错的一处**：Register 类（3/4/5）的 attribute 2 是原始整数，
+attribute 3 是 `structure {integer scaler, enum unit}`，工程值 = 原始值 × 10^scaler，
+**scaler 为负是除**。驱动读完 attribute 2 再读一次 attribute 3 并应用，带进程内缓存
+（scaler 是对象的静态配置参数，不会随测量值变化）。`ApplyScaler` 必须**一次**乘除
+`10^|scaler|`：逐次除 10 会累积舍入误差，`5001 / 10 / 10` 得到 `50.010000000000005`，
+屏幕上就是一串尾数且会污染聚合值。单位枚举同样只认标准表：**Wh = 29、VAh = 30、
+varh = 31**——写错不会报错，只会把电量标成「视在电能」，数值一切正常，最难发现。
+
+`data-access-result` 在 A-XDR 下是 `[1] IMPLICIT ENUMERATED`，定长 8 位、**无长度
+前缀**，线上只有 `01 <值>` 两个字节。不要「兼容」`01 01 xx` 那种带长度的写法：结果码为
+`hardware-fault(1)` 时两者前两字节完全相同，兼容会把它读成「数据不完整」，于是所有硬件
+故障都被报成超时。宁可只认标准形态，让非标实现明确报错。
+
+时间类型按 IEC 62056-62 §4.1.6.1 布局：`date_time` 12 字节是
+`年(2) 月 日 星期 时 分 秒 百分秒(2) 偏差(2) 状态`——**星期在日月之后、时分之前**，
+错一位会把日当时、星期当分。时区偏差是带符号分钟，`0x8000` 表示未指定。
+
+边界：只做 LN + 无安全（Lowest Level Security）+ HDLC 承载。不做 SN 引用；不做
+HLS/GMAC（密钥协商、帧计数器、AES-GCM 各厂商分发方式都不同，做了也只能覆盖一部分
+现场，却会把「密码错」与「地址错」混成同一类超时）；不做 TCP/UDP 的 COSEM wrapper
+（另一套 version + wrapper 头封装）；不做 Set/Action/EventNotification（写方向要处理
+selective access 与分块写，半成品比不做更难排查，`Write` 诚实声明 `unsupported`）；
+不做分块读——表在应答超过 max-PDU 时**必然**走数据块，驱动能识别并报 `ErrUnsupported`
+并提示调大 `max-pdu`，但不去拼块（拼块要处理块号连续性、重传与超时重取）。
+
+一条 `Get-Request` 只读**一个**属性，这是协议硬约束，所以一轮采集的往返数是点位数。
+标准里的批量机制 `get-request-with-list` 要求服务端声明 `multiple-references`（现场极少
+支持），因此 `MultiRead` 声明 `unsupported`——把「N 个点 = N 次往返」这个事实暴露给配置
+的人，比假装合并更负责任。300 个点挂 9600bps 串口，一轮要十几秒。
+
+`Probe` 打印的是**协商后**的 conformance，不是本端请求的那份：标准允许服务端砍掉一半
+能力，按请求值判断会得出错误结论。物理层固定 **8N1**（IEC 62056-46 的 HDLC profile），
+配成 8E1 会收到全错位的字节——若驱动发现「有字节回来但一帧都没成」，会报协议错误并提示
+查波特率/校验位与终端电阻，而不是笼统报超时。
 
 SNMP v1/v2c（交换机 / UPS / 服务器 / 带网管的仪表，UDP 161）：
 
@@ -1436,6 +1519,9 @@ obs  ← 所有包（不依赖任何内部包）
 | `internal/codec/mbus` | M-Bus（EN 13757-2/3）纯函数编解码（`E5` 单字符 / 短帧 / 长帧 / 控制帧四类分帧、`C+A+CI+DATA` 模 256 校验、双 `L` 一致性与整帧长 `L+6`、显式拒绝 `FDh` 次级地址；DIF/DIFE 与 VIF/VIFE 记录解析、整数/BCD/REAL/变长 LVAR、Type G/F/I 日期时间与无效位、固定数据结构、统一 VIF 表与幂次换算、`q:`/`r:` 反查与记录编码） | 无 I/O、无时钟、无可变状态；校验和**只覆盖** `C+A+CI+DATA`，不覆盖 L 与起止符（按整帧算会固定差 3）；长帧两个 `L` 必须相等、整帧长恒为 `L+6`；`0x68` 既是长帧头也是控制帧头，`E5` 只有 1 字节，扫描器必须能把它从粘包中单独切出；`FDh` 次级地址在编解码层直接拒绝（`ErrFrame`）；可变结构固定头恒 12 字节，少读一字节会让全部 VIF 错位；VIF 表按区间 + 幂次生成而不是手抄；时间无效位 → 文本 `(时间无效)`，不把 `0xFF` 解成 2159 年；`DIF=1Fh` 后续报文标志必须暴露 | 93.2% |
 | `internal/driver/mbus` | M-Bus 主站（SND_NKE 初始化、REQ_UD2 整表上送、FCB 跨轮翻转与同轮重放、失败后 NKE 复位再试、后续报文跟随上限、状态字降质量、`q:` 物理量寻址 + `r:` 逃生口、坏帧计数区分「无字节」与「有字节不成帧」；自检 `Table`） | 只做主地址 0..250 的单一主站轮询，251/253/254/255 配置期拒绝；`MultiRead` 声明 supported（一条 RSP_UD 覆盖整表，同报文内点位天然同快照）；同一轮重试**保持 FCB 不变**、跨轮才翻转（从站据此回放上次应答，访问号不累加）；读取失败后补发一次 `SND_NKE` 复位再重试；`Write`（SND_UD）声明 unsupported 并逐项返回 `ErrUnsupported`；状态字只有 bit0-1 非零才降质量为 uncertain（电源低/永久错误不影响读数可信度）；点表 `AddressPolicy{Width: WidthNone, AllowSymbol: true}`，`q:<物理量>[@存储号][/第几条]` 与 `r:<index>` 才算合法；`Reader.BadFrames()` 非零而好帧为零时报协议错并提示查波特率/校验位/终端电阻，而不是笼统超时；串口 `concurrency` 必须为 1 | 86.7% |
 | `internal/sim/mbus` | M-Bus 内置表计（虚拟热表 8 条记录 / FCB 重放不改访问号 / 访问号自增 / 地址过滤静默 / 校时与坏校验注入 / 静默模式 / 状态位与后续报文标志 / 值可变） | 与主站共用 codec/mbus；同一 FCB 重放回放上一次应答且**不增加访问号**（这是「同轮重传不重复读数」唯一可测的方式）；地址不符完全沉默（替别人应答会让主站张冠李戴）；坏校验只改校验和、结构保持完好（验证主站真的靠校验和发现问题）；`DIF=1Fh` 后续报文标志用于验证驱动的 follow 上限；`defaultRecords()` 与 `examples/mbus.json` 一一对应，`RecordNames` 的输出能被 `FindRecord` 直接吃回去 | 80.6% |
+| `internal/codec/dlms` | DLMS/COSEM（IEC 62056-46/-53/-62）纯函数编解码（HDLC 类型 3 帧按长度字段定界、HCS/FCS 两段 CRC-16/X-25、1/2/4 字节 7 位地址域、LLC 头请求/应答区分、I/RR/RNR/U 帧控制域；A-XDR 全标签编解码含 `date_time` 12 字节布局与时区偏差；AARQ/AARE 的 BER 逐段解析、xDLMS-Initiate 协商、Get-Request-Normal / Get-Response 三分支、`data-access-result` 2 字节形态；OBIS 六段解析与 `SplitRef` 地址切分、内置常见对象表、COSEM 类号/单位枚举、`ApplyScaler` 单次乘除） | 无 I/O、无时钟、无可变状态；长度字段 = 两标志之间全部字节（含 2 字节格式字段与末尾 FCS，不含标志），整帧 = `len(body)+2`，11 位跨两字节且 bit11 是分段位；**HCS 覆盖 `format+dest+src+ctl`**，必须先算长度再算 HCS，占位回填会让接收方判定头校验失败；**类型 3 帧不做透明转义**，`0x7E` 可合法出现在 info 与 FCS，分帧必须按长度字段定界（用 `1.0.13.7.0.255` 的 FCS `7E 64` 做回归）；U 帧控制域是固定常量、不携带可变 P/F；`E7` 是「这一帧是应答」的唯一信号；`date_time` 是 `年(2) 月 日 星期 时 分 秒 百分秒(2) 偏差(2) 状态`，**星期在日月之后、时分之前**；`data-access-result` 是 `[1] IMPLICIT ENUMERATED`，线上只有 `01 <值>` 两字节，**不兼容** `01 01 xx`（结果码为 `hardware-fault(1)` 时前两字节相同，兼容会把它读成数据不完整）；`ApplyScaler` 一次乘除 `10^|scaler|`，逐次除 10 会得到 `50.010000000000005`；单位枚举 Wh=29 / VAh=30 / varh=31，写错不报错只标错量纲 | 92.4% |
+| `internal/driver/dlms` | DLMS/COSEM 主站（LN 引用 + 无安全 + HDLC；SNRM→AARQ→GET→DISC 建链与断链、I 帧序号维护、`<OBIS>[:class[:attr]]` 地址推导、scaler 自动应用与进程内缓存、`data-access-result` 分类、坏帧归 `ErrProtocol`、链路错误缓存；自检 `Scan`/`Association`） | LN 引用 + Lowest Level Security + HDLC 三层承载，点表 `AddressPolicy{Width: WidthNone, AllowSymbol: true}`；只写 OBIS 时类号/属性号从内置表推导，**查不到报 `ErrAddress` 而不猜**（猜的类号会读到另一个对象的合法数字）；`SplitRef` 是唯一地址切分点（标准写法 `1-0:1-8-0-255` 自带冒号，靠「前缀必须解析成 6 段 OBIS」确定切点）；scaler 读 attribute 3 后按 `10^scaler` 应用并缓存（scaler 是静态配置参数）；`data-access-result` 归 `ErrAddress`（object-undefined / object-class-inconsistent 都指向点表写错，重试无用）；分块读报 `ErrUnsupported` 并提示调大 `max-pdu`；`Write`/`MultiRead`/`Browse` 声明 unsupported（一条 Get 只读一个属性，`get-request-with-list` 需服务端声明 multiple-references）；坏帧报协议错并提示查波特率/校验位（HDLC profile 8N1）与终端电阻；链路级失败记住 `linkErr`，不再逐点等超时；`Probe` 打印协商后的 conformance 而非请求值 | 87.8% |
+| `internal/sim/dlms` | DLMS 内置电表（三相表 40+ 项，值带 scaler_unit；SNRM/DISC 应答、AARQ 接受或拒绝、Get-Request 分派、未建关联读回 `read-write-denied`、对象未定义 / 类号不一致两种结果码、静默 / 坏校验 / 拒绝关联三种故障注入） | 与主站共用 codec/dlms，主站解出的值与从站放进去的值不会因为两边各写一套字节规则而漂移；地址不符完全沉默（总线串扰时替别人应答会让主站张冠李戴）；坏校验只改 FCS 前一字节、结构保持完好（验证主站真的靠校验序列发现问题，而不是靠内容）；未建关联就读回 `read-write-denied` 而不是 DM，自检能拿到明确原因；时钟点是固定 12 字节（`2026-11-13T08:30:00`），不用它断言「当前时间」；默认对象表与 `examples/dlms.json` 一一对应 | 91.7% |
 | `internal/codec/snmp` | SNMP v1/v2c/v3 纯函数编解码（BER TLV / 整数最短补码 / OID base-128 / 7 类 PDU / varbind / 异常标记 / error-status 分类；v3 另有 USM 安全参数、`BuildV3`/`ParseV3`、口令本地化、HMAC 摘要、DES/AES 加解密、Report 分类、时间窗口判定） | 无 I/O、无时钟、无可变状态；长度短/长形式必须按内容长度选；无符号值最高位为 1 必须补前导 `00`；OID 首两弧合并、`2.39.1`→`77 01`；异常标记只允许出现在应答，请求里出现即拒绝；v1 Trap PDU 识别后显式拒绝；v3 空 engineID 只允许出现在发现报文，带 auth/priv 时空 engineID 拒绝；摘要截断长度 = 摘要长度的一半 | 77.7% |
 | `internal/driver/snmp` | SNMP 主站（v1/v2c 批量 GET、v1 `noSuchName` 退化、单 OID SET、类型映射与回显校验、错误分类、request-id 配对、自检 `GetRaw`/`Walk`；v3 引擎发现、时间同步、密钥派生与缓存、Report 驱动的自愈重试） | 只做 v1/v2c 的读/写路径不变；通道必须是 UDP，地址省略端口补 161；读按 `maxOids` 与 1400 字节双预算分批，顺序不变；v1 批量 `noSuchName` 逐点重发；写不合并 varbind，逐点错误隔离；只接受与请求 request-id 相同的 Response；float/BCD 与 >2^32-1 的无符号写本地拒绝；地址错误不进入整轮 `firstErr`；v3 加密口令缺省回退认证口令、USM 口令 8..64 字节、AES-192/256 需 SHA-256+；固定 engineID 与代理不一致时同时报出两个 engineID 并拒绝连接 | 73.0% |
 | `internal/sim/snmp` | SNMP 内置代理（system 组 + 两块网卡、GET/GETNEXT/GETBULK/SET、community 静默丢弃、v1/v2 差异、SET 原子性；v3 真做 HMAC 验签与 DES/AES 解密、6 类 Report、引擎身份可切换、故障注入） | 与主站共用 codec/snmp；community 不匹配不回任何报文（不做口令预言机）；v1 缺 OID 回 `noSuchName` 带 `error-index`，v2c 回 `noSuchObject`；SET 先全量校验再落地；`sysUpTime` 固定值（测试要稳定）；`Close` 幂等；v3 对 USM 失败默认回 Report，`Faults.DropPercent` 模拟真机静默丢弃 | 85.1% | 85.1% | 85.1% |
@@ -1515,6 +1601,7 @@ go test -coverprofile=c.out ./... && go tool cover -func=c.out | tail -1
 25. internal/codec/snmp + driver/snmp + sim/snmp SNMP 三层：BER、OID 编码、双预算分批、v1 退化（80 分钟）
 26. internal/codec/snmp/v3.go + usm.go + driver/snmp/v3session.go + sim/snmp/usm.go：USM v3 认证加密、引擎发现与时间同步、密钥派生与自愈重试、真做 HMAC/解密的仿真代理（180 分钟）
 27. internal/codec/mbus + driver/mbus + sim/mbus M-Bus 三层：四类帧与校验范围、DIF/VIF 自描述记录、FCB 重传语义与整表上送（100 分钟）
+28. internal/codec/dlms + driver/dlms + sim/dlms DLMS/COSEM 三层：HDLC 长度定界与两段 CRC、A-XDR 全标签、AARQ/AARE 协商、OBIS 寻址与 scaler、内置电表（150 分钟）
 ```
 
 ---
@@ -1610,6 +1697,8 @@ OPC UA 服务端（同一份点位表的另一个出口）：
 | CJ/T 188 的边界 | ⚠️ | 只做 2004 版（2018 版配置期显式拒绝）；只收录 901F 与 D120..D12B，价格/金额/密钥/机电同步等未收录 DI 直接报错；不做位寻址、DI 自动发现、跨 DI 合并读、表地址扫描；`MultiRead` 诚实声明 unsupported——一轮采集耗时约等于「DI 数 × 单次事务」，这个代价必须让配点表的人看见 |
 | M-Bus（EN 13757）主站 + 内置从站 | ✅ | `internal/codec/mbus` + `internal/driver/mbus` + `internal/sim/mbus` + `uic mbusread` + `examples/mbus.json`；`serial`（共享串口总线锁）与 `tcp`（串口服务器/DTU 透传，每连接互斥）双承载；四种帧（`E5` / 短帧 / 长帧 / `L=3` 控制帧）、校验只覆盖 `C+A+CI+DATA`、双 `L` 与 `L+6` 整帧长；可变结构 12 字节固定头 + DIF/DIFE/VIF/VIFE 自描述记录（整数/BCD/REAL/变长 LVAR/Type G-F-I 时间）；点表 `WidthNone` + 符号地址 `q:<物理量>[@存储号][/第几条]` 与 `r:<index>`；一条 `REQ_UD2` 覆盖整表（`MultiRead` supported）、同报文内点位同快照；FCB 同轮重放 / 跨轮翻转、失败后 `SND_NKE` 复位再试；`BadFrames` 把「无字节」与「有字节不成帧」分开报；三层测试含真实 TCP 回环 |
 | M-Bus 的边界 | ⚠️ | 只做**主地址**（0..250）单主站轮询：次级地址需 `SND_UD(CI=52h)` 选中、地址域变 8 字节，编解码层显式拒绝 `FDh`；不做 `SND_UD` 写入（发数据 `51h` / 改地址 `5Eh` / 校时 `50h`——写错会改变计费参数、改地址会让表从站号上消失），`Write` 声明 unsupported；不做 2 类数据（ACD）上送与多主站仲裁；固定数据结构（`73h`）能解但按老式紧凑表处理，不推荐；不做多表并行（一条总线一次只能有一个主站在说话）|
+| DLMS/COSEM（IEC 62056）主站 + 内置从站 | ✅ | `internal/codec/dlms` + `internal/driver/dlms` + `internal/sim/dlms` + `uic dlmsread` + `examples/dlms.json`；`serial`（共享串口层总线锁）与 `tcp`（串口服务器/DTU 透传，每连接互斥）双承载；**LN 逻辑名引用 + Lowest Level Security + HDLC 三层承载**；HDLC 类型 3 帧按长度字段定界（`0x7E` 可出现在 info 与 FCS 里）、HCS 覆盖 `format+dest+src+ctl`、FCS 用 CRC-16/X-25、1/2/4 字节 7 位地址域；A-XDR 全标签编解码（含 `date_time` 12 字节布局与时区偏差）；SNRM→AARQ→GET→DISC 四步建链、I 帧序号维护；点表 `WidthNone` + 符号地址 `<OBIS>[:class[:attr]]`，只写 OBIS 时从内置表推导、查不到报 `ErrAddress`；scaler（attribute 3）自动应用并缓存；数据块报 `ErrUnsupported` 并提示调大 `max-pdu`；三层测试含真实 TCP 回环 |
+| DLMS 的边界 | ⚠️ | 只做 LN 引用 + 无安全 + HDLC 承载：不做 SN 引用（short name 是厂商在 `object_list` 里分配的，同一 OBIS 在不同表上编号不同，必须先发现再寻址）；不做 HLS/GMAC（密钥协商、帧计数器、AES-GCM 各厂商分发方式不同，做了也只能覆盖一部分现场，还会把「密码错」与「地址错」混成同一类超时）；不做 TCP/UDP 的 COSEM wrapper（另一套 version + wrapper 头封装）；不做 Set/Action/EventNotification（写方向要处理 selective access 与分块写，半成品比不做更难排查）；不做分块读（表在应答超过 max-PDU 时必然走数据块，驱动能识别并报错但不拼块）；不做 SN 的 `get-request-with-list` 批量（需服务端声明 `multiple-references`，现场极少支持），`MultiRead` 诚实声明 unsupported——一条 Get 只读一个属性，一轮往返数 = 点位数，300 点挂 9600bps 要十几秒，这个代价必须让配点表的人看见 |
 | 共享串口层 | ✅ | `internal/transport/serialport`：`Acquire` 按路径引用计数复用、同路径不同参数显式报错（不静默复用）、`Ref.Lock` 总线级互斥覆盖「排空 → 发送 → 收完帧」、`Drain` 必须早于 `SetDeadline`（反序会让每次写都 i/o timeout）；`modbus-rtu` / `modbus-ascii` / `dlt645` / `cjt188` / `iec101` / `mewtocol` 共用 |
 | IEC 104 的边界 | ⚠️ | 不做非平衡式（101 串口）、文件传输、驱动侧时钟同步、冗余通道切换、带时标命令、组召唤；没有「列举 IOA」这种协议动作，点表发现只能靠驱动旁路表（被动观察），设备不发就永远看不到；`Subscribe` 声明 supported 但对外仍是 `Read` 拉取契约 |
 | DNP3 的边界 | ⚠️ | 不做串口、Secure Authentication、文件传输（组 70）、时间同步写路径、SBO 两段式控制、事件缓冲区重配（组 50 写）、类 0 单组召唤、主动触发非请求响应；没有「列举点索引」这种协议动作，点表发现同样只能靠旁路表（被动观察）；总召唤与事件轮询都是整类扫描，点位数的增加不会增加单次事务数，但会增加响应体积 |

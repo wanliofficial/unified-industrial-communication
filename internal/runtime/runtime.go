@@ -40,6 +40,7 @@ import (
 	cjt188drv "uic/internal/driver/cjt188"
 	coapdrv "uic/internal/driver/coap"
 	"uic/internal/driver/computed"
+	dlmsdrv "uic/internal/driver/dlms"
 	dlt645drv "uic/internal/driver/dlt645"
 	dnp3drv "uic/internal/driver/dnp3"
 	enipdrv "uic/internal/driver/enip"
@@ -187,6 +188,7 @@ func RegisterBuiltins() error {
 			secsdrv.New(),
 			mtconndrv.New(),
 			mbusdrv.New(),
+			dlmsdrv.New(),
 		} {
 			if err := driver.Register(d); err != nil {
 				registerErr = err

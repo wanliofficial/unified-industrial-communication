@@ -131,7 +131,7 @@
 | **DNP3** | M/S/B | TCP/串口 | 点索引（Point Index） | 6 | PA-06、PA-34 | 4 | P2 | 链路层分片、应用层分片、事件缓冲、unsolicited 响应、Class 0/1/2/3 |
 | **DL/T 645-2007** | M | 串口 | 数据标识（DI，4 字节） | 6 | PA-06、PA-34 | 2 | P1 | 前导字节 FE、地址域 6 字节 BCD、加 0x33 偏移、DI 表巨大 |
 | **CJ/T 188-2004/2018** | M | 串口 | 表号 + 数据标识 | 4 | PA-34 | 3 | P1 | 两版本帧结构不同；水/气/热表差异 |
-| **IEC 62056 DLMS/COSEM** | C | 串口/TCP | OBIS 码 | 0 | — | 5 | P2 | HDLC 封装、加密（HLS）、对象模型庞大 |
+| **IEC 62056 DLMS/COSEM** | C | 串口/TCP | OBIS 码 | 0 | — | 5 | P2（已落地） | HDLC 封装、加密（HLS）、对象模型庞大。本仓库已实现 **LN 引用 + 无安全 + HDLC 三层承载**：A-XDR 全标签编解码、AARQ/AARE 协商、`Get-Request-Normal` 逐点读、OBIS + 类号 + 属性号寻址、scaler 自动应用；SN 引用、HLS/GMAC、TCP/UDP COSEM wrapper、Set/Action、分块读不做 |
 | **M-Bus** | M | 串口 | 主地址（0..250）+ 记录物理量名 | 0 | — | 3 | P2（已落地） | 需电平转换器；四种帧；记录自描述无固定偏移；整表上送；FCB 重传语义。本仓库已实现主地址寻址 + 可变/固定数据结构解析 + `q:`/`r:` 寻址 + 整表上送，次级地址、SND_UD 写入不做 |
 | **SL 651** | M/S | 串口/TCP | 测站地址 | 少 | PA-15 | 3 | P2 | 水文行业；报文结构简单但方言多 |
 | **GB/T 28181** | C | TCP/UDP | 设备/通道 ID | 1 | PA-11（视频） | 4 | X | 视频监控；SIP 信令 + RTP 媒体 |
@@ -298,7 +298,7 @@ IEC 61850、SECS/GEM、KNX、Mewtocol、Host Link、MTConnect。
 | **MTConnect** | 客户端 / HTTP | 机床数据采集的事实标准；纯 REST + XML，无二进制编解码 | HTTP GET 取 `probe`/`current`/`sample`，XML 解析，不做资产/事件完整模型 |
 
 > 截至当前实现：MC 3E、FINS、EtherNet/IP + CIP、BACnet/IP、IEC 104、DL/T 645、
-> CJ/T 188、M-Bus、SNMP v1/v2c/v3、ADS/AMS、SECS/GEM、KNXnet/IP、Mewtocol、Host Link、IEC 61850（MMS）、IEC 101、DNP3、CoAP、MTConnect、BACnet MS/TP 已落地（各含编解码、主站、内置从站/服务端/Agent 与自检 CLI）；
+> CJ/T 188、M-Bus、DLMS/COSEM、SNMP v1/v2c/v3、ADS/AMS、SECS/GEM、KNXnet/IP、Mewtocol、Host Link、IEC 61850（MMS）、IEC 101、DNP3、CoAP、MTConnect、BACnet MS/TP 已落地（各含编解码、主站、内置从站/服务端/Agent 与自检 CLI）；
 >
 > **DNP3**（编解码 + 主站 + 内置从站 + `uic dnp3read` + `examples/dnp3.json`）：只做
 > TCP 主站、类 0 总召唤、类 1/2/3 事件轮询、CROB 与组 41 直接控制、未请求响应的接收
@@ -571,6 +571,70 @@ IEC 61850、SECS/GEM、KNX、Mewtocol、Host Link、MTConnect。
 > 上面那条最重要的语义永远测不到）、访问号逐次自增、地址不符**完全沉默**（替别人的地址应答会
 > 让主站张冠李戴）、坏校验只改校验和（验证主站真的靠校验和发现问题而不是靠结构）、`DIF=1Fh`
 > 后续报文标志（验证驱动的 follow 上限）。
+
+> **DLMS/COSEM**（IEC 62056-46/-53/-62；编解码 + 主站 + 内置电表 + `uic dlmsread` +
+> `examples/dlms.json`）：只做 **LN 逻辑名引用 + 无安全（Lowest Level Security）+ HDLC 三层
+> 承载**。这是 DLMS 能做到「离线写出点表」的唯一一条路径：LN 的地址是 6 字节 OBIS 码，含义
+> 由标准与 companion specification 固定（`1.0.1.8.0.255` 永远是正向有功电能），点表因此可
+> 以离线书写、跨表复用。**SN（short name）引用不做**——short name 是厂商在 `object_list`
+> 里分配的，同一个 OBIS 在不同表上 short name 不同，要用它必须先读 `object_list` 建立映射，
+> 属于另一套「先发现再寻址」的模型，与「点表直接写地址」的采集方式不兼容。**HLS/GMAC 不做**
+> ——需要密钥协商、帧计数器、AES-GCM，且密钥分发方式各厂商完全不同，做了也只能覆盖一部分
+> 现场，却会把「密码错」与「地址错」混成同一类超时。**TCP/UDP 的 COSEM wrapper 不做**（另一
+> 套 version + wrapper 头封装）。**Set/Action/EventNotification 不做**——写方向要处理
+> selective access 与分块写，方法调用要处理参数与返回，服务端主动上报是无编号帧，它们不是
+> 「GET 换个方向」，半成品比不做更难排查，`Write` 诚实声明 `unsupported`。
+>
+> 四处 HDLC 线格式陷阱：**① 长度字段是两标志之间的全部字节数**（含 2 字节格式字段与末尾
+> FCS，不含标志），整帧 = `len(body)+2`，11 位跨两字节且 bit11 是分段位——少算 2 字节会让
+> 接收方永远等不到结束标志，症状是「第一帧之后就超时」；**② HCS 覆盖 `format+dest+src+ctl`**，
+> 因此必须**先算长度再算 HCS**，先占位后回填会让头校验与格式字段不一致，接收方判定「头校验
+> 失败」并丢弃整帧；**③ 类型 3 帧不做透明转义**，`0x7E` 可以合法出现在 info 与 FCS 里，分帧
+> 必须按长度字段定界而不是「扫下一个标志」——按标志扫会在某些应答上把一帧切成两半，而且只有
+> 特定数值才触发（本仓库用 `1.0.13.7.0.255` 的 FCS `7E 64` 做回归）；**④ 地址域是 7 位/字节
+> + 扩展位**（bit0=1 表示结束），1/2/4 字节，客户端恒 1 字节，4 字节按「高 7 位组 + 低 7 位
+> 组」各左移一位。CRC 是 CRC-16/X-25（初值 `0xFFFF`、反射多项式 `0x8408`、结果取反、小端），
+> 好帧残余是 `0xF0B8`——这个固定余数性质是分帧的基础，随手改一个比特就必须失效。
+>
+> 应用层是 A-XDR（IEC 61334-6）编码的 APDU。建链 `SNRM → UA`、`AARQ → AARE`，读
+> `Get-Request-Normal → Get-Response-Normal`，断链 `DISC → UA`；`SNRM` 的金帧是
+> `7E A0 07 03 21 93 0F 01 7E`。两处容易写反：**U 帧控制域是固定常量、不携带可变的 P/F 位**
+> （UA=0x63 的 bit4 为 0），要求往返保持 P/F 会让建链永远等不到应答；**LLC 头 `E6 E6 00`
+> （请求）/ `E6 E7 00`（应答）里的 `E7` 是「这一帧是应答」的唯一信号**，缺了它说明收到的是
+> 服务端主动上报。三个真实 bug 是在自检/测试里被挖出来的：`ParseRaw` 最初按 `0x7E` 扫帧尾
+> （改成按长度字段定界 + 结束标志校验，失步时前移 1 字节）；`date_time` 解码整体错位一位（日
+> 当成了月、星期当成了时——布局是 `年(2) 月 日 星期 时 分 秒 百分秒(2) 偏差(2) 状态`，**星期
+> 在日月之后、时分之前**，时区偏差是带符号分钟、`0x8000` 表示未指定）；`data-access-result`
+> 编成了 `01 01 xx`（标准是 `[1] IMPLICIT ENUMERATED`，定长 8 位无长度前缀，线上只有
+> `01 <值>` 两字节——「兼容两种形态」会让结果码为 `hardware-fault(1)` 的应答被读成「数据不
+> 完整」，于是所有硬件故障都报成超时）。
+>
+> **scaler 是 DLMS 最容易写错的一处**：Register 类（3/4/5）的 attribute 2 是原始整数，
+> attribute 3 是 `structure {integer scaler, enum unit}`，工程值 = 原始值 × 10^scaler，
+> **scaler 为负是除**（写反会差 10000 倍，而读数「看起来是个数」不会报错）。驱动读完
+> attribute 2 再读一次 attribute 3 并应用，带进程内缓存——scaler 是对象的静态配置参数，不会
+> 随测量值变化，而每轮每点都多读一次会让往返数翻倍。`ApplyScaler` 必须**一次**乘除
+> `10^|scaler|`：逐次除 10 会累积舍入误差，`5001 / 10 / 10` 得到 `50.010000000000005`，屏幕上
+> 就是一串尾数且会污染聚合值。单位枚举同样只认标准表：**Wh = 29、VAh = 30、varh = 31**——
+> 写错不会报错，只会把电量标成「视在电能」，数值一切正常，最难发现。
+>
+> 点表 `path` 是 `<OBIS>[:<class>[:<attribute>]]`。只写 OBIS 时类号与属性号从内置表推导，
+> **查不到就报 `ErrAddress` 而不是猜**——猜错的类号会让表回 `object-class-inconsistent(9)`，
+> 而「猜了一个看起来能读的类」会读到另一个对象的合法数字。`SplitRef` 是**唯一**的地址切分点
+> （驱动与自检命令都必须走它，否则两边对同一字符串的解析会分叉，而「自检通过、采集失败」正
+> 是最难查的一类问题）：标准正文写法 `1-0:1-8-0-255` 自带冒号，靠「前缀必须能解析成 6 段
+> OBIS」确定切点。`data-access-result` 全部归 `ErrAddress`（object-undefined 与
+> object-class-inconsistent 都指向点表写错，重试无用）。分块读报 `ErrUnsupported` 并提示调大
+> `max-pdu`——表在应答超过 max-PDU 时**必然**走数据块，直接报「不支持」只会让现场看到超时，
+> 正确做法是解出块号并明确报告。`MultiRead` 声明 `unsupported`：一条 Get 只读一个属性，批量
+> 的 `get-request-with-list` 要求服务端声明 `multiple-references`（现场极少支持），把
+> 「N 个点 = N 次往返」暴露给配置的人比假装合并更负责任。`Probe` 打印**协商后**的
+> conformance 而非本端请求值——标准允许服务端砍掉一半能力，按请求值判断会得出错误结论。
+> 物理层固定 **8N1**：配成 8E1 会收到全错位的字节，驱动的 `BadFrames` 计数会把它归成
+> `ErrProtocol` 并提示查波特率/校验位与终端电阻，而不是笼统报超时。内置从站复现五件事：
+> 三相表 40+ 项带 scaler_unit 的对象表、未建关联就读回 `read-write-denied`（而不是 DM，让自检
+> 拿到明确原因）、对象未定义与类号不一致两种结果码、坏校验只改 FCS 前一字节（验证主站真的靠
+> 校验序列发现问题而不是靠内容）、地址不符完全沉默（总线串扰时替别人应答会让主站张冠李戴）。
 
 **明确不做**：PROFINET IO、PROFIBUS、CANopen、CC-Link、FOCAS、DALI、LonWorks、DDS、EtherCAT、HART、GB/T 28181、Euromap、Matter、LoRaWAN、OCPP、Redfish。
 
