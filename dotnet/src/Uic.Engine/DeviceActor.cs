@@ -20,8 +20,15 @@ public sealed class ChannelGate : IDisposable
     public ChannelGate(int maxConcurrency)
     {
         var n = Math.Max(1, maxConcurrency);
+        Capacity = n;
         _slots = new SemaphoreSlim(n, n);
     }
+
+    /// <summary>
+    /// 生效的并发上限。热更新要拿它判断「配置改小了」——<see cref="SemaphoreSlim"/>
+    /// 建好之后不能改容量，只能换一个新的闸门。
+    /// </summary>
+    public int Capacity { get; }
 
     public async Task<IDisposable> EnterReadAsync(CancellationToken ct)
     {

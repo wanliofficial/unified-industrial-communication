@@ -89,12 +89,12 @@
 |---|---|---|
 | `id` | 必填 | `^[a-z0-9][a-z0-9-]{0,31}$`，设备靠它引用 |
 | `name` | — | 显示名 |
-| `protocol` | 必填 | `modbus-tcp` / `modbus-rtu` / `modbus-ascii` / `s7` / `opcua` / `mqtt` / `virtual` |
+| `protocol` | 必填 | `modbus-tcp` / `modbus-rtu` / `modbus-ascii` / `s7` / `opcua` / `mqtt` / `virtual`；必须是本进程已注册的驱动，否则 `config/apply` 整份被拒并指向这一行 |
 | `enabled` | `true` | 关闭后该通道上的设备不采集 |
 | `transport` | `tcp` | `tcp` / `serial` / `udp` / `none` |
 | `host` / `port` | — / `0` | `tcp`/`udp` 必填；端口 1..65535 |
 | `serial` | — | `transport=serial` 时必填，见下 |
-| `maxConcurrency` | `4` | 通道级并发上限（`>= 1`） |
+| `maxConcurrency` | `4` | 通道级并发上限（`>= 1`），支持热更新 |
 | `timeout` | `3s` | 单次请求超时 |
 | `connectTimeout` | `5s` | 建链超时 |
 | `idleTimeout` | `30s` | 空闲多久断开 |
@@ -582,6 +582,10 @@ Broker 侧用 TLS + 网络 ACL 把订阅方限定到固定网段，与 OPC UA �
 
 - 校验服务端证书链与主机名；`caFile` 通过自定义信任根（`CustomRootTrust`）参与链构建，
   不会因为「用了自签证书」就顺手关掉主机名校验；
+- `caFile` 指向空文件等于「显式不配 CA」（用系统信任库）；文件非空却一张证书都解析不出来
+  按配置错误拒绝——`ImportFromPemFile` 对非 PEM 内容不报错、只导入 0 张证书，
+  放任下去就是静默退回系统信任库，报错被推到握手时的「证书链不受信任」；
+- CA 读不出来时 `config/apply` 在**任何副作用之前**失败（不会先摘掉旧连接、提交新版本再报错）；
 - `insecureSkipVerify: true` 启动时在日志里明确告警一次：流量加密了，但对端没有被认证；
 - CA 与开关的变更在 `config/apply` 时重建客户端并重连后生效（不需要重启进程）；
 - 只做服务端认证，不做客户端证书；MQTT 命令这一版没有用户身份，TLS 只保护链路。
@@ -813,6 +817,12 @@ data/
 - **启动优先级**：`current` 指针 > `--config` 指定的文件 > 内置兜底配置。
   运维回滚过之后重启，不会把旧文件重新捡回来；
 - **热更新**：按设备粒度 diff，只重启受影响的设备，其余采集不中断。
+  应用是原子的：动任何设备之前先把「设备 → 通道 → 驱动」全量解析一遍，
+  驱动没注册就整份拒绝（`422 config.invalid` + `channels[x].protocol`），
+  不会留下「旧设备已拆、新的建不出、配置还没换」的半应用状态；
+  凭据与 MQTT 自签 CA 也在同一阶段解析，读不出来同样不产生任何副作用。
+  新版本写不下盘（磁盘满、只读挂载）时，设备会被退回上一份配置再报错，
+  「apply 失败 = 什么都没变」这条契约对磁盘故障同样成立。
 
 改配置有三条等效入口：直接编辑文件后启动/`config/apply`、控制台的配置页（编辑 JSON）、
 控制台设备页的「新建设备」。三者最后都落到同一个提交函数上（解析 → 校验 → 内容寻址 →
@@ -879,6 +889,13 @@ uic user reset-password --user admin   # 重置为一次性口令，口令走 st
 `uic check` 与 `POST /api/v1/config/validate` 走的是同一份校验器（`ModelValidator`），
 所以「控制台能存、重启起不来」不会发生。凭据引用由 `Secrets.Validate` 另外检查
 （环境变量是否存在、文件是否可读、密文能否解开），同样是两边一致。
+
+有一条检查不在 `ModelValidator` 里：**驱动引用**。校验器不认识驱动注册表（那会让
+领域校验反向依赖运行时装配），所以 `channels[].protocol` 只校验「非空」。真正是否注册
+由 `Scheduler.CheckReferences` 判定，`uic check` 与启动都用它、也都用同一组驱动：
+协议名拼错时 `check` 退出码 2 并指出 `channels[x].protocol`，启动同样以配置非法退出，
+`config/apply` 则整份拒绝（422）。这条放错位置的后果最严重——放晚了就是「旧设备已拆、
+新的建不出」，见 [implementation-notes.md](implementation-notes.md#几个为什么这么做)。
 
 ```bash
 dotnet run --project src/Uic.Host -- check --config ./gateway.json

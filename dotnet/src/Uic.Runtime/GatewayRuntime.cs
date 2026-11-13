@@ -277,6 +277,16 @@ public sealed class GatewayRuntime : IGatewayControl, IAsyncDisposable
         // 设备不会先重启一轮再告诉我们配置存不下。
         var secrets = Secrets.Resolve(doc);
 
+        // MQTT 的自签 CA 也要在这里先读一遍。ConfigureSinks 的顺序是「先摘旧 sink 再建新的」，
+        // 等它发现 CA 读不出来时，旧连接已经断开、版本也已经提交——一次报 422 的 apply
+        // 实际把 MQTT 上报停了。提前读（只读文件、不碰网络）能让同样的问题在任何副作用
+        // 之前失败；ConfigureSinks 里那次调用保留，用于装配阶段自证。
+        if (doc.Northbound.Mqtt is { Enabled: true, Tls.Enabled: true })
+        {
+            _ = MqttTls.LoadRoots(doc.Northbound.Mqtt.Tls.CaFile, _dataDir,
+                "northbound.mqtt.tls.caFile");
+        }
+
         await _applyGate.WaitAsync(ct).ConfigureAwait(false);
         try
         {
@@ -285,7 +295,25 @@ public sealed class GatewayRuntime : IGatewayControl, IAsyncDisposable
 
             // 先让调度器收敛，再落版本：反过来会出现「版本已切换但设备没重启」的假成功。
             var result = await _engine.ApplyAsync(doc).ConfigureAwait(false);
-            var version = _store.Commit(doc, comment);
+
+            string version;
+            try
+            {
+                version = _store.Commit(doc, comment);
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                // 版本写不下盘（磁盘满、只读挂载）时不能让引擎停在新配置上：
+                // 这次 apply 会以 500 结束，运维据此认为改动没生效，可机器上跑的却是新配置，
+                // 重启后又悄悄退回旧版本——三份状态各说各话，排障时无从判断现场到底是哪一份。
+                // 退回旧配置，让「apply 失败 = 什么都没变」这条契约成立。
+                _log.LogCritical(ex,
+                    "configuration could not be persisted; rolling the devices back to {Version}",
+                    _store.CurrentId);
+                await RollbackEngineAsync(before).ConfigureAwait(false);
+                throw;
+            }
+
             _config = doc;
             _secrets = secrets;
 
@@ -350,6 +378,25 @@ public sealed class GatewayRuntime : IGatewayControl, IAsyncDisposable
         finally
         {
             _applyGate.Release();
+        }
+    }
+
+    /// <summary>
+    /// 把设备退回上一份配置。只在「新配置已经生效但没能落盘」时使用：
+    /// 这是尽力而为的补偿，失败也只能留痕——此时磁盘已经出问题，再抛第二个异常
+    /// 会掩盖真正的原因（提交失败）。
+    /// </summary>
+    private async Task RollbackEngineAsync(ConfigDocument previous)
+    {
+        try
+        {
+            await _engine.ApplyAsync(previous).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            _log.LogCritical(ex,
+                "devices could not be rolled back to the last persisted configuration; " +
+                "runtime and stored configuration now disagree until the next successful apply or restart");
         }
     }
 

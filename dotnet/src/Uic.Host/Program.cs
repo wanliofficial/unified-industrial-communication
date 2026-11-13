@@ -9,6 +9,7 @@ using Uic.Driver.Mqtt;
 using Uic.Driver.OpcUa;
 using Uic.Driver.S7;
 using Uic.Driver.Virtual;
+using Uic.Engine;
 using Uic.Northbound;
 using Uic.Northbound.Security;
 using Uic.Obs;
@@ -301,6 +302,20 @@ internal static class Program
                 return 2;
             }
 
+            // 驱动引用同样要查：check 放过、启动却以「配置非法」退出，是最难查的一种不一致。
+            // 用与调度器同一份判定（不含任何副作用），注册表则与真实启动同一组驱动。
+            var referenceProblems = Scheduler.CheckReferences(doc, CreateDrivers());
+            if (referenceProblems.Count > 0)
+            {
+                Console.Error.WriteLine($"invalid: {path}");
+                Console.Error.WriteLine(
+                    $"  unresolved channel/driver references ({referenceProblems.Count} problem(s))");
+                foreach (var problem in referenceProblems)
+                    Console.Error.WriteLine($"    {problem}");
+
+                return 2;
+            }
+
             Console.WriteLine($"ok: {path}");
             Console.WriteLine($"  site: {doc.Site}");
             Console.WriteLine($"  channels: {doc.Channels.Count}, devices: {doc.Devices.Count}, " +
@@ -340,6 +355,21 @@ internal static class Program
             Console.Error.WriteLine($"cannot read '{path}': {ex.Message}");
             return 3;
         }
+    }
+
+    /// <summary>
+    /// 真实启动注册的那一组驱动。<c>uic check</c> 也用它——静态检查与启动必须看到
+    /// 同一份注册表，否则「check 通过、启动失败」会变成一条永远查不出的沟。
+    /// </summary>
+    private static DriverRegistry CreateDrivers()
+    {
+        var drivers = new DriverRegistry();
+        drivers.Register(ModbusMasterDriver.Tcp(), ModbusMasterDriver.Rtu(), ModbusMasterDriver.Ascii());
+        drivers.Register(new S7MasterDriver());
+        drivers.Register(new OpcUaClientDriver());
+        drivers.Register(new MqttClientDriver());
+        drivers.Register(new VirtualDriver());
+        return drivers;
     }
 
     private static async Task<int> RunAsync(CliOptions cli, bool simulate)
@@ -438,12 +468,7 @@ internal static class Program
         // 监听地址要等运行时读出配置（并应用 --listen 覆盖）后才定，
         // 因此 UseUrls 与证书都放到后面，这里只做准备。
 
-        var drivers = new DriverRegistry();
-        drivers.Register(ModbusMasterDriver.Tcp(), ModbusMasterDriver.Rtu(), ModbusMasterDriver.Ascii());
-        drivers.Register(new S7MasterDriver());
-        drivers.Register(new OpcUaClientDriver());
-        drivers.Register(new MqttClientDriver());
-        drivers.Register(new VirtualDriver());
+        var drivers = CreateDrivers();
 
         Simulator? simulator = null;
         if (simulate)

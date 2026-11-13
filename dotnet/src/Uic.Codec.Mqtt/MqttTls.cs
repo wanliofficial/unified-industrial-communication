@@ -27,7 +27,6 @@ public static class MqttTls
         try
         {
             roots.ImportFromPemFile(path);
-            return roots;
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException
                                        or CryptographicException or ArgumentException)
@@ -37,6 +36,21 @@ public static class MqttTls
                 new ValidationProblem(fieldPath, $"'{path}': {ex.Message}"),
             });
         }
+
+        // ImportFromPemFile 对「内容不是 PEM」的文件不抛异常，只是导入 0 张证书。
+        // 空集合的含义是「没有自定义 CA，用系统信任库」，于是配错的自签 CA 会静默退回
+        // 系统信任库，直到握手时才以「证书链不受信任」出现——报错点离原因很远。
+        // 空文件仍然允许（作为「显式不配 CA」的写法），非空却一张都解析不出来就不是配置意图。
+        if (roots.Count == 0 && new FileInfo(path).Length > 0)
+        {
+            throw new ConfigException("MQTT CA certificate is not usable", new[]
+            {
+                new ValidationProblem(fieldPath,
+                    $"'{path}': file contains no PEM certificate"),
+            });
+        }
+
+        return roots;
     }
 
     /// <summary>

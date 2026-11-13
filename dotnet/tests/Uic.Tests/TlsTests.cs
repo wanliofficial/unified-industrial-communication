@@ -23,6 +23,7 @@ internal static class TlsTests
         tests.Add(new TestCase("tls/rest_certificate_is_required_and_readable", RestCertificateIsRequiredAndReadable));
         tests.Add(new TestCase("tls/certificate_password_must_be_a_reference", CertificatePasswordMustBeAReference));
         tests.Add(new TestCase("tls/mqtt_insecure_skip_verify_requires_enabled", MqttInsecureSkipVerifyRequiresEnabled));
+        tests.Add(new TestCase("tls/mqtt_ca_file_without_pem_is_rejected", MqttCaFileWithoutPemIsRejected));
         tests.Add(new TestCase("contract/tls_rest_serves_https", TlsRestServesHttps));
         tests.Add(new TestCase("mqtt/tls_publishes_over_custom_ca", MqttPublishesOverCustomCa));
         tests.Add(new TestCase("mqtt/tls_rejects_untrusted_broker", MqttRejectsUntrustedBroker));
@@ -169,6 +170,41 @@ internal static class TlsTests
         t.Ok(ModelValidator.Validate(asReference)
                 .Any(p => p.Path == "northbound.mqtt.tls.caFile"),
             "a credential reference is not accepted as a CA path");
+
+        return Task.CompletedTask;
+    }
+
+    /// <summary>
+    /// 非 PEM 内容的 CA 文件必须被拒。`X509Certificate2Collection.ImportFromPemFile`
+    /// 对这种输入**不抛异常**，只是导入 0 张证书；空集合在本仓库的含义是
+    /// 「没有自定义 CA，用系统信任库」。两者一混淆，配错的自签 CA 会静默退回系统信任库，
+    /// 直到握手时才以「证书链不受信任」出现——报错点离原因隔了好几层。
+    ///
+    /// 空文件仍然允许：那是「显式不配 CA」的合法写法。
+    /// </summary>
+    private static Task MqttCaFileWithoutPemIsRejected(TestContext t)
+    {
+        var garbage = t.TempFile("garbage-ca.pem");
+        File.WriteAllText(garbage, "not a certificate\n");
+
+        var ex = t.Throws<ConfigException>(
+            () => MqttTls.LoadRoots(garbage, t.TempDir, "northbound.mqtt.tls.caFile"),
+            "a CA file with no PEM certificate");
+
+        t.Contains(ex.Message, "not usable", "the failure is reported as a configuration problem");
+        t.Ok(ex.Problems.Any(p => p.Path == "northbound.mqtt.tls.caFile"),
+            "the problem points at the CA field");
+        t.Contains(ex.Problems[0].Message, "no PEM certificate", "the message says what is wrong");
+
+        var empty = t.TempFile("empty-ca.pem");
+        File.WriteAllText(empty, string.Empty);
+
+        t.Equal(0, MqttTls.LoadRoots(empty, t.TempDir, "northbound.mqtt.tls.caFile").Count,
+            "an empty file means 'no custom CA' and falls back to the system store");
+
+        var real = TestCertificates.WritePem(t.TempDir, TestCertificates.Create());
+        t.Equal(1, MqttTls.LoadRoots(real, t.TempDir, "northbound.mqtt.tls.caFile").Count,
+            "a real PEM is loaded");
 
         return Task.CompletedTask;
     }

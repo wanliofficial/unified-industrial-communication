@@ -763,6 +763,12 @@ MQTT 的 TLS 是独立开关（`northbound.mqtt.tls`），语义见
 凭据是明文时同样 422，`code` 为 `config.invalid`，`path` 指向 `northbound.rest.token`
 或 `northbound.mqtt.password`。
 
+驱动引用也在这一层被拒：`channel.protocol` 必须对应一个**已注册**的驱动，
+否则整份配置不生效，`details` 指向 `channels[x].protocol`。校验器拿不到驱动注册表，
+所以这条在应用前由调度器预检；它发生在任何设备被卸载之前，因此被拒的 apply
+不会留下「旧设备已拆、新设备建不出」的半应用状态——运行态与配置版本仍然一致，
+在跑的设备继续采集。
+
 ```json
 {
   "version": "v6d22485a2e6d",

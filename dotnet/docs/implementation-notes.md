@@ -268,6 +268,53 @@
   既没有错误也没有丢弃计数。因此发号下界必须同时取「数据文件里的最大 id」与
   「确认位点 + 1」。用例 `outbox/compaction_does_not_reuse_ids`（修复前 FAIL：
   `expected <1>, got <0>`）。
+- **热更新必须先做无副作用的引用预检，再动任何 actor。** `Scheduler.ApplyAsync` 的顺序是
+  「先卸旧设备、再建新设备」（同一串口不能被新旧两个 actor 同时持有），而「驱动是否已注册」
+  只有 `CreateActor` 才检查——配置校验只要求 `protocol` 非空，它拿不到驱动注册表。
+  于是 `channel.protocol` 拼错时：第一台设备已经被 Dispose、新的建不出来、`_config` 还停在
+  旧值，接口只回一个 500。运行态与配置从此永久错位——一台仍在配置里的设备永远不出数，
+  再 apply 一次还可能按设备顺序把另一台也拆掉。现在卸载之前先把「设备 → 通道 → 驱动」
+  全量解析一遍（`Preflight`），有问题整份抛 `ConfigException`（422 + `channels[x].protocol`），
+  一个副作用都不产生；启动路径共用同一预检，把「驱动没注册」从进程崩溃（退出码 1）
+  变成配置错误（退出码 2，并一次列出全部未解析引用）。
+  预检本身抽成 `Scheduler.CheckReferences`，`uic check` 也用同一份、同一组驱动，
+  否则静态检查会放过一份启动必然失败的配置——那正是「check 通过、启动退出码 2」
+  这种最难查的不一致。
+  用例 `lifecycle/failed_apply_leaves_running_devices_alone`（修复前 FAIL：
+  `a refused apply does not dispose the device that was already running`）、
+  `contract/apply_refuses_unregistered_driver`（修复前 FAIL：
+  `expected <UnprocessableEntity>, got <InternalServerError>`）、
+  `sdk/check_command_rejects_unregistered_protocol`（去掉 `check` 里的引用检查后 FAIL：
+  `expected <2>, got <0>`）。
+- **「版本没落盘」也必须回滚引擎，否则三份状态各说各话。** `ApplyConfigAsync` 的顺序是
+  「先让调度器收敛、再提交版本」，这么做是为了避免「版本已切换但设备没重启」的假成功。
+  但提交本身会失败——磁盘满、只读挂载、配额打满。此时接口回 500（运维据此认为改动没生效），
+  设备跑的却是新配置，磁盘上仍是旧版本（下次重启悄悄退回）。三处各说各话，排障时无从判断
+  现场到底是哪一份。现在提交失败会把设备退回上一份配置再抛原异常：磁盘写不进去是运维问题，
+  但「apply 失败 = 什么都没变」必须成立。回滚本身失败只能记 critical——那时磁盘已经出问题，
+  再抛第二个异常只会掩盖真正的原因。
+  用例 `lifecycle/unpersisted_apply_rolls_the_devices_back`（去掉回滚后 FAIL：
+  `the devices were rolled back to the persisted configuration: expected <"42">, got <"7">`），
+  注入点是真实的文件系统权限（把 `config/versions` 改成只读），不是假实现。
+- **北向 sink 的装配失败也必须在副作用之前。** `ConfigureSinks` 的顺序是「先摘旧 sink、
+  再建新的」：等它发现 MQTT 的自签 CA 读不出来时，旧连接已经断开、版本也已经提交，
+  一次报 422 的 apply 实际把 MQTT 上报停了。现在 CA 装载与凭据解析一起前移到无副作用阶段。
+  顺带修掉一个更隐蔽的问题：`X509Certificate2Collection.ImportFromPemFile` 对「内容不是 PEM」
+  的文件**不抛异常**，只是导入 0 张证书，而空集合在本仓库的含义是「没有自定义 CA，用系统
+  信任库」——配错的自签 CA 会静默退回系统信任库，直到握手时才以「证书链不受信任」出现。
+  现在非空却解析不出证书的文件按配置错误拒绝；空文件仍然是合法的「显式不配 CA」。
+  用例 `lifecycle/bad_mqtt_ca_fails_before_anything_changes`（去掉前置检查后 FAIL：
+  `a config refused before its side effects does not commit a version`；去掉内容检查后 FAIL：
+  `an unreadable MQTT CA is reported as a configuration error`）、
+  `tls/mqtt_ca_file_without_pem_is_rejected`。
+- **通道并发上限要跟着热更新换闸门。** `ChannelGate` 底层是 `SemaphoreSlim`，容量建好就改不了，
+  而 `ApplyAsync` 用的是 `_gates.GetOrAdd(channel.Id, ...)`：闸门已存在就原样返回，
+  新上限被静默丢弃。于是 `maxConcurrency` 从 4 改到 1 只在重启进程后才生效——配置说一套、
+  跑的是另一套，两边都不报错，现场只能靠抓包或偶发错乱去猜。现在上限变了就换一个新闸门，
+  旧的在设备重建完成后统一释放（当场释放会撞上在飞读里的 `Release`，抛 `ObjectDisposedException`）。
+  用例 `lifecycle/channel_concurrency_follows_hot_update`（保留旧的 `GetOrAdd` 后 FAIL：
+  `the new concurrency limit takes effect without a process restart: expected <1>, got <2>`），
+  前半段先证明「上限 2 时两台设备确实会重叠」，否则后半段的断言测不到东西。
 - **已知边界：位置型游标挡不住「截断到另一个合法位置」。** 游标内部就是偏移量，
   没有签名；`MTAwMA==`（1000）截成 `MTAw`（100）后是另一页的**合法**游标，
   服务端无法区分「客户端截断了」与「客户端本来就在第 100 条」。要根治得给游标

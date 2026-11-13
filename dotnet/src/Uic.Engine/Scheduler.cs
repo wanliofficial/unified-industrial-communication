@@ -73,6 +73,10 @@ public sealed class Scheduler : IAsyncDisposable
 
     public void Start(ConfigDocument config)
     {
+        // 与 ApplyAsync 同一条预检：驱动没注册是配置错误，不是运行时崩溃。
+        // 启动时一次性报出全部未解析的引用，比逐个设备试错更快定位。
+        Preflight(config);
+
         _config = config;
 
         foreach (var channel in config.Channels)
@@ -98,10 +102,22 @@ public sealed class Scheduler : IAsyncDisposable
         await _applyLock.WaitAsync().ConfigureAwait(false);
         try
         {
+            // 先做一次无副作用的引用预检，再动任何 actor。
+            //
+            // 驱动是否已注册不在 ModelValidator 里（校验层不依赖注册表），而 CreateActor
+            // 只有在下线设备之后才会被调用。驱动名拼错时，前一台设备已经被 Dispose、
+            // 新的建不出来，_config 却还停在旧值——一台仍在配置里的设备被永久拆掉，
+            // 而且再 apply 一次可能按设备顺序把别的设备也拆掉。整份拒绝才谈得上原子。
+            Preflight(next);
+
             var added = new List<string>();
             var removed = new List<string>();
             var restarted = new List<string>();
             var unchanged = new List<string>();
+
+            // 被换下来的闸门不能当场 Dispose：在飞的读还握着它，释放时会撞上 ObjectDisposedException。
+            // 等这一轮设备重建都走完再统一释放。
+            var retiredGates = new List<ChannelGate>();
 
             var before = _config;
             var beforeById = before.Devices.ToDictionary(d => d.Id, StringComparer.Ordinal);
@@ -120,7 +136,21 @@ public sealed class Scheduler : IAsyncDisposable
 
             foreach (var channel in next.Channels)
             {
-                _gates.GetOrAdd(channel.Id, _ => new ChannelGate(channel.MaxConcurrency));
+                var wanted = Math.Max(1, channel.MaxConcurrency);
+
+                // 闸门建好之后容量改不了（SemaphoreSlim 不能改容量），所以上限变了必须换一个新的。
+                // 原来这里是 GetOrAdd：闸门已存在就原样返回，改小并发只在重启后才生效——
+                // 配置写着 1、实际仍按 4 路并发访问同一条串口/同一条链路。
+                if (_gates.TryGetValue(channel.Id, out var existing) && existing.Capacity != wanted)
+                {
+                    _gates[channel.Id] = new ChannelGate(wanted);
+                    retiredGates.Add(existing);
+                    _log.LogInformation("channel {Channel} concurrency changed {Old} -> {New}",
+                        channel.Id, existing.Capacity, wanted);
+                    continue;
+                }
+
+                _gates.GetOrAdd(channel.Id, _ => new ChannelGate(wanted));
             }
 
             for (var i = 0; i < next.Devices.Count; i++)
@@ -154,7 +184,16 @@ public sealed class Scheduler : IAsyncDisposable
             var nextChannels = next.Channels.Select(c => c.Id).ToHashSet(StringComparer.Ordinal);
             foreach (var id in _gates.Keys.Where(k => !nextChannels.Contains(k)).ToArray())
             {
-                if (_gates.TryRemove(id, out var gate)) gate.Dispose();
+                if (_gates.TryRemove(id, out var gate)) retiredGates.Add(gate);
+            }
+
+            // 设备重建已经走完，被换下来的闸门此刻理论上没有持有者；
+            // 万一还有迟到的释放，SemaphoreSlim 抛的是 ObjectDisposedException，
+            // 那条路径本来就是「设备正在被拆」，不值得为它把整轮 apply 判失败。
+            foreach (var gate in retiredGates)
+            {
+                try { gate.Dispose(); }
+                catch (ObjectDisposedException) { }
             }
 
             _config = next;
@@ -168,6 +207,55 @@ public sealed class Scheduler : IAsyncDisposable
         finally
         {
             _applyLock.Release();
+        }
+    }
+
+    /// <summary>
+    /// 把「设备 → 通道 → 驱动」这条引用链全部解析一遍，只读不写。
+    ///
+    /// 抽成公开的静态方法是为了让 <c>uic check</c> 用同一份判定：静态检查放过、
+    /// 启动却拒绝，正是「控制台能存、重启起不来」那种最难查的不一致。
+    /// 校验器本身不依赖驱动注册表，所以这一步只能放在拿得到注册表的地方。
+    /// </summary>
+    public static IReadOnlyList<ValidationProblem> CheckReferences(
+        ConfigDocument config, DriverRegistry drivers)
+    {
+        var problems = new List<ValidationProblem>();
+        var channels = config.Channels.ToDictionary(c => c.Id, StringComparer.Ordinal);
+        var reportedChannels = new HashSet<string>(StringComparer.Ordinal);
+
+        foreach (var device in config.Devices)
+        {
+            if (!channels.TryGetValue(device.ChannelId, out var channel))
+            {
+                problems.Add(new ValidationProblem($"devices[{device.Id}].channelId",
+                    $"channel '{device.ChannelId}' not found"));
+                continue;
+            }
+
+            if (drivers.TryGet(channel.Protocol, out _)) continue;
+
+            // 同一条通道上的多台设备只报一次：问题在通道上，不在设备上。
+            if (reportedChannels.Add(channel.Id))
+            {
+                problems.Add(new ValidationProblem($"channels[{channel.Id}].protocol",
+                    $"no driver is registered for protocol '{channel.Protocol}'"));
+            }
+        }
+
+        return problems;
+    }
+
+    /// <summary>一次报出全部问题而不是抛第一个：现场常是一整段配置拷过来，逐个试错太慢。</summary>
+    private void Preflight(ConfigDocument next)
+    {
+        var problems = CheckReferences(next, _drivers);
+
+        if (problems.Count > 0)
+        {
+            throw new ConfigException(
+                $"configuration has {problems.Count} unresolved channel/driver reference(s)",
+                problems);
         }
     }
 

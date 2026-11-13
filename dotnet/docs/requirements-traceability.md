@@ -12,8 +12,8 @@ PRD 中 M 级的采集协议已全部落地，FR-CFG-01 的四类寻址模型也
 可自动跑的用例（见 §7），唯一剩下的延期项是 object/file 寻址的实际驱动，
 见 [protocol-status.md](protocol-status.md) §4.1。
 
-当前测试基线：**332 passed / 0 failed / 3 skipped**（跳过的是需要 `--opcua` 的 OPC UA 端到端用例）；
-加 `-- --opcua` 跑全量是 **335 passed / 0 failed / 0 skipped**。
+当前测试基线：**340 passed / 0 failed / 3 skipped**（跳过的是需要 `--opcua` 的 OPC UA 端到端用例）；
+加 `-- --opcua` 跑全量是 **343 passed / 0 failed / 0 skipped**。
 
 ## 1. 采集（FR-COL）
 
@@ -42,12 +42,12 @@ PRD 中 M 级的采集协议已全部落地，FR-CFG-01 的四类寻址模型也
 | FR-CFG-04 | 设备模板 + 参数化实例化（≥50 实例） | 已实现 | `template/instantiate_fifty_devices`（50 个实例逐个断言）、`contract/template_instantiates_and_applies_devices`、`template/rejects_bad_parameters`、`template/store_rejects_unknown_placeholder` |
 | FR-CFG-05 | 点表 CSV 导入（地址表达式 + 命名规则） | 已实现 | `csv/address_expressions`、`csv/import_merges_and_reports_conflicts`、`contract/points_csv_import_previews_and_applies`；支持 `40001` / `holding:100` / 分列三种写法 |
 | FR-CFG-06 | 命名唯一性与非法字符校验 | 已实现 | `config/rejects_invalid_documents`；通道/设备/点位各自的重复 id 与命名规则都在 `ModelValidator` 里一次列全 |
-| FR-CFG-07 | 配置 Schema 校验（启动即校验） | 已实现 | `config/rejects_invalid_documents`、`contract/config_validate_reports_problems`；非法配置退出码 2 |
+| FR-CFG-07 | 配置 Schema 校验（启动即校验） | 已实现 | `config/rejects_invalid_documents`、`contract/config_validate_reports_problems`；非法配置退出码 2。`uic check` 与启动共用同一份引用检查（`Scheduler.CheckReferences`）与同一组驱动注册表：协议没注册时同样退出码 2 并指出 `channels[x].protocol`，不会「check 通过、启动失败」：`sdk/check_command_rejects_unregistered_protocol`、`sdk/check_references_flags_unregistered_protocol` |
 | FR-CFG-08 | 配置版本化（内容哈希）+ 历史列表 | 已实现 | `config/id_is_content_addressed`、`config/recommit_of_identical_content_keeps_one_version`、`config/bootstrap_prefers_current_pointer` |
 | FR-CFG-09 | 配置差异对比 | 已实现 | `config/diff_finds_changed_added_removed`、`config/diff_text_is_human_readable`；字段级 JSON Pointer；凭据字段的前后值在 REST 响应里脱敏（`contract/config_is_redacted`） |
 | FR-CFG-10 | 一键回滚（回滚也产生新版本） | 已实现 | `config/rollback_adds_a_version` |
 | FR-CFG-11 | 配置原子写（临时文件 + fsync + rename） | 已实现 | `ConfigStore.AtomicWrite`；`config/reload_after_restart` 验证重启后仍读得到 |
-| FR-CFG-12 | 热更新：只重启受影响设备 | 已实现 | `contract/template_instantiates_and_applies_devices`（apply 后返回 `restartedDevices`）；diff 按设备/点位粒度。下线设备的观测状态一并清理（否则删了又加回来不重推 `$state`、且吞掉第一轮停滞告警）：`lifecycle/removed_device_is_forgotten`、`lifecycle/readded_device_republishes_its_state`；读挂死时下线不被阻塞，否则配置应用与关机一起挂住：`lifecycle/hung_read_does_not_block_shutdown` |
+| FR-CFG-12 | 热更新：只重启受影响设备 | 已实现 | `contract/template_instantiates_and_applies_devices`（apply 后返回 `restartedDevices`）；diff 按设备/点位粒度。下线设备的观测状态一并清理（否则删了又加回来不重推 `$state`、且吞掉第一轮停滞告警）：`lifecycle/removed_device_is_forgotten`、`lifecycle/readded_device_republishes_its_state`；读挂死时下线不被阻塞，否则配置应用与关机一起挂住：`lifecycle/hung_read_does_not_block_shutdown`。apply 是原子的：动 actor 之前先做 `Preflight`（设备 → 通道 → 驱动全量解析），驱动没注册整份拒绝（422 + `channels[x].protocol`），不会留下「旧设备已拆、新设备建不出、配置没换」的半应用状态：`lifecycle/failed_apply_leaves_running_devices_alone`、`contract/apply_refuses_unregistered_driver`。版本写不下盘（磁盘满/只读挂载）时把设备退回上一份配置再报错，「apply 失败 = 什么都没变」：`lifecycle/unpersisted_apply_rolls_the_devices_back`；北向 sink 的装配（MQTT 自签 CA）也前移到无副作用阶段，不会先断旧连接、提交版本再报 422：`lifecycle/bad_mqtt_ca_fails_before_anything_changes` |
 | FR-CFG-13 | 配置导入/导出（跨版本迁移） | 已实现 | `config/migration_is_explicit_and_versioned`、`config/migrates_v0_legacy_shapes`、`config/repository_examples_validate`（仓库 `examples/` 三个示例都能直接 `check` 通过）、`contract/config_export_import_round_trip`、`contract/config_import_migrates_legacy_shape`、`config/redacted_secrets_are_restored`、`contract/apply_keeps_redacted_secrets`（默认导出的 `***` 在 apply/import 时按同路径还原）。迁移覆盖 `server.*`、`storage.dir`、`concurrency`、`devices[].channel`、transport 对象、数字 stopBits；时长接受 Go 复合写法 |
 
 ## 3. 调度与运行时（FR-RUN）
@@ -56,7 +56,7 @@ PRD 中 M 级的采集协议已全部落地，FR-CFG-01 的四类寻址模型也
 |---|---|---|---|
 | FR-RUN-01 | 时间片调度，避免同周期设备同时打满 | 已实现 | 每设备独立 `nextDue` + 50 ms tick；启动时按 `index/count` 把设备自己的 interval 均分（100 台 1s 设备即每 10 ms 一台），失败退避再叠加抖动：`schedule/phase_spreads_devices`、`schedule/scheduler_assigns_phases` |
 | FR-RUN-02 | 每设备串行、跨设备并行 | 已实现 | `engine/conn_is_never_called_concurrently`、`loopback/*` |
-| FR-RUN-03 | 通道并发上限与写优先 | 已实现 | `ChannelGate`：写等待计数让新读让路；`engine/conn_is_never_called_concurrently` 验证不重叠 |
+| FR-RUN-03 | 通道并发上限与写优先 | 已实现 | `ChannelGate`：写等待计数让新读让路；`engine/conn_is_never_called_concurrently` 验证不重叠。上限支持热更新：`SemaphoreSlim` 容量改不了，上限变化必须换新闸门——原来的 `GetOrAdd` 会让「配置写 1、实际按 4 路并发」一直持续到进程重启：`lifecycle/channel_concurrency_follows_hot_update` |
 | FR-RUN-04 | 指数退避 + 抖动重连 | 已实现 | `DeviceActor.LoopAsync`：`interval × 2^failures` 上限为 `RecoverInterval`，叠加 10% 抖动；`devices[].retries` 只重试临时性失败，重试前先断开避免迟到帧：`engine/transient_failure_is_retried`、`engine/bad_quality_batch_is_retried`、`engine/deadline_is_retried_as_timeout`、`engine/permanent_failure_is_not_retried`、`engine/retries_are_finite` |
 | FR-RUN-05 | 熔断（连续失败降级 + 定期探活） | 已实现 | `DeviceActor` 状态机 + `ProbeInterval`；`engine/actor_reports_state_and_generation`。`address` 类错误不参与熔断（点表问题不该把设备判离线）：`engine/permanent_failure_is_not_retried` |
 | FR-RUN-06 | 代次隔离（旧结果丢弃） | 已实现 | `engine/actor_reports_state_and_generation`；`CollectOnceAsync` 逐样本比对代次 |
@@ -105,7 +105,7 @@ PRD 中 M 级的采集协议已全部落地，FR-CFG-01 的四类寻址模型也
 | FR-OPS-07 | 诊断包（脱敏配置 + 日志 + 指标 + 版本） | 已实现 | `GET /api/v1/diagnostics/bundle` 与命令 `diag.bundle` 共用 `DiagnosticsBundle.Build`；`mqtt/command_diag_bundle_is_whitelisted` |
 | FR-OPS-08 | 远程命令白名单 | 已实现 | `contract/*` 与 `mqtt/command_unknown_action_returns_error`、`mqtt/command_privileged_action_is_forbidden`；REST/MQTT 共用 `CommandExecutor` |
 | FR-OPS-09 | 凭据加密存储 | 已实现 | 凭据字段（`northbound.rest.token` / `northbound.mqtt.password` / `northbound.rest.tls.certificatePassword`）只接受引用：`${env:NAME}`、`${file:PATH}`、`enc:v1:...`（AES-256-GCM，密钥来自 `UIC_SECRET_KEY` / `UIC_SECRET_KEY_FILE`）。明文在 `uic check`、启动、`config/validate`、`config/apply` 四处被拒并指出字段路径；落盘版本、diff、导出、诊断包与 `GET /api/v1/config` 只有引用或 `***`。`uic secret keygen|seal` 提供密钥与密封；`secret/*`（9 条）与 `contract/plaintext_credentials_are_rejected` 覆盖解析失败硬失败、篡改拒绝与明文拒绝；`contract/every_credential_field_is_redacted` 断言三个凭据字段在 `GET /api/v1/config` 里**全部**变成 `***`（读侧脱敏与写侧还原共用同一份清单，`certificatePassword` 曾两侧同时漏掉） |
-| FR-OPS-10 | TLS（API 与北向） | 已实现 | REST：`northbound.rest.tls` 打开后 Kestrel 按 HTTPS 监听，证书支持 PFX（`certificateFile` + `certificatePassword`）与 PEM（`certificateFile` + `keyFile`），口令仍是凭据引用；装载失败按配置非法退出（码 2）。MQTT：`northbound.mqtt.tls` 用 `SslStream` 包裹连接，校验服务端证书链与主机名，自签 Broker 通过 `caFile` 走 `CustomRootTrust`，`insecureSkipVerify` 只能联调且启动告警。REST 的证书/监听变更需重启（热更新只告警），MQTT 的 TLS/CA 变更在 `config/apply` 重建客户端后生效。证据：`tls/*`（3 条配置与装载）、`contract/tls_rest_serves_https`、`mqtt/tls_publishes_over_custom_ca`、`mqtt/tls_rejects_untrusted_broker` |
+| FR-OPS-10 | TLS（API 与北向） | 已实现 | REST：`northbound.rest.tls` 打开后 Kestrel 按 HTTPS 监听，证书支持 PFX（`certificateFile` + `certificatePassword`）与 PEM（`certificateFile` + `keyFile`），口令仍是凭据引用；装载失败按配置非法退出（码 2）。MQTT：`northbound.mqtt.tls` 用 `SslStream` 包裹连接，校验服务端证书链与主机名，自签 Broker 通过 `caFile` 走 `CustomRootTrust`，`insecureSkipVerify` 只能联调且启动告警。REST 的证书/监听变更需重启（热更新只告警），MQTT 的 TLS/CA 变更在 `config/apply` 重建客户端后生效。证据：`tls/*`（4 条配置与装载，含「CA 文件内容不是 PEM 必须拒绝」——`ImportFromPemFile` 对非 PEM 内容静默返回 0 张证书，等于退回系统信任库）、`contract/tls_rest_serves_https`、`mqtt/tls_publishes_over_custom_ca`、`mqtt/tls_rejects_untrusted_broker` |
 | FR-OPS-11 | 日志（结构化、分级、轮转） | 已实现 | 控制台 + 内存环形缓冲 + 可选 JSON 行文件日志：字段 `ts/level/category/msg/device/exception`，按 `logging.file.maxBytes` 轮转、保留 `retain` 份；支持热更新开关：`logs/json_line_fields_are_complete`、`logs/file_rotates_without_losing_lines`、`logs/retention_prunes_old_archives`、`logs/reconfigure_stops_writing` |
 
 ## 7. 驱动开发与测试（FR-SDK）

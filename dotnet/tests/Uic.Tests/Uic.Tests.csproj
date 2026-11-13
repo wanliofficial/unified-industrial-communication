@@ -50,6 +50,11 @@
     <ProjectReference Include="..\..\src\Uic.Northbound\Uic.Northbound.csproj" />
     <ProjectReference Include="..\..\src\Uic.Runtime\Uic.Runtime.csproj" />
     <ProjectReference Include="..\..\src\Uic.OpcUa\Uic.OpcUa.csproj" />
+    <!--
+      直接调用 uic 的入口：`check` 与 `run` 必须看到同一份驱动注册表，
+      「check 通过、启动退出码 2」是最难查的一类不一致，只有真跑一遍命令行才能钉住。
+    -->
+    <ProjectReference Include="..\..\src\Uic.Host\Uic.Host.csproj" />
   </ItemGroup>
 
 </Project>

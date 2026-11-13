@@ -60,6 +60,7 @@ internal static class ContractTests
         tests.Add(new TestCase("contract/config_validate_reports_problems", ConfigValidateReportsProblems));
         tests.Add(new TestCase("contract/plaintext_credentials_are_rejected", PlaintextCredentialsAreRejected));
         tests.Add(new TestCase("contract/every_credential_field_is_redacted", EveryCredentialFieldIsRedacted));
+        tests.Add(new TestCase("contract/apply_refuses_unregistered_driver", ApplyRefusesUnregisteredDriver));
         tests.Add(new TestCase("contract/write_returns_per_point_results", WriteReturnsPerPointResults));
         tests.Add(new TestCase("contract/write_values_are_engineering_units", WriteValuesAreEngineeringUnits));
         tests.Add(new TestCase("contract/single_point_write_is_idempotent", SinglePointWriteIsIdempotent));
@@ -1206,6 +1207,72 @@ internal static class ContractTests
             t.Equal("${env:" + TokenVariable + "}",
                 host.Runtime.CurrentConfig.Northbound.Rest.Token,
                 "the stored configuration is unchanged");
+        });
+    }
+
+    /// <summary>
+    /// 引用了未注册驱动的配置必须在 apply 时整份被拒：422 + 字段路径，而不是 500。
+    ///
+    /// 配置校验只要求 <c>protocol</c> 非空（它不依赖驱动注册表），而调度器是
+    /// 「先卸旧设备、再建新设备」，驱动是否已注册要到建新设备时才检查。驱动名写错时
+    /// 前一台设备已经被拆掉、新的建不出来，接口只回一个 500，配置版本还没变——
+    /// 运行态与配置从此不一致，运维只能重启进程。
+    /// </summary>
+    private static Task ApplyRefusesUnregisteredDriver(TestContext t)
+    {
+        return RunAsync(async () =>
+        {
+            await using var host = await Host.StartAsync(t);
+            var versionBefore = host.Runtime.ConfigVersion;
+
+            using var envelope = await ReadJsonAsync(t, await host.Client.SendAsync(
+                Get("/api/v1/config"), t.Ct));
+
+            var edited = JsonNode.Parse(
+                envelope.RootElement.GetProperty("config").GetRawText())!.AsObject();
+            edited["channels"]![0]!["protocol"] = "virtualx";
+
+            var refused = await host.Client.SendAsync(
+                Post("/api/v1/config/apply", edited.ToJsonString()), t.Ct);
+
+            t.Equal((HttpStatusCode)422, refused.StatusCode,
+                "an unregistered driver is a config error, not an internal error");
+
+            using var error = JsonDocument.Parse(await refused.Content.ReadAsStringAsync(t.Ct));
+            t.Equal("config.invalid",
+                error.RootElement.GetProperty("error").GetProperty("code").GetString(),
+                "the error uses the config envelope");
+            t.Ok(error.RootElement.GetProperty("error").GetProperty("details").EnumerateArray()
+                    .Any(d => d.GetProperty("path").GetString() == "channels[virtual-bus].protocol"),
+                "the error points at the channel protocol");
+
+            // 被拒的 apply 不能有副作用：配置、版本与被拆的设备都还是原来的。
+            t.Equal("virtual", host.Runtime.CurrentConfig.Channels[0].Protocol,
+                "the stored configuration is unchanged");
+            t.Equal(versionBefore, host.Runtime.ConfigVersion, "no config version was committed");
+
+            using var devices = await ReadJsonAsync(t, await host.Client.SendAsync(
+                Get("/api/v1/devices"), t.Ct));
+            t.Equal(1, devices.RootElement.GetProperty("items").GetArrayLength(),
+                "the running device was not torn down");
+
+            // 采集没被停在半路：被拒之后老配置仍然出数，seq 继续增长。
+            // 只看 quality=good 不够——那可能是 apply 之前缓存的最后一帧。
+            var before = await WaitForPointAsync(host, "v1", "temp", t);
+            var beforeSeq = before.GetProperty("seq").GetUInt64();
+
+            var afterSeq = beforeSeq;
+            var spin = Stopwatch.StartNew();
+            while (afterSeq <= beforeSeq && spin.Elapsed < TimeSpan.FromSeconds(10))
+            {
+                using var point = await ReadJsonAsync(t, await host.Client.SendAsync(
+                    Get("/api/v1/points/v1/temp"), t.Ct));
+                afterSeq = point.RootElement.GetProperty("seq").GetUInt64();
+                if (afterSeq > beforeSeq) break;
+                await Task.Delay(100, t.Ct);
+            }
+
+            t.Ok(afterSeq > beforeSeq, "the device keeps collecting after the refused apply");
         });
     }
 

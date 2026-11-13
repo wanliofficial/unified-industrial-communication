@@ -1,4 +1,7 @@
+using Uic.Domain;
 using Uic.Driver;
+using Uic.Driver.Virtual;
+using Uic.Engine;
 
 namespace Uic.Tests;
 
@@ -18,6 +21,8 @@ internal static class SdkTests
         tests.Add(new TestCase("sdk/register_rejects_sdk_version_mismatch", RegisterRejectsSdkVersionMismatch));
         tests.Add(new TestCase("sdk/register_rejects_duplicate_id", RegisterRejectsDuplicateId));
         tests.Add(new TestCase("sdk/register_accepts_matching_version", RegisterAcceptsMatchingVersion));
+        tests.Add(new TestCase("sdk/check_references_flags_unregistered_protocol", CheckReferencesFlagsUnregisteredProtocol));
+        tests.Add(new TestCase("sdk/check_command_rejects_unregistered_protocol", CheckCommandRejectsUnregisteredProtocol));
     }
 
     /// <summary>
@@ -107,5 +112,122 @@ internal static class SdkTests
 
         public IConn Open(OpenContext context) =>
             throw new NotSupportedException("本用例只测注册，不开连接");
+    }
+
+    /// <summary>
+    /// <c>Scheduler.CheckReferences</c> 必须能把「协议名拼错 / 未注册驱动」标出来，
+    /// 并指出字段路径，而不是留到调度器里才炸成 500。
+    ///
+    /// 走的是 <c>uic check</c> 与启动预检共用的同一条纯函数路径：
+    /// 静态检查放过、运行时却拒绝，是最难查的一种配置不一致。
+    /// </summary>
+    private static Task CheckReferencesFlagsUnregisteredProtocol(TestContext t)
+    {
+        var registry = new DriverRegistry();
+        registry.Register(new VirtualDriver());
+
+        var doc = new ConfigDocument
+        {
+            SchemaVersion = 1,
+            Site = "sdk-check-site",
+            Channels =
+            {
+                new Channel { Id = "good", Protocol = "virtual", Transport = "none" },
+                new Channel { Id = "bad", Protocol = "nonexistent", Transport = "none" },
+            },
+            Devices =
+            {
+                new Device { Id = "d1", ChannelId = "good" },
+                new Device { Id = "d2", ChannelId = "bad" },
+            },
+        };
+
+        var problems = Scheduler.CheckReferences(doc, registry);
+
+        t.Ok(problems.Count == 1, $"只报出未注册的驱动引用，实际 {problems.Count} 条");
+        t.Equal("channels[bad].protocol", problems[0].Path, "字段路径指向通道的 protocol");
+
+        // 同一条通道下的多台设备只报一次：问题在通道上，不在设备上。
+        doc.Devices.Add(new Device { Id = "d3", ChannelId = "bad" });
+        t.Ok(Scheduler.CheckReferences(doc, registry).Count == 1,
+            "同一条通道引用同一缺失驱动只报一次");
+
+        return Task.CompletedTask;
+    }
+
+    /// <summary>
+    /// <c>uic check</c> 必须与启动用同一份驱动注册表：协议名没注册时以退出码 2 失败，
+    /// 并指出 `channels[x].protocol`；同一份配置换成已注册的驱动则通过。
+    ///
+    /// 只测 `Scheduler.CheckReferences` 是不够的——真正的风险是「check 忘了调用它」，
+    /// 那会让部署前的静态检查放过一份启动必然失败的配置。所以这里直接跑命令行入口。
+    /// </summary>
+    private static async Task CheckCommandRejectsUnregisteredProtocol(TestContext t)
+    {
+        var path = t.TempFile("check.json");
+        await File.WriteAllTextAsync(path, JsonDefaults.ToJson(CheckConfig("nonexistent")), t.Ct);
+
+        var (badExit, badError) = await RunCheckAsync(path);
+
+        t.Equal(2, badExit, "an unregistered protocol is a configuration error");
+        t.Contains(badError, "channels[ch].protocol", "the message points at the channel protocol");
+        t.Contains(badError, "no driver is registered for protocol 'nonexistent'",
+            "the message names the missing driver");
+
+        // 反向对照：同一份配置只把协议换成已注册的 virtual 就必须通过。
+        // 少了这一条，一条「永远返回 2」的实现也能让上面两条断言通过。
+        await File.WriteAllTextAsync(path, JsonDefaults.ToJson(CheckConfig("virtual")), t.Ct);
+        var (goodExit, goodError) = await RunCheckAsync(path);
+
+        t.Equal(0, goodExit, $"a registered protocol passes: {goodError}");
+    }
+
+    private static ConfigDocument CheckConfig(string protocol) => new()
+    {
+        SchemaVersion = 1,
+        Site = "sdk-check-site",
+        Channels =
+        {
+            new Channel { Id = "ch", Protocol = protocol, Transport = "none" },
+        },
+        Devices =
+        {
+            new Device
+            {
+                Id = "d1",
+                ChannelId = "ch",
+                Points =
+                {
+                    new Point
+                    {
+                        Id = "p1",
+                        Address = Address.Register("holding", 0),
+                        DataType = DataType.UInt16,
+                    },
+                },
+            },
+        },
+    };
+
+    /// <summary>跑一次真实的 <c>uic check</c>，返回退出码与 stderr。</summary>
+    private static async Task<(int Exit, string Error)> RunCheckAsync(string path)
+    {
+        var originalOut = Console.Out;
+        var originalError = Console.Error;
+        var stdout = new StringWriter();
+        var stderr = new StringWriter();
+
+        try
+        {
+            Console.SetOut(stdout);
+            Console.SetError(stderr);
+            var exit = await Uic.Host.Program.Main(new[] { "check", "--config", path });
+            return (exit, stderr.ToString());
+        }
+        finally
+        {
+            Console.SetOut(originalOut);
+            Console.SetError(originalError);
+        }
     }
 }

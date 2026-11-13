@@ -113,6 +113,18 @@ invalid: /etc/uic/gateway.json
   - northbound.rest.token: plaintext credentials are not allowed; use ${env:NAME}, ...
 ```
 
+它还会用**与启动完全相同的那份驱动注册表**解析「设备 → 通道 → 驱动」这条引用链：
+`channels[].protocol` 没注册时同样退出码 2，并指明是哪条通道。
+
+```
+invalid: /etc/uic/gateway.json
+  unresolved channel/driver references (1 problem(s))
+    channels[bus].protocol: no driver is registered for protocol 'modbus-tpc'
+```
+
+这条检查只读不写，和启动预检共用同一份实现——「`check` 通过、启动却起不来」
+是最难查的一类不一致，不能靠两份各自演进的判定。
+
 ## 凭据
 
 配置里的 `northbound.rest.token` 与 `northbound.mqtt.password` 不接受明文，
@@ -219,7 +231,8 @@ dotnet run --project tests/Uic.Tests -- --opcua             # 额外跑 OPC UA �
 dotnet run --project tests/Uic.Tests -- --stop-on-fail
 ```
 
-正常情况下输出 `332 passed, 0 failed, 3 skipped`（跳过的是默认不启用的 OPC UA 用例）。
+正常情况下输出 `340 passed, 0 failed, 3 skipped`（跳过的是默认不启用的 OPC UA 用例）；
+加 `-- --opcua` 是 `343 passed, 0 failed, 0 skipped`。
 黄金帧测试默认从仓库的 `testdata/golden/` 读取，可用 `UIC_TESTDATA` 指向别的目录。
 
 串口用例（T15–T18）会用 libc 开一对伪终端，在 Linux 上默认执行，其它平台报 `skip`；

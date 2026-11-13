@@ -1,6 +1,8 @@
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using Uic.Domain;
 using Uic.Driver;
+using Uic.Driver.Virtual;
 using Uic.Engine;
 using Uic.Obs;
 using Uic.Runtime;
@@ -26,9 +28,19 @@ internal static class LifecycleTests
         tests.Add(new TestCase("lifecycle/removed_device_is_forgotten", RemovedDeviceIsForgotten));
         tests.Add(new TestCase("lifecycle/readded_device_republishes_its_state", ReaddedDeviceRepublishesItsState));
         tests.Add(new TestCase("lifecycle/hung_read_does_not_block_shutdown", HungReadDoesNotBlockShutdown));
+        tests.Add(new TestCase("lifecycle/failed_apply_leaves_running_devices_alone",
+            FailedApplyLeavesRunningDevicesAlone));
+        tests.Add(new TestCase("lifecycle/unpersisted_apply_rolls_the_devices_back",
+            UnpersistedApplyRollsTheDevicesBack));
+        tests.Add(new TestCase("lifecycle/bad_mqtt_ca_fails_before_anything_changes",
+            BadMqttCaFailsBeforeAnythingChanges));
+        tests.Add(new TestCase("lifecycle/channel_concurrency_follows_hot_update",
+            ChannelConcurrencyFollowsHotUpdate));
     }
 
-    private static ConfigDocument ConfigWith(params string[] deviceIds) => new()
+    private static ConfigDocument ConfigWith(params string[] deviceIds) => ConfigOn("noop", deviceIds);
+
+    private static ConfigDocument ConfigOn(string protocol, params string[] deviceIds) => new()
     {
         SchemaVersion = 1,
         Site = "lifecycle-site",
@@ -37,7 +49,7 @@ internal static class LifecycleTests
             new Channel
             {
                 Id = "ch",
-                Protocol = "noop",
+                Protocol = protocol,
                 Transport = "none",
                 MaxConcurrency = 1,
             },
@@ -196,9 +208,462 @@ internal static class LifecycleTests
         driver.Release();
     }
 
+    /// <summary>
+    /// 一份引用了未注册驱动的配置必须整份被拒，不能留下半应用状态。
+    ///
+    /// <see cref="Scheduler.ApplyAsync"/> 的顺序是「先卸旧的、再建新的」，而驱动是否
+    /// 已注册要到 <see cref="Scheduler.CreateActor"/> 里才检查——配置校验只要求
+    /// <c>protocol</c> 非空。于是驱动名拼错时，前一台设备已经被 Dispose、新的建不出来，
+    /// 而 <see cref="Scheduler.Config"/> 还停在旧值。运行态与配置从此不一致：一台仍在
+    /// 配置里的设备永远不出数，再 apply 一次还可能按设备顺序把另一台也拆掉。
+    ///
+    /// 失败必须是配置错误（带字段路径），不是「应用了一半再报 500」。
+    /// </summary>
+    private static async Task FailedApplyLeavesRunningDevicesAlone(TestContext t)
+    {
+        var registry = new DriverRegistry();
+        registry.Register(new VirtualDriver());
+
+        await using var engine = new Scheduler(
+            registry, new PointCache(), NullLoggerFactory.Instance,
+            new SchedulerOptions { Tick = TimeSpan.FromMilliseconds(10) });
+
+        engine.Start(ConfigOn("virtual", "d1", "d2"));
+        await WaitForSamples(t, engine, 2);
+
+        var d1 = engine.Find("d1");
+        var d2 = engine.Find("d2");
+        t.Ok(d1 is not null && d2 is not null, "both devices run before the bad apply");
+
+        // "virtualx" 是拼错的驱动名：校验查不出，注册表里没有。
+        var bad = ConfigOn("virtualx", "d1", "d2");
+
+        ConfigException? error = null;
+        try
+        {
+            await engine.ApplyAsync(bad);
+        }
+        catch (Exception ex)
+        {
+            error = ex as ConfigException;
+        }
+
+        // 先钉真正的后果：一台仍在配置里的设备被拆掉、且没有新 actor 顶替。
+        t.Ok(ReferenceEquals(d1, engine.Find("d1")),
+            "a refused apply does not dispose the device that was already running");
+        t.Ok(ReferenceEquals(d2, engine.Find("d2")),
+            "nor the one that had not been reached yet");
+        t.Equal("virtual", engine.Config.Channels[0].Protocol,
+            "the engine keeps the last applied config");
+
+        t.Ok(error is not null, "a config naming an unregistered driver is refused as a config error");
+        t.Ok(error?.Problems.Any(p => p.Path == "channels[ch].protocol") == true,
+            "the refusal points at the channel protocol, not at an internal exception");
+
+        // 拒绝之后老配置必须还能继续工作：采集没被停在半路。
+        var seq = engine.Cache.Get("d1", "p1")?.Seq ?? 0;
+        var spin = System.Diagnostics.Stopwatch.StartNew();
+        while ((engine.Cache.Get("d1", "p1")?.Seq ?? 0) <= seq &&
+               spin.Elapsed < TimeSpan.FromSeconds(10))
+        {
+            await Task.Delay(10, t.Ct);
+        }
+
+        t.Ok((engine.Cache.Get("d1", "p1")?.Seq ?? 0) > seq,
+            "the untouched device keeps collecting after the refused apply");
+    }
+
     private static double StaleCount(MetricsRegistry metrics, string device)
         => metrics.CounterValue("uic_watchdog_stale_total",
             new Dictionary<string, string> { ["device"] = device });
+
+    /// <summary>
+    /// 新配置已经在设备上生效、但版本写不下盘（磁盘满、只读挂载）时，必须把设备退回旧配置。
+    ///
+    /// 否则三份状态各说各话：接口回 500（运维据此认为没生效）、设备跑的是新配置、
+    /// 磁盘上还是旧版本（重启后悄悄退回）。「apply 失败 = 什么都没变」才是可操作的契约。
+    ///
+    /// 注入点是真实的文件系统权限：把 <c>config/versions</c> 改成只读，写入必然失败。
+    /// 以 root 运行时权限拦不住写入，这时跳过而不是假通过。
+    /// </summary>
+    private static async Task UnpersistedApplyRollsTheDevicesBack(TestContext t)
+    {
+        using var logs = LoggerFactory.Create(b => { b.ClearProviders(); });
+        var ring = new RingBufferLogProvider(128);
+
+        var runtime = await GatewayRuntime.CreateAsync(
+            new RuntimeOptions
+            {
+                DataDir = t.TempDir,
+                GatewayVersion = "0.0.0-test",
+                Fallback = () => RuntimeConfig(baseline: "42"),
+            },
+            RuntimeDrivers(),
+            logs,
+            ring,
+            t.Ct);
+
+        try
+        {
+            await WaitForRuntimeSamples(t, runtime, 1);
+            var versionBefore = runtime.ConfigVersion;
+
+            var versions = Path.Combine(t.TempDir, "config", "versions");
+            var mode = File.GetUnixFileMode(versions);
+            File.SetUnixFileMode(versions, UnixFileMode.UserRead | UnixFileMode.UserExecute);
+
+            try
+            {
+                // 先确认注入真的生效：root 下写只读目录照样成功，那样后面的断言就无从谈起。
+                try
+                {
+                    await File.WriteAllTextAsync(Path.Combine(versions, "probe"), "x", t.Ct);
+                    throw new SkipException("running with privileges that ignore directory permissions");
+                }
+                catch (UnauthorizedAccessException)
+                {
+                    // 期望路径：写不进去。
+                }
+
+                var edited = RuntimeConfig(baseline: "7");
+
+                Exception? failure = null;
+                try
+                {
+                    await runtime.ApplyConfigAsync(edited, "probe", t.Ct);
+                }
+                catch (Exception ex)
+                {
+                    failure = ex;
+                }
+
+                t.Ok(failure is not null, "an apply that cannot persist its version fails");
+                t.Ok(failure is IOException or UnauthorizedAccessException,
+                    $"the failure surfaces the storage problem, got {failure?.GetType().Name}");
+
+                t.Equal(versionBefore, runtime.ConfigVersion, "no version was committed");
+                t.Equal("42", runtime.Engine.Config.Devices[0].Labels["baseline"],
+                    "the devices were rolled back to the persisted configuration");
+
+                // 回滚后的老配置必须真的还在采：一台被停住的设备等于没回滚。
+                var seq = runtime.Engine.Cache.Get("v1", "temp")?.Seq ?? 0;
+                var spin = System.Diagnostics.Stopwatch.StartNew();
+                while ((runtime.Engine.Cache.Get("v1", "temp")?.Seq ?? 0) <= seq &&
+                       spin.Elapsed < TimeSpan.FromSeconds(10))
+                {
+                    await Task.Delay(20, t.Ct);
+                }
+
+                t.Ok((runtime.Engine.Cache.Get("v1", "temp")?.Seq ?? 0) > seq,
+                    "the rolled-back device keeps collecting");
+            }
+            finally
+            {
+                File.SetUnixFileMode(versions, mode);
+            }
+        }
+        finally
+        {
+            await runtime.DisposeAsync();
+        }
+    }
+
+    private static ConfigDocument RuntimeConfig(string baseline) => new()
+    {
+        SchemaVersion = 1,
+        Site = "lifecycle-site",
+        Channels = new List<Channel>
+        {
+            new() { Id = "virtual-bus", Protocol = "virtual", Transport = "none" },
+        },
+        Devices = new List<Device>
+        {
+            new()
+            {
+                Id = "v1",
+                ChannelId = "virtual-bus",
+                Interval = TimeSpan.FromMilliseconds(200),
+                Labels = new Dictionary<string, string>
+                {
+                    ["mode"] = "const",
+                    ["baseline"] = baseline,
+                },
+                Points = new List<Point>
+                {
+                    new()
+                    {
+                        Id = "temp",
+                        Address = Address.Register("holding", 0),
+                        DataType = DataType.Float64,
+                    },
+                },
+            },
+        },
+    };
+
+    private static DriverRegistry RuntimeDrivers()
+    {
+        var registry = new DriverRegistry();
+        registry.Register(new VirtualDriver());
+        return registry;
+    }
+
+    /// <summary>
+    /// MQTT 的自签 CA 读不出来时，apply 必须在任何副作用之前失败。
+    ///
+    /// <c>ConfigureSinks</c> 的顺序是「先摘旧 sink、再建新的」，CA 又是在建新 sink 时才读——
+    /// 那一步抛异常时，旧连接已经断了、版本也已经提交：接口回 422，实际却把 MQTT 上报停了，
+    /// 磁盘上还多了一个「应用成功过」的版本。提前读一次就能把这类问题挡在副作用之前。
+    /// </summary>
+    private static async Task BadMqttCaFailsBeforeAnythingChanges(TestContext t)
+    {
+        using var logs = LoggerFactory.Create(b => { b.ClearProviders(); });
+        var ring = new RingBufferLogProvider(128);
+
+        var runtime = await GatewayRuntime.CreateAsync(
+            new RuntimeOptions
+            {
+                DataDir = t.TempDir,
+                GatewayVersion = "0.0.0-test",
+                Fallback = () => RuntimeConfig(baseline: "42"),
+            },
+            RuntimeDrivers(),
+            logs,
+            ring,
+            t.Ct);
+
+        try
+        {
+            await WaitForRuntimeSamples(t, runtime, 1);
+            var versionBefore = runtime.ConfigVersion;
+
+            // 文件存在、但不是 PEM：这是「配了 CA 但内容不对」的真实形状。
+            var caFile = t.TempFile("garbage-ca.pem");
+            await File.WriteAllTextAsync(caFile, "not a certificate\n", t.Ct);
+
+            var baseline = RuntimeConfig(baseline: "42");
+            var edited = new ConfigDocument
+            {
+                SchemaVersion = 1,
+                Site = baseline.Site,
+                Channels = baseline.Channels,
+                Devices = baseline.Devices,
+                Northbound = new NorthboundOptions
+                {
+                    Rest = baseline.Northbound.Rest,
+                    OpcUa = baseline.Northbound.OpcUa,
+                    Mqtt = baseline.Northbound.Mqtt with
+                    {
+                        Enabled = true,
+                        Tls = new MqttTlsOptions { Enabled = true, CaFile = caFile },
+                    },
+                },
+            };
+
+            ConfigException? error = null;
+            try
+            {
+                await runtime.ApplyConfigAsync(edited, "probe", t.Ct);
+            }
+            catch (Exception ex)
+            {
+                error = ex as ConfigException;
+            }
+
+            t.Ok(error is not null, "an unreadable MQTT CA is reported as a configuration error");
+            t.Ok(error?.Problems.Any(p => p.Path == "northbound.mqtt.tls.caFile") == true,
+                "the error points at the CA file field");
+            t.Equal(versionBefore, runtime.ConfigVersion,
+                "a config refused before its side effects does not commit a version");
+            t.Equal(false, runtime.CurrentConfig.Northbound.Mqtt.Enabled,
+                "the running configuration keeps MQTT disabled");
+        }
+        finally
+        {
+            await runtime.DisposeAsync();
+        }
+    }
+
+    /// <summary>
+    /// 通道并发上限必须能热更新。`ChannelGate` 底层是 `SemaphoreSlim`，建好之后容量改不了，
+    /// 所以上限变化只能换一个新的闸门。原来的写法是 `GetOrAdd`：闸门已存在就原样返回，
+    /// 改小并发只在重启进程后才生效——配置写着 1、实际仍按 4 路并发打同一条串口/链路，
+    /// 这类「配置说一套、跑的是另一套」在现场极难发现，因为两边都没有报错。
+    ///
+    /// 用真实调度器 + 同通道两台设备：先确认上限 2 时确实会重叠（否则用例本身没测到东西），
+    /// 再把上限改成 1，确认重叠消失。
+    /// </summary>
+    private static async Task ChannelConcurrencyFollowsHotUpdate(TestContext t)
+    {
+        var driver = new OverlapDriver();
+
+        var registry = new DriverRegistry();
+        registry.Register(driver);
+
+        await using var engine = new Scheduler(
+            registry, new PointCache(), NullLoggerFactory.Instance,
+            new SchedulerOptions { Tick = TimeSpan.FromMilliseconds(10) });
+
+        engine.Start(TwoDeviceConfig(concurrency: 2));
+
+        // 先证明「上限 2 时真的会重叠」：不重叠的话后面那条断言毫无意义。
+        await WaitFor(t, () => driver.MaxInFlight >= 2, "two devices share the channel when the limit allows it");
+
+        // 换闸门的那一瞬间，旧闸门下还有在飞的读——它们不算新上限的证据。
+        // 先让这一轮走完再开始计量，否则测的是过渡期而不是稳态。
+        t.Equal(1, await PeakAfterApply(t, driver, engine, TwoDeviceConfig(concurrency: 1)),
+            "the new concurrency limit takes effect without a process restart");
+
+        // 改大同样要生效，否则「只能改小」还是个半成品。
+        t.Equal(2, await PeakAfterApply(t, driver, engine, TwoDeviceConfig(concurrency: 2)),
+            "raising the limit also takes effect");
+    }
+
+    /// <summary>
+    /// 应用一份配置，等旧闸门下的在飞读走完，再从零计量稳态并发峰值。
+    /// </summary>
+    private static async Task<int> PeakAfterApply(
+        TestContext t, OverlapDriver driver, Scheduler engine, ConfigDocument config)
+    {
+        await engine.ApplyAsync(config);
+
+        // 两轮读的时长（读本身 40ms）足以让旧闸门上的在飞请求落地。
+        await Task.Delay(150, t.Ct);
+
+        driver.ResetPeak();
+
+        for (var i = 0; i < 6; i++) await Task.Delay(50, t.Ct);
+
+        return driver.MaxInFlight;
+    }
+
+    private static ConfigDocument TwoDeviceConfig(int concurrency) => new()
+    {
+        SchemaVersion = 1,
+        Site = "lifecycle-site",
+        Channels = new List<Channel>
+        {
+            new()
+            {
+                Id = "ch",
+                Protocol = "overlap",
+                Transport = "none",
+                MaxConcurrency = concurrency,
+            },
+        },
+        Devices = new List<Device>
+        {
+            TwoDevice("d1"),
+            TwoDevice("d2"),
+        },
+    };
+
+    private static Device TwoDevice(string id) => new()
+    {
+        Id = id,
+        ChannelId = "ch",
+        Interval = TimeSpan.FromMilliseconds(50),
+        Points = new List<Point>
+        {
+            new()
+            {
+                Id = "p1",
+                Address = Address.Register("holding", 0),
+                DataType = DataType.UInt16,
+                Interval = TimeSpan.FromMilliseconds(50),
+            },
+        },
+    };
+
+    private static async Task WaitFor(TestContext t, Func<bool> condition, string what)
+    {
+        var clock = System.Diagnostics.Stopwatch.StartNew();
+        while (!condition() && clock.Elapsed < TimeSpan.FromSeconds(10))
+            await Task.Delay(10, t.Ct);
+
+        t.Ok(condition(), what);
+    }
+
+    /// <summary>
+    /// 记录「同时在读的最大路数」。读故意慢（40ms）：
+    /// 快到毫秒级的话并发窗口根本不会重叠，用例就成了摆设。
+    /// </summary>
+    private sealed class OverlapDriver : IDriver
+    {
+        private int _inFlight;
+        private int _peak;
+
+        public int MaxInFlight => Volatile.Read(ref _peak);
+
+        public void ResetPeak() => Interlocked.Exchange(ref _peak, 0);
+
+        public DriverMeta Meta { get; } = new()
+        {
+            Id = "overlap",
+            Name = "并发计数驱动",
+            Transports = new[] { "none" },
+            Roles = new[] { DriverRole.Master },
+        };
+
+        public IConn Open(OpenContext context) => new Conn(this);
+
+        private void Enter()
+        {
+            var now = Interlocked.Increment(ref _inFlight);
+
+            // CAS 抬高峰值：多路同时进入时不能互相覆盖。
+            int seen;
+            while (now > (seen = Volatile.Read(ref _peak)) &&
+                   Interlocked.CompareExchange(ref _peak, now, seen) != seen)
+            {
+            }
+        }
+
+        private void Leave() => Interlocked.Decrement(ref _inFlight);
+
+        private sealed class Conn : IConn
+        {
+            private readonly OverlapDriver _owner;
+
+            public Conn(OverlapDriver owner) => _owner = owner;
+
+            public Task ProbeAsync(CancellationToken ct) => Task.CompletedTask;
+
+            public async Task<IReadOnlyList<RawSample>> ReadAsync(
+                IReadOnlyList<ReadSpan> spans, CancellationToken ct)
+            {
+                _owner.Enter();
+                try
+                {
+                    await Task.Delay(40, ct).ConfigureAwait(false);
+
+                    return spans.SelectMany(s => s.Points)
+                        .Select(p => new RawSample(p.Id, DataValue.Number(p.DataType, 1), Quality.Good, null))
+                        .ToArray();
+                }
+                finally
+                {
+                    _owner.Leave();
+                }
+            }
+
+            public Task<IReadOnlyList<WriteResult>> WriteAsync(
+                IReadOnlyList<WriteCommand> commands, CancellationToken ct)
+                => throw new NotSupportedException("本用例只测读路径的并发");
+
+            public ValueTask DisposeAsync() => ValueTask.CompletedTask;
+        }
+    }
+
+    private static async Task WaitForRuntimeSamples(TestContext t, GatewayRuntime runtime, int count)
+    {
+        var clock = System.Diagnostics.Stopwatch.StartNew();
+        while (runtime.Engine.Cache.All().Count < count && clock.Elapsed < TimeSpan.FromSeconds(10))
+            await Task.Delay(20, t.Ct);
+
+        t.Ok(runtime.Engine.Cache.All().Count >= count,
+            $"expected {count} sample(s), got {runtime.Engine.Cache.All().Count}");
+    }
 
     private static async Task WaitForSamples(TestContext t, Scheduler engine, int count)
     {
