@@ -53,14 +53,43 @@ public sealed class MqttSink : IOutboxSink, IAsyncDisposable
 
     public async Task DeliverAsync(IReadOnlyList<OutboxRecord> batch, CancellationToken ct)
     {
+        await DeliverPartialAsync(batch, ct).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// 逐条发布并回报「实际送达 broker 的最后一条 id」。
+    ///
+    /// Outbox 按 at-least-once 工作：位点只在确认推进。若这里整批一起算成功，
+    /// 发到一半断连时已发到 broker 的那几条会被整批回退重发——订阅者收重复、
+    /// retained 被覆盖一遍。所以逐条发、逐条记，把真正送达的边界交回队列：
+    /// 发到一半失败时抛 <see cref="PartialDeliveryException"/>，让队列确认已送达部分、
+    /// 只对未送达部分重试。
+    /// </summary>
+    public async Task<long> DeliverPartialAsync(IReadOnlyList<OutboxRecord> batch, CancellationToken ct)
+    {
+        var lastId = -1L;
         foreach (var record in batch)
         {
             var (device, point, payload) = Parse(record.Payload);
             var topic = RenderTopic(device, point);
 
-            await _client.PublishAsync(topic, Encoding.UTF8.GetBytes(payload), _options.Retain, ct)
-                .ConfigureAwait(false);
+            try
+            {
+                await _client.PublishAsync(topic, Encoding.UTF8.GetBytes(payload), _options.Retain, ct)
+                    .ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                // 已发到 broker 的部分确认掉，未发的留给下一轮。断连只是传输问题，
+                // 重试即可，不算数据损坏。
+                throw new PartialDeliveryException(lastId,
+                    $"mqtt delivery stopped at record {lastId}: {ex.Message}", ex);
+            }
+
+            lastId = record.Id;
         }
+
+        return lastId;
     }
 
     public Task PublishBirthAsync(CancellationToken ct)

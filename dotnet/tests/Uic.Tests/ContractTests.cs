@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Globalization;
 using System.Net;
 using System.Net.Http.Headers;
 using System.Net.Http.Json;
@@ -47,6 +48,7 @@ internal static class ContractTests
     public static void Register(List<TestCase> tests)
     {
         tests.Add(new TestCase("contract/health_and_version_are_public", HealthAndVersionArePublic));
+        tests.Add(new TestCase("contract/health_reports_drops_in_the_last_hour", HealthReportsDropsInTheLastHour));
         tests.Add(new TestCase("contract/resource_pressure_degrades_health", ResourcePressureDegradesHealth));
         tests.Add(new TestCase("contract/apply_keeps_redacted_secrets", ApplyKeepsRedactedSecrets));
         tests.Add(new TestCase("contract/history_query_reads_journal", HistoryQueryReadsJournal));
@@ -66,6 +68,7 @@ internal static class ContractTests
         tests.Add(new TestCase("contract/single_point_write_is_idempotent", SinglePointWriteIsIdempotent));
         tests.Add(new TestCase("contract/idempotency_key_rejects_a_different_body", IdempotencyKeyRejectsADifferentBody));
         tests.Add(new TestCase("contract/idempotency_window_ignores_a_clock_jump", IdempotencyWindowIgnoresAClockJump));
+        tests.Add(new TestCase("contract/idempotency_ledger_is_per_runtime", IdempotencyLedgerIsPerRuntime));
         tests.Add(new TestCase("contract/template_instantiates_and_applies_devices", TemplateInstantiatesAndApplies));
         tests.Add(new TestCase("contract/points_csv_import_previews_and_applies", PointsCsvImportPreviewsAndApplies));
         tests.Add(new TestCase("contract/config_export_import_round_trip", ConfigExportImportRoundTrip));
@@ -82,6 +85,8 @@ internal static class ContractTests
         tests.Add(new TestCase("contract/auth_login_is_rate_limited", AuthLoginIsRateLimited));
         tests.Add(new TestCase("contract/auth_logout_revokes_session", AuthLogoutRevokesSession));
         tests.Add(new TestCase("contract/rate_limit_returns_429_with_the_shared_code", RateLimitReturns429));
+        tests.Add(new TestCase("contract/metrics_report_live_sse_connections", MetricsReportLiveSseConnections));
+        tests.Add(new TestCase("contract/stream_filters_by_point_pattern", StreamFiltersByPointPattern));
     }
 
     // ------------------------------------------------------------------
@@ -110,7 +115,8 @@ internal static class ContractTests
             TestContext t,
             Func<ConfigDocument>? config = null,
             bool tls = false,
-            TimeProvider? clock = null)
+            TimeProvider? clock = null,
+            string? dataDir = null)
         {
             // 配置里只有 ${env:UIC_CONTRACT_TOKEN}，真实值放进程环境：
             // 与现场「环境注入」走同一条解析路径，也让用例无法绕过明文校验。
@@ -167,10 +173,11 @@ internal static class ContractTests
 
             var options = new RuntimeOptions
             {
-                DataDir = t.TempDir,
+                DataDir = dataDir ?? t.TempDir,
                 GatewayVersion = "0.0.0-test",
                 Fallback = config ?? BuildConfig,
                 SchedulerOptions = clock is null ? null : new SchedulerOptions { Time = clock },
+                Clock = clock,
             };
 
             var runtime = await GatewayRuntime.CreateAsync(options, Drivers(), logs, ring, t.Ct);
@@ -239,7 +246,15 @@ internal static class ContractTests
     }
 
     /// <summary>最小配置：一台虚拟设备 + 一条启用了令牌的 REST 通道。</summary>
-    private static ConfigDocument BuildConfig() => new()
+    private static ConfigDocument BuildConfig() => WithMode("const");
+
+    /// <summary>
+    /// 与 <see cref="BuildConfig"/> 相同，只是把虚拟设备改成持续变化的正弦波形。
+    /// 死区判定只在值变化时产生样本：需要「订阅后不断有新样本」的用例必须用这个。
+    /// </summary>
+    private static ConfigDocument WaveConfig() => WithMode("sine");
+
+    private static ConfigDocument WithMode(string mode) => new()
     {
         SchemaVersion = 1,
         Site = "contract-site",
@@ -258,7 +273,7 @@ internal static class ContractTests
                 Interval = TimeSpan.FromMilliseconds(200),
                 Labels = new Dictionary<string, string>(StringComparer.Ordinal)
                 {
-                    ["mode"] = "const",
+                    ["mode"] = mode,
                     ["amplitude"] = "10",
                     ["baseline"] = "42",
                 },
@@ -372,6 +387,50 @@ internal static class ContractTests
             var metrics = await host.Client.GetAsync("/api/v1/metrics", t.Ct);
             t.Equal(HttpStatusCode.OK, metrics.StatusCode, "/api/v1/metrics status");
             t.Contains(await metrics.Content.ReadAsStringAsync(t.Ct), "# TYPE", "metrics are in Prometheus text format");
+        });
+    }
+
+    /// <summary>
+    /// `/api/v1/health` 的 `droppedLastHour` 必须是「最近一小时」，不是累计丢弃数。
+    ///
+    /// 累计值只会变大：一次磁盘打满之后接口会永久报同一个数，运维无法回答
+    /// 「现在还在丢吗」。这里用真实的 Outbox（小上限触发真实丢弃）、真实的 HTTP
+    /// 端点与可拨的单调时钟，而不是断言一个传进去的常量。
+    /// </summary>
+    private static Task HealthReportsDropsInTheLastHour(TestContext t)
+    {
+        return RunAsync(async () =>
+        {
+            var clock = new FakeClock();
+            var config = WithStorage(BuildConfig(), new StorageOptions
+            {
+                OutboxMaxRecords = 3,
+                OutboxFlushInterval = TimeSpan.FromMilliseconds(50),
+            });
+
+            await using var host = await Host.StartAsync(t, () => config, clock: clock);
+
+            // 投给一个没有 sink 的分区名：后台 flush 不会把它推走，计数是确定的。
+            for (var i = 0; i < 5; i++) host.Runtime.Outbox.Enqueue("unrouted", "x" + i);
+
+            using var fresh = await ReadJsonAsync(t, await host.Client.GetAsync("/api/v1/health", t.Ct));
+            var outbox = fresh.RootElement.GetProperty("outbox");
+
+            t.Equal(3L, outbox.GetProperty("pending").GetInt64(), "the queue is capped at three");
+            t.Equal(2L, outbox.GetProperty("droppedLastHour").GetInt64(),
+                "the two drops that just happened are reported");
+
+            // 单调时钟走一小时：窗口滑空，但累计值不变——两者的区别正是字段名的承诺。
+            clock.Advance(TimeSpan.Zero, TimeSpan.FromHours(1));
+
+            using var later = await ReadJsonAsync(t, await host.Client.GetAsync("/api/v1/health", t.Ct));
+            var laterOutbox = later.RootElement.GetProperty("outbox");
+
+            t.Equal(3L, laterOutbox.GetProperty("pending").GetInt64(), "pending is unchanged");
+            t.Equal(0L, laterOutbox.GetProperty("droppedLastHour").GetInt64(),
+                "drops older than an hour leave the window");
+            t.Equal(2L, host.Runtime.Outbox.Stats().DroppedTotal,
+                "the cumulative total still remembers the drops");
         });
     }
 
@@ -688,6 +747,26 @@ internal static class ContractTests
             t.Close(42, good.GetProperty("value").GetProperty("num").GetDouble(), 1e-9, "const waveform uses the baseline");
             t.Equal("°C", good.GetProperty("unit").GetString(), "unit comes from the config");
             t.Ok(good.GetProperty("seq").GetUInt64() > 0, "seq is assigned");
+
+            // 质量码写错不能返回空列表：200 + `items: []` 与「设备没有点位」完全一样，
+            // 调用方只能去翻配置才知道自己拼错了。
+            foreach (var path in new[] { "/api/v1/points?quality=gud", "/api/v1/devices/v1/points?quality=gud" })
+            {
+                using var invalid = await host.Client.SendAsync(Get(path), t.Ct);
+                t.Equal(HttpStatusCode.BadRequest, invalid.StatusCode,
+                    $"an unknown quality code is rejected on {path}");
+
+                using var error = await ReadJsonAsync(t, invalid);
+                t.Equal("request.invalid_parameter",
+                    error.RootElement.GetProperty("error").GetProperty("code").GetString(),
+                    "the error names the parameter");
+            }
+
+            // 合法过滤仍然照旧：good 有值、bad 为空。
+            using var filtered = await ReadJsonAsync(t, await host.Client.SendAsync(
+                Get("/api/v1/points?quality=good"), t.Ct));
+            t.Ok(filtered.RootElement.GetProperty("items").GetArrayLength() >= 1,
+                "a known quality code still filters normally");
         });
     }
 
@@ -1475,6 +1554,67 @@ internal static class ContractTests
                 PostWithKey("/api/v1/points/v1/temp/write", body, key), t.Ct);
             t.Equal("false", afterWindow.Headers.GetValues("X-Idempotent-Replay").Single(),
                 "past the real window the same key is executed again");
+        });
+    }
+
+    /// <summary>
+    /// 幂等台账必须随运行时实例走，不能是进程级静态字典。
+    ///
+    /// 台账里记的是「首次写入时的单调时刻」，只能与**同一个**单调时钟相减。
+    /// 静态字典会让同一进程里新起的运行时读到上一个运行时的条目：两个时钟读数
+    /// 相减是负数，`elapsed &lt; window` 永远成立，于是重投被判成重放、返回的是
+    /// 另一台网关、另一批设备的首次响应——而设备一次都没被写过。
+    /// 现场症状是「换完配置点写按钮没反应」，而日志、审计、接口返回值全都正常。
+    ///
+    /// 这里刻意让两个运行时的单调时钟相隔一天（模拟前一实例被替换后新实例刚启动，
+    /// 或用例/嵌入式场景在同一个宿主进程里先后起两套运行时），并让第二套使用
+    /// 同名的设备与点位——这正是静态字典最容易串味的情形。
+    /// </summary>
+    private static Task IdempotencyLedgerIsPerRuntime(TestContext t)
+    {
+        return RunAsync(async () =>
+        {
+            const string body = """
+                                { "value": { "type": "float64", "num": 71.5 } }
+                                """;
+            const string key = "shared-ledger-key";
+
+            // 第一套运行时：单调时钟已经跑了一小时（进程里先起的那个实例）。
+            var early = new FakeClock();
+            early.Advance(TimeSpan.Zero, TimeSpan.FromHours(1));
+
+            await using (var first = await Host.StartAsync(t, clock: early))
+            {
+                await WaitForPointAsync(first, "v1", "temp", t);
+
+                var accepted = await first.Client.SendAsync(
+                    PostWithKey("/api/v1/points/v1/temp/write", body, key), t.Ct);
+
+                t.Equal(HttpStatusCode.OK, accepted.StatusCode, "the first runtime accepts the write");
+                t.Equal("false", accepted.Headers.GetValues("X-Idempotent-Replay").Single(),
+                    "the first runtime executes the write");
+            }
+
+            // 第二套运行时的单调时钟刚从 0 起算（真实场景里两套运行时的单调基准
+            // 本来就毫无关系，新的那个通常更小）。进程级字典会拿它们相减。
+            var later = new FakeClock();
+
+            await using var second = await Host.StartAsync(t, clock: later, dataDir: t.TempDir + "-second");
+            await WaitForPointAsync(second, "v1", "temp", t);
+
+            var fresh = await second.Client.SendAsync(
+                PostWithKey("/api/v1/points/v1/temp/write", body, key), t.Ct);
+
+            t.Equal(HttpStatusCode.OK, fresh.StatusCode, "the second runtime accepts the write");
+            t.Equal("false", fresh.Headers.GetValues("X-Idempotent-Replay").Single(),
+                "a key used against another runtime must not be treated as a replay");
+
+            // 第二套自己的重投仍然要被判成重放：修的是串台，不是把幂等关掉。
+            var repeat = await second.Client.SendAsync(
+                PostWithKey("/api/v1/points/v1/temp/write", body, key), t.Ct);
+
+            t.Equal("true", repeat.Headers.GetValues("X-Idempotent-Replay").Single(),
+                "the second runtime still replays its own repeats");
         });
     }
 
@@ -2465,6 +2605,173 @@ internal static class ContractTests
             t.Equal("admin", entry.GetProperty("actor").GetString(),
                 "logout is audited against the account that logged out");
         });
+    }
+
+    private static Task MetricsReportLiveSseConnections(TestContext t)
+    {
+        return RunAsync(async () =>
+        {
+            RestApi.ResetRateLimitersForTests();
+            await using var host = await Host.StartAsync(t);
+
+            // 连一条真实的 SSE 流：读响应头就返回，服务端此时已经建立订阅。
+            using var request = new HttpRequestMessage(HttpMethod.Get, "/api/v1/stream?heartbeat=30");
+            request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", Token);
+            request.Headers.Accept.ParseAdd("text/event-stream");
+
+            using var response = await host.Client.SendAsync(
+                request, HttpCompletionOption.ResponseHeadersRead, t.Ct);
+
+            t.Equal(HttpStatusCode.OK, response.StatusCode, "the stream is established");
+
+            // 先读一条 hello：确认服务端确实走到了订阅之后的那一步，而不是只回了响应头。
+            await using var stream = await response.Content.ReadAsStreamAsync(t.Ct);
+            using var reader = new StreamReader(stream);
+            var hello = await reader.ReadLineAsync(t.Ct);
+            t.Contains(hello ?? "", "event: hello", "the stream starts with hello");
+
+            // 指标必须反映真实连接数。写死成常量 0 时，看板会一直显示「没有订阅者」，
+            // 而实际上连接已经接近 50 上限 —— 这条路径正是运维判断「该扩容还是该排障」的依据。
+            var metrics = await host.Client.GetStringAsync("/api/v1/metrics", t.Ct);
+            var line = metrics.Split('\n').FirstOrDefault(l => l.StartsWith("uic_sse_connections ", StringComparison.Ordinal));
+
+            t.Ok(line is not null, "the gauge is exported");
+            var value = double.Parse(line!.Split(' ')[1], CultureInfo.InvariantCulture);
+            t.Equal(1d, value, "the gauge counts the live stream");
+        });
+    }
+
+    private static Task StreamFiltersByPointPattern(TestContext t)
+    {
+        return RunAsync(async () =>
+        {
+            RestApi.ResetRateLimitersForTests();
+
+            // 用正弦波形而不是默认的 const：值不变时死区判定不产生样本，
+            // 订阅建立后一条都不会来，用例会误报成「过滤失败」。
+            await using var host = await Host.StartAsync(t, WaveConfig);
+
+            // 订阅表达式是 `device/point`（产品规格与 UI 都用 `/`）。设备 id 本身允许包含
+            // `.`（`^[a-z0-9][a-z0-9._-]{0,63}$`），所以分隔符不能是点：`meter-1.v2.temp`
+            // 这种 id 用点分隔时根本切不开，只能整串当设备名去比，永远匹配不上。
+            using var subscription = await OpenStreamAsync(t, host, "/api/v1/stream?points=v1/temp&heartbeat=30");
+
+            var samples = await ReadSamplesAsync(t, subscription, TimeSpan.FromSeconds(10), wanted: 1);
+
+            t.Ok(samples.Count >= 1, "the filtered stream delivers at least one sample");
+            foreach (var sample in samples)
+                t.Equal("temp", sample.Point, "only the subscribed point is delivered");
+
+            // 不匹配的模式也必须建立成功（200 + hello），但收不到该点位的样本。
+            using var other = await OpenStreamAsync(t, host, "/api/v1/stream?points=v1/nosuchpoint&heartbeat=30");
+            var none = await ReadSamplesAsync(t, other, TimeSpan.FromSeconds(2), wanted: 1);
+            t.Equal(0, none.Count, "a pattern that matches nothing delivers no samples");
+
+            // 质量码拼错不能建出一条永远不出样本的空流：那与「设备没数据」在客户端
+            // 看来完全一样，而 hello 与心跳都正常，没有任何线索。
+            //
+            // 用 ResponseHeadersRead 发：拒绝时立刻拿到 400；若没有校验，这里会拿到
+            // 200 + 一个不会自己结束的流——那正是要抓住的症状。
+            using var invalidRequest = Get("/api/v1/stream?quality=gud");
+            invalidRequest.Headers.Accept.ParseAdd("text/event-stream");
+            using var invalid = await host.Client.SendAsync(
+                invalidRequest, HttpCompletionOption.ResponseHeadersRead, t.Ct);
+
+            t.Equal(HttpStatusCode.BadRequest, invalid.StatusCode,
+                "an unknown quality code is rejected instead of silently filtering everything out");
+
+            using var body = await ReadJsonAsync(t, invalid);
+            t.Equal("request.invalid_parameter",
+                body.RootElement.GetProperty("error").GetProperty("code").GetString(),
+                "the error names the parameter");
+        });
+    }
+
+    private static async Task<StreamSubscription> OpenStreamAsync(TestContext t, Host host, string path)
+    {
+        var request = new HttpRequestMessage(HttpMethod.Get, path);
+        request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", Token);
+        request.Headers.Accept.ParseAdd("text/event-stream");
+
+        var response = await host.Client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, t.Ct);
+        t.Equal(HttpStatusCode.OK, response.StatusCode, $"the stream {path} is established");
+
+        var stream = await response.Content.ReadAsStreamAsync(t.Ct);
+        return new StreamSubscription(response, stream, new StreamReader(stream));
+    }
+
+    /// <summary>读到够数量或超时为止。SSE 是长连接，不能等流自己结束。</summary>
+    private static async Task<List<SampleDto>> ReadSamplesAsync(
+        TestContext t, StreamSubscription subscription, TimeSpan timeout, int wanted)
+    {
+        var samples = new List<SampleDto>();
+        using var limit = CancellationTokenSource.CreateLinkedTokenSource(t.Ct);
+        limit.CancelAfter(timeout);
+
+        string? type = null;
+        StringBuilder? data = null;
+
+        try
+        {
+            while (samples.Count < wanted && !limit.IsCancellationRequested)
+            {
+                var line = await subscription.Reader.ReadLineAsync(limit.Token);
+
+                // 流被服务端关掉时返回 null：按「读到这里」处理，断言交给调用方。
+                if (line is null) break;
+
+                if (line.Length == 0)
+                {
+                    if (type == "sample" && data is not null)
+                    {
+                        samples.Add(JsonSerializer.Deserialize<SampleDto>(data.ToString(), JsonDefaults.Options)!);
+                    }
+
+                    type = null;
+                    data = null;
+                    continue;
+                }
+
+                if (line.StartsWith("event:", StringComparison.Ordinal))
+                {
+                    type = line["event:".Length..].Trim();
+                    data = new StringBuilder();
+                }
+                else if (line.StartsWith("data:", StringComparison.Ordinal) && data is not null)
+                {
+                    if (data.Length > 0) data.Append('\n');
+                    data.Append(line["data:".Length..].Trim());
+                }
+            }
+        }
+        catch (OperationCanceledException) when (limit.IsCancellationRequested)
+        {
+            // 超时：把已经收到的样本交回去，由调用方断言数量。
+        }
+
+        return samples;
+    }
+
+    private sealed class StreamSubscription : IDisposable
+    {
+        private readonly HttpResponseMessage _response;
+
+        public StreamSubscription(HttpResponseMessage response, Stream stream, StreamReader reader)
+        {
+            _response = response;
+            Stream = stream;
+            Reader = reader;
+        }
+
+        public Stream Stream { get; }
+        public StreamReader Reader { get; }
+
+        public void Dispose()
+        {
+            Reader.Dispose();
+            Stream.Dispose();
+            _response.Dispose();
+        }
     }
 
     private static Task RunAsync(Func<Task> body) => body();

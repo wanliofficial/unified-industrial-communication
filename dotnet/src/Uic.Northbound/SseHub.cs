@@ -21,6 +21,24 @@ public sealed class SseHub
 {
     private const int DefaultBufferPerConnection = 1000;
 
+    /// <summary>
+    /// 契约里允许的质量码，与 <see cref="JsonEnum.ToWire(Quality)"/> 一一对应。
+    ///
+    /// 未知值必须在建流之前拒绝：过滤器不匹配时流照样建立、`hello` 照样来、
+    /// 心跳照样跳，只是永远没有样本——客户端没有任何线索，只能以为「设备没数据」。
+    /// 这与「游标非法返回 400 而不是静默回到第一页」是同一条原则。
+    /// </summary>
+    private static readonly string[] KnownQualities =
+    {
+        "good", "uncertain", "stale", "bad", "timeout", "comm_error", "address_error",
+        "not_connected", "disabled",
+    };
+
+    public static IReadOnlyList<string> Qualities => KnownQualities;
+
+    public static bool IsKnownQuality(string quality)
+        => Array.Exists(KnownQualities, q => string.Equals(q, quality, StringComparison.OrdinalIgnoreCase));
+
     private readonly List<Subscriber> _subscribers = new();
     private readonly ConcurrentDictionary<(string Device, string Point), Quality> _lastQuality = new();
     private readonly object _lock = new();

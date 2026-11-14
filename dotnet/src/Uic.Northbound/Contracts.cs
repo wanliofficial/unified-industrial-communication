@@ -51,8 +51,19 @@ public sealed record NorthboundContext(
     IResourceStatusSource? Resources = null,
     JournalHistory? History = null,
     AuditLog? Audit = null,
-    AuthService? Auth = null);
-
+    AuthService? Auth = null,
+    IdempotencyCache? Idempotency = null)
+{
+    /// <summary>
+    /// 写入幂等台账。刻意不做成 <c>RestApi</c> 上的 <c>static</c> 字段：
+    /// 台账里记的是「首次写入时刻的单调时刻」，而这个时刻只能与**同一个**单调时钟
+    /// 相减。进程级静态字典会让第二个运行时读到第一个运行时的条目，
+    /// 拿两套时钟做减法（差值为负）后 `elapsed &lt; window` 恒成立，
+    /// 重投永远被判成重放，返回的还是另一套配置、另一批设备的首次响应。
+    /// 由运行时持有并传进来，保证「台账」与「时钟」一一对应。
+    /// </summary>
+    public IdempotencyCache Writes { get; } = Idempotency ?? new IdempotencyCache();
+}
 /// <summary>业务错误。统一由中间件渲染成契约里的 error 信封。</summary>
 public sealed class ApiException : Exception
 {
@@ -105,3 +116,56 @@ public sealed record DependencyCheck(string Name, bool Ok, string? Detail = null
 /// </para>
 /// </summary>
 public sealed record IdempotentResponse(string Body, long MonoAt, string Fingerprint);
+
+/// <summary>
+/// 写入幂等台账：key → 首次响应，窗口 5 分钟。
+///
+/// 为什么是一个有实例的对象而不是 <c>RestApi</c> 上的静态字典：条目里的
+/// <see cref="IdempotentResponse.MonoAt"/> 只在**产出它的那个单调时钟**上可解释。
+/// 静态字典让同一进程里的第二个运行时读到第一个运行时的条目，两个时钟的读数
+/// 相减是负数，`elapsed &lt; window` 永远成立——重投被判成重放，返回的还是另一套
+/// 配置、另一批设备的首次响应，而设备上一次都没被写过。现场表现为「换了配置之后
+/// 点写按钮没反应」，日志、审计、接口返回值全都正常。
+///
+/// 台账随运行时一起生死，与它记的时钟同源，这个错误就无从发生。
+/// </summary>
+public sealed class IdempotencyCache
+{
+    /// <summary>键的数量由调用方决定，必须有上限；超过就清掉过窗的条目。</summary>
+    private const int MaxEntries = 1024;
+
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<string, IdempotentResponse> _entries =
+        new(StringComparer.Ordinal);
+
+    internal int Count => _entries.Count;
+
+    internal bool TryGet(string key, long monoNow, long window, out IdempotentResponse cached)
+    {
+        if (_entries.TryGetValue(key, out var entry) && monoNow - entry.MonoAt < window)
+        {
+            cached = entry;
+            return true;
+        }
+
+        cached = null!;
+        return false;
+    }
+
+    internal void Store(string key, string body, long monoNow, string fingerprint)
+    {
+        _entries[key] = new IdempotentResponse(body, monoNow, fingerprint);
+
+        if (_entries.Count > MaxEntries) Prune(monoNow);
+    }
+
+    private void Prune(long monoNow)
+    {
+        foreach (var (key, entry) in _entries)
+        {
+            if (monoNow - entry.MonoAt >= IdempotencyWindowTicks) _entries.TryRemove(key, out _);
+        }
+    }
+
+    /// <summary>幂等窗口长度。5 分钟足够覆盖客户端超时重试，又不会让缓存无限增长。</summary>
+    internal static readonly long IdempotencyWindowTicks = TimeSpan.FromMinutes(5).Ticks;
+}

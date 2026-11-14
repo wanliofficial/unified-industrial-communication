@@ -191,7 +191,7 @@ Configured ──start──► Connecting ──probe ok──► Collecting
 
 ## 观测
 
-- `/api/v1/metrics` 输出 Prometheus 文本：采集次数、失败按错误分类、样本发布、队列积压与丢弃；
+- `/api/v1/metrics` 输出 Prometheus 文本：采集次数、失败按错误分类、样本发布、队列积压（`uic_outbox_pending`）；
 - `/api/v1/logs` 读环形缓冲（默认 2000 条），支持按级别、分类、设备过滤；
 - `/api/v1/diagnostics/bundle` 打包配置、日志、指标与环境信息，便于贴工单；
 - 启动顺序固定：**先读配置（失败就别启动）→ 起采集 → 起北向**，

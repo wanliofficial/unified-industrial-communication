@@ -684,7 +684,8 @@ Broker 侧已经做了网络隔离或 ACL。即便打开，`config.rollback` 与
 | `audit.retain` | `6` | 最多保留几份（含当前文件），范围 `1..1000` |
 | `audit.directory` | `audit` | 相对 `dataDir` 的子目录；也接受绝对路径 |
 
-超限时丢最旧的并计数，`/api/v1/health` 与指标里都能看到丢弃数。
+超限时丢最旧的：`/api/v1/health` 的 `outbox.droppedLastHour` 是最近一小时的丢弃数，
+滑出窗口就归零。累计值不进健康接口——只增不减的数无法回答「现在还在丢吗」。
 
 ### 审计
 

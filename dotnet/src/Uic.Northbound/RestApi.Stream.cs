@@ -23,6 +23,14 @@ public static partial class RestApi
                 : rawPoints.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
 
             var quality = http.Request.Query["quality"].FirstOrDefault();
+
+            // 未知质量码必须在建流之前拒绝，而不是建一条永远不出样本的空流：
+            // 空流的 hello 与心跳都正常，客户端分不清「过滤写错了」和「设备没数据」。
+            if (!string.IsNullOrWhiteSpace(quality) && !SseHub.IsKnownQuality(quality))
+                throw ApiException.BadRequest(
+                    "request.invalid_parameter",
+                    $"'quality' must be one of: {string.Join(", ", SseHub.Qualities)}");
+
             var heartbeat = ParseInt(http.Request.Query["heartbeat"], 15);
             if (heartbeat is < 1 or > 300)
                 throw ApiException.BadRequest("request.invalid_parameter", "heartbeat must be 1..300 seconds");

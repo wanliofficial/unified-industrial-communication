@@ -24,7 +24,8 @@ public sealed record HistoryResult(IReadOnlyList<SampleDto> Items, int Total);
 /// 1. 原始字节按行扫描，先用固定形状的快路径只取「时间 + 身份 + 序号」，
 ///    只有最终会被返回的行才走完整解析——降采样时上百万行里通常只有几万行需要物化；
 /// 2. 设备/点位不匹配时立刻放弃，常见过滤只读三个字段；
-/// 3. 按 <c>(device, point, seq)</c> 去重——Outbox 是至少一次投递，重放会写出重复行；
+/// 3. 按 <c>(device, point, collectedAt, seq)</c> 去重——Outbox 是至少一次投递，重放会写出重复行；
+///    键里必须带采集时间：序号在进程重启后会从头开始，只用序号去重会把重启用后的真实样本一起吞掉；
 /// 4. 可选按时间桶降采样，每个点位每桶只保留最后一条。
 ///
 /// 保留策略仍是 journal 文件的策略：没有自动滚动清理，数据量上来后应换时序库，
@@ -58,8 +59,14 @@ public sealed class JournalHistory
         // 重放去重只在「原样返回每一行」时才需要单独一张表：
         // 降采样下重复行的 (设备, 点位, 时间, 序号) 完全相同，选胜出者时比不过已有值，
         // 天然不会重复输出。省掉这张 100 万条的表，扫描能快三分之一。
-        HashSet<(int Device, int Point, ulong Seq)>? seen =
-            buckets is null ? new HashSet<(int, int, ulong)>() : null;
+        //
+        // 键里必须带采集时间，不能只用 (设备, 点位, 序号)：序号是 PointCache 的
+        // 内存计数器，进程重启或设备被热更新重建后从 1 重新开始，而 journal 是跨重启
+        // 追加的。只按序号去重会把「重启后序号恰好相同的另一条真实样本」当成重放吞掉——
+        // 设备重启一次，之后的历史就再也查不出来了。重放写出的是同一行，
+        // 连采集时间也相同，所以带上时间既能去重也不会误杀。
+        HashSet<(int Device, int Point, long Ticks, ulong Seq)>? seen =
+            buckets is null ? new HashSet<(int, int, long, ulong)>() : null;
 
         var deviceFilter = query.Device is null ? default : Encoding.UTF8.GetBytes(query.Device);
         var pointFilter = query.Point is null ? default : Encoding.UTF8.GetBytes(query.Point);
@@ -131,7 +138,8 @@ public sealed class JournalHistory
 
                     var deviceId = names.Intern(fallback.Device);
                     var pointId = names.Intern(fallback.Point);
-                    if (seen is not null && !seen.Add((deviceId, pointId, fallback.Seq))) continue;
+                    if (seen is not null &&
+                        !seen.Add((deviceId, pointId, fallback.CollectedAt.UtcTicks, fallback.Seq))) continue;
 
                     if (buckets is null)
                     {
@@ -161,7 +169,7 @@ public sealed class JournalHistory
 
                 // 至少一次投递：重放会写出完全重复的行。原样返回时按身份去重；
                 // 降采样时重复行自然选不上（见上面 seen 的说明）。
-                if (seen is not null && !seen.Add((devId, ptId, row.Seq))) continue;
+                if (seen is not null && !seen.Add((devId, ptId, row.Ticks, row.Seq))) continue;
 
                 if (buckets is null)
                 {

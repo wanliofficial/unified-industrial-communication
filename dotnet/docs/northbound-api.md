@@ -233,6 +233,11 @@ MQTT 的 TLS 是独立开关（`northbound.mqtt.tls`），语义见
 `workingSetBytes` 为 `null` 表示平台读不到该项，不是 0。资源告急不会把已经
 `faulted` 的设备状态掩盖成 `degraded`——故障优先。
 
+`outbox.droppedLastHour` 是**最近一小时**的丢弃数（按分钟分桶的滑动窗口，单调时钟），
+不是进程启动以来的累计值：累计值只会变大，一次磁盘打满之后接口会永久报同一个数，
+运维无法回答「现在还在丢吗」。窗口只在内存里，进程重启后从 0 重新累计——
+判断「当前是否仍在丢」看 `pending` 与这个窗口就够了。
+
 ### 驱动
 
 | 方法 | 路径 | 说明 |
@@ -408,6 +413,8 @@ MQTT 的 TLS 是独立开关（`northbound.mqtt.tls`），语义见
 列表查询支持 `limit`（1..1000，默认 100）与 `cursor`。
 
 设备列表另支持 `q`（按 id / 名称过滤）；点位列表支持 `device`、`quality`、`q`。
+`quality` 必须是契约里的九个质量码之一，未知值返回 `400 request.invalid_parameter`——
+静默返回空列表的话，`items: []` 与「这台设备确实没有点位」无法区分。
 
 设备摘要里 `configuredState` 与 `runtimeState` 是**两件事**，必须分开看：
 
@@ -535,6 +542,9 @@ MQTT 的 TLS 是独立开关（`northbound.mqtt.tls`），语义见
   以为新值已经写进设备，而那次写入从未发生。键被复用到别的请求上通常是调用方
   拼接 id 的 bug，必须让它立刻暴露，所以这里选择报错而不是「最后一次为准」；
 - 幂等作用域是 `设备 + 单点/批量 + key`，同一个 key 用在另一个点位上不会被误判为重放。
+  台账随运行时实例走（不是进程级静态表）：条目里的单调时刻只能与产出它的时钟相减，
+  拿两个运行时的读数相减是负数，会让新实例把重投当成重放、返回另一台网关的结果。
+  台账在内存里，进程重启即清空——需要跨重启幂等时把键换成业务幂等键。
 
 ### 点表导入（CSV）
 
@@ -643,7 +653,11 @@ MQTT 的 TLS 是独立开关（`northbound.mqtt.tls`），语义见
 - 数据源是 `storage.journal` 的 NDJSON；没开 journal 时返回空页而不是 404。
 - 顺序固定为 `collectedAt` 升序，再按设备/点位/序号排序；journal 只追加，
   因此分页游标在查询期间是稳定的。
-- 同一 `(device, point, seq)` 只返回一次：Outbox 是至少一次投递，重放会写出重复行。
+- 同一 `(device, point, collectedAt, seq)` 只返回一次：Outbox 是至少一次投递，重放会写出重复行。
+  键里带采集时间而不能只用序号：序号是 `PointCache` 的内存计数器，进程重启或设备被热更新
+  重建后从 1 重新开始，而 journal 跨重启追加 —— 只按序号去重会把重启后的真实样本当成重放吞掉，
+  表现为「设备重启一次，之后的历史再也查不出来」。重放写出的是同一行，连时间也相同，
+  因此带上时间既能去重也不会误杀。
 - 掉电留下的半行会跳过，不影响同文件里其它样本。
 - 读取分两段：先用字节扫描只取「时间 + 设备 + 点位 + 序号」，做过滤、去重与选桶；
   扫描结束后按文件偏移回读胜出行，才做完整 JSON 解析。所以 `interval` 降采样时
@@ -732,6 +746,10 @@ MQTT 的 TLS 是独立开关（`northbound.mqtt.tls`），语义见
   `source` 区分 `rest` / `mqtt`，MQTT 命令当前没有身份，同为 `anonymous`。
 - 查询是全量扫描文件后过滤（按文件名日期先做一次粗筛），适合「最近几天」的量级；
   需要长期归档时应把文件转到外部存储。
+- 审计是「最新在前」，游标是一个偏移量。偏移量分页在**写入并发时并不稳定**：翻页期间
+  每落一条新记录，整列就向后移一位，用 `nextCursor` 连续翻会重复看到边界那条、漏掉中间那条。
+  这与历史查询不同（历史按 `collectedAt` 升序、journal 只追加，游标天然稳定）。
+  需要「不重不漏」地导全量审计时走 `export` 一次性导出，而不是翻页。
 
 ### 配置
 
@@ -851,13 +869,23 @@ MQTT 的 TLS 是独立开关（`northbound.mqtt.tls`），语义见
 
 ## SSE
 
-`GET /api/v1/stream?points=meter-1.voltage,meter-2.*&quality=good&heartbeat=15`
+`GET /api/v1/stream?points=meter-1/voltage,meter-2/*&quality=good&heartbeat=15`
 
 | 参数 | 说明 |
 |---|---|
-| `points` | 逗号分隔的 `device.point` 模式，支持结尾 `*`；省略表示全部 |
-| `quality` | 只推送指定质量（`good` / `timeout` …） |
+| `points` | 逗号分隔的 `device/point` 模式；两段都支持 `*`（`meter-2/*`、`*/voltage`）；省略表示全部 |
+| `quality` | 只推送指定质量（`good` / `timeout` …）。未知值返回 400，见下 |
 | `heartbeat` | 心跳间隔秒数，1..300，默认 15 |
+
+分隔符是 `/` 而不是 `.`：设备与点位 id 都允许包含点（`^[a-z0-9][a-z0-9._-]{0,63}$`），
+用点分隔时 `meter-1.v2` 这种设备名和「设备 + 点位」无法区分，只能整串当成设备名去比，
+永远匹配不上。写错分隔符不会报错——流照样建立、`hello` 照样来，只是永远没有样本，
+所以客户端要拿 `hello` 里的 `filters` 回显核对订阅表达式是否被原样接受。
+
+`quality` 写错则相反：未知质量码在建流之前就返回 400 `request.invalid_parameter`，
+响应里列出全部合法值（`good` / `uncertain` / `stale` / `bad` / `timeout` / `comm_error` /
+`address_error` / `not_connected` / `disabled`）。允许它建流的话，得到的是一条
+hello 正常、心跳正常、永不出一帧的空流——客户端无法区分「过滤写错了」与「设备没数据」。
 
 事件类型：
 
@@ -895,6 +923,8 @@ MQTT 的 TLS 是独立开关（`northbound.mqtt.tls`），语义见
 - 停机时发 `$death` 并把遗嘱（LWT）也指向它，这样「进程被 kill」与「正常退出」
   在订阅端看起来一致；
 - 投递失败直接抛给 `Outbox` 保留位点重试 —— 这一层只负责「发出去并拿到 PUBACK」，不负责「不丢」；
+  逐条发布、把「本批实际送达到哪一条」报回队列（正常返回末条 id，中途断连抛 `PartialDeliveryException`），
+  这样发到一半 broker 掉线时，已发到对端的记录不会被整批重发；
 - QoS1 的发布只有收到 PUBACK 才返回，3 s 内等不到就抛 `TimeoutException`；
   QoS0 发完即返回（丢一条不会卡住位点），因此对可靠性有要求的现场必须用 QoS1；
 - 连接空闲时按 keepalive 的一半发 PINGREQ：只声明 keepalive 而不发心跳，

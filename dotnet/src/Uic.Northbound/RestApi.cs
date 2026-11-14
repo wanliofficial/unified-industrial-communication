@@ -24,15 +24,16 @@ public static partial class RestApi
     private static volatile RateLimiter ReadLimiter = new(capacity: 100, refillPerSecond: 100);
     private static volatile RateLimiter WriteLimiter = new(capacity: 10, refillPerSecond: 10);
 
-    /// <summary>写入幂等窗口：key → 首次响应。5 分钟足够覆盖「客户端超时重试」，又不会无限增长。</summary>
-    private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, IdempotentResponse> Idempotency =
-        new(StringComparer.Ordinal);
-
     /// <summary>装配全部端点，并把 SSE 接到采集链路上。</summary>
     public static WebApplication UseNorthbound(this WebApplication app, NorthboundContext ctx)
     {
         var hub = new SseHub();
         ctx.Engine.Cache.Subscribe(hub.Publish);
+
+        // 连接数只有 hub 自己知道，指标必须在这里注册：放在 GatewayRuntime 里
+        // 只能读到 hub 不存在时的常量 0，运维会看到「一条流都没连」而实际上已连满。
+        ctx.Metrics.Gauge("uic_sse_connections", () => hub.ConnectionCount,
+            "active SSE streams");
 
         app.Use(async (http, next) =>
         {
@@ -302,7 +303,10 @@ public static partial class RestApi
     internal static HealthDto BuildHealth(NorthboundContext ctx)
     {
         var stats = ctx.Outbox.Stats();
-        var engineHealth = ctx.Engine.Health(stats.Pending, stats.DroppedTotal);
+
+        // 报「最近一小时」而不是累计值：累计值只会变大，一次磁盘打满之后健康接口
+        // 会永久显示正在丢弃，运维分不清「现在还在丢」和「早就恢复了」。
+        var engineHealth = ctx.Engine.Health(stats.Pending, stats.DroppedLastHour);
         var resourceStatus = ctx.Resources?.Status;
 
         var problems = ctx.Engine.Actors
@@ -344,7 +348,7 @@ public static partial class RestApi
                 engineHealth.PointsGood,
                 engineHealth.PointsStale,
                 engineHealth.PointsBad),
-            new OutboxHealthDto(stats.Pending, stats.DroppedTotal),
+            new OutboxHealthDto(stats.Pending, stats.DroppedLastHour),
             problems,
             resourceStatus is null
                 ? null

@@ -232,6 +232,16 @@
   日志、审计、接口返回值三者都说写成功了。键被复用到另一个请求上通常是调用方
   拼接 id 的 bug，选择报错而不是「最后一次为准」，是为了让它立刻暴露。
   已有的行为保持不变：同一份请求体重投仍然原样重放（那才是幂等键的用途）。
+  幂等键绑定的不只是请求体，还包括**运行时实例**：台账里存的是「首次写入时刻的
+  单调时刻」，这个数只在产出它的那个单调时钟上可解释。做成 `RestApi` 上的静态字段
+  会让同一进程里新起的运行时读到上一个运行时的条目——两个时钟读数相减是负数，
+  `elapsed < window` 永远成立，重投被判成重放，返回的是另一套配置、另一批设备的
+  首次响应，而设备一次都没被写过。现场症状是「换完配置后点写按钮没反应」，
+  而日志、审计、接口返回值三者全都正常，与上面那条 409 同属「假成功」家族。
+  现在台账由 `NorthboundContext.Writes`（`IdempotencyCache`）持有，与它记的时钟同源。
+  用例 `contract/idempotency_ledger_is_per_runtime`（让第二个运行时的单调时钟更小，
+  还原成静态字典后 FAIL：`a key used against another runtime must not be treated as a
+  replay: expected <"false">, got <"true">`）。
 - **分页游标不合法时报 400，不「当成从头开始」。** 游标对调用方是不透明串，
   服务端只认自己发出的那个形式。静默回落成 `offset=0` 会重新发一遍第一页，
   而 HTTP 仍是 200：客户端要么看到「整页重复」，要么按自己的去重逻辑跳过一页，
@@ -315,6 +325,70 @@
   用例 `lifecycle/channel_concurrency_follows_hot_update`（保留旧的 `GetOrAdd` 后 FAIL：
   `the new concurrency limit takes effect without a process restart: expected <1>, got <2>`），
   前半段先证明「上限 2 时两台设备确实会重叠」，否则后半段的断言测不到东西。
+- **历史去重键必须带采集时间，不能只用序号。** 去重的本意是「Outbox 至少一次投递，
+  同一行会被重放一次」。而 `seq` 是 `PointCache` 的内存计数器：进程重启、或设备被热更新
+  重建（`RemoveDevice` 清掉 `_seq`）之后从 1 重新开始——`cache/remove_device_clears_state`
+  正是把「重新加回来时 seq 从 1 开始」当作正确行为钉住的。journal 却跨重启追加。
+  两者一叠：只按 `(device, point, seq)` 去重会把重启后「序号恰好相同」的另一条真实样本
+  判成重放吞掉，表现为**设备重启一次，之后的历史就再也查不出来**，而且接口 200、
+  没有错误、没有计数。重放写出的是字节相同的同一行（连 `collectedAt` 也一样），
+  所以键里带上采集时间既能去掉真正的重复，也不会误杀重启后的新数据。
+  用例 `history/keeps_samples_after_seq_restarts`（修复前 FAIL：
+  `a seq restart must not swallow the newer samples: expected <4>, got <2>`）。
+- **「整批成功才推进位点」对逐条发送的 sink 太粗，必须允许它回报部分送达。** Outbox 的
+  语义是 at-least-once：位点只在确认后前进，宁可重复不可丢——这条没错。但「批」指的是队列
+  切给 sink 的那一段，不是 sink 内部的循环。`MqttSink` 是一条条 `PublishAsync`：发到一半
+  broker 断连时，已发到对端的那几条会被整批回退、下一轮从头重发，订阅者收重复、retained
+  被覆盖一遍。修复是让 sink 能报出「本批实际送达到最后一条」（正常返回末条 id，中途失败
+  抛 `PartialDeliveryException` 携带送达点），队列只确认送达点之前、对未送达部分重试。
+  用例 `outbox/a_failed_delivery_does_not_redeliver_earlier_records`：前 3 条成功、第 4 条
+  失败，还原成「无视送达点、整批不推进」后 FAIL：
+  `already-delivered records are not retried: expected <2>, got <5>`（5 条全部重发，前 3 条被发两遍）。
+- **SSE 连接数是 hub 的属性，指标必须在 hub 的所有者那里注册。** `GatewayRuntime.RegisterGauges`
+  里写的是 `() => 0`——`UseNorthbound` 内部才创建 `SseHub`，运行时根本拿不到它。
+  结果 `/api/v1/metrics` 永远报 `uic_sse_connections 0`：运维看到的「没有订阅者」与
+  「已接满 50 条、新连接开始被 429」完全一样，而这恰是判断「该扩容还是该排障」的依据。
+  现在指标在 `UseNorthbound` 里随 hub 一起注册；运行时那行删掉并留注释，避免下次
+  有人在那边再补一个常量。用例 `contract/metrics_report_live_sse_connections`
+  （修复前 FAIL：`the gauge counts the live stream: expected <1>, got <0>`），
+  持的是真实 Kestrel 上的真流，不是假 hub。
+- **SSE 的订阅分隔符是 `/`，文档曾经写成 `.`。** 设备与点位 id 都允许含点
+  （`^[a-z0-9][a-z0-9._-]{0,63}$`），用点分隔时 `meter-1.v2` 这种设备名与
+  「设备 + 点位」的边界无法区分，实现只能整串当设备名去比。文档写成
+  `meter-1.voltage` 的那个示例照着调会拿到 200、`hello` 照常、但**永远没有样本**——
+  静默失败，客户端没有任何线索。产品规格与 UI 用的都是 `/`，实现也一直是 `/`，
+  所以这里是文档单方面漂移。用例 `contract/stream_filters_by_point_pattern`
+  （把实现改回 `.` 后 FAIL：`the filtered stream delivers at least one sample`），
+  同时钉住「匹配不到任何东西的模式仍然建流成功但不出样本」这条容易误判的行为。
+- **未知质量码必须在建流之前拒绝，不能建一条永远空的流。** `quality` 拼错（`gud`）
+  时旧实现会给 200、发 `hello`、按心跳一直跳，但一帧样本都没有——客户端看到的是
+  「设备没数据」，而配置、设备、采集都可能完全正常，排查方向被彻底带偏。
+  现在按契约里的九个质量码校验，未知值 400 `request.invalid_parameter` 并列出合法值。
+  不匹配的 `points` 模式仍然建流成功（那是合法用法：等一台还没上线的设备），
+  但质量码不是「模式」，写错只能是笔误。用例仍是
+  `contract/stream_filters_by_point_pattern`（去掉校验后 FAIL：
+  `an unknown quality code is rejected instead of silently filtering everything out: expected <BadRequest>, got <OK>`）。
+- **列表端点的 `quality` 过滤同样不能「静默过滤到空」。** `/api/v1/points` 与
+  `/api/v1/devices/{id}/points` 的 `quality` 写错时旧行为返回 200 + `items: []`，
+  与「这台设备没有点位」「点位全被停用」一模一样——调用方只能去翻配置才知道是自己
+  拼错了。现在两处共用 `ReadQualityFilter`：未知值 `400 request.invalid_parameter`
+  并列出合法值。用例 `contract/devices_and_points_are_listed`（去掉校验后 FAIL：
+  `an unknown quality code is rejected on /api/v1/points?quality=gud: expected <BadRequest>, got <OK>`），
+  同时保留「合法质量码仍按原样过滤」的正向断言，避免把过滤本身改坏却没人发现。
+- **健康接口的「最近一小时丢弃数」必须真的是窗口，不能拿累计值冒充。** 字段名与产品
+  规格都写 `droppedLastHour`，实现传的却是 `OutboxStats.DroppedTotal`——进程启动以来的
+  累计丢弃。累计值只会变大：一次磁盘打满导致丢包之后，接口会永远报同一个数，
+  运维无法回答它唯一想问的问题「现在还在丢吗」，只能靠重启进程把计数器清零来「试探」。
+  现在 `Outbox` 按分钟分桶维护一个 60 桶的滑动窗口，桶号从构造时刻起按**单调时钟**算：
+  墙钟前跳不会把窗口瞬间清空、后跳也不会让桶号停住导致一小时前的桶永远算在窗口内。
+  60 个 `long` 与「逐条记时间戳」相比也避免了持续过载下每小时几十万条的内存增长。
+  累计值仍保留在 `OutboxStats.DroppedTotal`（指标口径），健康接口只报窗口。
+  为了让这条路径可测，`RuntimeOptions.Clock` 把可拨时钟交给 Outbox——否则在真实
+  Kestrel 上根本没法让一小时过去。用例 `outbox/dropped_last_hour_falls_out_of_the_window`
+  （把窗口换回累计值后 FAIL：`the window forgets drops older than an hour: expected <0>, got <2>`）
+  与 `contract/health_reports_drops_in_the_last_hour`（`BuildHealth` 仍传累计值时 FAIL：
+  `drops older than an hour leave the window: expected <0>, got <2>`），后者走真实的
+  小上限 Outbox + 真实 HTTP 端点，钉住「装配没接回累计值」这类只在接口层才看得见的漂移。
 - **已知边界：位置型游标挡不住「截断到另一个合法位置」。** 游标内部就是偏移量，
   没有签名；`MTAwMA==`（1000）截成 `MTAw`（100）后是另一页的**合法**游标，
   服务端无法区分「客户端截断了」与「客户端本来就在第 100 条」。要根治得给游标
@@ -363,7 +437,9 @@
 
 ### 加一个北向通道
 
-1. 在 `Uic.Northbound`（或新项目）实现 `IOutboxSink`，`DeliverAsync` 失败必须抛；
+1. 在 `Uic.Northbound`（或新项目）实现 `IOutboxSink`：整批一起送达的实现 `DeliverAsync` 抛异常即可；
+   若是逐条发送（一条失败不该连累整批），实现 `DeliverPartialAsync` 返回送达点、或在中途失败时
+   抛 `PartialDeliveryException` 携带已送达的最后一条 id，让队列只对未送达部分重试；
 2. 在 `GatewayRuntime.ConfigureSinks` 里按配置注册，并把 sink 名加进 `SampleFanout` 的
    `Targets` —— 队列按 sink 名分区，名字就是契约；
 3. 如果它是「拉模型」（像 OPC UA），不要走队列，直接读 `PointCache` 并订阅变化。

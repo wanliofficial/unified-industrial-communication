@@ -192,5 +192,9 @@ internal static class ShutdownTests
             Delivered.AddRange(batch.Select(r => r.Payload));
             return Task.CompletedTask;
         }
+
+        // ScriptedSink 整批一起送达，直接报批次末条。
+        public Task<long> DeliverPartialAsync(IReadOnlyList<OutboxRecord> batch, CancellationToken ct)
+            => DeliverAsync(batch, ct).ContinueWith(_ => batch.Count > 0 ? batch[^1].Id : -1L);
     }
 }

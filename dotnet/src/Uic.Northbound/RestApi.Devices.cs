@@ -49,7 +49,7 @@ public static partial class RestApi
                       ?? throw ApiException.NotFound("device.not_found", $"device '{device}' not found",
                           new { device });
 
-            var quality = http.Request.Query["quality"].FirstOrDefault();
+            var quality = ReadQualityFilter(http);
             var q = http.Request.Query["q"].FirstOrDefault();
             var limit = ClampLimit(ParseInt(http.Request.Query["limit"], 100));
             var offset = ParseCursor(http.Request.Query["cursor"]);
@@ -73,7 +73,7 @@ public static partial class RestApi
                          ?? throw ApiException.NotReady("configuration is not loaded");
 
             var deviceFilter = http.Request.Query["device"].FirstOrDefault();
-            var quality = http.Request.Query["quality"].FirstOrDefault();
+            var quality = ReadQualityFilter(http);
             var q = http.Request.Query["q"].FirstOrDefault();
             var limit = ClampLimit(ParseInt(http.Request.Query["limit"], 100));
             var offset = ParseCursor(http.Request.Query["cursor"]);
@@ -154,8 +154,7 @@ public static partial class RestApi
         var monoNow = MonoNow(ctx);
         var fingerprint = Fingerprint(items);
 
-        if (Idempotency.TryGetValue(cacheKey, out var cached) &&
-            monoNow - cached.MonoAt < IdempotencyWindowTicks)
+        if (ctx.Writes.TryGet(cacheKey, monoNow, IdempotencyCache.IdempotencyWindowTicks, out var cached))
         {
             // 同一个 key 配另一份请求体：绝不能重放首次结果。调用方会拿到
             // ok:true / verified:true，以为新值已经写进设备，而实际上那次写入
@@ -182,30 +181,16 @@ public static partial class RestApi
 
         var fresh = await ExecuteWritesAsync(http, ctx, device, items, ct).ConfigureAwait(false);
         var body = JsonSerializer.Serialize(fresh, ApiJson.Options);
-        Idempotency[cacheKey] = new IdempotentResponse(body, monoNow, fingerprint);
-
-        // 键的数量由调用方决定，长期运行的网关必须有上限；超过就把过窗的条目清掉。
-        if (Idempotency.Count > 1024) PruneIdempotency(monoNow);
+        ctx.Writes.Store(cacheKey, body, monoNow, fingerprint);
 
         http.Response.Headers["X-Idempotent-Replay"] = "false";
         return Results.Content(body, "application/json; charset=utf-8");
     }
 
-    /// <summary>幂等窗口长度。5 分钟足够覆盖客户端超时重试，又不会让缓存无限增长。</summary>
-    private static readonly long IdempotencyWindowTicks = TimeSpan.FromMinutes(5).Ticks;
-
     /// <summary>当前单调时刻，归一化到 <see cref="TimeSpan.Ticks"/>（与 <c>Sample.MonoAt</c> 同单位）。</summary>
     private static long MonoNow(NorthboundContext ctx)
         => (long)(ctx.Engine.Time.GetTimestamp() / (double)ctx.Engine.Time.TimestampFrequency
                   * TimeSpan.TicksPerSecond);
-
-    private static void PruneIdempotency(long monoNow)
-    {
-        foreach (var (key, entry) in Idempotency)
-        {
-            if (monoNow - entry.MonoAt >= IdempotencyWindowTicks) Idempotency.TryRemove(key, out _);
-        }
-    }
 
     // ------------------------------------------------------------------
     // 写入
@@ -543,6 +528,27 @@ public static partial class RestApi
 
     private static int ParseInt(string? text, int fallback)
         => int.TryParse(text, out var v) ? v : fallback;
+
+    /// <summary>
+    /// 读列表端点共用的 <c>quality</c> 过滤。
+    ///
+    /// 写错质量码必须 400，而不是「过滤掉所有点位」。后者的响应是 200 + 空列表，
+    /// 与「这台设备确实没有点位」「点位全被停用」完全一样，调用方只能去翻配置。
+    /// 这与游标非法返回 400、SSE 未知质量码返回 400 是同一条原则：
+    /// 参数错误要当场说清楚，不能让调用方从「结果为空」里反推。
+    /// </summary>
+    private static string? ReadQualityFilter(HttpContext http)
+    {
+        var quality = http.Request.Query["quality"].FirstOrDefault();
+        if (string.IsNullOrWhiteSpace(quality)) return null;
+
+        if (!SseHub.IsKnownQuality(quality))
+            throw ApiException.BadRequest(
+                "request.invalid_parameter",
+                $"'quality' must be one of: {string.Join(", ", SseHub.Qualities)}");
+
+        return quality;
+    }
 
     /// <summary>游标就是不透明化的偏移量。用 base64 是为了让调用方不要依赖它的语义。</summary>
     private static string EncodeCursor(int offset)

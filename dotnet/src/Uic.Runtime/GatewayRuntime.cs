@@ -26,6 +26,12 @@ public sealed record RuntimeOptions
     public LogLevelSwitch Level { get; init; } = new();
     public SchedulerOptions? SchedulerOptions { get; init; }
 
+    /// <summary>
+    /// 上报队列的时间来源。只影响「时长类」判定（TTL、最近一小时丢弃窗口），
+    /// 用例注入可拨时钟来验证校时跳变不会让整段积压同时过期。
+    /// </summary>
+    public TimeProvider? Clock { get; init; }
+
     /// <summary>JSON 行文件日志。配置热更新时由运行时重新 Configure，不必重启进程。</summary>
     public JsonLineFileLogProvider? FileLog { get; init; }
 
@@ -54,6 +60,13 @@ public sealed class GatewayRuntime : IGatewayControl, IAsyncDisposable
     private readonly ResourceMonitor _resources;
     private readonly AuditLog _audit;
     private readonly AuthService _auth;
+
+    /// <summary>
+    /// 写入幂等台账。属于运行时而不是 HTTP 层：条目里的单调时刻只能与
+    /// <see cref="Scheduler.Time"/> 相减，而这两个东西都归运行时装配。
+    /// 放在这里也让同一运行时多次 `CreateNorthboundContext()` 共用一份台账。
+    /// </summary>
+    private readonly IdempotencyCache _idempotency = new();
     private readonly string _dataDir;
     private readonly string _gatewayVersion;
     private readonly DateTimeOffset _startedAt = DateTimeOffset.UtcNow;
@@ -91,7 +104,8 @@ public sealed class GatewayRuntime : IGatewayControl, IAsyncDisposable
         ConfigStore store,
         DriverRegistry drivers,
         ConfigDocument config,
-        SchedulerOptions? schedulerOptions)
+        SchedulerOptions? schedulerOptions,
+        TimeProvider? clock)
     {
         _dataDir = dataDir;
         _gatewayVersion = gatewayVersion;
@@ -126,7 +140,7 @@ public sealed class GatewayRuntime : IGatewayControl, IAsyncDisposable
             Ttl = storage.OutboxTtl,
             BatchSize = storage.OutboxBatchSize,
             FlushInterval = storage.OutboxFlushInterval,
-        });
+        }, clock);
 
         ConfigureSinks(config, previous: null);
 
@@ -196,7 +210,8 @@ public sealed class GatewayRuntime : IGatewayControl, IAsyncDisposable
             store,
             drivers,
             config,
-            options.SchedulerOptions)
+            options.SchedulerOptions,
+            options.Clock)
         {
             Level = options.Level,
         };
@@ -263,7 +278,8 @@ public sealed class GatewayRuntime : IGatewayControl, IAsyncDisposable
             _resources,
             new JournalHistory(_dataDir),
             _audit,
-            _auth);
+            _auth,
+            _idempotency);
 
     // ------------------------------------------------------------------
     // IGatewayControl
@@ -615,8 +631,8 @@ public sealed class GatewayRuntime : IGatewayControl, IAsyncDisposable
         _metrics.Gauge("uic_devices_collecting",
             () => _engine.Actors.Count(a => a.State == RuntimeState.Collecting),
             "devices currently delivering good data");
-        _metrics.Gauge("uic_sse_connections", () => 0,
-            "active SSE streams (reported by the HTTP layer)");
+        // uic_sse_connections 由 RestApi.UseNorthbound 注册：连接数归 SseHub 所有，
+        // 这里没有 hub，写一个常量 0 只会让看板永远显示「没有订阅者」。
         _metrics.Gauge("uic_opcua_writes_total", () => _opcUa?.NodeManager.Writes ?? 0,
             "OPC UA write requests accepted");
         _metrics.Gauge("uic_opcua_write_failures_total", () => _opcUa?.NodeManager.WriteFailures ?? 0,

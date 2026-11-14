@@ -17,6 +17,7 @@ internal static class HistoryTests
         tests.Add(new TestCase("history/filters_by_time_and_identity", FiltersByTimeAndIdentity));
         tests.Add(new TestCase("history/downsamples_each_point_per_bucket", DownsamplesPerBucket));
         tests.Add(new TestCase("history/dedupes_redelivered_lines", DedupesRedeliveredLines));
+        tests.Add(new TestCase("history/keeps_samples_after_seq_restarts", KeepsSamplesAfterSeqRestarts));
         tests.Add(new TestCase("history/missing_journal_is_empty", MissingJournalIsEmpty));
         tests.Add(new TestCase("history/skips_malformed_lines", SkipsMalformedLines));
         tests.Add(new TestCase("history/handles_lines_across_read_buffer", HandlesLinesAcrossReadBuffer));
@@ -85,6 +86,31 @@ internal static class HistoryTests
         return QueryAndAssert(t, dir, new HistoryQuery(null, null, t0.AddMinutes(-1), t0.AddMinutes(1), null),
             items => t.Equal(1, items.Count, "the same (device, point, seq) is delivered twice"),
             _ => { });
+    }
+
+    private static Task KeepsSamplesAfterSeqRestarts(TestContext t)
+    {
+        var dir = t.TempDir;
+        var t0 = new DateTimeOffset(2026, 11, 7, 8, 0, 0, TimeSpan.Zero);
+
+        // 前一段运行（进度 1、2），然后进程重启 / 设备被热更新重建，序号从 1 重新开始
+        // （PointCache 的序号只活在内存里，见 cache/remove_device_clears_state）。
+        // journal 是跨重启追加的，所以同一个 (device, point, seq) 会带着不同的采集时间
+        // 各出现一次；去重只能按「重放」的本意做——重放的行是同一行，时间也一样。
+        WriteJournal(dir,
+            Sample("dev", "p", 1, t0.AddSeconds(10), 10),
+            Sample("dev", "p", 2, t0.AddSeconds(20), 20),
+            Sample("dev", "p", 1, t0.AddMinutes(5), 30),
+            Sample("dev", "p", 2, t0.AddMinutes(6), 40));
+
+        return QueryAndAssert(t, dir, new HistoryQuery(null, null, t0.AddMinutes(-1), t0.AddMinutes(10), null),
+            items =>
+            {
+                t.Equal(4, items.Count, "a seq restart must not swallow the newer samples");
+                t.Equal(30d, items[2].Value.Num!.Value, "the sample after the restart is kept");
+                t.Equal(40d, items[3].Value.Num!.Value, "and so is the one following it");
+            },
+            total => t.Equal(4, total, "the total counts the post-restart samples"));
     }
 
     private static Task MissingJournalIsEmpty(TestContext t)

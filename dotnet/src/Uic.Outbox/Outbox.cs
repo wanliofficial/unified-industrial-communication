@@ -12,7 +12,18 @@ public sealed record OutboxRecord(
     [property: JsonPropertyName("payload")] string Payload,
     [property: JsonPropertyName("at")] DateTimeOffset CreatedAt);
 
-public sealed record OutboxStats(long Pending, long DroppedTotal, long Delivered, long Bytes, int Partitions);
+/// <param name="DroppedTotal">进程启动以来的累计丢弃数。单调递增，适合做 counter。</param>
+/// <param name="DroppedLastHour">
+/// 最近一小时内的丢弃数。健康接口报的是它而不是累计值：累计值永远只增不减，
+/// 一次磁盘打满之后看板会永久显示「正在大量丢弃」，运维再也看不出「现在还丢不丢」。
+/// </param>
+public sealed record OutboxStats(
+    long Pending,
+    long DroppedTotal,
+    long Delivered,
+    long Bytes,
+    int Partitions,
+    long DroppedLastHour);
 
 /// <summary>
 /// 一个投递目标。失败必须抛异常——只有异常才表示「位点不能推进」。
@@ -20,7 +31,35 @@ public sealed record OutboxStats(long Pending, long DroppedTotal, long Delivered
 public interface IOutboxSink
 {
     string Name { get; }
+
     Task DeliverAsync(IReadOnlyList<OutboxRecord> batch, CancellationToken ct);
+
+    /// <summary>
+    /// 逐条投递并回报「本批实际送达到最后一条」的 id。
+    ///
+    /// 为什么需要这个回报：队列的语义是「整批成功才推进位点」，对逐条
+    /// 发送的 sink（<c>MqttSink</c> 一条条 <c>PublishAsync</c>）这条过于粗——
+    /// 发到一半 broker 断连时，已发到对端的几条会被整批回退重发。sink 若
+    /// 能报出送达点，队列就只推进到那之前，不重发已送达的记录。
+    ///
+    /// 逐条 sink 遇到某条失败时，把已送达的最后一条 id 放进这个异常抛出，
+    /// 队列据此推进到送达点、再对未送达部分重试。整批一起成功的 sink 只需
+    /// 照常返回批次末条 id，遇到真失败抛普通异常即可（语义退回「整批不推进」）。
+    /// </summary>
+    Task<long> DeliverPartialAsync(IReadOnlyList<OutboxRecord> batch, CancellationToken ct);
+}
+
+/// <summary>
+/// 逐条投递的 sink 在「发到一半失败」时抛出，携带已送达的最后一条 id。
+/// 让队列只把位点推进到送达点，不对已发到对端的记录重发。
+/// </summary>
+public sealed class PartialDeliveryException : Exception
+{
+    public PartialDeliveryException(long lastDeliveredId, string message, Exception? inner = null)
+        : base(message, inner) => LastDeliveredId = lastDeliveredId;
+
+    /// <summary>本批实际送达的最后一条 id；一条都没送达时为 -1。</summary>
+    public long LastDeliveredId { get; }
 }
 
 public sealed record OutboxOptions
@@ -53,6 +92,7 @@ public sealed class Outbox : IAsyncDisposable
     private readonly CancellationTokenSource _cts = new();
     private readonly SemaphoreSlim _flushLock = new(1, 1);
     private readonly TimeProvider _time;
+    private readonly DropWindow _dropWindow;
     private Task? _loop;
     private long _dropped;
     private int _disposed;
@@ -63,6 +103,7 @@ public sealed class Outbox : IAsyncDisposable
         _root = Path.Combine(dataDir, "outbox");
         _options = options ?? new OutboxOptions();
         _time = time ?? TimeProvider.System;
+        _dropWindow = new DropWindow(_time);
         Directory.CreateDirectory(_root);
 
         // 启动时就把磁盘上的分区读回来。
@@ -93,7 +134,11 @@ public sealed class Outbox : IAsyncDisposable
     {
         var partition = _partitions.GetOrAdd(sink, name => new Partition(Path.Combine(_root, Sanitize(name)), _time));
         var dropped = partition.Enqueue(payload, _options);
-        if (dropped > 0) Interlocked.Add(ref _dropped, dropped);
+        if (dropped > 0)
+        {
+            Interlocked.Add(ref _dropped, dropped);
+            _dropWindow.Add(dropped);
+        }
     }
 
     public void Start()
@@ -160,13 +205,24 @@ public sealed class Outbox : IAsyncDisposable
                             break;
                         }
 
-                        await sinkImpl.DeliverAsync(batch, ct).ConfigureAwait(false);
-                        partition.Ack(batch[^1].Id);
+                        // sink 回报「本批实际送达的最后一条」，位点只推进到那里：
+                        // 逐条发送的 sink 发到一半断连时，已发到对端的几条不会被整批重发。
+                        // sink 抛 PartialDeliveryException 时同样带送达点，位点照常推进到那之前。
+                        var lastDeliveredId = await sinkImpl
+                            .DeliverPartialAsync(batch, ct).ConfigureAwait(false);
+                        if (lastDeliveredId > 0) partition.Ack(lastDeliveredId);
                     }
                 }
                 catch (OperationCanceledException) when (ct.IsCancellationRequested)
                 {
                     throw;
+                }
+                catch (PartialDeliveryException partial)
+                {
+                    // 逐条 sink 发到一半失败：已送达的部分确认掉（不重发），
+                    // 未送达的部分留给下一轮重试。失败本身照常上报。
+                    if (partial.LastDeliveredId > 0) partition.Ack(partial.LastDeliveredId);
+                    firstFailure ??= partial;
                 }
                 catch (Exception ex)
                 {
@@ -194,7 +250,13 @@ public sealed class Outbox : IAsyncDisposable
             bytes += s.Bytes;
         }
 
-        return new OutboxStats(pending, Interlocked.Read(ref _dropped), delivered, bytes, _partitions.Count);
+        return new OutboxStats(
+            pending,
+            Interlocked.Read(ref _dropped),
+            delivered,
+            bytes,
+            _partitions.Count,
+            _dropWindow.LastHour());
     }
 
     public async ValueTask DisposeAsync()
@@ -222,6 +284,78 @@ public sealed class Outbox : IAsyncDisposable
             sb.Append(char.IsLetterOrDigit(c) || c is '-' or '_' ? c : '_');
         }
         return sb.Length == 0 ? "sink" : sb.ToString();
+    }
+
+    /// <summary>
+    /// 丢弃计数的滑动窗口：按分钟分桶，只保留最近一小时。
+    ///
+    /// 为什么不用「累计值减一小时前的快照」：那需要一张按时间回看的表，等于把
+    /// 一个纯内存指标做成了有状态的历史；而分桶只占 60 个 long，够用且不会随
+    /// 丢包速率增长（持续过载时每秒都可能丢，逐条记时间戳会是每小时几十万条）。
+    ///
+    /// 桶号按单调时钟从构造时刻起算：墙钟跳变既不会把窗口瞬间清空，也不会让
+    /// 桶号停在原地导致「一小时前的那些桶」永远算进窗口。
+    /// </summary>
+    private sealed class DropWindow
+    {
+        /// <summary>窗口长度（分钟）。60 个桶覆盖 [now-60m, now]。</summary>
+        private const int Buckets = 60;
+
+        private readonly TimeProvider _time;
+        private readonly long _origin;
+        private readonly long[] _bucketOf = new long[Buckets];
+        private readonly long[] _count = new long[Buckets];
+        private readonly object _lock = new();
+        private bool _started;
+
+        public DropWindow(TimeProvider time)
+        {
+            _time = time;
+            _origin = time.GetTimestamp();
+        }
+
+        public void Add(long count)
+        {
+            lock (_lock)
+            {
+                var bucket = CurrentBucketLocked();
+                var slot = Slot(bucket);
+
+                // 同一个槽可能是 60 分钟前的旧桶：换桶时先清零，不能把旧计数累加进来。
+                if (!_started || _bucketOf[slot] != bucket)
+                {
+                    _bucketOf[slot] = bucket;
+                    _count[slot] = 0;
+                    _started = true;
+                }
+
+                _count[slot] += count;
+            }
+        }
+
+        public long LastHour()
+        {
+            lock (_lock)
+            {
+                if (!_started) return 0;
+
+                var current = CurrentBucketLocked();
+                long total = 0;
+
+                for (var i = 0; i < Buckets; i++)
+                {
+                    // 桶号 <= current - 60 的是「一小时前的那一分钟」，已经滑出窗口。
+                    if (_bucketOf[i] > current - Buckets) total += _count[i];
+                }
+
+                return total;
+            }
+        }
+
+        private long CurrentBucketLocked()
+            => _time.GetElapsedTime(_origin).Ticks / TimeSpan.TicksPerMinute;
+
+        private static int Slot(long bucket) => (int)(((bucket % Buckets) + Buckets) % Buckets);
     }
 
     /// <summary>单个 sink 的追加日志 + 确认位点。</summary>
@@ -479,6 +613,13 @@ public sealed class JournalSink : IOutboxSink, IAsyncDisposable
         {
             _lock.Release();
         }
+    }
+
+    /// <summary>本地 journal 是一次写完整个批，整批成功才到这里，直接返回批次末条。</summary>
+    public async Task<long> DeliverPartialAsync(IReadOnlyList<OutboxRecord> batch, CancellationToken ct)
+    {
+        await DeliverAsync(batch, ct).ConfigureAwait(false);
+        return batch.Count > 0 ? batch[^1].Id : -1;
     }
 
     public ValueTask DisposeAsync()

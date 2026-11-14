@@ -206,7 +206,12 @@ public sealed class AuditLog : IDisposable
             Console.Error.WriteLine(message);
     }
 
-    /// <summary>按条件查询，最新在前。分页用 offset（追加写使游标天然稳定）。</summary>
+    /// <summary>按条件查询，最新在前。游标是偏移量（见 <see cref="EncodeCursor"/>）。</summary>
+    /// <remarks>
+    /// 这里**不能**说「追加写让游标稳定」：那是升序、只追加的历史查询才成立的性质。
+    /// 审计按最新在前排序，翻页期间每落一条新记录，整列向后移一位，用偏移量连续翻会
+    /// 重复/漏看边界那条。要完整导出请走一次性 <c>export</c>，而不是翻页。
+    /// </remarks>
     public async Task<AuditPage> QueryAsync(AuditQuery query, CancellationToken ct = default)
     {
         var matches = new List<AuditEntry>();
