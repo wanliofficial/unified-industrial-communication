@@ -16,13 +16,13 @@ dotnet run --project tests/Uic.Tests -- --stop-on-fail      # 首个失败即停
 正常输出：
 
 ```
-345 passed, 0 failed, 3 skipped · 733.0s
+347 passed, 0 failed, 3 skipped · 5729.1s
 ```
 
 加 `--opcua` 跑全量（含 3 条需外部 OPC UA 环境的端到端）：
 
 ```
-348 passed, 0 failed, 0 skipped · 524.3s
+350 passed, 0 failed, 0 skipped · 477.8s
 ```
 
 耗时随机器负载波动较大：219 条时在同一台机器上空载量到 65.5 s，233 条在同时跑着
@@ -41,6 +41,10 @@ dotnet run --project tests/Uic.Tests -- --stop-on-fail      # 首个失败即停
 331/334 条在 `load average` 5.7–8.3 时量到 429.1 s / 428.5 s；332/335 条在 `load average` 5.7–13.8 时量到
 3023.4 s / 759.3 s（那次机器另有别的负载，单条契约用例仍在 90 s 以内——差别是排队）；
 334/337 条在 `load average` 5.5–16 时量到 2206.7 s / 1540.9 s。
+347/350 条在 `load average` 5–7.5（另有数天未退的高 CPU 后台进程）时，全量 5729.1 s、
+其中 15 条 `contract/*` 触到 180 s 硬超时；单独复跑这 41 条契约用例全部通过（790.1 s，
+最慢的 `contract/tls_rest_serves_https` 单条 110 s，是宿主启动 + TLS 握手在排队，不是用例退化），
+`--opcua` 变体在同一份代码上 350 passed / 0 failed。
 （同一份代码，差别只在排队）。
 负载高时单条用例可能触到 180 s 的硬超时，先把机器腾空再判红。
 NFR 的门槛是 120 s，压测用例、PBKDF2 派生与 TLS 握手是主要开销——**这个门槛只在空载机器上有意义**，
