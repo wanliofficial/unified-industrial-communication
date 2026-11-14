@@ -354,6 +354,31 @@ func TestBadCRCRetriedAndReported(t *testing.T) {
 	}
 }
 
+// TestBadReportIsNotRetried 帧成了但报文解不开（正文被截断）：这属于「终端在
+// 正常应答、只是我们理解错了」，规范要求**不重发**——重发同一请求只会拿到同样
+// 的报文。它与 CRC 错（可重发）在错误种类上同为 ErrProtocol，若重发循环只看
+// KindOf 就会一起重试到上限，白等 retries × 超时。
+func TestBadReportIsNotRetried(t *testing.T) {
+	srv := startSim(t)
+	srv.SetTruncate(10) // 正文只剩 10 字节，连固定前缀都不够
+	c := openConn(t, srv, "retries=2,gap=1ms")
+
+	_, err := c.Read(context.Background(), spans(pt("z", "Z")))
+	if err == nil {
+		t.Fatal("正文截断应报错")
+	}
+	if k := driver.KindOf(err); k != driver.ErrProtocol {
+		t.Fatalf("错误分类 = %v，应为 ErrProtocol", k)
+	}
+	if driver.IsRetryable(err) {
+		t.Fatal("报文解不开必须标为不可重发")
+	}
+	// retries=2 时若误重发会发 3 次；正确行为是只发 1 次。
+	if got := srv.QueryCount(sl651codec.FuncQueryAll); got != 1 {
+		t.Fatalf("报文解不开不应重发（只发 1 次 37H），实际 %d 次", got)
+	}
+}
+
 // TestSilentStationTimesOut 静默终端：报超时并按 qualityOf 映射质量。
 func TestSilentStationTimesOut(t *testing.T) {
 	srv := startSim(t)

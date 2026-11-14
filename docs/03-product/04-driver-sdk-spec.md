@@ -7644,6 +7644,12 @@ Wh = 29 这一条被写错过：sim 里三处电能点用了 30（VAh），自�
 各等一次超时。单点失败（OBIS 写错、类号不匹配）**不**升级为链路失败：其它点位仍然
 读到了，说明链路是通的。
 
+「可重试」那一列不是抄的，它必须被代码真正执行。HCS/FCS 错与 DM/FRMR、LLC 头不对
+在错误种类上同为 `ErrProtocol`，光看 `KindOf` 分不开；实现把可重发性标在
+`driver.E(...)` 的 `temporary` 参数上（干扰类 `true`，语义类 `false`），`transact`
+在 `KindOf` 判断之后追加 `if !driver.IsRetryable(err) { return err }`。少了这一句，
+表拒连（DM）时配置了 `retries=3` 就会把同一个 Get 连发 4 次，每次都换来一个 DM。
+
 #### 3.10.26.8 `data-access-result` 只有一种合法形态
 
 这是本轮第四个真实 bug，值得单独一节：
@@ -7730,16 +7736,17 @@ octet-string 四种值形态。
 5. **时钟点是固定 12 字节**（`2026-11-13T08:30:00`），不用它断言「当前时间」。
 
 `SetRejectAssociation` 让 AARE 带 `rejected-permanent`，用于验证「认证失败」的路径；
-`SetSilent` 用于验证超时路径。测试只打开自己关心的那一个，因为「同时坏两处」会让
-断言失去诊断力。
+`SetSilent` 用于验证超时路径。`SetReplyDM` 让从站对 I 帧回 DM（断开模式），这是
+「帧成了但语义是拒绝」的典型形态——用于钉住「DM 不重发」。测试只打开自己关心的
+那一个，因为「同时坏两处」会让断言失去诊断力。
 
 #### 3.10.26.11 测试矩阵
 
 | 层 | 用例 |
 |---|---|
 | `codec/dlms` | `SNRM` 金帧 `7E A0 07 03 21 93 0F 01 7E`；`FCS(A0 07 03 21 93) == 0F 01` 与 `GoodFCS` 的固定余数 `0xF0B8`；长度字段跨两字节与 bit11 分段位；info 与 FCS 里出现 `0x7E` 时仍按长度定界（FCS `7E 64` 的回归）；截断 → `ErrIncomplete`、指针前移 1 字节重同步；1/2/4 字节地址域（含 `48 68 FE FF`）；LLC `E6 E6 00` vs `E6 E7 00`；I/RR/RNR/U 帧控制域与 `NS`/`NR` 回绕；AARQ/AARE 逐字节向量与拒绝诊断；conformance 位值与 `5F 1F 04 00` 编码；A-XDR 全标签（含 `0x07`/`0x0E` 空号必须报错）；`date_time` 12 字节布局（星期位置、`0x8000` 时区）与 `date`/`time`；`data-access-result` 只认 2 字节形态（用 `hardware-fault(1)` 锁「前两字节相同」的陷阱）；Get-Response 三分支（normal / datablock / list）；OBIS 十进制六段与 `.`/`-`/`:`/空格分隔；`SplitRef` 对 `1-0:1-8-0-255:3:2` 的切点；`ApplyScaler` 单次乘除（`50.01` 精确）；`UnitName`/`ClassName` 全扫 |
-| `driver/dlms` | 真实 TCP 回环：SNRM→AARQ→逐点 GET→DISC；`Probe` 复用已建关联；拒绝关联 → `ErrProtocol`；静默 → `ErrTimeout`；坏校验 → `ErrProtocol` 且文案含「坏帧」与波特率提示；`linkErr` 缓存后第二轮不再发包且立即返回；object-undefined → `ErrAddress`；类号不一致 → `ErrAddress`；分块 → `ErrUnsupported` 且提示调大 `max-pdu`；scaler 五个点逐位精确（`50.01`/`0.985`/`220.1`/`5.12`/`345.6`）；`Scan` 条数等于内置表条数且带 scaler_unit 文本；`Association` 采用服务端较小的 max-PDU；`Write`/`MultiRead`/`Browse` 逐项 `ErrUnsupported`；`parseOptions` 越界全忽略；`addressOf` 的 `labels.address` 优先级与 `addr-size=3` 拒绝；空 span 返回 `(nil, nil)`；关闭后所有入口 → `ErrDisconnected` |
-| `sim/dlms` | 默认对象表覆盖 40+ 项且 `examples/dlms.json` 能全部读到；AARQ 接受/拒绝两分支；未建关联读 → `read-write-denied`；对象未定义 / 类号不一致两种结果码；地址与客户端地址过滤静默；`SetSilent`/`SetBadChecksum`/`SetRejectAssociation`；`SetValue`/`Value` 的坏定位报错；TCP `acceptLoop`→`serveConn`→`tcpStream` 真实 socket 路径；`Close` 幂等且能清理连接；`isClosed` 对 `net.ErrClosed`/`io.EOF`/超时的分类 |
+| `driver/dlms` | 真实 TCP 回环：SNRM→AARQ→逐点 GET→DISC；`Probe` 复用已建关联；拒绝关联 → `ErrProtocol`；静默 → `ErrTimeout`；坏校验 → `ErrProtocol` 且文案含「坏帧」与波特率提示；**DM（断开模式）→ `ErrProtocol` 且 `IsRetryable==false`，`retries=2` 下 Get 只发 1 次**（与坏校验「重发到上限」构成成对断言）；`linkErr` 缓存后第二轮不再发包且立即返回；object-undefined → `ErrAddress`；类号不一致 → `ErrAddress`；分块 → `ErrUnsupported` 且提示调大 `max-pdu`；scaler 五个点逐位精确（`50.01`/`0.985`/`220.1`/`5.12`/`345.6`）；`Scan` 条数等于内置表条数且带 scaler_unit 文本；`Association` 采用服务端较小的 max-PDU；`Write`/`MultiRead`/`Browse` 逐项 `ErrUnsupported`；`parseOptions` 越界全忽略；`addressOf` 的 `labels.address` 优先级与 `addr-size=3` 拒绝；空 span 返回 `(nil, nil)`；关闭后所有入口 → `ErrDisconnected` |
+| `sim/dlms` | 默认对象表覆盖 40+ 项且 `examples/dlms.json` 能全部读到；AARQ 接受/拒绝两分支；未建关联读 → `read-write-denied`；对象未定义 / 类号不一致两种结果码；地址与客户端地址过滤静默；`SetSilent`/`SetBadChecksum`/`SetRejectAssociation`/`SetReplyDM`；`SetReplyDM` 下 Get 计数仍加一（证明请求确实到达，用于断言是否重发）；`SetValue`/`Value` 的坏定位报错；TCP `acceptLoop`→`serveConn`→`tcpStream` 真实 socket 路径；`Close` 幂等且能清理连接；`isClosed` 对 `net.ErrClosed`/`io.EOF`/超时的分类 |
 | `pointtable` | `dlms` 走 `WidthNone + AllowSymbol`；`1.0.1.8.0.255`、`:3`、`:3:2` 与连字符写法 `0-0-42-0-0-255:1:2` 都解析成 symbol 且 `Canonical` 往返一致；寄存器/对象/计算地址在导入期拒绝；`length` 列在导入期拒绝 |
 | `cmd/uic` | `dlmsSplitAddr` 走 `dl.SplitRef`（标准写法与只给 OBIS 两种）；`dlmsRefs` 列拆分；`dlmsRowOf` 的「可粘贴地址」带类号与属性号；默认 7 点列表 |
 
@@ -8053,6 +8060,14 @@ BCD 与 CRC 都正确——从「报文对不对」的角度查永远查不出�
 `Read` 在 `linkErr` 非空时直接返回，不再发帧：一台坏终端不该让 300 个点位各等一次
 3 秒超时。
 
+错误分类还决定**要不要重发**，这两件事不能混为一谈。CRC 错是瞬态干扰，重发同一
+流水号让终端回放上一次的应答（不会让它重读数据）；而「帧成了但报文解不开」「功能码
+不符」说明终端在正常应答、只是我们理解错了，重发只会拿到同样的结果。两者在错误种类
+上同为 `ErrProtocol`，所以不能靠 `KindOf` 区分——实现把它们分别标在 `driver.E(...)`
+的 `temporary` 参数上（前者 `true`、后者 `false`），`transact` 在 `KindOf` 判断之后
+追加 `if !driver.IsRetryable(err) { return err }` 让标记生效。少了这一句，配置了
+`retries=3` 的现场会在每次「报文解不开」时白等 3 个超时周期。
+
 #### 3.10.27.13 配置与承载
 
 ```json
@@ -8117,8 +8132,8 @@ TCP 默认端口取 `4001`（串口服务器/DTU 透传的常见端口，不是�
 | 层 | 用例 |
 |---|---|
 | `codec/sl651` | 链路维持报金帧 `7E 7E 00 9876543210 1234 2F 0008 02 7E08221011100747 03 C3AE`（25 字节，正文首字节就是 `7E`）与测试报金帧（60 字节）逐字节锁死；`CRC16` 的 `C3AE`/`717A` 与**结果不取反的反向断言**（`TestCRCIsNotInverted`：`C3AE` 取反得 `3C51`，实现若被改成 X-25 取反版此测试立刻红）；`FrameLen = 17+长度` 与长度字段高 4 位方向位；分帧时正文/CRC 含 `0x7E` 仍按长度定界、截断 → `ErrBadLen`、指针前移 1 字节重同步；M3 的 3 字节计入长度；上下行地址字段反序（同一站号在两种帧里的偏移不同）；ASCII 字符编码帧 → `ErrUnsupported`（判定用 `&0xF0`）；引导符类固定宽度与固定定义字节；`Guide.Variable()` 三项显式拒绝；时间步长码 3 字节 BCD 与全 0 组合；131 项引导符全扫（编码、简称、中文名、单位）；`LookupGuide` 三种写法与多命中取最小；`ParseField` 固定宽度不按高 5 位；`DRP`/`DRZ`/`ZT` 按 HEX 解与 `Slot*` 全套（`slot_test.go`）；缺测全 `F` 识别（整组与单段两种）；均匀时段报 `31H` 与小时报 `34H`；查询帧 `37H`/`38H`/`3AH` 构造；编码解码互逆 |
-| `driver/sl651` | 真实 TCP 回环：`Probe`（37H）→ 整帧读 → 关闭；`ReadWholeFrame` 一条 37H 取全部要素；`ReadSlot` 的 `DRP[0]`/`DRP[1]` 精确值与 `DRP[11]` 缺测降 `quality=bad`、`DRP[99]` 报地址错；`ReadSlotOnNonBatch` 的 `Z[1]` 提前拒绝；`ReadUnknownGuidePoint` 单点报 `addressError` 不升级为链路错；`TestWrongStationTimesOut` / `TestPasswordMismatchIsSilent` / `TestPasswordMatch`；`TestBadCRCRetriedAndReported` 坏校验重发后报 `ErrProtocol` 且文案含「坏帧」与波特率提示；`TestSilentStationTimesOut`；`TestLinkErrCached` 第二轮不再发包；`Write` 逐项 `ErrUnsupported`；`TestReadEmptySpans` 返回 `(nil, nil)`；`TestOpenRejectsBadConfig` 站号上限；`TestOpenFallsBackToUnitID`；`TestMetaContract` **断言 8 个能力位全部落在四态内（防 `Discovery`/`BitAccess` 漏写序列化成空串）**；`TestParseOptions` 越界全忽略；`TestGuideOf` 含段号与五种非法写法；`TestQualityMapping` 全错误类 |
-| `sim/sl651` | 默认 7 要素覆盖 BCD/HEX/状态字/整组缺测四分支；`37H`/`38H`/`3AH` 分派；自报帧 `2F`/`30`/`32`/`34`；站号/密码不符静默；`SetSilent`/`SetBadChecksum`；`SetValue`/`Value` 坏定位报错；`TestTrigger` 用 goroutine + `net.Pipe`；`TestDefaultFieldsCoverBranches` 扫全部值索引；`TestSetValueAndReadBack` 复用默认 `Z1` 缺测；`Close` 幂等 |
+| `driver/sl651` | 真实 TCP 回环：`Probe`（37H）→ 整帧读 → 关闭；`ReadWholeFrame` 一条 37H 取全部要素；`ReadSlot` 的 `DRP[0]`/`DRP[1]` 精确值与 `DRP[11]` 缺测降 `quality=bad`、`DRP[99]` 报地址错；`ReadSlotOnNonBatch` 的 `Z[1]` 提前拒绝；`ReadUnknownGuidePoint` 单点报 `addressError` 不升级为链路错；`TestWrongStationTimesOut` / `TestPasswordMismatchIsSilent` / `TestPasswordMatch`；`TestBadCRCRetriedAndReported` 坏校验重发后报 `ErrProtocol` 且文案含「坏帧」与波特率提示；`TestBadReportIsNotRetried` 正文截断（帧成了但报文解不开）**不重发**：`retries=2` 下 37H 只发 1 次且断言 `IsRetryable(err)==false`——与前者构成「可重发 / 不重发」成对断言；`TestSilentStationTimesOut`；`TestLinkErrCached` 第二轮不再发包；`Write` 逐项 `ErrUnsupported`；`TestReadEmptySpans` 返回 `(nil, nil)`；`TestOpenRejectsBadConfig` 站号上限；`TestOpenFallsBackToUnitID`；`TestMetaContract` **断言 8 个能力位全部落在四态内（防 `Discovery`/`BitAccess` 漏写序列化成空串）**；`TestParseOptions` 越界全忽略；`TestGuideOf` 含段号与五种非法写法；`TestQualityMapping` 全错误类 |
+| `sim/sl651` | 默认 7 要素覆盖 BCD/HEX/状态字/整组缺测四分支；`37H`/`38H`/`3AH` 分派；自报帧 `2F`/`30`/`32`/`34`；站号/密码不符静默；`SetSilent`/`SetBadCRC`/`SetTruncate`/`SetBadFunc`；**`SetBadFunc` 换的是合法功能码（32H 定时报），只验证「功能码与询问不符」而不验证解析失败——构造「报文解不开」要用 `SetTruncate`**；`SetValue`/`Value` 坏定位报错；`TestTrigger` 用 goroutine + `net.Pipe`；`TestDefaultFieldsCoverBranches` 扫全部值索引；`TestSetValueAndReadBack` 复用默认 `Z1` 缺测；`Close` 幂等 |
 | `pointtable` | `sl651` 走 `WidthNone + AllowSymbol`；要素标识符（`Z`/`PT`/`VT`/`39`/`DRP`）解析成 symbol 且 `Canonical` 往返一致；寄存器/对象/文件/计算/selector 地址在导入期拒绝；`length` 列在导入期拒绝 |
 | `cmd/uic` | `parseSL651Station` 的 10 位上限与前导零；`parseSL651Password` 拒绝非 4 位十六进制（不做静默补齐）；`sl651Refs` 列拆分；`sl651SplitSlot` 与驱动 `guideOfWithSlot` 同一套语法；`TestSL651PointsValidation` / `TestSL651SlotValidation` 的批量要素与非批量段号；`printSL651Guides` 的 `slot`/`slots`/`pointAddress`；`sl651RowOf` 按 `Slot*` 逐段输出且 `Count = len(Values)` |
 | 实机自检 | sim 起在 `127.0.0.1:4001` 后 `-probe`、无参整帧（`Z`/`P1`/`PT`/`Q`/`ZT`/`DRP` 12 段/`Z1` 缺测/`VT`）、`-raw`、`-json`、`-list`、`-points Z,PT,VT,DRP,DRP[1]`；`uic run` 运行时采集 5 个启用点位全部 `good`（`0.127`/`0.5`/`123.4`/`1234.567`/`12.1V`） |

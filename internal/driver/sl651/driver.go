@@ -462,6 +462,13 @@ func (c *conn) transact(ctx context.Context, op string, req []byte,
 		if driver.KindOf(err) == driver.ErrDisconnected || driver.KindOf(err) == driver.ErrUnsupported {
 			return nil, err
 		}
+		// 尊重 exchange 已经分好的「可重发」标记。CRC 错是瞬态干扰（可重发），
+		// 而功能码不符、上行报文解不开这类失败说明**终端在正常应答、只是我们
+		// 理解错了**——重发同一请求只会拿到同样的应答。两者在错误种类上同为
+		// ErrProtocol，只看 KindOf 会把「不重发」的那类一起重试到上限。
+		if !driver.IsRetryable(err) {
+			return nil, err
+		}
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return nil, driver.E(driver.ErrTimeout, op, c.devID, "context done", true, ctxErr)
 		}

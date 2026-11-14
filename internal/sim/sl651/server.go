@@ -275,7 +275,11 @@ func (s *Server) SetBadCRC(on bool) {
 	s.mu.Unlock()
 }
 
-// SetBadFunc 让从站用错误的功能码应答。
+// SetBadFunc 让从站用另一个**合法**的上行功能码（32H 定时报）应答。
+//
+// 注意它换的不是"非法功能码"：32H 本身是合法上行报文，ParseReport 照样能
+// 解析成功。它验证的是"终端回的功能码与我们问的不一致"这一现象，而不是
+// 驱动对解析失败的处理。要构造"帧成了但报文解不开"，用 SetTruncate。
 func (s *Server) SetBadFunc(on bool) {
 	s.mu.Lock()
 	s.badFunc = on

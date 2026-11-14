@@ -654,8 +654,59 @@ func TestBadChecksumIsProtocolError(t *testing.T) {
 	}
 }
 
-// 链路错误一旦记住，后续 Read 应立即整批标坏（不再逐点等超时）。
-// 用静默从站构造：超时会被 isLinkFailure 认成链路级错误。
+// TestDMIsNotRetried 表回了 DM（断开模式）：帧结构完好、地址正确，只是语义上
+// 表示「表拒绝继续通讯」。规范要求这类失败**不重发**——重发同一请求只会再收到
+// 一个 DM。它与 FCS 坏（线路干扰、可重发）在错误种类上同为 ErrProtocol，若重发
+// 循环只看 KindOf 就会一起重试到上限。
+func TestDMIsNotRetried(t *testing.T) {
+	srv, err := simdlms.NewServer("127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("启动从站失败: %v", err)
+	}
+	defer srv.Close()
+
+	d := New()
+	conn, err := d.Open(context.Background(), driver.OpenConfig{
+		Device: model.Device{ID: "meter", Timeout: model.Duration(500 * time.Millisecond),
+			Labels: map[string]string{"options": "client=16,server=1,addr-size=1,retries=2,gap=1ms"}},
+		Channel: model.Channel{
+			Transport: model.Transport{Kind: "tcp", Address: srv.Addr()},
+			Timeout:   model.Duration(2 * time.Second),
+		},
+	})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer conn.Close()
+
+	// 建链之后再打开 DM，否则 SNRM 都建不起来。
+	srv.SetReplyDM(true)
+	_, _, getBefore, _ := srv.Counts()
+
+	got, _ := conn.Read(context.Background(), []driver.ReadSpan{{ID: "s",
+		Points: []driver.PointRef{
+			{ID: "a", Address: model.Address{Kind: model.AddressSymbol, Path: "1.0.1.8.0.255"}},
+		}}})
+	if len(got) != 1 {
+		t.Fatalf("样本数 = %d", len(got))
+	}
+	if got[0].Err == nil {
+		t.Fatal("DM 应让该点位失败")
+	}
+	if k := driver.KindOf(got[0].Err); k != driver.ErrProtocol {
+		t.Fatalf("错误分类 = %v，应为 ErrProtocol", k)
+	}
+	if driver.IsRetryable(got[0].Err) {
+		t.Fatal("DM 必须标为不可重发")
+	}
+	_, _, getAfter, _ := srv.Counts()
+	// retries=2 时若误重发会发 3 次 Get；正确行为是只发 1 次。
+	if n := getAfter - getBefore; n != 1 {
+		t.Fatalf("DM 不应重发（只发 1 次 Get），实际 %d 次", n)
+	}
+}
+
+// 链路错误一旦记住，后续 Read 应立即整批标坏（不再逐点等超时）。// 用静默从站构造：超时会被 isLinkFailure 认成链路级错误。
 func TestLinkErrCached(t *testing.T) {
 	srv, err := simdlms.NewServer("127.0.0.1:0")
 	if err != nil {

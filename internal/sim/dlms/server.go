@@ -78,8 +78,10 @@ type Server struct {
 	ns, nr uint8
 
 	// 故障注入。
-	silent            bool
-	badChecksum       bool
+	silent      bool
+	badChecksum bool
+	// replyDM 为真时对 I 帧回 DM 帧（模拟表拒绝继续通讯）。
+	replyDM           bool
 	rejectAssociation bool
 
 	// 计数。
@@ -348,6 +350,17 @@ func (s *Server) SetBadChecksum(on bool) {
 	s.badChecksum = on
 }
 
+// SetReplyDM 开关"对 I 帧回 DM（断开模式）帧"。
+//
+// DM 表示表拒绝继续通讯：客户端/逻辑设备地址不对，或表主动断开链路。它是
+// "帧成了但内容不对"的典型形态——与 FCS 坏（线路干扰、可重发）不同，重发
+// 同一请求只会再收到一个 DM，因此驱动必须把它标为不可重发。
+func (s *Server) SetReplyDM(on bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.replyDM = on
+}
+
 // SetRejectAssociation 开关"拒绝应用关联"（模拟需要认证的表）。
 func (s *Server) SetRejectAssociation(on bool) {
 	s.mu.Lock()
@@ -516,7 +529,20 @@ func (s *Server) handle(fr dl.Frame) ([]byte, bool) {
 		// 收到 I 帧：更新 NR。
 		s.mu.Lock()
 		s.nr = (uint8(fr.Control.NS) + 1) & 0x07
+		replyDM := s.replyDM
 		s.mu.Unlock()
+		if replyDM {
+			// DM 是「表拒绝继续通讯」的应答：结构完好、地址正确、只是语义
+			// 上表示断开。用它验证驱动把这类失败归为不可重发。
+			//
+			// 这里把 getCount 也加一：请求确实到达了（驱动力学上就是一次
+			// Get），只是我们在分派 APDU 之前就决定用 DM 拒绝。不计数的话
+			// 「有没有重发」就无从断言。
+			s.mu.Lock()
+			s.getCount++
+			s.mu.Unlock()
+			return reply(dl.KindDM, dl.Control{Kind: dl.KindDM, PF: true}, nil), false
+		}
 		apdu, ok := fr.APDU()
 		if !ok || len(apdu) == 0 {
 			return nil, true

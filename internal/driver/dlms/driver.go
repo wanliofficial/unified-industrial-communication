@@ -928,6 +928,14 @@ func (c *conn) exchange(ctx context.Context, op string, body []byte, expect dlms
 		case driver.ErrDisconnected, driver.ErrUnsupported, driver.ErrPermission, driver.ErrAddress:
 			return dlmscodec.Frame{}, err
 		}
+		// 尊重 exchangeOnce 已经分好的「可重发」标记。HCS/FCS 校验错是线路
+		// 干扰（可重发），而 DM/FRMR、LLC 头不是应答形态、期望的帧类型不符
+		// 这类失败说明**表在正常应答、只是我们理解错了**（地址错、序号不同步、
+		// 服务端主动上报）——重发同一帧只会拿到同样的结果。两者在错误种类上
+		// 同为 ErrProtocol，只看 KindOf 会把「不重发」的那类一起重试到上限。
+		if !driver.IsRetryable(err) {
+			return dlmscodec.Frame{}, err
+		}
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return dlmscodec.Frame{}, driver.E(driver.ErrTimeout, op, c.devID, "context done", true, ctxErr)
 		}
