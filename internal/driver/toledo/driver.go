@@ -632,30 +632,82 @@ func (c *conn) setLinkErr(err error) {
 	c.mu.Unlock()
 }
 
+// Symbol 是一个读数字段的定义：名字 + 默认数据类型。
+//
+// 字段名单此前散在四处（knownSymbol / defaultDataType / sampleFor 的分支 /
+// 自检命令的 fields 切片与类型映射），任何一处改了别处就得跟着改，否则自检
+// 会「认得一个驱动读不到的字段」。现在唯一事实源是 Symbols()：knownSymbol、
+// defaultDataType 与自检命令都从它派生，sampleFor 仍按 symbol 取值但只处理
+// 这张表里的字段。
+type Symbol struct {
+	// Name 是点表里 symbol 地址用的字段名（小写）。
+	Name string
+	// Type 是该字段的默认数据类型。
+	Type model.DataType
+}
+
+// symbols 是全部受支持的读数字段，顺序即自检命令「默认读哪些字段」的顺序。
+//
+// 顺序刻意把重量放在最前：自检默认输出时人第一眼看到的就是它。新增字段只需
+// 在这里加一行，knownSymbol/defaultDataType/自检命令会自动跟上。
+var symbols = []Symbol{
+	{Name: "weight", Type: model.TypeFloat64},
+	{Name: "status", Type: model.TypeString},
+	{Name: "mode", Type: model.TypeString},
+	{Name: "unit", Type: model.TypeString},
+	{Name: "stable", Type: model.TypeBool},
+	{Name: "motion", Type: model.TypeBool},
+	{Name: "decimals", Type: model.TypeInt64},
+}
+
+// Symbols 返回全部读数字段的定义（名字 + 默认类型）。
+//
+// 这是本驱动读数字段的唯一事实源：Open 校验字段名、按字段定类型、以及自检命令
+// 要读哪些字段、各是什么类型，都从这里取。返回的是内部表的直接引用（只读使用），
+// 调用方不应修改它。
+func Symbols() []Symbol { return symbols }
+
+// SymbolsOf 返回全部读数字段名的有序列表（不含类型）。
+//
+// 自检命令合成「默认读哪些字段」的 PointRef 时用，避免它自己再维护一份名单。
+func SymbolsOf() []string {
+	out := make([]string, len(symbols))
+	for i, s := range symbols {
+		out[i] = s.Name
+	}
+	return out
+}
+
 // knownSymbol 判断是否是受支持的读数字段。
 func knownSymbol(s string) bool {
-	switch s {
-	case "weight", "status", "unit", "mode", "stable", "motion", "decimals":
-		return true
-	}
-	return false
+	return symbolType(s) != ""
 }
+
+// symbolType 返回字段的默认类型；不认识的字段返回空串。
+//
+// 空串既表示「不是字段」，也借 model.DataType 的零值同时表达「类型未知」——
+// 两者对「未知字段」是一回事：Open 会在建链前用 KnownSymbol 拦掉。
+func symbolType(s string) model.DataType {
+	for _, sym := range symbols {
+		if sym.Name == s {
+			return sym.Type
+		}
+	}
+	return ""
+}
+
+// SymbolType 返回字段的默认数据类型；不认识的字段返回空串。
+//
+// 自检命令合成点位时用它取类型，与驱动 Open 走同一张表（defaultDataType
+// 也委托这里），保证「自检给的类型」和「驱动认的类型」永远不会分叉。
+func SymbolType(s string) model.DataType { return symbolType(s) }
 
 // KnownSymbol 是 knownSymbol 的导出版本，供自检命令在连秤之前校验字段名。
 func KnownSymbol(s string) bool { return knownSymbol(s) }
 
-// defaultDataType 按字段给默认数据类型。
+// defaultDataType 按字段给默认数据类型（委托给唯一事实源 symbolType）。
 func defaultDataType(sym string) model.DataType {
-	switch sym {
-	case "stable", "motion":
-		return model.TypeBool
-	case "decimals":
-		return model.TypeInt64
-	case "status", "unit", "mode":
-		return model.TypeString
-	default: // weight
-		return model.TypeFloat64
-	}
+	return symbolType(sym)
 }
 
 // parseOptions 解析 labels.options。

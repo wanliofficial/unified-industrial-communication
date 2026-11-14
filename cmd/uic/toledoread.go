@@ -92,7 +92,9 @@ func toledoreadCmd(args []string) {
 	if *points != "" {
 		readFields = toledoRefs(*points)
 	} else {
-		readFields = []string{"weight", "status", "mode", "unit", "stable", "motion", "decimals"}
+		// 字段名单的唯一事实源在驱动的 Symbols()：自检命令不自己维护一份，
+		// 避免「自检认得、驱动读不到」这类漂移。
+		readFields = toledodrv.SymbolsOf()
 	}
 	dev := model.Device{
 		ID: "selfcheck", ChannelID: ch.ID, Enabled: true,
@@ -103,7 +105,7 @@ func toledoreadCmd(args []string) {
 	for _, f := range readFields {
 		dev.Points = append(dev.Points, model.Point{
 			ID: f, Address: model.Address{Kind: model.AddressSymbol, Path: f},
-			DataType: toledoDefaultType(f), Enabled: true,
+			DataType: toledodrv.SymbolType(f), Enabled: true,
 		})
 	}
 
@@ -195,13 +197,14 @@ func printToledoFields(asJSON bool) {
 // comm_error 样本（这是对的，否则采集层会把点位当「响应里缺项」）。判据必须是
 // 「至少有一个点位不是 comm_error」，否则这段循环等价于只读一次。
 func printToledoLatest(ctx context.Context, c driver.Conn, transport string, raw, asJSON bool) {
-	fields := []string{"weight", "status", "mode", "unit", "stable", "motion", "decimals"}
+	// 字段名单来自驱动的 SymbolsOf()（唯一事实源），不自维护一份。
+	fields := toledodrv.SymbolsOf()
 	refs := make([]driver.PointRef, 0, len(fields))
 	for _, f := range fields {
 		refs = append(refs, driver.PointRef{
 			ID:       f,
 			Address:  model.Address{Kind: model.AddressSymbol, Path: f},
-			DataType: toledoDefaultType(f),
+			DataType: toledodrv.SymbolType(f),
 		})
 	}
 
@@ -356,7 +359,7 @@ func readToledoPoints(ctx context.Context, c driver.Conn, spec string, raw, asJS
 		refs = append(refs, driver.PointRef{
 			ID:       p,
 			Address:  model.Address{Kind: model.AddressSymbol, Path: p},
-			DataType: toledoDefaultType(p),
+			DataType: toledodrv.SymbolType(p),
 		})
 	}
 	samples, err := c.Read(ctx, []driver.ReadSpan{{ID: "selfcheck", Points: refs}})
@@ -396,20 +399,6 @@ type toledoRow struct {
 	Value   string `json:"value,omitempty"`
 	Quality string `json:"quality,omitempty"`
 	Error   string `json:"error,omitempty"`
-}
-
-// toledoDefaultType 按字段给默认数据类型（与驱动 defaultDataType 一致）。
-func toledoDefaultType(field string) model.DataType {
-	switch field {
-	case "stable", "motion":
-		return model.TypeBool
-	case "decimals":
-		return model.TypeInt64
-	case "status", "unit", "mode":
-		return model.TypeString
-	default:
-		return model.TypeFloat64
-	}
 }
 
 // toledoFieldDesc 给字段一句话说明（输出用）。

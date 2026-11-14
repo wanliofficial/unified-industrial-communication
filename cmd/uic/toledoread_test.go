@@ -28,6 +28,7 @@ func TestToledoRefs(t *testing.T) {
 }
 
 func TestToledoDefaultType(t *testing.T) {
+	// 默认类型来自驱动 Symbols() 这张唯一事实源：自检命令不再自维护一份。
 	cases := map[string]string{
 		"weight":   "float64",
 		"status":   "string",
@@ -38,8 +39,8 @@ func TestToledoDefaultType(t *testing.T) {
 		"decimals": "int64",
 	}
 	for field, want := range cases {
-		if got := string(toledoDefaultType(field)); got != want {
-			t.Errorf("defaultType(%q) = %s，应为 %s", field, got, want)
+		if got := string(toledodrv.SymbolType(field)); got != want {
+			t.Errorf("SymbolType(%q) = %s，应为 %s", field, got, want)
 		}
 	}
 }
@@ -61,9 +62,12 @@ func TestToledoFieldValidation(t *testing.T) {
 
 func TestToledoFieldDescCoversAll(t *testing.T) {
 	// 每个合法字段都应有一句话说明（自检命令的可读性依赖它）。
-	for _, f := range []string{"weight", "status", "mode", "unit", "stable", "motion", "decimals"} {
+	//
+	// 名单从驱动的 SymbolsOf() 派生：新增字段若忘了补说明，这里会红，而不是悄悄
+	// 在自检输出里留空。
+	for _, f := range toledodrv.SymbolsOf() {
 		if toledoFieldDesc(f) == "" {
-			t.Errorf("字段 %q 缺少说明", f)
+			t.Errorf("字段 %q 缺少说明（在 toledoFieldDesc 里补一句）", f)
 		}
 	}
 }

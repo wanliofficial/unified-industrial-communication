@@ -306,3 +306,118 @@ func contains(s, sub string) bool {
 	}
 	return false
 }
+
+// ---------------------------------------------------------------------------
+// 字段名单的唯一事实源
+// ---------------------------------------------------------------------------
+
+// Symbols() 是唯一事实源，其余入口（KnownSymbol / defaultDataType / 自检命令）
+// 都从它派生。这条测试把「派生入口之间不能分叉」钉死：任何一处改了 Symbols()
+// 而忘了同步别处，这里就会红。
+func TestSymbolsSingleSourceOfTruth(t *testing.T) {
+	syms := Symbols()
+	if len(syms) == 0 {
+		t.Fatal("Symbols() 不能为空")
+	}
+	seen := map[string]bool{}
+	for _, s := range syms {
+		if s.Name == "" {
+			t.Fatalf("存在空字段名：%+v", s)
+		}
+		if seen[s.Name] {
+			t.Fatalf("字段名 %q 在 Symbols() 里重复", s.Name)
+		}
+		seen[s.Name] = true
+		// 每个字段必须有非空类型（空串是「未知」的零值，不该出现在事实源里）。
+		if s.Type == "" {
+			t.Errorf("字段 %q 的数据类型为空", s.Name)
+		}
+		// KnownSymbol 必须认得它。
+		if !KnownSymbol(s.Name) {
+			t.Errorf("KnownSymbol(%q) = false，但它在 Symbols() 里", s.Name)
+		}
+		// defaultDataType 必须与事实源的类型一致。
+		if got := defaultDataType(s.Name); got != s.Type {
+			t.Errorf("defaultDataType(%q) = %s，Symbols() = %s", s.Name, got, s.Type)
+		}
+	}
+	// 反过来说：不在表里的名字，KnownSymbol 必须拒、类型必须为空。
+	for _, bogus := range []string{"", "Weight", "kg", "net", "weight ", "gross"} {
+		if KnownSymbol(bogus) {
+			t.Errorf("KnownSymbol(%q) = true，但它不是合法字段名", bogus)
+		}
+		if got := defaultDataType(bogus); got != "" {
+			t.Errorf("defaultDataType(%q) = %s，未知字段应为空串", bogus, got)
+		}
+	}
+	// SymbolsOf 必须与 Symbols 的名字一一对应、顺序一致。
+	names := SymbolsOf()
+	if len(names) != len(syms) {
+		t.Fatalf("SymbolsOf() 长度 %d != Symbols() 长度 %d", len(names), len(syms))
+	}
+	for i, s := range syms {
+		if names[i] != s.Name {
+			t.Errorf("SymbolsOf()[%d] = %q，Symbols()[%d].Name = %q", i, names[i], i, s.Name)
+		}
+	}
+}
+
+// Symbols() 覆盖的字段必须与 sampleFor 的取值分支一一对应：
+// 少一个字段，那个字段就永远读不到值（Open 认得、Read 返回兜底 bad）。
+//
+// 做法：用全部字段建一个多点位连接，逐字段读回，断言每个都拿到了「按取值分支
+// 算出来的真实值」而不是「未知符号」的兜底 bad。这里只校验「非兜底」——各字段
+// 的取值正确性由 TestReadStableWeight 等单字段用例钉死，不在这里重复。
+func TestSymbolsCoveredBySampleFor(t *testing.T) {
+	srv := startSim(t, toledosim.WithWeight(149.0, "kg", 1))
+	// 全部字段都注册（Read 只为 Open 时登记过的点位返回样本）。
+	all := Symbols()
+	refs := make([]driver.PointRef, 0, len(all))
+	for _, s := range all {
+		refs = append(refs, pt(s.Name, s.Name, s.Type))
+	}
+	c := openConn(t, srv, refs...)
+	if err := c.Probe(context.Background()); err != nil {
+		t.Fatalf("probe: %v", err)
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	var out []driver.RawSample
+	for time.Now().Before(deadline) {
+		var err error
+		out, err = c.Read(context.Background(), spans(refs...))
+		if err != nil {
+			t.Fatalf("read: %v", err)
+		}
+		if hasAllFresh(out) {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	for _, s := range all {
+		sample, ok := sampleByID(out, s.Name)
+		if !ok {
+			t.Errorf("字段 %q 读不到样本", s.Name)
+			continue
+		}
+		if sample.Quality == model.QualityCommError {
+			t.Errorf("字段 %q 得到 comm_error，probe 后不该如此", s.Name)
+			continue
+		}
+		// 兜底分支：未知 symbol → bad 且无 Err。命中它说明 sampleFor 缺了这个
+		// 字段的取值分支（字段加进了 Symbols() 却忘了在 Read 里取值）。
+		if sample.Quality == model.QualityBad && sample.Err == nil {
+			t.Errorf("字段 %q 命中未知符号兜底（bad 且无 Err）——sampleFor 缺取值分支", s.Name)
+		}
+	}
+}
+
+// hasAllFresh 判断一批样本是否至少有一个非 comm_error（收到过帧）。
+func hasAllFresh(samples []driver.RawSample) bool {
+	for _, s := range samples {
+		if s.Quality != model.QualityCommError {
+			return true
+		}
+	}
+	return false
+}
