@@ -1,0 +1,109 @@
+{
+  "schemaVersion": 1,
+  "site": "toledo-lab",
+  "server": {
+    "listen": "127.0.0.1:8098",
+    "token": "dev-token-0123456789"
+  },
+  "storage": {
+    "dir": "./data-toledo",
+    "journal": true,
+    "outboxMaxRecords": 5000,
+    "outboxTtl": "10m"
+  },
+  "logging": {
+    "level": "info"
+  },
+  "northbound": {
+    "webhook": {
+      "enabled": false,
+      "url": "http://127.0.0.1:9999/ingest",
+      "timeout": "3s"
+    }
+  },
+  "channels": [
+    {
+      "id": "ch-toledo",
+      "protocol": "toledo",
+      "transport": {
+        "kind": "tcp",
+        "address": "127.0.0.1:4001"
+      },
+      "concurrency": 1,
+      "timeout": "5s"
+    }
+  ],
+  "devices": [
+    {
+      "id": "scale-line-1",
+      "name": "1 号线称重仪表（内置 Toledo 连续输出衡器）",
+      "channel": "ch-toledo",
+      "interval": "5s",
+      "timeout": "4s",
+      "enabled": true,
+      "labels": {
+        "options": "staleAfter=30s,readTimeout=10s"
+      },
+      "points": [
+        {
+          "id": "weight",
+          "name": "重量值（带符号，单位见 unit 点；运动中判 uncertain，超/欠量程判 bad）",
+          "address": { "kind": "symbol", "path": "weight" },
+          "dataType": "float64",
+          "unit": "kg",
+          "enabled": true
+        },
+        {
+          "id": "status",
+          "name": "称量状态（ST=稳定 US=运动中 OL=超量程 UL=欠量程）",
+          "address": { "kind": "symbol", "path": "status" },
+          "dataType": "string",
+          "enabled": true
+        },
+        {
+          "id": "mode",
+          "name": "毛净模式（GS=毛重 NT=净重 TR=皮重）",
+          "address": { "kind": "symbol", "path": "mode" },
+          "dataType": "string",
+          "enabled": true
+        },
+        {
+          "id": "unit",
+          "name": "计量单位（kg/lb/g/t/oz/kN… 或 lb_oz 磅盎司）",
+          "address": { "kind": "symbol", "path": "unit" },
+          "dataType": "string",
+          "enabled": true
+        },
+        {
+          "id": "stable",
+          "name": "是否稳定（status=ST）",
+          "address": { "kind": "symbol", "path": "stable" },
+          "dataType": "bool",
+          "enabled": true
+        },
+        {
+          "id": "motion",
+          "name": "是否运动中（status=US）",
+          "address": { "kind": "symbol", "path": "motion" },
+          "dataType": "bool",
+          "enabled": true
+        },
+        {
+          "id": "decimals",
+          "name": "数值段小数位数",
+          "address": { "kind": "symbol", "path": "decimals" },
+          "dataType": "int64",
+          "enabled": true
+        },
+        {
+          "id": "net-weight",
+          "name": "净重（同一重量值在 NT 模式下的读数；用于演示同一物理量按 mode 区分）",
+          "address": { "kind": "symbol", "path": "weight" },
+          "dataType": "float64",
+          "unit": "kg",
+          "enabled": false
+        }
+      ]
+    }
+  ]
+}

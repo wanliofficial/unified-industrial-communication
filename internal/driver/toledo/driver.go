@@ -487,6 +487,9 @@ func knownSymbol(s string) bool {
 	return false
 }
 
+// KnownSymbol 是 knownSymbol 的导出版本，供自检命令在连秤之前校验字段名。
+func KnownSymbol(s string) bool { return knownSymbol(s) }
+
 // defaultDataType 按字段给默认数据类型。
 func defaultDataType(sym string) model.DataType {
 	switch sym {

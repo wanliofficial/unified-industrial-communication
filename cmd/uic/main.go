@@ -97,6 +97,7 @@ import (
 	secssim "uic/internal/sim/secs"
 	sl651sim "uic/internal/sim/sl651"
 	snmpsim "uic/internal/sim/snmp"
+	toledosim "uic/internal/sim/toledo"
 )
 
 // 构建期注入：-ldflags "-X main.version=... -X main.commit=..."
@@ -153,6 +154,8 @@ func main() {
 		dlmsreadCmd(args)
 	case "sl651read":
 		sl651readCmd(args)
+	case "toledoread":
+		toledoreadCmd(args)
 	case "snmpread":
 		snmpreadCmd(args)
 	case "mtconnectread":
@@ -585,7 +588,7 @@ func simCmd(args []string) {
 	fs := flag.NewFlagSet("sim", flag.ExitOnError)
 	addr := fs.String("listen", "127.0.0.1:15020", "监听地址")
 	size := fs.Int("size", 1024, "寄存器数量")
-	proto := fs.String("protocol", "modbus", "从站协议：modbus | s7 | opcua | mqtt | mc | fins | enip | bacnet | bacnet-mstp | iec104 | iec101 | mewtocol | hostlink | dnp3 | coap | knx | dlt645 | cjt188 | mbus | dlms | sl651 | snmp | ads | secs | iec61850 | mtconnect")
+	proto := fs.String("protocol", "modbus", "从站协议：modbus | s7 | opcua | mqtt | mc | fins | enip | bacnet | bacnet-mstp | iec104 | iec101 | mewtocol | hostlink | dnp3 | coap | knx | dlt645 | cjt188 | mbus | dlms | sl651 | snmp | ads | secs | iec61850 | mtconnect | toledo")
 	pdu := fs.Int("pdu", 480, "S7 协商 PDU 长度（240/480/960）")
 	busAddr := fs.Int("busAddr", 1, "M-Bus：虚拟表计的主地址 0..250")
 
@@ -659,6 +662,9 @@ func simCmd(args []string) {
 	case "sl651":
 		simSL651(*addr)
 		return
+	case "toledo":
+		simToledo(*addr)
+		return
 	case "snmp":
 		simSNMP(*addr, snmpsim.Options{
 			V3: simSNMPV3(*v3, *user, *authProto, *authPass, *privProto, *privPass),
@@ -678,7 +684,7 @@ func simCmd(args []string) {
 		return
 	case "modbus":
 	default:
-		fmt.Fprintf(os.Stderr, "未知协议 %q（支持 modbus | s7 | opcua | mqtt | mc | fins | enip | bacnet | bacnet-mstp | iec104 | iec101 | mewtocol | hostlink | dnp3 | coap | knx | dlt645 | cjt188 | mbus | dlms | sl651 | snmp | ads | secs | iec61850 | mtconnect）\n", *proto)
+		fmt.Fprintf(os.Stderr, "未知协议 %q（支持 modbus | s7 | opcua | mqtt | mc | fins | enip | bacnet | bacnet-mstp | iec104 | iec101 | mewtocol | hostlink | dnp3 | coap | knx | dlt645 | cjt188 | mbus | dlms | sl651 | snmp | ads | secs | iec61850 | mtconnect | toledo）\n", *proto)
 		os.Exit(2)
 	}
 
@@ -1428,6 +1434,38 @@ func simSL651(addr string) {
 	fmt.Println("  不模拟：配置表（40~43H）、控制命令（4C~4FH）、图片报（36H）、M3 多包、ASCII 帧")
 	fmt.Println("  Ctrl+C 停止")
 	fmt.Printf("  自检：   uic sl651read -addr %s -station %s -probe\n", srv.Addr(), bcdStation(st))
+
+	<-ctx.Done()
+	_ = srv.Close()
+	slog.Info("sim_stopped")
+}
+
+// simToledo 启动一台内置称重仪表（连续输出推送方）。
+//
+// 衡器连上后按固定频率持续吐 ASCII 连续输出帧（ST,GS,+00149.0kg 之类），不发命令、
+// 不应答。默认监听 4001，与仓库里 M-Bus / IEC 101 / SL 651 的内置从站默认端口一致
+// ——都是「串口服务器透传」的常见端口。真实秤的端口由 DTU 决定，驱动不写死。
+//
+// 打印的说明刻意写出「本从站不模拟什么」（二进制 TOLEDO 格式、SICS 命令应答），
+// 因为自检最容易被误读成「协议全部实现了」。
+func simToledo(addr string) {
+	srv, err := toledosim.NewServer(addr)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "启动称重仪表失败: %v\n", err)
+		os.Exit(1)
+	}
+	defer func() { _ = srv.Close() }()
+
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	fmt.Printf("toledo scale slave listening on %s (连续输出 ~20 帧/秒，ST,GS,+00149.0kg)\n", srv.Addr())
+	fmt.Println("  读数：重量 weight=149.0kg  状态 status=ST（稳定）  mode=GS（毛重）  unit=kg  decimals=1")
+	fmt.Println("  只读推送：衡器不发命令、不应答；驱动被动收帧，取最新一帧")
+	fmt.Println("  不模拟：二进制 TOLEDO 格式（STX 18 字节）、SICS 命令应答、去皮/清零等写操作")
+	fmt.Println("  Ctrl+C 停止")
+	fmt.Printf("  自检：   uic toledoread -addr %s -probe\n", srv.Addr())
+	fmt.Printf("          uic toledoread -addr %s -points weight,status,stable\n", srv.Addr())
 
 	<-ctx.Done()
 	_ = srv.Close()

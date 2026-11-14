@@ -61,6 +61,7 @@ import (
 	secsdrv "uic/internal/driver/secs"
 	sl651drv "uic/internal/driver/sl651"
 	snmpdrv "uic/internal/driver/snmp"
+	toledodrv "uic/internal/driver/toledo"
 	"uic/internal/driver/virtual"
 	"uic/internal/history"
 	"uic/internal/model"
@@ -191,6 +192,7 @@ func RegisterBuiltins() error {
 			mbusdrv.New(),
 			dlmsdrv.New(),
 			sl651drv.New(),
+			toledodrv.New(),
 		} {
 			if err := driver.Register(d); err != nil {
 				registerErr = err

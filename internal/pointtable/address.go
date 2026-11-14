@@ -375,8 +375,20 @@ func PolicyFor(protocol string) AddressPolicy {
 		// 瞬时河道水位），所以这里与 M-Bus/DLMS 同类——地址是名字，不是
 		// 算术。规律性强的点位（多站同构点表）由 labels.address 表达站号。
 		return AddressPolicy{Width: WidthNone, AllowSymbol: true}
+	case "toledo":
+		// 读数字段寻址：weight / status / mode / unit / stable / motion /
+		// decimals。每个点位是「当前一帧读数」的一个字段，不是某个寄存器。
+		//
+		// 为什么不接受 register:offset：连续输出帧是 `状态,毛净,数值` 三段式，
+		// 没有「第 n 个寄存器」这种线性结构；数值段宽度由仪表的小数位数决定
+		// （D39 的 WEIGHT(7) 是 5 位整数 + '.' + 1 位小数），点表里写 length 只会
+		// 与帧里的实际宽度冲突。
+		//
+		// 为什么允许符号地址：字段名是衡器读数的**语义标签**（weight 永远是重量
+		// 值），与 SL 651 的要素标识符同类——地址是名字，不是算术。字段名的
+		// 合法性（weight/status/…）由驱动在 Open 时校验，这里只放开种类。
+		return AddressPolicy{Width: WidthNone, AllowSymbol: true}
 	}
-	// 未知协议：不拦地址种类（驱动可能在外部注册），但 length 必须显式，
 	// 避免用一个猜出来的宽度去读真实设备。
 	return AddressPolicy{
 		Width:         WidthExplicit,
