@@ -49,6 +49,14 @@ type Server struct {
 	// badChecksum 为真时把应答的校验和改坏一个字节（用于验证主站的
 	// 干扰处理路径：应报协议错误并重试，而不是把坏数据当真值）。
 	badChecksum bool
+	// badCI 非零时把应答的 CI 字段换成它（用于验证主站对「C/CI 不对」
+	// 的处理路径：应报协议错误且**不重发**）。
+	//
+	// 注意这里改的是 CI 而不是地址：地址被改成 0xFDh 会让 codec 在**分帧**
+	// 阶段就拒绝（Reader 跳过坏帧 → 最终表现成超时），走不到「帧成了但内容
+	// 不对」那条分支。只有让帧完整、校验和正确、只是 CI 不受支持，才能构造
+	// 出 spec §3.10.25.6 里「从站在正常应答，只是我们理解错了」的场景。
+	badCI byte
 	// silent 为真时对一切请求都不应答（模拟总线断开/站号错）。
 	silent bool
 	// statusError 为真时状态字报应用错误（bit0-1 非零）。
@@ -57,6 +65,11 @@ type Server struct {
 	requests int64
 	nkeCount int64
 	reads    int64
+	// reqCount 是收到的 REQ_UD1/REQ_UD2 帧数（含 FCB 回放）。
+	//
+	// 它与 reads 的区别正是「重发」：主站重发同一 FCB 时从站回放旧应答，
+	// reads 不变而 reqCount 会加一。测试「某类错误该不该重发」只能看它。
+	reqCount int64
 
 	ln     net.Listener
 	conns  map[net.Conn]struct{}
@@ -198,6 +211,16 @@ func (s *Server) Reads() int64 {
 	return s.reads
 }
 
+// ReqCount 返回收到的 REQ_UD1/REQ_UD2 帧数（含 FCB 回放）。
+//
+// 它与 Reads() 的差值就是重发次数：主站重发同一 FCB 时从站回放旧应答，
+// Reads 不增而 ReqCount 增。判断「某类错误该不该重发」只能看它。
+func (s *Server) ReqCount() int64 {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.reqCount
+}
+
 // NKECount 返回收到的 SND_NKE 次数。
 func (s *Server) NKECount() int64 {
 	s.mu.RLock()
@@ -256,6 +279,17 @@ func (s *Server) SetBadChecksum(on bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.badChecksum = on
+}
+
+// SetBadCI 让从站用一个"不受支持的 CI"应答。
+//
+// 它只用于验证主站的重发语义：spec §3.10.25.6 规定校验和错要重发（瞬态
+// 干扰），而 C/CI 不对**不重发**（从站在正常应答，重试无用）。非零值才会
+// 生效；0 表示恢复正常应答。
+func (s *Server) SetBadCI(ci byte) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.badCI = ci
 }
 
 // SetSilent 开关"完全不应答"。
@@ -423,6 +457,7 @@ func (s *Server) handleNKE() ([]byte, bool) {
 func (s *Server) handleREQ(fr mb.Frame) ([]byte, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.reqCount++
 
 	// FCB 回放：FCV=1 且 FCB 与上一次相同 → 主站在重传，回放上一次应答。
 	//
@@ -442,6 +477,13 @@ func (s *Server) handleREQ(fr mb.Frame) ([]byte, bool) {
 		return nil, true
 	}
 	frame := mb.BuildLong(mb.CtrlRSPUD, s.addr, mb.CIVariableData, data)
+	if s.badCI != 0 {
+		// 换 CI 之后必须重算校验和：否则失败原因会退化成"校验和错"，
+		// 而校验和错是可重发的，测不到"CI 错不重发"这条语义。
+		length := int(frame[1])
+		frame[6] = s.badCI
+		frame[4+length] = mb.Checksum(frame[4], frame[5], frame[6], frame[7:4+length])
+	}
 	if s.badChecksum {
 		// 改坏校验和而不是改坏数据：这是总线上真实会发生的形态，
 		// 而且主站必须靠校验和（而不是内容）发现它。

@@ -298,6 +298,61 @@ func TestBadChecksumIsRetriedThenReported(t *testing.T) {
 	}
 }
 
+func TestChecksumErrorIsRetriedThenReported(t *testing.T) {
+	// 校验和错是瞬态干扰：应当**重发**到重试上限，而不是第一次就放弃。
+	//
+	// 计数口径用 ReqCount()（含 FCB 回放）：校验和错时从站是正常处理请求的，
+	// 重发同一 FCB 会走到回放分支。retries=1 → 每次 readOnce 最多 2 次请求；
+	// readTable 失败后还会补发 SND_NKE 再读一轮，所以总计 4 次。
+	srv := startSim(t)
+	srv.SetBadChecksum(true)
+	c := openConn(t, srv, "retries=1,gap=1ms")
+	ctx := context.Background()
+	_, err := c.Read(ctx, spans(q("e", "energy")))
+	if err == nil {
+		t.Fatal("持续坏校验和应报错")
+	}
+	if driver.KindOf(err) != driver.ErrProtocol {
+		t.Fatalf("错误分类 = %v，应为 ErrProtocol", driver.KindOf(err))
+	}
+	// 两轮（首轮 2 次 + SND_NKE 复位后 2 次）都发满上限，说明校验和错
+	// 在每一轮里都被重发。
+	if got := srv.ReqCount(); got != 4 {
+		t.Fatalf("坏校验和应每轮重发到上限（2×2=4 次请求），实际 %d 次", got)
+	}
+	if got := srv.NKECount(); got != 1 {
+		t.Fatalf("失败后应补发 1 次 SND_NKE 复位 FCB，实际 %d 次", got)
+	}
+}
+
+func TestFrameErrorIsNotRetried(t *testing.T) {
+	// C/CI 不对（从站在正常应答、只是我们理解错了）：spec §3.10.25.6 要求
+	// **不重发**。
+	//
+	// 这里让从站回一个成帧、校验和正确、但 CI 不受支持的应答——只有这种
+	// 形态才会走到 CheckResponse/ParseResponse 的 ErrFrame 分支。改地址
+	// （A=FDh）会让 codec 在分帧阶段就拒绝，表现为「有字节不成帧」→
+	// ErrProtocol 超时 → 可重发，测不到本条语义。
+	srv := startSim(t)
+	srv.SetBadCI(0x5A)
+	c := openConn(t, srv, "retries=2,gap=1ms")
+	ctx := context.Background()
+	_, err := c.Read(ctx, spans(q("e", "energy")))
+	if err == nil {
+		t.Fatal("不受支持的 CI 应报错")
+	}
+	if driver.KindOf(err) != driver.ErrProtocol {
+		t.Fatalf("错误分类 = %v，应为 ErrProtocol", driver.KindOf(err))
+	}
+	if driver.IsRetryable(err) {
+		t.Fatal("C/CI 错必须标为不可重发")
+	}
+	// 每轮应只发 1 次：首轮 1 次 + SND_NKE 复位后 1 次 = 2 次。
+	if got := srv.ReqCount(); got != 2 {
+		t.Fatalf("C/CI 错不应重发（每轮 1 次，共 2 次），实际 %d 次", got)
+	}
+}
+
 func TestSilentMeterTimesOut(t *testing.T) {
 	srv := startSim(t)
 	srv.SetSilent(true)

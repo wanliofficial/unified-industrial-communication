@@ -277,6 +277,73 @@ func TestBadChecksumInjection(t *testing.T) {
 	}
 }
 
+// TestBadCIIsWellFormed 钉住 SetBadCI 的关键性质：换掉 CI 之后**必须重算
+// 校验和**，否则帧会先在分帧/校验阶段就被判坏，失败原因退化成"校验和错"
+// （可重发），而测不到"CI 不受支持不重发"这条语义。
+func TestBadCIIsWellFormed(t *testing.T) {
+	srv, err := NewServer("127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("server: %v", err)
+	}
+	t.Cleanup(func() { _ = srv.Close() })
+	const badCI = 0x5A
+	srv.SetBadCI(badCI)
+
+	c := dialSim(t, srv)
+	if _, err := c.Write(mb.BuildShort(mb.ReqUD2Control(true), srv.Address())); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	_ = c.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
+	buf := make([]byte, 320)
+	n, err := c.Read(buf)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	// 第一步：帧本身必须**完好**——能过 Parse（含校验和），CI 就是注入值。
+	fr, _, perr := mb.Parse(buf[:n])
+	if perr != nil {
+		t.Fatalf("SetBadCI 注入的帧应能正常分帧（校验和需重算），得到 %v（%x）", perr, buf[:n])
+	}
+	if fr.CIField != badCI {
+		t.Fatalf("CI = %02X，应为注入的 %02X", fr.CIField, badCI)
+	}
+	// 第二步：在业务层被拒为 ErrFrame——这才是"从站在正常应答、只是我们
+	// 理解错了"的那一类，驱动据此报不可重发。
+	if _, perr := mb.ParseResponse(fr); !errors.Is(perr, mb.ErrFrame) {
+		t.Fatalf("不受支持的 CI 应在 ParseResponse 报 ErrFrame，得到 %v", perr)
+	}
+}
+
+// TestReqCountSeparatesRetries 钉住 ReqCount 与 Reads 的口径差异：主站重发
+// 同一 FCB 时从站回放旧应答，Reads 不增而 ReqCount 增。判断"某类错误该不该
+// 重发"只能靠这一对计数。
+func TestReqCountSeparatesRetries(t *testing.T) {
+	srv, err := NewServer("127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("server: %v", err)
+	}
+	t.Cleanup(func() { _ = srv.Close() })
+
+	c := dialSim(t, srv)
+	req := mb.BuildShort(mb.ReqUD2Control(true), srv.Address())
+	for i := 0; i < 3; i++ {
+		if _, err := c.Write(req); err != nil {
+			t.Fatalf("write #%d: %v", i, err)
+		}
+		_ = c.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
+		buf := make([]byte, 320)
+		if _, err := c.Read(buf); err != nil {
+			t.Fatalf("read #%d: %v", i, err)
+		}
+	}
+	if got := srv.ReqCount(); got != 3 {
+		t.Fatalf("ReqCount = %d，应为 3（每次请求都计，含回放）", got)
+	}
+	if got := srv.Reads(); got != 1 {
+		t.Fatalf("Reads = %d，应为 1（同 FCB 重放不生成新应答）", got)
+	}
+}
+
 func TestSilentMode(t *testing.T) {
 	srv, err := NewServer("127.0.0.1:0")
 	if err != nil {

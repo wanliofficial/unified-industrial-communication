@@ -468,6 +468,16 @@ func (c *conn) transact(ctx context.Context, op string, req []byte,
 		if driver.KindOf(err) == driver.ErrDisconnected || driver.KindOf(err) == driver.ErrUnsupported {
 			return mbuscodec.Frame{}, err
 		}
+		// 尊重 exchange 已经分好的「可重发」标记。M-Bus 的应答校验和错是
+		// 瞬态干扰（可重发），而 C 字段/CI 不对、PRM 位错位、次级地址被拒
+		// 这类 `ErrFrame` 表示**从站在正常应答、只是我们理解错了**——
+		// 重发同一请求只会得到同样的应答，重试纯属浪费一次往返。spec
+		// §3.10.25.6 对此有明文约定，exchange 已在 OpError 上标好
+		// temporary=false；这里若只看错误种类（ErrProtocol）就会把两类失败
+		// 一起重试，与「校验和错才重发」的语义相悖。
+		if !driver.IsRetryable(err) {
+			return mbuscodec.Frame{}, err
+		}
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return mbuscodec.Frame{}, driver.E(driver.ErrTimeout, op, c.devID, "context done", true, ctxErr)
 		}

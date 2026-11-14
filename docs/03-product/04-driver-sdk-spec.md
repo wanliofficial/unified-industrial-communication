@@ -7215,6 +7215,17 @@ FCB，表现为问答完全对不上；`SND_NKE` 是唯一能把它拉回已知�
 重发同一 FCB 让它回放上次应答，不会让存储值被重读）；C 字段/CI 不对**不重发**
 （从站在正常应答，只是我们理解错了，重试没用）。
 
+这一条不能只靠注释表达。两类失败在错误**种类**上是同一个（都是 `ErrProtocol`），
+若重发循环只看 `KindOf(err)`，就会把「不重发」的那一类一起重试——症状是每次读表
+都白等 `retries × 超时`，且日志里看不出任何区别。因此实现把它落到驱动 SDK 已有的
+`driver.E(..., temporary, ...)` 第 5 个参数上：`exchange` 对校验和错标 `temporary=true`，
+对 C/CI 错及次级地址等 `ErrFrame` 标 `temporary=false`；`transact` 在 `KindOf` 判断
+之后追加 `if !driver.IsRetryable(err) { return err }`，让标记真正生效。测试也按这个
+口径写：`SetBadCI` 让从站回一个「成帧、校验和正确、CI 不受支持」的应答，断言
+`ReqCount()` 每轮只增 1（不重发）；`SetBadChecksum` 则每轮增满 `retries+1`（重发）。
+刻意不用「把应答地址改成 `FDh`」来构造该场景——那会在**分帧**阶段就被拒，最终表现
+成超时，恰好落进「可重发」的分支，测不到本条语义。
+
 `Write` 声明 `unsupported` 并对每项返回 `ErrUnsupported`。M-Bus 的写方向是
 `SND_UD`（`CI=51h` 发数据 / `5Eh` 改地址 / `50h` 校时），不实现的理由有两条：
 写什么、写成什么格式完全由表厂的应用层剖面决定（一次写整条记录需要主站构造
@@ -7310,13 +7321,20 @@ uic mbusread -port /dev/ttyUSB0 -baud 2400 -scan 1-20     # 扫主地址
 `SetSilent`（完全不应答 → 超时路径）、`SetValue`/`Value`（改值与读回，用于验证
 VIF 换算）三个注入点，测试只打开自己关心的那一个。
 
+`SetBadCI` 与 `SetBadChecksum` 是一对，专门用来钉住「哪类错该重发」：前者把 CI
+换成不受支持的值并**重算校验和**（保证帧本身是完好的，只有语义不支持），后者只
+弄坏校验和。配套的计数器也必须成对看——`Reads()` 只数「生成新应答」的次数（FCB
+回放不增），`ReqCount()` 数收到的请求帧（回放也增），两者之差就是重发次数。
+`Requests()` 则连 `SND_NKE` 一起数，用它断言重发次数会把复位帧算进去，得不出
+干净结论。
+
 #### 3.10.25.9 测试矩阵
 
 | 层 | 用例 |
 |---|---|
 | `codec/mbus` | 金帧逐字节（SND_NKE / 短帧 / 长帧 / 控制帧）与校验和范围（**不覆盖** L 与起止符）；双 `L` 不等、结束符错、截断 → `ErrIncomplete` vs `ErrFrame` 的区分；`FDh` 次级地址被拒；`E5` 与长帧粘包时先切 `E5`；`BadFrames` 只数内容不对的帧、重同步不计数；VIF 全表与幂次（含相邻编码 10 倍关系、厂商特定 7Fh/FFh、自定义 7Ch、主 VIFE 表 7Dh）；BCD 正负号与非法数字；REAL 不乘 Scale；LVAR 全编码表；Type G/F/I 日期时间与无效位、2 月 30 日拒绝；`2Fh` 填充跳过；`DIF=1Fh` 后续标志；固定结构 16 字节布局与 `type` 字节（含 J 族 `0x0B..0x13` 单调 1e3..1e11）；`q:`/`r:` 选择与失败时报候选；编码↔解码互逆 |
-| `driver/mbus` | 真实 TCP 回环读写；`MultiRead` 一条事务覆盖多点；FCB 跨轮翻转、同轮回放（访问号不变的端到端验证）；读取失败后 `SND_NKE` 复位再试；同 FCB 重放不累加访问号；坏帧 → `ErrProtocol` 且文案含波特率提示；完全无应答 → `ErrTimeout`；校验和错重发、C/CI 错不重发；状态字应用错误 → uncertain；`Write` 逐项 `ErrUnsupported`；`max-follow` 上限；`q:volume@1` / `q:power-max` / `r:0` 寻址；后续报文记录重新编号；地址 251/253/255 在 `Open` 被拒 |
-| `sim/mbus` | 默认 8 条记录可被 `RecordNames`→`FindRecord` 直接吃回去；同 FCB 重放不改访问号；访问号自增；地址不符静默；坏校验只改校验和；`SetStatusError`；`SetSilent`；`DIF=1Fh` 后续报文；`SetValue`/`Value` 与 VIF 换算一致 |
+| `driver/mbus` | 真实 TCP 回环读写；`MultiRead` 一条事务覆盖多点；FCB 跨轮翻转、同轮回放（访问号不变的端到端验证）；读取失败后 `SND_NKE` 复位再试；同 FCB 重放不累加访问号；坏帧 → `ErrProtocol` 且文案含波特率提示；完全无应答 → `ErrTimeout`；校验和错**重发到上限**（每轮 `retries+1` 次）与 C/CI 错**不重发**（每轮 1 次）成对断言，后者同时断言 `IsRetryable(err)==false`；状态字应用错误 → uncertain；`Write` 逐项 `ErrUnsupported`；`max-follow` 上限；`q:volume@1` / `q:power-max` / `r:0` 寻址；后续报文记录重新编号；地址 251/253/255 在 `Open` 被拒 |
+| `sim/mbus` | 默认 8 条记录可被 `RecordNames`→`FindRecord` 直接吃回去；同 FCB 重放不改访问号；访问号自增；地址不符静默；坏校验只改校验和；`SetBadCI` 换 CI 后重算校验和（帧完好、语义不支持）；`Reads` 与 `ReqCount` 在重发时分离；`SetStatusError`；`SetSilent`；`DIF=1Fh` 后续报文；`SetValue`/`Value` 与 VIF 换算一致 |
 | `pointtable` | `mbus` 走 `WidthNone + AllowSymbol`；`q:`/`r:` 两种记录寻址都解析成 symbol 且 `Canonical` 往返一致（`r:` 靠策略里的 `SymbolPrefixes` 先一步排除寄存器识别——`r` 同时是 Mewtocol 的接点区名，不排除会被判成「不接受寄存器地址」）；漏写 `q:` 前缀按物理量名处理；`coil:`/`holding:`/`dt:`/`dm:` 与 selector 在导入期拒绝；`length` 列在导入期拒绝；`q:energy` 不被 modbus/s7/iec104/mewtocol/fins 收下，而 `r:16.3` 在 mewtocol 下仍是寄存器位地址 |
 | `cmd/uic` | `parsePrimaryAddr`（253/255 的拒绝文案）、`parseScanRange`、`mbusRefs` 列拆分、`rowOf` 可粘贴地址 |
 
@@ -8837,6 +8855,8 @@ drivertest.Run(t, driver, virtualDevice)
 | `Capabilities` 只写「记得的几个」字段 | 漏写的字段序列化成**空串**，既不是 `supported` 也不是 `unsupported`；前端渲染成空白，调用方无法判断该不该依赖它 | 8 个字段**全部显式声明**（`Read`/`Write`/`Subscribe`/`Browse`/`Discovery`/`MultiRead`/`BitAccess`/`StructTypes`）。`CapState` 是 string 枚举，零值 `""` 不是四态之一 |
 | 每个驱动只写自己的 `TestMetaContract`，断言它「记得写」的那几项 | 漏写的字段正好不在断言里，全仓测试照样全绿（SL 651 长期 6/8 就是这么漏的） | 除驱动自检外，`internal/runtime` 有一条**全仓**兜底 `TestBuiltinDriversMetaContract`：遍历 `driver.List()`，对每个驱动的 8 个能力位逐个校验落在四态内 |
 | 为纯符号协议写带冒号的地址，而符号头撞上别的协议的区名 | 被误判成「本协议不接受寄存器地址」而在导入期拒绝，错误信息把人引向错误方向 | 在 `AddressPolicy.SymbolPrefixes` 里声明本协议占用的前缀（如 M-Bus 的 `q`/`r`），解析器见到即跳过寄存器识别 |
+| 在 `driver.E(...)` 上标了 `temporary=false`，重发循环却只看 `KindOf(err)` | 标记形同废纸：本该「不重发」的失败照样重试到上限，每次读表白等 `retries × 超时`，且日志上看不出与「可重发」那类有任何区别（两者 `KindOf` 同为 `ErrProtocol`） | 重发循环在 `KindOf` 判断之后追加 `if !driver.IsRetryable(err) { return err }`；测试要能区分两类：可重发的每轮请求数 = `retries+1`，不重发的每轮 = 1 |
+| 构造「帧内容不对」的测试用例时改地址（如 `A=FDh`） | 地址在**分帧**阶段就被拒，Reader 跳过坏帧，最终表现成超时 → 落进「可重发」分支，测不到「不重发」的语义，测试反而变成假绿或误导 | 让帧**成帧且校验和正确**，只把 CI 换成不受支持的值（sim 的 `SetBadCI`），这样才真正走到 `CheckResponse`/`ParseResponse` 的 `ErrFrame` |
 
 ---
 
