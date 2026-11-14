@@ -7241,6 +7241,43 @@ TCP 省略端口时补 4001（本平台与串口服务器的约定，与 IEC 101
 `link.tcpLink.Drain` 会把 deadline 临时压到 `now+1ms` 且不恢复，反序会让每次写都
 立刻超时，症状是「连上了，但每次写都 timeout」。
 
+##### 符号前缀撞名：为什么 `AddressPolicy` 需要 `SymbolPrefixes`
+
+`r:<n>` 是「报文里第 n 条记录」，`q:<物理量>` 是「按标准量名取」。两者都是**符号
+地址**，与寄存器无关。但点表解析器识别寄存器地址用的是一张**全局区名并集**——
+`holding`/`db`/`dt`/`x`/`y`/`r`/`l`/`t`/`c`/`dm`/`em`… 都在这张表里，其中 `r`、`l`、
+`t`、`c` 是 Mewtocol 的接点区名，`x`/`y` 也是。而这个识别发生在「本协议是否允许
+寄存器地址」的判断**之前**，于是任何纯符号协议只要符号里带冒号、且头部撞上另一个
+协议的区名，就会被判成「协议不接受寄存器地址」而在导入期拒绝：
+
+```
+line 3: address: protocol "mbus" does not accept register addresses (got "r:0")
+```
+
+这条错误信息把人引向「M-Bus 为什么不支持寄存器」，而真正的原因是解析器用了别人的
+命名空间。受影响的不只是 M-Bus：`opcua`/`snmp`/`mqtt`/`mtconnect`/`dlms`/`sl651`/
+`toledo`/`iec61850`/`knx`/`ads`/`secs` 这些纯符号协议，全部会在符号名撞上区名时
+报出同一条误导性的错误。
+
+修法不是「把 `r` 从全局区名表里删掉」——那会让 Mewtocol 的 `r:16.3` 失去寄存器
+语义。正确做法是让**协议自己声明它占有哪个前缀**：
+
+```go
+PolicyFor("mbus") = AddressPolicy{
+    Width: WidthNone, AllowSymbol: true,
+    SymbolPrefixes: map[string]bool{"q": true, "r": true},
+}
+```
+
+解析器见到命中本协议 `SymbolPrefixes` 的前缀就跳过寄存器识别，直接按符号地址处理。
+这口子刻意做**窄**：只放行本协议确实定义的写法，其余撞名（M-Bus 下的 `coil:3`、
+`dt:0`）仍然按「把寄存器地址贴错了协议」拒绝——宽松放行会让真正的配置错误变成
+运行期每周期一次的 `address_error`。
+
+`SymbolPrefixes` 只比前缀字面，不校验冒号之后的部分：`r:abc` 应当是「第 abc 条记录
+不存在」（驱动在 Open 时说得更准），而不是「这是寄存器地址」。这是点表层的一贯分工：
+**它按地址种类放行，符号内容由驱动校验**。
+
 #### 3.10.25.8 自检与内置从站
 
 `uic mbusread` 五个入口：
@@ -7280,7 +7317,7 @@ VIF 换算）三个注入点，测试只打开自己关心的那一个。
 | `codec/mbus` | 金帧逐字节（SND_NKE / 短帧 / 长帧 / 控制帧）与校验和范围（**不覆盖** L 与起止符）；双 `L` 不等、结束符错、截断 → `ErrIncomplete` vs `ErrFrame` 的区分；`FDh` 次级地址被拒；`E5` 与长帧粘包时先切 `E5`；`BadFrames` 只数内容不对的帧、重同步不计数；VIF 全表与幂次（含相邻编码 10 倍关系、厂商特定 7Fh/FFh、自定义 7Ch、主 VIFE 表 7Dh）；BCD 正负号与非法数字；REAL 不乘 Scale；LVAR 全编码表；Type G/F/I 日期时间与无效位、2 月 30 日拒绝；`2Fh` 填充跳过；`DIF=1Fh` 后续标志；固定结构 16 字节布局与 `type` 字节（含 J 族 `0x0B..0x13` 单调 1e3..1e11）；`q:`/`r:` 选择与失败时报候选；编码↔解码互逆 |
 | `driver/mbus` | 真实 TCP 回环读写；`MultiRead` 一条事务覆盖多点；FCB 跨轮翻转、同轮回放（访问号不变的端到端验证）；读取失败后 `SND_NKE` 复位再试；同 FCB 重放不累加访问号；坏帧 → `ErrProtocol` 且文案含波特率提示；完全无应答 → `ErrTimeout`；校验和错重发、C/CI 错不重发；状态字应用错误 → uncertain；`Write` 逐项 `ErrUnsupported`；`max-follow` 上限；`q:volume@1` / `q:power-max` / `r:0` 寻址；后续报文记录重新编号；地址 251/253/255 在 `Open` 被拒 |
 | `sim/mbus` | 默认 8 条记录可被 `RecordNames`→`FindRecord` 直接吃回去；同 FCB 重放不改访问号；访问号自增；地址不符静默；坏校验只改校验和；`SetStatusError`；`SetSilent`；`DIF=1Fh` 后续报文；`SetValue`/`Value` 与 VIF 换算一致 |
-| `pointtable` | `mbus` 走 `WidthNone + AllowSymbol`；`length`/`selector`/`index` 在导入期拒绝 |
+| `pointtable` | `mbus` 走 `WidthNone + AllowSymbol`；`q:`/`r:` 两种记录寻址都解析成 symbol 且 `Canonical` 往返一致（`r:` 靠策略里的 `SymbolPrefixes` 先一步排除寄存器识别——`r` 同时是 Mewtocol 的接点区名，不排除会被判成「不接受寄存器地址」）；漏写 `q:` 前缀按物理量名处理；`coil:`/`holding:`/`dt:`/`dm:` 与 selector 在导入期拒绝；`length` 列在导入期拒绝；`q:energy` 不被 modbus/s7/iec104/mewtocol/fins 收下，而 `r:16.3` 在 mewtocol 下仍是寄存器位地址 |
 | `cmd/uic` | `parsePrimaryAddr`（253/255 的拒绝文案）、`parseScanRange`、`mbusRefs` 列拆分、`rowOf` 可粘贴地址 |
 
 ### 3.10.26 DLMS/COSEM（IEC 62056：LN 引用 + 无安全，HDLC 三层承载）
@@ -7685,7 +7722,7 @@ octet-string 四种值形态。
 | `codec/dlms` | `SNRM` 金帧 `7E A0 07 03 21 93 0F 01 7E`；`FCS(A0 07 03 21 93) == 0F 01` 与 `GoodFCS` 的固定余数 `0xF0B8`；长度字段跨两字节与 bit11 分段位；info 与 FCS 里出现 `0x7E` 时仍按长度定界（FCS `7E 64` 的回归）；截断 → `ErrIncomplete`、指针前移 1 字节重同步；1/2/4 字节地址域（含 `48 68 FE FF`）；LLC `E6 E6 00` vs `E6 E7 00`；I/RR/RNR/U 帧控制域与 `NS`/`NR` 回绕；AARQ/AARE 逐字节向量与拒绝诊断；conformance 位值与 `5F 1F 04 00` 编码；A-XDR 全标签（含 `0x07`/`0x0E` 空号必须报错）；`date_time` 12 字节布局（星期位置、`0x8000` 时区）与 `date`/`time`；`data-access-result` 只认 2 字节形态（用 `hardware-fault(1)` 锁「前两字节相同」的陷阱）；Get-Response 三分支（normal / datablock / list）；OBIS 十进制六段与 `.`/`-`/`:`/空格分隔；`SplitRef` 对 `1-0:1-8-0-255:3:2` 的切点；`ApplyScaler` 单次乘除（`50.01` 精确）；`UnitName`/`ClassName` 全扫 |
 | `driver/dlms` | 真实 TCP 回环：SNRM→AARQ→逐点 GET→DISC；`Probe` 复用已建关联；拒绝关联 → `ErrProtocol`；静默 → `ErrTimeout`；坏校验 → `ErrProtocol` 且文案含「坏帧」与波特率提示；`linkErr` 缓存后第二轮不再发包且立即返回；object-undefined → `ErrAddress`；类号不一致 → `ErrAddress`；分块 → `ErrUnsupported` 且提示调大 `max-pdu`；scaler 五个点逐位精确（`50.01`/`0.985`/`220.1`/`5.12`/`345.6`）；`Scan` 条数等于内置表条数且带 scaler_unit 文本；`Association` 采用服务端较小的 max-PDU；`Write`/`MultiRead`/`Browse` 逐项 `ErrUnsupported`；`parseOptions` 越界全忽略；`addressOf` 的 `labels.address` 优先级与 `addr-size=3` 拒绝；空 span 返回 `(nil, nil)`；关闭后所有入口 → `ErrDisconnected` |
 | `sim/dlms` | 默认对象表覆盖 40+ 项且 `examples/dlms.json` 能全部读到；AARQ 接受/拒绝两分支；未建关联读 → `read-write-denied`；对象未定义 / 类号不一致两种结果码；地址与客户端地址过滤静默；`SetSilent`/`SetBadChecksum`/`SetRejectAssociation`；`SetValue`/`Value` 的坏定位报错；TCP `acceptLoop`→`serveConn`→`tcpStream` 真实 socket 路径；`Close` 幂等且能清理连接；`isClosed` 对 `net.ErrClosed`/`io.EOF`/超时的分类 |
-| `pointtable` | `dlms` 走 `WidthNone + AllowSymbol`；`length`/`bit` 在导入期拒绝 |
+| `pointtable` | `dlms` 走 `WidthNone + AllowSymbol`；`1.0.1.8.0.255`、`:3`、`:3:2` 与连字符写法 `0-0-42-0-0-255:1:2` 都解析成 symbol 且 `Canonical` 往返一致；寄存器/对象/计算地址在导入期拒绝；`length` 列在导入期拒绝 |
 | `cmd/uic` | `dlmsSplitAddr` 走 `dl.SplitRef`（标准写法与只给 OBIS 两种）；`dlmsRefs` 列拆分；`dlmsRowOf` 的「可粘贴地址」带类号与属性号；默认 7 点列表 |
 
 ### 3.10.27 SL 651（《水文监测数据通信规约》：中心站侧查询 + 应答）
@@ -8797,6 +8834,9 @@ drivertest.Run(t, driver, virtualDevice)
 | 写入「尽力而为」不返回结果 | 上层不知道成败 | 逐项返回 |
 | 在驱动里读配置文件 | 无法测试、配置漂移 | 一切经 `OpenConfig` 注入 |
 | 用 `panic` 处理协议错误 | 进程崩溃 | 返回 `ErrProtocol` |
+| `Capabilities` 只写「记得的几个」字段 | 漏写的字段序列化成**空串**，既不是 `supported` 也不是 `unsupported`；前端渲染成空白，调用方无法判断该不该依赖它 | 8 个字段**全部显式声明**（`Read`/`Write`/`Subscribe`/`Browse`/`Discovery`/`MultiRead`/`BitAccess`/`StructTypes`）。`CapState` 是 string 枚举，零值 `""` 不是四态之一 |
+| 每个驱动只写自己的 `TestMetaContract`，断言它「记得写」的那几项 | 漏写的字段正好不在断言里，全仓测试照样全绿（SL 651 长期 6/8 就是这么漏的） | 除驱动自检外，`internal/runtime` 有一条**全仓**兜底 `TestBuiltinDriversMetaContract`：遍历 `driver.List()`，对每个驱动的 8 个能力位逐个校验落在四态内 |
+| 为纯符号协议写带冒号的地址，而符号头撞上别的协议的区名 | 被误判成「本协议不接受寄存器地址」而在导入期拒绝，错误信息把人引向错误方向 | 在 `AddressPolicy.SymbolPrefixes` 里声明本协议占用的前缀（如 M-Bus 的 `q`/`r`），解析器见到即跳过寄存器识别 |
 
 ---
 

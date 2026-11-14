@@ -102,6 +102,20 @@ type AddressPolicy struct {
 	// 可选的元数据，而是地址的一部分——缺了它，驱动连该读几个字节都
 	// 不知道。
 	AllowDPT bool
+
+	// SymbolPrefixes 是本协议符号语法里「自己拥有」的 `head:` 前缀。
+	//
+	// 为什么需要：识别寄存器地址（holding:0、db1:0、r:16.3）用的是一张
+	// **全局**区名并集——`r` 既是 Mewtocol 的接点区，也是 M-Bus 的「按
+	// 记录序号取」前缀。而寄存器识别发生在「本协议是否允许寄存器」之前，
+	// 于是一个纯符号协议只要符号里带冒号、且头部撞上别的协议的区名，就会
+	// 被误报成「不接受寄存器地址」。M-Bus 的 `r:0` 就是这么被拦掉的：
+	// 它是 spec §3.10.25 与驱动 ConfigField 都承诺的合法写法。
+	//
+	// 因此让协议自己声明它占用了哪些前缀：命中即跳过寄存器识别，按符号
+	// 地址处理。这是一条**窄**口子——只放行本协议确实定义的写法，其余
+	// 撞名（如 mbus 的 `coil:3`）仍按「把寄存器地址贴错了协议」拒绝。
+	SymbolPrefixes map[string]bool
 }
 
 var (
@@ -310,7 +324,13 @@ func PolicyFor(protocol string) AddressPolicy {
 		// 只会与表实际声明的宽度冲突。selector/index 同样无意义——`@` 与
 		// `/` 已经在 path 里表达了"第几条"，拆成符号下标反而表达不了
 		// 「同一物理量的第二次出现」这种协议事实。
-		return AddressPolicy{Width: WidthNone, AllowSymbol: true}
+		//
+		// SymbolPrefixes 声明 `q:`/`r:` 属于本协议的符号语法：`r` 同时是
+		// Mewtocol 的接点区名，不声明就会被全局区名并集判成寄存器地址。
+		return AddressPolicy{
+			Width: WidthNone, AllowSymbol: true,
+			SymbolPrefixes: map[string]bool{"q": true, "r": true},
+		}
 	case "mtconnect":
 		// 数据项 ID 寻址：`/probe` 给出的 `dataItemId`（如 `Xabs`、`avail`），
 		// 由 `/current` 的 XML 文档按 id 查值。
@@ -446,15 +466,20 @@ func ParseAddressWithLength(expr string, dt model.DataType, protocol string, len
 		return parseDIAddress(expr, dt, pol, length)
 	}
 
-	if area, db, rest, ok := splitRegisterPrefix(expr); ok {
-		if !pol.AllowRegister {
-			return model.Address{}, fmt.Errorf("protocol %q does not accept register addresses", protocol)
+	// 本协议自己占用的符号前缀先一步排除：`r:0` 在 M-Bus 里是「第 0 条
+	// 记录」，在 Mewtocol 里是「接点区 R 的第 0 字」。不先挡这一下，前者
+	// 会被全局区名并集判成寄存器地址而在导入期被拒。
+	if !hasSymbolPrefix(expr, pol.SymbolPrefixes) {
+		if area, db, rest, ok := splitRegisterPrefix(expr); ok {
+			if !pol.AllowRegister {
+				return model.Address{}, fmt.Errorf("protocol %q does not accept register addresses", protocol)
+			}
+			if pol.RegisterAreas != nil && !pol.RegisterAreas[area] {
+				return model.Address{}, fmt.Errorf("area %q is not valid for protocol %q (allowed: %s)",
+					area, protocol, joinKeys(pol.RegisterAreas))
+			}
+			return parseRegister(area, db, rest, dt, pol, length)
 		}
-		if pol.RegisterAreas != nil && !pol.RegisterAreas[area] {
-			return model.Address{}, fmt.Errorf("area %q is not valid for protocol %q (allowed: %s)",
-				area, protocol, joinKeys(pol.RegisterAreas))
-		}
-		return parseRegister(area, db, rest, dt, pol, length)
 	}
 
 	if a, ok, err := parseObjectAddress(expr); ok {
@@ -527,6 +552,21 @@ func ParseAddressWithLength(expr string, dt model.DataType, protocol string, len
 		a.Length = length
 	}
 	return a, nil
+}
+
+// hasSymbolPrefix 判断 expr 的 `head:` 前缀是否被本协议的符号语法占用。
+//
+// 只比前缀字面，不校验冒号之后的部分：那是驱动在 Open 时的活（`r:abc`
+// 应当是「第 abc 条记录不存在」而不是「这是寄存器地址」）。
+func hasSymbolPrefix(expr string, prefixes map[string]bool) bool {
+	if len(prefixes) == 0 {
+		return false
+	}
+	colon := strings.IndexByte(expr, ':')
+	if colon <= 0 {
+		return false
+	}
+	return prefixes[strings.ToLower(expr[:colon])]
 }
 
 // splitRegisterPrefix 识别 `holding:...`、`db12:...` 这类前缀。

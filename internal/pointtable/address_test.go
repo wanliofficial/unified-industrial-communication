@@ -1386,3 +1386,260 @@ func TestParseAddressSL651RejectsLength(t *testing.T) {
 		t.Fatal("sl651 应拒绝 length 列（要素宽度由数据定义字节声明）")
 	}
 }
+
+// ---------------------------------------------------------------------------
+// M-Bus：记录名寻址（`q:` 按物理量 / `r:` 按记录序号）
+// ---------------------------------------------------------------------------
+
+// M-Bus 的点位是「自描述记录串里的一条记录」，不是寄存器。
+//
+// 与 DLMS/SL 651 同类：报文先用 DIF/VIF 说明每条记录多长、是什么量，数据跟在
+// 后面。没有「第 n 个寄存器」这种东西——偏移取决于前一条记录的长度，换一块表
+// 就会整体错位。因此 WidthNone，且 length 列没有含义（宽度由 DIF 声明）。
+func TestPolicyForMBus(t *testing.T) {
+	p := PolicyFor("mbus")
+	if p.Width != WidthNone {
+		t.Fatalf("mbus width = %v，应为 WidthNone（宽度由 DIF 声明）", p.Width)
+	}
+	if !p.AllowSymbol {
+		t.Fatal("mbus 必须允许符号地址（q:/r: 记录表达式）")
+	}
+	if p.AllowRegister || p.AllowObject || p.AllowFile || p.AllowComputed || p.AllowSelector {
+		t.Fatalf("mbus 只接受记录表达式，不应放行其它地址种类：%+v", p)
+	}
+}
+
+// 两种记录寻址都必须能解析成 symbol，且 Canonical 往返一致。
+//
+// `r:<n>` 这一条曾经是真实缺陷：`r` 同时是 Mewtocol 的接点区名，而寄存器
+// 前缀识别发生在「本协议是否允许寄存器」之前，于是 `r:0` 被判成寄存器地址
+// 而在导入期被拒——尽管 spec §3.10.25 与驱动 ConfigField 都把它写成合法
+// 写法，examples/mbus.json 里也用了它。策略里的 SymbolPrefixes 就是为此加的。
+func TestParseAddressMBus(t *testing.T) {
+	cases := []string{
+		"q:energy",
+		"q:volume@1",
+		"q:power-max",
+		"r:0",
+		"r:12",
+		"energy", // 漏写 q: 前缀时按物理量名处理
+	}
+	for _, expr := range cases {
+		t.Run(expr, func(t *testing.T) {
+			a, err := ParseAddress(expr, model.TypeFloat64, "mbus")
+			if err != nil {
+				t.Fatalf("parse: %v", err)
+			}
+			if a.Kind != model.AddressSymbol || a.Path != expr {
+				t.Fatalf("address = %+v，应为 symbol/%s", a, expr)
+			}
+			b, err := ParseAddress(a.Canonical(), model.TypeFloat64, "mbus")
+			if err != nil {
+				t.Fatalf("reparse %q: %v", a.Canonical(), err)
+			}
+			if b != a {
+				t.Fatalf("round trip: %+v != %+v", b, a)
+			}
+		})
+	}
+}
+
+// M-Bus 的符号前缀口子必须**窄**：只有 q:/r: 被放行，别的协议的区名
+// （coil/holding/dt）仍是「把寄存器地址贴错了协议」，必须拒绝。
+//
+// 不在断言范围的：`r:0` 在 Mewtocol 里是合法寄存器地址（接点区 R 第 0 字），
+// 两个协议各自拥有这个前缀，所以「mewtocol 收下 r:0」不是缺陷。而像
+// `1.0.1.8.0.255` 这种 OID 形态的串会被当成符号名收下——本包不校验符号
+// 内容，是否真能解析成 OBIS 由驱动在 Open 时决定。
+func TestParseAddressMBusRejectsOtherKinds(t *testing.T) {
+	for _, expr := range []string{
+		"coil:3",
+		"holding:0",
+		"input:1",
+		"dt:0",
+		"dm:0",
+		"expr:energy*2",
+		"q:energy#temp", // selector
+	} {
+		if _, err := ParseAddress(expr, model.TypeFloat64, "mbus"); err == nil {
+			t.Fatalf("mbus 接受了非法地址 %q", expr)
+		}
+	}
+}
+
+// length 列在 M-Bus 下必须导入期拒绝：记录宽度由 DIF 声明。
+func TestParseAddressMBusRejectsLength(t *testing.T) {
+	for _, expr := range []string{"q:energy", "r:0"} {
+		if _, err := ParseAddressWithLength(expr, model.TypeFloat64, "mbus", 4); err == nil {
+			t.Fatalf("mbus 应拒绝 length 列（%s）", expr)
+		}
+	}
+}
+
+// 反向：q: 不该被别的协议当成合法符号地址收下。
+//
+// `r:0` 不在断言里：它在 Mewtocol 里本来就是合法寄存器地址（接点区 R
+// 第 0 字），两个协议各自拥有这个前缀——这正是 SymbolPrefixes 存在的
+// 原因：让「谁拥有这个前缀」由协议自己声明，而不是靠一张全局并集去猜。
+func TestMBusExprRejectedByOtherProtocols(t *testing.T) {
+	for _, proto := range []string{"modbus-tcp", "s7", "iec104", "mewtocol", "fins"} {
+		if _, err := ParseAddress("q:energy", model.TypeFloat64, proto); err == nil {
+			t.Fatalf("%s 接受了 M-Bus 记录表达式 q:energy", proto)
+		}
+	}
+}
+
+// mewtocol 的 r:16.3 必须是寄存器位地址，不能被 M-Bus 的 r: 口子吃掉：
+// SymbolPrefixes 是按协议查的，不是全局开关。
+func TestMewtocolRStaysRegister(t *testing.T) {
+	a, err := ParseAddress("r:16.3", model.TypeBool, "mewtocol")
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if a.Kind != model.AddressRegister || a.Area != "r" || a.Offset != 16 || a.Bit != 3 {
+		t.Fatalf("mewtocol r:16.3 = %+v，应为寄存器 r 第 16 字第 3 位", a)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// DLMS/COSEM：OBIS 对象属性寻址
+// ---------------------------------------------------------------------------
+
+// DLMS 的地址是标准固定的六段码 + 类号 + 属性号，三层里没有一层是线性偏移。
+func TestPolicyForDLMS(t *testing.T) {
+	p := PolicyFor("dlms")
+	if p.Width != WidthNone {
+		t.Fatalf("dlms width = %v，应为 WidthNone（宽度由 A-XDR 标签决定）", p.Width)
+	}
+	if !p.AllowSymbol {
+		t.Fatal("dlms 必须允许符号地址（OBIS）")
+	}
+	if p.AllowRegister || p.AllowObject || p.AllowFile || p.AllowComputed || p.AllowSelector || p.AllowDPT {
+		t.Fatalf("dlms 只接受 OBIS，不应放行其它地址种类：%+v", p)
+	}
+}
+
+// spec §3.10.26 承诺的四种写法都必须解析成 symbol 并往返一致。
+func TestParseAddressDLMS(t *testing.T) {
+	cases := []string{
+		"1.0.1.8.0.255",      // 按内置表推导类号/属性号
+		"1.0.1.8.0.255:3",    // 显式类号
+		"1.0.1.8.0.255:3:2",  // 显式类号与属性号
+		"0-0-42-0-0-255:1:2", // 标准连字符写法
+	}
+	for _, expr := range cases {
+		t.Run(expr, func(t *testing.T) {
+			a, err := ParseAddress(expr, model.TypeFloat64, "dlms")
+			if err != nil {
+				t.Fatalf("parse: %v", err)
+			}
+			if a.Kind != model.AddressSymbol || a.Path != expr {
+				t.Fatalf("address = %+v，应为 symbol/%s", a, expr)
+			}
+			b, err := ParseAddress(a.Canonical(), model.TypeFloat64, "dlms")
+			if err != nil {
+				t.Fatalf("reparse %q: %v", a.Canonical(), err)
+			}
+			if b != a {
+				t.Fatalf("round trip: %+v != %+v", b, a)
+			}
+		})
+	}
+}
+
+func TestParseAddressDLMSRejects(t *testing.T) {
+	for _, expr := range []string{
+		"holding:0",
+		"db1:0",
+		"coil:3",
+		"expr:1+1",
+	} {
+		if _, err := ParseAddress(expr, model.TypeFloat64, "dlms"); err == nil {
+			t.Fatalf("dlms 接受了非法地址 %q", expr)
+		}
+	}
+	// length 列：宽度由 A-XDR 标签决定，写 length 会与应答冲突。
+	if _, err := ParseAddressWithLength("1.0.1.8.0.255", model.TypeFloat64, "dlms", 4); err == nil {
+		t.Fatal("dlms 应拒绝 length 列")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// virtual / modbus-ascii：策略与主承载同形
+// ---------------------------------------------------------------------------
+
+// virtual 是本地内存点，四种寻址全开；它是唯一「什么都不做也合法」的协议。
+func TestPolicyForVirtual(t *testing.T) {
+	p := PolicyFor("virtual")
+	if p.Width != WidthBytes {
+		t.Fatalf("virtual width = %v，应为 WidthBytes", p.Width)
+	}
+	if !p.AllowRegister || !p.AllowSymbol || !p.AllowComputed || !p.AllowSelector {
+		t.Fatalf("virtual 应放行寄存器/符号/计算/selector：%+v", p)
+	}
+	if p.AllowObject || p.AllowFile {
+		t.Fatalf("virtual 不应放行对象/文件地址：%+v", p)
+	}
+}
+
+func TestParseAddressVirtual(t *testing.T) {
+	cases := []struct {
+		expr string
+		dt   model.DataType
+		kind model.AddressKind
+	}{
+		{"holding:0", model.TypeUint16, model.AddressRegister},
+		{"coil:3", model.TypeBool, model.AddressRegister},
+		{"some.symbol", model.TypeFloat64, model.AddressSymbol},
+		{"expr:1+1", model.TypeFloat64, model.AddressComputed},
+		{"some.symbol#field", model.TypeFloat64, model.AddressSymbol},
+	}
+	for _, tc := range cases {
+		a, err := ParseAddress(tc.expr, tc.dt, "virtual")
+		if err != nil {
+			t.Fatalf("%q: %v", tc.expr, err)
+		}
+		if a.Kind != tc.kind {
+			t.Fatalf("%q: kind = %v, want %v", tc.expr, a.Kind, tc.kind)
+		}
+	}
+}
+
+// modbus-ascii 与 modbus-tcp/rtu 共用同一套寄存器寻址：同一份点表换个承载
+// 就能跑，这是三种 Modbus 帧格式放在一起的前提。
+func TestPolicyForModbusASCII(t *testing.T) {
+	a := PolicyFor("modbus-ascii")
+	for _, proto := range []string{"modbus-tcp", "modbus-rtu"} {
+		b := PolicyFor(proto)
+		if a.Width != b.Width || a.AllowRegister != b.AllowRegister {
+			t.Fatalf("modbus-ascii 与 %s 策略不一致：%+v vs %+v", proto, a, b)
+		}
+		for area := range b.RegisterAreas {
+			if !a.RegisterAreas[area] {
+				t.Fatalf("modbus-ascii 缺少区 %q", area)
+			}
+		}
+	}
+}
+
+func TestParseAddressModbusASCII(t *testing.T) {
+	cases := []struct {
+		expr string
+		dt   model.DataType
+		off  int
+	}{
+		{"holding:0", model.TypeUint16, 0},
+		{"input:12", model.TypeUint16, 12},
+		{"coil:3", model.TypeBool, 3},
+		{"discrete:7", model.TypeBool, 7},
+	}
+	for _, tc := range cases {
+		a, err := ParseAddress(tc.expr, tc.dt, "modbus-ascii")
+		if err != nil {
+			t.Fatalf("%q: %v", tc.expr, err)
+		}
+		if a.Kind != model.AddressRegister || a.Offset != tc.off {
+			t.Fatalf("%q: %+v", tc.expr, a)
+		}
+	}
+}

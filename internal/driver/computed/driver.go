@@ -59,6 +59,10 @@ func (d *Driver) Meta() driver.Meta {
 				Scope: "point",
 				Help:  "引用写法 device:point，例：line-a:power / line-a:rate"},
 		},
+		Description: "计算点：不连任何设备，按表达式引用其它点位并在本地求值。" +
+			"表达式支持四则运算、常用数学函数与历史窗口聚合（如 avg(dev:pt, 5m)）；" +
+			"被引用的点位缺失或质量非好时，计算结果降为 bad 并给出原因，" +
+			"不会用一个旧值冒充新值。适用于总功率求和、效率比值、跨点位告警阈值这类派生量。",
 	}
 }
 
