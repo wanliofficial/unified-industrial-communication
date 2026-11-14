@@ -209,8 +209,23 @@ public static partial class RestApi
         if (string.IsNullOrWhiteSpace(body))
             throw ApiException.BadRequest("request.empty_body", "request body is required");
 
-        using var doc = JsonDocument.Parse(body);
-        var root = doc.RootElement;
+        // 请求体由客户端拼装，语法写坏是常态（多一个逗号、少一个引号、被截断的报文）。
+        // JsonDocument.Parse 抛出的 JsonException 不是 ApiException，若不在此就地翻译，
+        // 它会一路冒到最外层的兜底 catch，被当成「未处理异常」返回 500——而 500 在运维
+        // 那里专指网关自身故障，会触发告警、进错误看板。配置导入那条路径早就把语法错误归
+        // 成客户端错误，写接口必须一致：请求不成立就是 400，网关没坏。
+        JsonDocument doc;
+        try
+        {
+            doc = JsonDocument.Parse(body);
+        }
+        catch (JsonException)
+        {
+            throw ApiException.BadRequest("request.invalid_json", "request body is not valid JSON");
+        }
+
+        using var parsedBody = doc;
+        var root = parsedBody.RootElement;
 
         var items = new List<WriteItemDto>();
 

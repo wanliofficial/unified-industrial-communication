@@ -66,6 +66,7 @@ internal static class ContractTests
         tests.Add(new TestCase("contract/write_returns_per_point_results", WriteReturnsPerPointResults));
         tests.Add(new TestCase("contract/write_values_are_engineering_units", WriteValuesAreEngineeringUnits));
         tests.Add(new TestCase("contract/single_point_write_is_idempotent", SinglePointWriteIsIdempotent));
+        tests.Add(new TestCase("contract/malformed_write_body_is_a_client_error", MalformedWriteBodyIsAClientError));
         tests.Add(new TestCase("contract/idempotency_key_rejects_a_different_body", IdempotencyKeyRejectsADifferentBody));
         tests.Add(new TestCase("contract/idempotency_window_ignores_a_clock_jump", IdempotencyWindowIgnoresAClockJump));
         tests.Add(new TestCase("contract/idempotency_ledger_is_per_runtime", IdempotencyLedgerIsPerRuntime));
@@ -1508,6 +1509,45 @@ internal static class ContractTests
                 "the repeat is marked as a replay");
             t.Equal(firstBody, await second.Content.ReadAsStringAsync(t.Ct),
                 "the cached response is returned verbatim");
+        });
+    }
+
+    /// <summary>
+    /// 写接口的请求体由客户端拼装，格式写坏是常态：多一个逗号、少一个引号、截断的报文。
+    /// 这类「请求本身不成立」必须返回 400，绝不能冒成 500。
+    ///
+    /// 500 在运维那里专指「网关自己出了故障」，会触发告警、进错误看板、被当成发布事故；
+    /// 而这里网关一切正常，只是收到了一段非法 JSON。配置导入那条路径早就把语法错误
+    /// 归成 422/客户端错误并写了断言，写接口却把 JsonException 漏到了最外层的兜底
+    /// catch，被当成未处理异常返回 500——同一套网关对两种请求体的处理标准不一致。
+    /// </summary>
+    private static Task MalformedWriteBodyIsAClientError(TestContext t)
+    {
+        return RunAsync(async () =>
+        {
+            await using var host = await Host.StartAsync(t);
+            await WaitForPointAsync(host, "v1", "temp", t);
+
+            // 单点接口：截断的 JSON。
+            var single = await host.Client.SendAsync(
+                Post("/api/v1/points/v1/temp/write", "{ \"value\": { "), t.Ct);
+            t.Equal(HttpStatusCode.BadRequest, single.StatusCode,
+                "a syntactically broken body is a 400, not a 500");
+            var singleBody = await ReadJsonAsync(t, single);
+            t.Equal("request.invalid_json",
+                singleBody.RootElement.GetProperty("error").GetProperty("code").GetString(),
+                "the error code names the malformed body");
+
+            // 批量接口同样不能 500。
+            var batch = await host.Client.SendAsync(
+                Post("/api/v1/points/v1/write", "{ not json"), t.Ct);
+            t.Equal(HttpStatusCode.BadRequest, batch.StatusCode,
+                "the batch endpoint also rejects a broken body with a 400");
+
+            // 关键断言：绝不能被兜底 catch 变成 500。500 会把一次客户端格式错误
+            // 误报成网关故障，污染告警与错误看板。
+            t.Ok(single.StatusCode != HttpStatusCode.InternalServerError,
+                "a malformed body must never surface as a server fault");
         });
     }
 
