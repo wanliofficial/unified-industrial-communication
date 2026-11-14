@@ -8068,6 +8068,211 @@ TCP 默认端口取 `4001`（串口服务器/DTU 透传的常见端口，不是�
 | `cmd/uic` | `parseSL651Station` 的 10 位上限与前导零；`parseSL651Password` 拒绝非 4 位十六进制（不做静默补齐）；`sl651Refs` 列拆分；`sl651SplitSlot` 与驱动 `guideOfWithSlot` 同一套语法；`TestSL651PointsValidation` / `TestSL651SlotValidation` 的批量要素与非批量段号；`printSL651Guides` 的 `slot`/`slots`/`pointAddress`；`sl651RowOf` 按 `Slot*` 逐段输出且 `Count = len(Values)` |
 | 实机自检 | sim 起在 `127.0.0.1:4001` 后 `-probe`、无参整帧（`Z`/`P1`/`PT`/`Q`/`ZT`/`DRP` 12 段/`Z1` 缺测/`VT`）、`-raw`、`-json`、`-list`、`-points Z,PT,VT,DRP,DRP[1]`；`uic run` 运行时采集 5 个启用点位全部 `good`（`0.127`/`0.5`/`123.4`/`1234.567`/`12.1V`） |
 
+### 3.10.28 Toledo（METTLER TOLEDO：ASCII 连续输出，只读推送）
+
+Toledo 是称重仪表的连续输出协议。现场形态是「一台衡器接 RS-232/RS-485，或接
+串口服务器/DTU 透传到以太网」，衡器上电后**自己不询问就持续往上送**帧（典型
+10~25 帧/秒）。它和仓库里所有表计协议的差别不在字段多少，而在**方向反了**——
+不是主站轮询、从站应答，而是从站（衡器）单向推送、主站（本驱动）被动收。这一个
+差别把错误模型、质量码语义、点位寻址全部带偏，是本节要讲清楚的事。
+
+#### 3.10.28.1 定位：只读客户端、推送模型、无握手
+
+本驱动只做**客户端（C）侧**：连上链路、被动收帧、不发任何命令。衡器不响应查询、
+不接受写入，帧里也没有站号、寄存器、功能码可供寻址。
+
+```
+ST,GS,+00149.0kg<CR><LF>
+└┬┘└┬┘ └──┬───┘└┬┘
+状态 毛净  符号+数值+单位
+```
+
+「TOLEDO」在业界并不对应单一帧格式，而是一个**家族**。本驱动只实现现场最通用、
+也是各国产仪表标注「Toledo compatible」时普遍采用的 **ASCII 逗号
+三段式**，其规范形态（D39 手册逐字节给出的实例）为：
+
+```
+53 54 2C 47 53 2C 2B 30 30 31 34 39 2E 30 6B 67 0D 0A
+即  ST,GS,+00149.0kg<CR><LF>
+```
+
+三段分别是：状态（`ST` 稳定 / `US` 运动中 / `OL` 超量程 / `UL` 欠量程）、毛净
+模式（`GS` 毛重 / `NT` 净重 / `TR` 皮重）、`<符号><数值><单位>`。数值段按
+`WEIGHT(7)` 定宽对齐（5 位整数 + `.` + 1 位小数，即 `00149.0`）。
+
+#### 3.10.28.2 推送模型：Read 里没有任何网络交互
+
+这是本驱动与其它驱动最硬的一条边界。驱动契约是拉取型——`Read` 立即返回一批
+样本。而衡器不会因为你「问了一次」而回答。两者的转换只有一种做法是对的：
+**`Open` 后起一个后台 goroutine 持续收帧，把最新一帧读数存进 `conn`，`Read`
+从 `conn` 里取**。
+
+```go
+func (c *conn) pump() {
+    r := toledocodec.NewReader(c.link)
+    for {
+        c.link.SetDeadline(time.Now().Add(c.readTimeout))
+        line, err := r.Next()
+        if err != nil {
+            if c.isClosed() { return }
+            if isTimeout(err) { continue } // 衡器暂时安静，不是断链
+            c.setLinkErr(err); return
+        }
+        reading, perr := toledocodec.Parse(line)
+        if perr != nil { continue }        // 解不出不等于链路坏
+        c.mu.Lock(); c.latest = reading; c.latestAt = time.Now(); c.hasData = true
+        c.mu.Unlock()
+    }
+}
+```
+
+由此带来一条硬性约束，与 MQTT 驱动同源：**`Read` 里没有任何网络交互**，耗时与
+点位数量无关，链路安静（衡器没推帧）也不会让它超时。真正断链时（读到底层错误）
+才把连接标记为重连，而不是每次 `Read` 都去「探一下」——那会让安静的正常设备被
+误判为断链。读超时在连续输出下通常只是「衡器暂时安静」，由 `Read` 依据
+`latestAt` 判 stale，不当作断链。
+
+#### 3.10.28.3 点位寻址：读数字段 symbol，不是寄存器
+
+Toledo 的点位是「当前一帧读数」的**语义字段**，不是某个寄存器。点表用 symbol
+寻址，每个点位读的是同一个字段名：
+
+| symbol | 含义 | 默认类型 |
+|---|---|---|
+| `weight` | 重量值（带符号，单位见 `unit`） | `float64` |
+| `status` | 称量状态 `ST`/`US`/`OL`/`UL` | `string` |
+| `mode` | 毛净模式 `GS`/`NT`/`TR` | `string` |
+| `unit` | 计量单位（`kg`/`lb`/`g`/`t`/`oz`/`kN`/`lb_oz`…） | `string` |
+| `stable` | 是否稳定（`status=ST`） | `bool` |
+| `motion` | 是否运动中（`status=US`） | `bool` |
+| `decimals` | 数值段小数位数 | `int64` |
+
+`Open` 校验每个点位的字段名：未知字段名在 Open 时即报 `ErrAddress`（fail fast），
+不等到 `Read` 才暴露。
+
+#### 3.10.28.4 质量码语义：只有重量类点位随称量状态降级
+
+推送型协议的质量码只能表达「读数有多可信」，不能表达「读到了寄存器」。映射如下：
+
+| 条件 | 质量码 | 作用点位 |
+|---|---|---|
+| 从未收到过帧 | `comm_error`（`ErrTimeout`） | 全部 |
+| 收到过但超过 `staleAfter` | `stale` | 全部 |
+| 最新帧状态 `US`（运动中） | `uncertain` | 仅重量类 |
+| 最新帧状态 `OL`/`UL`（超/欠量程） | `bad` | 仅重量类 |
+| 最新帧数值段是掩码占位 | `bad`（`ErrProtocol`） | 仅重量类 |
+| 其余 | `good` | 全部 |
+
+关键取舍：**`status`/`unit`/`mode`/`decimals` 这些描述性字段不受称量状态影响**
+——无论稳定与否，它们本身都是有效信息，故恒为 `good`（在读数新鲜的前提下）。
+只有重量类点位随称量状态降级。掩码（数值段无数字，如 `M-------L`）不是解析错误：
+衡器用占位符表达「出错」，此时 `Weight` 无意义但 `Status` 仍然有效——「超量程」
+恰恰靠 `Status` 而非数值表达。
+
+#### 3.10.28.5 收帧：CR/LF 分帧 + 首字母从严
+
+连续输出的帧边界只有 CR/LF，**没有长度字段也没有二进制同步字**。这让「怎么从一段
+字节流里认出一帧」变成一件必须写对、否则症状极其罕见的事。典型故障：一次连接
+上电时衡器打印的欢迎横幅、或另一台设备吐的字节，被当成连续帧的开头，于是此后
+每一帧都错位一截。
+
+因此 `codec/toledo.Reader` 强制以「首字节是**大写**状态助记符（`S`/`T`/`U`/`O`/`L`
+之一）或 STX(`0x02`)」为帧起点，其余一切丢弃并计数（`Dropped()`）。
+
+> 为什么只认大写：真实连续帧的状态段恒为大写。若把小写也纳入，噪声里任何一个
+> `l`/`o`/`s`/`t`/`u`（ASCII 输出里太常见了）都会被当成帧起点，等于没做噪声
+> 过滤。`Parse` 仍接受小写状态（为健壮），但**收帧这一层从严**——宁可漏一帧也不
+> 误切。
+
+`Dropped()` 持续上报：一条串着多设备的线上它增长说明有别的设备在串话或波特率
+对不上；一直是 0 也不代表链路正常，只是说明没收到过东西。
+
+#### 3.10.28.6 明确不做
+
+- **二进制 TOLEDO 连续格式**（`STX` 开头 18 字节：状态字 A/B/C + 6 位重量 + 6 位
+  皮重 + `CR` + 校验和）：官方手册有完整记载，但本版只实现 ASCII 三段式。`Parse`
+  识别到 `STX` 开头时**返回带可执行指引的错误**（提示切到 ASCII 格式），而不是
+  把它当 ASCII 硬解出垃圾值。
+- **SICS 命令应答**（`I0`/`IP`/`SIR` 等读命令、去皮/清零写命令）：这是交互式命令
+  协议，与「被动收连续输出」是两种工作模式，不在此实现。
+- **任何写操作**：衡器只读，`Write` 恒返回 `ErrUnsupported`。
+- **单位换算**：单位集合开放（`kg`/`lb`/`g`/`t`/`oz`/`kN`/`lb_oz`…），不做白名单、
+  不做换算，由使用方决定。`lb oz`/`lb:oz` 归一为 `lb_oz` 双单位并标记 `DualUnit`。
+
+半成品比不做更难排查：一个只实现 ASCII 的驱动，遇到二进制帧时给出明确指引，比
+「硬解出一堆看似合理的错值」有用得多。
+
+#### 3.10.28.7 数值精度：字符串拆分，不在 float64 上取整
+
+连续输出的整数位可能很宽（超大毛重），而 `float64` 尾数只有 15~16 位有效十进制。
+若先 `乘 10^n 取整` 再格式化，会在大值上丢精度。因此 `Format`/`splitSigned`
+走**字符串**拆分：`strconv.FormatFloat(v, 'f', -1, 64)` 取最短可往返表示，再手动
+切分整数/小数段。`Weight` 在 `Parse` 里保存**带符号**的值（符号单独存 `Sign`
+供诊断/显示，但驱动取数直接用 `Weight`，避免每处都乘一次符号而漏乘）。
+
+#### 3.10.28.8 错误分类
+
+| 现象 | 分类 | 排查方向 |
+|---|---|---|
+| 连上后一直没帧 | `ErrTimeout` | 波特率/校验位（常见 9600 8N1，也有 8E1）、接线/供电、衡器是否真的在连续输出 |
+| 有字节但一帧都不成 | `ErrProtocol` | 帧格式选错（二进制 vs ASCII）、小数点/逗号分隔符被改、掺了厂商前缀 |
+| 字段名不认识 | `ErrAddress` | 用 `-list` 查可用读数字段 |
+| 写操作 | `ErrUnsupported` | 衡器只读 |
+
+「有字节回来、一帧都没成」与「根本没收到」必须分开——前者说明衡器在推、只是没
+解对（最常见是帧格式选成二进制），后者才是链路断。把它们混为一谈，现场会先去
+改波特率而不是查仪表设置。
+
+#### 3.10.28.9 配置与承载
+
+```json
+{
+  "transport": { "kind": "tcp", "address": "127.0.0.1:4001" },
+  "concurrency": 1,
+  "labels": { "options": "staleAfter=30s,readTimeout=10s" }
+}
+```
+
+| 配置项 | 含义 | 默认 |
+|---|---|---|
+| `transport.kind` | `serial`（直连）/ `tcp`（串口服务器/DTU 透传） | — |
+| `transport.baud` | 波特率 | `9600`（连续输出常见，也有 8E1/8O1） |
+| `transport.parity` | 校验 | `none`（标准 8N1；个别 8E1） |
+| `labels.options.staleAfter` | 多久没新帧判 stale | `30s` |
+| `labels.options.readTimeout` | 后台收帧循环的读超时 | `10s`（须 < staleAfter） |
+
+`readTimeout` 必须**小于** `staleAfter`，否则链路真断时 `Read` 早已把点位判
+stale 而收帧循环还没察觉，会掩盖断链。这里做一致性校正（`readTimeout =
+staleAfter/2`）而不是报错。TCP 默认端口取 `4001`（串口服务器/DTU 透传常见端口，
+不是标准端口——Toledo 没有规定端口）。
+
+#### 3.10.28.10 自检与内置衡器
+
+```bash
+./uic sim -protocol toledo -listen 127.0.0.1:4001 &
+./uic toledoread -addr 127.0.0.1:4001 -probe                       # 只验链路
+./uic toledoread -addr 127.0.0.1:4001                               # 最新一帧全字段
+./uic toledoread -addr 127.0.0.1:4001 -points weight,status,stable
+./uic toledoread -list                                             # 可用读数字段
+```
+
+自检的重点不是「发什么、怎么配」，而是「连上后到底收到了什么帧、解成了什么」。
+内置衡器 `internal/sim/toledo` 复用 `codec/toledo.Format` 组帧，连上后按 ~20 帧/秒
+持续推 `ST,GS,+00149.0kg` 之类，不发命令、不应答；支持 `SetReading`/`SetWeight`/
+`SetStatus`/`SetMode` 改状态、`WithSilent` 不推帧（验证「连着但没数据 →
+comm_error」）。衡器写进去的、驱动解出来的共用同一套格式规则，不会出现两边各写
+一套而漂移。
+
+#### 3.10.28.11 测试矩阵
+
+| 层 | 用例 |
+|---|---|
+| `codec/toledo` | D39 金帧 `53542C47532C2B30303134392E306B670D0A` = `ST,GS,+00149.0kg` 逐字节锁死；`Format`→`Parse` 往返一致；`Format` 按 `WEIGHT(7)` 定宽（`00149.0`）；`splitSigned` 字符串拆分不丢精度；负值/无小数点/多位小数变体；`STX` 二进制帧 → 带「二进制」指引的拒绝；状态 `ST`/`US`/`OL`/`UL`（大小写）；毛净 `GS`/`NT`/`TR`/`GR`（`GR` 是 `GS` 别名）；掩码数值段 → `Masked` 不报错；`lb oz`/`lb:oz` → `lb_oz` + `DualUnit`；段数/状态/模式错误分类；`Reader` 按 CR/LF 分帧、噪声前缀丢弃并计 `Dropped()`、首字母只认大写、半帧多段到达、`MaxFrame` 兜底、EOF 原样返回 |
+| `driver/toledo` | 真 TCP 回环：`Probe` 等首帧；稳定重量 → `weight` good + 值；运动中 → 重量 uncertain、status 仍 good；超量程 → 重量 bad、status 仍 good；`stable`/`motion` 布尔点位；`-points` 走驱动 Read 路径；`Write` 恒 `ErrUnsupported`；register 地址 Open 拒绝；未知 symbol Open 报 `ErrAddress`；`readTimeout` 一致性校正；`parseOptions` 越界忽略 |
+| `sim/toledo` | 连上按 ~20 帧/秒推帧；`SetStatus`/`SetMode`/`SetWeight`/`SetReading` 后续帧反映新值；`WithSilent` 不推帧；`Close` 幂等 |
+| `pointtable` | `toledo` 走 `WidthNone + AllowSymbol`；`length`/`bit` 在导入期拒绝 |
+| `cmd/uic` | `toledoRefs` 列拆分；`toledoDefaultType` 与驱动一致；`KnownSymbol` 大小写不敏感、非法字段名（中文/寄存器语法）连秤前拒绝；`printToledoFields` 全字段有说明；sim 起在 `127.0.0.1:4001` 后 `-probe`/默认/`-points`/`-json`/`-list` |
+
 ### 3.11 计算点（`computed`）
 
 

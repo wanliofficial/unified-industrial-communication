@@ -1299,6 +1299,62 @@ DRP/DRZ/ZT 的数据是 **HEX 整数不是 BCD**：DRP 1 字节 × 0.1mm（`0x19
 （`36H`）——这些是写/控制类，`Write` 声明 `unsupported`；不做 `FFXXH` 自定义扩展（`XX`
 的含义只有设备方知道，报 `ErrUnknownGuide`）。
 
+称重仪表 Toledo（METTLER TOLEDO「连续输出 / Continuous Output」，ASCII 逗号三段式，只读推送）：
+
+```bash
+./uic sim -protocol toledo -listen 127.0.0.1:4001 &   # 内置衡器（~20 帧/秒 ST,GS,+00149.0kg）
+./uic -config examples/toledo.json
+curl -s -H 'Authorization: Bearer dev-token-0123456789' localhost:8098/api/v1/points
+#   8 点（7 启用）：重量 weight=149、状态 status=ST、毛净 mode=GS、单位 unit=kg、
+#                   稳定 stable=true、运动中 motion=false、小数位 decimals=1
+#   只验链路：./uic toledoread -addr 127.0.0.1:4001 -probe
+#   最新一帧：./uic toledoread -addr 127.0.0.1:4001
+#   按点表读：./uic toledoread -addr 127.0.0.1:4001 -points weight,status,stable
+#   读数字段：./uic toledoread -list
+#   串口实机：./uic toledoread -transport serial -port /dev/ttyUSB0 -baud 9600
+```
+
+Toledo 与其它表计的差别不在字段多少，而在**方向反了**：衡器上电后**自己不询问就持续
+吐帧**（典型 10~25 帧/秒），帧里没有站号、寄存器、功能码。所以本驱动是**后台收帧
+循环 + `Read` 取最新一帧**，`Read` 里**没有任何网络交互**（耗时与点位数量无关、链路
+安静也不会超时，与 MQTT 驱动同源）；真正断链（读到底层错误）才标记重连，而不是每次
+`Read` 去「探一下」——那会把安静的正常设备误判为断链。
+
+**「TOLEDO」不是单一帧格式，而是一个家族。** 本仓库只实现现场最通用、各品牌标注「Toledo
+compatible」时普遍采用的 **ASCII 逗号三段式**，其规范形态（D39 手册逐字节实例）：
+
+```
+53 54 2C 47 53 2C 2B 30 30 31 34 39 2E 30 6B 67 0D 0A   即  ST,GS,+00149.0kg<CR><LF>
+└┬┘  └┬┘  └────┬────┘
+状态   毛净    <符号><数值><单位>
+```
+
+**二进制 TOLEDO 格式**（`STX` 开头 18 字节：状态字 A/B/C + 6 位重量 + 6 位皮重 + `CR` +
+校验和）在手册里有完整记载，但本版**不实现**：`Parse` 识别到 `STX` 后**返回带可执行
+指引的错误**（提示切到 ASCII 格式），而不是当 ASCII 硬解出垃圾值——那会是一种「值看着
+合理、其实全错」的最坏故障。
+
+帧边界只有 **CR/LF，没有长度字段也没有同步字**。收帧因此强制以「**大写**状态首字母
+`S`/`T`/`U`/`O`/`L` 或 `STX`」为起点，其余字节丢弃并计 `Dropped()`。只认大写是刻意的：
+小写 `l`/`o`/`s`/`t`/`u` 在 ASCII 噪声（上电横幅、其它设备输出）里太常见，纳入等于
+没做过滤；`Parse` 仍接受小写状态（为健壮），但收帧层从严。
+
+**状态→质量码映射**是核心：从未收帧 → `comm_error`、超 `staleAfter` → `stale`、`US`
+运动中 → 重量点位 `uncertain`、`OL`/`UL` 超/欠量程 → `bad`、数值段掩码占位（无数字，
+如 `M-------L`）→ `bad`。注意**只有重量类点位随称量状态降级**，`status`/`unit`/`mode`/
+`decimals` 这些描述性字段恒 `good`（它们本身始终有效信息）。掩码不是解析错误：衡器
+用占位符表达「出错」，此时 `Weight` 无意义但 `Status` 仍有效——「超量程」恰恰靠 `Status`
+而非数值表达。
+
+数值精度走**字符串拆分**而不是先在 `float64` 上取整：连续输出的整数位可能很宽，而
+`float64` 尾数只有 15~16 位有效十进制，先乘 10^n 取整会在大值上丢精度。`Weight` 存
+带符号值（符号单独存 `Sign` 供诊断，驱动取数直接用，避免每处都乘一次符号而漏乘）。
+
+边界：只做**只读推送采集**。不做二进制 TOLEDO 格式、不做 SICS 命令应答（`I0`/`IP`/
+`SIR` 等交互式命令，与「被动收连续输出」是两种工作模式）、不做任何写操作（衡器只读，
+`Write` 恒 `ErrUnsupported`）、不做单位换算（单位集合开放 `kg`/`lb`/`g`/`t`/`oz`/
+`kN`/`lb_oz`，`GR` 是 `GS` 毛重别名，`lb oz` 归一为 `lb_oz` 磅盎司双单位）。
+
 ## 文档
 
 - **[docs/00-README.md](docs/00-README.md)** — 总索引：阅读路径、38 个参考方案总览、结论速查、代码地图、接口速查、实现边界
