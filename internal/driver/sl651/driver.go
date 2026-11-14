@@ -110,11 +110,19 @@ func (d *Driver) Meta() driver.Meta {
 		Transports:   []string{"serial", "tcp"},
 		AddressKinds: []model.AddressKind{model.AddressSymbol},
 		Capabilities: driver.Capabilities{
-			Read:        driver.CapSupported,
-			Write:       driver.CapUnsupported,      // 控制命令 4C~4FH 未实现
-			Subscribe:   driver.CapRuntimeDependent, // 遥测站自报（2F/30/32/34）
-			Browse:      driver.CapUnsupported,      // 无对象表，只有要素标识符
-			MultiRead:   driver.CapSupported,        // 一条查询取整帧全部要素
+			Read:      driver.CapSupported,
+			Write:     driver.CapUnsupported,      // 控制命令 4C~4FH 未实现
+			Subscribe: driver.CapRuntimeDependent, // 遥测站自报（2F/30/32/34）
+			Browse:    driver.CapUnsupported,      // 无对象表，只有要素标识符
+			// 声明 supported 指的是「协议本身支持自报帧」，不是「驱动对外提供
+			// 推送回调」：中心站不主动发自报帧，2F/30/32/34 的解析能力只供内置
+			// 从站造帧与自检命令打印抓包。上层拿到的仍是 Read 拉取契约（与 MQTT
+			// 推送驱动声明 supported 同源，见 driver-sdk-spec §3.10）。
+			MultiRead: driver.CapSupported, // 一条查询取整帧全部要素
+			// Discovery 与 BitAccess 显式声明 unsupported 而不是留空：留空会
+			// 序列化成空串，不是能力四态之一（CapState 零值陷阱）。
+			Discovery:   driver.CapUnsupported, // 无发现/枚举服务，地址是要素标识符
+			BitAccess:   driver.CapUnsupported, // 要素值是标量，无位访问语义
 			StructTypes: driver.CapUnsupported,
 		},
 		ConfigFields: []driver.ConfigField{

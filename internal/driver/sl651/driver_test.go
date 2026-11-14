@@ -519,6 +519,22 @@ func TestMetaContract(t *testing.T) {
 	if m.Capabilities.Browse != driver.CapUnsupported {
 		t.Errorf("Browse = %s", m.Capabilities.Browse)
 	}
+	// 8 个能力位必须全部落在能力四态内，不能是空串（CapState 零值陷阱）。
+	// 显式断言全字段，防止漏写 Discovery/BitAccess 后序列化成 ""。
+	caps := map[string]driver.CapState{
+		"Read": m.Capabilities.Read, "Write": m.Capabilities.Write,
+		"Subscribe": m.Capabilities.Subscribe, "Browse": m.Capabilities.Browse,
+		"Discovery": m.Capabilities.Discovery, "MultiRead": m.Capabilities.MultiRead,
+		"BitAccess": m.Capabilities.BitAccess, "StructTypes": m.Capabilities.StructTypes,
+	}
+	for name, st := range caps {
+		switch st {
+		case driver.CapSupported, driver.CapUnsupported,
+			driver.CapRuntimeDependent, driver.CapExperimental:
+		default:
+			t.Errorf("Capabilities.%s = %q，不是能力四态之一（漏写会序列化成空串）", name, st)
+		}
+	}
 	if m.Description == "" {
 		t.Error("Description 为空")
 	}

@@ -1303,3 +1303,86 @@ func TestToledoSymbolsRejectedByOtherProtocols(t *testing.T) {
 		}
 	}
 }
+
+// ---------------------------------------------------------------------------
+// SL 651：要素标识符寻址
+// ---------------------------------------------------------------------------
+
+// SL 651 的点位地址是「要素标识符」（引导符 + 数据定义字节），不是寄存器、不是对象。
+//
+// 与 Toledo 同类：报文是「要素信息组」，每个要素自带「我是什么、多长」，没有「第
+// n 个字节」这种线性结构，故 WidthNone；引导符是规约定义的常量（39H 永远是瞬时
+// 河道水位），故 AllowSymbol。地址写成 ASCII 简称（Z/PT/VT）或两位十六进制（39/26）。
+func TestPolicyForSL651(t *testing.T) {
+	p := PolicyFor("sl651")
+	if p.Width != WidthNone {
+		t.Fatalf("sl651 width = %v，应为 WidthNone（要素宽度由数据定义字节声明）", p.Width)
+	}
+	if !p.AllowSymbol {
+		t.Fatal("sl651 必须允许符号地址（要素标识符）")
+	}
+	if p.AllowRegister || p.AllowObject || p.AllowFile || p.AllowComputed || p.AllowSelector {
+		t.Fatalf("sl651 只接受要素标识符，不应放行其它地址种类：%+v", p)
+	}
+}
+
+// 要素标识符地址必须能解析成 symbol，并在 Canonical 后往返一致。
+func TestParseAddressSL651(t *testing.T) {
+	cases := []struct {
+		expr string
+		dt   model.DataType
+		want string
+	}{
+		{"Z", model.TypeFloat64, "Z"},     // 瞬时河道水位
+		{"PT", model.TypeFloat64, "PT"},   // 降水量累计值
+		{"VT", model.TypeFloat64, "VT"},   // 电压
+		{"39", model.TypeString, "39"},    // 两位十六进制写法
+		{"DRP", model.TypeFloat64, "DRP"}, // 批量雨量
+	}
+	for _, tc := range cases {
+		t.Run(tc.expr, func(t *testing.T) {
+			a, err := ParseAddress(tc.expr, tc.dt, "sl651")
+			if err != nil {
+				t.Fatalf("parse: %v", err)
+			}
+			if a.Kind != model.AddressSymbol || a.Path != tc.want {
+				t.Fatalf("address = %+v，应为 symbol/%s", a, tc.want)
+			}
+			b, err := ParseAddress(a.Canonical(), tc.dt, "sl651")
+			if err != nil {
+				t.Fatalf("reparse %q: %v", a.Canonical(), err)
+			}
+			if b != a {
+				t.Fatalf("round trip: %+v != %+v", b, a)
+			}
+		})
+	}
+}
+
+// 寄存器/对象/文件/计算/selector 地址在 SL 651 下必须在导入期就被拒。
+//
+// 注意「不是被拒」的：`39`、`Z` 本就是合法要素标识符；而像 `1.3.6.1...` 这种 OID
+// 形态的串在点表层会被当成符号名收下（本包不校验符号内容，是否真能解析成要素由
+// 驱动在 Open 时用 LookupGuide 校验）。这里只拦「地址种类」不对的。
+func TestParseAddressSL651RejectsOtherKinds(t *testing.T) {
+	for _, expr := range []string{
+		"holding:0:2",
+		"db1:0",
+		"expr:Z*2",
+		"Z#raw",
+	} {
+		if _, err := ParseAddress(expr, model.TypeFloat64, "sl651"); err == nil {
+			t.Fatalf("sl651 接受了非要素标识符地址 %q", expr)
+		}
+	}
+}
+
+// `length` 列在 SL 651 下必须在导入期拒绝。
+//
+// 要素宽度由报文里的数据定义字节声明，点表里写 length 只会与报文声明冲突；读错位
+// 不会报错，只会把降水量记到水位上。这类「配了但不生效」的列必须导入期报错。
+func TestParseAddressSL651RejectsLength(t *testing.T) {
+	if _, err := ParseAddressWithLength("Z", model.TypeFloat64, "sl651", 4); err == nil {
+		t.Fatal("sl651 应拒绝 length 列（要素宽度由数据定义字节声明）")
+	}
+}

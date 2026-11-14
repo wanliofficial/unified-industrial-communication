@@ -165,6 +165,38 @@ func TestCRCHighByteFirst(t *testing.T) {
 	}
 }
 
+// TestCRCIsNotInverted 钉死「结果不取反」这条最易抄错的规约事实。
+//
+// SL 651 的 CRC 是 CRC-16/MODBUS 变体（init FFFF、poly A001 反射、xorout 0000），
+// 规约附录在第六步算法之后就结束了——没有常见的「结果取反」。它与仓库里 DL/T 645、
+// CJ/T 188 用的 CRC-16/X-25 **只差最后一步取反**。因此最危险的一类回归是：有人
+// 照 X-25 实现「修正」CRC，加上一行 `crc ^= 0xFFFF`——此时金帧（C3AE）会失配报错、
+// 表面看是「设备发来的帧不对」，而真正错的是自己的校验函数。
+//
+// 这条测试用反向断言堵住它：CRC16 必须算出正确的 C3AE，且**绝不**等于取反值 3C51。
+// spec §3.10.27.4/§3.10.27.15 明确承诺过这条断言，此前缺失。
+func TestCRCIsNotInverted(t *testing.T) {
+	// 帧 0（25 字节链路维持报）正文 = 去掉末尾 2 字节 CRC 的部分。
+	body := goldenFrames[0][:len(goldenFrames[0])-2]
+	got := CRC16(body)
+	if got != 0xC3AE {
+		t.Fatalf("CRC16(链路维持报正文) = %04X，应为 C3AE（规约金向量）", got)
+	}
+	// 关键反向断言：取反值（X-25 会得到的结果）绝不能是同一正文的 CRC。若哪天
+	// 有人加了 xorout 0xFFFF，got 会变成 3C51，这条立刻红。
+	if got == 0x3C51 {
+		t.Fatal("CRC16 算出了取反值 3C51——实现被改成了 CRC-16/X-25（结果取反），与规约不符")
+	}
+	// 正向兜底：把正文的 CRC 换成取反值后，绝不能通过校验（证明校验确实认 C3AE
+	// 而不是 3C51）。
+	x25 := got ^ 0xFFFF
+	invertedFrame := append([]byte(nil), body...)
+	invertedFrame = append(invertedFrame, byte(x25>>8), byte(x25&0xFF))
+	if CheckCRC(invertedFrame) {
+		t.Fatal("取反值 3C51 竟然通过了校验——CRC 实现被改成了 X-25 变体")
+	}
+}
+
 // 长度字段数的是「STX 之后、ETX 之前」的字节数，不含 STX/ETX。
 func TestLengthSemantics(t *testing.T) {
 	raw := goldenFrames[0]
