@@ -272,3 +272,75 @@ func TestFormat_ClampsDecimals(t *testing.T) {
 		t.Errorf("decimals=0 时不应有小数点：%q", zero)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// 精度：字符串拆分，不在 float64 上取整
+// ---------------------------------------------------------------------------
+
+// splitSigned 必须走字符串拆分：先「乘 10^n 取整」再格式化会在大值上丢精度。
+//
+// float64 尾数只有 15~16 位有效十进制；工业衡器的大毛重（几十吨、以 g 为
+// 单位）加上小数位很容易越过这个边界。这类错误的表现是「末几位莫名其妙变了
+// 一位」，现场极难排查，所以这里把边界值逐字节钉死。
+func TestSplitSignedKeepsPrecision(t *testing.T) {
+	cases := []struct {
+		name     string
+		v        float64
+		decimals int
+		intPart  string
+		fracPart string
+		sign     int
+	}{
+		{name: "普通值", v: 149.0, decimals: 1, intPart: "149", fracPart: "0", sign: 1},
+		{name: "负值", v: -12.5, decimals: 1, intPart: "12", fracPart: "5", sign: -1},
+		// 15 位整数部分：仍在 float64 可精确表示范围内，必须逐位保留。
+		{name: "十五位整数", v: 123456789012345.0, decimals: 1,
+			intPart: "123456789012345", fracPart: "0", sign: 1},
+		// 大值 + 小数：整数与小数都要完整。
+		{name: "大值带小数", v: 999999999.5, decimals: 1,
+			intPart: "999999999", fracPart: "5", sign: 1},
+		// 小数位不足时右侧补零（不是截断）。
+		{name: "小数补零", v: 0.1, decimals: 2, intPart: "0", fracPart: "10", sign: 1},
+		// 小数位多于实际时按 decimals 截断。
+		{name: "小数截断", v: 1.23456, decimals: 2, intPart: "1", fracPart: "23", sign: 1},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			ip, fp, sg := splitSigned(c.v, c.decimals)
+			if ip != c.intPart || fp != c.fracPart || sg != c.sign {
+				t.Fatalf("splitSigned(%v, %d) = (%q, %q, %d)，期望 (%q, %q, %d)",
+					c.v, c.decimals, ip, fp, sg, c.intPart, c.fracPart, c.sign)
+			}
+		})
+	}
+}
+
+// decimals 为负时不得 panic：Format 会钳到 0，但 splitSigned 作为核心函数
+// 也必须自带防御（原实现会在 fracPart[:decimals] 处切片越界 panic）。
+func TestSplitSignedRejectsNegativeDecimals(t *testing.T) {
+	ip, fp, sg := splitSigned(1.0, -3)
+	if ip != "1" || fp != "" || sg != 1 {
+		t.Fatalf("splitSigned(1.0, -3) = (%q, %q, %d)", ip, fp, sg)
+	}
+}
+
+// 大值组帧后必须能被 Parse 原样解回来（往返一致）。
+func TestFormatParseRoundTripLargeValue(t *testing.T) {
+	for _, v := range []float64{0, 0.1, 149.0, -12.5, 999999999.5, 123456789012345} {
+		sign := 1
+		if v < 0 {
+			sign = -1
+		}
+		frame := Format(Reading{
+			Status: StatusStable, Mode: ModeGross,
+			Sign: sign, Weight: v, Unit: "kg",
+		}, 1)
+		r, err := Parse(frame)
+		if err != nil {
+			t.Fatalf("Parse(%q): %v", frame, err)
+		}
+		if r.Weight != v {
+			t.Fatalf("往返后 Weight = %v，期望 %v（帧 %q）", r.Weight, v, frame)
+		}
+	}
+}

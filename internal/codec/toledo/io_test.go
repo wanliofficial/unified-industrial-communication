@@ -185,3 +185,83 @@ func TestReaderDotNotTreatedAsTerminator(t *testing.T) {
 		t.Fatalf("frame = %q", got)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// 收帧诊断计数
+// ---------------------------------------------------------------------------
+
+// BytesRead 统计从链路真正读到的原始字节数（含被当噪声丢掉的）。
+//
+// 它是驱动区分「链路上没有字节」与「有字节但一帧都解不出」的唯一依据：
+// 前者查接线/供电，后者查仪表帧格式。少统计这部分，驱动就只能在两种故障下
+// 都报超时，把现场引向错误的排查方向。
+//
+// 注意语义是「已从链路读走的字节」，不是「线上总共有多少字节」：分帧是逐字节
+// 读的，遇到 CR 就返回成帧，尾随的 LF 要等下一次 Next 才会被读走。
+func TestReaderCountsBytesRead(t *testing.T) {
+	data := []byte("XYST,GS,+00149.0kg\r\n")
+	r := NewReader(&fakeStream{buf: data})
+	if _, err := r.Next(); err != nil {
+		t.Fatal(err)
+	}
+	// 2 字节噪声 + 16 字节帧体 + 1 字节 CR = 19；LF 尚未读入。
+	if got, want := r.BytesRead(), len(data)-1; got != want {
+		t.Fatalf("BytesRead() = %d，应为已读入的 %d 字节（尾随 LF 尚未读）", got, want)
+	}
+	if got := r.Dropped(); got != 2 {
+		t.Fatalf("Dropped() = %d，应为 2（前导 \"XY\"）", got)
+	}
+	// 再取一次：把尾随 LF 读进来后 BytesRead 补齐，然后 EOF。
+	if _, err := r.Next(); !errors.Is(err, io.EOF) {
+		t.Fatalf("第二次 Next 应返回 EOF，得到 %v", err)
+	}
+	if got := r.BytesRead(); got != len(data) {
+		t.Fatalf("读完尾随 LF 后 BytesRead() = %d，应为 %d", got, len(data))
+	}
+}
+
+// 一帧都没成（全是噪声）时：BytesRead > 0 且 Dropped == BytesRead，没有成帧。
+//
+// 这正是「仪表被设成二进制格式 / 波特率配错」在收帧层的表现，驱动据此报
+// ErrProtocol 而不是 ErrTimeout。
+func TestReaderCountsBytesWhenNoFrameForms(t *testing.T) {
+	// 小写状态 + 任意字节：isFrameStart 只认大写 S/T/U/O/L 与 STX，
+	// 所以这些字节会被全部当噪声丢掉。
+	noise := []byte("lorem ipsum dolor sit amet\r\n")
+	r := NewReader(&fakeStream{buf: noise})
+	_, err := r.Next()
+	if err == nil {
+		t.Fatal("无合法帧起点应返回错误（此处是 EOF）")
+	}
+	if !errors.Is(err, io.EOF) {
+		t.Fatalf("err = %v，应为 EOF", err)
+	}
+	if r.BytesRead() == 0 {
+		t.Fatal("BytesRead() 必须记录读到的字节，否则驱动无法区分「没字节」与「解不出」")
+	}
+	if r.Dropped() == 0 {
+		t.Fatal("全部字节都应计入 Dropped")
+	}
+}
+
+// 二进制 STX 帧在收帧层被当作合法起点切出（CR 定界），由解析层拒绝。
+//
+// 这条边界很重要：收帧层不能把 STX 当噪声丢掉——那样驱动就只能看到「没有
+// 帧」，而看不到「收到的是二进制帧」，那句「请切到 ASCII」的指引就永远发不出去。
+func TestReaderAcceptsSTXAsFrameStart(t *testing.T) {
+	frame := []byte{0x02, 'S', 'T', ' ', '0', '0', '1', '4', '9', 0x0D}
+	r := NewReader(&fakeStream{buf: frame})
+	got, err := r.Next()
+	if err != nil {
+		t.Fatalf("Next: %v", err)
+	}
+	if len(got) == 0 || got[0] != 0x02 {
+		t.Fatalf("frame = %x，应以 STX 开头", got)
+	}
+	// 交给解析层：必须得到「切到 ASCII」的可执行指引，而不是被硬解成垃圾值。
+	if _, perr := Parse(got); perr == nil {
+		t.Fatal("二进制帧不应被 Parse 接受")
+	} else if !strings.Contains(perr.Error(), "ASCII") {
+		t.Fatalf("解析错误应给出切到 ASCII 的指引，得到：%v", perr)
+	}
+}

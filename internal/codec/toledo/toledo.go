@@ -329,6 +329,12 @@ func Format(r Reading, decimals int) []byte {
 // strconv.FormatFloat 以 -1 精度取最短可往返表示，再手动切分，稳且不丢位。
 // 小数串强制补齐到 decimals 位（去尾的补零），保证帧宽固定。
 func splitSigned(v float64, decimals int) (intPart, fracPart string, sign int) {
+	// 防御负数：Format 会先把 decimals 钳到 [0, valueWidth-1]，但这个函数是
+	// 「字符串拆分不丢精度」的核心，不该依赖调用方先钳。负位数按 0 处理，
+	// 否则下面 `fracPart[:decimals]` 会切片越界直接 panic。
+	if decimals < 0 {
+		decimals = 0
+	}
 	s := strconv.FormatFloat(v, 'f', -1, 64)
 	sign = 1
 	if strings.HasPrefix(s, "-") {

@@ -389,6 +389,7 @@ func PolicyFor(protocol string) AddressPolicy {
 		// 合法性（weight/status/…）由驱动在 Open 时校验，这里只放开种类。
 		return AddressPolicy{Width: WidthNone, AllowSymbol: true}
 	}
+	// 未知协议：不拦地址种类（驱动可能在外部注册），但 length 必须显式，
 	// 避免用一个猜出来的宽度去读真实设备。
 	return AddressPolicy{
 		Width:         WidthExplicit,

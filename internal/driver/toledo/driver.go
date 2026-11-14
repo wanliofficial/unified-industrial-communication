@@ -96,15 +96,23 @@ func (d *Driver) Meta() driver.Meta {
 		Name:         "METTLER TOLEDO 连续输出（ASCII 逗号三段式，只读推送）",
 		Version:      "0.1.0",
 		SDKVersion:   driver.SDKVersion,
-		Roles:        []driver.Role{driver.RoleMaster}, // 客户端（C）侧：只读、无应答
+		Roles:        []driver.Role{driver.RoleMaster}, // 客户端（C）侧：只读、无应答（与 MQTT/MTConnect 同例）
 		Transports:   []string{"serial", "tcp"},
 		AddressKinds: []model.AddressKind{model.AddressSymbol},
 		Capabilities: driver.Capabilities{
-			Read:        driver.CapSupported,
-			Write:       driver.CapUnsupported, // 衡器只读，无写命令
-			Subscribe:   driver.CapUnsupported, // 衡器自报，无订阅语义
-			Browse:      driver.CapUnsupported, // 无对象表，只有读数字段
-			MultiRead:   driver.CapSupported,   // 一帧读数覆盖全部点位
+			Read:  driver.CapSupported,
+			Write: driver.CapUnsupported, // 衡器只读，无写命令
+			// 声明 supported 指的是「协议本身是推送型、由驱动内部收帧」，
+			// 不是「驱动对外提供推送回调」。上层拿到的仍然是 Read 拉取契约，
+			// 推送在包内被消化成最新一帧读数。若声明 unsupported，配置界面
+			// 会建议用户「换个协议」，方向就错了（与 MQTT 驱动同源）。
+			Subscribe: driver.CapSupported,
+			Browse:    driver.CapUnsupported, // 无对象表，只有读数字段
+			// 连续输出没有发现/枚举服务，也没有位访问语义；显式声明而不是
+			// 留空——留空会序列化成空串，不是能力四态之一。
+			Discovery:   driver.CapUnsupported,
+			MultiRead:   driver.CapSupported, // 一帧读数覆盖全部点位
+			BitAccess:   driver.CapUnsupported,
 			StructTypes: driver.CapUnsupported,
 		},
 		ConfigFields: []driver.ConfigField{
@@ -142,17 +150,27 @@ type pointState struct {
 type conn struct {
 	deviceID    string
 	link        link.Link
-	opt         Options
 	points      map[string]*pointState
 	staleAfter  time.Duration
 	readTimeout time.Duration
 
-	mu       sync.Mutex
-	closed   bool
-	linkErr  error
-	latest   toledocodec.Reading
+	mu      sync.Mutex
+	closed  bool
+	linkErr error
+	latest  toledocodec.Reading
+	// latestAt 是最近一帧**成功解析**的时间。
 	latestAt time.Time
 	hasData  bool
+
+	// 收帧诊断：用于区分「链路上根本没字节」与「有字节但一帧都解不出」。
+	//
+	// 这两者的排查方向完全不同：前者查接线/供电/仪表是否开启连续输出，后者查
+	// 帧格式（二进制 vs ASCII）、分隔符与波特率/校验位。把它们混成一句「超时」，
+	// 现场会先去换线。
+	bytesSeen    int   // 从链路读到的原始字节数（含被当噪声丢掉的）
+	dropped      int   // 被当作噪声丢弃的字节数
+	badFrames    int   // 收到成行、但 Parse 失败的帧数
+	lastParseErr error // 最近一次解析失败的原因（用于错误消息）
 }
 
 // Open 建链并启动后台收帧。
@@ -172,14 +190,23 @@ func (d *Driver) Open(ctx context.Context, cfg driver.OpenConfig) (driver.Conn, 
 	if readTimeout <= 0 {
 		readTimeout = defaultReadTimeout
 	}
-	// 读超时必须小于陈旧阈值，否则链路真断时 Read 早已把点位判 stale 而收帧循环还没
-	// 察觉，会掩盖断链。这里做一致性校正而不是报错：配置者不该为两个字段的耦合
-	// 费心。
+	// 读超时必须**小于**陈旧阈值，否则链路真断时 Read 早已把点位判 stale 而收帧
+	// 循环还没察觉，会掩盖断链。这里做一致性校正而不是报错：配置者不该为两个
+	// 字段的耦合费心。
+	//
+	// 校正分两步，且**顺序不能反**：先对半，再设下限。反过来（先设 1 秒下限）
+	// 会在 staleAfter ≤ 2s 时让 readTimeout == staleAfter，把「必须小于」这条
+	// 不变式破坏掉。
 	if readTimeout >= staleAfter {
 		readTimeout = staleAfter / 2
-		if readTimeout < time.Second {
-			readTimeout = time.Second
-		}
+	}
+	if readTimeout > 0 && readTimeout < time.Second && staleAfter > 2*time.Second {
+		readTimeout = time.Second
+	}
+	if readTimeout <= 0 {
+		// staleAfter 被配得极小（< 2ns 级别）时对半也会得到 0；保底一个非零值，
+		// 否则 SetDeadline(now+0) 会立刻超时，收帧循环空转。
+		readTimeout = time.Millisecond
 	}
 
 	points := make(map[string]*pointState, len(cfg.Device.Points))
@@ -221,7 +248,6 @@ func (d *Driver) Open(ctx context.Context, cfg driver.OpenConfig) (driver.Conn, 
 	c := &conn{
 		deviceID:    cfg.Device.ID,
 		link:        lnk,
-		opt:         opt,
 		points:      points,
 		staleAfter:  staleAfter,
 		readTimeout: readTimeout,
@@ -239,6 +265,9 @@ func (c *conn) pump() {
 	for {
 		c.link.SetDeadline(time.Now().Add(c.readTimeout))
 		line, err := r.Next()
+		// 每一轮都把 Reader 的累计量同步进 conn：Read/Probe 要用它区分
+		// 「链路上一点动静都没有」与「有字节但一帧都解不出」。
+		c.noteBytes(r.BytesRead(), r.Dropped())
 		if err != nil {
 			if c.isClosed() {
 				return
@@ -254,7 +283,10 @@ func (c *conn) pump() {
 		reading, perr := toledocodec.Parse(line)
 		if perr != nil {
 			// 解析失败不等于链路坏：多半是波特率/校验位配错或帧格式选了二进制。
-			// 不记 linkErr（那会让 Read 整体上抛），继续收。
+			// 不记 linkErr（那会让 Read 整体上抛），但必须计数——否则「有字节
+			// 但一帧都不成」会被 Read 当成「没收到」，把现场的排查方向引到
+			// 接线/供电上，而不是仪表帧格式。
+			c.noteBadFrame(perr)
 			continue
 		}
 		c.mu.Lock()
@@ -263,6 +295,94 @@ func (c *conn) pump() {
 		c.hasData = true
 		c.mu.Unlock()
 	}
+}
+
+// noteBytes 记录从链路读到的字节数与噪声丢弃数。
+func (c *conn) noteBytes(bytesRead, dropped int) {
+	c.mu.Lock()
+	if bytesRead > c.bytesSeen {
+		c.bytesSeen = bytesRead
+	}
+	c.dropped = dropped
+	c.mu.Unlock()
+}
+
+// noteBadFrame 记录一次「成行但解不出」的帧。
+func (c *conn) noteBadFrame(err error) {
+	c.mu.Lock()
+	c.badFrames++
+	c.lastParseErr = err
+	c.mu.Unlock()
+}
+
+// Stats 是收帧过程的只读快照，供自检命令与排障输出使用。
+//
+// 它不改变 Read 的语义，只是把「链路上发生了什么」暴露出来：Toledo 只有推送、
+// 没有命令可发，现场唯一能看的就是收帧质量（收到多少字节、坏帧几次、最后一帧
+// 多旧）。
+type Stats struct {
+	// BytesSeen 是从链路读到的原始字节数（含被当噪声丢弃的）。
+	BytesSeen int
+	// Dropped 是被当作噪声丢弃的字节数（没有落在合法帧起点上的字节）。
+	Dropped int
+	// BadFrames 是收到成行但解析失败的帧数。
+	BadFrames int
+	// HasFrame 表示是否至少成功解析过一帧。
+	HasFrame bool
+	// FrameAge 是距最近一帧成功解析的时间；HasFrame 为假时无意义。
+	FrameAge time.Duration
+	// LastError 是最近一次解析失败的原因（可能为空）。
+	LastError string
+	// Raw 是最近一帧成功解析的原始文本（不含 CR/LF）。
+	Raw string
+}
+
+// Stats 返回收帧统计快照。
+func (c *conn) Stats() Stats {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	st := Stats{
+		BytesSeen: c.bytesSeen,
+		Dropped:   c.dropped,
+		BadFrames: c.badFrames,
+		HasFrame:  c.hasData,
+		Raw:       c.latest.Raw,
+	}
+	if c.hasData {
+		st.FrameAge = time.Since(c.latestAt)
+	}
+	if c.lastParseErr != nil {
+		st.LastError = c.lastParseErr.Error()
+	}
+	return st
+}
+
+// noFrameError 构造「一直没有可用帧」的错误，并区分两种截然不同的原因。
+//
+// 这是本驱动最容易写错、也最影响现场排查的一处：Reader 会把噪声与解析失败都
+// 跳过继续扫描，最后报出来的总是「超时」。但：
+//
+//   - 一个字节都没读到 → 链路/接线/仪表没开连续输出，归 ErrTimeout；
+//   - 读到了字节但一帧都没成 → 帧格式或参数不对，归 ErrProtocol。
+//
+// 混为一谈时，现场会先去改波特率，而不是去查仪表的帧格式设置。
+func (c *conn) noFrameError(op string) error {
+	c.mu.Lock()
+	bytesSeen := c.bytesSeen
+	badFrames := c.badFrames
+	lastErr := c.lastParseErr
+	c.mu.Unlock()
+
+	if bytesSeen > 0 {
+		msg := fmt.Sprintf("收到 %d 字节但无一成帧（坏帧 %d）", bytesSeen, badFrames)
+		if lastErr != nil {
+			msg += "：" + lastErr.Error()
+		} else {
+			msg += "：检查仪表帧格式（应为 ASCII 连续输出 ST,GS,+00149.0kg）、分隔符与波特率/校验位"
+		}
+		return driver.E(driver.ErrProtocol, op, c.deviceID, msg, false, lastErr)
+	}
+	return nil
 }
 
 // Read 从最新一帧读数里取各点位的字段值。无任何网络交互。
@@ -286,6 +406,14 @@ func (c *conn) Read(ctx context.Context, spans []driver.ReadSpan) ([]driver.RawS
 	refs := flattenRefs(spans)
 	if len(refs) == 0 {
 		return nil, nil
+	}
+
+	// 一帧都没收到时，把「链路上没字节」与「有字节但解不出」分开报。
+	// 这是本驱动唯一会在 Read 里返回错误的分支，其余一律按点位降级。
+	if !hasData {
+		if err := c.noFrameError("read"); err != nil {
+			return nil, err
+		}
 	}
 
 	now := time.Now()
@@ -435,20 +563,46 @@ func (c *conn) Probe(ctx context.Context) error {
 		}
 		select {
 		case <-ctx.Done():
-			return driver.E(driver.ErrTimeout, "probe", c.deviceID,
-				"no frame within probe window", true, ctx.Err())
+			return c.probeTimeout(ctx.Err())
 		case <-deadline.C:
-			return driver.E(driver.ErrTimeout, "probe", c.deviceID,
-				"no frame received within "+defaultProbeTimeout.String(), false, nil)
+			return c.probeTimeout(nil)
 		case <-ticker.C:
 		}
 	}
 }
 
+// probeTimeout 构造探测失败的错误，并复用 noFrameError 的两种原因判据。
+//
+// 探测窗口内没帧时，「读到过字节但解不出」不该报成超时——那会让现场去查接线，
+// 而真正要改的是仪表的帧格式。
+func (c *conn) probeTimeout(cause error) error {
+	if err := c.noFrameError("probe"); err != nil {
+		return err
+	}
+	if cause != nil {
+		return driver.E(driver.ErrTimeout, "probe", c.deviceID,
+			"no frame within probe window", true, cause)
+	}
+	return driver.E(driver.ErrTimeout, "probe", c.deviceID,
+		"no frame received within "+defaultProbeTimeout.String(), false, nil)
+}
+
 // Write 不支持：衡器只读。
+//
+// 按仓库约定逐项返回 ErrUnsupported，而不是返回一个顶层错误：顶层错误会被
+// 采集层摊成「全部点位写失败 + comm_error」，看起来像链路故障；逐项返回能让
+// 调用方看到「这个协议就是不支持写」。
 func (c *conn) Write(ctx context.Context, reqs []driver.WriteRequest) ([]driver.WriteResult, error) {
-	return nil, driver.E(driver.ErrUnsupported, "write", c.deviceID,
-		"toledo continuous output is read-only", false, nil)
+	out := make([]driver.WriteResult, 0, len(reqs))
+	for _, req := range reqs {
+		out = append(out, driver.WriteResult{
+			PointID: req.PointID,
+			Quality: model.QualityBad,
+			Err: driver.E(driver.ErrUnsupported, "write", c.deviceID,
+				"Toledo 连续输出是只读推送，驱动不支持写入", false, nil),
+		})
+	}
+	return out, nil
 }
 
 // Close 停止收帧并关链路。

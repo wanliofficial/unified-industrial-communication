@@ -210,18 +210,33 @@ func TestStableMotionBoolPoints(t *testing.T) {
 	}
 }
 
-// TestWriteUnsupported 写操作返回 ErrUnsupported。
+// TestWriteUnsupported 写操作逐项返回 ErrUnsupported。
+//
+// 按仓库约定（与 M-Bus / SL 651 同款）逐项返回而不是抛顶层错误：顶层错误会被
+// 采集层摊成「全部点位写失败 + comm_error」，看起来像链路故障。
 func TestWriteUnsupported(t *testing.T) {
 	srv := startSim(t, toledosim.WithWeight(10.0, "kg", 1))
 	c := openConn(t, srv, pt("w", "weight", model.TypeFloat64))
-	_, err := c.Write(context.Background(), []driver.WriteRequest{{
-		PointID: "w",
-	}})
-	if err == nil {
-		t.Fatal("write should be unsupported")
+	out, err := c.Write(context.Background(), []driver.WriteRequest{
+		{PointID: "w"},
+		{PointID: "w2"},
+	})
+	if err != nil {
+		t.Fatalf("write 不应返回顶层错误（会掩盖成链路故障）：%v", err)
 	}
-	if driver.KindOf(err) != driver.ErrUnsupported {
-		t.Errorf("error kind = %s, want unsupported", driver.KindOf(err))
+	if len(out) != 2 {
+		t.Fatalf("应逐项返回结果，得到 %d 项", len(out))
+	}
+	for _, r := range out {
+		if r.Err == nil {
+			t.Fatalf("点位 %q 应带 ErrUnsupported", r.PointID)
+		}
+		if driver.KindOf(r.Err) != driver.ErrUnsupported {
+			t.Errorf("点位 %q 错误分类 = %s，应为 unsupported", r.PointID, driver.KindOf(r.Err))
+		}
+		if r.OK {
+			t.Errorf("点位 %q 不应标记成功", r.PointID)
+		}
 	}
 }
 

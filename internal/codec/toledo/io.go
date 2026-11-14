@@ -25,6 +25,9 @@ type Reader struct {
 	buf []byte
 	// maxFrame 是单帧上限，防止对端（或噪声）一直不回 CR/LF 时无限吞字节。
 	maxFrame int
+	// bytesRead 是从链路读到的原始字节总数（含被丢弃的），供诊断区分
+	// 「链路上没有字节」与「有字节但一帧都解不出」。
+	bytesRead int
 	// dropped 累计当作噪声丢弃的字节数，供诊断输出。
 	dropped int
 }
@@ -36,6 +39,12 @@ func NewReader(st transport.Stream) *Reader {
 
 // Buffered 返回尚未被消费的字节数。
 func (r *Reader) Buffered() int { return len(r.buf) }
+
+// BytesRead 返回从链路读到的原始字节总数（含被当作噪声丢弃的）。
+//
+// 它与 Dropped() 一起构成本驱动最重要的一条诊断判据：「读了 0 字节」是链路/
+// 接线问题，「读了 N 字节但一帧都没成」是帧格式/参数问题。两者排查方向完全不同。
+func (r *Reader) BytesRead() int { return r.bytesRead }
 
 // Dropped 返回被当作噪声丢弃的字节数。
 //
@@ -66,6 +75,7 @@ func (r *Reader) Next() ([]byte, error) {
 			if err != nil {
 				return nil, err
 			}
+			r.bytesRead += len(chunk)
 			r.buf = append(r.buf, chunk...)
 			continue
 		}
@@ -95,6 +105,7 @@ func (r *Reader) Next() ([]byte, error) {
 		if err != nil {
 			return nil, err
 		}
+		r.bytesRead += len(chunk)
 		r.buf = append(r.buf, chunk...)
 	}
 }

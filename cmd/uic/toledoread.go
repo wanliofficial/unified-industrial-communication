@@ -5,6 +5,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -46,7 +47,7 @@ func toledoreadCmd(args []string) {
 	points := fs.String("points", "", "读数字段列表，逗号分隔：weight,status,unit,mode,stable,motion,decimals")
 	probe := fs.Bool("probe", false, "只连上并验证收到连续输出帧，不列字段")
 	list := fs.Bool("list", false, "打印可用读数字段（不需要连秤）")
-	raw := fs.Bool("raw", false, "额外显示原始帧文本")
+	raw := fs.Bool("raw", false, "额外显示原始帧文本与收帧统计（字节数/坏帧/噪声）")
 	asJSON := fs.Bool("json", false, "以 JSON 输出")
 	timeout := fs.Duration("timeout", 3*time.Second, "连上与探测超时")
 	fs.Parse(args)
@@ -188,7 +189,11 @@ func printToledoFields(asJSON bool) {
 // printToledoLatest 连上后列出最新一帧的各字段。
 //
 // 推送模型下「最新一帧」就是此刻秤的读数。连续输出通常 10~25 帧/秒，因此连上
-// 后稍等让收帧循环攒一帧，再读一次即可；这里做短重试，读到首个 good 样本就停。
+// 后稍等让收帧循环攒一帧，再读一次即可。
+//
+// 注意重试判据不能用「样本数 > 0」：驱动在还没收到帧时也会为每个点位返回一条
+// comm_error 样本（这是对的，否则采集层会把点位当「响应里缺项」）。判据必须是
+// 「至少有一个点位不是 comm_error」，否则这段循环等价于只读一次。
 func printToledoLatest(ctx context.Context, c driver.Conn, transport string, raw, asJSON bool) {
 	fields := []string{"weight", "status", "mode", "unit", "stable", "motion", "decimals"}
 	refs := make([]driver.PointRef, 0, len(fields))
@@ -204,9 +209,13 @@ func printToledoLatest(ctx context.Context, c driver.Conn, transport string, raw
 	var out []driver.RawSample
 	for time.Now().Before(deadline) {
 		samples, err := c.Read(ctx, []driver.ReadSpan{{ID: "latest", Points: refs}})
-		if err == nil && len(samples) > 0 {
+		if err == nil && hasFreshFrame(samples) {
 			out = samples
 			break
+		}
+		if out == nil && err == nil {
+			// 先留住第一份（含 comm_error 的）结果，超时后照实打印。
+			out = samples
 		}
 		select {
 		case <-ctx.Done():
@@ -231,7 +240,11 @@ func printToledoLatest(ctx context.Context, c driver.Conn, transport string, raw
 		rows = append(rows, row)
 	}
 	if asJSON {
-		emitJSON(map[string]any{"transport": transport, "rows": rows, "count": len(rows)})
+		out := map[string]any{"transport": transport, "rows": rows, "count": len(rows)}
+		if raw {
+			out["stats"] = toledoStatsMap(c)
+		}
+		emitJSON(out)
 		return
 	}
 	fmt.Printf("最新一帧  传输 %s\n\n", transport)
@@ -244,9 +257,87 @@ func printToledoLatest(ctx context.Context, c driver.Conn, transport string, raw
 		printRow([]int{12, 24, 14, 20}, r.Field, v, r.Quality, toledoFieldDesc(r.Field))
 	}
 	if raw {
-		fmt.Println()
-		fmt.Println("提示：状态 ST=稳定 US=运动中 OL=超量程 UL=欠量程；mode GS=毛重 NT=净重 TR=皮重。")
-		fmt.Println("      运动中（US）重量判 uncertain，超/欠量程（OL/UL）判 bad。")
+		printToledoRaw(c)
+	}
+}
+
+// hasFreshFrame 判断一批样本里是否至少有一个点位真正拿到了帧。
+//
+// comm_error 表示「还没收到过帧」（见驱动质量码语义），它不是读数。
+func hasFreshFrame(samples []driver.RawSample) bool {
+	for _, s := range samples {
+		if s.Quality != model.QualityCommError {
+			return true
+		}
+	}
+	return false
+}
+
+// toledoStats 是驱动收帧统计的本地镜像（CLI 的输出结构）。
+type toledoStats struct {
+	BytesSeen int    `json:"bytesSeen"`
+	Dropped   int    `json:"dropped"`
+	BadFrames int    `json:"badFrames"`
+	HasFrame  bool   `json:"hasFrame"`
+	FrameAge  int64  `json:"frameAgeMs"`
+	LastError string `json:"lastError,omitempty"`
+	Raw       string `json:"raw,omitempty"`
+}
+
+// statsOf 通过可选接口取驱动的收帧统计。
+//
+// 用接口断言而不是把连接断言成驱动内部类型：与 sl651read 取 Report 的方式一致，
+// 自检命令只依赖驱动导出的能力，不依赖它的内部结构。
+func statsOf(c driver.Conn) (toledoStats, bool) {
+	getter, ok := c.(interface{ Stats() toledodrv.Stats })
+	if !ok {
+		return toledoStats{}, false
+	}
+	s := getter.Stats()
+	return toledoStats{
+		BytesSeen: s.BytesSeen,
+		Dropped:   s.Dropped,
+		BadFrames: s.BadFrames,
+		HasFrame:  s.HasFrame,
+		FrameAge:  s.FrameAge.Milliseconds(),
+		LastError: s.LastError,
+		Raw:       s.Raw,
+	}, true
+}
+
+func toledoStatsMap(c driver.Conn) any {
+	if s, ok := statsOf(c); ok {
+		return s
+	}
+	return nil
+}
+
+// printToledoRaw 打印原始帧与收帧统计。
+//
+// 这是 Toledo 自检最有价值的一部分：只有推送、没有命令可发，现场唯一能看的就是
+// 「线上到底来了什么字节」。字节数 > 0 而坏帧 > 0 且没有好帧，指向帧格式/参数；
+// 字节数为 0 才指向接线与供电。
+func printToledoRaw(c driver.Conn) {
+	s, ok := statsOf(c)
+	if !ok {
+		return
+	}
+	fmt.Println()
+	fmt.Println("收帧统计")
+	printRow([]int{16, 40}, "项目", "值")
+	printRow([]int{16, 40}, "读到字节", strconv.Itoa(s.BytesSeen))
+	printRow([]int{16, 40}, "噪声丢弃", strconv.Itoa(s.Dropped))
+	printRow([]int{16, 40}, "坏帧", strconv.Itoa(s.BadFrames))
+	printRow([]int{16, 40}, "最近帧龄", strconv.FormatInt(s.FrameAge, 10)+"ms")
+	if s.LastError != "" {
+		printRow([]int{16, 40}, "最近解析错误", s.LastError)
+	}
+	if s.Raw != "" {
+		fmt.Printf("\n最近一帧原文（不含 CR/LF）：%q\n", s.Raw)
+	}
+	if s.BytesSeen > 0 && !s.HasFrame {
+		fmt.Println("\n提示：读到了字节但一帧都没成。查仪表帧格式（应为 ASCII 连续输出）、")
+		fmt.Println("      分隔符设置与波特率/校验位，而不是先查接线。")
 	}
 }
 

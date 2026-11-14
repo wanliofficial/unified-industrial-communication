@@ -1195,3 +1195,111 @@ func TestParseAddressBACnetRejectsNonObject(t *testing.T) {
 		}
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Toledo：读数字段寻址
+// ---------------------------------------------------------------------------
+
+// Toledo 的点位地址是「当前一帧读数的一个字段名」，不是寄存器、不是对象。
+//
+// 这条策略要同时挡住两个方向：别把 Modbus 风格的 `holding:0:2` 喂给秤（现场
+// 会以为「读到了寄存器」，实际连续输出帧里根本没有线性寄存器结构），也别让
+// 秤的字段名混进只接受 DI/寄存器/对象的协议被误当成合法地址。
+//
+// 刻意**不**校验字段名合法性：这是仓库的既定分工——点表层只管「地址种类放不放
+// 行」，字段名与 dataType 的匹配由驱动在 Open 时校验（与 SNMP 的 OID 数值约束
+// 同例）。若这里再维护一份字段白名单，两处必然漂移。
+func TestPolicyForToledo(t *testing.T) {
+	p := PolicyFor("toledo")
+	if p.Width != WidthNone {
+		t.Fatalf("toledo width = %v，应为 WidthNone（数值段宽度由仪表小数位决定）", p.Width)
+	}
+	if !p.AllowSymbol {
+		t.Fatal("toledo 必须允许符号地址")
+	}
+	if p.AllowRegister || p.AllowObject || p.AllowFile || p.AllowComputed || p.AllowSelector {
+		t.Fatalf("toledo 只接受字段名，不应放行其它地址种类：%+v", p)
+	}
+}
+
+// 字段名地址必须能经 ParseAddress 解析成 symbol，并在 Canonical 后往返一致。
+func TestParseAddressToledo(t *testing.T) {
+	cases := []struct {
+		expr string
+		dt   model.DataType
+		want string
+	}{
+		{"weight", model.TypeFloat64, "weight"},
+		{"status", model.TypeString, "status"},
+		{"unit", model.TypeString, "unit"},
+		{"mode", model.TypeString, "mode"},
+		{"stable", model.TypeBool, "stable"},
+		{"motion", model.TypeBool, "motion"},
+		{"decimals", model.TypeInt64, "decimals"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.expr, func(t *testing.T) {
+			a, err := ParseAddress(tc.expr, tc.dt, "toledo")
+			if err != nil {
+				t.Fatalf("parse: %v", err)
+			}
+			if a.Kind != model.AddressSymbol || a.Path != tc.want {
+				t.Fatalf("address = %+v，应为 symbol/%s", a, tc.want)
+			}
+			b, err := ParseAddress(a.Canonical(), tc.dt, "toledo")
+			if err != nil {
+				t.Fatalf("reparse %q: %v", a.Canonical(), err)
+			}
+			if b != a {
+				t.Fatalf("round trip: %+v != %+v", b, a)
+			}
+		})
+	}
+}
+
+// 寄存器/对象/文件/selector 这些地址种类在 Toledo 下必须在导入期就被拒，
+// 而不是等到启动后每个周期返回 address_error。
+//
+// 注意「不是被拒」的几种：`12345`、`calc:weight*2`、`weight:4` 在点表层都会
+// 被当成**符号名**收下（本包不校验符号内容——那是驱动的职责，与 SNMP 不校验
+// OID 数值约束同例）。它们会在驱动 Open 时被 `KnownSymbol` 拒绝，报
+// ErrAddress 并列出可用字段，而不是等到采集周期里静默失败。
+func TestParseAddressToledoRejectsOtherKinds(t *testing.T) {
+	for _, expr := range []string{
+		"holding:0:2",
+		"holding:100",
+		"db1:0",
+		"expr:weight*2",
+		"file:1",
+		"weight#raw",
+		"weight#",
+	} {
+		if _, err := ParseAddress(expr, model.TypeFloat64, "toledo"); err == nil {
+			t.Fatalf("toledo 接受了非字段名地址 %q", expr)
+		}
+	}
+}
+
+// `length` 在 Toledo 下必须在导入期拒绝（点表的 length 列）。
+//
+// 连续输出帧的数值段宽度由仪表的小数位数决定（D39 的 WEIGHT(7) 是 5 位整数 +
+// '.' + 1 位小数），点表里写 length 只会与帧里的实际宽度冲突，读出来的值会
+// 被按错误的宽度切分。这类「配了但不生效」的列必须在导入期报错。
+func TestParseAddressToledoRejectsLength(t *testing.T) {
+	if _, err := ParseAddressWithLength("weight", model.TypeFloat64, "toledo", 4); err == nil {
+		t.Fatal("toledo 应拒绝 length 列（数值段宽度由仪表小数位决定）")
+	}
+}
+
+// 反向：秤的字段名不该被只接受 DI/寄存器的协议收下。
+func TestToledoSymbolsRejectedByOtherProtocols(t *testing.T) {
+	// 这三类协议的地址是严格形态（寄存器区名 / DI 十六进制 / 对象引用），
+	// 裸字段名必须被拒。
+	for _, proto := range []string{"modbus-tcp", "s7", "dlt645", "cjt188", "bacnet"} {
+		for _, expr := range []string{"weight", "status", "decimals"} {
+			if _, err := ParseAddress(expr, model.TypeFloat64, proto); err == nil {
+				t.Fatalf("%s 接受了 Toledo 字段名 %q", proto, expr)
+			}
+		}
+	}
+}
