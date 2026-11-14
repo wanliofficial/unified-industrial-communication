@@ -12,8 +12,8 @@ PRD 中 M 级的采集协议已全部落地，FR-CFG-01 的四类寻址模型也
 可自动跑的用例（见 §7），唯一剩下的延期项是 object/file 寻址的实际驱动，
 见 [protocol-status.md](protocol-status.md) §4.1。
 
-当前测试基线：**348 passed / 0 failed / 3 skipped**（跳过的是需要 `--opcua` 的 OPC UA 端到端用例）；
-加 `-- --opcua` 跑全量是 **351 passed / 0 failed / 0 skipped**。
+当前测试基线：**349 passed / 0 failed / 3 skipped**（跳过的是需要 `--opcua` 的 OPC UA 端到端用例）；
+加 `-- --opcua` 跑全量是 **352 passed / 0 failed / 0 skipped**。
 
 ## 1. 采集（FR-COL）
 
@@ -48,7 +48,7 @@ PRD 中 M 级的采集协议已全部落地，FR-CFG-01 的四类寻址模型也
 | FR-CFG-10 | 一键回滚（回滚也产生新版本） | 已实现 | `config/rollback_adds_a_version` |
 | FR-CFG-11 | 配置原子写（临时文件 + fsync + rename） | 已实现 | `ConfigStore.AtomicWrite`；`config/reload_after_restart` 验证重启后仍读得到 |
 | FR-CFG-12 | 热更新：只重启受影响设备 | 已实现 | `contract/template_instantiates_and_applies_devices`（apply 后返回 `restartedDevices`）；diff 按设备/点位粒度。下线设备的观测状态一并清理（否则删了又加回来不重推 `$state`、且吞掉第一轮停滞告警）：`lifecycle/removed_device_is_forgotten`、`lifecycle/readded_device_republishes_its_state`；读挂死时下线不被阻塞，否则配置应用与关机一起挂住：`lifecycle/hung_read_does_not_block_shutdown`。apply 是原子的：动 actor 之前先做 `Preflight`（设备 → 通道 → 驱动全量解析），驱动没注册整份拒绝（422 + `channels[x].protocol`），不会留下「旧设备已拆、新设备建不出、配置没换」的半应用状态：`lifecycle/failed_apply_leaves_running_devices_alone`、`contract/apply_refuses_unregistered_driver`。版本写不下盘（磁盘满/只读挂载）时把设备退回上一份配置再报错，「apply 失败 = 什么都没变」：`lifecycle/unpersisted_apply_rolls_the_devices_back`；北向 sink 的装配（MQTT 自签 CA）也前移到无副作用阶段，不会先断旧连接、提交版本再报 422：`lifecycle/bad_mqtt_ca_fails_before_anything_changes` |
-| FR-CFG-13 | 配置导入/导出（跨版本迁移） | 已实现 | `config/migration_is_explicit_and_versioned`、`config/migrates_v0_legacy_shapes`、`config/repository_examples_validate`（仓库 `examples/` 三个示例都能直接 `check` 通过）、`contract/config_export_import_round_trip`、`contract/config_import_migrates_legacy_shape`、`config/redacted_secrets_are_restored`、`contract/apply_keeps_redacted_secrets`（默认导出的 `***` 在 apply/import 时按同路径还原）。迁移覆盖 `server.*`、`storage.dir`、`concurrency`、`devices[].channel`、transport 对象、数字 stopBits；时长接受 Go 复合写法 |
+| FR-CFG-13 | 配置导入/导出（跨版本迁移） | 已实现 | `config/migration_is_explicit_and_versioned`、`config/migrates_v0_legacy_shapes`、`config/repository_examples_validate`（仓库 `examples/` 三个示例都能直接 `check` 通过）、`contract/config_export_import_round_trip`、`contract/config_import_migrates_legacy_shape`、`config/redacted_secrets_are_restored`、`contract/apply_keeps_redacted_secrets`（默认导出的 `***` 在 apply/import 时按同路径还原）。迁移覆盖 `server.*`、`storage.dir`、`concurrency`、`devices[].channel`、transport 对象、数字 stopBits；时长接受 Go 复合写法。v0 旧字段写成非字符串（`server.listen` 为数字、`token`/`transport.kind` 为对象/布尔）时迁移链归 `ConfigException` 而不是抛裸 `InvalidOperationException` 冒成 500——客户端配置错误不能误报成网关故障：`config/migration_rejects_non_string_legacy_fields`（单元层钉异常类型）、`contract/malformed_legacy_field_is_not_a_server_fault`（HTTP 层钉 validate 200/`valid:false`、apply 422） |
 
 ## 3. 调度与运行时（FR-RUN）
 

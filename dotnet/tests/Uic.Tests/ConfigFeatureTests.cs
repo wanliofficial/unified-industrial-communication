@@ -28,6 +28,7 @@ internal static class ConfigFeatureTests
         tests.Add(new TestCase("config/deadband_and_range_rules", DeadbandAndRangeRules));
         tests.Add(new TestCase("config/array_count_rules", ArrayCountRules));
         tests.Add(new TestCase("config/migration_is_explicit_and_versioned", MigrationIsExplicitAndVersioned));
+        tests.Add(new TestCase("config/migration_rejects_non_string_legacy_fields", MigrationRejectsNonStringLegacyFields));
         tests.Add(new TestCase("config/migrates_v0_legacy_shapes", MigratesLegacyShapes));
         tests.Add(new TestCase("config/composite_durations_parse", CompositeDurationsParse));
         tests.Add(new TestCase("config/redacted_secrets_are_restored", RedactedSecretsAreRestored));
@@ -531,6 +532,39 @@ internal static class ConfigFeatureTests
         t.Throws<ConfigException>(
             () => ConfigMigrations.Upgrade("not json"),
             "malformed JSON is a configuration error, not a crash");
+        return Task.CompletedTask;
+    }
+
+    /// <summary>
+    /// v0 旧字段（server.listen / server.token / transport.kind）在 JSON 里写成
+    /// 非字符串（数字、布尔、对象）时，迁移链不得抛裸的 InvalidOperationException。
+    ///
+    /// 这些 <c>GetValue&lt;string&gt;()</c> 原本没有类型守卫，遇到非字符串值直接抛
+    /// 运行时异常；而 Upgrade 的调用方（ConfigStore.Parse / TryParse）只按
+    /// ConfigException 分类「配置非法」。裸异常会一路冒到 REST 最外层兜底 catch，
+    /// 把一份客户端配置错误渲染成 500——和把写请求体语法错误冒成 500 是同一类
+    /// 「输入不成立被误报成网关故障」。迁移阶段遇到任何形状不符都应是 ConfigException。
+    /// </summary>
+    private static Task MigrationRejectsNonStringLegacyFields(TestContext t)
+    {
+        // server.listen 写成数字。
+        t.Throws<ConfigException>(() => ConfigMigrations.Upgrade("""
+            { "schemaVersion": 1, "site": "a", "server": { "listen": 9090 } }
+            """), "a numeric server.listen is a config error, not a crash");
+
+        // server.token 写成对象。
+        t.Throws<ConfigException>(() => ConfigMigrations.Upgrade("""
+            { "schemaVersion": 1, "site": "a", "server": { "token": { "x": 1 } } }
+            """), "a non-string server.token is a config error, not a crash");
+
+        // transport.kind 写成布尔。
+        t.Throws<ConfigException>(() => ConfigMigrations.Upgrade("""
+            {
+              "schemaVersion": 1, "site": "a",
+              "channels": [{ "id": "ch1", "transport": { "kind": true, "address": "127.0.0.1:502" } }]
+            }
+            """), "a non-string transport.kind is a config error, not a crash");
+
         return Task.CompletedTask;
     }
 

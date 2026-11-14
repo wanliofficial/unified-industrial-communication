@@ -219,6 +219,16 @@
   格式错误误报成网关崩溃，既掩盖了调用方的 bug，也污染了对网关健康度的判断。
   配置导入早就把语法错误归成客户端错误，写接口必须一致：请求不成立就是 400，
   网关没坏。用例 `contract/malformed_write_body_is_a_client_error` 双向钉住这条。
+- **配置迁移期的形状错误也不能冒成 500。** 现场升级程序时配置文件往往还是 v0 写出来的，
+  迁移链要读旧字段（`server.listen`、`server.token`、`transport.kind`）。这些字段原本
+  用 `GetValue<string>()` 直接读，一旦配置把它们写成数字 / 布尔 / 对象，就抛裸的
+  `InvalidOperationException`；而 REST 只按 `ConfigException` 分类「配置非法」，裸异常会
+  一路冒到最外层兜底 catch 变成 500。把一份客户端配置错误渲染成网关崩溃，会误触发告警、
+  污染错误看板，和把写请求体语法错误冒成 500 是同一类问题。迁移阶段遇到任何形状不符
+  都应是 `ConfigException`：`config/validate` 把它列进问题清单（200 + `valid:false`），
+  `config/apply` 由中间件渲染成 422 `config.invalid`。单元层
+  `config/migration_rejects_non_string_legacy_fields` 钉异常类型，契约层
+  `contract/malformed_legacy_field_is_not_a_server_fault` 钉 HTTP 状态码。
 - **限流桶必须能被清掉，否则限流器自己成了拒绝服务的手段。** 桶按来源 IP 建，
   全网扫描器每天能贡献几十万个不同地址；每来一个地址建一个永久桶，内存就是
   无上限增长。清扫按**时间**触发（至多每分钟一次），不是「每 N 次请求」——

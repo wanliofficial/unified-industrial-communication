@@ -60,6 +60,7 @@ internal static class ContractTests
         tests.Add(new TestCase("contract/unknown_device_returns_error_envelope", UnknownDeviceReturnsEnvelope));
         tests.Add(new TestCase("contract/config_is_redacted", ConfigIsRedacted));
         tests.Add(new TestCase("contract/config_validate_reports_problems", ConfigValidateReportsProblems));
+        tests.Add(new TestCase("contract/malformed_legacy_field_is_not_a_server_fault", MalformedLegacyFieldIsNotAServerFault));
         tests.Add(new TestCase("contract/plaintext_credentials_are_rejected", PlaintextCredentialsAreRejected));
         tests.Add(new TestCase("contract/every_credential_field_is_redacted", EveryCredentialFieldIsRedacted));
         tests.Add(new TestCase("contract/apply_refuses_unregistered_driver", ApplyRefusesUnregisteredDriver));
@@ -1129,6 +1130,62 @@ internal static class ContractTests
             // 语法错误走的是另一条路径（JSON 解析），必须是 422 而不是 500。
             var broken = await host.Client.SendAsync(Post("/api/v1/config/validate", "{ nope"), t.Ct);
             t.Equal((HttpStatusCode)422, broken.StatusCode, "malformed JSON is an unprocessable entity");
+        });
+    }
+
+    /// <summary>
+    /// v0 旧字段（server.listen 等）写成非字符串 JSON（数字 / 对象）时，配置接口
+    /// 绝不能冒成 500。
+    ///
+    /// 迁移链里这些字段原本用 <c>GetValue&lt;string&gt;()</c> 直接读，遇到非字符串抛
+    /// 裸 <see cref="InvalidOperationException"/>；而 REST 只按 <see cref="ConfigException"/>
+    /// 分类「配置非法」，裸异常会一路冒到最外层兜底 catch 变成 500。500 专指网关自身
+    /// 故障——把一份客户端配置错误渲染成网关崩溃，会误触发告警、污染错误看板，和把
+    /// 写请求体语法错误冒成 500 是同一类问题。
+    ///
+    /// 两个端点的正确表现不同：<c>config/validate</c> 的产出就是「问题清单」，语义非法
+    /// 的配置返回 200 + <c>valid:false</c>（只要不是崩溃）；<c>config/apply</c> 遇配置
+    /// 非法抛 <see cref="ConfigException"/>，由中间件渲染成 422。两者都必须避开 500。
+    /// 单元层（config/migration_rejects_non_string_legacy_fields）另钉异常类型是
+    /// ConfigException 而非 InvalidOperationException。
+    /// </summary>
+    private static Task MalformedLegacyFieldIsNotAServerFault(TestContext t)
+    {
+        return RunAsync(async () =>
+        {
+            await using var host = await Host.StartAsync(t);
+
+            // server.listen 写成数字：迁移时读字符串会炸。
+            var numericListen = """
+                                {
+                                  "config": {
+                                    "schemaVersion": 1,
+                                    "site": "plant-a",
+                                    "server": { "listen": 9090 }
+                                  }
+                                }
+                                """;
+
+            // validate：配置语义非法 → 200 + valid:false（列出问题），绝不 500。
+            var validate = await host.Client.SendAsync(
+                Post("/api/v1/config/validate", numericListen), t.Ct);
+            t.Ok(validate.StatusCode != HttpStatusCode.InternalServerError,
+                "validate must never surface a client config error as a server fault");
+            var body = await ReadJsonAsync(t, validate);
+            t.Equal(false, body.RootElement.GetProperty("valid").GetBoolean(),
+                "a non-string legacy field is reported as invalid, not accepted");
+            t.Ok(body.RootElement.GetProperty("problems").GetArrayLength() > 0,
+                "the problems list names what is wrong");
+
+            // apply：配置非法 → 422 config.invalid，绝不 500。
+            var apply = await host.Client.SendAsync(
+                Post("/api/v1/config/apply", numericListen), t.Ct);
+            t.Equal((HttpStatusCode)422, apply.StatusCode,
+                "apply rejects the malformed field with a 422, not a 500");
+            var applyBody = await ReadJsonAsync(t, apply);
+            t.Equal("config.invalid",
+                applyBody.RootElement.GetProperty("error").GetProperty("code").GetString(),
+                "the error code names the invalid config");
         });
     }
 

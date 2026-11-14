@@ -65,7 +65,7 @@ public static class ConfigMigrations
         // v0 的 server.listen / server.token → northbound.rest.*。
         if (root["server"] is JsonObject server)
         {
-            var listen = server["listen"]?.GetValue<string>();
+            var listen = ReadLegacyString(server, "listen");
 
             if (!string.IsNullOrWhiteSpace(listen))
             {
@@ -77,7 +77,7 @@ public static class ConfigMigrations
                 }
             }
 
-            var token = server["token"]?.GetValue<string>();
+            var token = ReadLegacyString(server, "token");
 
             if (!string.IsNullOrWhiteSpace(token))
             {
@@ -156,7 +156,7 @@ public static class ConfigMigrations
 
             if (channel["transport"] is JsonObject transport)
             {
-                var kind = transport["kind"]?.GetValue<string>();
+                var kind = ReadLegacyString(transport, "kind");
 
                 channel["transport"] = kind switch
                 {
@@ -173,7 +173,8 @@ public static class ConfigMigrations
                     if (port is not null) channel["port"] ??= port;
                 }
 
-                if (channel["transport"]!.GetValue<string>() == "serial")
+                var transportKind = channel["transport"]!.GetValue<string>();
+                if (transportKind == "serial")
                 {
                     var serial = channel["serial"] as JsonObject ?? new JsonObject();
                     channel["serial"] = serial;
@@ -202,7 +203,7 @@ public static class ConfigMigrations
                     channel["host"] = hostValue.DeepClone();
 
                 if (channel["port"] is null && transport["port"] is JsonValue portValue &&
-                    channel["transport"]!.GetValue<string>() != "serial")
+                    transportKind != "serial")
                 {
                     channel["port"] = portValue.DeepClone();
                 }
@@ -247,6 +248,33 @@ public static class ConfigMigrations
         throw new ConfigException(
             "schemaVersion must be an integer",
             new[] { new ValidationProblem("schemaVersion", "must be an integer") });
+    }
+
+    /// <summary>
+    /// 读取一个 v0 旧字段的字符串值。字段缺失返回 null；存在但类型不是字符串则报
+    /// <see cref="ConfigException"/>。
+    ///
+    /// 为什么必须显式判类型而不是直接 <c>GetValue&lt;string&gt;()</c>：后者在遇到
+    /// 数字 / 布尔 / 对象时抛的是 <see cref="InvalidOperationException"/>，而调用方
+    /// （ConfigStore.Parse / TryParse）只按 ConfigException 分类「配置非法」。裸异常会
+    /// 冒到 REST 最外层兜底 catch，把一份客户端配置错误渲染成 500——和把请求体语法
+    /// 错误冒成 500 同一类问题。旧字段写错了类型，本就等同于配置非法。
+    /// </summary>
+    private static string? ReadLegacyString(JsonObject node, string field)
+    {
+        var value = node[field];
+        if (value is null) return null;
+
+        // 只认字符串标量：数字 / 布尔 / 对象 / 数组都算形状不符。之前用
+        // GetValue<string>() 时，标量非字符串会抛裸 InvalidOperationException，
+        // 而对象 / 数组走的是另一条路（它们不是 JsonValue），若只用 is JsonValue
+        // 判类型就会把「token 写成 {...}」当成缺失而静默放过，等于半迁移。
+        if (value is JsonValue scalar && scalar.TryGetValue<string>(out var text))
+            return text;
+
+        throw new ConfigException(
+            $"'{field}' must be a string",
+            new[] { new ValidationProblem(field, "must be a string") });
     }
 
     private static (string Host, int? Port) SplitBroker(string broker)
