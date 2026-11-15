@@ -1,0 +1,11 @@
+{
+  "name": "file_record_write_2_regs",
+  "kind": "write",
+  "fileId": 2,
+  "recordId": 3,
+  "request": "0011 0000 000E 01 15 0B 06 0002 0003 0002 1122 3344",
+  "response": "0011 0000 000E 01 15 0B 06 0002 0003 0002 1122 3344",
+  "expect": [
+    { "point": "recipe", "type": "uint16", "array": [4386, 13124] }
+  ]
+}

@@ -1,0 +1,11 @@
+{
+  "name": "ascii_file_record_read_2_regs",
+  "frame": "ascii",
+  "fileId": 1,
+  "recordId": 0,
+  "request": ":01140706000100000002DB\r\n",
+  "response": ":0114060604000A000BC6\r\n",
+  "expect": [
+    { "point": "recipe", "type": "uint16", "array": [10, 11] }
+  ]
+}

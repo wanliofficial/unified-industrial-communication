@@ -24,6 +24,14 @@ internal sealed class GoldenCase
     /// <summary>寄存器区。缺省时按功能码推导。</summary>
     public string? Area { get; init; }
 
+    /// <summary>
+    /// 文件记录寻址（FC20/21）的文件号与记录号。给了这两个字段就把 `expect` 里的点位
+    /// 建成 file 寻址，而不是「区名 + 偏移」的寄存器寻址。
+    /// </summary>
+    public int? FileId { get; init; }
+
+    public int? RecordId { get; init; }
+
     /// <summary>字节序。默认 ABCD。</summary>
     public string ByteOrder { get; init; } = "abcd";
 

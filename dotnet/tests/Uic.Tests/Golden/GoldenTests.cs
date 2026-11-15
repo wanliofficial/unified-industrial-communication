@@ -54,6 +54,13 @@ internal static class GoldenTests
     {
         var requestPdu = wire.RequestPdu;
 
+        // 文件记录不是「区名 + 偏移」的窗口，不能套下面那套布局推导。
+        if (requestPdu.Length >= 9 && requestPdu[0] == ModbusConstants.FcReadFileRecord)
+        {
+            RunReadFile(t, g, wire, codec, order);
+            return;
+        }
+
         t.Ok(requestPdu.Length >= 5, "read request carries a 5-byte PDU");
         t.Ok((requestPdu[0] & 0x80) == 0, "request function code is not an exception code");
 
@@ -116,12 +123,78 @@ internal static class GoldenTests
     }
 
     // ------------------------------------------------------------------
+    // 读：文件记录（FC20）
+    // ------------------------------------------------------------------
+
+    /// <summary>
+    /// FC20 的请求自描述：功能码 + 字节数 + [参考类型 + 文件号 + 记录号 + 记录长度]。
+    /// 夹具里的 <c>fileId</c>/<c>recordId</c> 必须与帧里的一致——否则「编码对上了」
+    /// 只是恰好算出了同样的字节，点位实际指向另一条记录。
+    /// </summary>
+    private static void RunReadFile(TestContext t, GoldenCase g, Wire wire, ModbusCodec codec, ByteOrder order)
+    {
+        var requestPdu = wire.RequestPdu;
+
+        t.Equal(1, g.Expect.Length, "file fixture describes exactly one point");
+        t.Ok(g.FileId is not null && g.RecordId is not null,
+            "file fixture names its file id and record id");
+
+        var fileId = BinaryPrimitives.ReadUInt16BigEndian(requestPdu.AsSpan(3));
+        var recordId = BinaryPrimitives.ReadUInt16BigEndian(requestPdu.AsSpan(5));
+        var registers = BinaryPrimitives.ReadUInt16BigEndian(requestPdu.AsSpan(7));
+
+        t.Equal(g.FileId!.Value, (int)fileId, "fixture file id matches the request");
+        t.Equal(g.RecordId!.Value, (int)recordId, "fixture record id matches the request");
+
+        var point = FilePoint(g, order, out var length);
+        t.Equal((int)registers, length, "fixture point width matches the requested record length");
+
+        t.Equal(wire.RequestWire, wire.Render(codec.EncodeRead(new[] { point })),
+            "encoded file read matches the golden frame");
+
+        if (g.Error is not null)
+        {
+            var kind = ParseErrorKind(g.Error, g.Name);
+            var thrown = CatchDriverException(() => codec.DecodeRead(new[] { point }, wire.ResponsePdu), g.Name);
+            t.Equal(kind, thrown.Kind, "exception response maps to the expected error kind");
+            return;
+        }
+
+        var samples = codec.DecodeRead(new[] { point }, wire.ResponsePdu);
+        t.Equal(1, samples.Count, "one sample for the file point");
+        CompareSample(t, g.Expect[0], samples[0]);
+    }
+
+    /// <summary>把夹具里唯一的 expect 建成文件记录点位。</summary>
+    private static PointRef FilePoint(GoldenCase g, ByteOrder order, out int length)
+    {
+        var e = g.Expect[0];
+        var type = JsonEnum.ParseDataType(e.Type);
+        var elements = e.Array?.Length ?? 0;
+        length = Math.Max(1, e.Length ?? type.Registers() * Math.Max(1, elements));
+
+        return new PointRef(
+            e.Point,
+            Address.File(g.FileId!.Value, g.RecordId!.Value),
+            type,
+            order,
+            length,
+            elements);
+    }
+
+    // ------------------------------------------------------------------
     // 写
     // ------------------------------------------------------------------
 
     private static void RunWrite(TestContext t, GoldenCase g, Wire wire, ModbusCodec codec, ByteOrder order)
     {
         var requestPdu = wire.RequestPdu;
+
+        if (requestPdu.Length >= 9 && requestPdu[0] == ModbusConstants.FcWriteFileRecord)
+        {
+            RunWriteFile(t, g, wire, codec, order);
+            return;
+        }
 
         t.Ok(requestPdu.Length >= 5, "write request carries a 5-byte PDU");
         t.Equal(1, g.Expect.Length, "write fixture describes exactly one point");
@@ -163,6 +236,51 @@ internal static class GoldenTests
         var result = codec.DecodeWrite(command, wire.ResponsePdu);
         t.Ok(result.Ok, "write response is accepted");
         t.Equal(e.Point, result.PointId, "write result is attributed to the requested point");
+    }
+
+    // ------------------------------------------------------------------
+    // 写：文件记录（FC21）
+    // ------------------------------------------------------------------
+
+    /// <summary>
+    /// FC21 的响应把整个请求原样回显；<c>DecodeWrite</c> 逐字节比对，
+    /// 所以「回显少一截」或「回显里的数据被改过」都会当场判失败。
+    /// </summary>
+    private static void RunWriteFile(TestContext t, GoldenCase g, Wire wire, ModbusCodec codec, ByteOrder order)
+    {
+        var requestPdu = wire.RequestPdu;
+
+        t.Equal(1, g.Expect.Length, "file write fixture describes exactly one point");
+        t.Ok(g.FileId is not null && g.RecordId is not null,
+            "file write fixture names its file id and record id");
+
+        var fileId = BinaryPrimitives.ReadUInt16BigEndian(requestPdu.AsSpan(3));
+        var recordId = BinaryPrimitives.ReadUInt16BigEndian(requestPdu.AsSpan(5));
+        var registers = BinaryPrimitives.ReadUInt16BigEndian(requestPdu.AsSpan(7));
+
+        t.Equal(g.FileId!.Value, (int)fileId, "fixture file id matches the request");
+        t.Equal(g.RecordId!.Value, (int)recordId, "fixture record id matches the request");
+
+        var point = FilePoint(g, order, out var length);
+        t.Equal((int)registers, length, "fixture point width matches the written record length");
+
+        var type = JsonEnum.ParseDataType(g.Expect[0].Type);
+        var command = new WriteCommand(point, ToDataValue(g.Expect[0], type));
+
+        t.Equal(wire.RequestWire, wire.Render(codec.EncodeWrite(command)),
+            "encoded file write matches the golden frame");
+
+        if (g.Error is not null)
+        {
+            var kind = ParseErrorKind(g.Error, g.Name);
+            var thrown = CatchDriverException(() => codec.DecodeWrite(command, wire.ResponsePdu), g.Name);
+            t.Equal(kind, thrown.Kind, "exception response maps to the expected error kind");
+            return;
+        }
+
+        var result = codec.DecodeWrite(command, wire.ResponsePdu);
+        t.Ok(result.Ok, "file write response is accepted");
+        t.Equal(g.Expect[0].Point, result.PointId, "write result is attributed to the requested point");
     }
 
     // ------------------------------------------------------------------
@@ -213,14 +331,16 @@ internal static class GoldenTests
                 // 流式读取靠「功能码 + 字节数」预判长度；金报文必须能通过这条路径。
                 if (responsePdu[0] == requestPdu[0] && requestPdu.Length >= 5)
                 {
-                    var quantity = BinaryPrimitives.ReadUInt16BigEndian(requestPdu.AsSpan(3));
-                    var byteCount = requestPdu[0] is ModbusConstants.FcReadCoils or ModbusConstants.FcReadDiscreteInputs
-                        ? (quantity + 7) / 8
-                        : quantity * 2;
+                    // FC20 的字节数在响应里（第 2 字节），请求里的同位置是文件号；
+                    // FC21 的响应是整段回显，长度等于请求长度。两者都不能按「数量 × 2」算。
+                    var expected = requestPdu[0] switch
+                    {
+                        ModbusConstants.FcReadFileRecord => 5 + responsePdu[1],
+                        ModbusConstants.FcWriteFileRecord => request.Length,
+                        _ => ModbusRtuFrame.ExpectedResponseLength(requestPdu[0], ByteCountOf(requestPdu)),
+                    };
 
-                    t.Equal(response.Length,
-                        ModbusRtuFrame.ExpectedResponseLength(requestPdu[0], (byte)byteCount),
-                        "RTU response length matches the framing prediction");
+                    t.Equal(response.Length, expected, "RTU response length matches the framing prediction");
                 }
 
                 return new Wire(
@@ -253,6 +373,15 @@ internal static class GoldenTests
     // ------------------------------------------------------------------
     // 工具
     // ------------------------------------------------------------------
+
+    /// <summary>按读请求里的「数量」算响应字节数（FC1..4 专用）。</summary>
+    private static byte ByteCountOf(byte[] requestPdu)
+    {
+        var quantity = BinaryPrimitives.ReadUInt16BigEndian(requestPdu.AsSpan(3));
+        return requestPdu[0] is ModbusConstants.FcReadCoils or ModbusConstants.FcReadDiscreteInputs
+            ? (byte)((quantity + 7) / 8)
+            : (byte)(quantity * 2);
+    }
 
     private static (string Area, bool IsBits) AreaForFunction(byte function) => function switch
     {

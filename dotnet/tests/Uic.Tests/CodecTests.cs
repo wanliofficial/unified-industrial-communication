@@ -34,6 +34,9 @@ internal static class CodecTests
         tests.Add(new TestCase("codec/array_encode_rejects_wrong_element_count", ArrayEncodeRejectsWrongElementCount));
         tests.Add(new TestCase("codec/array_decode_requires_enough_bytes", ArrayDecodeRequiresEnoughBytes));
         tests.Add(new TestCase("codec/array_rejects_non_numeric_element_types", ArrayRejectsNonNumericTypes));
+        tests.Add(new TestCase("codec/file_record_read_frame_shape", FileRecordReadFrameShape));
+        tests.Add(new TestCase("codec/file_record_write_frame_shape", FileRecordWriteFrameShape));
+        tests.Add(new TestCase("codec/file_record_decode_rejects_bad_frames", FileRecordDecodeRejectsBadFrames));
     }
 
     private static Task Crc16(TestContext t)
@@ -568,6 +571,76 @@ internal static class CodecTests
         {
             t.Ok(type.SupportsArray(), $"{type} supports arrays");
         }
+
+        return Task.CompletedTask;
+    }
+
+    /// <summary>
+    /// FC20 请求帧：功能码 0x14 + 字节数 + [参考类型 06 + 文件号 + 记录号 + 记录长度]。
+    /// 记录长度是**寄存器**数（这里 2），不是字节数——写反了从站会按「4 个寄存器」回数据。
+    /// </summary>
+    private static Task FileRecordReadFrameShape(TestContext t)
+    {
+        var codec = new ModbusCodec("t");
+        var point = new PointRef("r0", Address.File(1, 0), DataType.UInt16, ByteOrder.ABCD, Length: 2, Count: 2);
+
+        var pdu = codec.EncodeRead(new[] { point });
+
+        // 14 | 07 | 06 | 0001 | 0000 | 0002
+        t.Equal("140706000100000002", Hex(pdu), "FC20 request frame");
+
+        return Task.CompletedTask;
+    }
+
+    /// <summary>
+    /// FC21 请求帧：功能码 0x15 + 字节数 + [参考类型 + 文件号 + 记录号 + 记录长度 + 数据]。
+    /// 字节数字段 = 7 字节子请求头 + 数据字节数；记录长度字段是寄存器数。
+    /// </summary>
+    private static Task FileRecordWriteFrameShape(TestContext t)
+    {
+        var codec = new ModbusCodec("t");
+        var point = new PointRef("r0", Address.File(2, 3), DataType.UInt16, ByteOrder.ABCD, Length: 2, Count: 2);
+
+        var cmd = new WriteCommand(point, DataValue.Numbers(DataType.UInt16, new double[] { 0x1122, 0x3344 }));
+        var pdu = codec.EncodeWrite(cmd);
+
+        // 15 | 0B | 06 | 0002 | 0003 | 0002 | 1122 | 3344
+        t.Equal("150B0600020003000211223344", Hex(pdu), "FC21 request frame");
+
+        return Task.CompletedTask;
+    }
+
+    /// <summary>
+    /// FC20 响应解析要拒绝几种「看起来能解」的坏帧：
+    /// 参考类型不符、数据量与请求寄存器数不符、总字节数与帧长不符。
+    /// 少给一截却「补 0 读出来」是最难查的一种——值像正常读数，位置已经错了。
+    /// </summary>
+    private static Task FileRecordDecodeRejectsBadFrames(TestContext t)
+    {
+        var codec = new ModbusCodec("t");
+        var point = new PointRef("r0", Address.File(1, 0), DataType.UInt16, ByteOrder.ABCD, Length: 2, Count: 2);
+
+        // 正常帧：14 | 06 | 06 | 04 | 0007 0008
+        var good = Convert.FromHexString("1406060400070008");
+        var samples = codec.DecodeRead(new[] { point }, good);
+        t.Equal(Quality.Good, samples[0].Quality, "a well-formed FC20 response decodes");
+        t.Equal(7d, samples[0].Value!.NumberAt(0), "first register");
+        t.Equal(8d, samples[0].Value!.NumberAt(1), "second register");
+
+        // 参考类型不是 06。
+        t.Throws<DriverException>(
+            () => codec.DecodeRead(new[] { point }, Convert.FromHexString("1406070400070008")),
+            "wrong reference type");
+
+        // 数据量 2 字节（1 个寄存器），但请求的是 2 个寄存器。
+        t.Throws<DriverException>(
+            () => codec.DecodeRead(new[] { point }, Convert.FromHexString("140406020007")),
+            "data length does not cover the requested registers");
+
+        // 总字节数声称 6，实际只给了 4。
+        t.Throws<DriverException>(
+            () => codec.DecodeRead(new[] { point }, Convert.FromHexString("14060604")),
+            "truncated FC20 frame");
 
         return Task.CompletedTask;
     }

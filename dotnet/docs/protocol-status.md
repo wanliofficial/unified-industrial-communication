@@ -63,10 +63,10 @@
 
 | 能力 | 实现情况 |
 |---|---|
-| 功能码 | FC 1/2/3/4/5/6/15/16（读线圈、读离散输入、读保持/输入寄存器、写单线圈/单寄存器、写多线圈/多寄存器） |
+| 功能码 | FC 1/2/3/4/5/6/15/16/20/21（读线圈、读离散输入、读保持/输入寄存器、写单线圈/单寄存器、写多线圈/多寄存器、读/写文件记录） |
 | 区域 | 保持寄存器、输入寄存器、线圈、离散输入 |
 | 位访问 | 支持位/字混读，按区域自动拆窗 |
-| 批量窗口 | 读寄存器 ≤125、写寄存器 ≤123、读位 ≤2000、写位 ≤1968（协议上限），相邻地址自动合并，跨空洞不合并 |
+| 批量窗口 | 读寄存器 ≤125、写寄存器 ≤123、读位 ≤2000、写位 ≤1968（协议上限），相邻地址自动合并，跨空洞不合并；文件记录单次数据 ≤244 字节（122 个寄存器），按「一点一帧」请求 |
 | 异常码 | 01/02/03/04 映射到质量码与错误文本，不把异常响应当成功 |
 | 写回显 | FC05/06/16 的响应必须与请求逐字节一致（地址、值或数量）；不一致按协议错处理，不报「写入成功」 |
 | 字节序 | ABCD / CDAB / BADC / DCBA，点位级可覆盖设备级；只影响 32/64 位数值，`string`/`bytes` 按原样字节流读写 |
@@ -84,9 +84,13 @@
 同一根 RS-485 上多台从站交替发请求时也共享这段静默；超时后同样重新计时，
 避免迟到响应撞进下一次事务。帧边界仍由长度字段/功能码与 CRC 判定。
 
-测试证据：`golden/*`（20 份 Modbus 黄金帧，含 4 份数组帧）、`codec/*`、`planner/*` 八条、
+测试证据：`golden/*`（24 份 Modbus 黄金帧，含 4 份数组帧与 4 份文件记录帧）、`codec/*`、`planner/*` 八条、
 `serial/rtu_golden_frame_over_pty`、`serial/ascii_golden_frame_over_pty`、
-`serial/half_duplex_does_not_cross_responses`、`serial/rtu_waits_between_frames`、`loopback/*`。
+`serial/half_duplex_does_not_cross_responses`、`serial/rtu_waits_between_frames`、`loopback/*`；
+文件记录的帧形状与解码拒绝坏帧见 `codec/file_record_read_frame_shape`、
+`codec/file_record_write_frame_shape`、`codec/file_record_decode_rejects_bad_frames`，
+主从回环与 RTU 链路见 `loopback/file_record_read_and_write_round_trip`、
+`loopback/missing_file_record_maps_to_address_error`、`serial/rtu_file_record_round_trip`。
 
 ### 2.2 从站（仿真）
 
@@ -95,7 +99,8 @@
 | 能力 | 实现情况 |
 |---|---|
 | 传输 | 仅 TCP（MBAP） |
-| 功能码 | 1/2/3/4/5/6/15/16，其余返回异常码 01 |
+| 功能码 | 1/2/3/4/5/6/15/16/20/21，其余返回异常码 01 |
+| 文件记录 | 文件号 → 记录号 → 寄存器数组（稀疏字典）；不存在的记录回异常码 02 而不是全 0；FC21 首次写入定型记录长度，之后只允许写前一段，超出长度回 02 |
 | 地址空间 | 保持/输入寄存器各 65536 字；线圈/离散输入初始 8192 点，按需扩容 |
 | 并发 | 单锁串行处理 PDU，避免半更新 |
 | 单元号 | 按请求回显，不做多单元路由 |
@@ -245,7 +250,21 @@ Basic128Rsa15/Aes 系列策略、结构体/ExtensionObject 类型的值、BCD �
 
 | 项 | 状态 | 说明 |
 |---|---|---|
-| object / file 寻址的驱动 | 模型已就绪，驱动未做 | 四类寻址的模型与校验已闭环（`config/four_address_kinds_validate`），symbol 由 OPC UA 与 MQTT 消费；object 要等 BACnet/CIP 的对象模型，file 要等带文件记录语义的协议 |
+| object 寻址的驱动 | 模型已就绪，驱动未做 | 四类寻址的模型与校验已闭环（`config/four_address_kinds_validate`），symbol 由 OPC UA 与 MQTT 消费、file 由 Modbus FC20/21 消费；object 要等 BACnet/CIP 的对象模型 |
+
+**file 寻址已落地**：Modbus（TCP/RTU/ASCII）实现 FC20 读文件记录与 FC21 写文件记录，
+`address.kind = "file"` 的 `fileId` / `recordId` 直接映射到帧里的「文件号 + 记录号」，
+`length`（或按数据类型推出的寄存器数）映射到「记录长度」。内置从站同步实现这两个功能码，
+主从共用同一份编解码。文件寻址没有「记录内偏移」——`Address.Offset` 必须为 0，
+非 0 会在配置校验阶段被拒绝（跳过校验直接构造 `PointRef` 时在编码阶段也会拒），
+否则读到的是「从记录头开始的一段」，值像对的、位置全错。
+记录长度以**寄存器**计，而 FC20 响应里的数据长度以**字节**计：这对字段看混就是「读回一半」。
+证据：`golden/file_record_read_2_regs`、`golden/file_record_write_2_regs`、
+`golden/rtu_file_record_read_2_regs`、`golden/ascii_file_record_read_2_regs`、
+`codec/file_record_read_frame_shape`、`codec/file_record_write_frame_shape`、
+`codec/file_record_decode_rejects_bad_frames`、`loopback/file_record_read_and_write_round_trip`、
+`loopback/missing_file_record_maps_to_address_error`、`loopback/file_offset_is_rejected`、
+`serial/rtu_file_record_round_trip`、`config/four_address_kinds_validate`。
 
 故障注入矩阵的 12 类已全部有可自动跑的用例（磁盘满、时钟跳变、进程假死用真实注入点
 补齐，见 [requirements-traceability.md](requirements-traceability.md) §7），因此不再列在此表。
@@ -279,8 +298,9 @@ Basic128Rsa15/Aes 系列策略、结构体/ExtensionObject 类型的值、BCD �
 
 以已落地的 S7 为参照，最小闭环是五步（细节见 [implementation-notes.md](implementation-notes.md)）：
 
-1. **地址表达式**：`Address` 已支持 register/symbol 两类字段，先确认目标协议的寻址能落在模型里；
-   落不进去就先改模型，不要先写驱动。S7 复用了 `register`（`area` 写 `db1`），没有新增字段。
+1. **地址表达式**：`Address` 已支持 register/symbol/object/file 四类字段，先确认目标协议的寻址能落在模型里；
+   落不进去就先改模型，不要先写驱动。S7 复用了 `register`（`area` 写 `db1`），没有新增字段；
+   Modbus 的 FC20/21 复用了 `file`（`fileId` + `recordId`），也没有新增字段。
 2. **分帧层**：把「收一条完整报文」抽成独立类型（参考 `Uic.Codec.S7/S7Frames.cs`、`Uic.Codec.Modbus/Frames.cs`），
    驱动只面对完整 PDU。
 3. **编解码 + 黄金帧**：每个功能码至少一份请求/响应黄金帧，异常码也要有；

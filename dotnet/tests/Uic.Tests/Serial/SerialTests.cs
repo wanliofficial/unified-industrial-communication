@@ -29,6 +29,7 @@ internal static class SerialTests
         tests.Add(new TestCase("serial/close_interrupts_blocked_read", CloseInterruptsBlockedRead));
         tests.Add(new TestCase("serial/half_duplex_does_not_cross_responses", HalfDuplexDoesNotCrossResponses));
         tests.Add(new TestCase("serial/rtu_waits_between_frames", RtuWaitsBetweenFrames));
+        tests.Add(new TestCase("serial/rtu_file_record_round_trip", RtuFileRecordRoundTrip));
     }
 
     private static Channel SerialChannel(PtyPair pty, string protocol, int readTimeoutMs = 300, int maxConcurrency = 1, int baud = 9600) => new()
@@ -350,6 +351,49 @@ internal static class SerialTests
             t.Ok(gap >= TimeSpan.FromMilliseconds(100),
                 $"consecutive requests are separated by 3.5 character times at 300 bps " +
                 $"(got {gap.TotalMilliseconds:F0} ms)");
+
+            t.Ok(slave.Fault is null, $"the fake slave stayed healthy: {slave.Fault}");
+        });
+    }
+
+    /// <summary>
+    /// FC20/21 走 RTU 串口：这条用例专门盯分帧层。
+    /// FC20 的响应是「功能码 + 后续字节数 + 数据」，长度由字节数决定；
+    /// 若分帧层不认识 0x14 就会按「固定 6 字节」读，把文件记录读成帧错位。
+    /// </summary>
+    private static Task RtuFileRecordRoundTrip(TestContext t)
+    {
+        return RunAsync(async () =>
+        {
+            using var pty = PtyPair.Open();
+
+            var model = new ModbusSlaveModel();
+            model.SeedFileRecord(1, 0, 111, 222, 333);
+
+            using var slave = new RtuSlave(pty, (1, model));
+            slave.Start();
+
+            var channel = SerialChannel(pty, "modbus-rtu");
+            var device = Unit("unit-1", 1);
+            await using var conn = Open(channel, device, ModbusLink.Rtu);
+
+            var point = new PointRef("recipe", Address.File(1, 0), DataType.UInt16, ByteOrder.ABCD,
+                Length: 2, Count: 2);
+
+            var samples = await conn.ReadAsync(ReadPlanner.Plan(new[] { point }), t.Ct);
+
+            t.Equal(1, samples.Count, "one sample over a real tty");
+            t.Equal(Quality.Good, samples[0].Quality,
+                $"file record read is good (error: {samples[0].Error ?? "none"})");
+            t.Equal(111d, samples[0].Value!.NumberAt(0), "first register");
+            t.Equal(222d, samples[0].Value!.NumberAt(1), "second register");
+
+            await WaitForAsync(() => slave.RequestCount >= 1, t);
+
+            // FC20 请求帧：站号 01 | 14 | 07 | 06 | 0001 | 0000 | 0002 | CRC(2)
+            var sent = Hex(slave.Requests[0]);
+            t.Equal("01140706000100000002", sent[..^4],
+                "the FC20 request on the wire has the documented shape");
 
             t.Ok(slave.Fault is null, $"the fake slave stayed healthy: {slave.Fault}");
         });

@@ -1,6 +1,7 @@
 # UIC 工业网关 · .NET 10 实现
 
-跨平台工业数据采集网关的 .NET 10 版本：南向接 Modbus（TCP / RTU / ASCII，主站与从站）、
+跨平台工业数据采集网关的 .NET 10 版本：南向接 Modbus（TCP / RTU / ASCII，主站与从站，
+寄存器与文件记录寻址）、
 S7comm（S7-300/400/1200/1500 主站）、OPC UA 客户端（None / Basic256Sha256）与
 MQTT 订阅（QoS0/1 + TLS，只读），
 中间做采集调度、数据加工与持久化队列，北向出 REST / SSE / MQTT / OPC UA 四个通道。
@@ -231,8 +232,8 @@ dotnet run --project tests/Uic.Tests -- --opcua             # 额外跑 OPC UA �
 dotnet run --project tests/Uic.Tests -- --stop-on-fail
 ```
 
-正常情况下输出 `349 passed, 0 failed, 3 skipped`（跳过的是默认不启用的 OPC UA 用例）；
-加 `-- --opcua` 是 `352 passed, 0 failed, 0 skipped`。
+正常情况下输出 `361 passed, 0 failed, 3 skipped`（跳过的是默认不启用的 OPC UA 用例）；
+加 `-- --opcua` 是 `364 passed, 0 failed, 0 skipped`。
 黄金帧测试默认从仓库的 `testdata/golden/` 读取，可用 `UIC_TESTDATA` 指向别的目录。
 
 串口用例（T15–T18）会用 libc 开一对伪终端，在 Linux 上默认执行，其它平台报 `skip`；

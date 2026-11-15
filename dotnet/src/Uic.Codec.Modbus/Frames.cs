@@ -86,9 +86,11 @@ public static class ModbusRtuFrame
         return requestFunction switch
         {
             ModbusConstants.FcReadCoils or ModbusConstants.FcReadDiscreteInputs
-                or ModbusConstants.FcReadHoldingRegs or ModbusConstants.FcReadInputRegs => 5 + byteCount,
+                or ModbusConstants.FcReadHoldingRegs or ModbusConstants.FcReadInputRegs
+                or ModbusConstants.FcReadFileRecord => 5 + byteCount,
             ModbusConstants.FcWriteSingleCoil or ModbusConstants.FcWriteSingleRegister
                 or ModbusConstants.FcWriteMultipleCoils or ModbusConstants.FcWriteMultipleRegs => 8,
+            // FC21 的响应长度等于请求长度，光靠功能码推不出来，必须由调用方提供。
             _ => 0,
         };
     }

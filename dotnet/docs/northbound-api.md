@@ -264,7 +264,7 @@ MQTT 的 TLS 是独立开关（`northbound.mqtt.tls`），语义见
       "sdkVersion": "1.0",
       "roles": ["master"],
       "transports": ["tcp"],
-      "addressKinds": ["register"],
+      "addressKinds": ["register", "file"],
       "capabilities": {
         "read": "supported",
         "write": "supported",
@@ -275,7 +275,7 @@ MQTT 的 TLS 是独立开关（`northbound.mqtt.tls`），语义见
         "bitAccess": "supported",
         "structTypes": "unsupported"
       },
-      "description": "Modbus TCP 主站：FC1/2/3/4/5/6/15/16，位访问与四种字序。"
+      "description": "Modbus TCP 主站：FC1/2/3/4/5/6/15/16/20/21，位访问、文件记录与四种字序。"
     },
     {
       "id": "s7",

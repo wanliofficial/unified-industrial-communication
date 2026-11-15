@@ -41,13 +41,13 @@ public sealed class ModbusMasterDriver : IDriver
             Version = "1.0.0",
             Roles = new[] { DriverRole.Master },
             Transports = new[] { "tcp" },
-            AddressKinds = new[] { AddressKind.Register },
+            AddressKinds = new[] { AddressKind.Register, AddressKind.File },
             Capabilities = new Capabilities(
                 Read: CapState.Supported,
                 Write: CapState.Supported,
                 MultiRead: CapState.Supported,
                 BitAccess: CapState.Supported),
-            Description = "Modbus TCP 主站：FC1/2/3/4/5/6/15/16，位访问与四种字序。",
+            Description = "Modbus TCP 主站：FC1/2/3/4/5/6/15/16/20/21，位访问、文件记录与四种字序。",
             ConfigFields = new[]
             {
                 new ConfigField("transport.host", "主机", "string", Required: true,
@@ -65,13 +65,13 @@ public sealed class ModbusMasterDriver : IDriver
             Version = "1.0.0",
             Roles = new[] { DriverRole.Master },
             Transports = new[] { "serial" },
-            AddressKinds = new[] { AddressKind.Register },
+            AddressKinds = new[] { AddressKind.Register, AddressKind.File },
             Capabilities = new Capabilities(
                 Read: CapState.Supported,
                 Write: CapState.Supported,
                 MultiRead: CapState.Supported,
                 BitAccess: CapState.Supported),
-            Description = "Modbus RTU 主站：CRC 校验、多设备共享同一串口、半双工事务串行。",
+            Description = "Modbus RTU 主站：CRC 校验、多设备共享同一串口、半双工事务串行、文件记录读写。",
             ConfigFields = new[]
             {
                 new ConfigField("transport.port", "串口", "string", Required: true,
@@ -89,13 +89,13 @@ public sealed class ModbusMasterDriver : IDriver
             Version = "1.0.0",
             Roles = new[] { DriverRole.Master },
             Transports = new[] { "serial" },
-            AddressKinds = new[] { AddressKind.Register },
+            AddressKinds = new[] { AddressKind.Register, AddressKind.File },
             Capabilities = new Capabilities(
                 Read: CapState.Supported,
                 Write: CapState.Supported,
                 MultiRead: CapState.Supported,
                 BitAccess: CapState.Supported),
-            Description = "Modbus ASCII 主站：LRC 校验、冒号/CRLF 边界、可读报文。",
+            Description = "Modbus ASCII 主站：LRC 校验、冒号/CRLF 边界、可读报文、文件记录读写。",
             ConfigFields = new[]
             {
                 new ConfigField("transport.port", "串口", "string", Required: true, Scope: "channel"),
@@ -311,8 +311,12 @@ internal sealed class RtuFraming : IModbusFraming
                 rest = new byte[3]; // 异常码 + CRC
                 await _lease.Stream.ReadExactlyAsync(rest, ct).ConfigureAwait(false);
             }
-            else if (fc is >= ModbusConstants.FcReadCoils and <= ModbusConstants.FcReadInputRegs)
+            else if (fc is >= ModbusConstants.FcReadCoils and <= ModbusConstants.FcReadInputRegs
+                     or ModbusConstants.FcReadFileRecord)
             {
+                // FC1..4 与 FC20 的响应都是「功能码 + 后续字节数 + 数据」，
+                // 字节数就是剩余长度（不含本字节与 CRC）。FC20 不单列一个分支会落到
+                // 下面的「固定 6 字节」读法，把文件记录数据读成帧错位。
                 var bc = new byte[1];
                 await _lease.Stream.ReadExactlyAsync(bc, ct).ConfigureAwait(false);
 
@@ -323,6 +327,13 @@ internal sealed class RtuFraming : IModbusFraming
                 rest = new byte[1 + bc[0] + 2];
                 rest[0] = bc[0];
                 await _lease.Stream.ReadExactlyAsync(rest.AsMemory(1), ct).ConfigureAwait(false);
+            }
+            else if (fc == ModbusConstants.FcWriteFileRecord)
+            {
+                // FC21 的响应把整个请求回显回来：帧 = 站号(1) + PDU + CRC(2)，
+                // head 已读掉站号与功能码 2 字节，剩余 pdu.Length + 1 字节。
+                rest = new byte[pdu.Length + 1];
+                await _lease.Stream.ReadExactlyAsync(rest, ct).ConfigureAwait(false);
             }
             else
             {

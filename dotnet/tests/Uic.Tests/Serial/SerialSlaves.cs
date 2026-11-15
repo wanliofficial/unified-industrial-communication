@@ -151,6 +151,17 @@ internal sealed class RtuSlave : IDisposable
                 _pty.ReadExactly(tail, FrameWait);
                 frame.AddRange(tail);
             }
+            else if (fc is ModbusConstants.FcReadFileRecord or ModbusConstants.FcWriteFileRecord)
+            {
+                // 文件记录请求自带长度：功能码后是「字节数」，再往后那么多字节 + CRC(2)。
+                var bc = new byte[1];
+                _pty.ReadExactly(bc, FrameWait);
+                frame.AddRange(bc);
+
+                var tail = new byte[bc[0] + 2];
+                _pty.ReadExactly(tail, FrameWait);
+                frame.AddRange(tail);
+            }
             else
             {
                 // 读功能码与单次写：addr(2) + qty/value(2) + CRC(2)

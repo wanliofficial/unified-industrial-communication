@@ -20,8 +20,58 @@ public sealed class ModbusSlaveModel
     private bool[] _coils = new bool[8192];
     private bool[] _discrete = new bool[8192];
 
+    /// <summary>
+    /// 文件记录区：文件号 → 记录号 → 寄存器数组。
+    /// 用嵌套字典而不是定长数组：现场文件号/记录号是稀疏的（1、4、9…），
+    /// 一次开满 65536 × N 的记录表只为几个记录付全部内存。
+    /// 记录长度按需增长，首次写入时定型——后续写入不能超出它。
+    /// </summary>
+    private readonly Dictionary<ushort, Dictionary<ushort, ushort[]>> _files = new();
+
     public bool[] Coils => _coils;
     public bool[] Discrete => _discrete;
+
+    /// <summary>文件记录内容；不存在返回 null（调用方按「非法地址」处理）。</summary>
+    public ushort[]? GetFileRecord(ushort fileId, ushort recordId)
+        => _files.TryGetValue(fileId, out var records) && records.TryGetValue(recordId, out var record)
+            ? record
+            : null;
+
+    /// <summary>
+    /// 写入文件记录。记录长度在首次写入时定型；后续写入不能超出已有长度——
+    /// 允许变长会让「读回比写进少一截」变成常态，而那正是最该被发现的数据错位。
+    /// 但**允许写记录的前一段**：现场记录长度由设备固定，一次只更新前几个寄存器是常态。
+    /// </summary>
+    public bool TryWriteFileRecord(ushort fileId, ushort recordId, ReadOnlySpan<ushort> values)
+    {
+        if (!_files.TryGetValue(fileId, out var records))
+        {
+            records = new Dictionary<ushort, ushort[]>();
+            _files[fileId] = records;
+        }
+
+        if (records.TryGetValue(recordId, out var existing))
+        {
+            if (values.Length > existing.Length) return false;
+            values.CopyTo(existing);
+            return true;
+        }
+
+        records[recordId] = values.ToArray();
+        return true;
+    }
+
+    /// <summary>预置一条文件记录（测试与演示用）。</summary>
+    public void SeedFileRecord(ushort fileId, ushort recordId, params ushort[] values)
+    {
+        if (!_files.TryGetValue(fileId, out var records))
+        {
+            records = new Dictionary<ushort, ushort[]>();
+            _files[fileId] = records;
+        }
+
+        records[recordId] = values.ToArray();
+    }
 
     public void EnsureBits(int count)
     {
@@ -92,6 +142,10 @@ public sealed class ModbusSlaveHandler
                 return WriteMultipleCoils(pdu);
             case ModbusConstants.FcWriteMultipleRegs:
                 return WriteMultipleRegisters(pdu);
+            case ModbusConstants.FcReadFileRecord:
+                return ReadFileRecord(pdu);
+            case ModbusConstants.FcWriteFileRecord:
+                return WriteFileRecord(pdu);
             default:
                 return Exception(fc, 0x01);
         }
@@ -226,6 +280,96 @@ public sealed class ModbusSlaveHandler
         }
 
         return pdu[..5].ToArray();
+    }
+
+    /// <summary>
+    /// FC20 读文件记录。请求：功能码 + 字节数 + 子请求[参考类型 + 文件号 + 记录号 + 记录长度]。
+    ///
+    /// 不存在的文件/记录回 exception 02（非法数据地址）而不是「全 0」：
+    /// 返回 0 会让主站把「没这个记录」读成「记录全是 0」，运维看到的是合法读数。
+    /// </summary>
+    private byte[] ReadFileRecord(ReadOnlySpan<byte> pdu)
+    {
+        if (pdu.Length < 8) return Exception(pdu[0], 0x03);
+
+        var byteCount = pdu[1];
+        if (byteCount < 7 || pdu.Length < 2 + byteCount) return Exception(pdu[0], 0x03);
+
+        if (pdu[2] != ModbusConstants.FileReferenceType) return Exception(pdu[0], 0x03);
+
+        var fileId = BinaryPrimitives.ReadUInt16BigEndian(pdu.Slice(3, 2));
+        var recordId = BinaryPrimitives.ReadUInt16BigEndian(pdu.Slice(5, 2));
+        var registers = BinaryPrimitives.ReadUInt16BigEndian(pdu.Slice(7, 2));
+
+        if (registers == 0 || registers * 2 > ModbusConstants.MaxFileRecordData)
+            return Exception(pdu[0], 0x03);
+
+        lock (_lock)
+        {
+            var record = _model.GetFileRecord(fileId, recordId);
+            if (record is null) return Exception(pdu[0], 0x02);
+
+            // 记录长度不足：请求要的比记录实际拥有的多，按非法地址拒绝。
+            if (registers > record.Length) return Exception(pdu[0], 0x02);
+
+            // 响应：功能码 + 总字节数 + 参考类型 + 数据字节数 + 数据
+            var dataBytes = registers * 2;
+            var resp = new byte[4 + dataBytes];
+            resp[0] = pdu[0];
+            resp[1] = (byte)(2 + dataBytes);
+            resp[2] = ModbusConstants.FileReferenceType;
+            resp[3] = (byte)dataBytes;
+
+            for (var i = 0; i < registers; i++)
+            {
+                BinaryPrimitives.WriteUInt16BigEndian(resp.AsSpan(4 + i * 2, 2), record[i]);
+            }
+
+            return resp;
+        }
+    }
+
+    /// <summary>
+    /// FC21 写文件记录。请求结构与 FC20 相同，只是多带数据：
+    /// 功能码 + 字节数 + 子请求[参考类型 + 文件号 + 记录号 + 记录长度 + 数据]。
+    ///
+    /// 记录不存在时**新建**（长度由本次写入定型）：要求现场先「声明记录长度」
+    /// 才能写，等于多一步无处可配的初始化，很多设备本身就是首次写入即建立。
+    /// 已存在的记录只允许写前一段，超出已有长度则拒绝，避免静默改长度导致回读错位。
+    /// </summary>
+    private byte[] WriteFileRecord(ReadOnlySpan<byte> pdu)
+    {
+        if (pdu.Length < 10) return Exception(pdu[0], 0x03);
+
+        var byteCount = pdu[1];
+        if (byteCount < 7 || pdu.Length < 2 + byteCount) return Exception(pdu[0], 0x03);
+
+        if (pdu[2] != ModbusConstants.FileReferenceType) return Exception(pdu[0], 0x03);
+
+        var fileId = BinaryPrimitives.ReadUInt16BigEndian(pdu.Slice(3, 2));
+        var recordId = BinaryPrimitives.ReadUInt16BigEndian(pdu.Slice(5, 2));
+        var registers = BinaryPrimitives.ReadUInt16BigEndian(pdu.Slice(7, 2));
+
+        if (registers == 0 || registers * 2 > ModbusConstants.MaxFileRecordData)
+            return Exception(pdu[0], 0x03);
+
+        // 字节数字段必须与「子请求头 + 数据」自洽：多了少了都说明帧异常。
+        if (byteCount != 7 + registers * 2) return Exception(pdu[0], 0x03);
+
+        var values = new ushort[registers];
+        for (var i = 0; i < registers; i++)
+        {
+            values[i] = BinaryPrimitives.ReadUInt16BigEndian(pdu.Slice(9 + i * 2, 2));
+        }
+
+        lock (_lock)
+        {
+            if (!_model.TryWriteFileRecord(fileId, recordId, values))
+                return Exception(pdu[0], 0x02);
+        }
+
+        // FC21 响应回显整个请求（与原请求逐字节一致）。
+        return pdu[..(2 + byteCount)].ToArray();
     }
 
     private static byte[] Exception(byte fc, byte code) => new[] { (byte)(fc | 0x80), code };

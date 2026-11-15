@@ -1,0 +1,11 @@
+{
+  "name": "rtu_file_record_read_2_regs",
+  "frame": "rtu",
+  "fileId": 1,
+  "recordId": 0,
+  "request": "011407060001000000024525",
+  "response": "0114060604000A000BF1FC",
+  "expect": [
+    { "point": "recipe", "type": "uint16", "array": [10, 11] }
+  ]
+}

@@ -1,0 +1,10 @@
+{
+  "name": "file_record_read_2_regs",
+  "fileId": 1,
+  "recordId": 0,
+  "request": "0001 0000 000A 01 14 07 06 0001 0000 0002",
+  "response": "0001 0000 0009 01 14 06 06 04 000A 000B",
+  "expect": [
+    { "point": "recipe", "type": "uint16", "array": [10, 11] }
+  ]
+}

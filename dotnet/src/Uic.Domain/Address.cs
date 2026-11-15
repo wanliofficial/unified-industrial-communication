@@ -96,9 +96,12 @@ public sealed record Address
                 break;
 
             case AddressKind.File:
-                if (FileId < 0) Add($"{path}.fileId", "must be >= 0");
-                if (RecordId < 0) Add($"{path}.recordId", "must be >= 0");
+                if (FileId is < 0 or > 0xFFFF) Add($"{path}.fileId", "must be 0..65535");
+                if (RecordId is < 0 or > 0xFFFF) Add($"{path}.recordId", "must be 0..65535");
                 if (!string.IsNullOrEmpty(Area)) Add($"{path}.area", "not allowed for file addressing");
+                // 文件记录寻址没有「记录内偏移」：帧里的引用就是「文件号 + 记录号 + 记录长度」。
+                // 放行非 0 的 offset 会让运行期每轮静默报 address_error，配置阶段就该拒绝。
+                if (Offset != 0) Add($"{path}.offset", "must be 0 for file addressing; use recordId to move");
                 break;
 
             default:

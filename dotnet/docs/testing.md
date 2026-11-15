@@ -16,13 +16,13 @@ dotnet run --project tests/Uic.Tests -- --stop-on-fail      # 首个失败即停
 正常输出：
 
 ```
-349 passed, 0 failed, 3 skipped · 5729.1s
+361 passed, 0 failed, 3 skipped · 220.6s
 ```
 
 加 `--opcua` 跑全量（含 3 条需外部 OPC UA 环境的端到端）：
 
 ```
-352 passed, 0 failed, 0 skipped · 477.8s
+364 passed, 0 failed, 0 skipped · 289.1s
 ```
 
 耗时随机器负载波动较大：219 条时在同一台机器上空载量到 65.5 s，233 条在同时跑着
@@ -40,11 +40,11 @@ dotnet run --project tests/Uic.Tests -- --stop-on-fail      # 首个失败即停
 `load average` 3.9 时量到 163.9 s / 191.3 s，同一批在 `load average` 6.0 时量到 1654.7 s / 1981.1 s；
 331/334 条在 `load average` 5.7–8.3 时量到 429.1 s / 428.5 s；332/335 条在 `load average` 5.7–13.8 时量到
 3023.4 s / 759.3 s（那次机器另有别的负载，单条契约用例仍在 90 s 以内——差别是排队）；
-334/337 条在 `load average` 5.5–16 时量到 2206.7 s / 1540.9 s。
+334/337 条在 `load average` 5.5–16 时量到 2206.7 s / 1540.9 s；357/360 条在 `load average` 6 时量到 156.5 s / 170.3 s；361/364 条（补了 4 份文件记录黄金帧）在 `load average` 20–26 时量到 220.6 s / 289.1 s。
 347/350 条在 `load average` 5–7.5（另有数天未退的高 CPU 后台进程）时，全量 5729.1 s、
 其中 15 条 `contract/*` 触到 180 s 硬超时；单独复跑这 43 条契约用例全部通过（790.1 s，
 最慢的 `contract/tls_rest_serves_https` 单条 110 s，是宿主启动 + TLS 握手在排队，不是用例退化），
-`--opcua` 变体在同一份代码上 352 passed / 0 failed。
+`--opcua` 变体在同一份代码上 350 passed / 0 failed。
 （同一份代码，差别只在排队）。
 负载高时单条用例可能触到 180 s 的硬超时，先把机器腾空再判红。
 NFR 的门槛是 120 s，压测用例、PBKDF2 派生与 TLS 握手是主要开销——**这个门槛只在空载机器上有意义**，
@@ -71,7 +71,7 @@ NFR 的门槛是 120 s，压测用例、PBKDF2 派生与 TLS 握手是主要开�
 
 | 分组 | 数量 | 覆盖 |
 |---|---|---|
-| `golden/*` | 20 | 字节级：请求与响应完全匹配（T14），含 4 份数组黄金帧（float32 数组、uint16 数组、批量写数组、逐元素字节序） |
+| `golden/*` | 24 | 字节级：请求与响应完全匹配（T14），含 4 份数组黄金帧（float32 数组、uint16 数组、批量写数组、逐元素字节序）与 4 份文件记录帧（FC20 TCP/RTU/ASCII、FC21 TCP） |
 | `codec/*` | 21 | 校验和、字节序（含「字符串/字节流不参与重排」）、BCD、时间值、窗口、异常码、分帧容错、数组逐元素字节序与元素个数校验、**写入值越界/超长文本直接拒绝**（不静默取模或截断）、写响应回显逐字节校验 |
 | `pipeline/*` | 13 | 缩放/偏移、整数取整、质量传播、三种死区模式、数组逐元素缩放与「取最大变化」死区、**变化率死区的 Δt 用单调时钟**（校时跳变不伪造也不抹平尖峰） |
 | `cache/*` | 5 | 序号单调、只在变化时通知、按点位死区判定、移除设备、订阅者故障隔离 |
@@ -143,7 +143,7 @@ NFR 的门槛是 120 s，压测用例、PBKDF2 派生与 TLS 握手是主要开�
 | T11 | 并发保护 | `engine/conn_is_never_called_concurrently` | 用会计数的假驱动，读写都不许重叠 |
 | T12 | 半包响应 | `loopback/fragmented_response_is_reassembled`、`codec/framing_rejects_corruption` | 响应分三片、带间隔到达 |
 | T13 | 异常码映射 | `codec/exception_codes_map_to_kinds` | 01/02/03/04/06/11 全覆盖 |
-| T14 | 金报文 | `golden/*`（20 份） | TCP / RTU / ASCII 三种封装 |
+| T14 | 金报文 | `golden/*`（24 份） | TCP / RTU / ASCII 三种封装 |
 | T15 | 半双工并发 | `serial/half_duplex_does_not_cross_responses` | 两台从站共用一条 pty：值不许串，响应未发出前总线上不许出现新请求 |
 | T16 | 沉默从站 | `loopback/silent_slave_times_out`、`serial/silent_slave_times_out` | TCP 与串口各一条，都是 300 ms 超时且不挂死 |
 | T17 | 串口 deadline | `serial/read_returns_near_deadline` | 返回时间落在 deadline 附近，既不是瞬间返回也不是 N 倍 |
@@ -187,6 +187,25 @@ posix_openpt → grantpt → unlockpt → ptsname
 }
 ```
 
+文件记录（FC20/21）用 `fileId` + `recordId` 代替「区名 + 偏移」，加载器据此把 `expect`
+建成 file 寻址点位：
+
+```json
+{
+  "name": "file_record_read_2_regs",
+  "fileId": 1,
+  "recordId": 0,
+  "request": "0001 0000 000A 01 14 07 06 0001 0000 0002",
+  "response": "0001 0000 0009 01 14 06 06 04 000A 000B",
+  "expect": [
+    { "point": "recipe", "type": "uint16", "array": [10, 11] }
+  ]
+}
+```
+
+请求里的 `0002` 是**寄存器数**，响应里的 `04` 是**字节数**——这对字段是 FC20 最容易写错的地方，
+所以黄金帧里把它钉死。
+
 | 字段 | 必需 | 说明 |
 |---|---|---|
 | `name` | 是 | 用例名，也是文件名 |
@@ -196,6 +215,7 @@ posix_openpt → grantpt → unlockpt → ptsname
 | `frame` | 否 | `tcp`（默认）/ `rtu` / `ascii` |
 | `area` | 否 | 写入用例的寄存器区 |
 | `byteOrder` | 否 | 默认 `abcd` |
+| `fileId` / `recordId` | 否 | 文件记录寻址（FC20/21）；给了这两个字段就把 `expect` 里的点位建成 file 寻址 |
 | `error` | 否 | 期望抛出的错误分类：`timeout`/`connection`/`protocol`/`address`/`permission`/`unsupported` |
 | `expect[].offset` | 否 | 绝对地址偏移；缺省按前一个点位的宽度顺延 |
 | `expect[].length` | 否 | `string`/`bytes` 的寄存器数 |
@@ -206,7 +226,7 @@ posix_openpt → grantpt → unlockpt → ptsname
 测试会做三件事：编码出请求字节并与 `request` 逐字节比较、解码 `response` 并与 `expect` 比较、
 再验证解码结果的类型与质量码。
 
-### 现有 20 份
+### 现有 24 份
 
 | 文件 | 覆盖 |
 |---|---|
@@ -230,6 +250,10 @@ posix_openpt → grantpt → unlockpt → ptsname
 | `write_exception_illegal_value` | 写异常 `0x86 0x03` → `protocol` |
 | `rtu_read_holding_2_regs` | RTU 封装 + CRC |
 | `ascii_read_holding_2_regs` | ASCII 封装 + LRC |
+| `file_record_read_2_regs` | FC20 读文件记录：请求里的「记录长度」是寄存器数，响应里的「数据长度」是字节数 |
+| `file_record_write_2_regs` | FC21 写文件记录：响应整段回显请求（含数据），逐字节比对 |
+| `rtu_file_record_read_2_regs` | FC20 走 RTU：分帧按响应里的字节数推长度，不落「固定 6 字节」 |
+| `ascii_file_record_read_2_regs` | FC20 走 ASCII：LRC 覆盖整个 PDU |
 
 ## 契约测试怎么起服务
 

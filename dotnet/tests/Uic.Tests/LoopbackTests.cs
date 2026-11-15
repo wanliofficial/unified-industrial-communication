@@ -37,6 +37,9 @@ internal static class LoopbackTests
         tests.Add(new TestCase("loopback/probe_times_out", ProbeTimesOut));
         tests.Add(new TestCase("loopback/empty_batch_is_a_no_op", EmptyBatchIsANoOp));
         tests.Add(new TestCase("loopback/fragmented_response_is_reassembled", FragmentedResponseIsReassembled));
+        tests.Add(new TestCase("loopback/file_record_read_and_write_round_trip", FileRecordRoundTrip));
+        tests.Add(new TestCase("loopback/missing_file_record_maps_to_address_error", MissingFileRecordMapsToAddressError));
+        tests.Add(new TestCase("loopback/file_offset_is_rejected", FileOffsetIsRejected));
     }
 
     private static (Channel Channel, Device Device) Setup(int port) => (
@@ -489,5 +492,108 @@ internal static class LoopbackTests
         });
     }
 
+    private static PointRef FileU16(string id, int fileId, int recordId, int registers = 1) =>
+        new(id, Address.File(fileId, recordId), DataType.UInt16, ByteOrder.ABCD,
+            Length: registers, Count: registers > 1 ? registers : 0);
+
+    /// <summary>
+    /// FC20/21 走完整主从回环：写进文件记录、当场从从站模型核对、再读回来。
+    /// 用内置从站而不是假字节流，才会真的经过 FC21 请求编码、从站记录写入、
+    /// FC20 响应解析这条真实路径。
+    /// </summary>
+    private static Task FileRecordRoundTrip(TestContext t)
+    {
+        return RunAsync(async () =>
+        {
+            var model = new ModbusSlaveModel();
+            model.SeedFileRecord(1, 0, 100, 200, 300);
+
+            await using var server = await StartSlaveAsync(t, model);
+            var (channel, device) = Setup(server.Port);
+
+            // 一条文件记录 3 个寄存器；点位读前 2 个。
+            var point = FileU16("recipe-a", 1, 0, registers: 2);
+
+            await using var conn = Open(channel, device);
+
+            // 先读：从站模型里预置的是 100/200。
+            var read = await conn.ReadAsync(ReadPlanner.Plan(new[] { point }), t.Ct);
+            t.Equal(1, read.Count, "one sample for a file point");
+            t.Equal(Quality.Good, read[0].Quality, "file read quality");
+            t.Equal(100d, read[0].Value!.NumberAt(0), "first register of the record");
+            t.Equal(200d, read[0].Value!.NumberAt(1), "second register of the record");
+
+            // 再写：整条记录前 2 个寄存器改成 7/8。
+            var write = await conn.WriteAsync(new[]
+            {
+                new WriteCommand(point, DataValue.Numbers(DataType.UInt16, new[] { 7d, 8d })),
+            }, t.Ct);
+
+            t.Equal(1, write.Count, "one write result");
+            t.Ok(write[0].Ok, $"file write is accepted: {write[0].Error}");
+            t.Equal(Quality.Good, write[0].Quality, "file write quality");
+            t.Equal((ushort)7, model.GetFileRecord(1, 0)![0], "the slave record holds the new first register");
+            t.Equal((ushort)8, model.GetFileRecord(1, 0)![1], "the slave record holds the new second register");
+            t.Equal((ushort)300, model.GetFileRecord(1, 0)![2], "the untouched third register is preserved");
+
+            // 写后回读必须一致。
+            var again = await conn.ReadAsync(ReadPlanner.Plan(new[] { point }), t.Ct);
+            t.Equal(7d, again[0].Value!.NumberAt(0), "read-back matches what was written");
+            t.Equal(8d, again[0].Value!.NumberAt(1), "read-back matches what was written");
+        });
+    }
+
+    /// <summary>
+    /// 不存在的文件/记录必须折成 address_error，而不是「读回一串 0」：
+    /// 0 是一个合法读数，运维会把「没有这个记录」当成「记录被清零」。
+    /// </summary>
+    private static Task MissingFileRecordMapsToAddressError(TestContext t)
+    {
+        return RunAsync(async () =>
+        {
+            var model = new ModbusSlaveModel();
+            await using var server = await StartSlaveAsync(t, model);
+            var (channel, device) = Setup(server.Port);
+
+            var point = FileU16("ghost", 9, 9);
+
+            await using var conn = Open(channel, device);
+            var samples = await conn.ReadAsync(ReadPlanner.Plan(new[] { point }), t.Ct);
+
+            t.Equal(1, samples.Count, "the failing point still yields a sample");
+            t.Equal(Quality.AddressError, samples[0].Quality, "a missing record maps to address_error");
+            t.Ok(samples[0].Value is null, "a bad sample carries no value");
+        });
+    }
+
+    /// <summary>
+    /// 文件寻址没有「记录内偏移」：FC20/21 的引用是「文件号 + 记录号 + 记录长度」。
+    /// 配了非 0 的 offset 却静默忽略，读到的是「从记录头开始的一段」——值像对的、位置全错。
+    /// </summary>
+    private static Task FileOffsetIsRejected(TestContext t)
+    {
+        return RunAsync(async () =>
+        {
+            var model = new ModbusSlaveModel();
+            model.SeedFileRecord(1, 0, 11, 22, 33);
+
+            await using var server = await StartSlaveAsync(t, model);
+            var (channel, device) = Setup(server.Port);
+
+            var point = new PointRef("shifted", Address.File(1, 0, offset: 1),
+                DataType.UInt16, ByteOrder.ABCD, 1);
+
+            await using var conn = Open(channel, device);
+            var samples = await conn.ReadAsync(ReadPlanner.Plan(new[] { point }), t.Ct);
+
+            t.Equal(1, samples.Count, "the rejected point still yields a sample");
+            t.Ok(samples[0].Value is null, "no value is produced for a rejected offset");
+            t.Equal(Quality.AddressError, samples[0].Quality, "a non-zero file offset is an address error");
+            t.Contains(samples[0].Error ?? string.Empty, "record-internal offset",
+                "the reason explains that file addressing has no offset");
+        });
+    }
+
     private static Task RunAsync(Func<Task> body) => body();
+
 }

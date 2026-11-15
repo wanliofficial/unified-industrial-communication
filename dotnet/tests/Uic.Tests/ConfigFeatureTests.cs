@@ -801,6 +801,15 @@ internal static class ConfigFeatureTests
         ExpectRejected("""{ "kind": "file", "fileId": 1, "recordId": 2, "area": "db1" }""",
             "address.area", "an area on a file address is rejected");
 
+        // 文件记录没有记录内偏移：配了非 0 的 offset 会在运行期每轮报 address_error，
+        // 不如在配置阶段就说清楚「要移位置用 recordId」。
+        ExpectRejected("""{ "kind": "file", "fileId": 1, "recordId": 2, "offset": 3 }""",
+            "address.offset", "a record-internal offset on a file address is rejected");
+        ExpectRejected("""{ "kind": "file", "fileId": 70000, "recordId": 0 }""",
+            "address.fileId", "a file id beyond the 16-bit wire field is rejected");
+        ExpectRejected("""{ "kind": "file", "fileId": 1, "recordId": 70000 }""",
+            "address.recordId", "a record id beyond the 16-bit wire field is rejected");
+
         return Task.CompletedTask;
     }
 

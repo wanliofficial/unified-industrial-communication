@@ -15,6 +15,15 @@ public static class ModbusConstants
     public const byte FcWriteSingleRegister = 0x06;
     public const byte FcWriteMultipleCoils = 0x0F;
     public const byte FcWriteMultipleRegs = 0x10;
+    public const byte FcReadFileRecord = 0x14;
+    public const byte FcWriteFileRecord = 0x15;
+
+    /// <summary>
+    /// 文件记录的参考类型。规范只定义了 6（"06" = 文件记录引用），
+    /// 请求/响应里这一字节必须原样回显；其它值是厂商扩展，不认就直接拒绝，
+    /// 免得把别的结构当成寄存器数据解出来。
+    /// </summary>
+    public const byte FileReferenceType = 0x06;
 
     /// <summary>单次请求上限（协议规定）。</summary>
     public const int MaxReadRegisters = 125;
@@ -23,6 +32,12 @@ public static class ModbusConstants
     public const int MaxReadBits = 2000;
     public const int MaxWriteBits = 1968;
     public const int MaxAdu = 260;
+
+    /// <summary>
+    /// FC20/21 单个子请求的数据上限（字节）。PDU 上限 253 减去功能码、字节数字段
+    /// 与一个 7 字节子请求头（参考类型 1 + 文件号 2 + 记录号 2 + 记录长度 2）。
+    /// </summary>
+    public const int MaxFileRecordData = 244;
 
     /// <summary>标准 Modbus CRC16。多项式 0xA001，初值 0xFFFF，线上小端。</summary>
     public static ushort Crc16(ReadOnlySpan<byte> data)
@@ -124,8 +139,19 @@ public sealed class ModbusCodec
 
     private static int LengthOf(PointRef p, bool isBits) => isBits ? 1 : Math.Max(1, p.Length);
 
+    /// <summary>
+    /// 读窗口是否落在文件记录上。文件记录点不能和寄存器点合进一个 span：
+    /// FC20 的子请求头是「文件号 + 记录号 + 记录长度」，与寄存器的「起始 + 数量」不是一回事，
+    /// 混在一起会生成一个两种语义都错的帧。
+    /// </summary>
+    public static bool IsFileSpan(ReadOnlySpan<PointRef> points)
+        => points.Length > 0 && points[0].Address.Kind == AddressKind.File;
+
     public byte[] EncodeRead(IReadOnlyList<PointRef> points)
     {
+        if (IsFileSpan(points.ToArray()))
+            return EncodeReadFile(points);
+
         var window = Window(points.ToArray());
         var (fc, _, _) = ModbusConstants.FunctionForArea(window.Area);
 
@@ -136,9 +162,134 @@ public sealed class ModbusCodec
         return pdu;
     }
 
+    /// <summary>
+    /// FC20 读文件记录。一个 span 只有一个文件点（读规划器对非寄存器寻址
+    /// 按「一点一 span」处理），因此只生成一个子请求：
+    /// 功能码 + 字节数 + [参考类型 + 文件号 + 记录号 + 记录长度]。
+    ///
+    /// 记录长度以**寄存器**为单位，与 <see cref="PointRef.Length"/> 一致——
+    /// 用「字节」会在 string/bytes 点位上差一倍，而帧里这个字段本身就是寄存器数。
+    /// </summary>
+    private byte[] EncodeReadFile(IReadOnlyList<PointRef> points)
+    {
+        var p = points[0];
+        RejectFileOffset(p);
+        var fileId = FileIdOf(p);
+        var recordId = RecordIdOf(p);
+        var registers = Math.Max(1, p.Length);
+
+        if (registers * 2 > ModbusConstants.MaxFileRecordData)
+            throw DriverException.Unsupported("modbus", "encode",
+                $"'{p.Id}' needs {registers * 2} data byte(s), the file-record limit is {ModbusConstants.MaxFileRecordData}");
+
+        // 子请求：参考类型(1) + 文件号(2) + 记录号(2) + 记录长度(2) = 7 字节
+        const int sub = 7;
+        var pdu = new byte[2 + sub];
+        pdu[0] = ModbusConstants.FcReadFileRecord;
+        pdu[1] = sub;                              // 后续字节数
+        pdu[2] = ModbusConstants.FileReferenceType;
+        BinaryPrimitives.WriteUInt16BigEndian(pdu.AsSpan(3, 2), (ushort)fileId);
+        BinaryPrimitives.WriteUInt16BigEndian(pdu.AsSpan(5, 2), (ushort)recordId);
+        BinaryPrimitives.WriteUInt16BigEndian(pdu.AsSpan(7, 2), (ushort)registers);
+        return pdu;
+    }
+
+    private static ushort FileIdOf(PointRef p) => (ushort)CheckFileField(p, p.Address.FileId, "fileId");
+    private static ushort RecordIdOf(PointRef p) => (ushort)CheckFileField(p, p.Address.RecordId, "recordId");
+
+    private static int CheckFileField(PointRef p, int value, string field)
+    {
+        if (value is < 0 or > 0xFFFF)
+            throw DriverException.Address("modbus", "encode",
+                $"'{p.Id}' {field} {value} is out of range 0..65535");
+        return value;
+    }
+
+    /// <summary>
+    /// 文件记录没有「记录内偏移」这个概念：FC20/21 的引用是
+    /// 文件号 + 记录号 + 记录长度，一次读/写的就是记录的前 N 个寄存器。
+    /// 配置里填了非 0 的 offset 却静默忽略，读回来的会是「从记录头开始的一段」，
+    /// 看着有值、位置却是错的——必须在编码阶段拒绝。
+    /// </summary>
+    private static void RejectFileOffset(PointRef p)
+    {
+        if (p.Address.Offset != 0)
+            throw DriverException.Address("modbus", "encode",
+                $"'{p.Id}' file addressing has no record-internal offset; use recordId to move, not offset {p.Address.Offset}");
+    }
+
+    /// <summary>
+    /// FC20 响应：功能码 + 总字节数 + 每个子响应 [参考类型 + 数据长度 + 数据]。
+    /// 注意响应里的「数据长度」是**字节数**，而请求里的最后一个字段是**寄存器数**——
+    /// 这两个字段容易看混，混了就是「读回一半的数据」或「多读一截下一个记录」。
+    /// </summary>
+    private IReadOnlyList<RawSample> DecodeReadFile(IReadOnlyList<PointRef> points, ReadOnlySpan<byte> response)
+    {
+        var p = points[0];
+
+        if (response.Length == 0)
+            throw DriverException.ProtocolError("modbus", "decode", "empty response");
+
+        if ((response[0] & 0x80) != 0)
+            throw ExceptionError(response, "read");
+
+        if (response[0] != ModbusConstants.FcReadFileRecord)
+            throw DriverException.ProtocolError("modbus", "decode",
+                $"function echo 0x{response[0]:x2}, want 0x{ModbusConstants.FcReadFileRecord:x2}");
+
+        if (response.Length < 2)
+            throw DriverException.ProtocolError("modbus", "decode", "missing byte count");
+
+        var total = response[1];
+
+        // 总字节数必须与帧长自洽：多一个少一个都说明帧边界错了，不能"按需截取"。
+        if (response.Length < 2 + total)
+            throw DriverException.ProtocolError("modbus", "decode",
+                $"truncated payload: have {response.Length - 2}, need {total}");
+
+        // 单个子响应：参考类型(1) + 数据长度(1) + 数据(n)
+        if (total < 2)
+            throw DriverException.ProtocolError("modbus", "decode",
+                $"file record response carries only {total} byte(s)");
+
+        var reference = response[2];
+        if (reference != ModbusConstants.FileReferenceType)
+            throw DriverException.ProtocolError("modbus", "decode",
+                $"unsupported file reference type 0x{reference:x2}, want 0x{ModbusConstants.FileReferenceType:x2}");
+
+        var dataBytes = response[3];
+
+        if (dataBytes > total - 2)
+            throw DriverException.ProtocolError("modbus", "decode",
+                $"file record claims {dataBytes} data byte(s), only {total - 2} available");
+
+        // 请求的寄存器数与响应回来的数据量必须严格一致：设备少给一截时
+        // 「读出一半、其余补 0」看起来像正常值，比直接失败难查得多。
+        var expected = Math.Max(1, p.Length) * 2;
+        if (dataBytes != expected)
+            throw DriverException.ProtocolError("modbus", "decode",
+                $"file record returned {dataBytes} byte(s), the point expects {expected}");
+
+        var data = response.Slice(4, dataBytes);
+
+        try
+        {
+            var v = ValueCodec.Decode(data, p.DataType, p.ByteOrder, p.Elements);
+            return new[] { new RawSample(p.Id, v, Quality.Good, null) };
+        }
+        catch (Exception ex)
+        {
+            return new[] { Bad(p.Id, Quality.Bad, ex.Message) };
+        }
+    }
+
     public IReadOnlyList<RawSample> DecodeRead(IReadOnlyList<PointRef> points, ReadOnlySpan<byte> response)
     {
         var arr = points.ToArray();
+
+        if (IsFileSpan(arr))
+            return DecodeReadFile(arr, response);
+
         var window = Window(arr);
         var (fc, _, _) = ModbusConstants.FunctionForArea(window.Area);
 
@@ -222,6 +373,10 @@ public sealed class ModbusCodec
     public byte[] EncodeWrite(WriteCommand cmd)
     {
         var p = cmd.Point;
+
+        if (p.Address.Kind == AddressKind.File)
+            return EncodeWriteFile(cmd);
+
         if (p.Address.Kind != AddressKind.Register)
             throw DriverException.Unsupported("modbus", "encode", "only register addresses are writable");
         if (p.Address.Offset is < 0 or > 0xFFFF)
@@ -273,6 +428,43 @@ public sealed class ModbusCodec
         return multi;
     }
 
+    /// <summary>
+    /// FC21 写文件记录。请求与 FC20 的自描述结构一致，只是多了要写的数据：
+    /// 功能码 + 字节数 + [参考类型 + 文件号 + 记录号 + 记录长度 + 数据]。
+    ///
+    /// 记录长度字段写的是**寄存器数**，数据长度靠「字节数字段 - 7」推出，
+    /// 两者必须自洽（设备按记录长度校验数据量，对不上会回 exception 03）。
+    /// </summary>
+    private byte[] EncodeWriteFile(WriteCommand cmd)
+    {
+        var p = cmd.Point;
+        RejectFileOffset(p);
+
+        var fileId = FileIdOf(p);
+        var recordId = RecordIdOf(p);
+
+        var data = ValueCodec.Encode(cmd.Value, p.DataType, p.ByteOrder, Math.Max(1, p.Length));
+
+        if (data.Length % 2 != 0)
+            throw DriverException.ProtocolError("modbus", "encode",
+                $"'{p.Id}' encodes to {data.Length} byte(s); a file record holds whole registers");
+
+        if (data.Length > ModbusConstants.MaxFileRecordData)
+            throw DriverException.Unsupported("modbus", "encode",
+                $"'{p.Id}' needs {data.Length} data byte(s), the file-record limit is {ModbusConstants.MaxFileRecordData}");
+
+        const int header = 7; // 参考类型(1) + 文件号(2) + 记录号(2) + 记录长度(2)
+        var pdu = new byte[2 + header + data.Length];
+        pdu[0] = ModbusConstants.FcWriteFileRecord;
+        pdu[1] = (byte)(header + data.Length);        // 后续字节数
+        pdu[2] = ModbusConstants.FileReferenceType;
+        BinaryPrimitives.WriteUInt16BigEndian(pdu.AsSpan(3, 2), (ushort)fileId);
+        BinaryPrimitives.WriteUInt16BigEndian(pdu.AsSpan(5, 2), (ushort)recordId);
+        BinaryPrimitives.WriteUInt16BigEndian(pdu.AsSpan(7, 2), (ushort)(data.Length / 2));
+        data.CopyTo(pdu.AsSpan(9));
+        return pdu;
+    }
+
     public WriteResult DecodeWrite(WriteCommand cmd, ReadOnlySpan<byte> response)
     {
         if (response.Length == 0)
@@ -281,9 +473,11 @@ public sealed class ModbusCodec
         if ((response[0] & 0x80) != 0)
             throw ExceptionError(response, "write");
 
-        var expected = cmd.Point.DataType == DataType.Bool
-            ? ModbusConstants.FcWriteSingleCoil
-            : cmd.Point.Length <= 1 ? ModbusConstants.FcWriteSingleRegister : ModbusConstants.FcWriteMultipleRegs;
+        var expected = cmd.Point.Address.Kind == AddressKind.File
+            ? ModbusConstants.FcWriteFileRecord
+            : cmd.Point.DataType == DataType.Bool
+                ? ModbusConstants.FcWriteSingleCoil
+                : cmd.Point.Length <= 1 ? ModbusConstants.FcWriteSingleRegister : ModbusConstants.FcWriteMultipleRegs;
 
         if (response[0] != expected)
             throw DriverException.ProtocolError("modbus", "decode-write",
@@ -292,14 +486,20 @@ public sealed class ModbusCodec
         if (response.Length < 5)
             throw DriverException.ProtocolError("modbus", "decode-write", "truncated write response");
 
-        // 回显必须与请求逐字节一致：FC05/FC06 回显地址与值，FC16 回显地址与数量。
-        // 只比地址的话，「写 1 却回显 0」会被当成成功——CRC 挡得住线路噪声，
-        // 挡不住从站回错值或单元号配错。重新编码一次请求即可拿到全部期望字节。
+        // 回显必须与请求逐字节一致：FC05/FC06 回显地址与值，FC16 回显地址与数量，
+        // FC21 回显整个子请求（含数据）。只比地址的话，「写 1 却回显 0」会被当成成功——
+        // CRC 挡得住线路噪声，挡不住从站回错值或单元号配错。重新编码一次请求即可拿到全部期望字节。
         var sent = EncodeWrite(cmd);
         var echo = Math.Min(sent.Length, response.Length);
         if (!response[..echo].SequenceEqual(sent.AsSpan(0, echo)))
             throw DriverException.ProtocolError("modbus", "decode-write",
                 $"echo {Convert.ToHexString(response[..echo])} does not match request {Convert.ToHexString(sent.AsSpan(0, echo))}");
+
+        // FC21 的响应必须把整段请求回显完（含数据）：只回了头部就说明从站没真正写，
+        // 或者帧被截断——两种情况都不能当成功。
+        if (expected == ModbusConstants.FcWriteFileRecord && response.Length < sent.Length)
+            throw DriverException.ProtocolError("modbus", "decode-write",
+                $"file-record write echoed {response.Length} byte(s), the request was {sent.Length}");
 
         return new WriteResult(cmd.Point.Id, true, Quality.Good, DateTimeOffset.UtcNow);
     }
