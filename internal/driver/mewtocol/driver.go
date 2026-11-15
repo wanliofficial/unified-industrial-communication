@@ -363,7 +363,11 @@ func (c *conn) readTimerContacts(ctx context.Context, span driver.ReadSpan, area
 		}
 		group := span.Points[start:end]
 		contacts := make([]mewtocol.Contact, 0, len(group))
-		for _, p := range group {
+		// pointIdx 记下每个接点对应组内哪个点位。被跳过的坏点位不进
+		// contacts，若最后按 group 的下标去取 vals，坏点位会拿到邻点的
+		// 值（先报地址错、再报一个好值），而真正请求的点位反而没有样本。
+		pointIdx := make([]int, 0, len(group))
+		for i, p := range group {
 			if p.Address.Bit > 0 {
 				// T/C 没有位号；地址上写了位号是点表错误。
 				out = append(out, errSample(p.ID, driver.E(driver.ErrAddress, "read", c.devID,
@@ -371,6 +375,7 @@ func (c *conn) readTimerContacts(ctx context.Context, span driver.ReadSpan, area
 				continue
 			}
 			contacts = append(contacts, mewtocol.Contact{Area: area, Word: p.Address.Offset, Bit: 0})
+			pointIdx = append(pointIdx, i)
 		}
 		if len(contacts) == 0 {
 			continue
@@ -400,12 +405,13 @@ func (c *conn) readTimerContacts(ctx context.Context, span driver.ReadSpan, area
 			return out, driver.E(driver.ErrProtocol, "read", c.devID,
 				fmt.Sprintf("response carries %d contact values, request asked for %d", len(vals), len(contacts)), true, nil)
 		}
-		for i, p := range group {
-			if i >= len(vals) {
+		for k, gi := range pointIdx {
+			if k >= len(vals) {
 				break
 			}
+			p := group[gi]
 			out = append(out, driver.RawSample{
-				PointID: p.ID, Value: model.BoolValue(vals[i]), Quality: model.QualityGood,
+				PointID: p.ID, Value: model.BoolValue(vals[k]), Quality: model.QualityGood,
 			})
 		}
 	}
@@ -871,8 +877,15 @@ func qualityOf(err error) model.Quality {
 	if errors.As(err, &ec) {
 		switch ec.Code {
 		case 0x60, 0x61, 0x66, 0x67:
+			// 参数错、无数据、地址错、数据范围错：点表配置问题。
 			return model.QualityAddressError
-		case 0x22, 0x23, 0x24, 0x26, 0x27, 0x28, 0x30, 0x32, 0x33, 0x36, 0x38:
+		}
+		// 链路类（ClassLink，0x22..0x38 整段）与可重试的协议/处理类，
+		// 都是「重连或重发可能就好了」的通信问题。这里从 ErrorCode 自身
+		// 的 Kind()/Retryable() 派生，而不是手抄一份码表——手抄的列表曾
+		// 漏掉 0x29/2A/2B/2C/2D/2E/2F/31/34/35/37 共 11 个链路码，让它们
+		// 的通信故障显示成 bad，运维会去查点表而不是查线路。
+		if ec.Kind() == mewtocol.ClassLink || ec.Retryable() {
 			return model.QualityCommError
 		}
 		return model.QualityBad

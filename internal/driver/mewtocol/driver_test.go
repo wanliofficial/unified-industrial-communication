@@ -91,8 +91,8 @@ func TestQualityOf(t *testing.T) {
 	if q := qualityOf(&mewtocol.ErrorCode{Code: 0x22}); q != model.QualityCommError {
 		t.Errorf("0x22 quality = %v, want comm error", q)
 	}
-	if q := qualityOf(&mewtocol.ErrorCode{Code: 0x41}); q != model.QualityBad {
-		t.Errorf("0x41 quality = %v, want bad", q)
+	if q := qualityOf(&mewtocol.ErrorCode{Code: 0x41}); q != model.QualityCommError {
+		t.Errorf("0x41 quality = %v, want comm error (retryable format error)", q)
 	}
 	if q := qualityOf(driver.E(driver.ErrTimeout, "read", "d", "", true, nil)); q != model.QualityTimeout {
 		t.Errorf("timeout quality = %v, want timeout", q)
@@ -100,5 +100,44 @@ func TestQualityOf(t *testing.T) {
 	// 普通协议错（非 ErrorCode）落到 Bad。
 	if q := qualityOf(errors.New("generic")); q != model.QualityBad {
 		t.Errorf("generic quality = %v, want bad", q)
+	}
+}
+
+// 质量位必须与错误码自身的 Kind()/Retryable() 一致：手抄的链路码白名单曾
+// 漏掉 0x29/2A/2B/2C/2D/2E/2F/31/34/35/37 共 11 个码，把可重试的链路故障
+// 显示成 bad。这里遍历整段链路码与全部协议/处理码，逐码钉住派生关系。
+func TestQualityOfDerivesFromErrorCode(t *testing.T) {
+	// 链路类：0x22..0x38 整段都应是 comm_error（含被旧白名单漏掉的那些）。
+	for code := 0x22; code <= 0x38; code++ {
+		ec := &mewtocol.ErrorCode{Code: byte(code)}
+		if got := qualityOf(ec); got != model.QualityCommError {
+			t.Errorf("%02XH (kind=%v): quality = %v, want comm error", code, ec.Kind(), got)
+		}
+	}
+	// 可重试的协议/处理类：同样是通信问题，得 comm_error。
+	for _, code := range []byte{0x40, 0x41, 0x42, 0x43, 0x50, 0x51, 0x52, 0x53} {
+		ec := &mewtocol.ErrorCode{Code: code}
+		if !ec.Retryable() {
+			t.Fatalf("%02XH 应是可重试的，测试前提有误", code)
+		}
+		if got := qualityOf(ec); got != model.QualityCommError {
+			t.Errorf("%02XH (retryable=%v): quality = %v, want comm error", code, ec.Retryable(), got)
+		}
+	}
+	// 地址类固定 address_error，不受派生规则影响。
+	for _, code := range []byte{0x60, 0x61, 0x66, 0x67} {
+		if got := qualityOf(&mewtocol.ErrorCode{Code: code}); got != model.QualityAddressError {
+			t.Errorf("%02XH: quality = %v, want address error", code, got)
+		}
+	}
+	// 不可重试的应用类：配置/模式问题，落 bad。
+	for _, code := range []byte{0x62, 0x63, 0x64, 0x65, 0x68} {
+		ec := &mewtocol.ErrorCode{Code: code}
+		if ec.Retryable() {
+			t.Fatalf("%02XH 不应是可重试的，测试前提有误", code)
+		}
+		if got := qualityOf(ec); got != model.QualityBad {
+			t.Errorf("%02XH: quality = %v, want bad", code, got)
+		}
 	}
 }

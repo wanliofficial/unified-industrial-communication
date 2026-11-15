@@ -361,6 +361,45 @@ func TestMultiContactWrite(t *testing.T) {
 	}
 }
 
+// T/C 分组读时，一个带位号的坏点位不能把后续点位的值顶偏。旧实现按下标
+// 遍历含坏点的原组去取 vals（vals 已排除坏点），坏点会拿到邻点的值、真正
+// 要读的点位反而没有样本——典型的「有值、质量好、对应关系全错」。
+func TestTimerContactBadPointDoesNotShiftValues(t *testing.T) {
+	srv := newSim(t)
+	c := open(t, srv)
+
+	srv.SetBit("t", 10, true)
+	srv.SetBit("t", 12, true)
+	srv.SetBit("t", 11, false)
+
+	span := driver.ReadSpan{ID: "st", Points: []driver.PointRef{
+		{ID: "t10", Address: model.Address{Kind: model.AddressRegister, Area: "t", Offset: 10, Length: 1, Bit: -1}, DataType: model.TypeBool},
+		{ID: "t11bad", Address: model.Address{Kind: model.AddressRegister, Area: "t", Offset: 11, Length: 1, Bit: 3}, DataType: model.TypeBool},
+		{ID: "t12", Address: model.Address{Kind: model.AddressRegister, Area: "t", Offset: 12, Length: 1, Bit: -1}, DataType: model.TypeBool},
+	}}
+	samples, _ := c.Read(ctx(), []driver.ReadSpan{span})
+
+	byID := map[string][]driver.RawSample{}
+	for _, s := range samples {
+		byID[s.PointID] = append(byID[s.PointID], s)
+	}
+	if got := byID["t11bad"]; len(got) != 1 || got[0].Err == nil {
+		t.Fatalf("t11bad should have exactly one failed sample, got %+v", got)
+	}
+	for id, want := range map[string]bool{"t10": true, "t12": true} {
+		got := byID[id]
+		if len(got) != 1 {
+			t.Fatalf("%s should have exactly one sample, got %d", id, len(got))
+		}
+		if got[0].Err != nil {
+			t.Fatalf("%s: %v", id, got[0].Err)
+		}
+		if got[0].Value.Bool != want {
+			t.Fatalf("%s = %v, want %v", id, got[0].Value.Bool, want)
+		}
+	}
+}
+
 func mustArea(t *testing.T, key string) mewcodec.Area {
 	t.Helper()
 	a, ok := mewcodec.Lookup(key)

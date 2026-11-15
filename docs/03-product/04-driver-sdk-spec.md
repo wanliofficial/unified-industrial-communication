@@ -5405,8 +5405,17 @@ T/C 的布尔量同样走 `WCS`，但位号必须省略（或显式写 0）：T/
 - **`23H` 站号重号、`24H` 硬件错、`26H` 站号设置错不可重试。** 把它们算进熔断重试，
   只会让一台配错的设备把整条通道拖黑。
 
-质量码只来自错误分类：`60/61/66/67` → `address_error`；`22/23/24/26/27/28/30/32/33/36/38`
-→ `comm_error`；超时 → `timeout`；断链 → `comm_error`；其余 → `bad`。
+质量码从错误码自身派生，不再手抄一份码表——`60/61/66/67` → `address_error`；链路类
+（`ClassLink`，`22`..`38` 整段）与可重试的协议/处理类 → `comm_error`（重连或重发可能
+就好，运维要查线路而不是查点表）；不可重试的应用类 → `bad`；超时 → `timeout`；断链 →
+`comm_error`。
+
+派生而非手抄是有来由的：早先的版本把链路类质量码硬编码成
+`22/23/24/26/27/28/30/32/33/36/38` 这十一个码，而 `ClassLink` 实际是 `22`..`38` 整段，
+漏掉了 `29/2A/2B/2C/2D/2E/2F/31/34/35/37` 共十一个。漏掉的表现是：这些链路码经 `classify`
+归为可重试的 `protocol`，重发循环照跑，但 `qualityOf` 落 `bad`——运维看到的是「坏值」，
+会去查点表而不是查线路。现在 `qualityOf` 直接读 `ErrorCode.Kind()`/`Retryable()`，码表
+和分类逻辑只有一处事实源，不会再漂移。
 
 #### 3.10.18.11 两种承载与「不做 FP2-ET-LAN 封装」
 
@@ -5508,8 +5517,8 @@ Mewtocol 的地址是**寄存器语义**：一个地址 = 一个 16 位字。因
 | 层 | 用例 |
 |---|---|
 | `codec/mewtocol` | 区域表与别名（`d`/`f`/`wx`/`set`/`k`）、站号校验（1..99、`FF`、0 拒绝）；BCC 覆盖 `%` 且不含 CR，手册实例 `%01#RCSX0000` → `1D`；黄金字节逐字节（RD/RCC/RCS/RCP/WCS/WCC/WD/RS/WS/RK/WK/异常应答）；接点编号双向（`001F`/`0163`/`0010`/`0999`，非法进制与越界拒绝）；索引寄存器的「区码 + 9 个 0」；`MaxWords=24` 与 `MaxContacts=8` 的边界（24 通过、25 拒绝；8 通过、9 拒绝）；`ParseRequest` 三字符命令优先于两字符前缀；`ParseResponse` 的 BCC 校验与异常应答；`FrameLen`/`Reader` 的分帧、噪声丢弃与半帧等待 |
-| `driver/mewtocol` | 纯函数：`pointWords`（bool 恒 1 字、显式长度优先、类型宽度回退）、`reqWords`、`orderFor`（32 位 CDAB / 64 位 DCBA / 显式覆盖）、`classify`（66H→address、65H→permission、41H/53H→protocol 可重试、60H→address）、`qualityOf`（address/comm/bad/timeout） |
-| `sim/mewtocol` | 真实 TCP 回环：16 位字往返（写 DT0..2 再读回）、接点按字读 + 位提取、`WCS` 单点写后邻位不变、字区位写拒绝（`ErrUnsupported`）、32 位跨字往返（低字在前）、索引寄存器越界 → address/protocol、站号过滤（站号 2 的请求静默、站号 1 有应答）、T/C 按点读（T 与 C 分属两个区，分开读）、T/C 单点写不碰邻号、`WCP` 多接点写（两位同时置 1，同字其余位不变——数据位读反的症状是「写 1 变成写 0」） |
+| `driver/mewtocol` | 纯函数：`pointWords`（bool 恒 1 字、显式长度优先、类型宽度回退）、`reqWords`、`orderFor`（32 位 CDAB / 64 位 DCBA / 显式覆盖）、`classify`（66H→address、65H→permission、41H/53H→protocol 可重试、60H→address）、`qualityOf`（address/comm/bad/timeout）+ **派生一致性**（遍历整段链路码 `22`..`38` 与可重试协议/处理码断言一律 `comm_error`，钉住「手抄白名单漏码」这类漂移） |
+| `sim/mewtocol` | 真实 TCP 回环：16 位字往返（写 DT0..2 再读回）、接点按字读 + 位提取、`WCS` 单点写后邻位不变、字区位写拒绝（`ErrUnsupported`）、32 位跨字往返（低字在前）、索引寄存器越界 → address/protocol、站号过滤（站号 2 的请求静默、站号 1 有应答）、T/C 按点读（T 与 C 分属两个区，分开读）、T/C 单点写不碰邻号、`WCP` 多接点写（两位同时置 1，同字其余位不变——数据位读反的症状是「写 1 变成写 0」）、**T/C 分组里一个带位号的坏点位不得顶偏后续点位的值**（旧实现按下标遍历含坏点的原组去取 `vals`，坏点会拿到邻点值、真正要读的点反而没样本） |
 | `pointtable` | `PolicyFor("mewtocol")` 是 `WidthRegisters` + 十四个区白名单 + `BitlessAreas` 只含 `t`/`c`；正向 14 例（字区、接点区、字区 bool、T/C、索引、SV、大写区名）× 往返（`Canonical()` 能重新解析成同一地址）；反向 5 例（未知区名、接点区缺位号、位号 16、字区 bool 缺位号、非 bool 带位号）；寄存器协议反向拒 `dt:0` |
 
 覆盖率（`go test -cover`）：
