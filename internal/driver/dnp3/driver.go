@@ -1151,6 +1151,19 @@ func convertObject(o dnp3codec.Object, dt model.DataType) (model.Value, model.Qu
 //
 // ONLINE=0 或 COMM_LOST=1 是 bad；RESTART/强置/越限/参考误差是
 // uncertain——值可能仍然有效，但不能当成正常值参与联锁。
+//
+// 关于 !o.HasFlags 直接返回 good：**这不是 fail-open，而是 IEEE 1815 的明
+// 确定义**。HasFlags=false 只可能来自「without flag」变体——计数器组 20
+// 变体 5/6、模拟量组 30 变体 3/4（详见 codec 的 numericSpecOf）。这些变体
+// 的线格式里**根本没有品质字节**，标准对它们的定义就是「值被假定有效」
+// （省略品质信息的变体，接收方按值有效处理）。因此这里没有 ONLINE 位可判，
+// 返回 good 是与协议一致的。
+//
+// 这与 MTConnect 的「条件缺级别」有本质差别：那边是「语义存在但读不出
+// 级别」，读不出就该判坏（否则告警被静默吞掉）；这边是「协议本就无此字
+// 段」，无从判断时标准规定假定有效。若把这里也改成判坏，会让所有使用
+// without-flag 变体的真实设备（现场很常见）上报「全部离线」，是另一种
+// 方向的假故障。测试 TestQualityWithoutFlagIsGood 从两个方向钉住这个判断。
 func qualityOf(o dnp3codec.Object) model.Quality {
 	if !o.HasFlags {
 		return model.QualityGood

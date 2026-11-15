@@ -272,6 +272,45 @@ func TestQualityMapping(t *testing.T) {
 	})
 }
 
+// TestQualityWithoutFlagIsGood 钉住 qualityOf 对「无品质字节」对象的判断：
+// 返回 good，且这是 IEEE 1815 的明确定义，不是漏判。
+//
+// 无标志变体（计数器组 20 v5/v6、模拟量组 30 v3/v4）的线格式里根本没有
+// 品质字节，标准对它们的定义就是「值被假定有效」。HasFlags=false 只可能
+// 来自这些变体，因此没有 ONLINE 位可判。
+//
+// 这条测试的意义是**双向**的：既确认无标志对象确实判 good（符合标准），
+// 又作为一道护栏——若有人误以为这里该判坏而去「修」，测试会立刻变红，
+// 提醒他这会让所有使用 without-flag 变体的真实设备上报「全部离线」。
+func TestQualityWithoutFlagIsGood(t *testing.T) {
+	cases := []struct {
+		name string
+		obj  dnp3codec.Object
+	}{
+		{"计数器无标志 v5", dnp3codec.Object{Group: dnp3codec.GroupCounter, Variation: 5, HasFlags: false, Value: uint64(12345)}},
+		{"计数器无标志 v6", dnp3codec.Object{Group: dnp3codec.GroupCounter, Variation: 6, HasFlags: false, Value: uint64(100)}},
+		{"模拟量无标志 v3", dnp3codec.Object{Group: dnp3codec.GroupAnalogInput, Variation: 3, HasFlags: false, Value: int64(2300)}},
+		{"模拟量无标志 v4", dnp3codec.Object{Group: dnp3codec.GroupAnalogInput, Variation: 4, HasFlags: false, Value: int64(-40)}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := qualityOf(c.obj); got != model.QualityGood {
+				t.Fatalf("qualityOf(无标志 %s) = %q，应为 good（IEEE 1815：无标志变体假定值有效）", c.name, got)
+			}
+		})
+	}
+
+	// 对照：同一个组换成带标志变体、且 ONLINE=0，必须判 bad。这样测试既
+	// 证明「无标志→good」不是「一律 good」，也证明 qualityOf 确实在读标志。
+	offline := dnp3codec.Object{
+		Group: dnp3codec.GroupAnalogInput, Variation: 1,
+		Flags: 0x00, HasFlags: true, Value: int64(2300),
+	}
+	if got := qualityOf(offline); got != model.QualityBad {
+		t.Fatalf("qualityOf(ONLINE=0) = %q，应为 bad——证明质量判断确实在读标志位", got)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // 写路径
 // ---------------------------------------------------------------------------
