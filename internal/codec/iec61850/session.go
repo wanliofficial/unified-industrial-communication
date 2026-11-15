@@ -121,10 +121,15 @@ func encodeUserData(payload []byte) []byte {
 //
 // 会话层的 LI 与 BER 的长度字段是两套独立编码，绝不能共用 parseLength：
 //   - 0x00..0xFE：长度值就是这一个字节（所以 0x95 = 149，是合法长度）；
-//   - 0xFF：后接 1~3 个字节表示长度（big-endian）。
+//   - 0xFF：后接**恰好两个**字节（big-endian）的长形式。
 //
 // BER 的 0x81/0x82/0x83 长形式在这里会被误读成内容长度的一部分；反过来会话
 // 层的 0x95 会被 BER 解析器当成「不支持的长度形式」。两者必须分开。
+//
+// 注意长形式宽度是**固定的**，不是「1~3 个按内容猜」：ISO 8327-1 规定长形式
+// 就是两字节。若按首字节去猜宽度，会把内容字节当成长度的一部分，凑出一个
+// 超出 liLongMax 的假长度再报一句无关的失败。putLI/liSize 与这里的「恰好
+// 两字节」必须保持一致。
 func parseLI(b []byte) (n, hdr int, err error) {
 	if len(b) == 0 {
 		return 0, 0, ErrTruncated
@@ -145,15 +150,21 @@ func parseLI(b []byte) (n, hdr int, err error) {
 
 // putLI 追加会话层长度字段。
 //
-// LI 是会话层专有的长度编码：短形式（<0x80）与「0xFF + 1~3 字节」长形式。
-// 它与 BER 的长形式（0x81/0x82/0x83）是两套独立编码，混用会让对端按错误
-// 的字节数去读长度，整条报文的边界随之错位。
+// LI 是会话层专有的长度编码（ISO 8327-1 §8.2.5），与 BER 的长形式
+// （0x81/0x82/0x83）是两套独立编码，混用会让对端按错误的字节数去读长度，
+// 整条报文的边界随之错位。宽度规则与 parseLI 必须一致（都由 liSize 计算）：
+//
+//	长度 0..254     → 单字节，值即长度
+//	长度 255..65535 → 三字节：0xFF + 恰好两个字节（big-endian）
+//
+// **255 走长形式，不是短形式。** 0xFF 是长形式标记，不能作为单字节 LI 的值；
+// 所以长度 255 必须编成 `FF 00 FF`。曾有一个 `n <= 0xFF` 的中间分支把 255
+// 编成 `FF FF`（只有一字节长度），既违反「长形式恰好两字节」，也无法被
+// parseLI 还原（它会把标记后的两个字节都当长度，吃掉一个内容字节）。这个
+// 分支已删除。
 func putLI(dst []byte, n int) []byte {
 	if n <= liShortMax {
 		return append(dst, byte(n))
-	}
-	if n <= 0xFF {
-		return append(dst, 0xFF, byte(n))
 	}
 	return append(dst, 0xFF, byte(n>>8), byte(n))
 }
@@ -162,9 +173,6 @@ func putLI(dst []byte, n int) []byte {
 func liSize(n int) int {
 	if n <= liShortMax {
 		return 1
-	}
-	if n <= 0xFF {
-		return 2
 	}
 	return 3
 }

@@ -322,6 +322,51 @@ func TestSessionConnectUsesExtendedUserData(t *testing.T) {
 	}
 }
 
+// TestSessionLIBoundaryRoundTrip 钉住会话层 LI 在 254/255/256 三个边界上的
+// 往返一致性，以及 liSize 与 putLI 的字节数一致。
+//
+// 为什么单独测 255：ISO 8327-1 §8.2.5 规定「长度 0..254 用单字节，长度
+// 255..65535 用 0xFF + 恰好两字节」。255 恰好落在长形式的最小端——0xFF 是
+// 长形式标记，不能当单字节 LI 的值，所以 255 必须编成 `FF 00 FF`。曾有一个
+// `n <= 0xFF` 的中间分支把 255 编成 `FF FF`（只有一字节长度），既违反
+// 「长形式恰好两字节」，也无法被 parseLI 还原（它把标记后的两个字节都当长度，
+// 吃掉一个内容字节）。短帧测试（300 走长形式、普通帧走短形式）永远踩不到
+// 这个边界，只有显式构造 255 才暴露。
+func TestSessionLIBoundaryRoundTrip(t *testing.T) {
+	cases := []struct {
+		n    int
+		want []byte // 期望的 LI 编码
+	}{
+		{0, []byte{0x00}},
+		{1, []byte{0x01}},
+		{254, []byte{0xFE}},             // 短形式上界
+		{255, []byte{0xFF, 0x00, 0xFF}}, // 长形式下界：0xFF 标记 + 两字节(0x00FF)
+		{256, []byte{0xFF, 0x01, 0x00}},
+		{300, []byte{0xFF, 0x01, 0x2C}},
+		{65535, []byte{0xFF, 0xFF, 0xFF}}, // 长形式上界
+	}
+	for _, c := range cases {
+		enc := putLI(nil, c.n)
+		if !bytes.Equal(enc, c.want) {
+			t.Errorf("putLI(%d) = % X, want % X", c.n, enc, c.want)
+		}
+		if liSize(c.n) != len(enc) {
+			t.Errorf("liSize(%d) = %d, but putLI wrote %d bytes", c.n, liSize(c.n), len(enc))
+		}
+		got, hdr, err := parseLI(enc)
+		if err != nil {
+			t.Errorf("parseLI(putLI(%d)) error: %v", c.n, err)
+			continue
+		}
+		if got != c.n {
+			t.Errorf("parseLI(putLI(%d)) = %d, want %d", c.n, got, c.n)
+		}
+		if hdr != len(enc) {
+			t.Errorf("parseLI hdr = %d, want %d (LI width)", hdr, len(enc))
+		}
+	}
+}
+
 func TestSessionAcceptShape(t *testing.T) {
 	ac, err := BuildSessionAccept(DefaultSessionParams(), []byte{0x01})
 	if err != nil {
