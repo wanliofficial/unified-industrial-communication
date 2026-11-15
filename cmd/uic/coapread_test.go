@@ -60,13 +60,15 @@ func TestCoAPCLIValue(t *testing.T) {
 }
 
 func TestValidCoAPType(t *testing.T) {
+	// 64 位整型由 textval 支持、驱动也接受，CLI 必须能指定（否则自检与
+	// 配置界面都配不出这类点位）。bcd16 是编码方式而非文本类型，仍拒绝。
 	for _, typ := range []string{"bool", "int16", "uint16", "int32", "uint32",
-		"float32", "float64", "string", "bytes"} {
+		"int64", "uint64", "float32", "float64", "string", "bytes"} {
 		if !validCoAPType(typ) {
 			t.Errorf("%s: want valid", typ)
 		}
 	}
-	for _, typ := range []string{"", "int64", "bcd16", "nope"} {
+	for _, typ := range []string{"", "bcd16", "bcd32", "nope"} {
 		if validCoAPType(typ) {
 			t.Errorf("%s: want invalid", typ)
 		}

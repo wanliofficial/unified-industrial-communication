@@ -47,6 +47,44 @@ func TestMeta(t *testing.T) {
 	}
 }
 
+// TestMetaDataTypeEnumMatchesImplementation 钉住「声明支持的类型」与
+// 「planPoint 实际接受、textval 实际能编解码」一致。
+//
+// 枚举漏一项的表现很隐蔽：驱动跑起来没问题，但配置界面里选不到那个类型，
+// 只能手改 JSON；反过来枚举多一项则会在 Open 阶段报 address 错误。两者都是
+// 声明与实现漂移，因此这里逐个枚举项跑一遍 planPoint。
+func TestMetaDataTypeEnumMatchesImplementation(t *testing.T) {
+	m := New().Meta()
+	var enum []string
+	for _, f := range m.PointFields {
+		if f.Name == "dataType" {
+			enum = f.Enum
+		}
+	}
+	if len(enum) == 0 {
+		t.Fatal("meta 未声明 dataType 枚举")
+	}
+	for _, name := range enum {
+		ref := driver.PointRefOf(model.Device{ID: "dev"}, pt("p", "/r", "", name))
+		if _, err := planPoint(ref); err != nil {
+			t.Errorf("枚举声明支持 %s，planPoint 却拒绝: %v", name, err)
+		}
+	}
+	// 64 位整型由 textval 支持、planPoint 接受，枚举不能漏（曾经漏过）。
+	for _, want := range []string{"int64", "uint64"} {
+		found := false
+		for _, name := range enum {
+			if name == want {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("dataType 枚举缺少 %s", want)
+		}
+	}
+}
+
 // ---------------------------------------------------------------------------
 // decodeValue
 // ---------------------------------------------------------------------------

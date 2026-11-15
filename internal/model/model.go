@@ -409,7 +409,15 @@ func (v Value) String() string {
 		return v.Text
 	}
 	if v.Num == math.Trunc(v.Num) {
-		return strconv.FormatInt(int64(v.Num), 10)
+		// 只有落在 int64 范围内的整数才能走 FormatInt：uint64 的上半段
+		// 直接转会把 1.8e19 变成 -9223372036854775808，日志与自检输出
+		// 会给出一个完全错误的数。
+		switch {
+		case v.Num >= -9223372036854775808 && v.Num < 9223372036854775808:
+			return strconv.FormatInt(int64(v.Num), 10)
+		case v.Type == TypeUint64 && v.Num >= 0 && v.Num < 18446744073709551616:
+			return strconv.FormatUint(uint64(v.Num), 10)
+		}
 	}
 	return strconv.FormatFloat(v.Num, 'g', -1, 64)
 }

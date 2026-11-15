@@ -36,7 +36,7 @@ func coapreadCmd(args []string) {
 	addr := fs.String("addr", "127.0.0.1:5683", "服务端地址 host[:port]，端口默认 5683")
 	path := fs.String("path", "/sensors/temp", "资源路径（省略前导斜杠会被补上）")
 	selector := fs.String("selector", "", "响应为 JSON 时取哪个字段，支持 a.b 与 a[0]")
-	typ := fs.String("type", "float64", "数据类型：bool|int16|uint16|int32|uint32|float32|float64|string|bytes")
+	typ := fs.String("type", "float64", "数据类型：bool|int16|uint16|int32|uint32|int64|uint64|float32|float64|string|bytes")
 	timeout := fs.Duration("timeout", 5*time.Second, "单次事务超时")
 	block := fs.Int("block", 0, "首选块大小 0|16|32|64|128|256|512|1024（0=跟随服务端）")
 	probe := fs.Bool("probe", false, "只探测 /.well-known/core，不读资源")
@@ -301,8 +301,8 @@ func coapCLIValue(s, dt string) (model.Value, error) {
 func validCoAPType(t string) bool {
 	switch model.DataType(t) {
 	case model.TypeBool, model.TypeInt16, model.TypeUint16, model.TypeInt32,
-		model.TypeUint32, model.TypeFloat32, model.TypeFloat64, model.TypeString,
-		model.TypeBytes:
+		model.TypeUint32, model.TypeInt64, model.TypeUint64, model.TypeFloat32,
+		model.TypeFloat64, model.TypeString, model.TypeBytes:
 		return true
 	}
 	return false

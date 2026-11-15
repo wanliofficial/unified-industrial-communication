@@ -159,6 +159,16 @@ func TestValueSemantics(t *testing.T) {
 	if BoolValue(false).String() != "false" {
 		t.Fatal("bool string")
 	}
+	// uint64 的上半段不能被 int64 转换回绕成负数。
+	if got := NumValue(TypeUint64, 18000000000000000000).String(); got != "18000000000000000000" {
+		t.Fatalf("uint64 string = %q", got)
+	}
+	if got := NumValue(TypeInt64, -9223372036854775808).String(); got != "-9223372036854775808" {
+		t.Fatalf("int64 string = %q", got)
+	}
+	if got := NumValue(TypeFloat64, 1.5).String(); got != "1.5" {
+		t.Fatalf("float string = %q", got)
+	}
 }
 
 func TestTypeWidths(t *testing.T) {

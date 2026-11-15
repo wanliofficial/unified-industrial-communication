@@ -151,8 +151,8 @@ func (d *Driver) Meta() driver.Meta {
 				Placeholder: "data.temperature",
 				Help:        "响应为 application/json 时取哪个字段；支持 a.b 与 a[0]，留空表示整个文档"},
 			{Name: "dataType", Label: "数据类型", Type: "enum", Required: true,
-				Enum: []string{"bool", "int16", "uint16", "int32", "uint32", "float32",
-					"float64", "string", "bytes"}, Scope: "point"},
+				Enum: []string{"bool", "int16", "uint16", "int32", "uint32", "int64",
+					"uint64", "float32", "float64", "string", "bytes"}, Scope: "point"},
 			{Name: "address.length", Label: "最大字节数", Type: "int", Scope: "point",
 				Help: "bytes/string 的接收上限；0 表示不限制"},
 		},
@@ -968,11 +968,14 @@ func jsonScalar(v model.Value, dt model.DataType) ([]byte, error) {
 		if !ok {
 			return nil, fmt.Errorf("cannot encode %s value as %s", v.Type, t)
 		}
-		if t == model.TypeFloat32 || t == model.TypeFloat64 {
-			out = []byte(strconv.FormatFloat(n, 'g', -1, 64))
-		} else {
-			out = []byte(strconv.FormatInt(int64(n), 10))
+		// 与文本写共用同一条校验+格式化路径：越界、带小数、NaN/Inf 都在
+		// 这里判错，不能靠 `int64(n)` 静默回绕（`int64(1e30)` 会变成
+		// `-9223372036854775808`，写进设备的是一个完全错误的数）。
+		txt, err := textval.FormatNumber(n, t)
+		if err != nil {
+			return nil, err
 		}
+		out = txt
 	}
 	if !json.Valid(out) {
 		return nil, fmt.Errorf("value %q cannot be represented as JSON", out)

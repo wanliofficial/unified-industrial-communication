@@ -390,6 +390,70 @@ func TestWriteOctetsRoundTrip(t *testing.T) {
 	}
 }
 
+// TestWriteRejectsOutOfRangeValue 钉住「越界判坏，不截断」。
+//
+// 写路径曾经把值直接交给 `int64(n)`：`int16` 的 40000 会原样写成 "40000"，
+// `int64` 的 1e30 会回绕成 "-9223372036854775808"——设备收到一个完全错误
+// 的数，而驱动报成功。这里不仅要求报错，还要求一个字节都没发出去。
+func TestWriteRejectsOutOfRangeValue(t *testing.T) {
+	cases := []struct {
+		name string
+		dt   string
+		v    model.Value
+	}{
+		{"int16 over", "int16", model.NumValue(model.TypeInt16, 40000)},
+		{"int32 fraction", "int32", model.NumValue(model.TypeInt32, 1.5)},
+		{"int64 overflow", "int64", model.NumValue(model.TypeInt64, 1e30)},
+		{"uint64 overflow", "uint64", model.NumValue(model.TypeUint64, 1e30)},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			// 两条编码路径都要覆盖：text 走 textval.Encode，json 走
+			// jsonScalar。只测其中一条会让另一条的 `int64(n)` 回绕漏网。
+			for _, format := range []string{"text", "json"} {
+				t.Run(format, func(t *testing.T) {
+					p := pt("sp", "/actuator/setpoint", "", c.dt)
+					conn, s := openSim(t, map[string]string{"contentFormat": format}, p)
+					res, err := conn.Write(context.Background(), []driver.WriteRequest{{
+						PointID: "sp", Address: p.Address, DataType: p.DataType, Value: c.v,
+					}})
+					if err == nil {
+						t.Fatalf("expected an error for %s", c.name)
+					}
+					if k := driver.KindOf(err); k != driver.ErrUnsupported {
+						t.Fatalf("kind = %s, want unsupported (%v)", k, err)
+					}
+					if len(res) != 1 || res[0].OK || res[0].Quality != model.QualityBad {
+						t.Fatalf("result = %+v", res)
+					}
+					if s.Writes() != 0 {
+						t.Fatalf("device saw %d writes, want 0", s.Writes())
+					}
+				})
+			}
+		})
+	}
+}
+
+// TestWrite64BitRoundTrip 确认合法的 64 位边界值仍能写入。
+func TestWrite64BitRoundTrip(t *testing.T) {
+	p := pt("sp", "/actuator/setpoint", "", "uint64")
+	conn, _ := openSim(t, nil, p)
+	res, err := conn.Write(context.Background(), []driver.WriteRequest{{
+		PointID: "sp", Address: p.Address, DataType: p.DataType,
+		Value: model.NumValue(model.TypeUint64, 18000000000000000000),
+	}})
+	if err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if !res[0].OK {
+		t.Fatalf("result = %+v", res[0])
+	}
+	if smp := readOne(t, conn, p); smp.Err != nil || smp.Value.String() != "18000000000000000000" {
+		t.Fatalf("read back = %+v", smp)
+	}
+}
+
 // TestWritePermissionDenied 覆盖 4.03 → 权限错误（不计入熔断）。
 func TestWritePermissionDenied(t *testing.T) {
 	// /sensors/temp 只支持 GET；用 PUT 会得到 4.05，映射为 unsupported。
