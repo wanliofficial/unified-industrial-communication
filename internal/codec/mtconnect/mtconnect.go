@@ -161,6 +161,20 @@ func (it Item) IsCondition() bool {
 	return it.Category == CategoryCondition && it.Condition != ""
 }
 
+// LevelKnown 表示这条观测是不是「带合法级别的条件」。
+//
+// 它与 IsCondition 的差别只在 Category==CONDITION 但级别缺失时：Agent 可能
+// 用了非标准的级别元素名（`<BogusLevel>OVERHEAT</BogusLevel>`），或外层只
+// 写条件类型、内层一个级别元素都没有。这类观测**不能**当成采样/事件处理
+// ——它的 Semantic 仍然是「报警」，只是我们读不出级别。
+//
+// 为什么需要这个区分：调用方若只看 `Condition == ""` 就回落成普通文本，会把
+// 一条无法识别的告警当成正常数据上报（quality=good、value="OVERHEAT"）。
+// 把「级别缺失」显式暴露出来，调用方才能把它归成坏质量。
+func (it Item) LevelKnown() bool {
+	return it.Category != CategoryCondition || it.Condition != ""
+}
+
 // DeviceStream 是一台设备在快照里的数据。
 type DeviceStream struct {
 	Name       string

@@ -6755,6 +6755,20 @@ MTConnect 的条件是两层：**外层元素是条件类型**（`System`/`Actua
 级别直接映射：`FAULT`→`bad`、`WARNING`→`uncertain`、`NORMAL`→`good`。同一 ID
 多条条件按 `FAULT > WARNING > UNAVAILABLE > NORMAL` 合并，不是「后者覆盖前者」。
 
+这条映射有一个**必须 fail-closed** 的边界：级别读不出来时判坏，而不是回落成
+「普通文本」。现场会写出 `<BogusLevel>OVERHEAT</BogusLevel>`（非标准级别名）或
+`<System dataItemId="alm"/>`（只有条件类型、没有级别）。这类观测的 `Category`
+仍是 `CONDITION`——语义上它确实是报警，只是严重度读不出。若把它当普通事件处理，
+`OVERHEAT` 文本会按 `string` 解析成功，于是上报 `quality=good`、`value="OVERHEAT"`、
+`err=nil`：**一条告警被静默吞掉，而且从数据上看完全正常**。这是本驱动最容易犯的
+错（能解析、字段不空、没有异常迹象），所以 codec 提供 `Item.LevelKnown()` 把
+「条件但级别缺失」显式暴露出来，驱动对它用坏质量 + 明确诊断
+（「is a condition (type ...) but carries no recognised level」），而不是让它
+落进空值分支误报成「carries an empty value」。测试矩阵里专门有一条
+`TestConditionWithoutLevelIsBadNotGood`，用**平铺未知元素名**这个唯一可观测的
+路径钉住它——两层的未知级别名文本落在外层（为空），会被空值分支提前拦成
+`bad`，测不出 fail-open。
+
 #### 3.10.23.4 多设备 Agent 必须显式选设备
 
 一条产线常挂多台机床。若都当单设备读，`A` 机床的 `Xabs` 会覆盖 `B` 机床的
@@ -6786,8 +6800,8 @@ HTML / 延迟 / 省略数据项 / 全 `UNAVAILABLE` / 条件）各自独立，�
 
 | 层 | 用例 |
 |---|---|
-| `codec/mtconnect` | 按本地名匹配忽略命名空间；Header 序号与 `nextSequence` 补齐；Samples/Events/Conditions 三类观测；两层与平铺条件写法归一到同一级别并按严重度合并；`/probe` 设备模型；`MTConnectError` 文档；ISO-8859-1/latin-1/windows-1252 与 UTF-8 BOM 往返 |
-| `driver/mtconnect` | 一条 `/current` 覆盖多点的 `MultiRead`；单点 `UNAVAILABLE`→bad、ID 不存在/类型解析失败→address_error 都只写该点；条件级别即质量；多设备未选报地址错误并列可选设备；省略端口补 5000；拒绝凭据/query/fragment；`/probe` 404 退回 `/current`；文档上限 32 MiB；`/sample` count 越界报 `unsupported`；对接真实 sim 的集成测试 |
+| `codec/mtconnect` | 按本地名匹配忽略命名空间；Header 序号与 `nextSequence` 补齐；Samples/Events/Conditions 三类观测；两层与平铺条件写法归一到同一级别并按严重度合并；**条件缺级别**（未知级别元素名/外层无内层/平铺未知元素名）保留 `Category=CONDITION` 且 `LevelKnown()==false`、`IsCondition()==false`；带合法级别的条件与非条件观测 `LevelKnown()==true`；`/probe` 设备模型；`MTConnectError` 文档；ISO-8859-1/latin-1/windows-1252 与 UTF-8 BOM 往返 |
+| `driver/mtconnect` | 一条 `/current` 覆盖多点的 `MultiRead`；单点 `UNAVAILABLE`→bad、ID 不存在/类型解析失败→address_error 都只写该点；条件级别→质量四态（Fault→bad / Warning→uncertain / Normal→good / Unavailable→bad）；**条件缺级别 fail-closed**：平铺未知元素名必须判 bad 且诊断不得误报成「空值」（变异验证：删掉防护即报 `quality="good" value=OVERHEAT`）；多设备未选报地址错误并列可选设备；省略端口补 5000；拒绝凭据/query/fragment；`/probe` 404 退回 `/current`；文档上限 32 MiB；`/sample` count 越界报 `unsupported`；对接真实 sim 的集成测试 |
 | `sim/mtconnect` | 三轴 Agent；`/probe`/`/current`/`/sample` 序号窗口；两层条件渲染；`toolOffset` 初始 `UNAVAILABLE`；gzip 与子路径；七类故障注入各自独立 |
 | `cmd/uic` | `-id` 折参、CSV→索引；自检命令三入口（probe/current/sample） |
 
@@ -8872,6 +8886,8 @@ drivertest.Run(t, driver, virtualDevice)
 | 为纯符号协议写带冒号的地址，而符号头撞上别的协议的区名 | 被误判成「本协议不接受寄存器地址」而在导入期拒绝，错误信息把人引向错误方向 | 在 `AddressPolicy.SymbolPrefixes` 里声明本协议占用的前缀（如 M-Bus 的 `q`/`r`），解析器见到即跳过寄存器识别 |
 | 在 `driver.E(...)` 上标了 `temporary=false`，重发循环却只看 `KindOf(err)` | 标记形同废纸：本该「不重发」的失败照样重试到上限，每次读表白等 `retries × 超时`，且日志上看不出与「可重发」那类有任何区别（两者 `KindOf` 同为 `ErrProtocol`） | 重发循环在 `KindOf` 判断之后追加 `if !driver.IsRetryable(err) { return err }`；测试要能区分两类：可重发的每轮请求数 = `retries+1`，不重发的每轮 = 1 |
 | 构造「帧内容不对」的测试用例时改地址（如 `A=FDh`） | 地址在**分帧**阶段就被拒，Reader 跳过坏帧，最终表现成超时 → 落进「可重发」分支，测不到「不重发」的语义，测试反而变成假绿或误导 | 让帧**成帧且校验和正确**，只把 CI 换成不受支持的值（sim 的 `SetBadCI`），这样才真正走到 `CheckResponse`/`ParseResponse` 的 `ErrFrame` |
+| 语义字段缺失时用 `default: return good` 兜底（fail-open） | 无法识别的内容被当成正常数据入库：MTConnect 里 `<BogusLevel>OVERHEAT</BogusLevel>` 会解析成 `quality=good` + `value="OVERHEAT"` + `err=nil`，告警被静默吞掉，且从数据上看毫无异常 | 语义不可判定时判**坏**并给明确诊断。先用测试确认「缺失」是可观测状态（必要时在 codec 加 `LevelKnown()` 一类谓词），再让它 fail-closed |
+| 为一个 fail-open 缺陷写回归测试，却用了会先被其他分支拦截的用例 | 测试永远绿：MTConnect 两层写法的未知级别名文本落在外层（为空），被「空值」分支提前判成 `bad`，删掉修复照样通过（变异验证能立刻发现） | 挑**唯一可观测路径**做用例（平铺写法文本非空），并做变异验证：去掉修复后测试必须红 |
 
 ---
 

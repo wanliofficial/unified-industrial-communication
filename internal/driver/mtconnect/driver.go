@@ -725,6 +725,17 @@ func (c *conn) decodeSample(plan pointPlan, idx *mtcodec.Index) driver.RawSample
 				fmt.Sprintf("point %q: data item %q reports UNAVAILABLE", plan.ref.ID, plan.dataItemID),
 				false, nil)}
 	}
+	// Category 是 CONDITION 但级别读不出来：Agent 用了非标准的级别元素名，
+	// 或只写了条件类型。语义上它是报警，不能当普通文本上报（那会得到
+	// quality=good + value="OVERHEAT"），也不能静默成空值。
+	if item.Category == mtcodec.CategoryCondition && item.Condition == "" {
+		return driver.RawSample{PointID: plan.ref.ID, Quality: model.QualityBad,
+			Err: driver.E(driver.ErrProtocol, "read", c.devID,
+				fmt.Sprintf("point %q: data item %q is a condition (type %q) but carries no recognised level "+
+					"(expected Normal/Warning/Fault/Unavailable); raw text %q",
+					plan.ref.ID, plan.dataItemID, item.Type, item.Text),
+				false, nil)}
+	}
 	raw := item.Value()
 	if raw == "" {
 		return driver.RawSample{PointID: plan.ref.ID, Quality: model.QualityBad,
@@ -743,20 +754,32 @@ func (c *conn) decodeSample(plan pointPlan, idx *mtcodec.Index) driver.RawSample
 				fmt.Sprintf("point %q: data item %q value %q cannot be read as %s%s",
 					plan.ref.ID, plan.dataItemID, raw, plan.ref.DataType, hint), false, err)}
 	}
-	return driver.RawSample{PointID: plan.ref.ID, Value: v, Quality: conditionQuality(item.Condition)}
+	return driver.RawSample{PointID: plan.ref.ID, Value: v, Quality: conditionQuality(item)}
 }
 
-// conditionQuality 把条件级别映射成平台质量位。条件点的值本身就是级别，因此
-// 级别即质量：FAULT 是坏值、WARNING 是不确定、NORMAL 是好值。
-func conditionQuality(level mtcodec.ConditionLevel) model.Quality {
-	switch level {
+// conditionQuality 把一条观测折成平台质量位。
+//
+// 条件点的值就是级别，因此级别即质量：FAULT 坏值、WARNING 不确定、NORMAL 好值。
+// 关键在于**级别缺失时不能默认成好值**：Agent 可能写了非标准的级别元素名
+// （`<BogusLevel>OVERHEAT</BogusLevel>`），或只写条件类型不写级别。这类观测
+// 的语义仍然是「报警」，只是我们读不出严重度——按 good 上报等于把一条告警
+// 静默吞掉，而这正是本驱动最容易犯的错（它能解析、字段也不空，看不出异常）。
+// 因此 Category==CONDITION 却拿不到合法级别时一律判坏。
+func conditionQuality(item mtcodec.Item) model.Quality {
+	if item.Category != mtcodec.CategoryCondition {
+		return model.QualityGood
+	}
+	switch item.Condition {
 	case mtcodec.ConditionFault:
 		return model.QualityBad
 	case mtcodec.ConditionWarning:
 		return model.QualityUncertain
-	default:
+	case mtcodec.ConditionNormal:
 		return model.QualityGood
 	}
+	// 走到这里只有两种情况：级别为空（Agent 没写或写了不认识的名字），
+	// 或 UNAVAILABLE（已在上游 Item.Unavailable() 拦下，这里兜底）。
+	return model.QualityBad
 }
 
 // ---------------------------------------------------------------------------

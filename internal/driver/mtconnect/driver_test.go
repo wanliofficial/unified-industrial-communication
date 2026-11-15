@@ -115,6 +115,107 @@ func TestReadUnavailableIsBadNotError(t *testing.T) {
 	}
 }
 
+// TestConditionWithoutLevelIsBadNotGood 是本驱动最容易犯的错的反向断言：
+// Agent 写了非标准的级别元素名时，那条观测仍然是「报警」，不能因为
+// 读不出级别就回落成普通文本上报（那会得到 quality=good + value="OVERHEAT"，
+// 一条告警被静默吞掉，而且看起来完全正常）。
+func TestConditionWithoutLevelIsBadNotGood(t *testing.T) {
+	cases := []struct{ name, conds string }{
+		// 平铺写法 + 未知元素名：这是**唯一**真正可观测的 fail-open 路径。
+		// 文本非空（"OVERHEAT"），若无「条件缺级别」判定，就会按 string 解出
+		// 来照常上报 quality=good+value="OVERHEAT"——看起来完全正常。
+		{"平铺未知元素名", `<Conditions><Bogus dataItemId="alm" type="SYSTEM" sequence="5">` +
+			`OVERHEAT</Bogus></Conditions>`},
+		// 两层写法 + 未知内层级别名：文本落在外层（为空），会被「空值」分支
+		// 拦成 bad；这里仍要断言 bad，但更要断言错误文案说清是「级别读不出来」
+		// 而不是误报成「空值」。
+		{"未知级别元素名", `<Conditions><System dataItemId="alm" type="SYSTEM" sequence="5">` +
+			`<BogusLevel sequence="5">OVERHEAT</BogusLevel></System></Conditions>`},
+		{"外层无内层", `<Conditions><System dataItemId="alm" type="SYSTEM" sequence="5">` +
+			`</System></Conditions>`},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			body := `<MTConnectStreams><Header/><Streams><DeviceStream name="VMC" uuid="u1">` +
+				`<ComponentStream component="Controller" name="c">` + c.conds +
+				`</ComponentStream></DeviceStream></Streams></MTConnectStreams>`
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				_, _ = w.Write([]byte(body))
+			}))
+			defer srv.Close()
+
+			c2 := openMTConnect(t, srv.URL, deviceWithPoints(pt("alm", "alm", "string")))
+			defer c2.Close()
+			out, err := c2.Read(context.Background(), span(pt("alm", "alm", "string")))
+			if err != nil {
+				t.Fatalf("Read 不应整体报错（单点问题不升级为链路错误）: %v", err)
+			}
+			if len(out) != 1 {
+				t.Fatalf("got %d samples", len(out))
+			}
+			if out[0].Quality == model.QualityGood {
+				t.Fatalf("条件缺级别必须判坏，实际 quality=%q value=%v err=%v",
+					out[0].Quality, out[0].Value, out[0].Err)
+			}
+			if out[0].Err == nil {
+				t.Fatal("应附带「级别读不出来」的诊断，否则运维只看到 bad 不知原因")
+			}
+			// 平铺未知元素名这条：文本非空且是合法的 string，若无「条件缺级别」
+			// 判定就会一路走到 conditionQuality 并（fail-open 时）返回 good。
+			// 额外断言错误文案不要误报成「空值」——那会把排查引向错误方向。
+			if c.name == "平铺未知元素名" {
+				if out[0].Value.Type == model.TypeString && out[0].Value.Text == "OVERHEAT" &&
+					out[0].Quality == model.QualityGood {
+					t.Fatal("无法识别的告警被当成正常字符串上报（fail-open）")
+				}
+				if strings.Contains(out[0].Err.Error(), "empty value") {
+					t.Fatalf("错误文案误报成空值：%v", out[0].Err)
+				}
+			}
+		})
+	}
+}
+
+// TestConditionLevelsMapToQuality 钉住四态映射的两端：Fault→bad、
+// Warning→uncertain、Normal→good、Unavailable→bad。
+func TestConditionLevelsMapToQuality(t *testing.T) {
+	body := `<MTConnectStreams><Header/><Streams><DeviceStream name="VMC" uuid="u1">` +
+		`<ComponentStream component="Controller" name="c"><Conditions>` +
+		`<Fault dataItemId="f" type="SYSTEM" sequence="1">x</Fault>` +
+		`<Warning dataItemId="w" type="SYSTEM" sequence="2">x</Warning>` +
+		`<Normal dataItemId="n" type="SYSTEM" sequence="3">x</Normal>` +
+		`<Unavailable dataItemId="u" type="SYSTEM" sequence="4"/>` +
+		`</Conditions></ComponentStream></DeviceStream></Streams></MTConnectStreams>`
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(body))
+	}))
+	defer srv.Close()
+
+	points := []model.Point{
+		pt("f", "f", "string"), pt("w", "w", "string"),
+		pt("n", "n", "string"), pt("u", "u", "string"),
+	}
+	c := openMTConnect(t, srv.URL, deviceWithPoints(points...))
+	defer c.Close()
+	out, err := c.Read(context.Background(), span(points...))
+	if err != nil {
+		t.Fatalf("Read: %v", err)
+	}
+	got := map[string]model.Quality{}
+	for _, s := range out {
+		got[s.PointID] = s.Quality
+	}
+	want := map[string]model.Quality{
+		"f": model.QualityBad, "w": model.QualityUncertain,
+		"n": model.QualityGood, "u": model.QualityBad,
+	}
+	for id, q := range want {
+		if got[id] != q {
+			t.Errorf("point %s quality = %q，应为 %q", id, got[id], q)
+		}
+	}
+}
+
 func TestReadMissingIDIsAddressError(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte(`<MTConnectStreams><Header/><Streams><DeviceStream name="VMC" uuid="u1">` +

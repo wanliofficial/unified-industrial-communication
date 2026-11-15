@@ -141,6 +141,82 @@ func TestParseStreamsConditionUnavailableFlat(t *testing.T) {
 	}
 }
 
+// TestParseStreamsConditionWithoutLevel 钉住「条件缺级别」这一形态：它必须
+// 保留 Category=CONDITION，同时让 LevelKnown() 明确为 false。
+//
+// 为什么不能把它当成普通事件：调用方只看 Condition=="" 就会回落成「普通文本」，
+// 于是一条读不出严重度的告警会被上报成 quality=good + value="OVERHEAT"——
+// 这正是本驱动最容易犯的错（能解析、字段不空、看不出异常）。能否识别出「级别
+// 缺失」决定了驱动是 fail-open 还是 fail-closed。
+func TestParseStreamsConditionWithoutLevel(t *testing.T) {
+	cases := []struct{ name, conds string }{
+		{"未知级别元素名", `<Conditions><System dataItemId="alm" type="SYSTEM" timestamp="t" sequence="5">` +
+			`<BogusLevel timestamp="t" sequence="5">OVERHEAT</BogusLevel></System></Conditions>`},
+		{"外层无内层", `<Conditions><System dataItemId="alm" type="SYSTEM" timestamp="t" sequence="5">` +
+			`</System></Conditions>`},
+		{"平铺+未知元素名", `<Conditions><Bogus dataItemId="alm" type="SYSTEM" timestamp="t" sequence="5">` +
+			`OVERHEAT</Bogus></Conditions>`},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			doc := `<MTConnectStreams><Header/><Streams><DeviceStream name="d" uuid="u">` +
+				`<ComponentStream component="Controller" name="c">` + c.conds +
+				`</ComponentStream></DeviceStream></Streams></MTConnectStreams>`
+			s, err := ParseStreams([]byte(doc))
+			if err != nil {
+				t.Fatalf("parse: %v", err)
+			}
+			it, ok := s.Index().Lookup("alm")
+			if !ok {
+				t.Fatal("alm 应被索引（它是一条条件观测，不是噪声）")
+			}
+			if it.Category != CategoryCondition {
+				t.Fatalf("Category = %q，应为 CONDITION（语义仍是报警）", it.Category)
+			}
+			if it.Condition != "" {
+				t.Fatalf("Condition = %q，本用例应构造「级别缺失」", it.Condition)
+			}
+			if it.IsCondition() {
+				t.Fatal("IsCondition 应为 false：它表示「带合法级别」")
+			}
+			if it.LevelKnown() {
+				t.Fatal("LevelKnown 应为 false：级别缺失必须让调用方判得出")
+			}
+		})
+	}
+}
+
+// TestParseStreamsLevelKnownTrue 是上一条的对照组：带合法级别的条件
+// LevelKnown 必须为 true，否则修复会「一律判坏」。
+func TestParseStreamsLevelKnownTrue(t *testing.T) {
+	doc := `<MTConnectStreams><Header/><Streams><DeviceStream name="d" uuid="u">` +
+		`<ComponentStream component="Controller" name="c">` +
+		`<Conditions><System dataItemId="alm" type="SYSTEM" timestamp="t" sequence="5">` +
+		`<Fault timestamp="t" sequence="5">OVERHEAT</Fault></System></Conditions>` +
+		`</ComponentStream></DeviceStream></Streams></MTConnectStreams>`
+	s, err := ParseStreams([]byte(doc))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	it, _ := s.Index().Lookup("alm")
+	if !it.LevelKnown() || !it.IsCondition() || it.Condition != ConditionFault {
+		t.Fatalf("带 Fault 级别的条件应 LevelKnown=true: %+v", it)
+	}
+	// 非条件观测不该被 LevelKnown 误伤。
+	sample := `<MTConnectStreams><Header/><Streams><DeviceStream name="d" uuid="u">` +
+		`<ComponentStream component="Axes" name="x">` +
+		`<Samples><Position dataItemId="Xabs" timestamp="t" sequence="1">12.5</Position>` +
+		`</Samples></ComponentStream></DeviceStream></Streams></MTConnectStreams>`
+	s2, err := ParseStreams([]byte(sample))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	pos, _ := s2.Index().Lookup("Xabs")
+	if !pos.LevelKnown() {
+		t.Fatalf("非条件观测应恒为 LevelKnown=true: %+v", pos)
+	}
+}
+
 func TestParseStreamsUnavailableSample(t *testing.T) {
 	doc := `<MTConnectStreams><Header/><Streams><DeviceStream name="d" uuid="u">` +
 		`<ComponentStream component="Systems" name="s">` +
