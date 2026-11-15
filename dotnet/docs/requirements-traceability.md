@@ -12,8 +12,8 @@ PRD 中 M 级的采集协议已全部落地，FR-CFG-01 的四类寻址模型也
 可自动跑的用例（见 §7），唯一剩下的延期项是 object 寻址的实际驱动，
 见 [protocol-status.md](protocol-status.md) §4.1。
 
-当前测试基线：**361 passed / 0 failed / 3 skipped**（跳过的是需要 `--opcua` 的 OPC UA 端到端用例）；
-加 `-- --opcua` 跑全量是 **364 passed / 0 failed / 0 skipped**。
+当前测试基线：**362 passed / 0 failed / 3 skipped**（跳过的是需要 `--opcua` 的 OPC UA 端到端用例）；
+加 `-- --opcua` 跑全量是 **365 passed / 0 failed / 0 skipped**。
 
 ## 1. 采集（FR-COL）
 
@@ -40,7 +40,7 @@ PRD 中 M 级的采集协议已全部落地，FR-CFG-01 的四类寻址模型也
 | FR-CFG-02 | 数据类型系统（≥8 类，含数组） | 已实现 | 13 种标量类型（bool/int/uint 16/32/64/float 32/64/string/BCD16/BCD32/bytes/datetime）；datetime 固定 4 寄存器 int64 Unix 毫秒 UTC，北向用 ISO-8601 UTC 文本：`codec/datetime_is_unix_milliseconds`、`json/datavalue_wire_shape_is_stable`、`opcua/anonymous_session_read_write_subscribe`。数组用「元素类型 + 元素个数」正交表达（`dataType` + `count`），只允许定宽数值类型，逐元素套字节序、逐元素缩放、死区取最大变化：`codec/array_roundtrip_per_element_byte_order`、`codec/array_encode_rejects_wrong_element_count`、`codec/array_rejects_non_numeric_element_types`、`json/datavalue_array_shape`、`json/config_point_count_roundtrip`、`pipeline/array_scales_element_wise`、`pipeline/deadband_array_uses_largest_change`、`config/array_count_rules`、`csv/imports_array_count`、`contract/points_expose_array_count_and_values`，另 4 份数组黄金帧 |
 | FR-CFG-03 | 字节序 ABCD/CDAB/BADC/DCBA | 已实现 | 四种排列见 `codec/byte_order_encodes_as_expected`、`codec/byte_order_roundtrip`、`json/enums_are_lowercase_wire_names`；字序只作用于 32/64 位数值，`string`/`bytes` 按原样字节流读写（否则设备级 `byteOrder` 为 `float32` 设成 `cdab` 会把该设备所有文本点位读成乱码）：`codec/byte_order_does_not_scramble_text` |
 | FR-CFG-04 | 设备模板 + 参数化实例化（≥50 实例） | 已实现 | `template/instantiate_fifty_devices`（50 个实例逐个断言）、`contract/template_instantiates_and_applies_devices`、`template/rejects_bad_parameters`、`template/store_rejects_unknown_placeholder` |
-| FR-CFG-05 | 点表 CSV 导入（地址表达式 + 命名规则） | 已实现 | `csv/address_expressions`、`csv/import_merges_and_reports_conflicts`、`contract/points_csv_import_previews_and_applies`；支持 `40001` / `holding:100` / 分列三种写法 |
+| FR-CFG-05 | 点表 CSV 导入（地址表达式 + 命名规则） | 已实现 | `csv/address_expressions`、`csv/import_merges_and_reports_conflicts`、`csv/rejects_non_register_addressing`、`contract/points_csv_import_previews_and_applies`；支持 `40001` / `holding:100` / 分列三种写法；**只表达寄存器寻址**——file/symbol/object 的专属列（fileId/recordId/path/objectType）与非 register 的 `kind` 值会被明确拒绝并提示改用 JSON 配置，不当成寄存器地址静默忽略 |
 | FR-CFG-06 | 命名唯一性与非法字符校验 | 已实现 | `config/rejects_invalid_documents`；通道/设备/点位各自的重复 id 与命名规则都在 `ModelValidator` 里一次列全 |
 | FR-CFG-07 | 配置 Schema 校验（启动即校验） | 已实现 | `config/rejects_invalid_documents`、`contract/config_validate_reports_problems`；非法配置退出码 2。`uic check` 与启动共用同一份引用检查（`Scheduler.CheckReferences`）与同一组驱动注册表：协议没注册时同样退出码 2 并指出 `channels[x].protocol`，不会「check 通过、启动失败」：`sdk/check_command_rejects_unregistered_protocol`、`sdk/check_references_flags_unregistered_protocol` |
 | FR-CFG-08 | 配置版本化（内容哈希）+ 历史列表 | 已实现 | `config/id_is_content_addressed`、`config/recommit_of_identical_content_keeps_one_version`、`config/bootstrap_prefers_current_pointer` |

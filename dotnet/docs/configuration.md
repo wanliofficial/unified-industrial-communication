@@ -366,6 +366,11 @@ Broker 侧用 TLS + 网络 ACL 把订阅方限定到固定网段，与 OPC UA �
 
 这个点位读回的是一条 6 个寄存器（24 字节）的连续记录，`array` 里是 3 个 float。
 
+> **CSV 导入不支持 file（以及 symbol / object）寻址。** 点表 CSV 的地址列只有寄存器寻址的
+> 三种写法（`area:offset`、Modbus 参考号、分列）；`fileId`/`recordId`/`path`/`objectType`
+> 没有对应的列。带这些列的 CSV 会在导入时被明确拒绝（提示改用 JSON 配置），而不是被当成
+> 寄存器地址静默忽略。文件点位需要在 JSON 文档里配（`config/validate` → `config/apply`）。
+
 ### 寄存器寻址
 
 寄存器寻址的 `area` 取值：

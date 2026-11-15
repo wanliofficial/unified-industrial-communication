@@ -1,4 +1,5 @@
 using System.Globalization;
+using System.Linq;
 using System.Text;
 using Uic.Domain;
 
@@ -55,6 +56,24 @@ public static class PointCsv
                 problems.Add(new ValidationProblem("csv.header", $"missing required column '{required}'"));
         }
 
+        // 非寄存器寻址的专属列在表头就能识别：fileId/recordId/path/objectType 没有对应的
+        // 寄存器列，出现即说明意图不在寄存器寻址上。在表头阶段就拒绝，比让它落到「缺
+        // address 列」或「area 为空」的误导性错误好查。（kind 的值是按行的，表头读不出来，
+        // 由 ParseCsvAddress 逐行处理。）
+        static bool HasColumn(Dictionary<string, int> h, params string[] names)
+            => names.Any(h.ContainsKey);
+
+        if (HasColumn(header, "fileid", "recordid"))
+        {
+            problems.Add(new ValidationProblem("csv.header",
+                "file addressing columns (fileId/recordId) are not supported by CSV import — configure file addressing in the JSON document (config/validate, config/apply)"));
+        }
+        else if (HasColumn(header, "objecttype") || HasColumn(header, "path"))
+        {
+            problems.Add(new ValidationProblem("csv.header",
+                "symbol/object addressing columns (path/objectType) are not supported by CSV import — configure them in the JSON document (config/validate, config/apply)"));
+        }
+
         if (!header.ContainsKey("address") &&
             !(header.ContainsKey("area") && header.ContainsKey("offset")))
         {
@@ -105,8 +124,15 @@ public static class PointCsv
             }
 
             var addressProblems = new List<ValidationProblem>();
-            var address = ParseAddress(Field("address"), Field("area"), Field("offset"),
-                Field("bit"), out var addressError);
+
+            // CSV 的地址表达式只能表达寄存器寻址（area:offset、Modbus 参考号、分列）。
+            // file/symbol/object 三类寻址的字段没有对应的列，若放行就会被当成寄存器地址：
+            // 一个 kind=file 的行会落到「area 为空」的校验失败，报一个跟真实意图无关的错。
+            // 这里在解析前就把意图识别出来，直接说清楚「用 JSON 配置」，比误导好查。
+            var address = ParseCsvAddress(Field, line, addressProblems);
+            var addressError = addressProblems.Count > 0
+                ? (string?)string.Join("; ", addressProblems.Select(p => p.Message))
+                : null;
 
             if (address is null)
             {
@@ -247,6 +273,54 @@ public static class PointCsv
     /// 2. Modbus 参考号（40001、30001.3、00001、10001）；
     /// 3. 分列填写 area + offset + bit。
     /// </summary>
+    // ------------------------------------------------------------------
+    // CSV 行地址解析：先识别非寄存器寻址的意图，再回落到寄存器解析
+    // ------------------------------------------------------------------
+
+    /// <summary>
+    /// 解析一行 CSV 的地址。CSV 的列只覆盖寄存器寻址；file/symbol/object 的字段
+    /// （kind/fileId/recordId/path/objectType）没有对应列。若一行里出现了这些列，
+    /// 说明用户想配非寄存器寻址——与其把它当寄存器解析出一个误导性的「area 为空」错误，
+    /// 不如直接点明「CSV 只支持寄存器寻址，请改用 JSON 配置」。
+    /// </summary>
+    /// <param name="field">按列名取值（已归一化为小写）。</param>
+    private static Address? ParseCsvAddress(
+        Func<string, string?> field,
+        int line,
+        List<ValidationProblem> problems)
+    {
+        // kind 列：显式声明寻址类型。非 register 一律拒绝。
+        var kind = field("kind");
+        if (!string.IsNullOrWhiteSpace(kind) &&
+            !string.Equals(kind.Trim(), "register", StringComparison.OrdinalIgnoreCase))
+        {
+            problems.Add(new ValidationProblem($"line {line}.kind",
+                $"CSV import supports register addressing only; '{kind.Trim()}' addressing " +
+                "has no CSV columns — configure it in the JSON document (config/validate, config/apply)"));
+            return null;
+        }
+
+        // 即使没有 kind 列，出现了 file/object/symbol 专属字段也说明意图不在寄存器寻址上。
+        static bool HasAny(Func<string, string?> f, params string[] names)
+            => names.Any(n => !string.IsNullOrWhiteSpace(f(n)));
+
+        if (HasAny(field, "fileid", "recordid"))
+        {
+            problems.Add(new ValidationProblem($"line {line}.address",
+                "file addressing (fileId/recordId) has no CSV columns — configure it in the JSON document"));
+            return null;
+        }
+
+        if (HasAny(field, "objecttype") || HasAny(field, "path"))
+        {
+            problems.Add(new ValidationProblem($"line {line}.address",
+                "symbol/object addressing (path/objectType) has no CSV columns — configure it in the JSON document"));
+            return null;
+        }
+
+        return ParseAddress(field("address"), field("area"), field("offset"), field("bit"), out _);
+    }
+
     public static Address? ParseAddress(
         string? expression,
         string? area,

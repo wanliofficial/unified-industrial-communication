@@ -25,6 +25,7 @@ internal static class ConfigFeatureTests
         tests.Add(new TestCase("csv/imports_deadband_mode_and_range", ImportDeadbandModeAndRange));
         tests.Add(new TestCase("csv/imports_point_interval", ImportPointInterval));
         tests.Add(new TestCase("csv/imports_array_count", ImportArrayCount));
+        tests.Add(new TestCase("csv/rejects_non_register_addressing", RejectsNonRegisterAddressing));
         tests.Add(new TestCase("config/deadband_and_range_rules", DeadbandAndRangeRules));
         tests.Add(new TestCase("config/array_count_rules", ArrayCountRules));
         tests.Add(new TestCase("config/migration_is_explicit_and_versioned", MigrationIsExplicitAndVersioned));
@@ -317,6 +318,63 @@ internal static class ConfigFeatureTests
                                       """, Array.Empty<Point>(), "d1");
         t.Ok(!garbage.Ok, "a non-duration is rejected");
         t.Contains(string.Join("; ", garbage.Problems), "line 2", "the problem points at the row");
+
+        return Task.CompletedTask;
+    }
+
+    /// <summary>
+    /// CSV 只支持寄存器寻址：file/symbol/object 的字段没有对应的列。
+    /// 若不拦截，一个 kind=file 的行会被当成寄存器地址、报一个跟意图无关的「area 为空」，
+    /// 误导排查。这里断言三种非寄存器意图都被点名拒绝，且提示改用 JSON 配置。
+    /// </summary>
+    private static Task RejectsNonRegisterAddressing(TestContext t)
+    {
+        // fileId/recordId 列：表头即识别。
+        var fileById = PointCsv.Import("""
+                                         id,kind,fileId,recordId
+                                         recipe,file,1,0
+                                         """, Array.Empty<Point>(), "d1");
+        t.Ok(!fileById.Ok, "a fileId/recordId row is rejected");
+        t.Contains(string.Join("; ", fileById.Problems), "JSON document",
+            "the message points at the JSON configuration path");
+        t.Contains(string.Join("; ", fileById.Problems), "csv.header", "the rejection is at the header");
+
+        var fileByColumn = PointCsv.Import("""
+                                            id,fileId,recordId
+                                            recipe,1,0
+                                            """, Array.Empty<Point>(), "d1");
+        t.Ok(!fileByColumn.Ok, "a fileId/recordId column is rejected even without a kind column");
+
+        // symbol/object：path / objectType 列。
+        var symbol = PointCsv.Import("""
+                                      id,kind,path
+                                      temp,symbol,ns=2;s=Demo.Temp
+                                      """, Array.Empty<Point>(), "d1");
+        t.Ok(!symbol.Ok, "a path column is rejected");
+
+        var objectKind = PointCsv.Import("""
+                                          id,kind,objectType,instance
+                                          lvl,object,analogInput,3
+                                          """, Array.Empty<Point>(), "d1");
+        t.Ok(!objectKind.Ok, "an objectType column is rejected");
+
+        // kind 值非 register（但没有专属列）：由逐行解析拒绝，报出行号。
+        var kindByValue = PointCsv.Import("""
+                                          id,kind,address
+                                          p,file,holding:0
+                                          """, Array.Empty<Point>(), "d1");
+        t.Ok(!kindByValue.Ok, "a kind=file value is rejected even without file/symbol columns");
+        t.Contains(string.Join("; ", kindByValue.Problems), "register addressing only",
+            "the row message says CSV is register-only");
+        t.Contains(string.Join("; ", kindByValue.Problems), "line 2", "the problem points at the row");
+
+        // 寄存器寻址不受影响：三种合法写法仍通过。
+        var register = PointCsv.Import("""
+                                        id,address
+                                        p1,40001
+                                        p2,holding:20
+                                        """, Array.Empty<Point>(), "d1");
+        t.Ok(register.Ok, $"register addressing still imports: {string.Join("; ", register.Problems)}");
 
         return Task.CompletedTask;
     }

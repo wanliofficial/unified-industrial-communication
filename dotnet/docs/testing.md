@@ -16,13 +16,13 @@ dotnet run --project tests/Uic.Tests -- --stop-on-fail      # 首个失败即停
 正常输出：
 
 ```
-361 passed, 0 failed, 3 skipped · 220.6s
+362 passed, 0 failed, 3 skipped · 220.6s
 ```
 
 加 `--opcua` 跑全量（含 3 条需外部 OPC UA 环境的端到端）：
 
 ```
-364 passed, 0 failed, 0 skipped · 289.1s
+365 passed, 0 failed, 0 skipped · 289.1s
 ```
 
 耗时随机器负载波动较大：219 条时在同一台机器上空载量到 65.5 s，233 条在同时跑着
@@ -41,6 +41,7 @@ dotnet run --project tests/Uic.Tests -- --stop-on-fail      # 首个失败即停
 331/334 条在 `load average` 5.7–8.3 时量到 429.1 s / 428.5 s；332/335 条在 `load average` 5.7–13.8 时量到
 3023.4 s / 759.3 s（那次机器另有别的负载，单条契约用例仍在 90 s 以内——差别是排队）；
 334/337 条在 `load average` 5.5–16 时量到 2206.7 s / 1540.9 s；357/360 条在 `load average` 6 时量到 156.5 s / 170.3 s；361/364 条（补了 4 份文件记录黄金帧）在 `load average` 20–26 时量到 220.6 s / 289.1 s。
+362/365 条（补了 `csv/rejects_non_register_addressing`）在 `load average` 5 时量到 159.1 s / 197.6 s。
 347/350 条在 `load average` 5–7.5（另有数天未退的高 CPU 后台进程）时，全量 5729.1 s、
 其中 15 条 `contract/*` 触到 180 s 硬超时；单独复跑这 43 条契约用例全部通过（790.1 s，
 最慢的 `contract/tls_rest_serves_https` 单条 110 s，是宿主启动 + TLS 握手在排队，不是用例退化），
@@ -482,6 +483,7 @@ journal、outbox、MQTT 都按默认关闭——它们各自的成本由 `histor
 | S7 只在 S7-1200/1500 的通用语义上验过 | 符号寻址（0xB2）、S7Plus、TPDU 分片、多连接并发都明确不支持（配置或运行期直接报错，不静默降级）；S7-300/400 的机架/槽位换算与老型号的 PUT/GET 差异没有实机对照 | 现场先用 `uic sim` 的内置从站验通链路，再用真实 CPU 跑一次 `device.selftest`；机架/槽位按型号手册填 `labels.rack` / `labels.slot` |
 | 模板只支持 string/int/bool 三种参数 | 「按站点切换整段点位」这类复杂参数化做不到 | 这是刻意的：更强的模板等于一门配置语言，先把三种类型用透 |
 | CSV 导入一次只写一台设备 | 上千台设备的批量开通需要逐台调用 | 调用方循环；若需要「一个 CSV 覆盖多设备」，在文件里加 `device` 列再扩展 `PointCsv` |
+| CSV 导入无法表达 file/symbol/object 寻址 | 配方、符号、对象类点位的批量开通要走 JSON 配置而非 CSV | 这是刻意的：CSV 的列只覆盖寄存器寻址，新增一套列语义等于一门配置语言。已在 `csv/rejects_non_register_addressing` 与 `docs/configuration.md` 明确：带 fileId/recordId/path/objectType 列的 CSV 会被拒绝并提示改用 JSON 配置 |
 
 串口用例虽然跑在伪终端上，走的是与真串口完全相同的内核 tty 路径（termios、
 行规程、poller），所以 T15–T18 在 pty 上通过是有意义的；但它仍然不是
