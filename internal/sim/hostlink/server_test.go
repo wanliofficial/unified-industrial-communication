@@ -143,6 +143,45 @@ func TestWrongUnitIsSilent(t *testing.T) {
 	}
 }
 
+// TestWriteBitOnWordOnlyAreaKeepsNeighbours：当前 EM 区没有位访问码，驱动只能
+// 「读整字 → 改位 → 写整字」。这条路径必须端到端成立，因为自检命令的
+// `-area em -bit N -write on` 就落在它上面——若 RMW 丢了邻位，现场改一个报警位
+// 会顺手清掉同一字里的其它 15 个。
+func TestWriteBitOnWordOnlyAreaKeepsNeighbours(t *testing.T) {
+	srv := newSim(t, 0)
+	srv.SetWord("em", 5, 0xFFF7) // bit3 = 0，其余全 1
+	c := open(t, srv, 0)
+
+	res, err := c.Write(ctx(), []driver.WriteRequest{{
+		PointID:  "em5.3",
+		Address:  model.Address{Kind: model.AddressRegister, Area: "em", Offset: 5, Bit: 3},
+		DataType: model.TypeBool,
+		Value:    model.BoolValue(true),
+	}})
+	if err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if !res[0].OK {
+		t.Fatalf("write not ok: %+v", res[0])
+	}
+	if got := srv.GetWord("em", 5); got != 0xFFFF {
+		t.Fatalf("em5 = 0x%04X, want 0xFFFF（只置 bit3，其余位必须保留）", got)
+	}
+
+	// 再清回 bit3：同样不能碰邻位。
+	if _, err := c.Write(ctx(), []driver.WriteRequest{{
+		PointID:  "em5.3",
+		Address:  model.Address{Kind: model.AddressRegister, Area: "em", Offset: 5, Bit: 3},
+		DataType: model.TypeBool,
+		Value:    model.BoolValue(false),
+	}}); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if got := srv.GetWord("em", 5); got != 0xFFF7 {
+		t.Fatalf("em5 = 0x%04X, want 0xFFF7（只清 bit3）", got)
+	}
+}
+
 func TestProbe(t *testing.T) {
 	srv := newSim(t, 0)
 	c := open(t, srv, 0)

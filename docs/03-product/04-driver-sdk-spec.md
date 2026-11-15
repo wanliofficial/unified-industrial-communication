@@ -5734,7 +5734,7 @@ Read(spans)
 | 收帧只认 `@` 与 `*`+CR | `Reader.ReadFrame(unit, sid)` 逐字节扫、按 `*`+CR 定界 | 上一轮的迟到应答被当成本轮结果：数据永远慢一轮 |
 | 校验应答单元号 | 不等即静默/报错 | 总线上两台 PLC 重号时，把 A 的数据记到 B 头上，完全看不出异常 |
 | 校验 MRC/SRC 回显 | 命令码对不上即协议错 | 总线噪声或另一台主站的应答串入，被当成真实数据 |
-| 超时文案带排查顺序 | 单元号 → 波特率/校验/停止位 → 端口模式 → 波特率 | 现场只知道「没应答」，不知道先查哪一项 |
+| 超时文案带排查顺序 | 单元号 → 波特率/校验/停止位 → 端口模式 | 现场只知道「没应答」，不知道先查哪一项 |
 
 与 Mewtocol 不同，Host Link **没有 SID 语义歧义问题**：SID 由主站自己维护
 （`transactor.sid++`），只用于把应答配回请求，不承担「重发计数」的协议级
@@ -5791,8 +5791,19 @@ uic hostlinkread -transport serial -port /dev/ttyUSB0 -baud 9600 -dataBits 7 \
 `-probe` 固定读 DM0：它是所有欧姆龙 PLC 都存在的最基础地址，用它当探活点
 不会把「探活点配得对吗」混进链路判断。`-limits` 打印四个单次上限（读 269
 字/538 位、写 267 字/534 位）与推导过程，便于核对「为什么一次读不了 999
-字」。探活失败时把排查顺序直接打出来（单元号 → 串口参数 → 端口模式 → 波特
-率），因为串行现场几乎所有失败都表现为同一句「没有应答」。
+字」。探活失败时把排查顺序直接打出来（单元号 → 串口参数 → 端口模式），
+因为串行现场几乎所有失败都表现为同一句「没有应答」。
+
+写路径的命令行判定单独抽成纯函数 `hostLinkWriteRequest`，只有两条规则，
+但都是「猜错就悄悄改数据」的高危分叉，因此单测钉死：
+
+| 命令行 | 行为 | 猜错的代价 |
+|---|---|---|
+| 给了 `-bit N` | 一律按位写，**不判断该区有没有原生位访问码**。CIO/WR/HR/AR/DM 走 FINS 原子位写；EM 当前区没有位码，驱动退化成「读整字→改位→写整字」的 RMW | 早先 CLI 用 `bit >= 0 && a.BitCapable()` 判断，`-area em -bit 3 -write on` 掉进字写分支：`on` 按数字解析直接报错；换成 `-write 1` 更糟，它发整字写把 em5 其余 15 位全清 0 |
+| 字写（没给 `-bit`） | 一次只写一个字（`Length=1`、`Bit=-1`），`-qty != 1` 直接拒 | 把 `-qty` 当写入宽度会补零清邻字，而且 8 字节宽度触发 DCBA 字节序，连本字都变形：`-qty 4 -write 5` 实测写成 `dm10=0x0500`、`dm11..13=0x0000` |
+
+多字写入应当走点表（那里有类型与宽度）；自检命令是「写一次、看结果」，
+不提供批量写。
 
 `uic sim -protocol hostlink -listen 127.0.0.1:2000` 起内置从站，单元号
 缺省 0，预置初值与 `examples/hostlink.json` 对应：DM0=0x1234、DM1=0x5678、
@@ -5843,8 +5854,10 @@ DM、当前 EM 区 `em`、以及 13 个 bank（`em0`..`em12`）。写错的区�
 | 层 | 用例 |
 |---|---|
 | `codec/hostlink` | `Build`/`ParseRequest`/`ParseResponse` 的黄金字节逐字节钉住；FCS 覆盖 `@` 且不含 `*`/CR；收发两条独立布局（请求无结束码、应答有结束码）；等待时间一位十六进制（0..F 越界拒绝）；单元号两位十进制（0..31）；`FromFINS` 丢弃六个路由字段且 ICF 显式 0x00；`Response.FINS()` 还原标准 FINS 帧；`FrameLen`/`Reader` 的分帧、噪声丢弃与 `*`+CR 定界；结束码 `0x13/0x14/0x15/0x18` 标 `Format()`、`0x03/0x23` 归 permission；`FCSMismatch`/`UnitMismatch` 的 `Comm()` 标记 |
-| `driver/hostlink` | 纯函数：`hostLinkLimits()` 四个上限（269/267/538/534）、`serialDefaults`（仅全空时补 9600-7-E-2）、`unitOf`（0..31、负数与越界拒绝）、`parseOptions`（`gap`/`wait` 边界）、`classifyRead`（超时文案带排查顺序、结束码分层、断链） |
-| `sim/hostlink` | 真实 TCP 回环：16 位字往返（写 DM0 再读回）、位读写 + 邻位不变、float32 低字在前往返（DM2/DM3）、单元号不匹配完全沉默、FCS 错回 0x13、头码不对回 0x16、格式错回 0x14、读超 269 字由 finscore 切块 |
+| `driver/hostlink` | 纯函数：`hostLinkLimits()` 四个上限（269/267/538/534）、`serialDefaults`（仅全空时补 9600-7-E-2，部分配置保留通用缺省 8/N/1）、`unitOf`（0..31、负数与越界拒绝）、`parseOptions`（`gap`/`wait` 边界）、`classifyRead`（超时文案带排查顺序、结束码分层、断链）；`RoundTrip` 对 FINS 结束码按语义分类（地址类 `0x1101..0x1104` → `ErrAddress`/不重试/不计熔断，链路类 `0x0202`/`0x0302` → 可重试，帧长错 `0x18` → 不重试） |
+| `driver/finscore` | `QualityOf`/`endCodeError` 的结束码→质量映射（地址类 `address_error`、链路类 `comm_error`、其余 `bad`）；`*TCPError` 的 `Comm()` 让封装层错误码得 `comm_error` |
+| `sim/hostlink` | 真实 TCP 回环：16 位字往返（写 DM0 再读回）、位读写 + 邻位不变、float32 低字在前往返（DM2/DM3）、**EM 当前区位写走读改写往返（0xFFF7→0xFFFF→0xFFF7、只动 bit3）**、单元号不匹配完全沉默、FCS 错回 0x13、头码不对回 0x16、格式错回 0x14、读超 269 字由 finscore 切块 |
+| `cmd/uic` | `hostLinkWriteRequest` 的写路径判定：给了 `-bit` 一律按位写（**不判区有无原生位码**，EM 区也走位写）、`-qty != 1` 的字写直接拒（避免补零清邻字 + 宽度变化切 DCBA 字节序）、字写 `Length=1`/`Bit=-1`、非法布尔量与非数字拒绝 |
 | `pointtable` | `PolicyFor("hostlink")` == `PolicyFor("fins")`（`WidthRegisters` + `finsAreas`）；正向（字区/float32/位点/EM 当前区/EM bank/别名/大写区名）× 往返（`Canonical()` 能重新解析成同一地址）；反向（未知区名 `dmm`、`em13` 越界、bool 缺位号、位号 16、非 bool 带位号）；Modbus/S7/Mewtocol 拒绝 FINS 区名 |
 
 覆盖率（`go test -count=1 -cover`）：
@@ -5867,10 +5880,10 @@ DM、当前 EM 区 `em`、以及 13 个 bank（`em0`..`em12`）。写错的区�
 | `internal/codec/hostlink/hostlink.go` | 帧常量（`MaxUnit`/`MaxWait`/`MinRequest`/`MinResponse`/`MaxCommandChars`/`MaxResponseChars`/`MaxTextChars`/`MaxDataChars`）、四个单次上限（`MaxReadWords` 等）、`FCS`、`Request`/`Response`/`Build`/`ParseRequest`/`ParseResponse`、`FromFINS`/`Reply`/`Frame.FINS()`/`WrapResponse`、`FrameLen`/`PeekUnit`/`WordsFor`、结束码分类（`EndCodeError`/`EndCodeText`/`Format`） |
 | `internal/codec/hostlink/io.go` | 流式收帧 `Reader`（只认 `@` 与 `*`+CR、逐字节扫、单元号/SID 过滤、噪声容忍） |
 | `internal/driver/finscore/finscore.go` | 与 FINS/TCP 共享的主站会话：区拆分、字/位读、EM 当前区读字取位、按 `Limits` 切块、结束码分类（Host Link 通过 `Limits` 与 `Transactor` 复用，不复制） |
-| `internal/driver/hostlink/driver.go` | 主站：`Meta`（能力/配置字段/出厂串口参数文案）、`Open`（`unitOf`/`parseOptions`/`serialDefaults`）、`transactor`（`FromFINS` 套信封、`Build`、收帧、`MRC/SRC`/单元号校验、结束码分层）、`classifyRead`（超时文案带排查顺序）、`hostLinkLimits` |
+| `internal/driver/hostlink/driver.go` | 主站：`Meta`（能力/配置字段/出厂串口参数文案）、`Open`（`unitOf`/`parseOptions`/`serialDefaults`）、`transactor`（`FromFINS` 套信封、`Build`、收帧、`MRC/SRC`/单元号校验、`hostLinkEndCodeError` 结束码按语义分类）、`classifyRead`（超时文案带排查顺序）、`hostLinkLimits` |
 | `internal/sim/finsmem/finsmem.go` | 与 FINS/TCP 共享的从站内存表（字视图 + 位视图、EM bank、`Respond`） |
 | `internal/sim/hostlink/server.go` | 内置从站（TCP 透传、逐字节扫帧、`*`+CR 定界、单元号过滤沉默、FCS 错 0x13、格式错 0x14、头码错 0x16） |
-| `cmd/uic/hostlinkread.go` | 自检命令（probe / 读写 / limits / json） |
+| `cmd/uic/hostlinkread.go` | 自检命令（probe / 读写 / limits / json）；写路径判定抽成纯函数 `hostLinkWriteRequest`（给 `-bit` 按位写、字写一次一个字）便于单测 |
 | `examples/hostlink.json` | 6 点示例（DM 字、float32、CIO 可写位、可写计数） |
 | `internal/pointtable/address.go` | `PolicyFor("fins", "hostlink")`、`finsAreas`、`finsAliases`、`splitRegisterPrefix` 的 FINS 区名与 EM bank 归一 |
 

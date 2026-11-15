@@ -198,25 +198,24 @@ func hostLinkLimits() finscore.Limits {
 // 报「参数不合法」。而 Host Link 的出厂参数是协议事实（9600-7-E-2），
 // 不写出来就意味着每个点表都得抄一遍这四个值。
 //
-// 只补「完全没配」的情况：只要用户填了任一项，其余项就按通用缺省
-// （8/N/1）走——那是用户已经知道自己在做什么的信号，替他把奇偶校验
-// 改回来反而更意外。
+// 只补「完全没配」的情况：只有 baud/dataBits/parity/stopBits **四项全空**
+// 才补成 9600-7-E-2。只要用户填了任一项，其余项就保持零值，由
+// transport.Normalize 补通用缺省（9600-8-N-1）——那是用户已经知道自己在
+// 做什么的信号，替他把 7 位数据位、偶校验、2 停止位改回来反而更意外：
+// 现场最常见的「只想改波特率」配置（例如 baud=19200）会被悄悄变成
+// 19200-7-E-2，对一台 19200-8-N-1 的 PLC 表现为「发得出去、收不到东西」，
+// 而且不报错——正是本驱动最要避免的那类静默故障。
 func serialDefaults(t model.Transport) model.Transport {
 	if t.Kind != "serial" {
 		return t
 	}
-	if t.Baud == 0 {
-		t.Baud = defaultBaud
+	if t.Baud != 0 || t.DataBits != 0 || t.Parity != "" || t.StopBits != 0 {
+		return t
 	}
-	if t.DataBits == 0 {
-		t.DataBits = defaultDataBits
-	}
-	if t.Parity == "" {
-		t.Parity = defaultParity
-	}
-	if t.StopBits == 0 {
-		t.StopBits = defaultStopBits
-	}
+	t.Baud = defaultBaud
+	t.DataBits = defaultDataBits
+	t.Parity = defaultParity
+	t.StopBits = defaultStopBits
 	return t
 }
 
@@ -360,9 +359,20 @@ func (t *transactor) RoundTrip(ctx context.Context, req []byte) (finscodec.Frame
 				resp.MRC, resp.SRC, frame[10], frame[11]), true, nil)
 	}
 	if resp.FinsEndCode != 0 {
-		return finscodec.Frame{}, driver.E(driver.ErrProtocol, "read", t.devID,
-			(&finscodec.EndCodeError{Code: resp.FinsEndCode}).Error(), true,
-			&finscodec.EndCodeError{Code: resp.FinsEndCode})
+		// 结束码必须按语义分类，**不能一律当协议错**。
+		//
+		// 早先这里写的是 driver.E(driver.ErrProtocol, …, temporary=true)：
+		// 每一类结束码都被标成「可重试」，后果是 0x1103（地址越界）这种点表错误
+		// 被重发一遍（结果相同），并且——更糟——被 driver.CountsTowardBreaker
+		// 计入熔断：一个填错地址的点，会把整台 PLC 标成坏设备。而 0x1101..0x1104
+		// 按 FINS 手册是地址类，本就不该重试也不该熔断；链路类（节点不在网、
+		// 令牌超时、路由表错）才是「重发一次可能就通了」的那一类。
+		//
+		// FINS/TCP 信封对 FINS 结束码的做法是不判定、原样返回；这里的 Host
+		// Link 信封不同：它没有 FINS/TCP 那层分类，只能自己判定。分类依据是
+		// 同一张结束码表（finscodec.EndCodeError.Address/Link），两个驱动因此
+		// 对同一个码给出同一个 Kind 与同一个重试决策。
+		return finscodec.Frame{}, hostLinkEndCodeError(resp.FinsEndCode, t.devID)
 	}
 	parsed, err := finscodec.Parse(resp.FINS())
 	if err != nil {
@@ -380,6 +390,36 @@ func (t *transactor) setDeadline(ctx context.Context) {
 		dl = time.Now().Add(finscore.DefaultTimeout())
 	}
 	_ = t.link.SetDeadline(dl)
+}
+
+// hostLinkEndCodeError 把一个 FINS 结束码（Host Link 应答正文里的 4 位
+// 十六进制）翻译成带分类的驱动错误。
+//
+// 为什么信封层要自己判定，而 FINS/TCP 不用：FINS/TCP 把 FINS 结束码原样返回
+// 给调用方，由 finscore 判定；Host Link 没有那层二进制定长封套，结束码是解析
+// 应答时顺手拿到的，本函数就是这里的等价物。两者必须使用**同一张表**
+// （finscodec.EndCodeError.Address/Link），否则同一个地址错在 TCP 上显示
+// address_error、在串口上只是 bad——而这两个驱动共用的正是 finscore 的命令
+// 语义。
+//
+// 三类的依据是「重发一次会不会好」：
+//
+//   - 地址类（0x1101..0x1104 区码不认识 / 范围超限 / 地址越界 / 写保护）：
+//     ErrAddress，temporary=false。重发一万次结果相同，而且 ErrAddress 走
+//     driver.CountsTowardBreaker 时不计入熔断——设备是好的，是这个点写错了。
+//   - 链路类（0x0201..0x0205、0x0301/0x0302 节点不在网 / 令牌超时 / 路由表
+//     错 / 单元缺失）：ErrProtocol + temporary=true。重发通常正是它等的动作。
+//   - 其余（模式不允许、权限、命令未定义、帧长错……）：ErrProtocol，不重试。
+func hostLinkEndCodeError(code uint16, devID string) error {
+	ec := &finscodec.EndCodeError{Code: code}
+	switch {
+	case ec.Address():
+		return driver.E(driver.ErrAddress, "read", devID, ec.Error(), false, ec)
+	case ec.Link():
+		return driver.E(driver.ErrProtocol, "read", devID, ec.Error(), true, ec)
+	default:
+		return driver.E(driver.ErrProtocol, "read", devID, ec.Error(), false, ec)
+	}
 }
 
 // classifyRead 把「收帧/解析」阶段的错误映射成驱动错误分类。

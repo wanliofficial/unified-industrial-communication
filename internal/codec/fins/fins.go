@@ -231,6 +231,14 @@ func EndCodeText(code uint16) string {
 }
 
 // TCPError 表示 FINS/TCP 封装层错误码非 0。
+//
+// Comm 为 true：封装层错误码（节点号被占用、连接数满、长度过长、不支持的
+// 命令……）全部源于链路而不是点位，质量码必须是 comm_error。没有这个方法时
+// `errors.As(err, &CommError)` 匹配不上，QualityOf 会一路落到 driver.Kind
+// 的兜底分支，把一次可自愈的断链记成 bad——运维会去查点表而不是重连。
+//
+// 注意：封装层错误码（0x01..0x03、0x20..0x24）与 FINS 结束码（0x0201 起）
+// 数值可能巧合，但语义完全无关，不要合并这两张表。
 type TCPError struct {
 	Code uint32
 }
@@ -238,6 +246,9 @@ type TCPError struct {
 func (e *TCPError) Error() string {
 	return fmt.Sprintf("fins/tcp error 0x%08X: %s", e.Code, TCPErrorText(e.Code))
 }
+
+// Comm 报告该错误是否源于链路。见类型注释。
+func (e *TCPError) Comm() bool { return true }
 
 // TCPErrorText 返回 FINS/TCP 错误码说明。
 func TCPErrorText(code uint32) string {

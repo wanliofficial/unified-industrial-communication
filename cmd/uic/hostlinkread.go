@@ -88,6 +88,17 @@ func hostlinkreadCmd(args []string) {
 		fmt.Fprintf(os.Stderr, "-wait 必须在 0..%d 之间（一位十六进制），得到 %d\n", hlcodec.MaxWait, *wait)
 		os.Exit(2)
 	}
+	// 位号与数量在发帧前就拦住：位号越界会变成 FINS 结束码 0x1103（地址错），
+	// 现场看到的是「PLC 说地址错」，而不是「你 -bit 填了 16」。位号 -1 是
+	// 「不做位访问」的合法写法，其余负数同样是笔误。
+	if *bit < -1 || *bit > 15 {
+		fmt.Fprintf(os.Stderr, "-bit 必须在 0..15 之间（0 = LSB）或 -1（不做位访问），得到 %d\n", *bit)
+		os.Exit(2)
+	}
+	if *qty < 1 {
+		fmt.Fprintf(os.Stderr, "-qty 必须 >= 1，得到 %d\n", *qty)
+		os.Exit(2)
+	}
 
 	ch := model.Channel{
 		ID: "ch-hostlink", Protocol: "hostlink",
@@ -235,37 +246,58 @@ func runHostLinkRead(ctx context.Context, c driver.Conn, ch model.Channel, area 
 	}
 }
 
-func runHostLinkWrite(ctx context.Context, c driver.Conn, area string, offset, bit, qty int, value string, asJSON bool) {
-	a, _ := finscodec.Lookup(area)
-	// 有直接位访问码的区（CIO/WR/HR/AR/DM）在 -bit 给定时按位写；当前 EM 区
-	// 没有位码，驱动会退化成「读整字改位写整字」。
-	isBit := bit >= 0 && a.BitCapable()
-
-	var req driver.WriteRequest
-	if isBit {
+// hostLinkWriteRequest 把命令行开关翻译成一条写请求。
+//
+// 抽成纯函数是为了能单测：这条判断一旦错了，错法是「把用户没点名的字或位一
+// 起改掉」，而不是报错——只能在回环里跑一遍才看得出来。
+//
+// 两条判定：
+//
+//  1. **给了 -bit 就按位写，与区有没有原生位访问码无关。** CIO/WR/HR/AR/DM
+//     有原生位写命令（原子、不碰邻位），EM 当前区没有，驱动退化
+//     「读整字 → 改位 → 写整字」。这个分叉属于驱动，CLI 不该替它决定：
+//     早先用 `bit >= 0 && a.BitCapable()` 判断，`-area em -bit 3 -write on`
+//     就掉进字写分支——值是 `on` 按数字解析直接报错；换成 `-write 1` 更糟，
+//     它真的发出整字写，把 em5 其余 15 位全清成 0。
+//
+//  2. **字写一次只写一个字。** 把 -qty 当写入宽度会让后面的字全部补零
+//     （悄悄清邻字），而且宽度变了还会切换多字字节序（8 字节走 DCBA），
+//     连本字的值都变形：`-qty 4 -write 5` 实测写成 dm10=0x0500、
+//     dm11..13=0x0000。多字写入应当走点表（那里有类型与宽度）。
+func hostLinkWriteRequest(area string, offset, bit, qty int, value string) (driver.WriteRequest, error) {
+	if bit >= 0 {
 		v, err := parseOnOff(value)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "布尔量写入值必须是 on|off|1|0: %v\n", err)
-			os.Exit(2)
+			return driver.WriteRequest{}, fmt.Errorf("布尔量写入值必须是 on|off|1|0: %w", err)
 		}
-		req = driver.WriteRequest{
+		return driver.WriteRequest{
 			PointID:  fmt.Sprintf("%s%d.%d", area, offset, bit),
 			Address:  model.Address{Kind: model.AddressRegister, Area: area, Offset: offset, Bit: bit, Length: 1},
 			DataType: model.TypeBool,
 			Value:    model.BoolValue(v),
-		}
-	} else {
-		n, err := parseHostLinkNumber(value)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "%v\n", err)
-			os.Exit(2)
-		}
-		req = driver.WriteRequest{
-			PointID:  fmt.Sprintf("%s%d", area, offset),
-			Address:  model.Address{Kind: model.AddressRegister, Area: area, Offset: offset, Bit: -1, Length: qty},
-			DataType: model.TypeUint16,
-			Value:    model.NumValue(model.TypeUint16, n),
-		}
+		}, nil
+	}
+	if qty != 1 {
+		return driver.WriteRequest{}, fmt.Errorf(
+			"字写一次只写一个字：-qty 必须为 1（位写忽略 -qty），得到 %d", qty)
+	}
+	n, err := parseHostLinkNumber(value)
+	if err != nil {
+		return driver.WriteRequest{}, err
+	}
+	return driver.WriteRequest{
+		PointID:  fmt.Sprintf("%s%d", area, offset),
+		Address:  model.Address{Kind: model.AddressRegister, Area: area, Offset: offset, Bit: -1, Length: 1},
+		DataType: model.TypeUint16,
+		Value:    model.NumValue(model.TypeUint16, n),
+	}, nil
+}
+
+func runHostLinkWrite(ctx context.Context, c driver.Conn, area string, offset, bit, qty int, value string, asJSON bool) {
+	req, err := hostLinkWriteRequest(area, offset, bit, qty, value)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "%v\n", err)
+		os.Exit(2)
 	}
 
 	res, err := c.Write(ctx, []driver.WriteRequest{req})

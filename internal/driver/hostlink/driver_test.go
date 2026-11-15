@@ -74,6 +74,24 @@ func readFrame(t *testing.T, tr *transactor) (finscodec.Frame, error) {
 	return tr.RoundTrip(context.Background(), frame)
 }
 
+// replyWithEndCode 构造一条 FINS 结束码非 0 的合法应答（FCS 正确、单元号与
+// SID 与请求对上），只是把结束码改成 code。
+//
+// 走 BuildResponse 而不是手工改字节：FCS 覆盖整帧正文，手改结束码会先被
+// FCS 校验拦下，测到的是「校验和错」而不是「结束码分类」。
+func replyWithEndCode(code uint16) []byte {
+	resp := hlcodec.Response{
+		Unit: 0, EndCode: 0, ICF: 0x40, MRC: 1, SRC: 1,
+		FinsEndCode: code, Data: nil,
+	}
+	resp.SID = 1
+	b, err := hlcodec.BuildResponse(resp)
+	if err != nil {
+		panic(err)
+	}
+	return b
+}
+
 // goodReply 生成一条「DM0 = v」的合法应答（FCS 正确）。
 func goodReply(sid byte, v uint16) []byte {
 	resp := hlcodec.Response{
@@ -252,6 +270,93 @@ func TestRoundTripTimeoutIsRetryable(t *testing.T) {
 	}
 }
 
+// 结束码按语义分类，不能一律当协议错且可重试。
+//
+// 早先 transactor.RoundTrip 把所有非零 FINS 结束码都包成
+// driver.E(driver.ErrProtocol, …, temporary=true)，后果分两层：
+//
+//   - 地址类（0x1101..0x1104）被当成「可重试」。调度器会为一个填错地址的
+//     点重发，结果完全相同；而重试次数还会把这一轮的采集时延拖长。
+//   - 更严重的是 CountsTowardBreaker：ErrProtocol 计入熔断，于是**一个写错
+//     地址的点数会把整台 PLC 标成坏设备**。设备本身是好的。
+//
+// 现在按同一张结束码表分类（与 FINS/TCP 共用 finscodec.EndCodeError）：
+//
+//   - 地址类 → ErrAddress（不计入熔断、不重试）；
+//   - 链路类（节点不在网 / 令牌超时 / 路由表错）→ ErrProtocol + 可重试；
+//   - 其余 → ErrProtocol，不重试。
+func TestRoundTripEndCodeIsClassified(t *testing.T) {
+	// 结束码在应答里紧跟精简头（ICF/DA2/SA2/SID 之后），FCS 已由
+	// replyWithEndCode 正确计算。
+	reply := replyWithEndCode
+
+	cases := []struct {
+		code    uint16
+		kind    driver.ErrorKind
+		retry   bool
+		breaker bool
+		quality model.Quality
+	}{
+		// 地址越界：点表问题，不重试、不计熔断、质量 address_error。
+		{0x1103, driver.ErrAddress, false, false, model.QualityAddressError},
+		// 区码不认识：同样是地址类。
+		{0x1101, driver.ErrAddress, false, false, model.QualityAddressError},
+		// 令牌超时：链路类，重发有意义。
+		{0x0202, driver.ErrProtocol, true, true, model.QualityCommError},
+		// 目标单元缺失：链路类。
+		{0x0302, driver.ErrProtocol, true, true, model.QualityCommError},
+		// 帧长错：配置/组帧问题，修一次永久消失。
+		{0x0018, driver.ErrProtocol, false, true, model.QualityBad},
+		// 模式不允许：PLC 状态错，重试只会再错一次。
+		{0x0001, driver.ErrProtocol, false, true, model.QualityBad},
+	}
+	for _, tc := range cases {
+		l := &memLink{}
+		l.addFrame(reply(tc.code))
+		tr := newTransactor(l)
+		h := tr.Header()
+		frame, _ := finscodec.BuildMemoryRead(h, finscodec.WordAccess(finscodec.Area{Key: "dm", Word: 0x82}), 0, 0, 1)
+		_, err := tr.RoundTrip(t.Context(), frame)
+		if err == nil {
+			t.Fatalf("结束码 %04X 应报错", tc.code)
+		}
+		if got := driver.KindOf(err); got != tc.kind {
+			t.Errorf("结束码 %04X：kind = %q，要 %q（%v）", tc.code, got, tc.kind, err)
+		}
+		if got := driver.IsRetryable(err); got != tc.retry {
+			t.Errorf("结束码 %04X：retryable = %v，要 %v（%v）", tc.code, got, tc.retry, err)
+		}
+		if got := driver.CountsTowardBreaker(err); got != tc.breaker {
+			t.Errorf("结束码 %04X：计入熔断 = %v，要 %v（%v）", tc.code, got, tc.breaker, err)
+		}
+		if got := finscore.QualityOf(err); got != tc.quality {
+			t.Errorf("结束码 %04X：质量 = %q，要 %q（%v）", tc.code, got, tc.quality, err)
+		}
+	}
+}
+
+// 结束码错误必须原样透传在 OpError.Err 里：QualityOf 靠它把地址类结束码
+// 映射成 address_error（而不是只看外层 Kind 得到 bad）。若哪次重构把
+// Err 丢了，这条会先红。
+func TestRoundTripEndCodeKeepsInnerError(t *testing.T) {
+	b := replyWithEndCode(0x1103)
+	l := &memLink{}
+	l.addFrame(b)
+	tr := newTransactor(l)
+	h := tr.Header()
+	frame, _ := finscodec.BuildMemoryRead(h, finscodec.WordAccess(finscodec.Area{Key: "dm", Word: 0x82}), 0, 0, 1)
+	_, err := tr.RoundTrip(t.Context(), frame)
+
+	var ec *finscodec.EndCodeError
+	if !errors.As(err, &ec) || ec.Code != 0x1103 {
+		t.Fatalf("err = %v，应包含 *EndCodeError{0x1103}", err)
+	}
+	var oe *driver.OpError
+	if !errors.As(err, &oe) || oe.Err == nil {
+		t.Fatalf("err = %v，应保留内层错误", err)
+	}
+}
+
 func TestRoundTripContextCancelled(t *testing.T) {
 	l := &memLink{readErr: timeoutErr{}}
 	tr := newTransactor(l)
@@ -293,6 +398,39 @@ func TestDefaultSerialParams(t *testing.T) {
 	}
 	if got := serialDefaults(model.Transport{Kind: "tcp", Address: "x"}); got.Baud != 0 {
 		t.Fatalf("tcp transport was touched: %+v", got)
+	}
+}
+
+// TestSerialDefaultsPartialKeepsGenericFallback 钉住「部分配置」这一条：
+// 只要用户填了任一项（最常见的场景是只改波特率），其余三项必须保持零值，
+// 由 transport.Normalize 补通用缺省 8/N/1——而不是被强行改成 Host Link 的
+// 7 位数据位 + 偶校验 + 2 停止位。
+//
+// 为什么这条重要：一台配成 19200-8-N-1 的 PLC，如果点表只写了
+// `transport.baud: 19200`，逐字段补缺省会把链路悄悄改成 19200-7-E-2，
+// 结果是「帧发得出去、应答收不回来」，而且不报错——串口现场最典型也最难
+// 定位的假故障。规范 §3.10.19.8 与本函数的注释都写明「只补完全没配」，
+// 这条测试把该行为固定下来。
+func TestSerialDefaultsPartialKeepsGenericFallback(t *testing.T) {
+	// 只改波特率：其余三项保持零，交给 Normalize 补 8/N/1。
+	got := serialDefaults(model.Transport{Kind: "serial", Port: "/dev/ttyUSB0", Baud: 19200})
+	if got.Baud != 19200 {
+		t.Fatalf("explicit baud overridden: %+v", got)
+	}
+	if got.DataBits != 0 || got.Parity != "" || got.StopBits != 0 {
+		t.Fatalf("partial config must keep the untouched fields empty (so Normalize applies 8/N/1), got %+v", got)
+	}
+
+	// 只填校验：同样不应触发 Host Link 出厂值。
+	got = serialDefaults(model.Transport{Kind: "serial", Port: "/dev/ttyUSB0", Parity: "odd"})
+	if got.Parity != "odd" || got.Baud != 0 || got.DataBits != 0 || got.StopBits != 0 {
+		t.Fatalf("partial config with parity only was coerced: %+v", got)
+	}
+
+	// 反向：完全没配时仍必须补 9600-7-E-2（否则就丢了出厂缺省这条事实）。
+	got = serialDefaults(model.Transport{Kind: "serial", Port: "/dev/ttyUSB0"})
+	if got.Baud != 9600 || got.DataBits != 7 || got.Parity != "even" || got.StopBits != 2 {
+		t.Fatalf("empty config must fill the Host Link factory defaults 9600-7-E-2, got %+v", got)
 	}
 }
 

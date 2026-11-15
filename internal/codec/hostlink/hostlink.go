@@ -368,8 +368,14 @@ func ParseResponse(raw []byte) (Response, error) {
 	if err != nil {
 		return Response{}, err
 	}
-	if len(rest) < 2 {
-		return Response{}, fmt.Errorf("hostlink: response is missing the FINS end code")
+	// FINS 结束码是 2 字节 = 4 个字符，所以下面要读 rest[0:4]。守卫的宽度
+	// 必须和读取的宽度一致：早先写成 `< 2`（只覆盖了「一个字节」），随后
+	// parseHex2(rest[2:4]) 会在 rest 恰好 2..3 字符时越界 panic。
+	// 当前该分支不可达——split 按 MinResponse=27 已保证 rest ≥ 4——但这层
+	// 守卫的语义是「防御绕过 split 直接调 ParseResponse 的路径」，就该按真实
+	// 读取宽度写，而不是依赖上游某个常量恰好更大。
+	if len(rest) < 4 {
+		return Response{}, fmt.Errorf("hostlink: response is missing the 4-char FINS end code")
 	}
 	hi, err := parseHex2(rest[0:2])
 	if err != nil {
@@ -504,7 +510,7 @@ func (e *EndCodeError) Error() string {
 
 // Format 报告该结束码是否说明「帧本身写错了」。
 //
-// 这三类错误修一次就永久消失（改帧格式/长度），不该参与重试或熔断统计；
+// 这四类错误修一次就永久消失（改帧格式/长度），不该参与重试或熔断统计；
 // 把它们和「PLC 忙」混在一起，会让一个写错的实现看起来像链路不稳。
 func (e *EndCodeError) Format() bool {
 	switch e.Code {

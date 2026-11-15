@@ -89,16 +89,16 @@ func (l Limits) normalize() Limits {
 	return l
 }
 
+// Transactor 是一个信封实现：把 FINS 帧送出去，把应答拿回来。
+func New(cfg driver.OpenConfig, tr Transactor, lim Limits) *Conn {
+	return &Conn{cfg: cfg, tr: tr, lim: lim.normalize(), devID: cfg.Device.ID}
+}
+
 // CommError 由信封层的错误实现，表示「这次失败源于线路而不是点位」：
 // 校验和不符、单元号串话、迟到的应答。它们的正确质量是通信错误——把
 // 噪声记成「坏值」，运维会去查点表而不是查终端电阻。
 type CommError interface {
 	Comm() bool
-}
-
-// New 组装一个主站连接。tr 与 cfg 都由具体驱动提供。
-func New(cfg driver.OpenConfig, tr Transactor, lim Limits) *Conn {
-	return &Conn{cfg: cfg, tr: tr, lim: lim.normalize(), devID: cfg.Device.ID}
 }
 
 // Conn 实现 driver.Conn 的读/写/探活/关闭。
@@ -603,9 +603,37 @@ func reqWords(req driver.WriteRequest) int {
 // 错误与工具
 // ---------------------------------------------------------------------------
 
+// endCodeError 把一个 FINS/Host Link 结束码翻成带 driver 分类的错误。
+//
+// 这是**信封实现之外**的另一个调用点：finscore 自己在构造结束码错误（点表
+// 里的地址不合法、读回的数据不够长）。同一个结束码，从 Host Link 信封层
+// 抛出和从共享命令层抛出，分类必须一模一样——否则「同一个地址错在 TCP 上
+// 显示 address_error、在串口上只是 bad」，而这两个驱动共用的正是本包。
+//
+// 三类的划分依据是「重发一次会不会好」：
+//
+//   - **地址类**（0x1101..0x1104 区/范围/越界/写保护）：配置或点表问题。重发
+//     一万次结果相同，而且它会走调度器的重试路径，拖长一轮采集；它也不该
+//     计入熔断（设备本身是好的，只是这个点写错了）。
+//   - **链路类**（0x0201..0x0205、0x0301/0x0302 节点不在网/令牌超时/路由表
+//     错）：对端没接住这一帧。重发通常正是它等的动作，所以标为可重试。
+//   - **其余**（模式错、权限、命令未定义、帧长错……）：协议错，重发只会把同
+//     一个错误重复 N 次。
+func endCodeError(code uint16, msg string) error {
+	ec := &finscodec.EndCodeError{Code: code}
+	switch {
+	case ec.Address():
+		return driver.E(driver.ErrAddress, "fins", "", msg, false, ec)
+	case ec.Link():
+		return driver.E(driver.ErrProtocol, "fins", "", msg, true, ec)
+	default:
+		return driver.E(driver.ErrProtocol, "fins", "", msg, false, ec)
+	}
+}
+
 func (c *Conn) areaError(op, name string) error {
-	return driver.E(driver.ErrAddress, op, c.devID,
-		fmt.Sprintf("unknown FINS area %q (supported: %s)", name, strings.Join(finscodec.Areas(), ", ")), false, nil)
+	return endCodeError(0x1101, fmt.Sprintf("unknown FINS area %q (supported: %s)",
+		name, strings.Join(finscodec.Areas(), ", ")))
 }
 
 func (c *Conn) failed(span driver.ReadSpan, err error) []driver.RawSample {
@@ -625,9 +653,26 @@ func (c *Conn) writeFail(req driver.WriteRequest, err error) driver.WriteResult 
 	return driver.WriteResult{PointID: req.PointID, Quality: QualityOf(err), Err: err}
 }
 
-// QualityOf 把一次失败映射成点位质量。顺序有讲究：先看 FINS 结束码（它比
-// 通用驱动错误更具体），再看信封层的噪声标记，最后才按 driver.Kind 归类。
+// QualityOf 把一次失败映射成点位质量。顺序有讲究，因为同一条失败可能既
+// 带着协议层自己的分类、又带着信封层的噪声标记。
+//
+//  1. **结束码**（第 1 步）：`EndCodeError` 按地址/链路/其余三类分。它比
+//     driver.Kind 具体——地址类结束码（0x1101..0x1104）必须得
+//     `address_error`，只靠 Kind 会落到 `bad`。
+//  2. **信封层的噪声标记**（第 2 步）：Comm() 为真说明源于线路（校验和错、
+//     单元号串话、FINS/TCP 封装层错误码），质量记 comm_error。
+//  3. **driver.Kind 兜底**（第 3 步）：超时、地址、断链等。
+//
+// 不在这里解包 OpError.Err 再递归：内层若是 `EndCodeError`，`errors.As`
+// 本来就能穿透 OpError 找到它；内层若是 `*TCPError`，它自己实现了 Comm()，
+// 第 2 步直接命中。所以解包不会改变任何结论，反而让「超时错误内层是
+// *net.OpError」这类路径多绕一圈（而且 net.OpError 归 bad，会误把 timeout
+// 降级）。两层各自负责自己最具体的那个分类，足够且没有歧义。
 func QualityOf(err error) model.Quality {
+	if err == nil {
+		return model.QualityGood
+	}
+	// 1. 结束码：地址类记 address_error、链路类记 comm_error、其余记 bad。
 	var ec *finscodec.EndCodeError
 	if errors.As(err, &ec) {
 		if ec.Address() {
@@ -638,10 +683,13 @@ func QualityOf(err error) model.Quality {
 		}
 		return model.QualityBad
 	}
+	// 2. 信封层的噪声/串话类错误：校验和错、单元号错、迟到应答、FINS/TCP
+	// 封装层错误码（*TCPError 实现 Comm()）。
 	var ce CommError
 	if errors.As(err, &ce) && ce.Comm() {
 		return model.QualityCommError
 	}
+	// 3. 按 driver.Kind 兜底。
 	switch driver.KindOf(err) {
 	case driver.ErrTimeout:
 		return model.QualityTimeout
