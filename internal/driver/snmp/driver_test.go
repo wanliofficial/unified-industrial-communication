@@ -187,6 +187,61 @@ func TestMeta(t *testing.T) {
 	}
 }
 
+// TestMetaExposesV3Config 钉住一件事：v3（USM）已交付，Meta 就必须把
+// version=3 与 v3 的安全参数暴露给配置界面。
+//
+// 这不是文档洁癖。配置界面完全依据 Meta.ConfigFields 渲染：version 的 Enum
+// 缺 "3"，界面就选不出 v3；v3 安全字段缺失，运维就没有地方填 username/
+// authProtocol，USM 配置在界面上根本填不出来。而驱动本身早已支持 v3
+// （parseOptions + newV3Session + 端到端测试），于是出现「底层能用、
+// 界面配不出」的割裂——正是本次 Standards 轴 review 要抓的那类 Meta 与
+// 实现漂移。
+func TestMetaExposesV3Config(t *testing.T) {
+	m := New().Meta()
+
+	byName := map[string]driver.ConfigField{}
+	for _, f := range m.ConfigFields {
+		byName[f.Name] = f
+	}
+
+	// version 必须能选到 3。
+	vf, ok := byName["labels.version"]
+	if !ok {
+		t.Fatal("labels.version field missing")
+	}
+	hasV3 := false
+	for _, e := range vf.Enum {
+		if e == "3" {
+			hasV3 = true
+		}
+	}
+	if !hasV3 {
+		t.Errorf("labels.version Enum = %v，缺 \"3\"：界面选不出 v3", vf.Enum)
+	}
+
+	// v3 的五个安全参数（+ 可选 engineID）必须作为 ConfigField 暴露，且
+	// 口令字段必须是 password 类型（否则界面把认证口令当明文显示）。
+	required := []string{
+		"labels.username", "labels.authProtocol", "labels.authPassword",
+		"labels.privProtocol", "labels.privPassword", "labels.engineID",
+	}
+	for _, name := range required {
+		f, ok := byName[name]
+		if !ok {
+			t.Errorf("v3 配置字段 %q missing", name)
+			continue
+		}
+		if f.Scope == "" {
+			t.Errorf("v3 字段 %q 缺 Scope", name)
+		}
+	}
+	for _, name := range []string{"labels.authPassword", "labels.privPassword"} {
+		if f := byName[name]; f.Type != "password" {
+			t.Errorf("%s Type = %q，应为 password（凭据不能明文展示）", name, f.Type)
+		}
+	}
+}
+
 func TestReadDecodesAllWireTypes(t *testing.T) {
 	table := map[string]snmpcodec.Value{
 		"1.3.6.1.2.1.1.1.0":      snmpcodec.String("Linux router"),
