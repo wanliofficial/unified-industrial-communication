@@ -863,10 +863,15 @@ func numericSpecOf(g, v byte) (numericSpec, bool) {
 			return numericSpec{size: 5, flags: true, kind: 'u'}, true
 		case 2:
 			return numericSpec{size: 3, flags: true, kind: 'U'}, true
+		// 带时标的计数器事件（22v5/v6）：32/16 位值 + 品质 + 6 字节绝对时标，
+		// 合计 11/9 字节。此前误用了组 20「无品质」的 4/2 字节布局，真实从站
+		// 回这两条变体时对象体整体错位——第一个对象就把后续所有对象读歪。
+		// 尺寸与 IEEE 1815 / DNP Users Group AN2013-004b 一致：组 32 带时标
+		// 整型同样是 11/9 字节绝对时标（组 22 没有相对时标变体，只有绝对时标）。
 		case 5:
-			return numericSpec{size: 4, kind: 'u'}, true
+			return numericSpec{size: 11, flags: true, kind: 'u', time: true}, true
 		case 6:
-			return numericSpec{size: 2, kind: 'U'}, true
+			return numericSpec{size: 9, flags: true, kind: 'U', time: true}, true
 		}
 	case GroupAnalogInput:
 		switch v {

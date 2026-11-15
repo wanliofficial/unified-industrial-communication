@@ -321,6 +321,59 @@ func TestParseEventWithTime(t *testing.T) {
 	}
 }
 
+// TestParseCounterEventTimed 钉住带时标的计数器事件（22v5/v6）的对象布局。
+//
+// 这两个变体是「值 + 品质 + 6 字节绝对时标」，合计 11/9 字节。此前实现误用了
+// 组 20「无品质」的 4/2 字节布局：从站回一批 22v5/22v6 事件时，解析按 4/2 字节
+// 切对象，第一个对象就把品质字节与时标当成下一个计数器的值，整批对象全部读歪。
+// 这里用两个对象拼一个缓冲区，既验证单对象的值/品质/时标，又验证不会错位。
+func TestParseCounterEventTimed(t *testing.T) {
+	t1 := time.UnixMilli(1700000000123).UTC()
+	t2 := time.UnixMilli(1700000000456).UTC()
+
+	// 22v5：32 位计数器 + 品质 + 时标（11 字节/对象）。
+	var raw []byte
+	raw = append(raw, GroupCounterEvent, 5, QualIndex8, 2)
+	raw = append(raw, 5, FlagOnline)
+	raw = binary.LittleEndian.AppendUint32(raw, 42)
+	raw = append(raw, EncodeTime48(t1)...)
+	raw = append(raw, 6, FlagOnline)
+	raw = binary.LittleEndian.AppendUint32(raw, 100)
+	raw = append(raw, EncodeTime48(t2)...)
+
+	objs, err := ParseObjects(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(objs) != 2 {
+		t.Fatalf("objects = %d, want 2 (mis-sized layout would misalign and mis-parse)", len(objs))
+	}
+	if objs[0].Index != 5 || objs[0].Value != uint64(42) || !objs[0].HasFlags ||
+		objs[0].Flags != FlagOnline || !objs[0].HasTime || !objs[0].When.Equal(t1) {
+		t.Fatalf("object 0 = %+v", objs[0])
+	}
+	if objs[1].Index != 6 || objs[1].Value != uint64(100) || !objs[1].HasTime ||
+		!objs[1].When.Equal(t2) {
+		t.Fatalf("object 1 = %+v (second object misaligned)", objs[1])
+	}
+
+	// 22v6：16 位计数器 + 品质 + 时标（9 字节/对象）。
+	var raw16 []byte
+	raw16 = append(raw16, GroupCounterEvent, 6, QualIndex8, 1)
+	raw16 = append(raw16, 7, FlagOnline)
+	raw16 = binary.LittleEndian.AppendUint16(raw16, 7)
+	raw16 = append(raw16, EncodeTime48(t1)...)
+
+	objs, err = ParseObjects(raw16)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(objs) != 1 || objs[0].Index != 7 || objs[0].Value != uint64(7) ||
+		!objs[0].HasFlags || !objs[0].HasTime || !objs[0].When.Equal(t1) {
+		t.Fatalf("16-bit timed counter = %+v", objs)
+	}
+}
+
 func TestParseRequestHeaders(t *testing.T) {
 	raw, err := ClassObjects(0, 1, 2, 3)
 	if err != nil {

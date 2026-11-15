@@ -34,6 +34,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"net"
 	"sort"
 	"strconv"
@@ -988,6 +989,15 @@ func (c *conn) writeOne(ctx context.Context, req driver.WriteRequest) (driver.Wr
 		default:
 			variation = 1
 		}
+		// 发报文前先确认这个值能装进选定的线格式。组 41 没有无符号变体，
+		// 整数输出按 int32/int16 下发：越界或带小数的值此前会被
+		// uint32(int32(value)) 静默回绕后发给从站，而驱动报成功——现场表现为
+		// 「下发了错误设定点却显示成功」。与 CoAP 写路径共用同一条原则：
+		// 语义可判定时就判坏并给明确诊断，而不是发一个看起来正常的错误值。
+		if !analogFitsWire(variation, n) {
+			return fail(driver.ErrUnsupported,
+				fmt.Sprintf("point %q: value %g cannot be represented in the selected output type", req.PointID, n))
+		}
 		objects, err := dnp3codec.AnalogOutputObjects(index, variation, n)
 		if err != nil {
 			return fail(driver.ErrInternal, err.Error())
@@ -1218,4 +1228,31 @@ func numericOf(v model.Value) (float64, bool) {
 		return v.Num, true
 	}
 	return 0, false
+}
+
+// analogFitsWire 判断一个浮点值能否按选定线格式原样下发。
+//
+// 组 41 的整型输出没有无符号变体，点位类型到变体的映射是：
+//
+//	int16                 → v2 (int16)
+//	int32/uint16/uint32/
+//	int64/uint64          → v1 (int32)
+//	float32               → v3 (float32)
+//	float64               → v4 (float64)
+//
+// 对整型变体，越界（含 uint32 上半段、int64 大值）与带小数的值都必须在这里
+// 判坏：它们会被编码端的 uint32(int32(value))/uint16(int16(value)) 静默
+// 截断或回绕。uint32/uint64 点位映射到 v1 是协议本身的限制（组 41 无无符号
+// 变体），不是这里能绕过的——值超过 int32 上界时只能拒绝并让点表评审改类型。
+func analogFitsWire(variation byte, n float64) bool {
+	switch variation {
+	case 1: // int32
+		return n == math.Trunc(n) && n >= -2147483648 && n <= 2147483647
+	case 2: // int16
+		return n == math.Trunc(n) && n >= -32768 && n <= 32767
+	case 3: // float32：拒绝 NaN/Inf 与超出 float32 幅度的值（会溢出成 Inf）
+		return !math.IsInf(n, 0) && !math.IsNaN(n) && math.Abs(n) <= math.MaxFloat32
+	default: // 4：float64
+		return !math.IsInf(n, 0) && !math.IsNaN(n)
+	}
 }

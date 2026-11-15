@@ -3,6 +3,7 @@ package dnp3
 import (
 	"context"
 	"errors"
+	"math"
 	"net"
 	"strings"
 	"sync"
@@ -366,6 +367,88 @@ func TestWriteAnalogOutput(t *testing.T) {
 	p, _ := h.srv.Value(sim.AnalogOutput, 0)
 	if p.Num != 12.5 {
 		t.Fatalf("outstation analog output = %v, want 12.5", p.Num)
+	}
+}
+
+// 值装不进选定的输出线格式时，驱动必须在发报文前拒绝并保留从站原值，
+// 而不是把回绕后的错误设定点发给设备却报成功（与 CoAP 写路径同一条原则）。
+func TestWriteAnalogRejectsUnrepresentable(t *testing.T) {
+	// 每种「不可表示」都对应一个 int 输出点：带小数、越界（> MaxInt16/MaxInt32）。
+	cases := []struct {
+		name string
+		dt   model.DataType
+		val  float64
+	}{
+		{"fractional to int16", model.TypeInt16, 12.5},
+		{"above int16 max", model.TypeInt16, 40000},
+		{"below int16 min", model.TypeInt16, -40000},
+		{"fractional to int32", model.TypeInt32, 1.5},
+		{"above int32 max", model.TypeInt32, 3000000000},
+		{"NaN to float64", model.TypeFloat64, math.NaN()},
+		{"+Inf to float32", model.TypeFloat32, math.Inf(1)},
+		{"above float32 max", model.TypeFloat32, 1e40},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newHarness(t)
+			c := h.open()
+
+			// 预置一个已知值：被拒绝的写必须一个字节都不发，所以它应保持不变。
+			const seed = float64(111)
+			if err := h.srv.SetValue(sim.AnalogOutput, 0, seed); err != nil {
+				t.Fatalf("seed: %v", err)
+			}
+
+			_, err := c.Write(context.Background(), []driver.WriteRequest{{
+				PointID:  "ao-bad",
+				DataType: tc.dt,
+				Address:  model.Address{Kind: model.AddressRegister, Area: AreaAnalogOutput, Offset: 0, Bit: -1},
+				Value:    model.NumValue(tc.dt, tc.val),
+			}})
+			if err == nil {
+				t.Fatal("write of unrepresentable value succeeded")
+			}
+			if driver.KindOf(err) != driver.ErrUnsupported {
+				t.Fatalf("kind = %s, want unsupported", driver.KindOf(err))
+			}
+			// 设备必须原封不动：从站模拟量输出保持预置值。
+			after, ok := h.srv.Value(sim.AnalogOutput, 0)
+			if !ok || after.Num != seed {
+				t.Fatalf("outstation value = %v (ok=%v), want untouched %v", after.Num, ok, seed)
+			}
+		})
+	}
+}
+
+// 边界值与浮点写入仍然成功：拒绝逻辑不能误伤合法值。
+func TestWriteAnalogAcceptsRepresentable(t *testing.T) {
+	h := newHarness(t)
+	c := h.open()
+
+	cases := []struct {
+		dt  model.DataType
+		val float64
+	}{
+		{model.TypeInt16, 32767},  // int16 上界
+		{model.TypeInt16, -32768}, // int16 下界
+		{model.TypeInt32, 2147483647},
+		{model.TypeFloat32, 0.5},
+		{model.TypeFloat64, 12.5},
+	}
+	for i, tc := range cases {
+		idx := uint32(100 + i)
+		res, err := c.Write(context.Background(), []driver.WriteRequest{{
+			PointID:  "ao-ok",
+			DataType: tc.dt,
+			Address:  model.Address{Kind: model.AddressRegister, Area: AreaAnalogOutput, Offset: int(idx), Bit: -1},
+			Value:    model.NumValue(tc.dt, tc.val),
+		}})
+		if err != nil {
+			t.Fatalf("%v: write: %v", tc, err)
+		}
+		if len(res) != 1 || !res[0].OK {
+			t.Fatalf("%v: result = %+v", tc, res)
+		}
 	}
 }
 
