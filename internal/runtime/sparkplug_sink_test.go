@@ -170,6 +170,52 @@ func TestSparkplugBirthOrderAndData(t *testing.T) {
 	}
 }
 
+// 序号是边缘节点级的：两台设备交替发布时，线上序号必须连续递增，而不是
+// 各自从 0 开始（那会得到 0,1,0,1）。严格的主机把「序号不连续」当成丢包，
+// 会请求重生或丢弃数据，而发送方完全看不出问题。
+func TestSparkplugSeqIsNodeWide(t *testing.T) {
+	b := mqtttest.New(t, nil)
+	s := newTestSparkplugSink(t, b.URL())
+	defer s.close()
+
+	deliverSample(t, s, "dev1", "p1", 1)
+	deliverSample(t, s, "dev2", "p1", 2)
+	waitTopic(t, b, "spBv1.0/plant-a/DDATA/gw-01/dev2")
+
+	// 按发布顺序取出所有带序号的消息。STATE 是 JSON（没有 seq），
+	// NDEATH 规范要求不带序号，二者都跳过。
+	var kinds []string
+	var seqs []uint64
+	for _, m := range b.Messages() {
+		switch {
+		case strings.HasPrefix(m.Topic, "spBv1.0/plant-a/NBIRTH/"),
+			strings.HasPrefix(m.Topic, "spBv1.0/plant-a/DBIRTH/"),
+			strings.HasPrefix(m.Topic, "spBv1.0/plant-a/DDATA/"),
+			strings.HasPrefix(m.Topic, "spBv1.0/plant-a/DDEATH/"):
+		default:
+			continue
+		}
+		p := decodeMsg(t, m)
+		if !p.HasSeq {
+			t.Fatalf("%s carries no seq; every non-NDEATH message must include one", m.Topic)
+		}
+		kinds = append(kinds, m.Topic[strings.LastIndex(m.Topic, "/")+1:])
+		seqs = append(seqs, p.Seq)
+	}
+	if len(seqs) < 5 {
+		t.Fatalf("got %d sequenced messages (%v), want at least 5", len(seqs), kinds)
+	}
+	if seqs[0] != 0 {
+		t.Fatalf("NBIRTH seq = %d, want 0", seqs[0])
+	}
+	for i := 1; i < len(seqs); i++ {
+		if want := (seqs[i-1] + 1) & 0xFF; seqs[i] != want {
+			t.Fatalf("seq[%d] = %d, want %d (topics %v); the counter must span the node and all its devices",
+				i, seqs[i], want, kinds)
+		}
+	}
+}
+
 // 设备进入 faulted 必须发 DDEATH，并在恢复后重新 DBIRTH。为了不依赖
 // 调制解调器的故障注入时序，这里直接驱动 sink。
 func TestSparkplugDeviceDeath(t *testing.T) {
@@ -217,7 +263,7 @@ func TestSparkplugNodeRebirthCommand(t *testing.T) {
 
 	raw, err := (codec.Payload{Metrics: []codec.Metric{{
 		Name: "Node Control/Rebirth", DataType: codec.TypeBoolean, Value: true,
-	}}}).Encode()
+	}}, OmitSeq: true}).Encode()
 	if err != nil {
 		t.Fatal(err)
 	}

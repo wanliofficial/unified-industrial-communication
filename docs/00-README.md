@@ -1148,7 +1148,8 @@ mosquitto_sub -h 127.0.0.1 -t 'uic/mqtt-lab/#' -v
 
 它和 json 格式**互斥**，不是「多带几个字段」：`format: "sparkplug-b"` 时主题由
 `groupId/nodeId/设备名` 拼出，`topic` 必须留空（配了会启动报错），`retain` 必须
-为 false（只有 STATE 用 retained）。NBIRTH 从 0 开始编号，DBIRTH 把设备序号归零；
+为 false（只有 STATE 用 retained）。序号是节点级的（节点消息与全部设备消息
+共用一个 0..255 计数器，NBIRTH 为 0 并重置），NDEATH 不带序号；
 重连、NCMD `Node Control/Rebirth`、设备从故障恢复都会重发 BIRTH。质量非 good
 用 `is_null` 表达——把断线前的旧值当新值发出去，比不发更危险。
 
@@ -1636,8 +1637,8 @@ obs  ← 所有包（不依赖任何内部包）
 | `internal/auth` | 凭据表：Token → 身份；`Reloadable` 支持热替换 | Token 先 SHA-256 再定长比较；无凭据进入 open 模式而不是造默认口令；拒绝弱口令；枚举永不返回 Token | 96.7% |
 | `internal/audit` | 审计存储：NDJSON 分段 + SHA-256 哈希链 + 查询/校验 | 序号连续；字段边界用「长度:内容」编码；整段淘汰后链仍可校验；尾部半行触发新段 | 80.7% |
 | `internal/northbound/httpapi` | REST + SSE + 认证/授权 + 错误码 | 错误码稳定；响应不泄露凭据；未知角色全拒；401 与 403 在审计里区分；报警/历史查询的未知参数取值必须报错而不是静默忽略 | 83.4% |
-| `internal/codec/sparkplug` | Sparkplug B 载荷的纯函数 Protobuf 编解码（varint/长度前缀/定长、Metric oneof、PropertySet、未知字段跳过） | 无第三方 protobuf 运行时；未知字段按规则跳过（对端升级 schema 不应让解析失败）；oneof 值字段即使为 0/false 也必须显式编码；声明类型与承载字段冲突时报错；PropertySet 是平行数组，键必须排序才能确定性编码 | 86.2% |
-| `internal/sparkplug` | Sparkplug B 生命周期状态机（主题、NBIRTH/NDEATH/DBIRTH/DDEATH/DDATA、序号作用域与回绕、bdSeq、NCMD/DCMD 解析、指标映射） | 节点序号与设备序号独立；DBIRTH 占用 0、下一条从 1 开始；NDEATH 遗嘱在 CONNECT 前就能生成；非 good 质量用 `is_null` + `quality` 属性；bytes 走 `bytes_value`；命令只认 Rebirth | 96.6% |
+| `internal/codec/sparkplug` | Sparkplug B 载荷的纯函数 Protobuf 编解码（varint/长度前缀/定长、Metric oneof、PropertySet、未知字段跳过） | 无第三方 protobuf 运行时；未知字段按规则跳过（对端升级 schema 不应让解析失败）；oneof 值字段即使为 0/false 也必须显式编码；`seq` 同样不能按「0 即缺省」省略（NBIRTH/DBIRTH 的序号就是 0，proto2 里「字段缺失」≠「值为 0」），NDEATH 则必须不带序号；声明类型与承载字段冲突时报错；PropertySet 是平行数组，键必须排序才能确定性编码 | 86.3% |
+| `internal/sparkplug` | Sparkplug B 生命周期状态机（主题、NBIRTH/NDEATH/DBIRTH/DDEATH/DDATA、序号与回绕、bdSeq、NCMD/DCMD 解析、指标映射） | 序号是**边缘节点级**的（节点消息与全部设备消息共用 0..255，只有 NBIRTH 重置为 0）；NDEATH 不带也不消耗序号；NDEATH 遗嘱在 CONNECT 前就能生成；非 good 质量用 `is_null` + `quality` 属性；bytes 走 `bytes_value`；命令只认 Rebirth | 96.4% |
 | `internal/mqtt` | MQTT 3.1.1 客户端（北向发布 + 南向订阅共用，纯 Go 零依赖） | 单 goroutine 读 socket；QoS1 必须等到 PUBACK；`Ping` 必须等到 PINGRESP（写成功不算活着）；断线立即失败而非超时；`Epoch` 暴露连接代数，供订阅方区分「新会话的第一条消息」 | 70.3% |
 | `internal/mqtt/mqtttest` | 测试封装：`internal/sim/mqtt` 的 `*testing.T` 生命周期 + 等待断言 | 不另写 Broker（两份实现必然长歪）；开关一律走 setup 函数而非直接赋字段 | — |
 | `internal/runtime` | 唯一编排层 + 后端实现 + 看门狗 + 审计埋点 + 窗口缓存 | 启动/关闭顺序（失败逆序收口）；`configuredState` 与 `runtimeState` 分离；协议/传输匹配在装配期校验；只向驱动与报警引擎注入只读 `cache.Get` 与窗口数据源；北向 OPC UA 启停与热重建；凭据表热替换后旧用户立即失效；MQTT 北向以 `northboundSink` 接口隔离 json 与 sparkplug-b | 81.1% |

@@ -41,6 +41,47 @@ func TestEncodeGolden(t *testing.T) {
 	}
 }
 
+// 序号 0 必须**出现在线上**。
+//
+// 规范 TCK 项 [tck-id-payloads-sequence-num-always-included] 要求「除
+// NDEATH 外每条消息都必须带序号」，而 NBIRTH/DBIRTH 的序号恰好是 0。
+// protobuf 是 proto2（`optional uint64 seq = 3`），「字段缺失」与「字段为
+// 0」在消费方是两件事：Tahu 生成的代码用 hasSeq() 区分。此前编码走的是
+// 「值为 0 就省略」的通用路径，于是每一条 NBIRTH/DBIRTH 都没有 seq 字段。
+func TestSeqZeroIsOnTheWire(t *testing.T) {
+	raw, err := Payload{Seq: 0}.Encode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []byte{0x18, 0x00} // field 3, wire type 0, value 0
+	if !bytes.Equal(raw, want) {
+		t.Fatalf("seq=0 payload = % x, want % x", raw, want)
+	}
+	got, err := Decode(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.HasSeq || got.Seq != 0 {
+		t.Fatalf("decoded = %+v, want present seq 0", got)
+	}
+
+	// NDEATH 相反：必须不带序号（[tck-id-topics-ndeath-seq]）。
+	raw, err = Payload{Seq: 7, OmitSeq: true}.Encode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(raw) != 0 {
+		t.Fatalf("OmitSeq payload = % x, want empty", raw)
+	}
+	got, err = Decode(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.HasSeq {
+		t.Fatalf("OmitSeq decode reports seq=%d present", got.Seq)
+	}
+}
+
 func TestEncodeZeroValues(t *testing.T) {
 	// 0 / false / 空串都是合法值：oneof 字段必须显式写出，否则对端会把
 	// 它们读成「没有值」。这是 Protobuf 里最容易踩的一个坑。
@@ -167,7 +208,8 @@ func TestPropertySetGolden(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want, _ := hex.DecodeString("12130a016d20024a0a0a01751205080c4201565001")
+	// 末尾的 1800 是 seq=0：每条非 NDEATH 消息都必须带序号。
+	want, _ := hex.DecodeString("12130a016d20024a0a0a01751205080c42015650011800")
 	if !bytes.Equal(raw, want) {
 		t.Fatalf("payload = %x, want %x", raw, want)
 	}

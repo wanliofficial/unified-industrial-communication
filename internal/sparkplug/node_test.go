@@ -67,9 +67,14 @@ func TestParseTopicRejects(t *testing.T) {
 	}
 }
 
-// 序号按作用域独立：节点序号与每个设备的序号互不影响，DBIRTH 把设备序号
-// 重置为 0，255 之后回绕。
-func TestSequenceScopes(t *testing.T) {
+// 序号是**边缘节点级**的：节点自己的消息与它所有设备的消息共用同一个
+// 0..255 计数器（规范对每种消息都写「one greater than the previous MQTT
+// message from the Edge Node」）。只有 NBIRTH 把它重置为 0。
+//
+// 这条用例同时钉住两个容易写错的地方：
+//   - 设备消息不能各自从 0 开始（两台设备交替时会变成 0,0,1,1）；
+//   - NDEATH 不带序号，也不消耗序号。
+func TestSequenceIsPerEdgeNode(t *testing.T) {
 	n := newTestNode(t)
 
 	birth, err := n.NBIRTH()
@@ -79,8 +84,8 @@ func TestSequenceScopes(t *testing.T) {
 	if got := decodeSeq(t, birth); got != 0 {
 		t.Fatalf("NBIRTH seq = %d", got)
 	}
-	// 设备序号与节点序号互相独立；DDATA 用的是设备序号。
-	for want := uint64(0); want <= 2; want++ {
+	// 节点出生之后，设备消息接着节点序号走，不从 0 重新开始。
+	for want := uint64(1); want <= 3; want++ {
 		msg, err := n.DDATA("dev-a", sample("p", 1))
 		if err != nil {
 			t.Fatal(err)
@@ -89,15 +94,15 @@ func TestSequenceScopes(t *testing.T) {
 			t.Fatalf("DDATA %d seq = %d", want, got)
 		}
 	}
-	// 另一个设备从 0 开始；DBIRTH 也必须是 0。
+	// 另一台设备的 DBIRTH 继续同一个计数器，不重置。
 	db, err := n.DBIRTH("dev-b", []model.Sample{sample("p", 1)})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := decodeSeq(t, db); got != 0 {
-		t.Fatalf("DBIRTH seq = %d", got)
+	if got := decodeSeq(t, db); got != 4 {
+		t.Fatalf("DBIRTH seq = %d, want 4 (node-wide counter)", got)
 	}
-	// 同一设备再 DBIRTH 重置回 0：消费方靠这个判定「设备重新出生」。
+	// 设备重生同样不重置序号。
 	if _, err := n.DBIRTH("dev-a", []model.Sample{sample("p", 1)}); err != nil {
 		t.Fatal(err)
 	}
@@ -105,25 +110,70 @@ func TestSequenceScopes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := decodeSeq(t, msg); got != 1 {
+	if got := decodeSeq(t, msg); got != 6 {
+		t.Fatalf("DDATA after DBIRTH seq = %d, want 6", got)
+	}
+	// DDEATH 也是序列里的一条。
+	death, err := n.DDEATH("dev-b")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := decodeSeq(t, death); got != 7 {
+		t.Fatalf("DDEATH seq = %d, want 7", got)
+	}
+
+	// 再发一次 NBIRTH（重生）：计数器回到 0，下一条是 1。
+	if _, err := n.NBIRTH(); err != nil {
+		t.Fatal(err)
+	}
+	after, err := n.DDATA("dev-a", sample("p", 3))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := decodeSeq(t, after); got != 1 {
 		t.Fatalf("DDATA after rebirth seq = %d, want 1", got)
 	}
-	// 设备序号不影响节点序号。
+}
+
+// NDEATH 必须不带序号，也不能消耗序号。
+func TestNDEATHHasNoSeq(t *testing.T) {
+	n := newTestNode(t)
+	if _, err := n.NBIRTH(); err != nil { // seq 0
+		t.Fatal(err)
+	}
+	if _, err := n.NBIRTH(); err != nil { // 重置后又是 seq 0
+		t.Fatal(err)
+	}
 	death, err := n.NDEATH()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := decodeSeq(t, death); got == 0 {
-		t.Fatal("NDEATH reused node seq 0")
+	if p := decodePayload(t, death); p.HasSeq {
+		t.Fatalf("NDEATH carries seq=%d; spec: NDEATH MUST NOT include a sequence number", p.Seq)
+	}
+	// NDEATH 没有消耗序号：下一条仍是 NBIRTH 之后的 1。
+	msg, err := n.DDATA("d", sample("p", 1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := decodeSeq(t, msg); got != 1 {
+		t.Fatalf("seq after NDEATH = %d, want 1 (NDEATH must not consume a seq)", got)
 	}
 }
 
 func TestSequenceWrap(t *testing.T) {
 	n := newTestNode(t)
-	// 直接消费到 255，再要一次必须是 0。
-	for i := 0; i < 256; i++ {
-		if _, err := n.DDATA("d", sample("p", 1)); err != nil {
+	if _, err := n.NBIRTH(); err != nil { // 占用 0
+		t.Fatal(err)
+	}
+	// 从 1 连续发到 255，下一条必须回到 0。
+	for want := uint64(1); want <= 255; want++ {
+		msg, err := n.DDATA("d", sample("p", 1))
+		if err != nil {
 			t.Fatal(err)
+		}
+		if got := decodeSeq(t, msg); got != want {
+			t.Fatalf("seq = %d, want %d", got, want)
 		}
 	}
 	msg, err := n.DDATA("d", sample("p", 1))
@@ -209,9 +259,11 @@ func TestSubscriptions(t *testing.T) {
 	}
 }
 
+// 命令载荷按规范不带序号（[tck-id-payloads-ncmd-seq]/[tck-id-payloads-dcmd-seq]），
+// 这一层只解析不发送，所以夹具要按真实主机的样子构造。
 func TestParseCommand(t *testing.T) {
 	mk := func(names ...codec.Metric) []byte {
-		raw, err := codec.Payload{Metrics: names}.Encode()
+		raw, err := codec.Payload{Metrics: names, OmitSeq: true}.Encode()
 		if err != nil {
 			t.Fatal(err)
 		}

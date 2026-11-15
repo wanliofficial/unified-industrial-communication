@@ -7,7 +7,7 @@
 //   - 本包负责「哪条消息该在什么时候发、带什么指标」；
 //   - internal/runtime 的 sink 负责 MQTT 连接与投递。
 //
-// 这样节点状态机可以脱离网络单测：序号回绕、bdSeq、DBIRTH 重置等最容易
+// 这样节点状态机可以脱离网络单测：序号回绕、bdSeq、NDEATH 不带序号等最容易
 // 出错的地方不需要真的连 Broker。
 package sparkplug
 
@@ -83,21 +83,22 @@ func ParseTopic(topic string) (group, kind, node, device string, ok bool) {
 
 // Node 维护一个边缘节点的序号与 bdSeq。
 //
-// 序号按作用域独立：
-//   - NBIRTH/NDEATH 用节点序号；
-//   - DBIRTH/DDATA/DDEATH 用设备序号，DBIRTH 从 0 重新开始。
+// 序号是**每个边缘节点一个**，不是每台设备一个：规范对 NBIRTH/NDATA/
+// DBIRTH/DDATA/DDEATH 逐条写明「one greater than the previous MQTT message
+// from the Edge Node」。所以节点自己的消息与它所有设备的消息共用同一个
+// 0..255 计数器，只有 NBIRTH 会把它重置为 0（[tck-id-topics-nbirth-seq-num]）。
+// 把设备当成独立序号作用域会让两台设备交替发布时线上出现 0,0,1,1——严格
+// 的主机按「序号必须连续」判定就会请求重生或丢弃数据。
 //
-// Sparkplug 的序号是 8 位，255 之后回到 0；用 uint64 保存并在编码前取低
-// 8 位，避免在状态机里到处写 %256。
+// NDEATH 例外：它不带序号，也不消耗序号。
 type Node struct {
 	GroupID string
 	NodeID  string
 	BdSeq   uint64
 
-	mu      sync.Mutex
-	nodeSeq uint64
-	devSeq  map[string]uint64
-	now     func() time.Time
+	mu  sync.Mutex
+	seq uint64
+	now func() time.Time
 }
 
 // NewNode 创建一个节点。bdSeq 由调用方在进程启动时生成，并在整个 MQTT
@@ -108,7 +109,6 @@ func NewNode(group, node string, bdSeq uint64) *Node {
 		GroupID: group,
 		NodeID:  node,
 		BdSeq:   bdSeq & 0xFF,
-		devSeq:  map[string]uint64{},
 		now:     func() time.Time { return time.Now().UTC() },
 	}
 }
@@ -116,37 +116,27 @@ func NewNode(group, node string, bdSeq uint64) *Node {
 // SetClock 供测试固定时间。
 func (n *Node) SetClock(fn func() time.Time) { n.now = fn }
 
-func (n *Node) nextNode() uint64 {
+// nextSeq 取出当前序号并把计数器推进一格（255 之后回绕到 0）。
+func (n *Node) nextSeq() uint64 {
 	n.mu.Lock()
 	defer n.mu.Unlock()
-	v := n.nodeSeq
-	n.nodeSeq = (n.nodeSeq + 1) & 0xFF
+	v := n.seq
+	n.seq = (n.seq + 1) & 0xFF
 	return v
 }
 
-func (n *Node) nextDevice(device string, reset bool) uint64 {
-	n.mu.Lock()
-	defer n.mu.Unlock()
-	if reset {
-		// DBIRTH 自己占用 0，下一条消息必须是 1：两条消息共用一个序号
-		// 会让消费方把 DDATA 当成重复帧丢掉。
-		n.devSeq[device] = 1
-		return 0
-	}
-	v := n.devSeq[device]
-	n.devSeq[device] = (v + 1) & 0xFF
-	return v
-}
-
-// NBIRTH 生成节点出生消息，节点序号重置为 0。
+// NBIRTH 生成节点出生消息。
+//
+// 规范要求 NBIRTH 的序号必须是 0（并重置计数器）：一次重生开启一个新的
+// 消息序列，后续每条消息从 1 开始递增。
 func (n *Node) NBIRTH() (Message, error) {
 	n.mu.Lock()
-	n.nodeSeq = 0
+	n.seq = 0
 	n.mu.Unlock()
 	now := n.now()
 	p := codec.Payload{
 		Timestamp: now,
-		Seq:       n.nextNode(),
+		Seq:       n.nextSeq(),
 		Metrics: []codec.Metric{
 			bdSeqMetric(n.BdSeq, now),
 			controlMetric("Node Control/Rebirth", now),
@@ -157,17 +147,24 @@ func (n *Node) NBIRTH() (Message, error) {
 
 // NDEATH 生成节点死亡消息。MQTT 的遗嘱在建立连接时就要有完整载荷，因此
 // 这个方法必须能在连接之前调用。
+//
+// NDEATH 是唯一不带序号的消息（[tck-id-topics-ndeath-seq]），也不消耗
+// 序号：它由 Broker 在会话结束时代发，与节点自己发出的消息不在同一个
+// 序列里。
 func (n *Node) NDEATH() (Message, error) {
 	now := n.now()
 	p := codec.Payload{
 		Timestamp: now,
-		Seq:       n.nextNode(),
+		OmitSeq:   true,
 		Metrics:   []codec.Metric{bdSeqMetric(n.BdSeq, now)},
 	}
 	return n.message(KindNDEATH, "", p)
 }
 
-// DBIRTH 生成设备出生消息，设备序号重置为 0。
+// DBIRTH 生成设备出生消息。
+//
+// 序号不按设备重置：Sparkplug 的序号是边缘节点级的，DBIRTH 取「上一条消息
+// 的序号 + 1」。设备重新出生只重发 BIRTH，不开启新的序号序列。
 //
 // samples 是该设备当前已知的全部点位：Sparkplug 要求 DBIRTH 列出设备的
 // 全部指标，后续 DDATA 只更新值。只带首个点位出生会让消费方在出生时看到
@@ -181,7 +178,7 @@ func (n *Node) DBIRTH(device string, samples []model.Sample) (Message, error) {
 	}
 	p := codec.Payload{
 		Timestamp: now,
-		Seq:       n.nextDevice(device, true),
+		Seq:       n.nextSeq(),
 		Metrics:   metrics,
 	}
 	return n.message(KindDBIRTH, device, p)
@@ -190,7 +187,7 @@ func (n *Node) DBIRTH(device string, samples []model.Sample) (Message, error) {
 // DDEATH 生成设备死亡消息。载荷不带指标：设备已经不可达，保留最后一帧
 // 值只会让消费方误以为那是当前值。
 func (n *Node) DDEATH(device string) (Message, error) {
-	p := codec.Payload{Timestamp: n.now(), Seq: n.nextDevice(device, false)}
+	p := codec.Payload{Timestamp: n.now(), Seq: n.nextSeq()}
 	return n.message(KindDDEATH, device, p)
 }
 
@@ -199,7 +196,7 @@ func (n *Node) DDATA(device string, s model.Sample) (Message, error) {
 	now := n.now()
 	p := codec.Payload{
 		Timestamp: now,
-		Seq:       n.nextDevice(device, false),
+		Seq:       n.nextSeq(),
 		Metrics:   []codec.Metric{MetricForSample(s, now)},
 	}
 	return n.message(KindDDATA, device, p)

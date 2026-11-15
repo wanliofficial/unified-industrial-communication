@@ -343,7 +343,7 @@ func (s *sparkplugSink) rebirth(device string) {
 		return
 	}
 	if device == "" {
-		// 节点级重生：重发 NBIRTH 与全部 DBIRTH（设备序号各自归零）。
+		// 节点级重生：重发 NBIRTH 与全部 DBIRTH（序号从 0 重新开始）。
 		birth, berr := s.node.NBIRTH()
 		if err := s.publishLocked(ctx, birth, berr); err != nil {
 			return

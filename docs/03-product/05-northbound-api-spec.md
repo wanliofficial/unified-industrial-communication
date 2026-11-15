@@ -1350,21 +1350,40 @@ spBv1.0/{group}/STATE/{node}          # retained JSON，不是 Protobuf
 | 收到 DCMD `Device Control/Rebirth=true` | 该设备 DBIRTH |
 | 正常停机 | STATE `online=false` → NDEATH → DISCONNECT |
 
-序号规则：
+序号规则（**一个边缘节点一个计数器**，不是每台设备一个）：
 
-| 消息 | 作用域 | 规则 |
-|---|---|---|
-| NBIRTH / NDEATH | 节点 | NBIRTH 从 0 开始，之后 +1；255 后回绕到 0 |
-| DBIRTH / DDATA / DDEATH | 每设备独立 | DBIRTH 每次重置为 0，后续 +1 |
+| 消息 | 规则 |
+|---|---|
+| NBIRTH | 必须带序号且为 0；同时把计数器重置为 0 |
+| DBIRTH / DDATA / DDEATH | 取「上一条消息（含节点消息与其它设备的消息）的序号 + 1」；255 之后回绕到 0 |
+| NDEATH | **不带序号，也不消耗序号** |
+
+规范对每种消息都逐条写明「one greater than the previous MQTT message from the
+Edge Node」，并有三条可测的 TCK 约束：
+`[tck-id-payloads-sequence-num-always-included]`（除 NDEATH 外每条消息都必须带
+序号）、`[tck-id-topics-nbirth-seq-num]`（NBIRTH 的序号必须是 0）、
+`[tck-id-topics-ndeath-seq]`（NDEATH 不得带序号）。
+
+两个因此容易写错的地方：
+
+- **序号 0 必须真的写进载荷。** 载荷是 Protobuf（proto2，`optional uint64
+  seq = 3`），「字段缺失」与「字段为 0」在消费方是两件事（Tahu 生成的代码用
+  `hasSeq()` 区分）。把 0 当「缺省字段」省略，会让每一条 NBIRTH/DBIRTH 都
+  丢掉必需的序号——而它们恰好全是 0。
+- **设备消息不能各自从 0 开始。** 若按设备维护计数器，两台设备交替发布时线上
+  会是 `0,1,0,1`；严格的主机把「序号不连续」当成丢包，会请求重生或丢弃数据，
+  而发送方完全看不出问题。
 
 `bdSeq` 在进程启动时生成一次，整个会话期间不变：NDEATH 遗嘱在 CONNECT 时就
 已经固定，重连后的 NBIRTH 必须能用同一个值把「生—死」配对。遗嘱消息的 QoS 为
 1、**不 retained**——retained 的 NDEATH 会让新订阅者把一次历史掉线当成当前状态。
 
 **为什么 BIRTH 必须带完整点位表**：DBIRTH 是消费方建立「设备有哪些指标」的
-唯一时机。只带当前这一个点会让设备在出生时就不完整，后续 DDATA 出现新名字时
-再补 BIRTH 又会让序号回退。实现上为每台设备保存「最后一个采样」，点位集合
-变化时重发完整 BIRTH。
+唯一时机——指标名、datatype 与别名的解析都在这一步完成，DDATA 只负责更新值。
+只带当前这一个点会让设备在出生时就不完整：消费方在 DDATA 里看到一个 BIRTH
+从未声明过的指标名，只能当成未知数据丢弃（再去补一帧 BIRTH 也没用，那一帧
+DDATA 已经过去了）。实现上为每台设备保存「最后一个采样」，点位集合变化时
+重发完整 BIRTH，再发 DDATA。
 
 **为什么等待重连后要重发 BIRTH**：MQTT 会话是 `CleanSession=true`，Broker
 重启后订阅与 retained 状态都可能丢失。`OnConnect` 回调是异步的，不能保证它
@@ -1443,8 +1462,11 @@ Sparkplug 没有质量位。把断线前的旧值当成新值发出去，比不�
 ```
 
 集成测试 (`internal/runtime/sparkplug_sink_test.go`) 覆盖：BIRTH 顺序、DBIRTH
-完整点位表、DDATA 序号、STATE retained、DDEATH、NCMD 重生、断线后重发 BIRTH、
-停机 STATE offline 与 NDEATH。编解码金帧在 `internal/codec/sparkplug`。
+完整点位表、STATE retained、DDEATH、NCMD 重生、断线后重发 BIRTH、停机 STATE
+offline 与 NDEATH，以及**两台设备交替发布时的序号连续性**（节点级计数器，
+不允许各自从 0 开始）。编解码金帧与「序号 0 必须出现在线上」在
+`internal/codec/sparkplug`；序号规则本身在 `internal/sparkplug` 的状态机单测里
+（含 NDEATH 不带序号、255 回绕、NBIRTH 重置）。
 
 ### 6.7 本地 journal 兜底（`storage.journal`）
 

@@ -128,8 +128,22 @@ type Metric struct {
 // Payload 是 Sparkplug B 的一帧。
 type Payload struct {
 	Timestamp time.Time
-	Seq       uint64
-	Metrics   []Metric
+	// Seq 是 8 位序号（0..255 回绕）。注意它必须**出现在线上**，哪怕是 0：
+	// 规范把它列成 TCK 项 [tck-id-payloads-sequence-num-always-included]
+	// 「除 NDEATH 外每条消息都必须带序号」，而 NBIRTH/DBIRTH 的序号恰好是
+	// 0。protobuf 是 proto2，`seq` 的「没写」与「写了 0」在消费方是两件事
+	// （Tahu 生成的代码用 hasSeq() 区分），所以编码走 uintForce 而不是
+	// 「0 即缺省」的省略路径。
+	Seq     uint64
+	Metrics []Metric
+	// OmitSeq 用于 NDEATH：规范要求它 [tck-id-topics-ndeath-seq]
+	// 「MUST NOT include a sequence number」，其余消息都不能置位。
+	OmitSeq bool
+	// HasSeq 只在解码时有意义：报告线格式里是否真的写了 seq 字段。
+	// proto2 的 optional 字段「没写」与「写了 0」在消费方是两件事，而
+	// Sparkplug 恰好要求 NBIRTH/DBIRTH 把 0 显式写出来，所以测试需要能
+	// 区分二者。编码不读这个字段（写不写由 OmitSeq 决定）。
+	HasSeq bool
 }
 
 // ---------------------------------------------------------------------------
@@ -231,7 +245,11 @@ func (p Payload) Encode() ([]byte, error) {
 		}
 		w.message(2, func(sw *writer) { sw.metric(m) })
 	}
-	w.uint(3, p.Seq)
+	// 序号必须出现在线上：0 是 NBIRTH/DBIRTH 的合法序号，不能按「缺省字段」
+	// 省略。NDEATH 是唯一不带序号的消息。
+	if !p.OmitSeq {
+		w.uintForce(3, p.Seq)
+	}
 	return w.b, nil
 }
 
@@ -437,6 +455,7 @@ func Decode(b []byte) (Payload, error) {
 	}
 	if v, ok := last(fields, 3); ok {
 		p.Seq = v.varint
+		p.HasSeq = true
 	}
 	for _, mv := range fields[2] {
 		m, err := decodeMetric(mv.bytes)
