@@ -23,9 +23,11 @@
 //
 //  1. **只有一个 0x68**，且数据域不加 0x33。把 645 的经验直接搬过来会让
 //     校验和永远对不上。
-//  2. **所有多字节数据低字节先传**：地址 A0 是最低字节，DI0 是低字节，
-//     数值的最低位字节在前。DI 在点表里写成手册顺序（如 901F），上线时
-//     发 1F 90。
+//  2. **地址低字节先传，但数据标识 DI 是高字节先传。** 地址 A0 是最低字节、
+//     数值的最低位字节在前，都遵守 6.4.2 的「先低位」；唯独 DI 是命令/应答的
+//     标识字段，2004 版按大端书写——点表里 901F 上线发 90 1F（DI0=0x90 在前）。
+//     把「先低位」无套到 DI 上会发出 1F 90，表把它当成一个不存在的标识而不应答。
+//     注意这是 2004 的规定；2018 版才把 DI 改成小端。
 //  3. **CS 从 0x68 到数据域末字节**，前导 FE 不计入。把前导算进去会让所有
 //     带前导的帧都校验失败，而现场的表几乎都要求前导。
 package cjt188
@@ -77,17 +79,10 @@ const (
 	TypeBroadcast = 0xAA // 读地址时使用：T 与地址域都为 AA
 )
 
-// 特殊报文标识：读地址命令的报文标识固定为 81 0A（按线序书写）。
-//
-// 标准里其它 DI 的显示顺序与线序是反的（901F → 1F 90），唯独这条命令在
-// 所有实现里都是字面量 81 0A。把它写成常量而不是走 DI 的字节序变换，是
-// 为了不让下一个人以为这里漏了反转。
-var (
-	wireReadAddr  = [2]byte{0x81, 0x0A}
-	wireWriteAddr = [2]byte{0x18, 0xA0}
-	wireValve     = [2]byte{0x17, 0xA0}
-)
-
+// 特殊报文标识（读地址 810A、写地址 A018、阀门 A017）与 901F 一样，按
+// CJ/T 188-2004 的大端书写：DIReadAddr.Bytes() = 81 0A、DIWriteAddr.Bytes()
+// = A0 18、DIValve.Bytes() = A0 17。构造请求时统一走 DI.Bytes()，不再维护
+// 独立的线序字面量——那样会多一处可能写反的真相来源。
 var (
 	// ErrIncomplete 表示缓冲区里的字节还不足以构成一整帧。
 	ErrIncomplete = errors.New("cjt188: incomplete frame")
@@ -288,8 +283,9 @@ func ReadRequest(t byte, addr Addr, di DI, ser byte) ([]byte, error) {
 //
 // T 与地址域都是 AA（单机操作）；报文标识固定为 81 0A。
 func ReadAddrRequest(ser byte) ([]byte, error) {
+	wire := DIReadAddr.Bytes()
 	return Build(TypeBroadcast, BroadcastAddr, CtrlReadAddr,
-		[]byte{wireReadAddr[0], wireReadAddr[1], ser})
+		[]byte{wire[0], wire[1], ser})
 }
 
 // WriteRequest 构造写数据请求（0x04）。
@@ -307,9 +303,10 @@ func WriteRequest(t byte, addr Addr, di DI, ser byte, payload []byte) ([]byte, e
 
 // WriteAddrRequest 构造写地址请求（0x15）。
 //
-// 数据域 = 报文标识 18 A0 + SER + 7 字节新地址，L=0x0A。
+// 数据域 = 报文标识 A0 18 + SER + 7 字节新地址，L=0x0A。
 func WriteAddrRequest(t byte, addr Addr, ser byte, next Addr) ([]byte, error) {
-	data := []byte{wireWriteAddr[0], wireWriteAddr[1], ser}
+	wire := DIWriteAddr.Bytes()
+	data := []byte{wire[0], wire[1], ser}
 	data = append(data, next[:]...)
 	return Build(t, addr, CtrlWriteAddr, data)
 }
@@ -323,7 +320,8 @@ func ValveRequest(t byte, addr Addr, ser byte, open bool) ([]byte, error) {
 	if open {
 		ctr = 0x55
 	}
-	data := []byte{wireValve[0], wireValve[1], ser, ctr}
+	wire := DIValve.Bytes()
+	data := []byte{wire[0], wire[1], ser, ctr}
 	return Build(t, addr, CtrlWrite, data)
 }
 
@@ -353,7 +351,7 @@ func ParseReply(fr Frame) (Reply, error) {
 		return Reply{}, fmt.Errorf("cjt188: 应答数据域只有 %d 字节，至少需要 3 字节（DI+SER）", len(fr.Data))
 	}
 	return Reply{
-		DI:      DI{Hi: fr.Data[1], Lo: fr.Data[0]},
+		DI:      DI{Hi: fr.Data[0], Lo: fr.Data[1]}, // 大端：DI0 是高字节
 		SER:     fr.Data[2],
 		Payload: append([]byte(nil), fr.Data[3:]...),
 	}, nil
@@ -390,7 +388,7 @@ func ParseErrorReply(fr Frame) (ErrorReply, error) {
 	}
 	switch len(fr.Data) {
 	case 3:
-		return ErrorReply{DI: DI{Hi: fr.Data[1], Lo: fr.Data[0]}, SER: fr.Data[2]}, nil
+		return ErrorReply{DI: DI{Hi: fr.Data[0], Lo: fr.Data[1]}, SER: fr.Data[2]}, nil // 大端
 	case 1:
 		return ErrorReply{SER: fr.Data[0]}, nil
 	default:

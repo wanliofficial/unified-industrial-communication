@@ -208,7 +208,7 @@ func TestSimValveWrite(t *testing.T) {
 	if fr.Ctrl != cj.CtrlWrite|cj.BitReply {
 		t.Fatalf("ctrl = %02X", fr.Ctrl)
 	}
-	if got := mustDI(t, "A017"); !bytes.Equal(fr.Data[:2], []byte{0x17, 0xA0}) || fr.Data[2] != 0x04 {
+	if got := mustDI(t, "A017"); !bytes.Equal(fr.Data[:2], []byte{0xA0, 0x17}) || fr.Data[2] != 0x04 {
 		t.Fatalf("echo = %X (DI %s)", fr.Data, got)
 	}
 	if len(fr.Data) != 5 || fr.Data[3] != 1 {

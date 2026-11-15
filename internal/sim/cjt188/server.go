@@ -402,8 +402,8 @@ func (s *Server) handleReadAddr(fr cj.Frame) ([]byte, bool) {
 	if len(fr.Data) < 3 {
 		return s.exception(fr), false
 	}
-	// 读地址的报文标识是字面量 81 0A，**不**走低字节先传的变换，
-	// 因此这里逐字节比较，不能复用 DIFromBytes。
+	// 读地址的报文标识在帧里是字面量 81 0A（大端 DI{0x81,0x0A} 的直接写出），
+	// 这里逐字节比较即可；与 handleRead 一样从帧首两字节取标识，语义清晰。
 	if fr.Data[0] != 0x81 || fr.Data[1] != 0x0A {
 		return s.exception(fr), false
 	}
@@ -473,7 +473,7 @@ func (s *Server) handleWriteAddr(fr cj.Frame) ([]byte, bool) {
 	return s.reply(fr.Addr, cj.CtrlWriteAddr|cj.BitReply, cj.DIWriteAddr, ser, nil), false
 }
 
-// reply 组「DI + SER + 数据」应答（DI 按低字节先传的常规变换）。
+// reply 组「DI + SER + 数据」应答（DI 按 2004 的大端变换，901F → 90 1F）。
 func (s *Server) reply(addr cj.Addr, ctrl byte, di cj.DI, ser byte, payload []byte) []byte {
 	b := di.Bytes()
 	return s.replyWire(addr, ctrl, b, ser, payload)

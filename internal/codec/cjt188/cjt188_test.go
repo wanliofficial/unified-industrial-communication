@@ -26,15 +26,18 @@ func mustAddr(t *testing.T, s string) Addr {
 	return a
 }
 
-// TestReadRequestGolden 钉住整帧字节：单 68、无 0x33、DI 低字节在前、
-// CS 不含前导。这张金帧来自一台现场水表的实际请求。
+// TestReadRequestGolden 钉住整帧字节：单 68、无 0x33、DI 高字节先传、CS 不含前导。
+//
+// 金帧取自 CJ/T 188-2004 标准表 5 与现场水表的真实抓包：地址 00000805000001、
+// 读计量数据 901F、SER=0。数据标识按 2004 的大端书写，线上 DI0=0x90、DI1=0x1F
+// （`03 90 1F 00`），与 2018 版的小端（`1F 90`）正好相反——这是最容易写反的一处。
 func TestReadRequestGolden(t *testing.T) {
 	addr := mustAddr(t, "00000805000001")
 	fr, err := ReadRequest(0x10, addr, DIReadData, 0x00)
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := mustHex(t, "FEFE681001000005080000"+"01031F9000"+"3916")
+	want := mustHex(t, "FEFE681001000005080000"+"0103"+"901F"+"00"+"3916")
 	if !bytes.Equal(fr, want) {
 		t.Fatalf("request = %X, want %X", fr, want)
 	}
@@ -45,13 +48,17 @@ func TestReadRequestGolden(t *testing.T) {
 	}
 }
 
-// TestReadReplyGolden 用一台冷水表的真实应答（556677.00 m³）。
+// TestReadReplyGolden 用一台冷水表的应答（累积流量 556677.00 m³）检验解码。
+//
+// 数据标识按 CJ/T 188-2004 的大端书写，与请求一致（应答回显同一 DI）。
+// 交换两个 DI 字节不改变校验和（仍是 0x13），但会改变语义：1F 90 会被当成
+// 一个不存在的数据标识，正确写法是 90 1F。
 func TestReadReplyGolden(t *testing.T) {
 	// 前导 FE×4 + 帧。末尾 CS 是按标准重算的 0x13（原始博客写 0x08，
-	// 逐字节相加得到的是 0x13；这里以可验证的算法为准）。
+	// 逐字节相加得到的是 0x13；这里以可验证的算法为准）。数据域 DI 为大端 90 1F。
 	raw := mustHex(t, "FEFEFEFE"+
 		"6810443322110033788116"+
-		"1F9000"+
+		"901F00"+
 		"007766552C"+"007766552C"+
 		"31012211051520"+
 		"2184"+
@@ -268,7 +275,7 @@ func TestReadAddr(t *testing.T) {
 
 func TestParseErrorReply(t *testing.T) {
 	addr := mustAddr(t, "00000805000001")
-	resp, _ := Build(0x10, addr, CtrlRead|BitReply|BitError, []byte{0x1F, 0x90, 0x07})
+	resp, _ := Build(0x10, addr, CtrlRead|BitReply|BitError, []byte{0x90, 0x1F, 0x07})
 	fr, _, err := Parse(resp)
 	if err != nil {
 		t.Fatal(err)
@@ -293,16 +300,51 @@ func TestParseDI(t *testing.T) {
 	if di.String() != "901F" {
 		t.Fatalf("string = %s", di.String())
 	}
-	if b := di.Bytes(); b[0] != 0x1F || b[1] != 0x90 {
-		t.Fatalf("wire = %X (want 1F90)", b)
+	if b := di.Bytes(); b[0] != 0x90 || b[1] != 0x1F {
+		t.Fatalf("wire = %X (want 901F)", b)
 	}
-	if back, err := DIFromBytes([]byte{0x1F, 0x90}); err != nil || back != di {
+	if back, err := DIFromBytes([]byte{0x90, 0x1F}); err != nil || back != di {
 		t.Fatalf("from bytes = %v, %v", back, err)
 	}
 	for _, bad := range []string{"", "90", "901F0", "90G1"} {
 		if _, err := ParseDI(bad); err == nil {
 			t.Fatalf("DI %q must fail", bad)
 		}
+	}
+}
+
+// TestDIBigEndian2004 钉住 CJ/T 188-2004 的数据标识字节序契约。
+//
+// 2004 版 DI 是**大端**：手册写 901F，线上先传高字节 0x90（`90 1F`）。这与
+// 地址/数值的「低字节先传」相反，是 DI 独有的例外；发成小端 `1F 90` 时帧本身
+// 合法，但表把它当成不存在的标识而不应答——现场最难查的一类「静默无响应」。
+//
+// 这里同时钉住四个特殊报文标识，确保它们与 901F 走同一套变换、没有被单独写成
+// 反序的字面量（早先正是那样埋下过整段写反的隐患）。2018 版才改成小端并更名
+// SER→SEQ；本实现面向 2004，若将来接 2018 的表必须按版本分派，不能只翻字节。
+func TestDIBigEndian2004(t *testing.T) {
+	cases := []struct {
+		di   DI
+		wire [2]byte
+	}{
+		{DIReadData, [2]byte{0x90, 0x1F}},
+		{DIValve, [2]byte{0xA0, 0x17}},
+		{DIWriteAddr, [2]byte{0xA0, 0x18}},
+		{DIReadAddr, [2]byte{0x81, 0x0A}},
+	}
+	for _, c := range cases {
+		got := c.di.Bytes()
+		if got != c.wire {
+			t.Fatalf("%s wire = %X, want %X", c.di, got, c.wire)
+		}
+		back, err := DIFromBytes(c.wire[:])
+		if err != nil || back != c.di {
+			t.Fatalf("%X decode = %s, %v; want %s", c.wire, back, err, c.di)
+		}
+	}
+	// 明确断言「不是小端」：把这行删掉就等于放弃了 2004 契约。
+	if b := DIReadData.Bytes(); b[0] == 0x1F {
+		t.Fatalf("901F 被写成小端 %X；2004 要求大端 901F", b)
 	}
 }
 
@@ -372,7 +414,7 @@ func TestPreambleOutsideChecksum(t *testing.T) {
 // 不能被一起丢掉。
 func TestParseRecoversFromNoise(t *testing.T) {
 	good, _ := Build(0x10, mustAddr(t, "00000805000001"), CtrlRead|BitReply,
-		[]byte{0x1F, 0x90, 0x00, 0x00, 0x00, 0x00, 0x00})
+		[]byte{0x90, 0x1F, 0x00, 0x00, 0x00, 0x00, 0x00})
 	bad := append([]byte(nil), good...)
 	bad[len(bad)-3] ^= 0xFF // 破坏 CS
 	buf := append([]byte{0x12, 0x34}, bad...)
@@ -394,7 +436,7 @@ func TestParseRecoversFromNoise(t *testing.T) {
 
 func TestWriteRequests(t *testing.T) {
 	addr := mustAddr(t, "00000805000001")
-	// 阀门：DI A017（线上 17 A0）+ SER + 55/99。
+	// 阀门：DI A017（线上 A0 17）+ SER + 55/99。
 	open, err := ValveRequest(0x10, addr, 0x01, true)
 	if err != nil {
 		t.Fatal(err)
@@ -407,7 +449,7 @@ func TestWriteRequests(t *testing.T) {
 	if di != DIValve || fr.Ctrl != CtrlWrite {
 		t.Fatalf("valve frame = %X (DI %s ctrl %02X)", open, di, fr.Ctrl)
 	}
-	if !bytes.Equal(fr.Data, []byte{0x17, 0xA0, 0x01, 0x55}) {
+	if !bytes.Equal(fr.Data, []byte{0xA0, 0x17, 0x01, 0x55}) {
 		t.Fatalf("valve data = %X", fr.Data)
 	}
 	closeFr, _ := ValveRequest(0x10, addr, 0x01, false)
@@ -416,7 +458,7 @@ func TestWriteRequests(t *testing.T) {
 		t.Fatalf("close data = %X", fr.Data)
 	}
 
-	// 写地址：DI A018（线上 18 A0）+ SER + 7 字节新地址。
+	// 写地址：DI A018（线上 A0 18）+ SER + 7 字节新地址。
 	next := mustAddr(t, "00000805000099")
 	wa, err := WriteAddrRequest(0x10, addr, 0x02, next)
 	if err != nil {
@@ -429,7 +471,7 @@ func TestWriteRequests(t *testing.T) {
 	if fr.Ctrl != CtrlWriteAddr || len(fr.Data) != 10 {
 		t.Fatalf("write addr ctrl = %02X len = %d", fr.Ctrl, len(fr.Data))
 	}
-	if !bytes.Equal(fr.Data[:3], []byte{0x18, 0xA0, 0x02}) {
+	if !bytes.Equal(fr.Data[:3], []byte{0xA0, 0x18, 0x02}) {
 		t.Fatalf("write addr head = %X", fr.Data[:3])
 	}
 	if !bytes.Equal(fr.Data[3:], next[:]) {
