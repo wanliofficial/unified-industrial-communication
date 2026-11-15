@@ -160,10 +160,13 @@ func (s *Server) handleV3(datagram []byte) []byte {
 		return nil
 	}
 
+	// 与 community 路径（server.handle）同样：dispatch 读写共享状态，锁必须
+	// 握到 dispatch 返回，而不是只锁住 s.requests++ 一行。否则一条 v3 SET 与
+	// 并发的读（另一请求的 Get，或测试的 Get）会在 s.table 上数据竞争。
 	s.mu.Lock()
 	s.requests++
-	s.mu.Unlock()
 	vbs, status, index := s.dispatch(snmpcodec.V3, pdu)
+	s.mu.Unlock()
 
 	respPDU := snmpcodec.PDU{
 		Type: snmpcodec.PDUResponse, RequestID: pdu.RequestID,

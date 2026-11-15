@@ -381,10 +381,16 @@ func (s *Server) handle(datagram []byte) []byte {
 		return nil
 	}
 
+	// dispatch 会读写 s.table / s.sorted / s.writes，必须与读它的
+	// Get/Set 共用同一把锁。计数器自增与 dispatch 在**同一临界区**内：
+	// 原先这里在 s.requests++ 后立刻 Unlock，再无锁调用 dispatch，导致
+	// 并发请求之间、以及请求与测试夹具 Get/Set 之间在 map 上数据竞争
+	//（go test -race 能稳定复现）。dispatch 及其子调用不再二次取锁，
+	// 所以把锁一直握到 dispatch 返回是安全的。
 	s.mu.Lock()
 	s.requests++
-	s.mu.Unlock()
 	vbs, status, index := s.dispatch(msg.Version, msg.PDU)
+	s.mu.Unlock()
 	return s.buildCommunityResponse(msg, vbs, status, index)
 }
 

@@ -1016,7 +1016,7 @@ func decodeValue(p driver.PointRef, v snmpcodec.Value) (model.Value, error) {
 			if v.Int == 0 || v.Int == 1 {
 				return model.BoolValue(v.Int == 1), nil
 			}
-		case snmpcodec.TypeCounter32, snmpcodec.TypeGauge32, snmpcodec.TypeTimeTicks, snmpcodec.TypeUInteger32:
+		case snmpcodec.TypeCounter32, snmpcodec.TypeGauge32, snmpcodec.TypeTimeTicks:
 			if v.Uint == 0 || v.Uint == 1 {
 				return model.BoolValue(v.Uint == 1), nil
 			}
@@ -1030,7 +1030,7 @@ func decodeValue(p driver.PointRef, v snmpcodec.Value) (model.Value, error) {
 	switch v.Type {
 	case snmpcodec.TypeInteger:
 		num = float64(v.Int)
-	case snmpcodec.TypeCounter32, snmpcodec.TypeGauge32, snmpcodec.TypeTimeTicks, snmpcodec.TypeUInteger32, snmpcodec.TypeCounter64:
+	case snmpcodec.TypeCounter32, snmpcodec.TypeGauge32, snmpcodec.TypeTimeTicks, snmpcodec.TypeCounter64:
 		// Counter64 经 float64 承载：超过 2^53 会丢精度。平台的数值通道
 		// 是 float64，这在设计上就无法避免；文档的边界一节明确写出。
 		num = float64(v.Uint)
@@ -1253,7 +1253,7 @@ func valueEqual(a, b snmpcodec.Value) bool {
 	case snmpcodec.TypeInteger:
 		return a.Int == b.Int
 	case snmpcodec.TypeCounter32, snmpcodec.TypeGauge32, snmpcodec.TypeTimeTicks,
-		snmpcodec.TypeUInteger32, snmpcodec.TypeCounter64:
+		snmpcodec.TypeCounter64:
 		return a.Uint == b.Uint
 	case snmpcodec.TypeOctetString, snmpcodec.TypeOpaque, snmpcodec.TypeIPAddress:
 		return bytes.Equal(a.Bytes, b.Bytes)

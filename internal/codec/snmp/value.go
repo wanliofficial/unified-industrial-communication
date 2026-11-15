@@ -22,13 +22,20 @@ const (
 	TypeNull        Type = tagNull
 	TypeOID         Type = tagOID
 
-	TypeIPAddress  Type = 0x40
-	TypeCounter32  Type = 0x41
-	TypeGauge32    Type = 0x42
-	TypeTimeTicks  Type = 0x43
-	TypeOpaque     Type = 0x44
-	TypeCounter64  Type = 0x46
-	TypeUInteger32 Type = 0x47
+	TypeIPAddress Type = 0x40
+	TypeCounter32 Type = 0x41
+	// Gauge32 与 Unsigned32 在 SMIv2 里是同一个 ASN.1 类型
+	// （`Unsigned32 ::= [APPLICATION 2] IMPLICIT INTEGER (0..4294967295)`，
+	// RFC 2578 §7.1.7 明确写「indistinguishable from Gauge32」），
+	// 共用线上标签 0x42。因此没有独立的 Unsigned32 标签：无符号 32 位一律
+	// 用 TypeGauge32 承载。历史上这里曾出现过 0x47（APPLICATION 7）这个
+	// 「UInteger32」标签，但标准 SNMP 从未分配过 0x47——保留它会让解析器
+	// 把一个线上不存在的标签当成合法无符号值接受，也会诱导调用方构造出对
+	// 标准代理无意义的报文。已按标准移除。
+	TypeGauge32   Type = 0x42
+	TypeTimeTicks Type = 0x43
+	TypeOpaque    Type = 0x44
+	TypeCounter64 Type = 0x46
 
 	// v2c 的三种「这个 OID 没有值」标记。它们出现在 varbind 的值位置，
 	// 代替真正的值；错误码仍是 0。
@@ -59,8 +66,6 @@ func (t Type) String() string {
 		return "Opaque"
 	case TypeCounter64:
 		return "Counter64"
-	case TypeUInteger32:
-		return "UInteger32"
 	case TypeNoSuchObject:
 		return "noSuchObject"
 	case TypeNoSuchInstance:
@@ -95,7 +100,8 @@ type Value struct {
 // Integer 构造 INTEGER。
 func Integer(v int64) Value { return Value{Type: TypeInteger, Int: v} }
 
-// Counter32/Gauge32/TimeTicks/UInteger32 共用无符号载体。
+// Counter32/Gauge32/TimeTicks 共用无符号载体。Gauge32 同时是 SMIv2 里
+// Unsigned32 的线上表示（二者不可区分，见 TypeGauge32 的说明）。
 func Unsigned(t Type, v uint64) Value { return Value{Type: t, Uint: v} }
 
 // Octets 构造 OCTET STRING（含 Opaque）。
@@ -128,7 +134,7 @@ func (v Value) String() string {
 	switch v.Type {
 	case TypeInteger:
 		return strconv.FormatInt(v.Int, 10)
-	case TypeCounter32, TypeGauge32, TypeTimeTicks, TypeUInteger32, TypeCounter64:
+	case TypeCounter32, TypeGauge32, TypeTimeTicks, TypeCounter64:
 		return strconv.FormatUint(v.Uint, 10)
 	case TypeOctetString, TypeOpaque:
 		if printable(v.Bytes) {
@@ -175,7 +181,7 @@ func encodeValue(v Value) ([]byte, error) {
 			return nil, fmt.Errorf("snmp: IpAddress must be 4 bytes, got %d", len(v.Bytes))
 		}
 		return appendTLV(nil, byte(TypeIPAddress), v.Bytes), nil
-	case TypeCounter32, TypeGauge32, TypeTimeTicks, TypeUInteger32:
+	case TypeCounter32, TypeGauge32, TypeTimeTicks:
 		if v.Uint > 0xFFFFFFFF {
 			return nil, fmt.Errorf("snmp: %s value %d overflows 32 bits", v.Type, v.Uint)
 		}
@@ -219,7 +225,7 @@ func parseValue(tag byte, b []byte) (Value, error) {
 			return Value{}, fmt.Errorf("snmp: IpAddress is %d bytes, want 4", len(b))
 		}
 		return IP(b), nil
-	case TypeCounter32, TypeGauge32, TypeTimeTicks, TypeUInteger32:
+	case TypeCounter32, TypeGauge32, TypeTimeTicks:
 		n, err := decodeUnsigned(b)
 		if err != nil {
 			return Value{}, err

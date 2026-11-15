@@ -381,6 +381,34 @@ func TestErrorStatusKinds(t *testing.T) {
 	}
 }
 
+// Unsigned32 与 Gauge32 在 SMIv2 里是不可区分的同一个 ASN.1 类型，共用
+// 线上标签 0x42（RFC 2578 §7.1.7）。历史上这里曾存在一个 0x47 的
+// 「UInteger32」标签，但标准 SNMP 从未分配过 APPLICATION 7。这条用例钉住：
+//   - Unsigned32 语义的值必须编成 0x42（不是 0x47）；
+//   - 0x47 作为线上标签出现时，解析必须明确拒绝，而不是当成合法无符号值。
+func TestUnsigned32SharesGauge32Tag(t *testing.T) {
+	// Unsigned32 语义用 TypeGauge32 承载：编码必须是 42 01 2a（最短形式）。
+	raw, err := encodeValue(Unsigned(TypeGauge32, 42))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := []byte{0x42, 0x01, 0x2a}; !bytes.Equal(raw, want) {
+		t.Fatalf("unsigned32 = % x, want % x", raw, want)
+	}
+	// 回读必须得到 TypeGauge32（Unsigned32 没有独立标签）。
+	v, err := parseValue(0x42, []byte{0x2a})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v.Type != TypeGauge32 || v.Uint != 42 {
+		t.Fatalf("decoded = %+v", v)
+	}
+	// 0x47 不是标准 SNMP 标签：必须被拒绝。
+	if _, err := parseValue(0x47, []byte{0x2a}); err == nil {
+		t.Fatal("tag 0x47 must be rejected: it is not a valid SNMP application tag")
+	}
+}
+
 func TestStringValues(t *testing.T) {
 	if got := String("rt-01").String(); got != "rt-01" {
 		t.Fatalf("text = %q", got)

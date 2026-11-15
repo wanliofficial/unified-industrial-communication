@@ -104,6 +104,75 @@ func TestGetAndCounters(t *testing.T) {
 	}
 }
 
+// TestConcurrentDispatchIsRaceFree 钉住 handle/handleV3 的锁边界：dispatch
+// 读写 s.table / s.sorted / s.writes，必须与测试夹具 Get/Set 共用 s.mu。
+// 原先这里只在 s.requests++ 后立刻 Unlock 再无锁调用 dispatch，导致 UDP
+// 处理协程（写表）与调用方 Get（读表）在 map 上数据竞争，`go test -race`
+// 稳定复现。修复后并发跑一批 SET + Get 必须无竞争。
+func TestConcurrentDispatchIsRaceFree(t *testing.T) {
+	srv := startAgent(t, Options{})
+	const oid = "1.3.6.1.2.1.1.4.0" // sysContact：默认可写
+	if err := srv.SetWritable(oid, true); err != nil {
+		t.Fatal(err)
+	}
+	c := dialAgent(t, srv)
+
+	const writers = 4
+	const perWriter = 50
+	done := make(chan struct{}, writers)
+	for w := 0; w < writers; w++ {
+		go func(seed int) {
+			defer func() { done <- struct{}{} }()
+			for i := 0; i < perWriter; i++ {
+				id := int32(seed*perWriter + i)
+				pdu, err := snmpcodec.NewSetPDU(id, []snmpcodec.Varbind{
+					{OID: snmpcodec.MustParseOID(oid), Value: snmpcodec.String("ops@x.invalid")},
+				})
+				if err != nil {
+					t.Errorf("set pdu: %v", err)
+					return
+				}
+				raw, err := snmpcodec.Build(snmpcodec.Message{
+					Version: snmpcodec.V2c, Community: "public", PDU: pdu,
+				})
+				if err != nil {
+					t.Errorf("build set: %v", err)
+					return
+				}
+				if _, err := c.conn.Write(raw); err != nil {
+					t.Errorf("write: %v", err)
+					return
+				}
+				// 读应答，避免请求在内核里无限堆积；忽略内容。
+				buf := make([]byte, snmpcodec.MaxDatagram)
+				_ = c.conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+				_, _ = c.conn.Read(buf)
+			}
+		}(w)
+	}
+
+	// 一边并发读表，逼出与写表的竞争。
+	stop := make(chan struct{})
+	go func() {
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			if _, ok := srv.Get(oid); !ok {
+				t.Errorf("Get(%s) = missing during concurrent SET", oid)
+				return
+			}
+		}
+	}()
+
+	for w := 0; w < writers; w++ {
+		<-done
+	}
+	close(stop)
+}
+
 // community 不匹配必须静默丢弃：回一条错误会让代理变成口令探测的
 // 预言机，真实设备不会这么做。
 func TestWrongCommunityIsDropped(t *testing.T) {
