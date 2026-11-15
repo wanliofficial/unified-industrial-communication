@@ -810,6 +810,17 @@ internal static class ConfigFeatureTests
         ExpectRejected("""{ "kind": "file", "fileId": 1, "recordId": 70000 }""",
             "address.recordId", "a record id beyond the 16-bit wire field is rejected");
 
+        // 记录长度不是靠 address.length 表达的：它由 count × 类型宽度推出。
+        // 允许它「配了不生效」比拒绝更难查——现场会以为自己在读 4 个寄存器。
+        ExpectRejected("""{ "kind": "file", "fileId": 1, "recordId": 0, "length": 4 }""",
+            "address.length", "a window width on a file address is rejected");
+        ExpectRejected("""{ "kind": "file", "fileId": 1, "recordId": 0, "bit": 3 }""",
+            "address.bit", "a bit selector on a file address is rejected");
+        ExpectRejected("""{ "kind": "file", "fileId": 1, "recordId": 0, "path": "DB1.DBD0" }""",
+            "address.path", "a symbol path on a file address is rejected");
+        ExpectRejected("""{ "kind": "file", "fileId": 1, "recordId": 0, "objectType": "analogInput" }""",
+            "address.objectType", "an object type on a file address is rejected");
+
         return Task.CompletedTask;
     }
 

@@ -102,6 +102,14 @@ public sealed record Address
                 // 文件记录寻址没有「记录内偏移」：帧里的引用就是「文件号 + 记录号 + 记录长度」。
                 // 放行非 0 的 offset 会让运行期每轮静默报 address_error，配置阶段就该拒绝。
                 if (Offset != 0) Add($"{path}.offset", "must be 0 for file addressing; use recordId to move");
+                // 记录长度由点位的寄存器数推出（count × 类型宽度，string/bytes 用点位级 length）。
+                // 寄存器寻址的窗口宽度 `length` 在这里没有任何作用，静默忽略就是「配了不生效」。
+                if (Length != 0) Add($"{path}.length", "not allowed for file addressing; the record length comes from count and the data type");
+                // `path`/`objectType` 由 symbol/object 寻址独占，`bit` 由字区的位访问独占。
+                // 它们填在 file 上都是抄错了别的寻址，拒绝时把提示写清楚，比「字段没生效」好查。
+                if (Bit != -1) Add($"{path}.bit", "not allowed for file addressing; a record holds whole registers");
+                if (!string.IsNullOrEmpty(Path)) Add($"{path}.path", "not allowed for file addressing; that field belongs to symbol/object addressing");
+                if (!string.IsNullOrEmpty(ObjectType)) Add($"{path}.objectType", "not allowed for file addressing; that field belongs to object addressing");
                 break;
 
             default:
