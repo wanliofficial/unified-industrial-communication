@@ -551,6 +551,24 @@ func isTimeout(err error) bool {
 	return errors.Is(err, os.ErrDeadlineExceeded) || errors.Is(err, context.DeadlineExceeded)
 }
 
+// qualityOf 把驱动错误翻成质量码。
+//
+// 驱动在几处返回点直接写了质量码，但「等命令确认」这一步的错误种类取决于
+// 当时发生的事：超时（话没说到）、链路掉线（ErrDisconnected）、从站忙
+// （ErrProtocol）。把它们一律记成 timeout 会让运维看到「超时」去查接线，
+// 而真正的问题是链路已经断了。因此按错误种类派生，而不是写死一种。
+func qualityOf(err error) model.Quality {
+	switch driver.KindOf(err) {
+	case driver.ErrTimeout:
+		return model.QualityTimeout
+	case driver.ErrAddress, driver.ErrUnsupported:
+		return model.QualityAddressError
+	case driver.ErrDisconnected:
+		return model.QualityCommError
+	}
+	return model.QualityBad
+}
+
 // busyError 把从站的否定确认翻成「链路忙，可重试」。
 //
 // 它与「超时」不同：否定确认说明从站听懂了但暂时处理不了（缓冲满、
@@ -1053,7 +1071,7 @@ func (c *conn) writeOne(ctx context.Context, req driver.WriteRequest) (driver.Wr
 	conf, err := c.waitCommand(ctx, plan.ioa)
 	if err != nil {
 		return driver.WriteResult{PointID: req.PointID, OK: false,
-			Quality: model.QualityTimeout, Err: err}, err
+			Quality: qualityOf(err), Err: err}, err
 	}
 	if conf.Negative ||
 		(conf.Cause != iec60870.CauseActivationCon && conf.Cause != iec60870.CauseActivationTerm) {

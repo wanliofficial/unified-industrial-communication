@@ -267,3 +267,30 @@ func TestUserFrameTogglesFCB(t *testing.T) {
 		}
 	}
 }
+
+// qualityOf 必须按错误种类派生，而不是写死一种：等命令确认这一步可能是
+// 超时、链路掉线或从站忙，写死 timeout 会让运维把「链路断了」当成「接线/波特率」
+// 去查。这条钉住超时→timeout、断链→comm_error、地址→address_error、其余→bad。
+func TestQualityOfByErrorKind(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want model.Quality
+	}{
+		{"timeout", driver.E(driver.ErrTimeout, "write", "d", "", true, nil), model.QualityTimeout},
+		{"disconnected", driver.E(driver.ErrDisconnected, "write", "d", "", true, nil), model.QualityCommError},
+		{"address", driver.E(driver.ErrAddress, "write", "d", "", false, nil), model.QualityAddressError},
+		{"unsupported", driver.E(driver.ErrUnsupported, "write", "d", "", false, nil), model.QualityAddressError},
+		{"protocol-is-bad", driver.E(driver.ErrProtocol, "write", "d", "", true, nil), model.QualityBad},
+		{"permission-is-bad", driver.E(driver.ErrPermission, "write", "d", "", false, nil), model.QualityBad},
+	}
+	for _, tc := range cases {
+		if got := qualityOf(tc.err); got != tc.want {
+			t.Errorf("%s: qualityOf = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+	// nil 不该走到这条路径，但兜底应是 bad 而不是 good。
+	if got := qualityOf(nil); got != model.QualityBad {
+		t.Errorf("qualityOf(nil) = %v, want bad", got)
+	}
+}
