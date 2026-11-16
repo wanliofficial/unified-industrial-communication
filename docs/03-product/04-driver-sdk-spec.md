@@ -4032,6 +4032,14 @@ DNP3 的「类」不是数据类型，而是**更新频率的约定**：
 set?)」，而不是返回零值。零值会被上游当成「设备读数 0」，这个提示则直接把排查方向
 指向「点表配置的索引/区与从站实际点表不一致」。
 
+**链路断开时这张表里的值全部是「断链前的快照」。** 关键细节在
+`runtime/collector.go`：它会对 `Read` 返回的每一个样本调用 `apply`，即使同一轮也拿到了
+错误。也就是说「把错误一并返回」并不足以保护上游——断线期间上层仍会看到一串标着
+`good` 的旧值，把它们当当前值参与联锁。因此 `Read` 在链路级失败时逐点降级：质量改
+`stale`、值保留（诊断需要知道断线前是多少）、原因写进 `Err`；已经带自己错误的样本
+（地址错、从未收到值）保持原样，因为那更具体。这一条与「零值不是好值」是同一条
+原则的两面：**看不出来的失效比看得出来的失效危险得多**。
+
 #### 3.10.14.11 写：CROB 与模拟量输出都要检查回显
 
 二进制输出用 CROB（组 12）：控制码 `1`=脉冲开、`2`=脉冲关、`3`=锁存开、`4`=锁存关，
@@ -4076,11 +4084,38 @@ read-back 确认读到 uncertain → 上层显示「写入未确认」，与事�
 |---|---|---|
 | 拨号失败、链路断开、写帧失败 | `disconnected` | 是 |
 | 复位链路 / 探活 / 应用事务超时 | `timeout` | 是 |
+| 链路层二级帧回 `NACK` | `protocol` | 是（请求被拒，换参数后） |
+| 链路层二级帧回 `NOT_SUPPORTED` | `unsupported` | 否 |
 | IIN 置位（功能不支持、对象未知、参数错误、已在执行） | `protocol` | 是（换参数后） |
 | CROB 回显非零状态 | `protocol` | 是（看状态码） |
 | 模拟量输出值无法装进选定线格式（越界、带小数、`NaN`/`±Inf`） | `unsupported`（**发报文前**拒绝） | 否 |
 | 配置错误（地址区未知、类型不匹配、轮询参数非法、主从地址相同） | `unsupported` / `address` | 否 |
 | 未知 `area`、`kind != register` | `address` | 否 |
+
+**错误类别不得在写路径里被「洗白」。** 两条写路径（CROB 与组 41）都通过
+`c.request` 与从站做一次应用事务，`request` 已经按真实原因分类好了：链路断开是
+`disconnected`、事务超时是 `timeout`。此前两处都写成 `fail(driver.ErrTimeout, ...)`，
+等于把所有写失败统一报成「设备慢、可重试」——一条已经断掉的链路会被调度器原地重试，
+永远不触发重建连接，而 `runtime/collector.go` 恰恰是按 `ErrDisconnected` 决定丢弃连接的。
+现在 `writeFailed` 保留原错误的 `KindOf`，只做质量码换算（超时→`timeout`、
+断连→`comm_error`）。回归用例 `TestWriteFailureKeepsErrorKind` 杀掉从站后断言写失败
+得到 `disconnected`；把 `writeFailed` 改回 `fail(driver.ErrTimeout, ...)` 必须变红。
+
+**链路层 ACK 不等于「对方接受了请求」。** 二级帧有三种：`ACK`（0）、`NACK`（1）、
+`LINK_STATUS`（11），还有 `NOT_SUPPORTED`（15）。`waitAck` 此前对**任何**二级帧都返回
+成功，于是复位被从站拒绝的设备会被当成链路已就绪，真实失败被推迟到应用层总召唤超时，
+`NACK` 这个真实原因在日志里一次都不出现。现在按功能码分流：`ACK`/`LINK_STATUS` 才算通过，
+`NACK` 报 `protocol`、`NOT_SUPPORTED` 报 `unsupported`。回归用例
+`TestLinkResetNackIsFailure` 让脚本化从站对复位回 `NACK`，断言 `Open` 失败且错误信息
+指出「从站拒绝」。把 `waitAck` 的 NACK 分支改回 `return nil` 必须变红。
+
+**链路断开后本地表里的值是快照，不是当前值。** `Read` 返回本地缓存，而
+`runtime/collector.go` 会对返回的**每个**样本调用 `apply`——即便同一轮也拿到了错误。
+因此「把 `ErrDisconnected` 一并上抛」不足以保护上游：断线期间上层会看到一串标着
+`good` 的旧值，正是最危险的一类假数据。现在链路级失败时逐点降级为 `stale`、
+值保留、原因写进 `Err`（见 `degradeSamples`）。已经带错误的样本保持自己的错误更具体。
+回归用例 `TestReadAfterLinkDownIsStaleNotGood` 断言断线后没有任何样本以 `good` 或空质量
+返回，且 `bi0` 是 `stale`。
 
 重连不是「每次读失败都拨号」，而是后台轮询循环发现链路错误后进入 `recover`：退避从
 200ms 开始翻倍，上限 5 秒。接不接受重连由配置决定不了——现场交换机重启通常几秒到
@@ -4105,7 +4140,7 @@ read-back 确认读到 uncertain → 上层显示「写入未确认」，与事�
 | 内容 | 路径 |
 |---|---|
 | 编解码 | `internal/codec/dnp3`（`CRC`、`EncodeFrame`/`DecodeFrame`、流式 `Decoder`、`Reassembler`、`EncodeTransport`、`EncodeRequest`/`EncodeResponse`、`DecodeApp`、`ParseObjects`、`ParseRequestHeaders`、`ClassObjects`、`CROBObjects`、`AnalogOutputObjects`、`EncodeTime48`/`decodeTime48`） |
-| 主站驱动 | `internal/driver/dnp3`（`Meta`/`Open`/`Probe`/`Read`/`Write`；内部 `connect`/`linkReset`/`linkTest`/`pollLoop`/`poll`/`recover`/`applyObjects`/`convertObject`/`qualityOf`；诊断 `Observed`/`Dropped`/`IIN`） |
+| 主站驱动 | `internal/driver/dnp3`（`Meta`/`Open`/`Probe`/`Read`/`Write`；内部 `connect`/`linkReset`/`linkTest`/`waitAck`/`pollLoop`/`poll`/`recover`/`applyObjects`/`convertObject`/`qualityOf`/`writeFailed`/`degradeSamples`；诊断 `Observed`/`Dropped`/`IIN`） |
 | 内置从站 | `internal/sim/dnp3`（`NewServer`/`Addr`/`SetPoint`/`SetValue`/`SetFlags`/`Value`/`Points`/`SetAutoChange`/`Stats`/`Inflight`/`Pending`/`BadFrames`/`Close`） |
 | CLI | `uic dnp3read`（`-addr`/`-master`/`-unit`/`-wait`/`-timeout`/`-index`/`-json`/`-raw`/`-probe`/`-binary INDEX=on\|off`/`-analog INDEX=VALUE`） |
 | 示例 | `examples/dnp3.json`（13 点位，REST 8098，从站 20000，主站链路地址 1024） |
@@ -4172,7 +4207,7 @@ curl -s -X POST -H 'Authorization: Bearer dev-token-0123456789' \
 | 层 | 用例 |
 |---|---|
 | `codec/dnp3` | CRC 已知答案与分块、链路帧编解码与流式收帧（粘包/半包/坏 CRC 恢复）、传输分片与重组、应用请求/响应（有无 IIN）、8/16 位起止与全部对象、计数限定词、索引前缀、静态位图（1 位/点与双点 2 位/点）、变体 2 无位图、计数器/模拟量交错、带时标事件（22v5/v6 双对象不错位）、请求头解析、CROB 与组 41 构造、未知组报错 |
-| `driver/dnp3` | 真实 TCP 回环：复位 + 总召唤 + 静态值、双点中间态 uncertain、事件轮询与主站应用层确认（inflight 清零）、质量映射三态、CROB 写/读回、模拟量写、模拟量写越界/带小数/`NaN` 在发报文前拒绝（设备零写入）、合法边界值与浮点写仍成功、只读区拒绝、未知输出索引被从站拒绝、`Probe`、`Close` 后读失败、配置校验（地址范围/主从相同/轮询参数/传输/区/类型）、无 ACK 超时有限、并发 Read 与后台轮询（`-race`） |
+| `driver/dnp3` | 真实 TCP 回环：复位 + 总召唤 + 静态值、双点中间态 uncertain、事件轮询与主站应用层确认（inflight 清零）、质量映射三态、CROB 写/读回、模拟量写、模拟量写越界/带小数/`NaN` 在发报文前拒绝（设备零写入）、合法边界值与浮点写仍成功、只读区拒绝、未知输出索引被从站拒绝、`Probe`、`Close` 后读失败、配置校验（地址范围/主从相同/轮询参数/传输/区/类型）、无 ACK 超时有限、并发 Read 与后台轮询（`-race`）；**错误分类不被洗白（写失败保 `disconnected`）**、**链路复位被 `NACK` 时 `Open` 失败且原因可见**、**链路断开后 `Read` 的旧值降级为 `stale` 而非 `good`** |
 | `sim/dnp3` | 静态编码 → 主站解析的往返自洽（15 个对象逐一比对），专门抓「编码少一个字节 / 解析多读一个字节」的错位 |
 | `cmd/uic` | `-probe`/`-index`/`-raw`/`-json`、`-binary`/`-analog` 解析与错误写法、`-master`/`-unit` 范围与相同地址拒绝、行显示 |
 

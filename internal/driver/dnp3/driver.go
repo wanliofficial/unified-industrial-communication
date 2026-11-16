@@ -224,7 +224,7 @@ func (d *Driver) Open(ctx context.Context, cfg driver.OpenConfig) (driver.Conn, 
 		values:   map[string]cachedValue{},
 		observed: map[pointKey]Observed{},
 		done:     make(chan struct{}),
-		linkAck:  make(chan struct{}, 1),
+		linkAck:  make(chan secondaryFrame, 1),
 	}
 
 	openCtx, cancel := context.WithTimeout(ctx, 3*c.timeout)
@@ -385,6 +385,12 @@ func areaOfGroup(g byte) (string, bool) {
 // 连接
 // ---------------------------------------------------------------------------
 
+// secondaryFrame 是一条收到的二级帧（ACK / NACK / 链路状态 / 不支持）。
+// 链路层等待方需要功能码才能区分「对方接受了」与「对方拒绝了」。
+type secondaryFrame struct {
+	fn byte
+}
+
 type conn struct {
 	devID         string
 	addr          string
@@ -417,7 +423,7 @@ type conn struct {
 	pending    chan dnp3codec.AppMessage
 	pendingSeq uint8
 
-	linkAck   chan struct{}
+	linkAck   chan secondaryFrame
 	done      chan struct{}
 	closeOnce sync.Once
 }
@@ -492,9 +498,10 @@ func (c *conn) readLoop(nc net.Conn) {
 
 func (c *conn) handleFrame(nc net.Conn, f dnp3codec.Frame, re *dnp3codec.Reassembler) error {
 	if !f.Primary() {
-		// 二级帧：ACK / NACK / 链路状态。只用于复位与探活。
+		// 二级帧：ACK / NACK / 链路状态。只用于复位与探活，但必须把功能码
+		// 带上去——NACK 与 NOT_SUPPORTED 不是「成功」。
 		select {
-		case c.linkAck <- struct{}{}:
+		case c.linkAck <- secondaryFrame{fn: f.Function()}:
 		default:
 		}
 		return nil
@@ -732,14 +739,31 @@ func (c *conn) drainAcks() {
 	}
 }
 
-// waitAck 等任意一条二级帧。DNP3 的 ACK 不带事务号，链路层同一时刻只允许
-// 一条未确认的复位/探活，因此「收到下一条二级帧」就足够。
+// waitAck 等待一条**二级帧应答**，并区分它的种类。
+//
+// DNP3 的链路层确认不带事务号：同一时刻只允许一条未确认的复位/探活，所以
+// 「收到下一帧二级帧」在时序上足够。但「收到二级帧」不等于「对方接受了请求」
+// ——从站可以回 NACK（1）表示拒绝处理，回 NOT_SUPPORTED（15）表示不支持。
+// 把这两种当成 ACK 会让复位被拒的设备被当成链路已就绪，失败被推迟到
+// 应用层超时，真实原因（NACK）从不出现在日志里。因此这里按功能码分流。
 func (c *conn) waitAck(ctx context.Context, what string) error {
 	timer := time.NewTimer(3 * time.Second)
 	defer timer.Stop()
 	select {
-	case <-c.linkAck:
-		return nil
+	case ack := <-c.linkAck:
+		switch ack.fn {
+		case dnp3codec.FuncAck, dnp3codec.FuncLinkStatus:
+			return nil
+		case dnp3codec.FuncNack:
+			return driver.E(driver.ErrProtocol, what, c.devID,
+				"outstation replied NACK: it refused the link-layer request", true, nil)
+		case dnp3codec.FuncNotSupported:
+			return driver.E(driver.ErrUnsupported, what, c.devID,
+				"outstation replied not-supported: link-layer function not implemented", false, nil)
+		default:
+			return driver.E(driver.ErrProtocol, what, c.devID,
+				fmt.Sprintf("unexpected secondary frame function %d", ack.fn), true, nil)
+		}
 	case <-timer.C:
 		return driver.E(driver.ErrTimeout, what, c.devID, "no link-layer ACK within 3s", true, nil)
 	case <-ctx.Done():
@@ -852,6 +876,13 @@ func (c *conn) Probe(ctx context.Context) error {
 }
 
 // Read 只读本地表。DNP3 的「读」是整类轮询，由后台循环完成。
+//
+// 链路断开时有一件必须做的事：本表里的值都是**断链前**的快照。把它们原样
+// 标着 good 返回，正好构成工业网关最危险的一类假数据——断线期间上层看到的是
+// 一串「正常」的旧值。`runtime/collector.go` 会对返回的**每个**样本调用
+// apply（即便同时拿到了错误），所以「把错误一并返回」并不足以保护上游。
+// 因此链路级失败时逐点降级为 stale 并写明原因，值本身保留（诊断需要知道
+// 断线前是多少），只是不再冒充「当前有效」。
 func (c *conn) Read(ctx context.Context, spans []driver.ReadSpan) ([]driver.RawSample, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, driver.E(driver.ErrTimeout, "read", c.devID, "context done", true, err)
@@ -866,13 +897,31 @@ func (c *conn) Read(ctx context.Context, spans []driver.ReadSpan) ([]driver.RawS
 	}
 	c.mu.Unlock()
 
-	if closed {
-		return out, driver.E(driver.ErrDisconnected, "read", c.devID, "connection closed", true, nil)
-	}
-	if linkErr != nil {
-		return out, driver.E(driver.ErrDisconnected, "read", c.devID, "link is down", true, linkErr)
+	switch {
+	case closed:
+		return degradeSamples(out, c.devID, "connection closed",
+				driver.ErrDisconnected), driver.E(driver.ErrDisconnected, "read", c.devID,
+				"connection closed", true, nil)
+	case linkErr != nil:
+		return degradeSamples(out, c.devID, "link is down; value is the last snapshot before the outage",
+				driver.ErrDisconnected), driver.E(driver.ErrDisconnected, "read", c.devID,
+				"link is down", true, linkErr)
 	}
 	return out, nil
+}
+
+// degradeSamples 把一轮样本整体降级为「陈旧」：值保留、质量改成 stale、原因
+// 写进 Err。已经带错误的样本保持它自己的错误（那更具体），只把「看起来正常」
+// 的那些换掉——否则断线期间的旧值会以 good 流进上层。
+func degradeSamples(in []driver.RawSample, devID, msg string, kind driver.ErrorKind) []driver.RawSample {
+	for i := range in {
+		if in[i].Err != nil {
+			continue
+		}
+		in[i].Quality = model.QualityStale
+		in[i].Err = driver.E(kind, "read", devID, msg, true, nil)
+	}
+	return in
 }
 
 func (c *conn) lookupLocked(id string) driver.RawSample {
@@ -951,7 +1000,8 @@ func (c *conn) writeOne(ctx context.Context, req driver.WriteRequest) (driver.Wr
 		}
 		resp, err := c.request(ctx, dnp3codec.AppDirectOperate, objects)
 		if err != nil {
-			return fail(driver.ErrTimeout, err.Error())
+			// 保留 request 的真实分类（断连 ≠ 超时），不洗白成 timeout。
+			return c.writeFailed(req, err)
 		}
 		if msg := iinError(resp.IIN); msg != "" {
 			return fail(driver.ErrProtocol, msg)
@@ -1004,7 +1054,8 @@ func (c *conn) writeOne(ctx context.Context, req driver.WriteRequest) (driver.Wr
 		}
 		resp, err := c.request(ctx, dnp3codec.AppDirectOperate, objects)
 		if err != nil {
-			return fail(driver.ErrTimeout, err.Error())
+			// 保留 request 的真实分类（断连 ≠ 超时），不洗白成 timeout。
+			return c.writeFailed(req, err)
 		}
 		if msg := iinError(resp.IIN); msg != "" {
 			return fail(driver.ErrProtocol, msg)
@@ -1042,6 +1093,25 @@ func (c *conn) storeWritten(id string, dt model.DataType, v model.Value) {
 	c.mu.Lock()
 	c.values[id] = cachedValue{value: v, quality: model.QualityGood, at: time.Now().UTC()}
 	c.mu.Unlock()
+}
+
+// writeFailed 把一次「请求阶段就失败」的写整理成结果 + 错误。
+//
+// 关键点是**不得洗白错误类别**。`c.request` 已经按真实原因分类：链路断开是
+// `disconnected`、事务超时是 `timeout`、ctx 到期是 `timeout`、写帧失败是
+// `disconnected`。此前这里统一 `fail(driver.ErrTimeout, ...)`，等于把所有写
+// 失败都报成「超时可重试」——一条已经断掉的链路会被调度器当成「设备慢」而
+// 原地重试，永远不触发重建连接（§3.10.14.12 的错误分类表把拨号/断连明确列为
+// `disconnected`）。所以这里保留原错误的 `KindOf`，只做质量码换算。
+func (c *conn) writeFailed(req driver.WriteRequest, err error) (driver.WriteResult, error) {
+	q := model.QualityBad
+	switch driver.KindOf(err) {
+	case driver.ErrTimeout:
+		q = model.QualityTimeout
+	case driver.ErrDisconnected:
+		q = model.QualityCommError
+	}
+	return driver.WriteResult{PointID: req.PointID, OK: false, Quality: q, Err: err}, err
 }
 
 func (c *conn) Close() error {

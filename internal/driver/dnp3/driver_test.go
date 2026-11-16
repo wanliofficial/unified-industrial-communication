@@ -127,6 +127,13 @@ func (h *harness) waitFor(c *conn, what string, cond func(map[string]driver.RawS
 	return nil
 }
 
+// linkDown 报告驱动是否已把链路标记为断开。
+func (h *harness) linkDown(c *conn) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.linkErr != nil || c.closed
+}
+
 func num(t *testing.T, s driver.RawSample) float64 {
 	t.Helper()
 	if s.Value.Type == model.TypeBool {
@@ -502,6 +509,39 @@ func TestProbe(t *testing.T) {
 	}
 }
 
+// 写失败必须保留 request 的真实错误类别，不能一律洗白成 timeout。
+//
+// 现场区分这两种错误的意义完全不同：timeout 是「设备慢，原地重试」，
+// disconnected 是「链路没了，必须重建连接」。此前两条写路径都
+// `fail(driver.ErrTimeout, ...)`，于是从站进程退出、网线拔掉这类断连
+// 会被报成可重试的超时，调度器一直原地重试，永远不恢复。
+//
+// 这里直接杀掉从站（链路级事件），断言写失败得到 disconnected。
+func TestWriteFailureKeepsErrorKind(t *testing.T) {
+	h := newHarness(t)
+	c := h.open()
+
+	// 杀掉从站，模拟网线断开 / 设备进程退出。
+	_ = h.srv.Close()
+	// 给读循环一点时间把 linkErr 记下来。
+	deadline := time.Now().Add(3 * time.Second)
+	for !h.linkDown(c) && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	_, err := c.Write(context.Background(), []driver.WriteRequest{{
+		PointID: "bo0", DataType: model.TypeBool,
+		Address: model.Address{Kind: model.AddressRegister, Area: AreaBinaryOutput, Offset: 0, Bit: -1},
+		Value:   model.BoolValue(true),
+	}})
+	if err == nil {
+		t.Fatal("write on a dead link succeeded")
+	}
+	if got := driver.KindOf(err); got != driver.ErrDisconnected {
+		t.Fatalf("kind = %s, want disconnected（断连被洗白成 timeout 会让调度器原地重试）", got)
+	}
+}
+
 func TestCloseThenRead(t *testing.T) {
 	h := newHarness(t)
 	c := h.open()
@@ -616,6 +656,117 @@ func TestOpenTimesOutWithoutLinkAck(t *testing.T) {
 	}
 	if driver.KindOf(err) != driver.ErrTimeout {
 		t.Fatalf("kind = %s, want timeout (%v)", driver.KindOf(err), err)
+	}
+}
+
+// 链路复位被从站 NACK 时必须失败，不能当成 ACK 通过。
+//
+// DNP3 里「收到的下一帧是二级帧」不等于确认：从站可以回 NACK（功能码 1）
+// 表示「这个请求我不处理」，回 NOT_SUPPORTED（15）表示「不支持」。此前的
+// waitAck 对任何二级帧都返回成功，于是复位被拒绝的设备会被当成链路已就绪，
+// 后续每次总召唤都超时——现场表现为「连上了、但永远没数据」，而链路层的
+// 真实失败原因（NACK）在日志里一次都没出现过。
+func TestLinkResetNackIsFailure(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	go func() {
+		c, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer c.Close()
+		var dec dnp3codec.Decoder
+		buf := make([]byte, 256)
+		for {
+			n, err := c.Read(buf)
+			if err != nil {
+				return
+			}
+			dec.Feed(buf[:n])
+			f, ok, derr := dec.Next()
+			if derr != nil || !ok {
+				continue
+			}
+			// 对主站的请求回 NACK：二级帧，DIR=0、PRM=0、功能码 1。
+			raw, _ := dnp3codec.EncodeFrame(dnp3codec.FuncNack, f.Source, f.Dest, nil)
+			if _, err := c.Write(raw); err != nil {
+				return
+			}
+		}
+	}()
+
+	dev := model.Device{
+		ID: "rtu-nack", ChannelID: "ch", UnitID: 1, Enabled: true,
+		Interval: model.Duration(time.Second),
+		Timeout:  model.Duration(300 * time.Millisecond),
+		Points:   []model.Point{dp("bi", AreaBinaryInput, 0, model.TypeBool, false)},
+	}
+	ch := model.Channel{ID: "ch", Protocol: "dnp3",
+		Transport: model.Transport{Kind: "tcp", Address: ln.Addr().String()}}
+
+	_, err = New().Open(context.Background(), driver.OpenConfig{Channel: ch, Device: dev})
+	if err == nil {
+		t.Fatal("open succeeded although the outstation NACKed the link reset")
+	}
+	if strings.Contains(strings.ToLower(err.Error()), "timeout") {
+		t.Fatalf("NACK 被报成超时，真实原因丢失: %v", err)
+	}
+	if !strings.Contains(err.Error(), "NACK") && !strings.Contains(err.Error(), "not supported") {
+		t.Fatalf("错误信息应指出从站拒绝了复位，得到: %v", err)
+	}
+}
+
+// 链路断开后，本地表里的值都是断链前的快照，不能继续标 good 返回。
+//
+// collector 会对 Read 返回的**每个**样本调用 apply（即便同时拿到错误），
+// 所以「错误一并上抛」不足以保护上游：断线期间上层会看到一串标着 good 的
+// 旧值——正是工业网关最危险的一类假数据。修复后这类样本降级为 stale，
+// 值保留（诊断要知道断线前是多少），原因写进 Err。
+func TestReadAfterLinkDownIsStaleNotGood(t *testing.T) {
+	h := newHarness(t)
+	c := h.open()
+
+	// 先确认链路正常时拿到的是 good。
+	if got := h.readAll(c); got["bi0"].Quality != model.QualityGood {
+		t.Fatalf("健康链路上 bi0 质量 = %s, want good", got["bi0"].Quality)
+	}
+
+	_ = h.srv.Close()
+	deadline := time.Now().Add(3 * time.Second)
+	for !h.linkDown(c) && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !h.linkDown(c) {
+		t.Fatal("从站已关闭但驱动没把链路标记为断开")
+	}
+
+	out, err := c.Read(context.Background(), h.spans())
+	if err == nil {
+		t.Fatal("链路断开时 Read 必须返回错误")
+	}
+	if driver.KindOf(err) != driver.ErrDisconnected {
+		t.Fatalf("kind = %s, want disconnected", driver.KindOf(err))
+	}
+	for _, s := range out {
+		if s.Err == nil {
+			t.Fatalf("%s 没有诊断错误", s.PointID)
+		}
+		if s.Quality == model.QualityGood || s.Quality == "" {
+			t.Fatalf("%s 质量 = %s：断线后的快照不能标 good", s.PointID, s.Quality)
+		}
+	}
+	// 值本身要保留：诊断需要知道断线前是多少。
+	var bi0 driver.RawSample
+	for _, s := range out {
+		if s.PointID == "bi0" {
+			bi0 = s
+		}
+	}
+	if bi0.Quality != model.QualityStale {
+		t.Fatalf("bi0 质量 = %s, want stale", bi0.Quality)
 	}
 }
 
