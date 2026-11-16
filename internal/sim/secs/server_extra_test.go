@@ -122,6 +122,48 @@ func TestServerCustomVariableVisible(t *testing.T) {
 	}
 }
 
+// TestServerRejectWritesKeepsAck 模拟「写被 ACK 接受但值不生效」的设备：
+// S2F16 仍回 ACKC7=0，但编号的值保持不变。自检命令的写后重读确认依赖
+// 这种设备来验证「OK 不等于生效」这条判定真的会失败——若这条设备不存在，
+// verify 分支就没有任何测试覆盖，等于一个开关被打开了却从没有人按过。
+func TestServerRejectWritesKeepsAck(t *testing.T) {
+	srv, err := secssim.NewServerWithOptions("127.0.0.1:0", secssim.Options{RejectWrites: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = srv.Close() })
+
+	cl := dial(t, srv.Addr())
+	cl.roundTrip(secscodec.NewSelectReq(0))
+
+	// S2F15：把 ECID 10 改成 999（默认是 300）。
+	body, _ := secscodec.EncodeConstantSend([]secscodec.Constant{
+		{ID: 10, Value: secscodec.Int(secscodec.FormatU4, 999)},
+	})
+	dm := secscodec.DataMessage{Stream: 2, Function: 15, WBit: true, Body: body}
+	resp := cl.roundTrip(dm.ToMessage())
+	if resp.MsgType != secscodec.MsgTypeDataMsg {
+		t.Fatalf("应答类型 = %s", secscodec.TypeName(resp.MsgType))
+	}
+	ack, err := secscodec.DecodeAck(resp.Payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ack != 0 {
+		t.Fatalf("设备应照回 ACKC7=0（请求被接受），得到 %d", ack)
+	}
+
+	// 但读回仍是旧值 300：这正是「OK 不等于生效」。
+	got, ok := srv.ValueOf(secscodec.ObjectECID, 10)
+	if !ok {
+		t.Fatal("ECID 10 应存在")
+	}
+	v, _ := got.U4()
+	if v != 300 {
+		t.Fatalf("rejectWrites 设备上 ECID 10 = %d，应保留旧值 300", v)
+	}
+}
+
 // 不存在的 SVID 请求：设备回空列表（S1F4），主站据此判 address_error。
 func TestServerUnknownSVIDReturnsEmpty(t *testing.T) {
 	srv := newSim(t)

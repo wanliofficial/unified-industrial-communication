@@ -4849,7 +4849,9 @@ HSMS 跑在 TCP 上，重发只在「对端进程卡住但连接没断」时有�
 
 #### 3.10.16.13 自检：先看编号和格式，再读值
 
-自检命令 `uic secsread` 有五种模式，顺序上刻意把「看结构」排在「读值」前面：
+自检命令 `uic secsread` 有六种模式。前五种的顺序上刻意把「看结构」排在「读值」前面；最后一种是写——
+写之前必须先读回确认，因为 S2F16 的 ACKC7 是设备**对整批**的一个结论，它不告诉你「哪一个被拒」，
+一次写多个常数等于把失败原因扔掉：
 
 | 模式 | 动作 | 用途 |
 |---|---|---|
@@ -4858,6 +4860,7 @@ HSMS 跑在 TCP 上，重发只在「对端进程卡住但连接没断」时有�
 | `-raw` | S1F3（或 S2F13） | 打印**原始 SECS-II 项**，不做类型转换 |
 | 默认 | S1F3/S2F13 + 类型转换 | 按 `-type` 解释，输出值与质量 |
 | `-write` | S2F15/S2F16 | 仅 `-object ecid`，仅单编号 |
+| `-write` **+** `-verify` | 写 → 重读原编号 → 比对 | 确认写下去的不只是 ACK，还有设备里的值 |
 
 `-raw` 是排查效率最高的一档。现场最常见的问题是「设备回的格式与点表声明不一致」（点表
 写 int32、设备回 `A "RUN"`）；先看原始项就能一眼定位，而不是从一个「类型不符」的错误里猜。
@@ -4893,6 +4896,17 @@ HSMS 跑在 TCP 上，重发只在「对端进程卡住但连接没断」时有�
 # SECS/GEM 的状态变量（svid）只读：写设备常数请加 -object ecid
 ```
 
+写只报 ACKC7=0 时，加 `-verify` 重读原编号做最终确认——ACK 是设备的**意图**
+（「请求合法、已受理」），不是**结果**（值已变成 X）。真实设备上这两者会分岔：
+ACK 被设备接受但值随后被内部联锁拉回、写进影子副本而非生效副本、设备侧异步校验
+失败——这些都不会反映在 S2F16 里，只有重读才能看见。自检命令对「重读回来的值」
+与「要求写入的值」做逐字节比对，不一致时**失败退出（exit 1）**而不是打印一条
+「看起来像提示」的警告后返回成功：警告会被人忽略，而一次写错工艺设定值的代价
+远大于一条被误报的告警。
+
+`-verify` 的比对规则与驱动读路径的严格程度一致：类型不符、编码不上的值一律判
+不一致并输出原始项，不做「数值上近似就算通过」的宽容。
+
 示例配置 `examples/secs.json` 带上网关跑真实采集（2 台设备 5 个点位）：
 
 ```bash
@@ -4910,9 +4924,9 @@ curl -s -X POST -H 'Authorization: Bearer dev-token-0123456789' \
 |---|---|
 | 编解码 | `internal/codec/secs`（`Encode`/`Decode` HSMS 帧、`FrameDataLen`、`ParseFrame`、`EncodeItem`/`DecodeItem`、`MaxPayload`） |
 | 消息语义 | `internal/codec/secs`（`EncodeIDList`/`DecodeIDList`、`EncodeStatusReply`/`DecodeStatusReply`、`EncodeStatusNameReply`/`DecodeStatusNameReply`、`EncodeConstantSend`、`EncodeConstantAck`/`DecodeAck`、`EncodeCommAck`/`DecodeCommAck`、`EncodeOnLineData`、`EncodeEventReport`、`EncodeAlarmReport`、`itemUint`） |
-| 主站驱动 | `internal/driver/secs`（`Meta`/`Open`/`Read`/`Write`/`Probe`/`Close`；内部 `selectLink`/`exchange`/`awaitSecondary`/`readOne`/`readGroup`/`planFor`；值转换 `itemValue`/`itemFloat`/`valueItem`；自检扩展 `Inspector`/`Describe`/`RawRead`） |
+| 主站驱动 | `internal/driver/secs`（`Meta`/`Open`/`Read`/`Write`/`Probe`/`Close`；内部 `selectLink`/`exchange`/`awaitSecondary`/`readOne`/`readGroup`/`planFor`；值转换 `itemValue`/`itemFloat`/`valueItem`；自检扩展 `Inspector`/`Describe`/`RawRead`/`Verify`） |
 | 内置设备 | `internal/sim/secs`（`NewServer`/`NewServerWithOptions`/`Addr`/`Name`/`SetVID`/`SetVIDNamed`/`SetECID`/`Value`/`ValueOf`/`IDs`/`IDsOf`/`SortedIDs`/`Requests`/`Writes`/`PushEvent`/`PushAlarm`/`Close`） |
-| CLI | `uic secsread`（`-addr`/`-object`/`-id`/`-type`/`-timeout`/`-comm-timeout`/`-retries`/`-probe`/`-describe`/`-raw`/`-write`/`-json`） |
+| CLI | `uic secsread`（`-addr`/`-object`/`-id`/`-type`/`-timeout`/`-comm-timeout`/`-retries`/`-probe`/`-describe`/`-raw`/`-write`/`-verify`/`-json`） |
 | 示例 | `examples/secs.json`（2 台设备 5 个点位，REST 8100，设备 5000） |
 
 #### 3.10.16.15 测试矩阵
@@ -4921,7 +4935,7 @@ curl -s -X POST -H 'Authorization: Bearer dev-token-0123456789' \
 |---|---|
 | `codec/secs` | 帧往返与金字节（含 W 位、控制消息 0xFF）、Stream 1..15 边界、字节顺序非 1 拒绝、长度字段与实际数据不一致、`FrameDataLen` 短头与超上限、`ParseFrame` 半帧/多帧、长度字节数 00/01/10/11、`encodeLen`/`decodeLen` 边界（255/256/65535/65536/16777215）、L 项子项数边界与畸形声明、各格式 `Item` 取值与宽度校验、BOOLEAN 非 0 即 true、`Int`/`Float` 的非定长格式、`FormatName`/`TypeName`/`StatusName` 兜底 |
 | `codec/secs`（消息） | `L,n{U4}` 编号列表往返与 U1/U2 容忍、S1F4/S2F14 往返与金字节、S1F12 往返与第四项容忍、S2F15/S2F16 与 `B,1` 应答、S1F14 COMMACK、S1F2 机型版本、S6F11 多层报告与 `FindVID`、S5F1 ALCD 的发生/解除与类别保留、各消息体的畸形形状拒绝、空值与 nil 值 |
-| `driver/secs` | 真实 TCP 回环：Select 握手成功/被拒/错应答/沉默、批量读 SVID（3 点 1 次事务）、混合 svid+ecid（2 次事务）、缺失编号 → `address`、类型不符、范围校验、字符串数字、异步推送被忽略、迟到应答被忽略、S2F15 写入与回读、只读 ECID、svid 不可写、点表外写入被拒、未知 ECID 被拒、重发一次后成功、ctx 取消、半帧/畸形帧头/对端挂断、`Probe` 的 timeout/protocol、`Close` 发 Separate 且幂等、系统字节回绕跳过 0、禁用点不入表、负 length 拒绝、**部分失败语义（坏地址 + 好点时 `err==nil` 且坏点带 `address`、全失败才返回整体错误、SVID 组链路失败后 ECID 组的点位显式标坏）**、`RawRead`（svid/ecid）、`Describe`、值转换全类型与全错误分支 |
+| `driver/secs` | 真实 TCP 回环：Select 握手成功/被拒/错应答/沉默、批量读 SVID（3 点 1 次事务）、混合 svid+ecid（2 次事务）、缺失编号 → `address`、类型不符、范围校验、字符串数字、异步推送被忽略、迟到应答被忽略、S2F15 写入与回读、只读 ECID、svid 不可写、点表外写入被拒、未知 ECID 被拒、重发一次后成功、ctx 取消、半帧/畸形帧头/对端挂断、`Probe` 的 timeout/protocol、`Close` 发 Separate 且幂等、系统字节回绕跳过 0、禁用点不入表、负 length 拒绝、**部分失败语义（坏地址 + 好点时 `err==nil` 且坏点带 `address`、全失败才返回整体错误、SVID 组链路失败后 ECID 组的点位显式标坏）**、`RawRead`（svid/ecid）、`Describe`、**`Verify`（写后重读一致 / ACK 接受但值没变 → 判失败）**、值转换全类型与全错误分支 |
 | `sim/secs` | 默认值与两个独立编号空间、`SetVIDNamed` 与 S1F12、S1F11 空列表=全部 SVID、未知编号回空列表、S2F15 写入与未知 ECID 拒绝、未选中 Reject、Deselect 后 Reject、S1F1 无 W 位不应答、S5F1 报警推送与解除、S6F11 事件推送、未选中不推送、计数器语义、Separate 关闭连接、畸形请求容错、空闲 2.5 秒不断链、重复监听报错、二次 Close 幂等 |
 
 覆盖率（`go test -cover`）：`codec/secs` 94.6%、`driver/secs` 89.1%、`sim/secs` 95.1%。

@@ -42,11 +42,11 @@ func secsreadCmd(args []string) {
 	probe := fs.Bool("probe", false, "只做 Linktest 探活，不读编号")
 	describe := fs.Bool("describe", false, "用 S1F11/S1F12 查询状态变量的名称与单位")
 	raw := fs.Bool("raw", false, "读取原始 SECS-II 项（不做类型转换，直接看设备回什么格式）")
+	noVerify := fs.Bool("no-verify", false, "跳过写后重读确认（默认开启，见 -verify）")
 	asJSON := fs.Bool("json", false, "以 JSON 输出")
 
 	write := fs.String("write", "", "写入值（仅 ecid；按 -type 解释）")
 	fs.Parse(args)
-
 	hasWrite := false
 	fs.Visit(func(f *flag.Flag) {
 		if f.Name == "write" {
@@ -130,7 +130,10 @@ func secsreadCmd(args []string) {
 	}
 
 	if hasWrite {
-		runSECSWrite(ctx, conn, secsPoint(obj, list[0], model.DataType(*typ), true), writeValue, *asJSON)
+		// verify 默认开启：写成功但值没变是最危险的失败模式（工艺设定值被
+		// 悄悄写成旧值，界面全绿），必须显式 -no-verify 才能跳过。
+		runSECSWrite(ctx, conn, secsPoint(obj, list[0], model.DataType(*typ), true),
+			writeValue, *asJSON, !*noVerify)
 		return
 	}
 
@@ -275,20 +278,31 @@ func runSECSRaw(ctx context.Context, conn driver.Conn, object string, ids []uint
 	}
 }
 
+// runSECSWrite 写单个 ecid；verify 为真时写成功后重读该编号做最终确认。
+//
+// ACKC7=0 是设备的「意图」（请求合法、已受理），不是「结果」（值已变成 X）。
+// 真实设备上 ACK 被接受但值随后被内部联锁拉回、或写进影子副本而非生效副本
+// 的情况都存在——S2F16 不会反映这些，只有重读能看见。因此 verify 失败要
+// **失败退出**，而不是打印一条看起来像提示的警告：写错工艺设定值的代价远
+// 大于一条被误报的告警，而警告会被人忽略。
 func runSECSWrite(ctx context.Context, conn driver.Conn, p model.Point,
-	value model.Value, asJSON bool) {
+	value model.Value, asJSON, verify bool) {
 	results, err := conn.Write(ctx, []driver.WriteRequest{{
 		PointID: p.ID, Address: p.Address, DataType: p.DataType, Value: value,
 	}})
 
 	type row struct {
-		Object  string `json:"object"`
-		ID      int    `json:"id"`
-		OK      bool   `json:"ok"`
-		Quality string `json:"quality"`
-		Error   string `json:"error,omitempty"`
+		Object   string `json:"object"`
+		ID       int    `json:"id"`
+		OK       bool   `json:"ok"`
+		Written  string `json:"written,omitempty"`
+		ReadBack string `json:"read_back,omitempty"`
+		Verified bool   `json:"verified,omitempty"`
+		Quality  string `json:"quality"`
+		Error    string `json:"error,omitempty"`
 	}
-	r := row{Object: p.Address.ObjectType, ID: p.Address.Instance, Quality: string(model.QualityBad)}
+	r := row{Object: p.Address.ObjectType, ID: p.Address.Instance,
+		Quality: string(model.QualityBad)}
 	if len(results) > 0 {
 		r.OK = results[0].OK
 		r.Quality = string(results[0].Quality)
@@ -296,19 +310,157 @@ func runSECSWrite(ctx context.Context, conn driver.Conn, p model.Point,
 			r.Error = results[0].Err.Error()
 		}
 	}
+	writeFailed := err != nil || (len(results) > 0 && !r.OK)
+	if writeFailed && err != nil && !asJSON {
+		fmt.Fprintf(os.Stderr, "写入失败: %v\n", err)
+	}
+
+	// 写失败就不再 verify：读回只能确认「旧值还在」，诊断上不如直接给出写错的原因。
+	if !writeFailed {
+		r.Written = secsValueText(value)
+		if verify {
+			r.Verified = true
+			it, verr := verifyItem(ctx, conn, p)
+			if verr != nil {
+				r.Verified = false
+				r.Error = verr.Error()
+			} else {
+				r.ReadBack = it.Text()
+				if !itemMatches(it, value) {
+					r.Verified = false
+					r.Error = fmt.Sprintf("写后被设备拒绝（ACKC7=0 但值未生效），读回 %s",
+						r.ReadBack)
+				}
+			}
+		} else {
+			// 未开启 verify：OK 只证明 ACKC7=0，不证明生效。如实声明，不装作已确认。
+			fmt.Printf("     未做写后重读确认（默认开启；本行 OK 只表示 ACKC7=0）\n")
+			return
+		}
+	}
+
 	if asJSON {
 		emitJSON(r)
-	} else if r.OK {
-		fmt.Printf("OK   %s %d = %s\n", r.Object, r.ID, secsValueText(value))
-	} else {
-		fmt.Printf("FAIL %s %d: %s\n", r.Object, r.ID, r.Error)
+		if writeFailed || (verify && r.OK && !r.Verified) {
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "写入失败: %v\n", err)
+			}
+			os.Exit(1)
+		}
+		return
 	}
-	if err != nil || !r.OK {
-		if err != nil && !asJSON {
+	if writeFailed || (verify && r.OK && !r.Verified) {
+		if err != nil {
 			fmt.Fprintf(os.Stderr, "写入失败: %v\n", err)
 		}
 		os.Exit(1)
 	}
+	if r.OK {
+		fmt.Printf("OK   %s %d = %s\n", r.Object, r.ID, r.Written)
+	} else {
+		fmt.Printf("FAIL %s %d: %s\n", r.Object, r.ID, r.Error)
+	}
+	if r.OK && !verify {
+		// 未开启 verify：OK 只证明 ACKC7=0，不证明生效。如实声明，不装作已确认。
+		fmt.Printf("     未做写后重读确认（默认开启；本行 OK 只表示 ACKC7=0）\n")
+		return
+	}
+	if verify && r.OK {
+		if r.Verified {
+			fmt.Printf("     读回确认: %s\n", r.ReadBack)
+		} else {
+			fmt.Printf("     读回确认失败: %s\n", r.Error)
+		}
+	}
+}
+
+// verifyItem 用驱动的自检扩展读回刚写的编号，拿到原始 SECS-II 项。
+func verifyItem(ctx context.Context, conn driver.Conn, p model.Point) (*secscodec.Item, error) {
+	d, ok := conn.(secsdrv.Inspector)
+	if !ok {
+		return nil, fmt.Errorf("驱动不提供原始项读取")
+	}
+	it, err := d.RawRead(ctx, p.Address.ObjectType, uint32(p.Address.Instance))
+	if err != nil {
+		return nil, err
+	}
+	// 读回本身也可能失败：那同样是「写未生效」的证据，不是无关的后续错误。
+	return it, nil
+}
+
+// itemMatches 比对读回的原始项与要求写入的值，与驱动的按声明解码严格程度一致：
+// 不做「数值上近似就算通过」的宽容。宽容在这里比严格危险——
+// 温度上限被写成 349.9 而读回 350，在界面上是绿色的一行。
+func itemMatches(it *secscodec.Item, want model.Value) bool {
+	switch want.Type {
+	case model.TypeBool:
+		b, err := it.Bool()
+		return err == nil && b == want.Bool
+	case model.TypeString:
+		s, err := it.String()
+		return err == nil && s == want.Text
+	case model.TypeBytes:
+		b, err := it.Bytes()
+		return err == nil && string(b) == want.Text
+	}
+	f, err := secsItemFloat(it)
+	if err != nil {
+		return false
+	}
+	got, ok := want.AsFloat()
+	if !ok {
+		return false
+	}
+	return f == got
+}
+
+// secsItemFloat 从读回的原始项里取数值：与驱动读路径的 itemFloat 同规则
+// （数值格式按宽度取，字符串项也接受数字），避免「CLI 认作相等、驱动认作
+// 不等」这类两边不一致的判定。
+func secsItemFloat(it *secscodec.Item) (float64, error) {
+	switch it.Format {
+	case secscodec.FormatU1:
+		v, err := it.U1()
+		return float64(v), err
+	case secscodec.FormatU2:
+		v, err := it.U2()
+		return float64(v), err
+	case secscodec.FormatU4:
+		v, err := it.U4()
+		return float64(v), err
+	case secscodec.FormatU8:
+		v, err := it.U8()
+		return float64(v), err
+	case secscodec.FormatI1:
+		v, err := it.I1()
+		return float64(v), err
+	case secscodec.FormatI2:
+		v, err := it.I2()
+		return float64(v), err
+	case secscodec.FormatI4:
+		v, err := it.I4()
+		return float64(v), err
+	case secscodec.FormatI8:
+		v, err := it.I8()
+		return float64(v), err
+	case secscodec.FormatF4:
+		v, err := it.F4()
+		return float64(v), err
+	case secscodec.FormatF8:
+		v, err := it.F8()
+		return float64(v), err
+	case secscodec.FormatASCII, secscodec.FormatJIS:
+		s, err := it.String()
+		if err != nil {
+			return 0, err
+		}
+		var f float64
+		if _, err := fmt.Sscanf(strings.TrimSpace(s), "%g", &f); err != nil {
+			return 0, fmt.Errorf("cannot read %q as number", s)
+		}
+		return f, nil
+	}
+	return 0, fmt.Errorf("cannot read %s as number", secscodec.FormatName(it.Format))
 }
 
 func runSECSDescribe(ctx context.Context, conn driver.Conn, ids []uint32, asJSON bool) {

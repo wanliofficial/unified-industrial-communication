@@ -163,6 +163,49 @@ func TestWriteECID(t *testing.T) {
 	}
 }
 
+// TestWriteACKsButValueUnchanged 钉住一条重要的边界：S2F16 的 ACKC7=0 只证明
+// 「设备接受了请求」，不证明「值已经生效」。驱动层的 Write 只负责把 ACKC7 翻译成
+// OK/失败——这是协议层语义，不是缺陷。真正防「ACK 通过但值没变」的是自检命令
+// 的写后重读确认（cmd/uic/secsread.go），那条路径由 RejectWrites 仿真覆盖。
+// 这一条测试保证驱动层的这个语义边界不会被后续改动悄悄抹平（例如有人「好心」
+// 在驱动里加一次隐式重读，把「写成功但值没变」也变成驱动层的成功）。
+func TestWriteACKsButValueUnchanged(t *testing.T) {
+	srv, err := secssim.NewServerWithOptions("127.0.0.1:0", secssim.Options{RejectWrites: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = srv.Close() })
+
+	srv.SetECID(10, secscodec.Int(secscodec.FormatU4, 300))
+	cfg := testConfig(srv, ecidPoint("limit", 10, model.TypeUint32, true))
+	c, err := New().Open(context.Background(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	res, err := c.Write(context.Background(), []driver.WriteRequest{{
+		PointID: "limit", Address: model.Address{Kind: model.AddressObject, ObjectType: "ecid", Instance: 10, Property: "value"},
+		DataType: model.TypeUint32, Value: model.NumValue(model.TypeUint32, 350),
+	}})
+	if err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	// 驱动层的成功判据就是 ACKC7=0：这一条必须是 OK，因为驱动不能替协议
+	// 承诺它没承诺过的事（值生效）。真正校验生效与否由自检命令的
+	// verify 路径负责。
+	if !res[0].OK || res[0].Quality != model.QualityGood {
+		t.Fatalf("驱动层 ACKC7=0 应翻译为 OK，得到 %+v", res[0])
+	}
+	v, ok := srv.ValueOf(secscodec.ObjectECID, 10)
+	if !ok {
+		t.Fatal("sim 应保留 ECID 10")
+	}
+	if n, _ := v.U4(); n != 300 {
+		t.Fatalf("RejectWrites 设备应保留旧值，得到 %d（驱动不应隐式重读校验生效）", n)
+	}
+}
+
 func TestWriteSVIDRejected(t *testing.T) {
 	srv := startSim(t)
 	cfg := testConfig(srv, svidPoint("temp", 1, model.TypeUint32))

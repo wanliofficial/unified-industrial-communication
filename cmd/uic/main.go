@@ -591,6 +591,9 @@ func simCmd(args []string) {
 	proto := fs.String("protocol", "modbus", "从站协议：modbus | s7 | opcua | mqtt | mc | fins | enip | bacnet | bacnet-mstp | iec104 | iec101 | mewtocol | hostlink | dnp3 | coap | knx | dlt645 | cjt188 | mbus | dlms | sl651 | snmp | ads | secs | iec61850 | mtconnect | toledo")
 	pdu := fs.Int("pdu", 480, "S7 协商 PDU 长度（240/480/960）")
 	busAddr := fs.Int("busAddr", 1, "M-Bus：虚拟表计的主地址 0..250")
+	// SECS 专用（只在 -protocol secs 时生效）
+	secsRejectWrites := fs.Bool("reject-writes", false,
+		"SECS：模拟写被 ACK 接受但值随后不变的设备（供 secsread 写后重读确认自检）")
 
 	// SNMP v3/USM 专用（只在 -protocol snmp 时生效）
 	v3 := fs.Bool("v3", false, "SNMP：启用 v3/USM（默认只开 community）")
@@ -674,7 +677,7 @@ func simCmd(args []string) {
 		simADS(*addr)
 		return
 	case "secs":
-		simSECS(*addr)
+		simSECSWithOptions(*addr, secssim.Options{RejectWrites: *secsRejectWrites})
 		return
 	case "iec61850":
 		simIEC61850(*addr)
@@ -1688,7 +1691,11 @@ func simADS(addr string) {
 // 语义。设备主动推送（S6F11/S5F1）需要外部触发，仿真里没有定时器——它刻意
 // 保持「只应答」，这样自检结果不会被异步消息干扰。
 func simSECS(addr string) {
-	srv, err := secssim.NewServer(addr)
+	simSECSWithOptions(addr, secssim.Options{})
+}
+
+func simSECSWithOptions(addr string, opt secssim.Options) {
+	srv, err := secssim.NewServerWithOptions(addr, opt)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "启动 SECS 服务端失败: %v\n", err)
 		os.Exit(1)

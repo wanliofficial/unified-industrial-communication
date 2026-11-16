@@ -41,6 +41,12 @@ type variable struct {
 // Options 是可选参数。
 type Options struct {
 	Name string
+	// RejectWrites 为真时，模拟「ACKC7=0 但值随后不生效」的设备：应答照收，
+	// 存储层保留旧值。真实设备上有几种机制会造成这个结果（内部联锁拉回、
+	// 写进影子副本而非生效副本、设备侧异步校验失败），而 S2F16 都不反映
+	// 这些——只有写后重读能发现。自检命令的 -verify 依赖这种设备来验证
+	// 「OK 不等于生效」这条判定真的会失败。
+	RejectWrites bool
 }
 
 // Server 是一个 HSMS 设备仿真。
@@ -48,12 +54,13 @@ type Server struct {
 	ln   net.Listener
 	name string
 
-	mu       sync.Mutex
-	vars     map[vkey]*variable // 按 (对象类型, 编号) 索引
-	order    []vkey             // 保持插入顺序，便于自检输出
-	selected map[net.Conn]bool
-	wg       sync.WaitGroup
-	closed   bool
+	mu           sync.Mutex
+	vars         map[vkey]*variable // 按 (对象类型, 编号) 索引
+	order        []vkey             // 保持插入顺序，便于自检输出
+	selected     map[net.Conn]bool
+	rejectWrites bool // 写应答照收，但存储层不落值（见 Options）
+	wg           sync.WaitGroup
+	closed       bool
 
 	// stats
 	requests int
@@ -74,10 +81,11 @@ func NewServerWithOptions(addr string, opt Options) (*Server, error) {
 		name = "UIC SECS sim"
 	}
 	s := &Server{
-		ln:       ln,
-		name:     name,
-		vars:     map[vkey]*variable{},
-		selected: map[net.Conn]bool{},
+		ln:           ln,
+		name:         name,
+		rejectWrites: opt.RejectWrites,
+		vars:         map[vkey]*variable{},
+		selected:     map[net.Conn]bool{},
 	}
 	s.loadDefaults()
 	s.wg.Add(1)
@@ -388,6 +396,11 @@ func (s *Server) replyConstantAck(c net.Conn, dm secscodec.DataMessage) {
 		v, ok := s.vars[vkey{object: secscodec.ObjectECID, id: kv.ID}]
 		if !ok {
 			ack = 1
+			continue
+		}
+		// rejectWrites 模拟「ACK 被接受但值不生效」的设备：应答照回 0，
+		// 存储层保留旧值。自检命令靠它验证「OK 不等于生效」这条判定。
+		if s.rejectWrites {
 			continue
 		}
 		v.value = kv.Value
