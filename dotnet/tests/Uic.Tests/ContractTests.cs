@@ -383,6 +383,7 @@ internal static class ContractTests
             t.Equal("uic", root.GetProperty("name").GetString(), "product name is protocol-neutral");
             t.Equal("0.0.0-test", root.GetProperty("version").GetString(), "gateway version");
             t.Equal("1", root.GetProperty("apiVersion").GetString(), "api version");
+            t.Equal("1", root.GetProperty("schemaVersion").GetString(), "schema version");
             t.Equal("contract-site", root.GetProperty("site").GetString(), "site");
             t.Ok(root.GetProperty("startedAt").GetString()!.EndsWith('Z'), "startedAt is UTC with Z");
             t.Ok(root.GetProperty("configVersion").GetString()!.StartsWith('v'), "config version is content-addressed");
@@ -1002,6 +1003,32 @@ internal static class ContractTests
             t.Equal("supported", Cap(mqtt, "subscribe"), "mqtt is subscription based");
             t.Equal("symbol", mqtt.GetProperty("addressKinds")[0].GetString(),
                 "mqtt addresses points by topic (symbol addressing)");
+
+            // 表单元数据必须原样透出：控制台与接入方都靠它知道某个协议要填什么，
+            // 各自再抄一份协议手册迟早与驱动实现分叉。
+            var tcpFields = modbus.GetProperty("configFields").EnumerateArray()
+                .ToDictionary(f => f.GetProperty("key").GetString()!, f => f.Clone(), StringComparer.Ordinal);
+
+            t.Equal(2, tcpFields.Count, "modbus-tcp declares host and port");
+            t.Equal("主机", tcpFields["transport.host"].GetProperty("label").GetString(), "label is exposed");
+            t.Equal("string", tcpFields["transport.host"].GetProperty("type").GetString(), "type is exposed");
+            t.Ok(tcpFields["transport.host"].GetProperty("required").GetBoolean(), "host is required");
+            t.Equal("channel", tcpFields["transport.host"].GetProperty("scope").GetString(), "scope is exposed");
+            t.Equal(502, tcpFields["transport.port"].GetProperty("default").GetInt32(), "default is exposed");
+            t.Ok(!modbus.TryGetProperty("pointFields", out _),
+                "a driver that declares no point fields omits the list instead of sending an empty one");
+
+            var virtualFields = virtualDriver.GetProperty("configFields").EnumerateArray()
+                .ToDictionary(f => f.GetProperty("key").GetString()!, f => f.Clone(), StringComparer.Ordinal);
+            var fault = virtualFields["labels.fault"];
+            t.Equal("none", fault.GetProperty("default").GetString(), "virtual defaults to no fault");
+            t.Ok(fault.GetProperty("enum").EnumerateArray().Select(e => e.GetString()).Contains("timeout"),
+                "enum values are exposed, not flattened into help text");
+
+            var mqttPointFields = mqtt.GetProperty("pointFields").EnumerateArray()
+                .ToDictionary(f => f.GetProperty("key").GetString()!, f => f.Clone(), StringComparer.Ordinal);
+            t.Ok(mqttPointFields["address.path"].GetProperty("required").GetBoolean(),
+                "point fields carry their own required flag");
 
             static string? Cap(JsonElement driver, string name)
                 => driver.GetProperty("capabilities").GetProperty(name).GetString();

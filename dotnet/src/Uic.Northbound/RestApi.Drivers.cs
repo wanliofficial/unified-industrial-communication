@@ -31,7 +31,24 @@ public static partial class RestApi
         meta.Transports,
         meta.AddressKinds,
         meta.Capabilities,
+        // 没有声明的驱动不输出空数组：null 在契约里统一表示「没有这一项」，
+        // 免得接入方要区分「空数组」和「字段缺失」两种同样无内容的状态。
+        meta.ConfigFields.Count == 0 ? null : meta.ConfigFields.Select(ToFieldView).ToArray(),
+        meta.PointFields.Count == 0 ? null : meta.PointFields.Select(ToFieldView).ToArray(),
         meta.Description);
+
+    private static FieldDto ToFieldView(ConfigField field) => new(
+        // SDK 内部叫 Name，线上叫 key：配置树里的参数名就是 labels.xxx / address.xxx，
+        // 接入方拿它直接写配置；叫 name 会和「驱动的 Name」混淆。
+        field.Name,
+        field.Label,
+        field.Type,
+        field.Required,
+        field.Default,
+        field.Enum,
+        field.Placeholder,
+        field.Help,
+        field.Scope);
 }
 
 /// <summary>驱动列表。数量很小，不分页。</summary>
@@ -46,4 +63,21 @@ public sealed record DriverDto(
     IReadOnlyList<string> Transports,
     IReadOnlyList<AddressKind> AddressKinds,
     Capabilities Capabilities,
+    IReadOnlyList<FieldDto>? ConfigFields,
+    IReadOnlyList<FieldDto>? PointFields,
     string? Description);
+
+/// <summary>
+/// 一条表单元数据。由驱动自己声明，网关只做投影：控制台的「驱动」页与外部接入方
+/// 据此知道某个协议要填哪些参数、哪些必填、默认值是多少，不必各自抄一份协议手册。
+/// </summary>
+public sealed record FieldDto(
+    string Key,
+    string Label,
+    string Type,
+    bool Required,
+    object? Default,
+    IReadOnlyList<string>? Enum,
+    string? Placeholder,
+    string? Help,
+    string Scope);

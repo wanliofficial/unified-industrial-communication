@@ -35,6 +35,7 @@ internal static class LoopbackTests
         tests.Add(new TestCase("loopback/close_is_idempotent", CloseIsIdempotent));
         tests.Add(new TestCase("loopback/planner_windows_round_trip", PlannerWindowsRoundTrip));
         tests.Add(new TestCase("loopback/probe_times_out", ProbeTimesOut));
+        tests.Add(new TestCase("loopback/connection_refused_is_a_comm_error", ConnectionRefusedIsACommError));
         tests.Add(new TestCase("loopback/empty_batch_is_a_no_op", EmptyBatchIsANoOp));
         tests.Add(new TestCase("loopback/fragmented_response_is_reassembled", FragmentedResponseIsReassembled));
         tests.Add(new TestCase("loopback/file_record_read_and_write_round_trip", FileRecordRoundTrip));
@@ -355,6 +356,62 @@ internal static class LoopbackTests
                 var expected = double.Parse(sample.PointId[1..], System.Globalization.CultureInfo.InvariantCulture);
                 t.Equal(expected, sample.Value!.AsNumber(), $"{sample.PointId}");
             }
+        });
+    }
+
+    /// <summary>
+    /// 连不上必须折成 `comm_error`，且**可重试**。
+    ///
+    /// 故障注入矩阵第 1 类「连接拒绝」此前没有真实注入点——`probe_times_out` 验的是
+    /// 端口收连接但不回包（超时），是另一类故障。这条用例指向一个**没人监听**的端口，
+    /// 走的是 `TcpByteStream.ConnectAsync` 里 `SocketException` → `DriverException.Connection`
+    /// 的真实分支。
+    ///
+    /// 「可重试」这一点必须钉住：连接被拒与地址错误在上层看起来都是「这一个点读不到」，
+    /// 但前者下一秒可能就好了，后者再试一万次也一样。混成永久错误会让设备在从站重启后
+    /// 一直停在熔断状态，等运维去手工点一下。
+    /// </summary>
+    private static Task ConnectionRefusedIsACommError(TestContext t)
+    {
+        return RunAsync(async () =>
+        {
+            // 先占一个端口再放掉：拿到一个几乎肯定没人监听的端口号，
+            // 比硬编码 1 号端口更可靠（某些环境里低端口会被守护进程占着）。
+            int port;
+            var probe = new TcpListener(IPAddress.Loopback, 0);
+            probe.Start();
+            port = ((IPEndPoint)probe.LocalEndpoint).Port;
+            probe.Stop();
+
+            var (channel, device) = Setup(port);
+            await using var conn = Open(channel, device);
+
+            var clock = Stopwatch.StartNew();
+
+            // 探活是唯一会把异常抛出来的入口，先用它钉住错误分类。
+            try
+            {
+                await conn.ProbeAsync(t.Ct);
+                t.Fail("probing a closed port must not succeed");
+            }
+            catch (DriverException ex)
+            {
+                t.Equal(ErrorKind.Connection, ex.Kind, "a refused connection is a connection error");
+                t.Ok(ex.Temporary, "a refused connection is temporary: the peer may come back");
+                t.Contains(ex.Message, $"127.0.0.1:{port}", "the message names the endpoint that failed");
+            }
+
+            t.Ok(clock.Elapsed < TimeSpan.FromSeconds(5),
+                $"refusal is reported immediately, not after the connect timeout (took {clock.ElapsedMilliseconds} ms)");
+
+            // 读路径不抛：每个点位各自得到一条带原因的 comm_error 样本，其余窗口照常返回。
+            var samples = await conn.ReadAsync(ReadPlanner.Plan(new[] { U16("p", 0) }), t.Ct);
+
+            t.Equal(1, samples.Count, "the unreachable point still yields a sample");
+            t.Equal(Quality.CommError, samples[0].Quality, "a refused connection surfaces as comm_error");
+            t.Ok(samples[0].Value is null, "no value is invented for an unreachable device");
+            t.Contains(samples[0].Error ?? string.Empty, "connect",
+                "the reason says the connect attempt failed");
         });
     }
 

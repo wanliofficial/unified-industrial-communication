@@ -159,8 +159,7 @@ MQTT 的 TLS 是独立开关（`northbound.mqtt.tls`），语义见
   "error": {
     "code": "device.not_found",
     "message": "device 'meter-9' is not configured",
-    "requestId": "req-3f7c1d0a9b2e4c58",
-    "details": null
+    "requestId": "req-3f7c1d0a9b2e4c58"
   }
 }
 ```
@@ -179,6 +178,12 @@ MQTT 的 TLS 是独立开关（`northbound.mqtt.tls`），语义见
 | 422 | `config.invalid` | 配置语法或语义非法，`details` 里是逐条问题 |
 | 429 | `request.rate_limited` | 限流、SSE 连接数超限、登录失败锁定（三者同一个 code） |
 | 500 | `internal.error` | 未预期异常 |
+| 503 | `service.not_ready` | 配置还没加载完、运行时尚未就绪；重试即可，不是调用方写错 |
+
+上表是跨端点共用的 code。端点专属的（`request.invalid_cursor`、`request.invalid_json`、
+`request.idempotency_conflict`、`point.not_writable`、`config.version_not_found`、
+`template.not_found`、`command.*`）在对应章节就地说明——把它们全塞进一张表反而看不出
+「这个错误是哪个接口才会返回」。
 
 响应头 `X-Request-Id` 会回显客户端传入的值（没传就生成一个），日志里也用同一个 id。
 
@@ -187,7 +192,10 @@ MQTT 的 TLS 是独立开关（`northbound.mqtt.tls`），语义见
 - 枚举一律小写线上名：`uint16`、`comm_error`、`abcd`；
 - 时间统一 UTC + 毫秒 + `Z`；
 - 时长写成 `"1s"` / `"500ms"`；
-- 值为 `null` 的字段不输出。
+- 值为 `null` 的字段不输出；
+- 契约版本用路径 `/api/v1` 表达，权威值在 `GET /api/v1/version` 的 `schemaVersion` /
+  `apiVersion`。REST 与 SSE 的样本**不**逐条带 `schemaVersion`——同一份载荷只有一种形状，
+  逐条复制同一个数字没有信息量；MQTT 的载荷按需注入（见下文），OPC UA 交给 UA 类型系统。
 
 ## REST
 
@@ -254,6 +262,10 @@ MQTT 的 TLS 是独立开关（`northbound.mqtt.tls`），语义见
 | `runtimeDependent` | 视设备型号 / 固件而定，不能当成保证 |
 | `experimental` | 有实现，但还没有经过现场验证 |
 
+下面是节选：除 `modbus-tcp` 外，其余驱动只列了部分参数。接口返回每个驱动声明的
+**全部** `configFields` / `pointFields`；驱动没声明的那一项整体省略，不返回空数组
+——「没有参数」与「字段缺失」在契约里是同一件事，没必要让调用方分两种情况处理。
+
 ```json
 {
   "items": [
@@ -275,6 +287,12 @@ MQTT 的 TLS 是独立开关（`northbound.mqtt.tls`），语义见
         "bitAccess": "supported",
         "structTypes": "unsupported"
       },
+      "configFields": [
+        { "key": "transport.host", "label": "主机", "type": "string", "required": true,
+          "placeholder": "192.168.1.10", "scope": "channel" },
+        { "key": "transport.port", "label": "端口", "type": "int", "required": true,
+          "default": 502, "scope": "channel" }
+      ],
       "description": "Modbus TCP 主站：FC1/2/3/4/5/6/15/16/20/21，位访问、文件记录与四种字序。"
     },
     {
@@ -423,8 +441,13 @@ MQTT 的 TLS 是独立开关（`northbound.mqtt.tls`），语义见
 `multiRead` 是 `unsupported`（一次 ReadProperty 只读一个属性），`subscribe` 是
 `unsupported`（COV 订阅本轮不做，绝不会谎报成功）。
 
-`configFields` / `pointFields` 是驱动自己声明的表单元数据：控制台据此渲染参数，
-不把协议知识写死在页面里。S7 的 `address.offset` 是**字节**偏移（Modbus 是寄存器序号），
+`configFields` / `pointFields` 是驱动自己声明的表单元数据：接入方拿 `key` 直接写配置
+（`transport.host`、`labels.rack`、`address.offset`），按 `required` / `default` / `enum`
+生成表单，不必各自抄一份协议手册再等它分叉。控制台本版只在「驱动」页渲染能力四态；
+「新建设备」表单用的是另一条更窄的路子（`ConfigDraft` 里固定了通道级的 host/port/
+串口/波特率），**不会**按这里的 `configFields` 动态长表单——所以新增协议参数时，
+两边要一起改，不要以为改了驱动声明界面就会自动跟上。
+S7 的 `address.offset` 是**字节**偏移（Modbus 是寄存器序号），
 `labels.rack` / `labels.slot` 是 COTP 建链参数（S7-1200/1500 通常 0/1）。
 BACnet 的 `address.property` 是**属性标识符**（85=present-value），不是属性名——
 对象模型里属性名是给人看的，线上只有编号。
@@ -479,7 +502,6 @@ BACnet 的 `address.property` 是**属性标识符**（85=present-value），不
   "value": { "type": "uint16", "num": 2201 },
   "quality": "good",
   "unit": "V",
-  "deviceTime": null,
   "collectedAt": "2026-11-05T09:14:02.113Z",
   "seq": 812,
   "writable": true,
@@ -556,8 +578,8 @@ BACnet 的 `address.property` 是**属性标识符**（85=present-value），不
 ```json
 {
   "results": [
-    { "point": "setpoint", "ok": true,  "quality": "good",      "appliedAt": "2026-11-05T09:15:20.004Z", "error": null, "verified": true },
-    { "point": "enable",   "ok": false, "quality": "disabled",  "appliedAt": "2026-11-05T09:15:20.004Z", "error": "point is read-only", "verified": null }
+    { "point": "setpoint", "ok": true,  "quality": "good",      "appliedAt": "2026-11-05T09:15:20.004Z", "verified": true },
+    { "point": "enable",   "ok": false, "quality": "disabled",  "appliedAt": "2026-11-05T09:15:20.004Z", "error": "point is read-only" }
   ]
 }
 ```
@@ -688,8 +710,8 @@ BACnet 的 `address.property` 是**属性标识符**（85=present-value），不
     {
       "device": "plc-01", "point": "temp",
       "value": { "type": "float64", "num": 77.5 },
-      "quality": "good", "unit": "°C", "deviceTime": null,
-      "collectedAt": "2026-11-05T09:15:20.004Z", "seq": 1024, "error": null
+      "quality": "good", "unit": "°C",
+      "collectedAt": "2026-11-05T09:15:20.004Z", "seq": 1024
     }
   ],
   "nextCursor": "Mg==",
@@ -870,7 +892,7 @@ BACnet 的 `address.property` 是**属性标识符**（85=present-value），不
 响应里的 `migrations` 列出实际执行的升级项，例如：
 
 ```json
-{ "valid": true, "applied": false, "version": null,
+{ "valid": true, "applied": false,
   "migrations": ["v0.server.listen -> northbound.rest.listen",
                  "v0.northbound.mqtt.broker -> host/port"],
   "config": { ... }, "problems": [] }
@@ -961,7 +983,7 @@ hello 正常、心跳正常、永不出一帧的空流——客户端无法区�
 
 | 主题 | 载荷 | 保留 |
 |---|---|---|
-| `{prefix}/{site}/{device}/{point}/value` | `SampleDto` JSON | 按 `retain` |
+| `{prefix}/{site}/{device}/{point}/value` | `SampleDto` JSON，额外注入 `schemaVersion: 1` | 按 `retain` |
 | `{prefix}/{site}/{device}/$state` | `{schemaVersion, state, previous, at, error}` | 是 |
 | `{prefix}/{site}/$birth` | `{schemaVersion, online: true, startedAt}` | 是 |
 | `{prefix}/{site}/$death` | `{schemaVersion, online: false}` | 是 |

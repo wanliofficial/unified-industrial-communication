@@ -16,10 +16,11 @@ dotnet run --project tests/Uic.Tests -- --stop-on-fail      # 首个失败即停
 正常输出：
 
 ```
-400 passed, 0 failed, 3 skipped · 2610.5s
+401 passed, 0 failed, 3 skipped · 2878.4s
 ```
 
-加 `--opcua` 跑全量（含 3 条需外部 OPC UA 环境的端到端），全部 403 条都会跑。
+加 `--opcua` 跑全量（含 3 条需外部 OPC UA 环境的端到端），全部 404 条都会跑。
+不带 `--opcua` 时那 3 条显示 `skip`（原因 `requires --opcua`），不计入通过数。
 `load average` 5 左右那次实测 `401 passed, 2 failed`：两条失败都是 `contract/*`
 触到 180 s 硬超时，单独复跑分别 119.0 s / 109.6 s 全过——先腾空再判红，
 见下面的耗时记录。
@@ -52,6 +53,10 @@ dotnet run --project tests/Uic.Tests -- --stop-on-fail      # 首个失败即停
 400/403 条（补了指标抓取端点、8 条 `virtual/*` 故障注入与 1 条分层边界用例）在
 `load average` 4.8–5.5 时量到 2610.5 s；这一轮新增的 10 条里，9 条合计不到 4 s，
 `contract/metrics_export_runtime_series` 单条 92 s——它要起真实 Kestrel 并等设备进入 collecting。
+404 条（补了 `loopback/connection_refused_is_a_comm_error`）在 `load average` 6.6–7.7 时
+量到 2878.4 s，`401 passed, 0 failed, 3 skipped`：新增的那条 3.0 s，`loopback/*` 整组
+16 条 7.7 s。这一轮 `contract/*` 单条普遍 60–127 s（最慢
+`contract/idempotency_ledger_is_per_runtime` 127.3 s），仍是宿主启动与磁盘排队，不是用例退化。
 `--opcua` 变体在同一份代码上 401 passed / 2 failed / 2972.4 s：两条失败都是
 180 s 硬超时（`contract/rate_limit_returns_429_with_the_shared_code`、
 `contract/metrics_report_live_sse_connections`），机器当时 `load average` 4.9–6.5；
@@ -104,10 +109,10 @@ NFR 的门槛是 120 s，压测用例、PBKDF2 派生与 TLS 握手是主要开�
 | `virtual/*` | 8 | 虚拟设备的故障注入（`FR-COL-07`）：`timeout`/`drop` 归为临时性超时、`address` 归为永久性且落 `address_error`、`bad` **不抛异常**（采样保留、值为空、带原因，避免一个坏点让整批重试）、`disconnect` 持续失败（不是抖一次）、`faultAt` 只注入第 N 次而前后两次正常、缺省不注入、常量波形写后回读 |
 | `schedule/*` | 5 | 启动相位均匀铺开、单调时间换算与到期边界、调度器实际分配相位、相位按设备内最快点位周期、**uptime 用单调时钟**（校时跳变不会让它凭空多出一小时） |
 | `sdk/*` | 6 | 驱动注册契约：**SDK 版本不匹配直接拒绝**（错误消息里同时给出驱动声明与宿主要求的版本，且不留半注册状态）、**重复 id 拒绝且不覆盖先注册的驱动**、版本匹配时正常注册并把能力/传输声明原样透出；`check` 与启动共用同一份引用检查：**协议没注册时 `uic check` 退出码 2 并指出 `channels[x].protocol`**（同一份配置换成已注册驱动则通过），同一条通道只报一次；**分层边界由程序集实际引用表钉住**（Modbus/S7/BACnet 三个 codec 的实际引用里不得出现 `Uic.Transport`/`Engine`/`Runtime` 等 I/O 层、不得出现 `System.Net`，且必须依赖 `Uic.Domain` 作为反向对照） |
-| `loopback/*` | 15 | Modbus 主站 ↔ 内置从站的真实链路 |
+| `loopback/*` | 16 | Modbus 主站 ↔ 内置从站的真实链路；含**指向未监听端口的真实连接拒绝**（`SocketException` → `comm_error`、可重试、消息带出端点、且立即返回而不是等到 `connectTimeout`） |
 | `s7/*` | 31 | S7comm：17 条手算黄金帧与地址解析（TPKT/COTP 握手、PDU 协商、读/写/位读写、长度字段按传输尺寸解释（0x03–0x07 位 / 0x09 字节）、错误分类、地址字段上限、**项数字段只有一字节（256 项当场失败而不是静默截断）**），14 条主站 ↔ 内置从站回环（探活、DB/I/Q/M 读、位读写、写输入区被拒、越界落 `address_error`、bool 缺 bit 被拒、数组、按 PDU 切片、单点装不下点名失败、沉默 PLC 超时、断线重连） |
 | `serial/*` | 8 | 真实伪终端上的 RTU / ASCII、半双工、帧间静默、deadline、关闭打断读 |
-| `bacnet/*` | 28 | BACnet/IP：17 条手算黄金帧与地址解析（BVLC/NPDU 封拆帧、NPDU 版本必须为 1、ReadProperty/WriteProperty 帧字节、I-Am 设备实例、对象标识符 10/22 位编码、应用标签往返含扩展长度（LVT=5）、类型不符拒绝、NPDU 路由控制字节拒绝、**ACK 值里出现形似关闭标签的字节也不得截断**），10 条主站 ↔ 内置从站回环（Who-Is/I-Am 探活、**按 invoke-id 配对（从站先回一条 invoke-id 不对的响应，取错会读到别的点位的值而质量仍 good）**、多对象读、bool/字符串、写后回读、unknown-object/property 落 `address_error`、沉默设备超时、**实例号核对（配了 deviceInstance 却回错设备即失败，消息带出期望实例号）**、元数据声明 object 寻址与 udp），1 条 `uic sim` 端到端（**拿 DemoConfig 的开发配置起真实从站再用真实主站读一遍：端口/transport/对象号/四个点位全 good**，值域按正弦基线核对） |
+| `bacnet/*` | 28 | BACnet/IP：16 条手算黄金帧与地址解析（BVLC/NPDU 封拆帧、NPDU 版本必须为 1、ReadProperty/WriteProperty 帧字节、I-Am 设备实例、对象标识符 10/22 位编码、应用标签往返含扩展长度（LVT=5）、类型不符拒绝、NPDU 路由控制字节拒绝、**ACK 值里出现形似关闭标签的字节也不得截断**），11 条主站 ↔ 内置从站回环（Who-Is/I-Am 探活、**按 invoke-id 配对（从站先回一条 invoke-id 不对的响应，取错会读到别的点位的值而质量仍 good）**、多对象读、bool/字符串、写后回读、unknown-object/property 落 `address_error`、沉默设备超时、**实例号核对（配了 deviceInstance 却回错设备即失败，消息带出期望实例号）**、元数据声明 object 寻址与 udp），1 条 `uic sim` 端到端（**拿 DemoConfig 的开发配置起真实从站再用真实主站读一遍：端口/transport/对象号/四个点位全 good**，值域按正弦基线核对） |
 | `mqtt/*` | 34 | 测试内 broker：CONNECT/SUBSCRIBE 字段、QoS0/1、主题渲染、重连补发、**下线设备清 retained `$state`**、**命令去重窗口用单调时钟（校时跳变不会重复执行命令）**、**过期判定用单调「多久没收到报文」（校时跳变不伪造也不放过过期）**、TLS 发布与不可信 CA 拒绝；南向驱动：主题通配匹配、JSON 字段/类型/信封取值、首次读数前 `stale`、QoS0/1 取数、点位字段覆盖、坏载荷与恢复、断线重订阅、订阅被 ACL 拒绝 |
 | `template/*` | 4 | 50 实例批量生成、参数类型/缺失/未知参数拒绝、未声明占位符拒绝；**同一模板产出 Modbus 与 S7 两台设备并同时通过校验**（FR-CFG-01 验收口径） |
 | `csv/*` | 6 | 地址表达式（参考号/区域偏移/分列）、按 id 合并与冲突行号、死区模式与量程列、点位周期列、数组元素个数列 |
@@ -126,14 +131,14 @@ NFR 的门槛是 120 s，压测用例、PBKDF2 派生与 TLS 握手是主要开�
 
 | # | 故障 | 注入方式 | 用例 |
 |---|---|---|---|
-| 1 | 连接拒绝 | 指向未监听的端口 | `loopback/*`、`s7/silent_plc_times_out` |
-| 2 | 连接中断 | 回环中主动断链 | `loopback/*`、`mqtt/driver_resubscribes_after_broker_drop` |
-| 3 | 读超时 | 从站沉默 | `loopback/probe_times_out`、`loopback/silent_slave_times_out` |
+| 1 | 连接拒绝 | 指向一个刚释放、无人监听的端口（真实 `SocketException`） | `loopback/connection_refused_is_a_comm_error`、`mqtt/refused_connack_keeps_retrying_without_connecting` |
+| 2 | 连接中断 | 从站在会话中途主动断链，客户端重建会话 | `s7/reconnect_after_peer_closes`、`mqtt/driver_resubscribes_after_broker_drop` |
+| 3 | 读超时 | 从站 accept 但不回包 / 仿真器沉默 | `loopback/probe_times_out`、`loopback/silent_slave_times_out`、`s7/silent_plc_times_out`、`bacnet/silent_device_times_out`、`serial/silent_slave_times_out` |
 | 4 | 半包 | 响应分片到达 | `loopback/fragmented_response_is_reassembled` |
 | 5 | 错 CRC | 篡改校验和 | `codec/framing_rejects_corruption` |
 | 6 | 异常码 | 从站返回 01/02/03/04/06/11 | `codec/exception_codes_map_to_kinds` |
 | 7 | 部分响应 | 少于请求的寄存器数 | `codec/decode_rejects_inconsistent_frames` |
-| 8 | 慢响应 | 延迟应答 | `engine/deadline_is_retried_as_timeout`、`s7/silent_plc_times_out` |
+| 8 | 慢响应 | 从站延迟应答 | `engine/deadline_is_retried_as_timeout`、`serial/read_returns_near_deadline` |
 | 9 | Broker 断线 | 测试内 broker 主动断开 | `mqtt/driver_resubscribes_after_broker_drop` |
 | 10 | 磁盘满 | 目标文件软链到 `/dev/full`，内核写时返回 ENOSPC | `outbox/disk_full_keeps_records_pending` |
 | 11 | 时钟跳变 | 注入可拨的 `TimeProvider`，墙钟与单调时钟分开推进 | `fault/clock_jump_does_not_fake_a_stall`、`fault/outbox_ttl_ignores_a_clock_jump` |
