@@ -493,41 +493,37 @@ func (c *connState) exchange(ctx context.Context, payload []byte, id int32, op s
 	return snmpcodec.Message{}, lastErr
 }
 
-// readV3Datagram 读一条可解析为 v3 的报文，直到超时或读满重试次数。
+// readV3Datagram 读一条可解析为 v3 的报文。
 //
 // 只做「结构上是不是 v3」的判断，**不做 request-id 配对**：加密应答的
 // request-id 在密文里，读这一层还没解密。配对交给调用方在解密之后做
 // （见 v3Round 的 matchID）。把配对放在这里会导致「所有加密应答都被
 // 当成不匹配的报文丢掉」，症状是「authPriv 永远超时、authNoPriv 正常」。
+//
+// 这里**不重试**，也不负责重发：重发必须同时重设截止时间并重新组帧（新
+// 的 salt），那是 v3Round 的职责。早先这里有一个「只 Read 不 Write」的
+// 尝试循环——第一次超时后截止时间已经过去，后续每次 Read 立刻返回，既
+// 不重发也不延长等待，唯一的效果是让超时路径多空转几次、并把「重发」
+// 这件事伪装成已经实现。
 func (c *connState) readV3Datagram(ctx context.Context, op string) ([]byte, error) {
-	var lastErr error
-	for attempt := 0; attempt <= c.retries; attempt++ {
-		if err := ctx.Err(); err != nil {
-			return nil, driver.E(driver.ErrTimeout, op, c.cfg.Device.ID, "context done", true, err)
-		}
-		for {
-			datagram, err := c.conn.Read()
-			if err != nil {
-				lastErr = c.readError(op, err, ctx)
-				break
-			}
-			if _, perr := snmpcodec.ParseV3(datagram); perr != nil {
-				// 可能是 v1/v2c 应答：给一个更明确的诊断（「代理说的不是
-				// v3」比「malformed v3」有用）。
-				if _, cperr := snmpcodec.Parse(datagram); cperr == nil {
-					return nil, driver.E(driver.ErrProtocol, op, c.cfg.Device.ID,
-						"agent replied with a v1/v2c message, but v3 was configured", false, nil)
-				}
-				return nil, driver.E(driver.ErrProtocol, op, c.cfg.Device.ID,
-					"malformed v3 datagram: "+perr.Error(), false, perr)
-			}
-			return datagram, nil
-		}
-		if driver.KindOf(lastErr) != driver.ErrTimeout || ctx.Err() != nil {
-			return nil, lastErr
-		}
+	if err := ctx.Err(); err != nil {
+		return nil, driver.E(driver.ErrTimeout, op, c.cfg.Device.ID, "context done", true, err)
 	}
-	return nil, lastErr
+	datagram, err := c.conn.Read()
+	if err != nil {
+		return nil, c.readError(op, err, ctx)
+	}
+	if _, perr := snmpcodec.ParseV3(datagram); perr != nil {
+		// 可能是 v1/v2c 应答：给一个更明确的诊断（「代理说的不是
+		// v3」比「malformed v3」有用）。
+		if _, cperr := snmpcodec.Parse(datagram); cperr == nil {
+			return nil, driver.E(driver.ErrProtocol, op, c.cfg.Device.ID,
+				"agent replied with a v1/v2c message, but v3 was configured", false, nil)
+		}
+		return nil, driver.E(driver.ErrProtocol, op, c.cfg.Device.ID,
+			"malformed v3 datagram: "+perr.Error(), false, perr)
+	}
+	return datagram, nil
 }
 
 // sendDatagram 设置期限并发出一个报文。
@@ -565,6 +561,30 @@ func (c *connState) transact(ctx context.Context, pdu snmpcodec.PDU, op string) 
 	for round := 0; round < 2; round++ {
 		resp, err := c.v3Round(ctx, pdu, keys, op)
 		if err != nil {
+			// 应答的引擎状态与缓存不符（代理重启 / 报文重放 / 时钟跑偏）。
+			// 刷新基准后重试一次；再不符就判协议错，不能静默接受——
+			// 那等于把「重放防护」整条关掉。
+			var stale *staleEngineError
+			if errors.As(err, &stale) {
+				if round == 1 {
+					return snmpcodec.PDU{}, driver.E(driver.ErrProtocol, op, c.cfg.Device.ID,
+						"agent keeps reporting a different engine state: "+stale.Error(), false, stale)
+				}
+				// 时间取「报告值与本地估计的较大者」：重放报文的时间偏旧，
+				// 用它覆盖缓存只会让下一轮再被判坏；boots 则必须采信报告值
+				// （代理重启后旧 boots 一定作废）。
+				t := stale.engineTime
+				if cur := s.estimatedEngineTime(); t < cur {
+					t = cur
+				}
+				s.setEngine(stale.engineID, stale.engineBoots, t)
+				if err := s.deriveKeys(); err != nil {
+					return snmpcodec.PDU{}, driver.E(driver.ErrInternal, op, c.cfg.Device.ID, err.Error(), false, err)
+				}
+				s.keysReady.Store(true)
+				keys = s.currentKeys()
+				continue
+			}
 			return snmpcodec.PDU{}, err
 		}
 		if resp.pdu != nil {
@@ -649,25 +669,38 @@ func (c *connState) v3Round(ctx context.Context, pdu snmpcodec.PDU, keys *snmpco
 	if err != nil {
 		return v3RoundResult{}, driver.E(driver.ErrInternal, op, c.cfg.Device.ID, err.Error(), false, err)
 	}
-	raw, err := snmpcodec.BuildV3(hdr, sec, scoped, keys)
-	if err != nil {
-		return v3RoundResult{}, driver.E(driver.ErrInternal, op, c.cfg.Device.ID, err.Error(), false, err)
-	}
 	for attempt := 0; attempt <= c.retries; attempt++ {
+		// 每一轮都重新组帧（也就是重新加密）。**不能**把 BuildV3 提到循环
+		// 外面复用同一份密文：AES-CFB/DES-CBC 的安全性要求同一把密钥下
+		// salt（进而 IV）绝不重复（RFC 3414 §8、RFC 3826 §3.1）。重发同一
+		// 份密文等于用同一个 (key, IV) 加密同一段明文两次——攻击者拿到两份
+		// 相同报文立刻知道这是重传，而若两次明文不同（这里相同）就会泄露
+		// 明文异或。salt 由 V3Keys.Salt() 单调推进，重新组帧天然满足唯一性。
+		raw, err := snmpcodec.BuildV3(hdr, sec, scoped, keys)
+		if err != nil {
+			return v3RoundResult{}, driver.E(driver.ErrInternal, op, c.cfg.Device.ID, err.Error(), false, err)
+		}
 		if err := c.sendDatagram(ctx, raw, op); err != nil {
 			return v3RoundResult{}, err
 		}
 		res, err := c.readV3Round(ctx, id, keys, op)
 		if err != nil {
+			// 超时才重发（与 exchange 同一条纪律）：协议错、验签失败、
+			// 解密失败重发一万次结果相同，只会把一次可诊断的失败拖成超时。
+			//
+			// 这段以前不存在——readV3Datagram 内部有个只读不写的「重试」
+			// 循环，而外层这个分支永远拿不到 nil，于是 v3 的 retries 配置
+			// 实际完全无效：UDP 丢一个包就是一轮采集失败。丢掉一个包在
+			// 现场是常态，而这一条只在真实网络里暴露。
+			if driver.KindOf(err) == driver.ErrTimeout && attempt < c.retries && ctx.Err() == nil {
+				continue
+			}
 			return v3RoundResult{}, err
 		}
-		if res != nil {
-			return *res, nil
-		}
-		// 收到了报文但都不是这次请求的应答：重发。
+		return *res, nil
 	}
 	return v3RoundResult{}, driver.E(driver.ErrTimeout, op, c.cfg.Device.ID,
-		"only stale or mismatched v3 messages arrived", true, nil)
+		"no matching v3 response after retries", true, nil)
 }
 
 // readV3Round 读一条属于本次请求的 v3 报文；返回 nil 表示只收到无关报文。
@@ -716,6 +749,12 @@ func (c *connState) readV3Round(ctx context.Context, id int32, keys *snmpcodec.V
 		if msg.PDU.Type != snmpcodec.PDUResponse || msg.PDU.RequestID != id {
 			// 迟到的旧应答 / Trap：继续读。
 			continue
+		}
+		// 配对之后再校验引擎身份与时间窗口（RFC 3414 §3.2）。**只查
+		// Response**：Report 的职责恰恰是带来新的 boots/time（尤其
+		// notInTimeWindow），把它挡掉会让恢复路径失效。
+		if stale := c.v3.staleEngine(msg.Security); stale != nil {
+			return nil, stale
 		}
 		p := msg.PDU
 		return &v3RoundResult{pdu: &p}, nil

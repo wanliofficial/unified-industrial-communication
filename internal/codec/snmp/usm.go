@@ -159,14 +159,37 @@ func (a AuthProtocol) Hash() func() hash.Hash {
 	return nil
 }
 
-// DigestLen 是 HMAC 在报文里的截断长度：摘要长度的一半（RFC 3414 §6、
-// RFC 7860 §2.3）。MD5 与 SHA-1 都得 12，SHA-256 得 16，SHA-512 得 32。
+// DigestLen 是 HMAC 在报文里的截断长度。
+//
+// **不能统一写成「摘要长度的一半」**——这是 USM 最容易被想当然的一处，也是
+// 本地回环测不出来的那种错：主站与内置代理都按同一个（错的）长度算，互通
+// 正常；一接真实设备就变成「认证失败/无响应」，而且没有任何可读的报错。
+//
+// 两个标准给的是两张固定表：
+//
+//	RFC 3414 §6/§7   HMAC-MD5-96、HMAC-SHA-96  → 固定 96 位 = 12 字节
+//	RFC 7860 §3      SHA-224 → 128 位 = 16 字节
+//	                 SHA-256 → 192 位 = 24 字节
+//	                 SHA-384 → 256 位 = 32 字节
+//	                 SHA-512 → 384 位 = 48 字节
+//
+// 注意 SHA-1 是 12（不是 20/2=10）、MD5 也是 12（不是 16/2=8）：两者都进
+// 「96 位」那张表，与摘要长度无关。SHA-2 系列才恰好是「一半」，但 SHA-224
+// 的 14 字节从来不是标准值，标准写的是 16。
 func (a AuthProtocol) DigestLen() int {
-	h := a.Hash()
-	if h == nil {
-		return 0
+	switch a {
+	case AuthMD5, AuthSHA1:
+		return 12
+	case AuthSHA224:
+		return 16
+	case AuthSHA256:
+		return 24
+	case AuthSHA384:
+		return 32
+	case AuthSHA512:
+		return 48
 	}
-	return h().Size() / 2
+	return 0
 }
 
 // KeyLen 是本地化密钥的字节数（等于摘要长度）。

@@ -209,8 +209,9 @@ func (s *v3Session) discoverEngineID(ctx context.Context, c *connState) error {
 	if err != nil {
 		return driver.E(driver.ErrInternal, "discover", c.cfg.Device.ID, err.Error(), false, err)
 	}
-	// 重发交给 readV3Datagram 内部的尝试循环，这里只发一次：发现包本身
-	// 极短，重复发送没有额外好处，反而会在丢包时把一轮发现拖成两轮超时。
+	// 发现包只发一次：它极短，丢包时重发没有额外收益，反而会把一轮发现
+	// 拖成两轮超时。真丢了由 Probe/调度器在下一轮重来（发现不消耗任何
+	// 会话状态）。
 	if err := c.sendDatagram(ctx, raw, "discover"); err != nil {
 		return err
 	}
@@ -339,6 +340,63 @@ func (s *v3Session) currentKeys() *snmpcodec.V3Keys {
 func (s *v3Session) estimatedEngineTime() int {
 	elapsed := int(time.Since(s.engineTimeAt).Seconds())
 	return s.engineTime + elapsed
+}
+
+// engineTimeWindow 是 RFC 3414 §3.2 规定的时间窗口（秒）。
+//
+// 它不是「时钟容差」而是一条**防重放**约束：USM 的摘要只保证报文没被改过，
+// 不保证它是新的。同一份带正确摘要的旧应答可以被原样重放，只有
+// (engineBoots, engineTime) 的窗口能把它挡下来。
+const engineTimeWindow = 150
+
+// staleEngineError 表示应答里的引擎状态与本地缓存不符。
+//
+// 两种成因的处置不同，但都需要先刷新缓存再重试一次：
+//   - 代理重启（boots 变了）：缓存的时间基准作废；
+//   - 报文是重放（boots 更旧，或 |time-本地| 超过窗口）：本地基准其实是对的。
+type staleEngineError struct {
+	engineID    []byte
+	engineBoots int
+	engineTime  int
+	reason      string
+}
+
+func (e *staleEngineError) Error() string {
+	return fmt.Sprintf("v3 response rejected: %s (agent reports engineID %x, boots %d, time %d)",
+		e.reason, e.engineID, e.engineBoots, e.engineTime)
+}
+
+// staleEngine 按 RFC 3414 §3.2 检查应答的引擎身份与时间窗口。
+//
+// 为什么要检查：认证摘要只覆盖「报文内容未被改动」，不覆盖「报文是新的」。
+// 一条几天前抓到的合法应答可以被原样重放，若不比较 engineID/boots/time，
+// 主站会把旧值当成新采集结果写进缓存——对计量、计数类点位就是静默回退。
+//
+// 返回 nil 表示可以接受。
+func (s *v3Session) staleEngine(sec snmpcodec.USMSecurityParameters) *staleEngineError {
+	if len(sec.EngineID) == 0 {
+		return &staleEngineError{reason: "response carries no engine ID"}
+	}
+	if !bytes.Equal(sec.EngineID, s.engineID) {
+		return &staleEngineError{
+			engineID: sec.EngineID, engineBoots: sec.EngineBoots, engineTime: sec.EngineTime,
+			reason: fmt.Sprintf("engine ID changed (cached %x)", s.engineID),
+		}
+	}
+	if sec.EngineBoots != s.engineBoots {
+		return &staleEngineError{
+			engineID: sec.EngineID, engineBoots: sec.EngineBoots, engineTime: sec.EngineTime,
+			reason: fmt.Sprintf("engineBoots %d, cached %d", sec.EngineBoots, s.engineBoots),
+		}
+	}
+	if delta := sec.EngineTime - s.estimatedEngineTime(); delta > engineTimeWindow || delta < -engineTimeWindow {
+		return &staleEngineError{
+			engineID: sec.EngineID, engineBoots: sec.EngineBoots, engineTime: sec.EngineTime,
+			reason: fmt.Sprintf("engineTime %d is %+d s from the expected %d (window ±%d s)",
+				sec.EngineTime, delta, s.estimatedEngineTime(), engineTimeWindow),
+		}
+	}
+	return nil
 }
 
 // probeV3 是 v3 的 Probe：确认链路并（首次）完成发现。

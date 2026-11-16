@@ -6878,7 +6878,7 @@ Kul = localize(Ku, engineID) = H(Ku ‖ engineID ‖ Ku)  -- 绑定引擎身份
 |---|---|---|
 | 摘要计算 | 对「`authParameters` 原地清零」的**原始字节**算 HMAC，不重新编码 | 重新编码会产生不同的 TLV 字节（长度前缀、空串 vs 缺失），摘要必然不匹配 |
 | 摘要比对 | `subtle.ConstantTimeCompare` | 非常量时间比较会泄露摘要前缀匹配长度，等于给口令预言机开门 |
-| 摘要长度 | 截断到摘要长度的一半（MD5/SHA-1=12，SHA-256=16，SHA-512=32） | USM 规定 |
+| 摘要长度 | **两张固定表**：MD5/SHA-1 → 12 字节（96 位）；SHA-224/256/384/512 → 16/24/32/48 字节 | 见下：它不是「摘要长度的一半」 |
 | DES | `privParameters = engineBoots(4) ‖ salt(4)`，IV = `preIV(key[8:16]) XOR privParameters`，CBC 补齐到 8 的倍数 | 3DES 以外唯一被 USM 承认的对称加密 |
 | AES | `privParameters = salt(8)`，IV = `engineBoots(4) ‖ engineTime(4) ‖ salt(8)`，CFB **不补齐** | CFB 是流模式，补齐会破坏对齐 |
 | 解密后截断 | 按外层 `SEQUENCE` 长度 `trimBERSequence` | CBC 补齐的字节要剥掉，否则 ScopedPDU 解析失败 |
@@ -6886,6 +6886,25 @@ Kul = localize(Ku, engineID) = H(Ku ‖ engineID ‖ Ku)  -- 绑定引擎身份
 DES/AES 的 IV 差异固化到签名：`encryptScoped`/`decryptScoped` 直接收
 `engineBoots/engineTime` 整数与 `salt`，不传拼接字节——传拼接字节会让「IV 拼错」
 这类错误在编译期不可见。
+
+**摘要长度为什么不是「摘要长度的一半」**：这是本协议最容易想当然、而且**本地回环
+永远测不出来**的一处——主站与内置代理用同一个（错的）长度，互通完全正常；接真实
+设备才表现为「认证失败/无响应」，而 USM 的失败是静默的：代理直接丢包，日志里只有
+超时。两张表分别来自：
+
+| 协议 | 摘要长度 | 报文里的 authParameters | 依据 |
+|---|---|---|---|
+| HMAC-MD5-96 | 16 | **12**（96 位） | RFC 3414 §6 |
+| HMAC-SHA-96 | 20 | **12**（96 位） | RFC 3414 §7 |
+| usmHMAC128SHA224 | 28 | **16**（128 位） | RFC 7860 §3 |
+| usmHMAC192SHA256 | 32 | **24**（192 位） | RFC 7860 §3 |
+| usmHMAC256SHA384 | 48 | **32**（256 位） | RFC 7860 §3 |
+| usmHMAC384SHA512 | 64 | **48**（384 位） | RFC 7860 §3 |
+
+也就是说 MD5 是 12 而**不是** 8、SHA-1 是 12 而**不是** 10、SHA-224 是 16 而**不是**
+14；只有 SHA-2 系列恰好是「一半」，但那个「一半」是标准**选定的值**，不是推导规则。
+`TestDigestLen` 因此直接写死六个数，而不是写 `KeyLen()/2`——后者会把错误规则再证
+明一遍。
 
 #### 3.10.22.3 引擎发现：只有一条路
 
@@ -6918,13 +6937,25 @@ DES/AES 的 IV 差异固化到签名：`encryptScoped`/`decryptScoped` 直接收
 
 - 时间窗口 150 秒；`engineBoots` 必须相等（代理重启会让 boots 变化）；`engineTime`
   用「学到值 + elapsed」估算。
+- **时间窗口是双向的**：不只代理检查我们的请求，我们也检查它的应答（RFC 3414
+  §3.2）。USM 摘要只证明报文没被改过，不证明它是新的——一条带正确摘要的旧应答可以
+  被原样重放，若主站不比 `engineID/boots/time`，就会把旧值当成新采集结果写进缓存
+  （对计量/计数类点位是静默回退）。应答不符时刷新基准重试一次，仍不符则判
+  `protocol` 并打印两边的时间；**Report 不查**——它的职责恰恰是带来新的 boots/time。
 - 收到 `unknownEngineIDs` → `resetEngine()`（丢掉缓存身份回空 engineID 重发现）；
   收到 `notInTimeWindow` → 保留 engineID 只重学时间。
+- **重发必须重新组帧**：AES-CFB / DES-CBC 要求同一把密钥下 salt（进而 IV）绝不
+  重复（RFC 3414 §8），所以每轮重发都重新 `BuildV3`（`V3Keys.Salt()` 单调推进），
+  **不能**复用上一轮的密文。只有超时才重发（与 v1/v2c 的 `exchange` 同一条纪律）；
+  协议错、验签失败、解密失败重发一万次结果相同。重发的 msgID/request-id 不变——
+  它是同一条请求，不是两条业务请求。
 - **密钥是 engineID 的函数**：`setEngine` 统一把 `keysReady` 打回未就绪，绝不让调用
   方记得手动清标志。漏清一次的后果是「代理重装后一直认证失败，重启进程才好」。
 - request-id 配对必须在**解密之后**——加密应答的 id 在密文里。`readV3Datagram`
   只判「结构上是不是 v3」，配对交给 `v3Round`。把配对放在读层会让所有加密应答被当
-  不匹配丢掉，症状是「authPriv 永远超时、authNoPriv 正常」。
+  不匹配丢掉，症状是「authPriv 永远超时、authNoPriv 正常」。读层**不重发**：它既没有
+  请求字节也不重设截止时间，早先那里一个「只 Read 不 Write」的循环把「重发」伪装成
+  已实现，实际效果只是超时后空转。
 - `transact` 最多两轮；认证前 Report 不签名（密钥不一致签了也验不过），验签之后的
   解密失败 Report 必须签名。
 
@@ -6976,8 +7007,8 @@ USM 的 6 类 Report 各有明确的现场含义：
 
 | 层 | 用例 |
 |---|---|
-| `codec/snmp` | RFC 3414 A.3.1 的 SHA-1/MD5 派生向量逐字节通过；6 种认证算法摘要截断；DES/AES 加密→解密往返；空 engineID 只允许发现报文、带 auth/priv 拒绝；`BuildV3`/`ParseV3`/`VerifyV3` 往返；`ScopedPDU` 加解密往返 |
-| `driver/snmp` | `TestV3EndToEnd`（发现 → 认证 → 加密 → 读 → 写 → 读回）；口令错 → `permission`；未知用户 → `permission`；安全级别不匹配 → `permission`；`TestV3FixedEngineID`（读写成功 + 全程只有 1 次 Report）；`TestV3FixedEngineIDMismatch`（错误含两个 engineID + `protocol`）；`TestV3EngineResetRecovers`（代理换身份后会话自愈）；`TestV3FixedEngineIDNoAuth` |
+| `codec/snmp` | RFC 3414 A.3.1 的 SHA-1/MD5 派生向量逐字节通过；**6 种认证算法的摘要截断按 RFC 3414 §6/§7 与 RFC 7860 §3 的固定表钉住**（MD5/SHA-1=12、224/256/384/512=16/24/32/48，不是 `KeyLen/2`）；DES/AES 加密→解密往返；空 engineID 只允许发现报文、带 auth/priv 拒绝；`BuildV3`/`ParseV3`/`VerifyV3` 往返；`ScopedPDU` 加解密往返 |
+| `driver/snmp` | `TestV3EndToEnd`（发现 → 认证 → 加密 → 读 → 写 → 读回）；口令错 → `permission`；未知用户 → `permission`；安全级别不匹配 → `permission`；`TestV3FixedEngineID`（读写成功 + 全程只有 1 次 Report）；`TestV3FixedEngineIDMismatch`（错误含两个 engineID + `protocol`）；`TestV3EngineResetRecovers`（代理换身份后会话自愈）；`TestV3FixedEngineIDNoAuth`；**`TestStaleEngineWindow`**（engineID/boots/时间窗口六个拒绝分支 + 窗口内放行）；**`TestReadV3RoundRejectsStaleEngine`**（接线：读层真的调用检查）；**`TestV3RetransmitsWithFreshSalt`**（超时重发恰好一次、每轮密文与 privParameters 都不同、msgID 不变） |
 | `sim/snmp` | 真做 HMAC 验签与 DES/AES 解密（两侧互为对端，杜绝「自己骗自己」）；6 类 Report；引擎身份可切换；`Faults.DropPercent` 模拟真机静默丢弃 |
 | `cmd/uic` | v3 flag 折参、`secret()`、`securityLevelLabel()` |
 

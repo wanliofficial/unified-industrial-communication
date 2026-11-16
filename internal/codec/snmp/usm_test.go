@@ -56,17 +56,25 @@ func TestPasswordToKey_md5(t *testing.T) {
 	}
 }
 
-// TestDigestLen 钉住「截断长度是摘要长度的一半」，不是固定 12。
+// TestDigestLen 钉住 RFC 3414 / RFC 7860 的两张截断表。
+//
+// 这条用例的价值不在「数字对上了」，而在于钉住**不是**「摘要长度的一半」：
+// MD5 是 12（不是 8）、SHA-1 是 12（不是 10）、SHA-224 是 16（不是 14）。
+// 三类错法都能让主站与内置代理互通，却与任何真实设备都对不上——USM 的失败
+// 是静默的，代理直接丢包，日志里只会看到「无响应」。
 func TestDigestLen(t *testing.T) {
-	cases := map[AuthProtocol]int{
+	keyLens := map[AuthProtocol]int{
 		AuthMD5: 16, AuthSHA1: 20, AuthSHA224: 28, AuthSHA256: 32, AuthSHA384: 48, AuthSHA512: 64,
 	}
-	for a, keyLen := range cases {
-		if got := a.KeyLen(); got != keyLen {
-			t.Errorf("%v KeyLen = %d, want %d", a, got, keyLen)
+	digestLens := map[AuthProtocol]int{
+		AuthMD5: 12, AuthSHA1: 12, AuthSHA224: 16, AuthSHA256: 24, AuthSHA384: 32, AuthSHA512: 48,
+	}
+	for a, want := range keyLens {
+		if got := a.KeyLen(); got != want {
+			t.Errorf("%v KeyLen = %d, want %d", a, got, want)
 		}
-		if got := a.DigestLen(); got != keyLen/2 {
-			t.Errorf("%v DigestLen = %d, want %d", a, got, keyLen/2)
+		if got := a.DigestLen(); got != digestLens[a] {
+			t.Errorf("%v DigestLen = %d, want %d (RFC 3414 §6/§7 与 RFC 7860 §3)", a, got, digestLens[a])
 		}
 	}
 	if AuthNone.DigestLen() != 0 || AuthNone.KeyLen() != 0 {
