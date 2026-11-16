@@ -552,12 +552,23 @@ func (c *conn) readPoint(ctx context.Context, ref driver.PointRef) (driver.RawSa
 	// 只有 attribute 2（value）需要应用 scaler。attribute 3 本身就是
 	// scaler_unit 结构、attribute 1 是 OBIS，乘 10^n 没有意义。
 	if desc.Attribute == dlmscodec.AttrValue {
-		if scaler, ok := c.scalerOf(ctx, desc); ok {
+		scaler, has, serr := c.scalerOf(ctx, desc)
+		switch {
+		case serr != nil:
+			// Register 家族的值取不到 scaler：拿到的原始整数可能是 2201（真值
+			// 220.1 V），也可能是别的量级，当成「不缩放」报出去就是静默回绕——
+			// 与 codec 层 scalerUnit「形态不对不默认 0，真值可能差 1000 倍」的
+			// 既定原则一致。标坏而不是报一个可能错 10^n 倍的 good 值；下一轮
+			// 会重试，链路/点表恢复后自动回到正确缩放。
+			return driver.RawSample{}, serr
+		case has:
 			if n, numeric := v.Number(); numeric {
 				v = dlmscodec.Value{Tag: dlmscodec.TagFloat64,
 					Float: dlmscodec.ApplyScaler(n, scaler)}
 			}
 		}
+		// has=false && serr==nil：这个类本身没有 scaler_unit（Data/Clock 等），
+		// 原始值即终值，按 good 上送。
 	}
 	val, err := valueOf(ref, v)
 	if err != nil {
@@ -568,41 +579,61 @@ func (c *conn) readPoint(ctx context.Context, ref driver.PointRef) (driver.RawSa
 
 // scalerOf 取某对象的 scaler（来自 attribute 3），带进程内缓存。
 //
+// 返回值三种语义：
+//
+//	(scaler, true,  nil)   Register 家族，scaler_unit 读到了；
+//	(0,     false, nil)    这个类按标准没有 scaler_unit（Data/Clock 等）——
+//	                       这是一个**类级别**的事实、与网络无关，缓存 known=false 是安全的；
+//	(0,     false, err)    Register 家族但 attribute 3 读失败/无法解析——**不缓存**，
+//	                       把错误交回调用方判坏。见下。
+//
 // 缓存失效面：表在运行中被重新配置（改 register 的 scaler_unit）时缓存会
 // 变旧。这个风险是刻意接受的——scaler 是计费参数，运行期改变它属于运维
 // 动作，通常伴随重启采集。相比之下每轮每点都多读一次 attribute 3 会让
 // 往返数翻倍，在 300 点的表上是不可接受的代价。
 //
-// 读失败时记 known=false 的哨兵，避免每个点都重试一次注定失败的请求。
-func (c *conn) scalerOf(ctx context.Context, desc dlmscodec.AttributeDescriptor) (int, bool) {
+// 关键：Register 家族按标准**一定有** scaler_unit。这里读 attribute 3 失败，
+// 可能是瞬时链路抖动，也可能是表本身缺这个属性——两者都不是「类没有 scaler」
+// 这一类级别的事实。早先实现把这种失败也缓存成 known=false，于是：
+//
+//  1. 该点此后永远按未缩放的原始值上报（getter 命中缓存直接返回），
+//     即便原始值需要 ×10^-1 才是对的（2201 被当成 220.1 V 的 10 倍）；
+//  2. 缓存没有失效路径，链路/点表随后恢复也回不到正确缩放。
+//
+// 因此 Register 家族的读失败一律**不缓存**，交回调用方按本轮判坏、下一轮重试。
+// 只有类级别的「没有 scaler_unit」才缓存 known=false。
+func (c *conn) scalerOf(ctx context.Context, desc dlmscodec.AttributeDescriptor) (int, bool, error) {
 	key := fmt.Sprintf("%d/%s", desc.ClassID, dlmscodec.OBIS(desc.InstanceID).String())
 	if e, ok := c.scalers[key]; ok {
-		return e.scaler, e.known
+		return e.scaler, e.known, nil
 	}
 	if c.scalers == nil {
 		c.scalers = map[string]scalerEntry{}
 	}
-	// 只有 Register 家族才有 scaler_unit；其它类（Data/Clock）直接记不支持。
+	// 只有 Register 家族才有 scaler_unit；其它类（Data/Clock）**按类**确定没有，
+	// 缓存 known=false 安全。
 	switch desc.ClassID {
 	case dlmscodec.ClassRegister, dlmscodec.ClassExtendedRegister, dlmscodec.ClassDemandRegister:
 	default:
 		c.scalers[key] = scalerEntry{}
-		return 0, false
+		return 0, false, nil
 	}
 	scDesc := desc
 	scDesc.Attribute = dlmscodec.AttrScalerUnit
 	v, err := c.getAttribute(ctx, "", scDesc)
 	if err != nil {
-		c.scalers[key] = scalerEntry{}
-		return 0, false
+		// 不缓存：可能是瞬时抖动，下一轮要重试。交回调用方判坏。
+		return 0, false, err
 	}
 	scaler, ok := scalerUnit(v)
 	if !ok {
-		c.scalers[key] = scalerEntry{}
-		return 0, false
+		// 形态不对同样不缓存：按 scalerUnit 的既定原则报「没有 scaler」，
+		// 绝不默认 0（默认 0 = 不缩放 = 真值可能差 1000 倍）。
+		return 0, false, driver.E(driver.ErrProtocol, "read", c.devID,
+			"scaler_unit 结构无法解析（应为 {integer, enum}）", false, nil)
 	}
 	c.scalers[key] = scalerEntry{scaler: scaler, known: true}
-	return scaler, true
+	return scaler, true, nil
 }
 
 // getAttribute 发一条 Get-Request-Normal 并解出 A-XDR 值。

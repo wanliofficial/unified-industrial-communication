@@ -336,6 +336,18 @@ func (s *Server) Value(class uint16, obis string, attr int8) (dl.Value, bool) {
 	return obj.Value, ok
 }
 
+// AddObject 插入/替换一个对象（按 class + OBIS + attribute 定位）。
+//
+// 与 SetValue 的区别：SetValue 只能替换**已存在**的对象，用于改值；AddObject
+// 用于测试里在链路上途「补一个属性」——例如先给 Register 只有 attribute 2
+// （读出来 scaler 缺失、点必须判坏），再中途补上 attribute 3（scaler_unit），
+// 验证主站在同一条连接上能回到正确缩放，而不是被首轮的失败永久毒化。
+func (s *Server) AddObject(o Object) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.put(o)
+}
+
 // SetSilent 开关"完全不应答"（模拟地址错/断线）。
 func (s *Server) SetSilent(on bool) {
 	s.mu.Lock()

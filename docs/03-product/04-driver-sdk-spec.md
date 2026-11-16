@@ -7747,6 +7747,32 @@ Register 家族（Class 3/4/5）的 attribute 2 是**原始整数**，attribute 
 9600bps 的串口上这是十几秒与几十秒的差别。缓存失效面写在文档里：表在运行中被重新
 配置（改 register 的 scaler_unit）后，驱动不会自己发现，需要重连。
 
+缓存只记**确定的结论**，绝不记一次失败的快照。`scalerOf` 的返回有三种语义，必须分清：
+
+| 情形 | 缓存？ | 后果 |
+|---|---|---|
+| 类本身没有 scaler_unit（Data/Clock 等，按类号即可判定） | 记 `known=false` | 安全：这是类级别事实，与网络无关 |
+| Register 家族，attribute 3 读到了 | 记 `known=true` + scaler | 正常缓存 |
+| Register 家族，attribute 3 读失败/无法解析 | **不缓存**，交回调用方判坏 | 见下 |
+
+关键在第三种。Register 家族（Class 3/4/5）按标准**一定有** scaler_unit，所以这里读
+attribute 3 失败只可能是两种瞬时情形：链路抖动，或表本身这个属性缺失/畸形——两者都
+**不是**「类没有 scaler」这一类级别的事实。早先实现把这种失败也写成 `known=false` 哨兵，
+造成两个真实缺陷：
+
+1. **静默回绕**：哨兵命中后 `scalerOf` 返回「无 scaler」，于是 attribute 2 的原始整数
+   被当 good 直接上送。`2201`（真值 `220.1 V`，scaler=−1）会被报成 `2201 good`——整整
+   差 10 倍且毫无征兆。这与 `scalerUnit` 对结构形态「不默认 0，真值可能差 1000 倍」是
+   同一条既定原则，驱动层却违反了它。
+2. **永久毒化**：缓存没有失效路径，一旦首轮失败写了哨兵，即便链路/点表随后恢复，
+   该点也永远按未缩放的原始值上报，回不到正确缩放。
+
+修复后：Register 家族的读失败一律**不缓存**、把错误交回 `readPoint`。`readPoint` 对
+Register 取值拿不到 scaler 时**判坏**（设 quality + err）而不是报一个可能错 10^n 倍的
+good 值——语义不可判定时判坏，给明确诊断。下一轮 `scalerOf` 会重试 attribute 3，
+链路/点表恢复后自动回到正确缩放。注意这只在 Register 家族触发：Data/Clock 等类
+没有 scaler_unit，原始值即终值，仍按 good 上送，不受影响。
+
 `ApplyScaler` 必须**一次**乘除 `10^|scaler|`：
 
 ```go
@@ -7907,8 +7933,8 @@ octet-string 四种值形态。
 | 层 | 用例 |
 |---|---|
 | `codec/dlms` | `SNRM` 金帧 `7E A0 07 03 21 93 0F 01 7E`；`FCS(A0 07 03 21 93) == 0F 01` 与 `GoodFCS` 的固定余数 `0xF0B8`；长度字段跨两字节与 bit11 分段位；info 与 FCS 里出现 `0x7E` 时仍按长度定界（FCS `7E 64` 的回归）；截断 → `ErrIncomplete`、指针前移 1 字节重同步；1/2/4 字节地址域（含 `48 68 FE FF`）；LLC `E6 E6 00` vs `E6 E7 00`；I/RR/RNR/U 帧控制域与 `NS`/`NR` 回绕；AARQ/AARE 逐字节向量与拒绝诊断；conformance 位值与 `5F 1F 04 00` 编码；A-XDR 全标签（含 `0x07`/`0x0E` 空号必须报错）；`date_time` 12 字节布局（星期位置、`0x8000` 时区）与 `date`/`time`；`data-access-result` 只认 2 字节形态（用 `hardware-fault(1)` 锁「前两字节相同」的陷阱）；Get-Response 三分支（normal / datablock / list）；OBIS 十进制六段与 `.`/`-`/`:`/空格分隔；`SplitRef` 对 `1-0:1-8-0-255:3:2` 的切点；`ApplyScaler` 单次乘除（`50.01` 精确）；`UnitName`/`ClassName` 全扫 |
-| `driver/dlms` | 真实 TCP 回环：SNRM→AARQ→逐点 GET→DISC；`Probe` 复用已建关联；拒绝关联 → `ErrProtocol`；静默 → `ErrTimeout`；坏校验 → `ErrProtocol` 且文案含「坏帧」与波特率提示；**DM（断开模式）→ `ErrProtocol` 且 `IsRetryable==false`，`retries=2` 下 Get 只发 1 次**（与坏校验「重发到上限」构成成对断言）；`linkErr` 缓存后第二轮不再发包且立即返回；object-undefined → `ErrAddress`；类号不一致 → `ErrAddress`；分块 → `ErrUnsupported` 且提示调大 `max-pdu`；scaler 五个点逐位精确（`50.01`/`0.985`/`220.1`/`5.12`/`345.6`）；`Scan` 条数等于内置表条数且带 scaler_unit 文本；`Association` 采用服务端较小的 max-PDU；`Write`/`MultiRead`/`Browse` 逐项 `ErrUnsupported`；`parseOptions` 越界全忽略；`addressOf` 的 `labels.address` 优先级与 `addr-size=3` 拒绝；空 span 返回 `(nil, nil)`；关闭后所有入口 → `ErrDisconnected` |
-| `sim/dlms` | 默认对象表覆盖 40+ 项且 `examples/dlms.json` 能全部读到；AARQ 接受/拒绝两分支；未建关联读 → `read-write-denied`；对象未定义 / 类号不一致两种结果码；地址与客户端地址过滤静默；`SetSilent`/`SetBadChecksum`/`SetRejectAssociation`/`SetReplyDM`；`SetReplyDM` 下 Get 计数仍加一（证明请求确实到达，用于断言是否重发）；`SetValue`/`Value` 的坏定位报错；TCP `acceptLoop`→`serveConn`→`tcpStream` 真实 socket 路径；`Close` 幂等且能清理连接；`isClosed` 对 `net.ErrClosed`/`io.EOF`/超时的分类 |
+| `driver/dlms` | 真实 TCP 回环：SNRM→AARQ→逐点 GET→DISC；`Probe` 复用已建关联；拒绝关联 → `ErrProtocol`；静默 → `ErrTimeout`；坏校验 → `ErrProtocol` 且文案含「坏帧」与波特率提示；**DM（断开模式）→ `ErrProtocol` 且 `IsRetryable==false`，`retries=2` 下 Get 只发 1 次**（与坏校验「重发到上限」构成成对断言）；`linkErr` 缓存后第二轮不再发包且立即返回；object-undefined → `ErrAddress`；类号不一致 → `ErrAddress`；分块 → `ErrUnsupported` 且提示调大 `max-pdu`；scaler 五个点逐位精确（`50.01`/`0.985`/`220.1`/`5.12`/`345.6`）；**Register 缺 attribute 3 时该点判坏（不报 raw good 静默回绕），补上后同一连接回到正确缩放（不永久毒化）**；`Scan` 条数等于内置表条数且带 scaler_unit 文本；`Association` 采用服务端较小的 max-PDU；`Write`/`MultiRead`/`Browse` 逐项 `ErrUnsupported`；`parseOptions` 越界全忽略；`addressOf` 的 `labels.address` 优先级与 `addr-size=3` 拒绝；空 span 返回 `(nil, nil)`；关闭后所有入口 → `ErrDisconnected` |
+| `sim/dlms` | 默认对象表覆盖 40+ 项且 `examples/dlms.json` 能全部读到；AARQ 接受/拒绝两分支；未建关联读 → `read-write-denied`；对象未定义 / 类号不一致两种结果码；地址与客户端地址过滤静默；`SetSilent`/`SetBadChecksum`/`SetRejectAssociation`/`SetReplyDM`；`SetReplyDM` 下 Get 计数仍加一（证明请求确实到达，用于断言是否重发）；`SetValue`/`Value` 的坏定位报错；`AddObject` 链路上途补属性（供测试「缺 scaler_unit 判坏→补上后同一连接恢复正确缩放」）；TCP `acceptLoop`→`serveConn`→`tcpStream` 真实 socket 路径；`Close` 幂等且能清理连接；`isClosed` 对 `net.ErrClosed`/`io.EOF`/超时的分类 |
 | `pointtable` | `dlms` 走 `WidthNone + AllowSymbol`；`1.0.1.8.0.255`、`:3`、`:3:2` 与连字符写法 `0-0-42-0-0-255:1:2` 都解析成 symbol 且 `Canonical` 往返一致；寄存器/对象/计算地址在导入期拒绝；`length` 列在导入期拒绝 |
 | `cmd/uic` | `dlmsSplitAddr` 走 `dl.SplitRef`（标准写法与只给 OBIS 两种）；`dlmsRefs` 列拆分；`dlmsRowOf` 的「可粘贴地址」带类号与属性号；默认 7 点列表 |
 
