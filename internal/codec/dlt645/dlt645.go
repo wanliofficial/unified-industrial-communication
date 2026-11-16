@@ -91,14 +91,15 @@ const (
 // 一位一因，但现场常见多个位同时置位；因此调用方应当按「地址类/权限类/
 // 协议类」做归类，而不是只认第一个命中的位。
 const (
-	ErrOther      = 1 << 0 // 其它错误
-	ErrNoData     = 1 << 1 // 无请求数据
-	ErrPassword   = 1 << 2 // 密码错 / 未授权
-	ErrBaud       = 1 << 3 // 通信速率不能更改
-	ErrYearZone   = 1 << 4 // 年时区数超
-	ErrDayPeriod  = 1 << 5 // 日时段数超
-	ErrRateCount  = 1 << 6 // 费率数超
-	ErrSegments   = 1 << 6 // 与 ErrRateCount 同位：不同备案文档口径不一，统一按「配置项超限」解释
+	ErrOther     = 1 << 0 // 其它错误
+	ErrNoData    = 1 << 1 // 无请求数据
+	ErrPassword  = 1 << 2 // 密码错 / 未授权
+	ErrBaud      = 1 << 3 // 通信速率不能更改
+	ErrYearZone  = 1 << 4 // 年时区数超
+	ErrDayPeriod = 1 << 5 // 日时段数超
+	ErrRateCount = 1 << 6 // 费率数超
+	// 注意：没有 D7 位定义。标准把 D7 标为「保留」，ErrSegments 因此删除——
+	// 它与 ErrRateCount 同值重复，只会让「按位分类」出现两个名字解释同一位。
 	BroadcastAddr = 0x999999999999
 )
 
@@ -505,8 +506,36 @@ func TimeBytes(t time.Time) [6]byte {
 	return b
 }
 
-// ParseTime 解码 6 字节 BCD 时间。年份按 2000..2099 解释——协议只有两位
-// 年，这个窗口是行业默认；跨世纪问题不在本驱动的责任范围内。
+// ValidDateParts 校验时间各字段的取值范围。
+//
+// 只有范围校验、没有日历校验：2 月 30 日这类「字段都合法但日期不存在」要
+// 交给调用方按语义决定（写路径必须拒绝，读路径可以选择如实上报），codec
+// 层不做日历运算，避免与 time.Time 的时区行为耦合。
+func ValidDateParts(mon, day, hour, min, sec int) error {
+	switch {
+	case mon < 1 || mon > 12:
+		return fmt.Errorf("月份 %d 必须在 1..12", mon)
+	case day < 1 || day > 31:
+		return fmt.Errorf("日 %d 必须在 1..31", day)
+	case hour < 0 || hour > 23:
+		return fmt.Errorf("小时 %d 必须在 0..23", hour)
+	case min < 0 || min > 59:
+		return fmt.Errorf("分钟 %d 必须在 0..59", min)
+	case sec < 0 || sec > 59:
+		return fmt.Errorf("秒 %d 必须在 0..59", sec)
+	}
+	return nil
+}
+
+// ParseTime 解码 6 字节 BCD 时间（ss mm hh DD MM YY）。年份按 2000..2099
+// 解释——协议只有两位年，这个窗口是行业默认；跨世纪问题不在本驱动的责任
+// 范围内。
+//
+// 除了 BCD 半字节合法性，还会校验各字段取值范围。为什么必须做：time.Date
+// 会把「秒=72」这类垃圾静默归一化（变成下一分钟 12 秒），月=19 会变成
+// 次年 7 月，2 月 30 日会变成 3 月 2 日，且都不报错。电表时钟是最不能「猜」
+// 的数据项之一——读到一个假的 07:06 比读不到更危险，因为它会被当成真实事件
+// 时间参与结算与统计。
 func ParseTime(b []byte) (time.Time, error) {
 	if len(b) < 6 {
 		return time.Time{}, fmt.Errorf("dlt645: 时间需要 6 字节，实际 %d", len(b))
@@ -518,6 +547,12 @@ func ParseTime(b []byte) (time.Time, error) {
 			return time.Time{}, fmt.Errorf("dlt645: 时间第 %d 字节 0x%02X 不是 BCD", i+1, b[i])
 		}
 		v[i] = int(hi)*10 + int(lo)
+	}
+	if err := ValidDateParts(v[4], v[3], v[2], v[1], v[0]); err != nil {
+		return time.Time{}, fmt.Errorf("dlt645: % X: %w", b, err)
+	}
+	if yy := v[5]; yy > 99 {
+		return time.Time{}, fmt.Errorf("dlt645: 年份 20%02d 超出 2000..2099", yy)
 	}
 	return time.Date(2000+v[5], time.Month(v[4]), v[3], v[2], v[1], v[0], 0, time.Local), nil
 }

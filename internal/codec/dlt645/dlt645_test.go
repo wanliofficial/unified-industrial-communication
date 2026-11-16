@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"io"
+	"strings"
 	"testing"
 	"time"
 )
@@ -269,7 +270,9 @@ func TestDecodeTimeAndAddress(t *testing.T) {
 func TestDecodeDemand(t *testing.T) {
 	// 12.3456 kW + 11-07 12:00
 	it, _ := Lookup(mustDI(t, "01010000"))
-	raw := []byte{0x56, 0x34, 0x12, 0x00, 0x00, 0x12, 0x07, 0x11}
+	// 8 字节复合：需量按数值编码（低字节在前），发生时间按 **MM DD hh mm**
+	// 字段序——与日期数据项同形，不是小端整数。
+	raw := []byte{0x56, 0x34, 0x12, 0x00, 0x11, 0x07, 0x12, 0x00}
 	v, err := Decode(it, raw)
 	if err != nil {
 		t.Fatal(err)
@@ -279,6 +282,17 @@ func TestDecodeDemand(t *testing.T) {
 	}
 	if s := Format(it, raw); s != "12.3456（发生于 11-07 12:00）" {
 		t.Fatalf("format = %q", s)
+	}
+	// 发生时间段用字段序解释：MM DD hh mm。若实现把它当成小端整数，会把
+	// 「12 月 31 日 23:59」读成「59 月 23 日…」，必须报错而不是归一化。
+	bad := append([]byte{0x56, 0x34, 0x12, 0x00}, 0x59, 0x23, 0x31, 0x12)
+	if _, err := Decode(it, bad); err == nil {
+		t.Fatal("发生时间按错误的字节序被接受")
+	}
+	// 正确的「12 月 31 日 23:59」必须能读出来。
+	good := append([]byte{0x56, 0x34, 0x12, 0x00}, 0x12, 0x31, 0x23, 0x59)
+	if _, err := Decode(it, good); err != nil {
+		t.Fatalf("valid demand timestamp rejected: %v", err)
 	}
 }
 
@@ -304,6 +318,184 @@ func TestEncodeRejectsOverflow(t *testing.T) {
 	volt, _ := Lookup(mustDI(t, "02010100"))
 	if _, err := EncodeValue(volt, 10000); err == nil {
 		t.Fatal("2-byte BCD must reject 4-digit overflow")
+	}
+}
+
+// TestEncodeRejectsBCDBoundary 钉住「按 BCD 上界而非二进制上界校验」。
+//
+// 早先用 1<<(4*width*2)=256^width 做上界，2 字节项的界是 65536，而真正的
+// BCD 上界只有 9999：6000..9999 之间的值全部「通过校验、被静默截断」。电压
+// 是 2 字节 1 位小数，BCD 上界为 999.9；1000.0 必须报错而不是发出 00 00。
+func TestEncodeRejectsBCDBoundary(t *testing.T) {
+	volt, _ := Lookup(mustDI(t, "02010100"))
+	// 边界内：999.9 → 9999，必须成功且能原样读回。
+	if b, err := EncodeValue(volt, 999.9); err != nil {
+		t.Fatalf("999.9 must encode: %v", err)
+	} else if !bytes.Equal(b, []byte{0x99, 0x99}) {
+		t.Fatalf("999.9 wire = % X, want 99 99", b)
+	}
+	// 刚过边界：1000.0 必须报错，不能发出 00 00。
+	for _, v := range []float64{1000.0, 6500.0, 6000.0} {
+		if b, err := EncodeValue(volt, v); err == nil {
+			back, _ := Decode(volt, b)
+			t.Fatalf("%v 必须被拒绝（BCD 上界 999.9），却编成 % X（读回 %v）", v, b, back)
+		}
+	}
+	// 1 字节有符号项：符号位占最高位，有效位只到 79。85 会被编成 0x85、
+	// 读回 -5；必须报错。
+	oneByte := Item{Name: "1 字节有符号", Width: 1, Signed: true}
+	if b, err := EncodeValue(oneByte, 79); err != nil {
+		t.Fatalf("79 must encode: %v", err)
+	} else if !bytes.Equal(b, []byte{0x79}) {
+		t.Fatalf("79 wire = % X", b)
+	}
+	for _, v := range []float64{80, 85, 99} {
+		if b, err := EncodeValue(oneByte, v); err == nil {
+			back, _ := Decode(oneByte, b)
+			t.Fatalf("有符号 1 字节值 %v 必须被拒绝（符号位占最高位），却编成 % X（读回 %v）", v, b, back)
+		}
+	}
+	// 无符号 1 字节仍可到 99。
+	oneByteU := Item{Name: "1 字节无符号", Width: 1}
+	if b, err := EncodeValue(oneByteU, 99); err != nil || !bytes.Equal(b, []byte{0x99}) {
+		t.Fatalf("无符号 99 = % X, %v", b, err)
+	}
+}
+
+// TestEncodeBitsIsBinary 钉住位域写入是**二进制**、与 Decode 对称。
+//
+// 周休日特征字（04000701）是唯一可写的 KindBits 项。早先 EncodeValue 把它
+// 落进 BCD 编码：18 写成 0x18、读回 24；100 写成 0x00、读回 0。全是「写
+// 成功、值是错的」。位域必须按二进制字节写出。
+func TestEncodeBitsIsBinary(t *testing.T) {
+	weekday, ok := Lookup(mustDI(t, "04000701"))
+	if !ok || weekday.Kind != KindBits || !weekday.Writable {
+		t.Fatalf("周休日特征字 = %+v，期望可写的 KindBits", weekday)
+	}
+	for _, v := range []float64{0, 5, 18, 100, 255} {
+		b, err := EncodeValue(weekday, v)
+		if err != nil {
+			t.Fatalf("encode %v: %v", v, err)
+		}
+		if !bytes.Equal(b, []byte{byte(v)}) {
+			t.Fatalf("%v wire = % X，期望 [%02X]（二进制）", v, b, byte(v))
+		}
+		back, err := Decode(weekday, b)
+		if err != nil {
+			t.Fatalf("decode % X: %v", b, err)
+		}
+		if back != v {
+			t.Fatalf("往返 %v → % X → %v", v, b, back)
+		}
+	}
+	// 越界与非整数必须拒绝。
+	for _, v := range []float64{256, -1, 1.5} {
+		if _, err := EncodeValue(weekday, v); err == nil {
+			t.Fatalf("位域值 %v 必须被拒绝", v)
+		}
+	}
+}
+
+// TestParseTimeRejectsOutOfRangeFields 钉住「读路径的时间不再被静默归一化」。
+//
+// 早先 ParseTime 只校验 BCD 半字节是否合法，然后交给 time.Date。结果是
+// 一堆「半字节都合法、字段却越界」的垃圾被静默洗成合法时间：
+//
+//	72 65 30 32 19 26 → 2027-08-02 07:06:12（秒=72 变下一分钟、月=19 变次年 7 月）
+//	00 00 00 00 13 26 → 2026-12-31 00:00:00（月=13 变 12 月，日=0 变 31 日）
+//
+// 电表时钟是最不能「猜」的数据项：一个假的 07:06 比读不到更危险，因为它会
+// 被当成真实事件时间参与结算与统计。与写路径共用同一套范围规则。
+func TestParseTimeRejectsOutOfRangeFields(t *testing.T) {
+	cases := []struct {
+		name string
+		raw  []byte
+		want string // 错误里必须出现的字段名
+	}{
+		{"秒越界", []byte{0x72, 0x11, 0x11, 0x11, 0x11, 0x26}, "秒"},
+		{"分越界", []byte{0x00, 0x65, 0x11, 0x11, 0x11, 0x26}, "分钟"},
+		{"时越界", []byte{0x00, 0x00, 0x30, 0x11, 0x11, 0x26}, "小时"},
+		{"日越界", []byte{0x00, 0x00, 0x00, 0x32, 0x11, 0x26}, "日"},
+		{"月为 0", []byte{0x00, 0x00, 0x00, 0x11, 0x00, 0x26}, "月份"},
+		{"月越界", []byte{0x00, 0x00, 0x00, 0x11, 0x19, 0x26}, "月份"},
+	}
+	for _, c := range cases {
+		tm, err := ParseTime(c.raw)
+		if err == nil {
+			t.Errorf("%s: ParseTime(% X) = %s, want error", c.name, c.raw, tm.Format("2006-01-02 15:04:05"))
+			continue
+		}
+		if !strings.Contains(err.Error(), c.want) {
+			t.Errorf("%s: err = %v, want mention of %q", c.name, err, c.want)
+		}
+	}
+	// 合法时间必须照常解析。
+	tm, err := ParseTime([]byte{0x07, 0x30, 0x12, 0x11, 0x11, 0x26})
+	if err != nil {
+		t.Fatalf("valid time: %v", err)
+	}
+	if tm.Year() != 2026 || int(tm.Month()) != 11 || tm.Day() != 11 ||
+		tm.Hour() != 12 || tm.Minute() != 30 || tm.Second() != 7 {
+		t.Fatalf("valid time parsed wrong: %s", tm)
+	}
+}
+
+// TestDecodeDateRejectsOutOfRangeFields 钉住 4 字节日期数据项（MMDDhhmm）。
+//
+// 早先 Decode 用 decodeBCD(raw, true) 把它当「小端带符号整数」，两个问题：
+// 一是字段越界会被静默接受（月=19、日=0）；二是 0x31 会被当成符号位，
+// 「结算日 = 12312359」这类值会被解成负数。现在按 MMDDhhmm 逐字段解析。
+func TestDecodeDateRejectsOutOfRangeFields(t *testing.T) {
+	it, _ := Lookup(mustDI(t, "04000B01"))
+	cases := []struct {
+		name string
+		raw  []byte
+		want float64
+	}{
+		{"11-07 12:00", []byte{0x11, 0x07, 0x12, 0x00}, 11071200},
+		{"12-31 23:59", []byte{0x12, 0x31, 0x23, 0x59}, 12312359},
+	}
+	for _, c := range cases {
+		v, err := Decode(it, c.raw)
+		if err != nil {
+			t.Errorf("%s: %v", c.name, err)
+			continue
+		}
+		if v != c.want {
+			t.Errorf("%s: value = %v, want %v", c.name, v, c.want)
+		}
+		// 读出来的值必须能被写回去（原样写回是常见操作）。
+		b, err := EncodeDate(time.Date(2026, time.Month(int(c.want/1e6)),
+			int(c.want/1e4)%100, int(c.want/1e2)%100, int(c.want)%100, 0, 0, time.UTC))
+		if err != nil {
+			t.Errorf("%s: EncodeDate: %v", c.name, err)
+			continue
+		}
+		if !bytes.Equal(b, c.raw) {
+			t.Errorf("%s: round trip = % X, want % X", c.name, b, c.raw)
+		}
+		// 再解回来必须是同一个数值——这才是「原样写回」要成立的原因。
+		back, err := Decode(it, b)
+		if err != nil {
+			t.Errorf("%s: decode(encode) : %v", c.name, err)
+			continue
+		}
+		if back != c.want {
+			t.Errorf("%s: decode(encode) = %v, want %v", c.name, back, c.want)
+		}
+	}
+	for _, c := range []struct {
+		name string
+		raw  []byte
+	}{
+		{"月为 19", []byte{0x19, 0x07, 0x12, 0x00}},
+		{"日为 0", []byte{0x11, 0x00, 0x12, 0x00}},
+		{"时为 30", []byte{0x11, 0x07, 0x30, 0x00}},
+		{"分越界", []byte{0x11, 0x07, 0x12, 0x60}},
+	} {
+		if _, err := Decode(it, c.raw); err == nil {
+			t.Errorf("%s: Decode(% X) 被接受，应为错误", c.name, c.raw)
+		}
 	}
 }
 
@@ -338,6 +530,53 @@ func TestExceptionClassification(t *testing.T) {
 		if got := e.Kind(); got != c.kind {
 			t.Fatalf("code %#x kind = %v, want %v", c.code, got, c.kind)
 		}
+	}
+}
+
+// TestRejectsRequestDirectionAsReply 钉住「D7 方向位必须校验」。
+//
+// D7=1 是从站应答、D7=0 是主站请求。部分 USB 转 485 / 两线半双工适配器会把
+// 主站刚发出的字节回显给接收端，于是主站会收到自己发出的请求帧。若解析器
+// 只看功能码而不看 D7：
+//
+//   - 写请求（0x14）被当成 0x94 应答 → 写操作「成功」，设备其实没收到；
+//   - 读请求（0x11）被当成 0x91 应答 → 数据域是「DI 回显 + 空数据」，
+//     DI 校验能过，最后得到一条 0 字节的数据项。
+//
+// 两个方向都必须拒绝。回显的跳过由驱动的事务层负责（见 exchange）。
+func TestRejectsRequestDirectionAsReply(t *testing.T) {
+	di := mustDI(t, "04000101")
+	addr := [AddrLen]byte{0x42}
+
+	writeReq, err := WriteRequest(addr, di, 0x02, [3]byte{}, [4]byte{},
+		[]byte{0x12, 0x00, 0x11, 0x07, 0x26, 0x00})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wfr, _, err := Parse(writeReq[PreambleLen:])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if wfr.IsReply() {
+		t.Fatal("写请求帧不应带 D7")
+	}
+	if err := WriteAck(wfr); err == nil {
+		t.Fatal("主站自己发出的写请求被当成写成功——适配器回显时会让写操作假成功")
+	}
+
+	readReq, err := ReadRequest(addr, di)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rfr, _, err := Parse(readReq[PreambleLen:])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ParseReadReply(rfr, di); err == nil {
+		t.Fatal("读请求帧被当成读应答（数据域是 DI 回显 + 空数据）")
+	}
+	if _, err := ParseAddrReply(rfr); err == nil {
+		t.Fatal("请求帧被当成读地址应答")
 	}
 }
 

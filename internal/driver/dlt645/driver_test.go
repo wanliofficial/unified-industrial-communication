@@ -3,6 +3,8 @@ package dlt645
 import (
 	"context"
 	"errors"
+	"net"
+	"strings"
 	"testing"
 	"time"
 
@@ -145,8 +147,13 @@ func TestReadUnknownDIReturnsAddressError(t *testing.T) {
 	if got[0].Err == nil {
 		t.Fatal("failed point must carry an error")
 	}
-	if got[0].Quality != model.QualityCommError {
-		t.Fatalf("quality = %v", got[0].Quality)
+	// 质量码必须与错误种类一致：这是「地址错」（点表要改），不是「通信错」
+	// （线路要查）。把地址错标成 comm_error 会让运维去查一根没问题的线。
+	if driver.KindOf(got[0].Err) != driver.ErrAddress {
+		t.Fatalf("kind = %v", driver.KindOf(got[0].Err))
+	}
+	if got[0].Quality != model.QualityAddressError {
+		t.Fatalf("quality = %v, want address_error", got[0].Quality)
 	}
 }
 
@@ -328,6 +335,218 @@ func TestWriteReadonlyDI(t *testing.T) {
 	}
 }
 
+// TestWriteQualityFollowsErrorKind 钉住写失败的质量码同样由错误种类派生。
+//
+// 早先 writeOne 的每条失败路径都不设 Quality，序列化出去是空串——既不是
+// good 也不是 bad，下游按「可用」判断会把它当成一次成功的写入。现在与读
+// 路径共用 qualityOf：权限错 → bad（要改开关/点表），地址错 → address_error
+// （要改 DI），两者都不能冒充 comm_error。
+func TestWriteQualityFollowsErrorKind(t *testing.T) {
+	srv := startSim(t)
+	dev := model.Device{
+		ID: "meter", ChannelID: "ch", Enabled: true,
+		Interval: model.Duration(time.Second),
+		Labels:   map[string]string{"address": "000000000042", "options": "allow-write"},
+	}
+	c, err := New().Open(context.Background(), driver.OpenConfig{
+		Channel: model.Channel{ID: "ch", Protocol: "dlt645",
+			Transport: model.Transport{Kind: "tcp", Address: srv.Addr()},
+			Timeout:   model.Duration(2 * time.Second)},
+		Device: dev,
+	})
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer func() { _ = c.Close() }()
+
+	cases := []struct {
+		name    string
+		area    string
+		value   model.Value
+		wantKnd driver.ErrorKind
+		wantQ   model.Quality
+	}{
+		{
+			name: "只读数据项", area: "02010100",
+			value:   model.NumValue(model.TypeFloat64, 220.0),
+			wantKnd: driver.ErrPermission, wantQ: model.QualityBad,
+		},
+		{
+			name: "未收录的 DI", area: "03010000",
+			value:   model.NumValue(model.TypeFloat64, 1),
+			wantKnd: driver.ErrAddress, wantQ: model.QualityAddressError,
+		},
+	}
+	for _, c1 := range cases {
+		res, err := c.Write(context.Background(), []driver.WriteRequest{{
+			PointID: c1.name,
+			Address: model.Address{Kind: model.AddressRegister, Area: c1.area, Bit: -1, Length: 2},
+			Value:   c1.value,
+		}})
+		if err != nil {
+			t.Fatalf("%s: write: %v", c1.name, err)
+		}
+		if res[0].OK {
+			t.Fatalf("%s: 不应成功", c1.name)
+		}
+		if got := driver.KindOf(res[0].Err); got != c1.wantKnd {
+			t.Fatalf("%s: kind = %v, want %v (%v)", c1.name, got, c1.wantKnd, res[0].Err)
+		}
+		if res[0].Quality != c1.wantQ {
+			t.Fatalf("%s: quality = %q, want %q", c1.name, res[0].Quality, c1.wantQ)
+		}
+		if res[0].Quality == "" {
+			t.Fatalf("%s: 质量码为空——序列化后既不是 good 也不是 bad", c1.name)
+		}
+	}
+	if srv.Writes() != 0 {
+		t.Fatal("被本地闸门拒绝的写入不得到达设备")
+	}
+}
+
+// TestAdapterEchoIsSkipped 钉住「适配器回显要被跳过、而不是当成应答」。
+//
+// 部分 USB 转 485 / 两线半双工适配器会把主站刚发出的字节原样回显给接收端，
+// 于是主站先收到自己的请求帧、然后才是真正的应答。请求帧的 D7=0，任何从站
+// 应答的 D7=1，因此这一帧是可无条件识别的。
+//
+// 两种错误处理都会造成现场事故：把回显当应答 → 写完报成功但设备没收到；
+// 把回显当协议错 → 这类适配器完全不可用。正确行为是丢掉回显、继续等。
+//
+// 这里用一个「先回显、再转发」的 TCP 代理模拟这类适配器，跑真实驱动。
+func TestAdapterEchoIsSkipped(t *testing.T) {
+	srv := startSim(t)
+
+	// 代理：把客户端发来的每个字节先原样回给客户端，再转给从站；
+	// 从站的应答原样转回客户端。
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("proxy listen: %v", err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+	go func() {
+		for {
+			client, aerr := ln.Accept()
+			if aerr != nil {
+				return
+			}
+			go func(client net.Conn) {
+				defer client.Close()
+				up, derr := net.Dial("tcp", srv.Addr())
+				if derr != nil {
+					return
+				}
+				defer up.Close()
+				// 客户端 → 从站：先把字节回显给客户端，再转发。
+				go func() {
+					buf := make([]byte, 512)
+					for {
+						n, rerr := client.Read(buf)
+						if n > 0 {
+							_, _ = client.Write(buf[:n]) // 回显
+							_, _ = up.Write(buf[:n])
+						}
+						if rerr != nil {
+							return
+						}
+					}
+				}()
+				// 从站 → 客户端。
+				buf := make([]byte, 512)
+				for {
+					n, rerr := up.Read(buf)
+					if n > 0 {
+						_, _ = client.Write(buf[:n])
+					}
+					if rerr != nil {
+						return
+					}
+				}
+			}(client)
+		}
+	}()
+
+	dev := model.Device{
+		ID: "meter", ChannelID: "ch", Enabled: true,
+		Interval: model.Duration(time.Second),
+		Timeout:  model.Duration(2 * time.Second),
+		Labels:   map[string]string{"address": "000000000042", "options": "allow-write,gap=1ms"},
+	}
+	c, err := New().Open(context.Background(), driver.OpenConfig{
+		Channel: model.Channel{ID: "ch", Protocol: "dlt645",
+			Transport: model.Transport{Kind: "tcp", Address: ln.Addr().String()},
+			Timeout:   model.Duration(2 * time.Second)},
+		Device: dev,
+	})
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer func() { _ = c.Close() }()
+
+	// 读：必须拿到真实电压 220.0，而不是「回显 DI + 0 字节」。
+	got, err := c.Read(context.Background(), []driver.ReadSpan{{ID: "s", Points: []driver.PointRef{{
+		ID: "v", Address: model.Address{Kind: model.AddressRegister, Area: "02010100", Bit: -1},
+		DataType: model.TypeFloat64,
+	}}}})
+	if err != nil {
+		t.Fatalf("read through echoing adapter: %v", err)
+	}
+	if len(got) != 1 || got[0].Err != nil {
+		t.Fatalf("read sample = %+v", got)
+	}
+	if f, ok := got[0].Value.AsFloat(); !ok || f != 220.0 {
+		t.Fatalf("value = %v (want 220.0)", got[0].Value)
+	}
+
+	// 写：必须真的写到设备（Writes()==1），而不是把回显当成功。
+	res, err := c.Write(context.Background(), []driver.WriteRequest{{
+		PointID: "clock",
+		Address: model.Address{Kind: model.AddressRegister, Area: "04000101", Bit: -1, Length: 6},
+		Value:   model.NumValue(model.TypeFloat64, 20261107120000),
+	}})
+	if err != nil {
+		t.Fatalf("write through echoing adapter: %v", err)
+	}
+	if !res[0].OK {
+		t.Fatalf("write = %+v", res[0])
+	}
+	if srv.Writes() != 1 {
+		t.Fatalf("设备收到 %d 次写；回显被当成应答时会是 0", srv.Writes())
+	}
+}
+
+// TestAllowControlIsRejected 钉住「死掉的高危开关要被显式拒绝」。
+//
+// allow-control 曾被文档写成「拉合闸/清零的闸门」，但驱动从来没有控制入口，
+// 也没有任何代码读这个字段。它因此是一个死开关：运维写了会以为已经授权拉闸，
+// 实际什么也没打开；而将来若有人补上控制入口，一个陈旧配置会**默认**已经放行。
+//
+// 正确行为是 Open 直接报错，明确告诉配置者「这条路本驱动不通」，而不是静默忽略。
+func TestAllowControlIsRejected(t *testing.T) {
+	srv := startSim(t)
+	_, err := New().Open(context.Background(), driver.OpenConfig{
+		Channel: model.Channel{ID: "ch", Protocol: "dlt645",
+			Transport: model.Transport{Kind: "tcp", Address: srv.Addr()},
+			Timeout:   model.Duration(2 * time.Second)},
+		Device: model.Device{ID: "meter", ChannelID: "ch", Enabled: true,
+			Interval: model.Duration(time.Second),
+			Labels: map[string]string{"address": "000000000042",
+				"options": "allow-write,allow-control"}},
+	})
+	if err == nil {
+		t.Fatal("allow-control 被静默接受——用户会以为拉闸已授权")
+	}
+	if driver.KindOf(err) != driver.ErrUnsupported {
+		t.Fatalf("kind = %v (%v)", driver.KindOf(err), err)
+	}
+	if !strings.Contains(err.Error(), "allow-control") {
+		t.Fatalf("错误信息必须点名 allow-control：%v", err)
+	}
+	if !strings.Contains(err.Error(), "厂商工具") {
+		t.Fatalf("错误信息必须给出出路：%v", err)
+	}
+}
+
 func TestOpenRequiresAddressLabel(t *testing.T) {
 	srv := startSim(t)
 	_, err := New().Open(context.Background(), driver.OpenConfig{
@@ -446,7 +665,8 @@ func TestWriteSettlementDateRoundTrip(t *testing.T) {
 		t.Fatalf("settlement date = %v, want 11071200 (MMDDhhmm)", v)
 	}
 
-	// 原样写回读到的值。
+	// 原样写回读到的值。Decode 现在返回 MMDDhhmm（11 月 7 日 12:00 → 11071200），
+	// 不是旧实现的小端带符号整数。
 	res, err := c.Write(context.Background(), []driver.WriteRequest{{
 		PointID: "date",
 		Address: model.Address{Kind: model.AddressRegister, Area: "04000B01", Bit: -1, Length: 4},
@@ -473,6 +693,20 @@ func TestWriteSettlementDateRoundTrip(t *testing.T) {
 	}
 	if v := read(); v != 12312359 {
 		t.Fatalf("settlement date after write = %v, want 12312359", v)
+	}
+
+	// 读到的非法时钟必须报错，而不是被归一化成另一个合法日期。写路径早已
+	// 拒绝这类值（TestWriteTimeRejectsInvalidDate），读路径若静默接受，运维
+	// 就会看到一个「看起来正常、实际是 time.Date 猜出来的」结算日。
+	if err := srv.SetValue("04000B01", []byte{0x19, 0x07, 0x12, 0x00}); err != nil {
+		t.Fatalf("set bad settlement date: %v", err)
+	}
+	got, rerr := c.Read(context.Background(), points("04000B01"))
+	if rerr == nil {
+		t.Fatalf("月=19 的结算日被静默接受：%+v", got)
+	}
+	if !strings.Contains(rerr.Error(), "月份") {
+		t.Fatalf("错误信息应指出是月份越界：%v", rerr)
 	}
 }
 

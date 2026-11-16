@@ -126,6 +126,16 @@ func ParseReadNextReply(fr Frame, want DI, seq byte) (ReadReply, error) {
 }
 
 func parseDataReply(fr Frame, want DI, next bool, seq ...byte) (ReadReply, error) {
+	// 先校验方向位 D7：只有「从站 → 主站」的帧才可能是应答。
+	//
+	// RS-485 两线半双工适配器（尤其 USB 转 485 的部分型号）会把主站刚发出
+	// 的字节回显给接收端。若不看 D7，主站就会把自己发出的读请求当应答：
+	// 数据域恰好是「DI 回显 + 空数据」，DI 校验能过、长度校验在某些数据块
+	// 上也能过，最后得到一条「0 字节的数据项」。在写路径上更糟——见
+	// WriteAck：请求帧 D7=0、功能码是 0x14，会被当成「写成功」。
+	if !fr.IsReply() {
+		return ReadReply{}, fmt.Errorf("dlt645: 控制码 0x%02X 不是从站应答（D7=0，方向位表明这是主站发出的请求，多为适配器回显）", fr.Ctrl)
+	}
 	if fr.IsError() {
 		return ReadReply{}, fr.Exception()
 	}
@@ -154,6 +164,9 @@ func parseDataReply(fr Frame, want DI, next bool, seq ...byte) (ReadReply, error
 // ParseAddrReply 解析 0x93（读通信地址应答）：数据域就是 6 字节地址。
 func ParseAddrReply(fr Frame) ([AddrLen]byte, error) {
 	var out [AddrLen]byte
+	if !fr.IsReply() {
+		return out, fmt.Errorf("dlt645: 控制码 0x%02X 不是从站应答（D7=0，是主站请求方向；多为适配器回显）", fr.Ctrl)
+	}
 	if fr.IsError() {
 		return out, fr.Exception()
 	}
@@ -168,7 +181,14 @@ func ParseAddrReply(fr Frame) ([AddrLen]byte, error) {
 //
 // 成功应答是 0x94 且 L=0；有的表会多回一个字节，这不算错（标准允许
 // 厂商扩展），因此只要求「不是异常应答」。
+//
+// 必须同时校验方向位 D7：只看功能码会把**主站自己发出的写请求**（D7=0、
+// 功能码同为 0x14）当成 0x94 的应答——适配器回显时写操作会立刻「成功」，
+// 而设备根本没收到。这是 D7 存在的全部意义，不能省。
 func WriteAck(fr Frame) error {
+	if !fr.IsReply() {
+		return fmt.Errorf("dlt645: 控制码 0x%02X 不是从站应答（D7=0，是主站请求方向；多为适配器回显）", fr.Ctrl)
+	}
 	if fr.IsError() {
 		return fr.Exception()
 	}

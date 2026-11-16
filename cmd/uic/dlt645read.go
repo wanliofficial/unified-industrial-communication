@@ -44,8 +44,8 @@ func dlt645readCmd(args []string) {
 	address := fs.String("address", "000000000001", "表地址：12 位 BCD，可缩位（如 0042），高位自动补 AA 通配")
 	diList := fs.String("di", "00000000,02010100", "数据标识，逗号分隔（8 位十六进制，手册顺序 DI3DI2DI1DI0）")
 	password := fs.String("password", "", "写命令密码，6 位十六进制（PA P0 P1 P2 里的 P0..P2，3 字节）")
-	write := fs.String("write", "", "写入值（按 DI 的数据项类型解释；拉合闸用 trip|allow）")
-	allowControl := fs.Bool("allow-control", false, "允许拉合闸（0x1C）；高危，默认关闭")
+	write := fs.String("write", "", "写入值（按 DI 的数据项类型解释）")
+	allowControl := fs.Bool("allow-control", false, "(本命令不支持) 拉合闸在驱动层就没有入口，给了会报错")
 	probe := fs.Bool("probe", false, "只读通信地址（0x13）验证链路")
 	raw := fs.Bool("raw", false, "额外显示数据块/字节串的原始数据")
 	preamble := fs.Int("preamble", dlt645codec.PreambleLen, "前导 FE 字节数 0..8（默认 4）")
@@ -72,11 +72,14 @@ func dlt645readCmd(args []string) {
 	// 写命令的选项通过设备标签传给驱动：与运行时走同一条路径，避免
 	// 「CLI 能写、网关不能写」这种只在一侧出现的差异。
 	opts := []string{fmt.Sprintf("preamble=%d", *preamble), "gap=" + gap.String()}
+	if *allowControl {
+		// 驱动层根本没有控制入口；把 allow-control 透传下去只会在 Open
+		// 时报错，但报在那里说不清是哪个参数，所以在这里先拦。
+		fmt.Fprintln(os.Stderr, "本命令不提供拉合闸/清零（-allow-control 无效）：控制类命令请用厂商工具")
+		os.Exit(2)
+	}
 	if *write != "" {
 		opts = append(opts, "allow-write")
-		if *allowControl {
-			opts = append(opts, "allow-control")
-		}
 		if *password != "" {
 			opts = append(opts, "password="+*password)
 		}
@@ -259,8 +262,9 @@ func (r dlt645Row) display() string {
 
 // runDLT645Write 下发一条写命令。
 //
-// 拉合闸单独走一个分支：它的数据域形状与普通写完全不同（没有 DI，而是
-// 密码 + 操作者代码 + 控制类型 + 有效期），而且必须显式开启 allow-control。
+// 只做普通写数据（0x14）。拉合闸是另一套数据域形状（没有 DI，而是密码 +
+// 操作者代码 + 控制类型 + 有效期），本驱动刻意不提供入口——一个「能读」
+// 的驱动不应该顺手能把闸拉了，见包文档的边界说明。
 func runDLT645Write(ctx context.Context, c driver.Conn, dis []dlt645codec.DI, value string, raw, asJSON bool) {
 	if len(dis) != 1 {
 		fmt.Fprintln(os.Stderr, "-write 只能配一个 -di（一次只写一个数据项）")
@@ -274,7 +278,7 @@ func runDLT645Write(ctx context.Context, c driver.Conn, dis []dlt645codec.DI, va
 	}
 	lower := strings.ToLower(strings.TrimSpace(value))
 	if lower == "trip" || lower == "allow" {
-		fmt.Fprintln(os.Stderr, "拉合闸请用 -di 控制字并显式开启 -allow-control；本命令不做隐式控制下发")
+		fmt.Fprintln(os.Stderr, "拉合闸不在本驱动范围内（0x1C 是厂商备案扩展，各厂数据域不一致）；请用厂商工具")
 		os.Exit(2)
 	}
 

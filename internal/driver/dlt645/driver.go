@@ -59,7 +59,16 @@ const defaultTCPPort = "4001"
 type Options struct {
 	// AllowWrite 允许普通写数据（0x14）。
 	AllowWrite bool
-	// AllowControl 允许拉合闸（0x1C）与清零（0x19/0x1A/0x1B）。
+	// AllowControl 是历史遗留字段，**本驱动不再接受**。
+	//
+	// 早先它被文档写成「拉合闸（0x1C）与清零的闸门」，但驱动从来没有控制
+	// 入口（没有 Relay/Clear 方法），于是它成了一个被解析、被写进帮助文本、
+	// 却没有任何代码读取的死开关。死掉的高危开关比没有开关更危险：运维写了
+	// `allow-control` 会以为已经授权拉闸，实际什么也没打开；而将来若有人补上
+	// 控制入口，一个陈旧的配置会**默认**已经放行。
+	//
+	// 因此改为显式拒绝：Open 见到它直接报错，让人知道「这条路本驱动不通，
+	// 请用厂商工具」。与「广播命令不提供入口」是同一条原则。
 	AllowControl bool
 	// Password 是写数据/控制用的密码权限（PA 的高 4 位）与密码（P0..P2）。
 	Password  byte
@@ -119,7 +128,7 @@ func (d *Driver) Meta() driver.Meta {
 			{Name: "concurrency", Label: "并发上限", Type: "int", Default: 1, Scope: "channel",
 				Help: "半双工总线必须串行；同一物理串口由多个通道共享时按总线锁排队"},
 			{Name: "labels.options", Label: "写命令开关", Type: "string", Default: "", Scope: "device",
-				Help: "allow-write,allow-control,preamble=0,gap=50ms,password=000000"},
+				Help: "allow-write,preamble=0,gap=50ms,password=000000（本驱动不提供拉合闸/清零，allow-control 会被拒绝）"},
 		},
 		PointFields: []driver.ConfigField{
 			{Name: "labels.address", Label: "表地址", Type: "string", Required: true, Scope: "device",
@@ -131,7 +140,7 @@ func (d *Driver) Meta() driver.Meta {
 			{Name: "address.length", Label: "长度（数据块）", Type: "int", Scope: "point",
 				Help: "仅数据块（DI 含 FF）需要；普通数据项由 DI 表推导，写了会与推导值冲突"},
 		},
-		Description: "多功能电能表通信协议主站：按数据标识读取电量/瞬时量/参变量，写参数与可选的拉合闸控制（RS-485）",
+		Description: "多功能电能表通信协议主站：按数据标识读取电量/瞬时量/参变量，写参数（RS-485）；不提供拉合闸/清零",
 	}
 }
 
@@ -149,6 +158,10 @@ func (d *Driver) Open(ctx context.Context, cfg driver.OpenConfig) (driver.Conn, 
 	}
 	opt := parseOptions(cfg.Device)
 	t := cfg.Channel.Transport
+	if opt.AllowControl {
+		return nil, driver.E(driver.ErrUnsupported, "open", cfg.Device.ID,
+			"本驱动不提供拉合闸/清零入口，options 里的 allow-control 不会打开任何功能；请改用厂商工具", false, nil)
+	}
 
 	l, err := link.Open(ctx, link.Options{
 		Proto:       "dlt645",
@@ -418,8 +431,19 @@ func (c *conn) readPoint(ctx context.Context, ref driver.PointRef) (driver.RawSa
 	//
 	// 必须在这里跟完而不是把半包交给上层：一条被截断的电能读数会以
 	// 「比实际少了几位」的形式入账，而且看不出任何异常。
+	//
+	// 上限必须按**帧数**而不是字节数。只做「累计字节 ≤ 200×64」时，一台
+	// 每帧只回 1 字节的坏表能把这个循环拖到上万次事务（每次一个超时窗口，
+	// 一轮采集变成几十分钟），而字节上限永远碰不到。帧数与字节数两道都留：
+	// 前者挡住碎帧，后者挡住满帧。
 	seq := byte(0)
+	frames := 0
 	for reply.Follow {
+		frames++
+		if frames > maxFollow {
+			return driver.RawSample{}, driver.E(driver.ErrProtocol, "read", c.devID,
+				fmt.Sprintf("后续帧超过 %d 帧上限，疑似对端一直置后续位", maxFollow), false, nil)
+		}
 		seq++
 		if seq == 0 {
 			seq = 1
@@ -539,8 +563,9 @@ func (c *conn) Write(ctx context.Context, reqs []driver.WriteRequest) ([]driver.
 	out := make([]driver.WriteResult, 0, len(reqs))
 	for _, req := range reqs {
 		if err := ctx.Err(); err != nil {
+			e := driver.E(driver.ErrTimeout, "write", c.devID, "context done", true, err)
 			out = append(out, driver.WriteResult{PointID: req.PointID,
-				Err: driver.E(driver.ErrTimeout, "write", c.devID, "context done", true, err)})
+				Quality: qualityOf(e), Err: e})
 			continue
 		}
 		out = append(out, c.writeOne(ctx, req))
@@ -553,6 +578,7 @@ func (c *conn) writeOne(ctx context.Context, req driver.WriteRequest) driver.Wri
 	di, item, err := resolveWrite(req)
 	if err != nil {
 		res.Err = err
+		res.Quality = qualityOf(err)
 		return res
 	}
 	if !item.Writable {
@@ -562,41 +588,49 @@ func (c *conn) writeOne(ctx context.Context, req driver.WriteRequest) driver.Wri
 		// 是最容易被误配成「可写」的一类点位。
 		res.Err = driver.E(driver.ErrPermission, "write", c.devID,
 			fmt.Sprintf("%s（%s）是只读数据项", item.Name, di), false, nil)
+		res.Quality = qualityOf(res.Err)
 		return res
 	}
 	if !c.opt.AllowWrite {
 		res.Err = driver.E(driver.ErrPermission, "write", c.devID,
 			"未开启写权限（通道 options 需包含 allow-write）", false, nil)
+		res.Quality = qualityOf(res.Err)
 		return res
 	}
 
 	payload, err := encodeWriteValue(item, req)
 	if err != nil {
 		res.Err = err
+		res.Quality = qualityOf(err)
 		return res
 	}
 	frame, err := dlt645.WriteRequest(c.addr, di, c.opt.Password, c.opt.PasswordB,
 		c.opt.Operator, payload)
 	if err != nil {
 		res.Err = driver.E(driver.ErrInternal, "write", c.devID, err.Error(), false, err)
+		res.Quality = qualityOf(res.Err)
 		return res
 	}
 	resp, err := c.exchange(ctx, frame, "write")
 	if err != nil {
 		res.Err = err
+		res.Quality = qualityOf(err)
 		return res
 	}
 	fr, err := resp.Frame()
 	if err != nil {
 		res.Err = driver.E(driver.ErrProtocol, "write", c.devID, err.Error(), true, err)
+		res.Quality = qualityOf(res.Err)
 		return res
 	}
 	if err := c.checkAddr(fr, "write"); err != nil {
 		res.Err = err
+		res.Quality = qualityOf(err)
 		return res
 	}
 	if err := dlt645.WriteAck(fr); err != nil {
 		res.Err = c.classify(di, "write", err)
+		res.Quality = qualityOf(res.Err)
 		return res
 	}
 	res.OK = true
@@ -714,37 +748,32 @@ func fromCompact(v float64) (time.Time, error) {
 	return t, nil
 }
 
+// checkDateParts 是驱动侧对「从用户/点位拿到的日期字段」的最后一道校验。
+//
+// 它只做取值范围校验：2 月 30 日这类「字段都合法但日期不存在」由各语义
+// 入口单独拒绝（见 fromCompact 的反向比对）。范围校验的规则与读路径共用
+// codec.ValidDateParts——两处规则若分叉，就会出现「读得到一个非法时钟、
+// 写同一个时钟却被拒绝」这类无法解释的行为差异。
 func checkDateParts(mon, day, hour, min, sec int) error {
-	switch {
-	case mon < 1 || mon > 12:
-		return fmt.Errorf("月份 %d 必须在 1..12", mon)
-	case day < 1 || day > 31:
-		return fmt.Errorf("日 %d 必须在 1..31", day)
-	case hour < 0 || hour > 23:
-		return fmt.Errorf("小时 %d 必须在 0..23", hour)
-	case min < 0 || min > 59:
-		return fmt.Errorf("分钟 %d 必须在 0..59", min)
-	case sec < 0 || sec > 59:
-		return fmt.Errorf("秒 %d 必须在 0..59", sec)
-	}
-	return nil
+	return dlt645.ValidDateParts(mon, day, hour, min, sec)
 }
 
 // ---------------------------------------------------------------------------
 // 事务
 // ---------------------------------------------------------------------------
 
-// reply 把收到的帧连同原始字节一起带回。
+// reply 把收到的帧带回给调用方。
 //
-// 保留原始字节是为了失败样本：现场排查「为什么这个点读不到」时，光有
-// 「校验和错误」四个字没有用，需要看到实际收到的那 20 个字节。
+// 早先这里还有一个 raw 字段，注释声称「保留原始字节便于现场排查校验和错误」，
+// 但没有任何路径给它赋值，永远 nil——一个只在注释里存在的诊断能力。校验和
+// 错误本身已经带着地址/控制码/收发两侧的 CS（见 ChecksumError.Error），
+// 那才是真正有用的信息；因此删掉这个空壳，而不是留着让人误以为能拿到原始帧。
 type reply struct {
-	fr  dlt645.Frame
-	raw []byte
+	fr dlt645.Frame
 }
 
 func (r reply) Frame() (dlt645.Frame, error) {
-	if len(r.raw) == 0 && r.fr.Ctrl == 0 {
+	if r.fr.Ctrl == 0 {
 		return dlt645.Frame{}, errors.New("dlt645: 空应答")
 	}
 	return r.fr, nil
@@ -787,16 +816,27 @@ func (c *conn) exchange(ctx context.Context, req []byte, op string) (reply, erro
 	}
 
 	rd := dlt645.NewReader(c.link)
-	fr, err := rd.Next()
-	if err != nil {
-		e := c.readError(op, err, ctx)
-		if isLinkFailure(e) {
-			c.linkErr = e
+	// 适配器回显：部分 USB 转 485 / 两线半双工适配器会把主站刚发出的字节
+	// 原样回显给接收端。回显帧的 D7=0（请求方向），而任何从站应答的 D7=1，
+	// 因此它是可以无条件识别的。跳过它继续等真正的应答，而不是把回显当成
+	// 应答或直接报「协议错」——前者会让写操作「成功」而设备根本没收到，
+	// 后者会让这类适配器完全不可用（现场量不小）。
+	for {
+		fr, err := rd.Next()
+		if err != nil {
+			e := c.readError(op, err, ctx)
+			if isLinkFailure(e) {
+				c.linkErr = e
+			}
+			return reply{}, e
 		}
-		return reply{}, e
+		if !fr.IsReply() {
+			// 不是应答方向：这是回显（或总线上别的主站的帧），丢掉继续等。
+			continue
+		}
+		c.linkErr = nil
+		return reply{fr: fr}, nil
 	}
-	c.linkErr = nil
-	return reply{fr: fr}, nil
 }
 
 func (c *conn) deadline() time.Duration {
@@ -902,12 +942,32 @@ func parseDI(s string) (dlt645.DI, error) {
 
 // bad 生成一条坏样本。失败样本必须带上点位 ID：采集层按 ID 归位，
 // 少一条会让北向看到一个「卡在旧值」的点，比明确报错更危险。
+//
+// 质量码由错误的**种类**派生，而不是一律 comm_error：一个「这个 DI 电表
+// 没有」的地址错被标成 comm_error，运维会去查线路，而真正要改的是点表。
+// 这与其它驱动（mc/bacnet/iec101）的 qualityOf 是同一套约定。
 func bad(ref driver.PointRef, err error) driver.RawSample {
 	return driver.RawSample{
 		PointID: ref.ID,
-		Quality: model.QualityCommError,
+		Quality: qualityOf(err),
 		Err:     err,
 	}
+}
+
+// qualityOf 把驱动错误分类映射为质量码，与 classify 对错误码的分类保持
+// 一致（同一条错误在「码」与「质量」两个维度上不能给相反结论）。
+func qualityOf(err error) model.Quality {
+	switch driver.KindOf(err) {
+	case driver.ErrTimeout:
+		return model.QualityTimeout
+	case driver.ErrAddress, driver.ErrUnsupported:
+		return model.QualityAddressError
+	case driver.ErrDisconnected:
+		return model.QualityCommError
+	case driver.ErrPermission:
+		return model.QualityBad
+	}
+	return model.QualityBad
 }
 
 // isLinkFailure 判断错误是否意味着「这一轮别再发了」。

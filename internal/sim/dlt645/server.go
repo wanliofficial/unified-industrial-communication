@@ -145,7 +145,9 @@ func (s *Server) seed() {
 	// 电网频率 50.00 Hz。
 	setBCD("02800002", 5000, 2, false)
 	// 最大需量 12.3456 kW + 发生时间 11-07 12:00 —— 8 字节复合。
-	demand := append(bcdLEWidth(123456, 4), bcdLEWidth(11071200, 4)...)
+	// 需量按数值小端编码；发生时间按 MM DD hh mm 字段序（与日期数据项同形，
+	// 不是小端整数），颠倒后会被读成「59 月 23 日」。
+	demand := append(bcdLEWidth(123456, 4), []byte{0x11, 0x07, 0x12, 0x00}...)
 	set("01010000", demand, false)
 	// 日期及时间（6 字节 ss mm hh DD MM YY）。
 	clockBytes := dlt.TimeBytes(s.clock)
@@ -154,8 +156,9 @@ func (s *Server) seed() {
 	set("04000401", s.addr[:], true)
 	// 电表运行状态字。
 	setBCD("04000402", 0, 2, false)
-	// 第 1 结算日：4 字节 MMDDhhmm（没有年）。
-	setBCD("04000B01", 11071200, 4, true)
+	// 第 1 结算日：4 字节 MMDDhhmm（没有年）。注意这不是小端 BCD：
+	// 字节序是 MM DD hh mm，用「数值小端」编码会把月份与分钟对调。
+	set("04000B01", []byte{0x11, 0x07, 0x12, 0x00}, true)
 }
 
 // Addr 返回监听地址（TCP 模式）。
