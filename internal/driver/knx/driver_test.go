@@ -696,3 +696,41 @@ func (nopDatagram) SetDeadline(time.Time) error { return nil }
 func (nopDatagram) Close() error                { return nil }
 
 var _ transport.Datagram = nopDatagram{}
+
+// TestReadPartialFailureKeepsGoodSamples 钉住部分失败契约（docs §3.7.4 /
+// §3.9.5）：一个组地址配错（ErrAddress）时，只要还有别的点读成功，Read 就
+// 不向上返回错误。否则 collector 会丢弃隧道、整台网关每周期重连。
+func TestReadPartialFailureKeepsGoodSamples(t *testing.T) {
+	c := openSim(t, newSim(t), nil)
+	good := ref("lamp", "1/1/1", "1.001", model.TypeBool)
+	bad := ref("bad", "9/9/9", "1.001", model.TypeBool)
+
+	samples, err := c.Read(context.Background(), []driver.ReadSpan{{
+		ID: "s", Points: []driver.PointRef{good, bad},
+	}})
+	if err != nil {
+		t.Fatalf("有成功点时 Read 不该返回错误，得到 %v", err)
+	}
+	if len(samples) != 2 {
+		t.Fatalf("samples = %d, want 2", len(samples))
+	}
+	if samples[0].Err != nil || samples[0].Quality != model.QualityGood {
+		t.Fatalf("好点不该被连累: %+v", samples[0])
+	}
+	if samples[1].Err == nil || driver.KindOf(samples[1].Err) != driver.ErrAddress {
+		t.Fatalf("坏点应带 address 错误: %+v", samples[1])
+	}
+}
+
+// 全部点位失败时必须返回错误，让熔断器看到「设备全坏」。
+func TestReadAllFailedStillReturnsError(t *testing.T) {
+	c := openSim(t, newSim(t), nil)
+	bad1 := ref("bad1", "9/9/8", "1.001", model.TypeBool)
+	bad2 := ref("bad2", "9/9/9", "1.001", model.TypeBool)
+
+	if _, err := c.Read(context.Background(), []driver.ReadSpan{{
+		ID: "s", Points: []driver.PointRef{bad1, bad2},
+	}}); err == nil {
+		t.Fatal("全部点位失败时必须返回错误")
+	}
+}

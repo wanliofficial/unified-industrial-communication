@@ -710,3 +710,51 @@ func (d *dropFirst) Write(p []byte) error {
 func (d *dropFirst) Read() ([]byte, error)         { return d.inner.Read() }
 func (d *dropFirst) SetDeadline(t time.Time) error { return d.inner.SetDeadline(t) }
 func (d *dropFirst) Close() error                  { return d.inner.Close() }
+
+// TestReadPartialFailureKeepsGoodSamples 钉住部分失败契约（docs §3.7.4 /
+// §3.9.5）：一轮里有一个点配错（属性名不存在）时，**只要还有别的点读成功，
+// Read 就不向上返回错误**，好样本照常上送，坏点只在自己的样本上带 Err。
+//
+// 为什么必须这样：上层 collector 看到 Read 返回错误会按错误分类丢弃连接
+// （ErrDisconnected/ErrTimeout/ErrProtocol 直接 Close 重连）。若单点错误
+// 上升为整轮错误，一个属性名写错的点位会让整台设备每周期重连一次，且
+// 熔断器会把「点表有一个错」误判成「设备坏了」。
+func TestReadPartialFailureKeepsGoodSamples(t *testing.T) {
+	c := openSim(t, newSim(t))
+	good := objRef("temp", "analog-input", 1, "present-value", model.TypeFloat32)
+	bad := objRef("bad", "analog-input", 1, "no-such-property", model.TypeFloat32)
+
+	samples, err := c.Read(context.Background(), []driver.ReadSpan{{
+		ID: "s", Points: []driver.PointRef{good, bad},
+	}})
+	if err != nil {
+		t.Fatalf("有成功点时 Read 不该返回错误，得到 %v", err)
+	}
+	if len(samples) != 2 {
+		t.Fatalf("samples = %d, want 2（坏点也要有样本）", len(samples))
+	}
+	if samples[0].Err != nil || samples[0].Quality != model.QualityGood || samples[0].Value.Num != 42.5 {
+		t.Fatalf("好点不该被连累: %+v", samples[0])
+	}
+	if samples[1].Err == nil || driver.KindOf(samples[1].Err) != driver.ErrAddress {
+		t.Fatalf("坏点应带 address 错误: %+v", samples[1])
+	}
+}
+
+// TestReadAllFailedStillReturnsError 是反面：全部点位都失败时必须返回错误，
+// 否则「设备在采但全坏」对熔断器不可见。
+func TestReadAllFailedStillReturnsError(t *testing.T) {
+	c := openSim(t, newSim(t))
+	bad1 := objRef("bad1", "analog-input", 1, "no-such-property", model.TypeFloat32)
+	bad2 := objRef("bad2", "analog-input", 1, "no-such-property-either", model.TypeFloat32)
+
+	samples, err := c.Read(context.Background(), []driver.ReadSpan{{
+		ID: "s", Points: []driver.PointRef{bad1, bad2},
+	}})
+	if err == nil {
+		t.Fatal("全部点位失败时必须返回错误")
+	}
+	if len(samples) != 2 {
+		t.Fatalf("samples = %d, want 2", len(samples))
+	}
+}

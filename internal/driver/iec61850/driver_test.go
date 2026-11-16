@@ -350,3 +350,45 @@ func itemNames(keys []string, domain string) []string {
 	}
 	return out
 }
+
+// TestReadPartialFailureKeepsGoodSamples 钉住部分失败契约（docs §3.7.4 /
+// §3.9.5）：一个对象引用配错（ErrAddress）时，只要还有别的点读成功，Read 就
+// 不向上返回错误。否则 collector 会丢弃关联、整台 IED 每周期重新建链。
+func TestReadPartialFailureKeepsGoodSamples(t *testing.T) {
+	c := openSim(t, newSim(t), func(d *model.Device) {
+		d.Labels = map[string]string{"defaultFC": "ST"}
+	})
+	good := ref("ind1", "simpleIO/GGIO1.Ind1.stVal", model.TypeBool)
+	bad := ref("ghost", "simpleIO/GGIO1.ST.Ghost.stVal", model.TypeBool)
+
+	samples, err := c.Read(context.Background(), []driver.ReadSpan{{
+		ID: "s", Points: []driver.PointRef{good, bad},
+	}})
+	if err != nil {
+		t.Fatalf("有成功点时 Read 不该返回错误，得到 %v", err)
+	}
+	if len(samples) != 2 {
+		t.Fatalf("samples = %d, want 2", len(samples))
+	}
+	if samples[0].Err != nil || samples[0].Quality != model.QualityGood || !samples[0].Value.Bool {
+		t.Fatalf("好点不该被连累: %+v", samples[0])
+	}
+	if samples[1].Err == nil || driver.KindOf(samples[1].Err) != driver.ErrAddress {
+		t.Fatalf("坏点应带 address 错误: %+v", samples[1])
+	}
+}
+
+// 全部点位失败时必须返回错误。
+func TestReadAllFailedStillReturnsError(t *testing.T) {
+	c := openSim(t, newSim(t), func(d *model.Device) {
+		d.Labels = map[string]string{"defaultFC": "ST"}
+	})
+	bad1 := ref("b1", "simpleIO/GGIO1.ST.Ghost1.stVal", model.TypeBool)
+	bad2 := ref("b2", "simpleIO/GGIO1.ST.Ghost2.stVal", model.TypeBool)
+
+	if _, err := c.Read(context.Background(), []driver.ReadSpan{{
+		ID: "s", Points: []driver.PointRef{bad1, bad2},
+	}}); err == nil {
+		t.Fatal("全部点位失败时必须返回错误")
+	}
+}

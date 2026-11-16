@@ -466,15 +466,15 @@ type xmlGroup struct {
 
 type xmlItem struct {
 	XMLName          xml.Name
-	DataItemID       string    `xml:"dataItemId,attr"`
-	Name             string    `xml:"name,attr"`
-	TypeAttr         string    `xml:"type,attr"`
-	SubType          string    `xml:"subType,attr"`
-	Units            string    `xml:"units,attr"`
-	NativeUnits      string    `xml:"nativeUnits,attr"`
-	CoordinateSystem string    `xml:"coordinateSystem,attr"`
-	NativeCode       string    `xml:"nativeCode,attr"`
-	SampleRate       string    `xml:"sampleRate,attr"`
+	DataItemID       string       `xml:"dataItemId,attr"`
+	Name             string       `xml:"name,attr"`
+	TypeAttr         string       `xml:"type,attr"`
+	SubType          string       `xml:"subType,attr"`
+	Units            string       `xml:"units,attr"`
+	NativeUnits      string       `xml:"nativeUnits,attr"`
+	CoordinateSystem string       `xml:"coordinateSystem,attr"`
+	NativeCode       string       `xml:"nativeCode,attr"`
+	SampleRate       string       `xml:"sampleRate,attr"`
 	TimestampText    string       `xml:"timestamp,attr"`
 	Sequence         tolerantUint `xml:"sequence,attr"`
 	Text             string       `xml:",chardata"`

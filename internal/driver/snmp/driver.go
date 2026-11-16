@@ -801,6 +801,7 @@ func (c *connState) Read(ctx context.Context, spans []driver.ReadSpan) ([]driver
 	}
 
 	var firstErr error
+	goodSamples := 0
 	// 任一链路级失败后，后续批次不可能成功；统一标记并停止。
 	failRest := func(from int, err error) {
 		if firstErr == nil {
@@ -818,13 +819,16 @@ func (c *connState) Read(ctx context.Context, spans []driver.ReadSpan) ([]driver
 	start := 0
 	estimate := 48 // 报文头 + PDU 头的粗略上界
 
+	// linkErr 记录链路级失败：它必须绕过下面的部分失败闸门立即抛给调度器。
+	var linkErr error
 	flush := func() bool {
 		if len(batch) == 0 {
 			return true
 		}
-		res, linkErr := c.readBatch(ctx, points, batch)
-		if linkErr != nil {
-			failRest(start, linkErr)
+		res, err := c.readBatch(ctx, points, batch)
+		if err != nil {
+			failRest(start, err)
+			linkErr = err
 			return false
 		}
 		for _, r := range res {
@@ -835,6 +839,7 @@ func (c *connState) Read(ctx context.Context, spans []driver.ReadSpan) ([]driver
 					firstErr = r.err
 				}
 			} else {
+				goodSamples++
 				out[r.pos] = driver.RawSample{PointID: points[r.pos].ID, Value: r.value, Quality: model.QualityGood}
 			}
 			filled[r.pos] = true
@@ -848,7 +853,7 @@ func (c *connState) Read(ctx context.Context, spans []driver.ReadSpan) ([]driver
 		size := estimateOID(it.oid) + 4
 		if len(batch) > 0 && (len(batch) >= c.maxOids || estimate+size > maxRequestBytes) {
 			if !flush() {
-				return out, firstErr
+				return out, linkErr
 			}
 			start = i
 		}
@@ -856,7 +861,11 @@ func (c *connState) Read(ctx context.Context, spans []driver.ReadSpan) ([]driver
 		estimate += size
 	}
 	flush()
-	return out, firstErr
+	if linkErr != nil {
+		return out, linkErr
+	}
+	// 部分失败语义（docs §3.3.1）：有成功点就不向上返回错误。
+	return out, driver.PartialReadError(goodSamples, firstErr)
 }
 
 // estimateOID 是 OID 编码长度的保守上界：TLV 头 2 字节 + 每子标识符 5 字节。

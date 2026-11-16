@@ -560,3 +560,47 @@ func TestSymbolNameRejects(t *testing.T) {
 		}
 	}
 }
+
+// TestReadPartialFailureKeepsGoodSamples 钉住部分失败契约（docs §3.7.4 /
+// §3.9.5）：一轮里既有点读成功、又有**非地址类**点位失败（这里用 BCD
+// 类型 → unsupported）时，Read 不向上返回错误。
+//
+// 为什么不能用地址错误来测：ADS 的 firstErr 本来就把 ErrAddress 排除了，
+// 用地址错误会得到假绿。真正的风险面是 protocol/unsupported 这类错误——
+// 上层 collector 见到 Read 返回错误会按分类丢弃连接并重建，一个变量类型
+// 配错的点位就会让整台 PLC 每周期重连。
+func TestReadPartialFailureKeepsGoodSamples(t *testing.T) {
+	srv := startSim(t)
+	c := openTest(t, srv)
+	refs := []driver.PointRef{
+		sym("MAIN.nSetpoint", model.TypeInt16),
+		sym("MAIN.nCounter", model.TypeBCD16),
+	}
+	out, err := c.Read(context.Background(), []driver.ReadSpan{{ID: "s", Points: refs}})
+	if err != nil {
+		t.Fatalf("有成功点时 Read 不该返回错误，得到 %v", err)
+	}
+	if len(out) != 2 {
+		t.Fatalf("samples = %d, want 2（坏点也要有样本）", len(out))
+	}
+	if out[0].Err != nil || out[0].Value.Num != 500 {
+		t.Fatalf("好点不该被连累: %+v", out[0])
+	}
+	if out[1].Err == nil || driver.KindOf(out[1].Err) != driver.ErrUnsupported {
+		t.Fatalf("坏点应带 unsupported 错误: %+v", out[1])
+	}
+}
+
+// TestReadAllFailedStillReturnsError 是反面：全部点位都失败时必须返回错误，
+// 否则「设备在采但全坏」对熔断器不可见。
+func TestReadAllFailedStillReturnsError(t *testing.T) {
+	srv := startSim(t)
+	c := openTest(t, srv)
+	refs := []driver.PointRef{
+		sym("MAIN.nCounter", model.TypeBCD16),
+		sym("MAIN.nSetpoint", model.TypeBCD16),
+	}
+	if _, err := c.Read(context.Background(), []driver.ReadSpan{{ID: "s", Points: refs}}); err == nil {
+		t.Fatal("全部点位失败时必须返回错误")
+	}
+}

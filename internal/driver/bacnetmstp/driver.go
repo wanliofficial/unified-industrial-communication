@@ -759,7 +759,7 @@ func (c *connState) Read(ctx context.Context, spans []driver.ReadSpan) ([]driver
 		okSamples++
 		out = append(out, driver.RawSample{PointID: p.ID, Value: v, Quality: model.QualityGood})
 	}
-	// 部分失败语义（docs §3.7.4 / §3.9.5）：只要有任意一项成功，`Read` 就不
+	// 部分失败语义（docs §3.3.1）：只要有任意一项成功，`Read` 就不
 	// 向上返回错误（好样本必须保留）；全部点位失败才返回第一个错误，让设备
 	// 进入故障/退避。链路级错误在上面已提前返回。
 	if okSamples == 0 && firstErr != nil {

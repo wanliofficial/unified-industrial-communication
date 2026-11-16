@@ -299,17 +299,48 @@ func (c *conn) Read(ctx context.Context, spans []driver.ReadSpan) ([]driver.RawS
 
 	var out []driver.RawSample
 	var firstErr error
-	for _, span := range spans {
+	okSamples := 0
+	for si, span := range spans {
 		if err := ctx.Err(); err != nil {
-			return out, driver.E(driver.ErrTimeout, "read", c.cfg.Device.ID, "context done", true, err)
+			e := driver.E(driver.ErrTimeout, "read", c.cfg.Device.ID, "context done", true, err)
+			// 剩余 span 的点位必须显式标坏，不能让它们从结果里消失——
+			// 消失的点位在采集层表现为「没有新样本」，会被当成设备安静，
+			// 把真正的超时原因盖掉。
+			for _, rest := range spans[si:] {
+				out = append(out, failed(rest, e)...)
+			}
+			return out, e
 		}
 		samples, err := c.readSpan(ctx, span)
 		out = append(out, samples...)
-		if err != nil && firstErr == nil {
-			firstErr = err
+		okSamples += goodCount(samples)
+		if err != nil {
+			// 链路级失败：立即返回，不由下面的闸门吞掉——一轮采集被周期
+			// 超时打断本身就是「设备太慢」的信号，需要让调度器看到。
+			if driver.IsLinkFailure(err) {
+				for _, rest := range spans[si+1:] {
+					out = append(out, failed(rest, err)...)
+				}
+				return out, err
+			}
+			if firstErr == nil {
+				firstErr = err
+			}
 		}
 	}
-	return out, firstErr
+	// 部分失败语义（docs §3.3.1）：有成功点就不向上返回错误。
+	return out, driver.PartialReadError(okSamples, firstErr)
+}
+
+// goodCount 数一段结果里的成功点位。
+func goodCount(samples []driver.RawSample) int {
+	n := 0
+	for _, s := range samples {
+		if s.Err == nil && s.Quality == model.QualityGood {
+			n++
+		}
+	}
+	return n
 }
 
 func (c *conn) readSpan(ctx context.Context, span driver.ReadSpan) ([]driver.RawSample, error) {

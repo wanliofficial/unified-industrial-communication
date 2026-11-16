@@ -462,3 +462,41 @@ func TestBitOutsideElement(t *testing.T) {
 		t.Fatalf("samples = %+v", samples)
 	}
 }
+
+// TestReadPartialFailureKeepsGoodSamples 钉住部分失败契约（docs §3.7.4 /
+// §3.9.5）：一个标签名配错（ErrAddress）时，只要还有别的点读成功，Read 就
+// 不向上返回错误。否则 collector 会丢弃会话、整台 PLC 每周期重连。
+func TestReadPartialFailureKeepsGoodSamples(t *testing.T) {
+	c := openSim(t, newSim(t))
+	good := ref("dint", "DINT_TAG", model.TypeInt32)
+	bad := ref("bad", "NO_SUCH_TAG", model.TypeInt32)
+
+	samples, err := c.Read(context.Background(), []driver.ReadSpan{{
+		ID: "s", Points: []driver.PointRef{good, bad},
+	}})
+	if err != nil {
+		t.Fatalf("有成功点时 Read 不该返回错误，得到 %v", err)
+	}
+	if len(samples) != 2 {
+		t.Fatalf("samples = %d, want 2", len(samples))
+	}
+	if samples[0].Err != nil || samples[0].Quality != model.QualityGood || samples[0].Value.Num != 1234 {
+		t.Fatalf("好点不该被连累: %+v", samples[0])
+	}
+	if samples[1].Err == nil {
+		t.Fatalf("坏点应带错误: %+v", samples[1])
+	}
+}
+
+// 全部点位失败时必须返回错误，让熔断器看到「设备全坏」。
+func TestReadAllFailedStillReturnsError(t *testing.T) {
+	c := openSim(t, newSim(t))
+	bad1 := ref("b1", "NO_SUCH_TAG_A", model.TypeInt32)
+	bad2 := ref("b2", "NO_SUCH_TAG_B", model.TypeInt32)
+
+	if _, err := c.Read(context.Background(), []driver.ReadSpan{{
+		ID: "s", Points: []driver.PointRef{bad1, bad2},
+	}}); err == nil {
+		t.Fatal("全部点位失败时必须返回错误")
+	}
+}

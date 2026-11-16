@@ -174,6 +174,81 @@ type RawSample struct {
 3. 驱动可以自行决定「一个 span 发几个协议请求」，但**必须**在一次 `Read` 内完成；
 4. 驱动不得在 `Read` 内 sleep 超过 `cfg.Device.Timeout`。
 
+#### 3.3.1 部分失败契约（全仓统一，不可逐协议自定义）
+
+「哪些错误该上抛、哪些只标样本」不是各驱动的口味问题，而是一条**被上层代码
+强制的硬契约**。它同时被两个方向的错都咬过，所以在这里一次说清，后面各协议
+章节只写「本协议的链路级判据是什么」，不再重复规则本身。
+
+**规则**（`driver.PartialReadError` 是它的唯一实现）：
+
+| 情形 | `Read` 返回的错误 | 样本 |
+|---|---|---|
+| 有任意一个点位成功 | `nil` | 失败点各自带 `Err` + 对应质量码，成功点保持 `good` |
+| 全部点位失败 | 第一个错误 | 每个失败点都带 `Err`（不得缺样本） |
+| 链路级失败（超时 / 断连 / ctx 到期） | 该错误，**立即返回** | 剩余未发出的点位显式标坏 |
+
+**为什么「有成功点就返回 nil」不是宽容而是必须**：`runtime/collector.go` 拿到
+`Read` 的错误后会按分类处理——
+
+```go
+switch driver.KindOf(err) {
+case driver.ErrDisconnected, driver.ErrTimeout, driver.ErrProtocol:
+    _ = c.conn.Close()   // 丢弃连接，下一轮重新建链
+    c.conn = nil
+}
+```
+
+也就是说，一个点位失败一旦升级成整轮错误，代价是**整台设备每周期断链重连**
+（TCP 握手 / UDP 会话重建 / 串口重新打开），而调度器那一侧还会
+`consecutive++` → `StateDegraded`/`StateFaulted` → 指数退避。一个属性名写错的
+点位就能让一台正常设备看起来彻底坏掉，点表里其它点位跟着不再采集。
+
+**反过来「全失败必须返回错误」也不能省**：只在样本上标坏、整体返回 `nil`，
+熔断器与告警永远看不到异常，设备会以「在采但全坏」的状态长期存活——比直接
+报错更难发现。
+
+**链路级失败是上面闸门的例外**：一轮采集被周期超时打断本身就是「设备太慢」
+的信号，必须让调度器看到；此时即便本轮已有好样本也要返回该错误。而「哪个错误
+算链路级」必须由统一的谓词回答，不能各驱动各写一遍：
+
+```go
+// driver.IsLinkFailure：只有超时与断连是链路级
+func IsLinkFailure(err error) bool {
+    switch KindOf(err) {
+    case ErrTimeout, ErrDisconnected:
+        return true
+    }
+    return false
+}
+```
+
+地址 / 权限 / 不支持是**点级**问题（点表配错、符号写错、变量类型不符），换一个
+点位照样能读，因此绝不能短路整轮。它们**可以**进 `firstErr`（全轮都配错时正该
+把地址错误报上去，`CountsTowardBreaker` 也恰好对它们返回 false、不熔断），但绝不能
+触发「中止剩余点位」——那一分支只留给 `IsLinkFailure`。
+
+协议错（`ErrProtocol`）要看**帧边界是否还可信**：
+
+- 数据报 / 一问一答（BACnet/IP、SNMP、CoAP、KNX）：一帧畸形只说明这一次应答坏了，
+  下一帧是独立的，按点级处理。
+- 长度前缀字节流（AMS/TCP、CIP、HSMS、MMS）：帧已被完整读入才发现内容不对，说明
+  帧边界仍然对齐，也可以按点级处理；但**长度字段本身不可信**时帧边界已经丢失，
+  后续帧不可信，必须立即收尾并上抛。ADS 的 `linkFailure` 因此把 `protocol` 与
+  超时/断连一起算作链路级——它的 `protocol` 只来自帧长/AMS 应答层的结构性错误。
+
+> **这条契约的失效方式是「静默的」**：违反它的驱动照样能通过全部功能测试，
+> 只在运行期表现为「采集很慢、设备老是重连、日志里偶发 protocol/address」。
+> 因此本仓库把 `IsLinkFailure` 与 `PartialReadError` 收敛到 `internal/driver`
+> 一处实现，并要求每个逐点轮询驱动都有一条「有成功点时 `err == nil`」与
+> 一条「全失败时必须返回错误」的回归用例（见各协议测试矩阵）。
+>
+> 历史教训：这条契约最初只写在 S7（§3.7.4）与 OPC UA（§3.9.5）两节，其余
+> 协议章节没有引用它，于是 BACnet、KNX、IEC 61850、EtherNet/IP、SNMP、ADS、
+> CoAP、SECS 八个驱动各自实现了「无条件上抛 firstErr」的同一份模板缺陷。修复
+> 时另有两条既有测试把违规行为钉成了期望值（SECS 的「坏地址 + 好点必须返回
+> address 错误」、CoAP 的「混合成功与失败必须返回错误」），一并改正。
+
 ### 3.4 写请求与结果
 
 ```go
@@ -440,10 +515,11 @@ type Kinded interface{ Kind() ErrorKind }
 驱动里逐处包 `*OpError`。少包一层就少一处漏包，错误分类是不会在正常路径上
 被发现的缺陷，只能靠「只写一次」来保证。
 
-**部分失败的策略与 Modbus 一致**：只要有任意一项成功，`Read` 就不向上返回错误
-（好样本必须保留）；**全部点位失败**才返回第一个错误，让设备进入故障/退避。
-链路级错误（超时、断连）例外：立即返回，并把剩余未发送的点位显式标坏——
-让它们「消失」会诱导上层报「point missing」，把真正的断链原因盖掉。
+**部分失败的策略与 Modbus 一致**（完整规则与「为什么」见 §3.3.1）：只要有任意一项
+成功，`Read` 就不向上返回错误（好样本必须保留）；**全部点位失败**才返回第一个
+错误，让设备进入故障/退避。链路级错误（超时、断连）例外：立即返回，并把剩余
+未发送的点位显式标坏——让它们「消失」会诱导上层报「point missing」，把真正的
+断链原因盖掉。S7 的「链路级」判据直接用 `driver.IsLinkFailure`（超时/断连）。
 
 #### 3.7.5 切块策略
 
@@ -1497,6 +1573,11 @@ CIP 通用状态在 `codec/enip` 里分类，驱动只做「错误 → 质量码
 属于自愈路径；其它状态判协议错，不重试。这条区分很重要——把 0x64 当永久错误会让
 一次网络闪断把设备标成坏点直到人工重启；把它当通用重试又会对着配置错误反复重连。
 
+本轮结果按 §3.3.1 的契约汇总：`disconnected` 走 `driver.IsLinkFailure`，一出现就
+立即返回并把剩余点位显式标坏（CIP 会话已断，后面的标签不可能读到）；`address` /
+`permission` / `unsupported` 是点级问题，只标该点，整轮仍 `err == nil`。全失败才
+把第一个错误上抛。否则点表里一个标签名写错就会让整台 PLC 每周期重连一次。
+
 #### 3.10.7.8 能力边界（刻意的）
 
 | 不做 | 理由 |
@@ -1554,7 +1635,7 @@ curl -H 'Authorization: Bearer dev-token-0123456789' \
 | 层 | 用例 |
 |---|---|
 | `codec/enip` | 封装头/长度语义、CPF 奇数对齐与越界、SendRRData、RegisterSession、CIP 请求/应答、附加状态、符号路径偶对齐、逻辑路径 8/16/32 位、Read/Write Tag 金帧、多服务偏移表、类型表、字符串编解码 |
-| `driver/enip` | 注册与状态、命令/上下文错位、原子类型、大小写、STRING、bytes 两阶段读、数组 offset、位读/位写保邻位、offset 写保前缀、多服务合包与拆批、MSP 自动退回、错类型/越界位/未知标签、会话失效可重试、Probe 容忍不支持、能力声明 |
+| `driver/enip` | 注册与状态、命令/上下文错位、原子类型、大小写、STRING、bytes 两阶段读、数组 offset、位读/位写保邻位、offset 写保前缀、多服务合包与拆批、MSP 自动退回、错类型/越界位/未知标签、会话失效可重试、Probe 容忍不支持、能力声明；**部分失败语义（有成功点则 `err==nil`、全失败才返回整体错误、链路级失败立即返回且剩余 span 的点位显式标坏）** |
 | `sim/enip` | 真实 TCP 回环：注册/注销/坏版本/未知命令、Read/Write Tag 与错误码 0x03/0x05/0x13/0x15、STRING 写、多服务与关闭、非符号路径、`SetTag` 校验、默认标签 |
 
 ### 3.10.8 BACnet/IP（对象属性读写，UDP 47808）
@@ -1753,6 +1834,11 @@ BACnet 的类型编码是最容易写错的一处：**同一个 LVT 数值，在
 `resources` 归为可重试的 `disconnected` 而不是 `bad`：设备只是暂时没有缓冲，
 下一轮采集大概率成功，标成坏点会让运维去查一台其实正常的设备。
 
+注意 `disconnected` 在本驱动里同时是**链路级**判据（`driver.IsLinkFailure`）：一轮里
+遇到它就立即收尾、把剩余点位一并标坏，不逐个再等超时。而 `address`（对象/属性名
+写错）只是点级问题——一个属性名拼错不应该让整台设备每周期丢弃 UDP 会话重连，
+见 §3.3.1。
+
 #### 3.10.8.7 读的宽容与写的严格
 
 读路径对数值类型刻意宽松：同一台设备的 `analog-input` 可能回 REAL，也可能回
@@ -1831,7 +1917,7 @@ UNSIGNED（老设备或网关转换过）。把配置类型当成「怎么解释
 | 层 | 用例 |
 |---|---|
 | `codec/bacnet` | BVLC/NPDU 长度语义、Forwarded-NPDU、标签头六种 LVT、application/context 差异、BOOLEAN 内联、最短字节数、REAL/DOUBLE 金帧、Read/Write 请求金帧、ComplexACK 两种形态、Error/Reject/Abort 解析、参数往返、别名与编号解析 |
-| `driver/bacnet` | 元数据与能力声明、模拟量/字符串/枚举读、类型宽松与严格、未知对象/属性、数组下标与越界、写 REAL/字符串/枚举/布尔、写只读对象、类型不匹配本地拒绝、超时、迟到应答丢弃、重发、ctx 取消、invoke 环绕、错误类映射 |
+| `driver/bacnet` | 元数据与能力声明、模拟量/字符串/枚举读、类型宽松与严格、未知对象/属性、数组下标与越界、写 REAL/字符串/枚举/布尔、写只读对象、类型不匹配本地拒绝、超时、迟到应答丢弃、重发、ctx 取消、invoke 环绕、错误类映射；**部分失败语义（有成功点则 `err==nil`、全失败才返回整体错误、链路级失败立即返回并把剩余点标坏）** |
 | `sim/bacnet` | 真实 UDP 回环：默认对象表、数组下标、未知对象/属性、写权限、写类型收敛、分段拒绝、未知服务、垃圾报文静默丢弃、自增与停止、对象表排序 |
 
 > 跨驱动的读回确认：`runtime` 的 `confirm` 用**补齐类型后的请求值**与读回值比较
@@ -3134,8 +3220,11 @@ Counter64 经转换会丢低位。这不是实现疏漏，而是数值模型决�
 2. 值是异常标记时归为 `address`（v2c 的 `noSuchObject` / `noSuchInstance`）；
 3. 线类型能被点表 `dataType` 接受（§3.10.12.4）。
 
-链路级失败（超时、断链）会让**本轮剩余批次全部快速失败**，不再逐批等超时；地址级
-错误只标记该点，不影响其它点位的质量码，也不进入 `Read` 的汇总错误。
+链路级失败（超时、断链）会让**本轮剩余批次全部快速失败**，不再逐批等超时，并
+立即以该错误返回（§3.3.1 的例外条款）。地址级错误只标记该点，不影响其它点位的
+质量码，也不进入 `Read` 的汇总错误；其余点级错误（如线类型与 `dataType` 不符
+→ `protocol`）同样只标该点——只要还有一个点位成功，整轮就是 `err == nil`。
+全部点位失败才上抛第一个错误，让熔断器看到「这台设备全坏了」。
 
 `Meta().Capabilities.MultiRead` 声明 `supported`——这里的「多读」是协议真实支持的
 「一条 GET 带多个 varbind」，与 645/188 的「一次只能问一个数据标识」相反。
@@ -3342,7 +3431,7 @@ curl -s -X POST -H 'Authorization: Bearer dev-token-0123456789' \
 | 层 | 用例 |
 |---|---|
 | `codec/snmp` | GET/应答金帧、INTEGER 最短编码与负数、无符号前导零（`0x80000000`）、OID base-128（`2.39.1`→`77 01`）、OID 排序与前缀、非法 OID、版本解析（v3 拒绝）、异常标记只允许出现在应答、GetBulk 线格式、错误码分类、字符串/字节值、截断错误可识别 |
-| `driver/snmp` | 五种线类型解码、MultiRead 一条 GET、按 maxOids 与字节预算分批（顺序不变、每条 ≤1400 字节）、v1 `noSuchName` 逐点重发、写类型映射与回显校验、类型/范围拒绝不发包、9 种 error-status 分类、SET 回显被收敛、Probe 接受异常标记/超时提示、request-id 陈旧应答丢弃、链路失败停止后续批次、坏地址与线类型不符、Counter64 精度边界、`GetRaw`/`Walk`（子树边界、max、v1 表尾） |
+| `driver/snmp` | 五种线类型解码、MultiRead 一条 GET、按 maxOids 与字节预算分批（顺序不变、每条 ≤1400 字节）、v1 `noSuchName` 逐点重发、写类型映射与回显校验、类型/范围拒绝不发包、9 种 error-status 分类、SET 回显被收敛、Probe 接受异常标记/超时提示、request-id 陈旧应答丢弃、链路失败停止后续批次、坏地址与线类型不符、Counter64 精度边界、`GetRaw`/`Walk`（子树边界、max、v1 表尾）；**部分失败语义（好点 + protocol 错时 `err==nil`、全失败才返回错误）** |
 | `sim/snmp` | 真实 UDP 回环：GET 与计数器、错 community 静默、v1/v2c 缺 OID 差异、GETNEXT 遍历与表尾、GETBULK 三行递增、SET 可写与回读、只读/类型错/不存在、SET 原子性、坏报文与非请求丢弃、`Set`/`SetWritable`/`Close` 幂等 |
 | 点表/规划 | `PolicyFor("snmp")` 只允许 symbol、selector/寄存器/对象地址在导入期拒绝、`examples/snmp.json` 通过 `-check`（当时 21 个驱动） |
 | `cmd/uic` | `-set` 值解析（bool/int/uint/string/bytes、进制、越界、float/BCD 拒绝）、`snmpRow` 的 raw/error 显示 |
@@ -3542,8 +3631,12 @@ AMS 头里的 error 表示「报文没有被目标处理」；ADS 载荷里的 r
 | `0x0710` | symbol not found | 符号名区分大小写；数组写 `NAME[0]`；结构体成员逐级写全 |
 
 错误分三类处置：地址/权限/不支持只影响当前点位，不进入整轮 `firstErr`，也不熔断
-设备；超时/断链/协议错会停止本轮剩余点位（链路已经不可继续）。这条区分让「一个
-变量名写错」不会把整台 PLC 标红。
+设备；超时/断链会停止本轮剩余点位（链路已经不可继续，判据是 `driver.IsLinkFailure`）。
+这条区分让「一个变量名写错」不会把整台 PLC 标红。
+
+汇总按 §3.3.1：`goodSamples > 0` 时 `Read` 返回 `nil`——否则 `collector` 会按错误
+分类 `Close()` 连接，一个 `BCD`/宽度配错的点位就能让整台 PLC 每周期重新走 AMS
+握手与句柄重解析。全部点位失败才上抛第一个错误。
 
 #### 3.10.13.7 标签与握手
 
@@ -3658,7 +3751,7 @@ result，没有回显），但缓存里的值要等下一轮采集才刷新；�
 | 层 | 用例 |
 |---|---|
 | `codec/ads` | AMS/TCP 与 AMS 头金帧（HandleByName `MAIN.nCounter`）、两层长度一致性、reserved 非零拒绝、NetID 解析（6 段/0..255/非法）、7 类请求构造、Read/Write/ReadWrite/DeviceInfo/State/Control 应答解析、错误码分类与临时性、Command/State 字符串 |
-| `driver/ads` | 真实 TCP 回环：9 种类型读写、数组与字符串、地址/权限/宽度错误逐点隔离、坏 NetId/端口、握手超时、Close 幂等、句柄失效重解析（读与写）、类型范围/小数/BCD/字符串 NUL 拒绝、脚本化服务端：临时 AMS 错误重试、通知帧与陈旧 invoke 丢弃、畸形帧、句柄 0/短句柄、设备信息/状态/控制的 AMS 错误与短载荷、ctx 超时、拨号失败 |
+| `driver/ads` | 真实 TCP 回环：9 种类型读写、数组与字符串、地址/权限/宽度错误逐点隔离、坏 NetId/端口、握手超时、Close 幂等、句柄失效重解析（读与写）、类型范围/小数/BCD/字符串 NUL 拒绝、脚本化服务端：临时 AMS 错误重试、通知帧与陈旧 invoke 丢弃、畸形帧、句柄 0/短句柄、设备信息/状态/控制的 AMS 错误与短载荷、ctx 超时、拨号失败；**部分失败语义（好点 + unsupported 错时 `err==nil`、全失败才返回错误）** |
 | `sim/ads` | 真实 TCP 回环：默认变量表、GET/PUT 夹具、句柄分配/释放/失效、只读与宽度校验、数组仅 `[2]` 可写、字符串/浮点、错误 NetId/端口、未知命令、通知不应答、畸形载荷、坏帧断链后仍可服务、Close 幂等 |
 | 点表/规划 | `PolicyFor("ads")` 只允许 symbol、`NAME:81` 与 length 列、`MAIN.arr[2]` 保留在 path、寄存器/selector 在导入期拒绝、`examples/ads.json` 通过 `-check`（当时 21 个驱动） |
 | `cmd/uic` | `-symbol` 声明解析（类型/长度/错误写法）、`-set` 值解析（bool/int/uint/float/string/bytes、进制、越界、BCD 拒绝）、`-control` 映射、行显示与错误质量 |
@@ -4310,9 +4403,11 @@ JSON 写入的语义必须说清楚：**PUT 是替换整个资源，不是合并
 量级，串行的总时长仍在采集周期内。并发读的测试只验证「多个 goroutine 调用 `Read`
 不会数据竞争」，内部仍然由一把锁排队。
 
-链路级失败（超时、断开）后，**剩余点位直接标同一个错误并结束**，不再逐个等超时。
-这一条在多点位设备上非常关键：否则一个掉线的设备会让一轮采集变成「点位数 ×
-超时」。地址级失败（`4.04`、类型不匹配）只影响当前点位，后面的点位继续读。
+链路级失败（超时、断开）后，**剩余点位直接标同一个错误并结束**，不再逐个等超时，
+并以该错误返回。这一条在多点位设备上非常关键：否则一个掉线的设备会让一轮采集变成
+「点位数 × 超时」。地址级失败（`4.04`）与类型不匹配只影响当前点位，后面的点位继续
+读；按 §3.3.1，只要还有一个点位成功，整轮就是 `err == nil`，全失败才上抛第一个
+错误——否则点表里一个拼错的路径会让整台设备每周期丢弃套接字重连。
 
 #### 3.10.15.11 发现与探测：两件不同的事
 
@@ -4443,7 +4538,7 @@ uncertain，等下一轮采集确认）；加 `"confirm":true` 时会立刻回�
 |---|---|
 | `codec/coap` | 头字段与 TKL 边界、Token 8 字节、选项 delta/length 的 0..12/13/14 扩展与两种同时扩展、重复 Uri-Path（delta=0）、`15` 保留值拒绝、uint 编解码边界、Block2 `NUM/M/SZX` 往返与非法 SZX、URI 拆分（有无 scheme/端口/查询）、link-format 解析（带引号属性、空清单、缺 `>`） |
 | `codec/textval` | 文本/JSON 标量 → bool/各宽度整数/浮点/字符串/bytes、`on/off`、科学计数法、越界（含 `int64`/`uint64` 边界、`NaN`/`±Inf`）、写路径越界与小数拒绝、`uint64` 不带符号回绕、超 2^53 的整数推断保持文本、`a.b` 与 `a[0]` selector、非整数方括号按字段名处理、整文档紧凑化 |
-| `driver/coap` | 真实 UDP 回环：纯文本/布尔/JSON selector/整文档/octets 读、Block2 3000 字节重组、服务端不认 Block2 时降级、分离响应 + 回 ACK、RST 分类、`4.04` 地址错误不计熔断、混合成功与失败、PUT/POST/JSON 子树/octets 写入与回读、数组下标拒绝、只读资源拒绝、越界值在发报文前拒绝（text/json 两条路径）、`uint64` 边界回读、`Probe`/`Discover`、超时重传次数（`maxRetransmit` 0/2）、ctx 取消零发送、坏包跳过、无关 CON 回 RST、读错误后重连、`Close` 幂等、并发 Read、配置校验表、标签默认值与别名 |
+| `driver/coap` | 真实 UDP 回环：纯文本/布尔/JSON selector/整文档/octets 读、Block2 3000 字节重组、服务端不认 Block2 时降级、分离响应 + 回 ACK、RST 分类、`4.04` 地址错误不计熔断、**部分失败语义（混合成功与失败时 `err==nil`、全失败才返回错误）**、PUT/POST/JSON 子树/octets 写入与回读、数组下标拒绝、只读资源拒绝、越界值在发报文前拒绝（text/json 两条路径）、`uint64` 边界回读、`Probe`/`Discover`、超时重传次数（`maxRetransmit` 0/2）、ctx 取消零发送、坏包跳过、无关 CON 回 RST、读错误后重连、`Close` 幂等、并发 Read、配置校验表、标签默认值与别名 |
 | `sim/coap` | CON/NON 响应类型与 MID 规则、同 MID 去重（写不重复执行）、Block2 多块与越界 `4.02`、`4.04`/`4.05`、Block1 `4.02`、空载荷 `4.00`、发现清单自洽（自动续块、不列自己、`rt`/`ct` 正确）、分离响应 + ACK、RST、畸形计数、块大小参数与非法回落 |
 | `cmd/uic` | `-discover`/`-probe`/读/写/`-json`/`-raw` 的显示、`-type` 与 `-block` 校验、`-content-format` 归一化、文本值解析 |
 
@@ -4693,6 +4788,12 @@ HSMS 跑在 TCP 上，重发只在「对端进程卡住但连接没断」时有�
 质量映射：`timeout` → `timeout`，`disconnected` → `comm_error`，`address` →
 `address_error`，其余 → `bad`。
 
+汇总按 §3.3.1：SECS 一个 span 只有 1..2 次事务，但一次事务里可以装一整组 SVID。
+应答里少了某个编号、某个编号格式解析失败，都只让那一个点变坏，同组的其它点照常
+返回（这正是批量读的价值）；整轮仍 `err == nil`。只有 `timeout` / `disconnected`
+这类链路级失败才短路后续组并向上返回。`address` 甚至不进 `firstErr`——点表里写错
+一个编号不该让整台设备被判死。
+
 #### 3.10.16.12 内置设备（`internal/sim/secs`）
 
 内置设备是一个只应答的 HSMS 设备，用来在没有硬件时跑通整条链路：
@@ -4798,7 +4899,7 @@ curl -s -X POST -H 'Authorization: Bearer dev-token-0123456789' \
 |---|---|
 | `codec/secs` | 帧往返与金字节（含 W 位、控制消息 0xFF）、Stream 1..15 边界、字节顺序非 1 拒绝、长度字段与实际数据不一致、`FrameDataLen` 短头与超上限、`ParseFrame` 半帧/多帧、长度字节数 00/01/10/11、`encodeLen`/`decodeLen` 边界（255/256/65535/65536/16777215）、L 项子项数边界与畸形声明、各格式 `Item` 取值与宽度校验、BOOLEAN 非 0 即 true、`Int`/`Float` 的非定长格式、`FormatName`/`TypeName`/`StatusName` 兜底 |
 | `codec/secs`（消息） | `L,n{U4}` 编号列表往返与 U1/U2 容忍、S1F4/S2F14 往返与金字节、S1F12 往返与第四项容忍、S2F15/S2F16 与 `B,1` 应答、S1F14 COMMACK、S1F2 机型版本、S6F11 多层报告与 `FindVID`、S5F1 ALCD 的发生/解除与类别保留、各消息体的畸形形状拒绝、空值与 nil 值 |
-| `driver/secs` | 真实 TCP 回环：Select 握手成功/被拒/错应答/沉默、批量读 SVID（3 点 1 次事务）、混合 svid+ecid（2 次事务）、缺失编号 → `address`、类型不符、范围校验、字符串数字、异步推送被忽略、迟到应答被忽略、S2F15 写入与回读、只读 ECID、svid 不可写、点表外写入被拒、未知 ECID 被拒、重发一次后成功、ctx 取消、半帧/畸形帧头/对端挂断、`Probe` 的 timeout/protocol、`Close` 发 Separate 且幂等、系统字节回绕跳过 0、禁用点不入表、负 length 拒绝、`RawRead`（svid/ecid）、`Describe`、值转换全类型与全错误分支 |
+| `driver/secs` | 真实 TCP 回环：Select 握手成功/被拒/错应答/沉默、批量读 SVID（3 点 1 次事务）、混合 svid+ecid（2 次事务）、缺失编号 → `address`、类型不符、范围校验、字符串数字、异步推送被忽略、迟到应答被忽略、S2F15 写入与回读、只读 ECID、svid 不可写、点表外写入被拒、未知 ECID 被拒、重发一次后成功、ctx 取消、半帧/畸形帧头/对端挂断、`Probe` 的 timeout/protocol、`Close` 发 Separate 且幂等、系统字节回绕跳过 0、禁用点不入表、负 length 拒绝、**部分失败语义（坏地址 + 好点时 `err==nil` 且坏点带 `address`、全失败才返回整体错误、SVID 组链路失败后 ECID 组的点位显式标坏）**、`RawRead`（svid/ecid）、`Describe`、值转换全类型与全错误分支 |
 | `sim/secs` | 默认值与两个独立编号空间、`SetVIDNamed` 与 S1F12、S1F11 空列表=全部 SVID、未知编号回空列表、S2F15 写入与未知 ECID 拒绝、未选中 Reject、Deselect 后 Reject、S1F1 无 W 位不应答、S5F1 报警推送与解除、S6F11 事件推送、未选中不推送、计数器语义、Separate 关闭连接、畸形请求容错、空闲 2.5 秒不断链、重复监听报错、二次 Close 幂等 |
 
 覆盖率（`go test -cover`）：`codec/secs` 94.6%、`driver/secs` 89.1%、`sim/secs` 95.1%。
@@ -6220,6 +6321,11 @@ error 位表示总线级问题——总线忙、冲突、链路发送失败。�
 设备超时还长时，一轮采集会被心跳拖长，表现为「设备响应变慢」而不是「心跳配错
 了」。这条约束在 `Open` 时就检查，报错文案里直接点出 `device.timeout`。
 
+读结果汇总按 §3.3.1：`L_Data.con` 超时与隧道断开是链路级（`driver.IsLinkFailure`），
+立即返回并把剩余组地址标坏；组地址不存在、DPT 与点位类型不匹配是点级问题，只标
+该点。只要还有一个组地址读成功，`Read` 就返回 `nil`——否则点表里一个写错的组地址
+会让整台网关每周期重建隧道（重新申请通道号、重置 8 位序号）。
+
 #### 3.10.20.11 自检与内置网关
 
 `uic knxread` 不依赖点表，回答「这条隧道建得起来吗、这个组地址现在是什么值」：
@@ -6280,7 +6386,7 @@ uic knxread -list
 | 层 | 用例 |
 |---|---|
 | `codec/knx` | 组地址 4/4/8 与物理地址 4/4/8 的往返与越界；DPT 解析与规范化（`9.1` ≡ `9.001`）、`Accepts` 的位宽/类型校验、`Encode`/`Decode` 各 Kind（Bool 接受 on/off/1/0 且拒绝其它数值、Unsigned/Signed/Float16/Float32/Scaled）；cEMI 的黄金字节（1 位 2 字节 TPDU 长度 = 1、2 字节 = 3）；`ParseLData` 跳过附加信息段；**1 位 APCI 归一化回归**；`DecodeGroupValue` 拒绝位宽不符与 `GroupValueRead`；KNXnet/IP 信封往返、HPAI 编解码、全部服务报文的 Parse/Build 对称、`ParseDisconnectResponse` |
-| `driver/knx` | `Meta`（能力/地址类型/`address.dpt` 必填）；`Open` 补默认端口、保留显式端口、拒绝非 UDP、九类非法 settings（心跳过长/为零/不可解析、ack 过短/超过设备超时、重传过多/不可解析、源地址非法/为 0）；缺 DPT 与 DPT-类型不符都在 `Open` 拒；`planPoint` 拒绝 selector/index/length/组地址语法错/DPT 语法错；`Probe` 建隧道且**不读组地址**；1 位/2 字节/4 字节/百分比读；未知组地址超时（`ErrTimeout` + `QualityTimeout`）；错误 DPT 读按 `ErrAddress`；首个链路错误后**中止剩余点位**（不逐个等超时）；写开关并回读、写浮点、写未知地址成功、con 报错报 `ErrProtocol`；丢 2 个 ACK 后重传成功且序号仍同步；序号错乱后重建隧道并恢复；隧道被网关回收后心跳发现并重连；网关不回 con 时写仍成功；槽位满判可重试、释放后可连；`Close` 归还槽位；源地址三级优先 |
+| `driver/knx` | `Meta`（能力/地址类型/`address.dpt` 必填）；`Open` 补默认端口、保留显式端口、拒绝非 UDP、九类非法 settings（心跳过长/为零/不可解析、ack 过短/超过设备超时、重传过多/不可解析、源地址非法/为 0）；缺 DPT 与 DPT-类型不符都在 `Open` 拒；`planPoint` 拒绝 selector/index/length/组地址语法错/DPT 语法错；`Probe` 建隧道且**不读组地址**；1 位/2 字节/4 字节/百分比读；未知组地址超时（`ErrTimeout` + `QualityTimeout`）；错误 DPT 读按 `ErrAddress`；首个链路错误后**中止剩余点位**（不逐个等超时）；**部分失败语义（好点 + 坏地址时 `err==nil`、全失败才返回错误）**；写开关并回读、写浮点、写未知地址成功、con 报错报 `ErrProtocol`；丢 2 个 ACK 后重传成功且序号仍同步；序号错乱后重建隧道并恢复；隧道被网关回收后心跳发现并重连；网关不回 con 时写仍成功；槽位满判可重试、释放后可连；`Close` 归还槽位；源地址三级优先 |
 | `sim/knx` | 手写最小客户端（**不复用驱动**）：建连分配通道与 CRD、槽位满拒绝、非隧道 CRI 拒绝且不占槽位、DISCONNECT 释放槽位、未知通道拒绝、通道状态存活与回收；序号严格校验（拒绝后不推进期望值）、重传只重发 ACK 不重复执行、8 位回绕后「新帧 vs 重传」边界、未知通道拒绝、畸形数据报计数；读返回存储载荷（含 `L_Data.con` 正常）、未知组地址只有 ACK + con、写 1 位/2 字节落地、写未知地址被转发但不落地、`FailNextConfirms` 只影响一条、`DisableConfirm` 抑制 con；`DropNextACKs` 后重传、`FailNextSequence` 只失败一次；对象表覆盖与**宽度与 DPT 一致**（`4/1/1` 必须 4 字节）、`SetValue`/`SetNumber` 越界拒绝、`SetPayload` 拒绝非法组地址、每秒自增、`Close` 幂等 |
 | `pointtable` | `PolicyFor("knx")` 是 `WidthNone + AllowSymbol + AllowDPT` 且不泄漏 DI/length 标志；正向（`@9.001`、`@9.1` 规范化）× 往返（`Canonical()` 能重新解析成同一地址且保留 DPT）；反向（缺 DPT、DPT 语法、主组/中间组越界、符号地址带 selector） |
 
@@ -6504,8 +6610,10 @@ MMS 的读/写响应是「逐项结果」：一批 5 个变量里可以 3 个成
 一万次也一样），`permission` 要改权限或换账号，只有 `2`/`1` 值得让调度器退避重试。
 把「点位配错了」与「装置在重启」混成一类，运维只能两边都查。
 
-链路级失败（超时、断链）则**中止本轮剩余点位**：后面的点不可能成功，逐个等超时只会
-把一轮采集拖成 N 倍时长。地址类错误不影响其它点，继续读下一个。
+链路级失败（超时、断链）则**中止本轮剩余点位**（判据 `driver.IsLinkFailure`）：后面的
+点不可能成功，逐个等超时只会把一轮采集拖成 N 倍时长。地址类错误不影响其它点，继续
+读下一个。汇总按 §3.3.1：只要还有一个点位成功，`Read` 就返回 `nil`；全失败才上抛第一
+个错误——否则点表里一个拼错的对象引用会让整台 IED 每周期丢弃 MMS 关联重连。
 
 一处实现细节：错误消息里已经带上了错误码与对象引用（`mms data access error
 object-non-existent (10) on simpleIO/GGIO1.ST.Ghost.stVal`），所以构造 `driver.E` 时
@@ -6653,7 +6761,7 @@ uic iec61850read -list
 | 层 | 用例 |
 |---|---|
 | `codec/iec61850` | BER 整数最短补码与无符号符号位、不定长拒绝、长形式长度、位串/浮点往返；TPKT 往返与版本校验；COTP CR 形状、CC/DT 往返、TPDU size 码；**会话层 `0xFF` 扩展长度**、CN/AC 形状、DT 固定四字节头、FIN/AB；表示层 CP/CPA 形状与上下文编号；ACSE AARQ/AARE 往返、带认证、拒绝、固定 PDU（RLRQ/RLRE/ABRT）；MMS Initiate 形状与响应往返；对象名两种形态；读/写/getNameList 请求形状与响应往返、**写请求变量数与数据数不等时拒绝**、读响应部分失败；类型规格与数据值往返；`Data.ToValue` 拒绝结构体、`ValueFromData` 类型放宽、位串取值；连接 PDU 全链、连接响应全链、拒绝解析、`WrapData`/`UnwrapData`、错误上下文拒绝、释放 PDU；对象引用解析（显式 FC / 默认 FC / 六类语法错）、`String`、`SplitMMSName`、`DataSetName`；**服务端侧构造与解析往返**（`BuildReadResponse`/`ParseReadResponse`、`BuildWriteResponse`/`ParseWriteResponse`、四个请求解析、`MMSServiceTag`、`ConfirmedResponse` 对称、错误服务标签拒绝、坏值降级为 `object-invalidated`） |
-| `driver/iec61850` | `Meta`（能力/地址种类/`defaultFC` 与 `probeObject` 字段）；`Open` 拒绝非 TCP 与非法对象引用；`Probe` 建立关联；bool/int/float 三类读；`defaultFC` 补齐；对象不存在 → `address`；写后读回；写不存在对象 → `address`；关联被拒 → `protocol` 且 `assocCount==0`；读超时 → `timeout`；`Browse` 全量枚举且不产生读请求；`Browse` 未知域返回空列表 |
+| `driver/iec61850` | `Meta`（能力/地址种类/`defaultFC` 与 `probeObject` 字段）；`Open` 拒绝非 TCP 与非法对象引用；`Probe` 建立关联；bool/int/float 三类读；`defaultFC` 补齐；对象不存在 → `address`；写后读回；写不存在对象 → `address`；关联被拒 → `protocol` 且 `assocCount==0`；读超时 → `timeout`；`Browse` 全量枚举且不产生读请求；`Browse` 未知域返回空列表；**部分失败语义（好点 + 坏对象引用时 `err==nil`、全失败才返回错误）** |
 | `sim/iec61850` | 手写最小客户端（**不复用驱动**）：默认对象表每个值都能被 `ToValue` 读懂、名字有序、`Set`/`Get`；真实 TCP 上的多对象读、未知对象逐项 `object-non-existent`、写落地、写未知对象失败；**getNameList 分页**（每页 3 项 + continueAfter 驱动读完，且只回项名）；关联被拒；`DropReads` 超时后恢复投递仍能读；有序释放回 RLRE |
 | `pointtable` | `PolicyFor("iec61850")` 是 `WidthNone + AllowSymbol` 且不泄漏 length/DPT/selector 标志；正向（显式 FC、默认 FC 补齐）× 反向（缺 LD、非标准 FC、带 length） |
 | `runtime` | `TestExamplesAreValid` 覆盖 `examples/iec61850.json` |

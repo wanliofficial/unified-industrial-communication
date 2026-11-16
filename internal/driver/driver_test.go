@@ -191,3 +191,57 @@ var (
 	_ Driver = metaDriver{}
 	_ Conn   = (*stubConn)(nil)
 )
+
+// TestIsLinkFailure 钉住「链路级」判据的边界。
+//
+// 这个谓词决定「一个点位失败之后还要不要继续读剩下的点位」。放宽到地址错误
+// 会让一个写错的属性名短路整轮、好点位跟着遭殃；收紧到只看 internal 会让
+// 真超时被当成点级问题，一轮采集拖成 N 倍超时。两条边界都必须锁住。
+func TestIsLinkFailure(t *testing.T) {
+	link := []error{
+		E(ErrTimeout, "read", "d1", "no response", true, nil),
+		E(ErrDisconnected, "read", "d1", "peer closed", true, nil),
+		context.DeadlineExceeded,
+	}
+	for _, err := range link {
+		if !IsLinkFailure(err) {
+			t.Fatalf("%v 应判为链路级", err)
+		}
+	}
+	point := []error{
+		E(ErrAddress, "read", "d1", "unknown property", false, nil),
+		E(ErrPermission, "read", "d1", "denied", false, nil),
+		E(ErrUnsupported, "read", "d1", "unsupported", false, nil),
+		E(ErrProtocol, "read", "d1", "malformed reply", false, nil),
+		errors.New("boom"),
+	}
+	for _, err := range point {
+		if IsLinkFailure(err) {
+			t.Fatalf("%v 不该判为链路级：会把点级问题升级成整轮失败", err)
+		}
+	}
+	if IsLinkFailure(nil) {
+		t.Fatal("nil 不是链路失败")
+	}
+}
+
+// TestPartialReadError 钉住部分失败契约的判定本身（docs §3.3.1）。
+//
+// 这是全仓复用的一条闸门：有成功点则吞掉错误（好样本必须保留），
+// 全失败则上抛第一个错误（熔断器要看到「设备全坏」）。两个方向都要锁，
+// 只锁一个方向的闸门写法会在另一个方向上静默失效。
+func TestPartialReadError(t *testing.T) {
+	e := E(ErrProtocol, "read", "d1", "boom", false, nil)
+	if got := PartialReadError(3, e); got != nil {
+		t.Fatalf("有成功点时必须返回 nil，得到 %v", got)
+	}
+	if got := PartialReadError(0, e); got != e {
+		t.Fatalf("全部失败时必须返回第一个错误，得到 %v", got)
+	}
+	if got := PartialReadError(0, nil); got != nil {
+		t.Fatalf("没有错误时返回 nil，得到 %v", got)
+	}
+	if got := PartialReadError(5, nil); got != nil {
+		t.Fatalf("没有错误时返回 nil，得到 %v", got)
+	}
+}

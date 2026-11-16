@@ -613,6 +613,7 @@ func (c *connState) Read(ctx context.Context, spans []driver.ReadSpan) ([]driver
 	}
 
 	var firstErr error
+	goodSamples := 0
 	for i, p := range points {
 		if err := ctx.Err(); err != nil {
 			e := driver.E(driver.ErrTimeout, "read", c.cfg.Device.ID, "context done", true, err)
@@ -630,11 +631,17 @@ func (c *connState) Read(ctx context.Context, spans []driver.ReadSpan) ([]driver
 			}
 			return out, linkErr
 		}
-		if s.Err != nil && firstErr == nil && driver.KindOf(s.Err) != driver.ErrAddress {
-			firstErr = s.Err
+		if s.Err != nil {
+			if firstErr == nil && driver.KindOf(s.Err) != driver.ErrAddress {
+				firstErr = s.Err
+			}
+			continue
 		}
+		goodSamples++
 	}
-	return out, firstErr
+	// 部分失败语义（docs §3.3.1）：有成功点就不向上返回错误，否则
+	// 一个变量名写错会让 collector 丢弃连接、整台 PLC 每周期重连。
+	return out, driver.PartialReadError(goodSamples, firstErr)
 }
 
 func (c *connState) readOne(ctx context.Context, p driver.PointRef) (driver.RawSample, error) {
@@ -982,8 +989,16 @@ func staleHandle(code adscodec.Code) bool {
 
 // linkFailure 表示这个错误已经让连接不可继续使用，剩余点位应当快速失败。
 //
-// 地址/权限/不支持三类是“这个点位的问题”，连接仍然可用；其余（超时、
-// 断链、协议错、内部错）都可能影响后续请求。
+// 地址/权限/不支持三类是「这个点位的问题」，连接仍然可用（换一个变量名照样能读）；
+// 其余（超时、断链、协议错、设备内部错）都按链路级处理。
+//
+// 这里把 `protocol` 也算链路级，是因为 ADS 的 `protocol` 无法区分「帧结构错」
+// 与「AMS 应答内容错」：前者意味着 TCP 字节流已经错位、后续帧边界不可信，
+// 只能断链重建。宁可对一个点位的解析失败多重连一次，也不能在错位的字节流上
+// 继续解析——那会把下一个点的值读成上一条报文的残片，静默给出错误数字。
+//
+// 这与 BACnet/IP、SNMP 这类数据报协议不同：那里每一帧独立成包，一帧畸形只
+// 影响这一帧（见 docs §3.3.1 对两类承载层的区分）。
 func linkFailure(err error) error {
 	switch driver.KindOf(err) {
 	case driver.ErrAddress, driver.ErrPermission, driver.ErrUnsupported:

@@ -265,8 +265,10 @@ func TestReadMixedSuccessAndFailure(t *testing.T) {
 	conn, _ := openSim(t, nil, temp, missing)
 
 	got, err := conn.Read(context.Background(), spans(temp, missing))
-	if err == nil {
-		t.Fatal("expected an error from the missing resource")
+	// docs §3.3.1：有任意一点成功，Read 就不向上返回错误——
+	// 否则一个 404 资源会让 collector 丢弃连接、整台设备每周期重连。
+	if err != nil {
+		t.Fatalf("有成功点时 Read 不该返回错误，得到 %v", err)
 	}
 	if len(got) != 2 {
 		t.Fatalf("samples = %d, want 2", len(got))
@@ -276,6 +278,25 @@ func TestReadMixedSuccessAndFailure(t *testing.T) {
 	}
 	if got[1].PointID != "missing" || got[1].Err == nil {
 		t.Fatalf("missing = %+v", got[1])
+	}
+	if got[1].Quality != model.QualityAddressError {
+		t.Fatalf("missing quality = %v, want address_error", got[1].Quality)
+	}
+}
+
+// TestReadAllFailedReturnsError 是上一条的反面：全部点位失败时必须返回错误，
+// 否则驱动「在采但全坏」而上层熔断器看不到任何异常。
+func TestReadAllFailedReturnsError(t *testing.T) {
+	a := pt("a", "/nope-a", "", "string")
+	b := pt("b", "/nope-b", "", "string")
+	conn, _ := openSim(t, nil, a, b)
+
+	got, err := conn.Read(context.Background(), spans(a, b))
+	if err == nil {
+		t.Fatal("全部点位失败时必须返回错误")
+	}
+	if len(got) != 2 {
+		t.Fatalf("samples = %d, want 2（坏点也要有样本，不能消失）", len(got))
 	}
 }
 

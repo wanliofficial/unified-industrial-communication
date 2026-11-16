@@ -746,3 +746,32 @@ func TestReadByteArrayOffsetPreservesPrefix(t *testing.T) {
 		}
 	}
 }
+
+// TestReadLinkFailureMarksRemainingSpans 钉住「链路级失败时剩余点位一并标坏」
+// （docs §3.3.1 例外条款）。
+//
+// 让它们从结果里消失是更糟的选择：采集层把「没有样本」当成「设备安静」，
+// 于是一次断链会表现成「这些点位这段时间没数据」而不是「读取失败」，真正
+// 的原因被盖掉。
+func TestReadLinkFailureMarksRemainingSpans(t *testing.T) {
+	s := newScript().add(registerReply(0x11, 0, 1))
+	c, _ := openScript(t, s)
+	// 注册已完成，接下来任何一次写都失败 → disconnected（链路级）。
+	s.failAfter = s.writes + 1
+
+	out, err := c.Read(context.Background(), []driver.ReadSpan{
+		{ID: "s1", Points: []driver.PointRef{ref("a", "DINT_TAG", model.TypeInt32)}},
+		{ID: "s2", Points: []driver.PointRef{ref("b", "DINT_TAG", model.TypeInt32)}},
+	})
+	if err == nil || !driver.IsLinkFailure(err) {
+		t.Fatalf("链路失败必须上抛，得到 %v", err)
+	}
+	if len(out) != 2 {
+		t.Fatalf("samples = %d, want 2（剩余 span 必须显式标坏）", len(out))
+	}
+	for _, sp := range out {
+		if sp.Err == nil || sp.Quality == model.QualityGood {
+			t.Fatalf("%s 应带错误与坏质量: %+v", sp.PointID, sp)
+		}
+	}
+}

@@ -922,3 +922,63 @@ func TestWalkV1EndOfMib(t *testing.T) {
 		t.Fatalf("walked = %d", len(out))
 	}
 }
+
+// TestReadPartialFailureKeepsGoodSamples 钉住部分失败契约（docs §3.7.4 /
+// §3.9.5）：一轮里既有点读成功、又有**非地址类**失败（这里是把 INTEGER
+// 当成 string 读 → protocol）时，Read 不向上返回错误。
+//
+// 这条契约不是「宽容」而是必须：上层 collector 见到 Read 返回错误会按错误
+// 分类丢弃连接（ErrProtocol 也在其中）并重建，一个 dataType 配错的点位就会
+// 让整台设备每周期断链重连一次；熔断器还会把「点表配错」误判成「设备坏了」。
+// 为了让测试覆盖到真正的风险面，这里刻意用 protocol 错误而不是 address
+// 错误——address 从来不进 firstErr，用它会得到假绿。
+func TestReadPartialFailureKeepsGoodSamples(t *testing.T) {
+	table := map[string]snmpcodec.Value{
+		"1.3.6.1.2.1.1.1.0": snmpcodec.String("Linux router"),
+		"1.3.6.1.2.1.1.7.0": snmpcodec.Integer(72),
+	}
+	f := &fakeDatagram{handler: tableAgent(t, table)}
+	c := openTest(t, f, testConfig(nil))
+
+	pts := []driver.PointRef{
+		point("good", "1.3.6.1.2.1.1.1.0", model.TypeString),
+		// INTEGER 按 string 读：设备没错、点表配错，分类是 protocol。
+		point("bad", "1.3.6.1.2.1.1.7.0", model.TypeString),
+	}
+	out, err := c.Read(context.Background(), []driver.ReadSpan{{ID: "s", Points: pts}})
+	if err != nil {
+		t.Fatalf("有成功点时 Read 不该返回错误，得到 %v", err)
+	}
+	if len(out) != 2 {
+		t.Fatalf("samples = %d, want 2（坏点也要有样本）", len(out))
+	}
+	if out[0].Err != nil || out[0].Quality != model.QualityGood || out[0].Value.Text != "Linux router" {
+		t.Fatalf("好点不该被连累: %+v", out[0])
+	}
+	if out[1].Err == nil || driver.KindOf(out[1].Err) != driver.ErrProtocol {
+		t.Fatalf("坏点应带 protocol 错误: %+v", out[1])
+	}
+}
+
+// TestReadAllFailedStillReturnsError 是反面：全部点位都失败时必须返回错误。
+// 只在样本上标坏而不返回错误，上层熔断器与告警都看不到「这台设备全坏了」。
+func TestReadAllFailedStillReturnsError(t *testing.T) {
+	table := map[string]snmpcodec.Value{
+		"1.3.6.1.2.1.1.7.0": snmpcodec.Integer(72),
+		"1.3.6.1.2.1.1.3.0": snmpcodec.Unsigned(snmpcodec.TypeTimeTicks, 9),
+	}
+	f := &fakeDatagram{handler: tableAgent(t, table)}
+	c := openTest(t, f, testConfig(nil))
+
+	pts := []driver.PointRef{
+		point("bad1", "1.3.6.1.2.1.1.7.0", model.TypeString),
+		point("bad2", "1.3.6.1.2.1.1.3.0", model.TypeString),
+	}
+	out, err := c.Read(context.Background(), []driver.ReadSpan{{ID: "s", Points: pts}})
+	if err == nil {
+		t.Fatal("全部点位失败时必须返回错误")
+	}
+	if len(out) != 2 {
+		t.Fatalf("samples = %d, want 2", len(out))
+	}
+}

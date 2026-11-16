@@ -322,16 +322,16 @@ func (c *connState) Read(ctx context.Context, spans []driver.ReadSpan) ([]driver
 	}
 	out := make([]driver.RawSample, 0, len(points))
 	var firstErr error
+	okSamples := 0
 	for i, p := range points {
 		if err := ctx.Err(); err != nil {
 			e := driver.E(driver.ErrTimeout, "read", c.cfg.Device.ID, "context done", true, err)
 			for _, rest := range points[i:] {
 				out = append(out, errSample(rest.ID, e))
 			}
-			if firstErr == nil {
-				firstErr = e
-			}
-			break
+			// 链路级：即便本轮已有好样本也要让调度器看到（周期被超时打断
+			// 本身就是「设备太慢」），因此不走下面的部分失败闸门。
+			return out, e
 		}
 		plan, err := planPoint(p)
 		if err != nil {
@@ -349,17 +349,20 @@ func (c *connState) Read(ctx context.Context, spans []driver.ReadSpan) ([]driver
 			}
 			// 链路级失败（超时/断链）时剩下的点不可能成功，继续逐个超时
 			// 只会把一轮采集拖成 N 倍时长。
-			if driver.KindOf(err) == driver.ErrTimeout || driver.KindOf(err) == driver.ErrDisconnected {
+			if driver.IsLinkFailure(err) {
 				for _, rest := range points[i+1:] {
 					out = append(out, errSample(rest.ID, err))
 				}
-				break
+				return out, err
 			}
 			continue
 		}
+		okSamples++
 		out = append(out, driver.RawSample{PointID: p.ID, Value: v, Quality: model.QualityGood})
 	}
-	return out, firstErr
+	// 部分失败语义（docs §3.3.1）：只要有一个点成功就不向上返回错误，
+	// 否则一个属性名写错会让 collector 丢弃连接、整台设备每周期重连。
+	return out, driver.PartialReadError(okSamples, firstErr)
 }
 
 func (c *connState) readOne(ctx context.Context, plan pointPlan) (model.Value, error) {

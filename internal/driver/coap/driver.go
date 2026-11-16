@@ -600,16 +600,15 @@ func (c *conn) Read(ctx context.Context, spans []driver.ReadSpan) ([]driver.RawS
 	}
 	out := make([]driver.RawSample, 0, len(refs))
 	var firstErr error
+	goodSamples := 0
 	for i, ref := range refs {
 		if err := ctx.Err(); err != nil {
 			e := driver.E(driver.ErrTimeout, "read", c.devID, "context done", true, err)
 			for _, rest := range refs[i:] {
 				out = append(out, errSample(rest.ID, e))
 			}
-			if firstErr == nil {
-				firstErr = e
-			}
-			break
+			// 链路级：不走下面的部分失败闸门。
+			return out, e
 		}
 		plan, ok := c.byID[ref.ID]
 		if !ok {
@@ -633,17 +632,20 @@ func (c *conn) Read(ctx context.Context, spans []driver.ReadSpan) ([]driver.RawS
 			}
 			// 链路级失败后剩下的点位不可能成功；继续逐个等超时只会把
 			// 一轮采集拖成 N 倍时长。
-			if k := driver.KindOf(err); k == driver.ErrTimeout || k == driver.ErrDisconnected {
+			if driver.IsLinkFailure(err) {
 				for _, rest := range refs[i+1:] {
 					out = append(out, errSample(rest.ID, e))
 				}
-				break
+				return out, e
 			}
 			continue
 		}
+		goodSamples++
 		out = append(out, driver.RawSample{PointID: plan.ref.ID, Value: v, Quality: model.QualityGood})
 	}
-	return out, firstErr
+	// 部分失败语义（docs §3.3.1）：有成功点就不向上返回错误，否则
+	// 一个 404 资源会让 collector 丢弃连接、整台设备每周期重连。
+	return out, driver.PartialReadError(goodSamples, firstErr)
 }
 
 func (c *conn) readOne(ctx context.Context, plan pointPlan) (model.Value, error) {

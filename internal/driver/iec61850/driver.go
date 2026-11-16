@@ -738,16 +738,15 @@ func (c *conn) Read(ctx context.Context, spans []driver.ReadSpan) ([]driver.RawS
 	}
 	out := make([]driver.RawSample, 0, len(refs))
 	var firstErr error
+	okSamples := 0
 	for i, ref := range refs {
 		if err := ctx.Err(); err != nil {
 			e := driver.E(driver.ErrTimeout, "read", c.devID, "context done", true, err)
 			for _, rest := range refs[i:] {
 				out = append(out, errSample(rest.ID, e))
 			}
-			if firstErr == nil {
-				firstErr = e
-			}
-			break
+			// 链路级：不走下面的部分失败闸门。
+			return out, e
 		}
 		plan, ok := c.byID[ref.ID]
 		if !ok {
@@ -773,18 +772,21 @@ func (c *conn) Read(ctx context.Context, spans []driver.ReadSpan) ([]driver.RawS
 			out = append(out, sample)
 			// 链路级失败时剩下的点不可能成功，继续逐个等超时只会把一轮
 			// 采集拖成 N 倍时长。地址类错误不影响其它点，继续。
-			if k := driver.KindOf(err); k == driver.ErrTimeout || k == driver.ErrDisconnected {
+			if driver.IsLinkFailure(err) {
 				for _, rest := range refs[i+1:] {
 					out = append(out, errSample(rest.ID, err))
 				}
-				break
+				return out, err
 			}
 			continue
 		}
 		sample.Value = v
+		okSamples++
 		out = append(out, sample)
 	}
-	return out, firstErr
+	// 部分失败语义（docs §3.3.1）：有成功点就不向上返回错误，
+	// 否则点表里一个对象引用写错会让整台 IED 每周期断链重连。
+	return out, driver.PartialReadError(okSamples, firstErr)
 }
 
 // readObject 读一个对象引用并转成平台值。

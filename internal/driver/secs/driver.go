@@ -546,17 +546,52 @@ func (c *conn) Read(ctx context.Context, spans []driver.ReadSpan) ([]driver.RawS
 		}
 	}
 
+	var linkErr error
 	// 固定顺序：先 SVID 再 ECID。组顺序影响的是日志与重试顺序，不影响正确性，
 	// 但固定下来能让「同一个 span 两次读」产生可比对的线程序。
 	order := []string{objectSVID, objectECID}
-	for _, object := range order {
+	for oi, object := range order {
 		i, ok := index[object]
 		if !ok {
 			continue
 		}
-		c.readGroup(ctx, groups[i], &out, &firstErr)
+		if err := c.readGroup(ctx, groups[i], &out, &firstErr); err != nil {
+			// 链路级失败：后面的组不可能成功，剩余点必须显式标坏——
+			// 让它们「消失」会被采集层当成设备安静，把真正的超时原因盖掉。
+			linkErr = err
+			for _, rest := range order[oi+1:] {
+				j, ok := index[rest]
+				if !ok {
+					continue
+				}
+				for _, plan := range groups[j].plans {
+					out = append(out, driver.RawSample{
+						PointID: plan.ref.ID,
+						Quality: qualityFor(driver.KindOf(err)),
+						Err:     err,
+					})
+				}
+			}
+			break
+		}
 	}
-	return out, firstErr
+
+	if linkErr != nil {
+		return out, linkErr
+	}
+	// 部分失败语义（docs §3.3.1）：有成功点就不向上返回错误。
+	return out, driver.PartialReadError(countGood(out), firstErr)
+}
+
+// countGood 数结果里的成功点位，用于部分失败判定。
+func countGood(samples []driver.RawSample) int {
+	n := 0
+	for _, s := range samples {
+		if s.Err == nil && s.Quality == model.QualityGood {
+			n++
+		}
+	}
+	return n
 }
 
 // planFor 取点位的解析结果：优先用 Open 时算好的计划（它带着 Writable 等
@@ -578,7 +613,10 @@ type readGroupReq struct {
 //
 // 分发失败（应答里缺某个编号、编号格式解析失败）只影响那一个点，其余点照常
 // 返回——批量读的价值正是「一次往返拿到多数」，不能因为一个坏编号让整组作废。
-func (c *conn) readGroup(ctx context.Context, g readGroupReq, out *[]driver.RawSample, firstErr *error) {
+//
+// 返回值只在**链路级失败**（超时/断连）时非 nil：那时后面的组不可能成功，
+// 调用方应当立即收尾并把整轮判错。组内的点级失败写进 firstErr 后返回 nil。
+func (c *conn) readGroup(ctx context.Context, g readGroupReq, out *[]driver.RawSample, firstErr *error) error {
 	obj := g.object
 
 	var sf secscodec.SF
@@ -595,7 +633,7 @@ func (c *conn) readGroup(ctx context.Context, g readGroupReq, out *[]driver.RawS
 				*firstErr = e
 			}
 		}
-		return
+		return nil
 	}
 
 	ids := make([]uint32, 0, len(g.plans))
@@ -615,20 +653,23 @@ func (c *conn) readGroup(ctx context.Context, g readGroupReq, out *[]driver.RawS
 	if err != nil {
 		fail(driver.ErrInternal, driver.E(driver.ErrInternal, "read", c.devID,
 			fmt.Sprintf("%s: encode request", sf), false, err))
-		return
+		return nil
 	}
 
 	dm, err := c.exchange(ctx, sf, reqBody, "read:"+obj)
 	if err != nil {
 		// 链路级失败：整组都拿不到，逐点标注同一错误。
 		fail(driver.KindOf(err), err)
-		return
+		if driver.IsLinkFailure(err) {
+			return err
+		}
+		return nil
 	}
 	vals, derr := secscodec.DecodeStatusReply(dm.Body)
 	if derr != nil {
 		fail(driver.ErrProtocol, driver.E(driver.ErrProtocol, "read", c.devID,
 			fmt.Sprintf("decode %s", sf), false, derr))
-		return
+		return nil
 	}
 	byID := make(map[uint32]secscodec.StatusValue, len(vals))
 	for _, v := range vals {
@@ -659,6 +700,7 @@ func (c *conn) readGroup(ctx context.Context, g readGroupReq, out *[]driver.RawS
 		}
 		*out = append(*out, driver.RawSample{PointID: plan.ref.ID, Value: v, Quality: model.QualityGood})
 	}
+	return nil
 }
 
 // ---------------------------------------------------------------------------

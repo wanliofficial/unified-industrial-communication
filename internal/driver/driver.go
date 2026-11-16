@@ -310,6 +310,39 @@ func CountsTowardBreaker(err error) bool {
 	return true
 }
 
+// IsLinkFailure 表示该错误是否说明「链路本身已经不可继续」。
+//
+// 超时与断连是链路级：同一个连接上的后续点位不可能成功，继续逐个等超时只会
+// 把一轮采集拖成 N 倍时长。地址/权限/不支持是**点级**问题（点表配错、符号写错），
+// 换一个点位照样能读，因此不能短路整轮。
+//
+// 这个谓词必须由 driver 包统一给出而不是各驱动各写一遍：漏掉一处就会出现
+// 「一个坏点让整台设备每周期断链重连」——而且它只在运行期表现为「采集很慢」，
+// 单测里看不出来。
+func IsLinkFailure(err error) bool {
+	switch KindOf(err) {
+	case ErrTimeout, ErrDisconnected:
+		return true
+	}
+	return false
+}
+
+// PartialReadError 决定一次「逐点读」的结果里该向调用方返回哪个错误。
+//
+// 契约（docs §3.3.1）：**只要有任意一个点位成功，`Read` 就不向上
+// 返回错误**——好样本必须保留，单点失败由该样本自己的 Err + 质量位表达。
+// 全部点位失败才返回第一个错误，让调度器进入故障/退避。
+//
+// good 是成功点位数。这不是「宽容」而是必须的：上层 collector 看到
+// Read 返回错误会按错误分类丢弃连接（ErrDisconnected/ErrTimeout/ErrProtocol
+// 直接 Close 重连），一个属性名写错的点位就会让整台设备每周期重连一次。
+func PartialReadError(good int, firstErr error) error {
+	if good == 0 && firstErr != nil {
+		return firstErr
+	}
+	return nil
+}
+
 // ---------------------------------------------------------------------------
 // 注册表
 // ---------------------------------------------------------------------------
