@@ -130,32 +130,81 @@ func (c *Conn) Close() error { return c.tr.Close() }
 
 // Read 读取一组 span。单个 span 失败不影响其它 span：现场最需要的正是
 // 「哪几个点坏了」而不是「整批都没了」。
+//
+// 部分失败语义见 docs §3.3.1：**有任意一个点位成功就不向上返回错误**，
+// 全失败才把第一个错误交出去；链路级失败（超时/断连）是这条闸门的例外，
+// 必须立即收尾并上抛，即便本轮已经有好样本。
 func (c *Conn) Read(ctx context.Context, spans []driver.ReadSpan) ([]driver.RawSample, error) {
 	if len(spans) == 0 {
 		return nil, nil
 	}
 	var out []driver.RawSample
 	var firstErr error
-	ok := 0
-	for _, span := range spans {
+	good := 0
+	for si, span := range spans {
 		if err := ctx.Err(); err != nil {
-			return out, driver.E(driver.ErrTimeout, "read", c.devID, "context done", true, err)
+			e := driver.E(driver.ErrTimeout, "read", c.devID, "context done", true, err)
+			// 剩余 span 的点位必须显式标坏，不能让它们从结果里消失——消失
+			// 的点位在采集层表现为「没有新样本」，会被当成设备安静（甚至
+			// 被兜底成 protocol 错），把真正的超时原因盖掉。
+			for _, rest := range spans[si:] {
+				out = append(out, c.failed(rest, e)...)
+			}
+			return out, e
 		}
 		samples, err := c.readSpan(ctx, span)
 		if err != nil {
+			// 链路级失败：立即返回，不由下面的闸门吞掉——一轮采集被周期
+			// 超时打断本身就是「设备太慢」的信号，需要让调度器看到。
+			if driver.IsLinkFailure(err) {
+				out = append(out, c.failed(span, err)...)
+				for _, rest := range spans[si+1:] {
+					out = append(out, c.failed(rest, err)...)
+				}
+				return out, err
+			}
 			if firstErr == nil {
 				firstErr = err
 			}
 			out = append(out, c.failed(span, err)...)
 			continue
 		}
-		ok++
+		// span 成功不等于「有成功的点位」：解码阶段的错误（EM 当前区的 bool
+		// 缺位号、类型与宽度不符）是逐点记在样本上的，readSpan 仍然返回
+		// nil error。按 span 计数会把这批「全员失败」当成成功，`Read` 于是
+		// 返回 nil error——正是 §3.3.1 点名禁止的那种静默。
+		if n := goodSamples(samples); n > 0 {
+			good += n
+		} else if e := firstSampleErr(samples); e != nil && firstErr == nil {
+			firstErr = e
+		}
 		out = append(out, samples...)
 	}
-	if ok == 0 && firstErr != nil {
-		return out, firstErr
+	// 部分失败语义（docs §3.3.1）：有成功点就不向上返回错误。
+	return out, driver.PartialReadError(good, firstErr)
+}
+
+// goodSamples 数一段结果里真正带值的点位。失败样本一律带 Err（见 errSample /
+// failed），因此「Err == nil」就是「这个点位读到了值」。
+func goodSamples(samples []driver.RawSample) int {
+	n := 0
+	for _, s := range samples {
+		if s.Err == nil {
+			n++
+		}
 	}
-	return out, nil
+	return n
+}
+
+// firstSampleErr 返回一段结果里的第一个点位级错误，供「整段全失败但 span
+// 本身没报错」时喂给部分失败闸门。
+func firstSampleErr(samples []driver.RawSample) error {
+	for _, s := range samples {
+		if s.Err != nil {
+			return s.Err
+		}
+	}
+	return nil
 }
 
 // readSpan 处理一个 span。与 MC 不同，FINS 的同一个内存区可以同时有字点位
@@ -451,6 +500,10 @@ func (c *Conn) readBits(ctx context.Context, acc finscodec.Access, word int, bit
 
 // Write 逐条写入。单条失败不影响后续：批量点位里一条地址越界，不该让其余
 // 几十条一起失败。
+//
+// 返回的 `results` 必须**逐项**回答（docs §3.4）：成功的条目不能因为同一批里
+// 另一条失败而被回填上错误——调用方据此决定「哪几条要重发/要告警」，把成功
+// 项也标上 Err 会让运维对着一个实际已写下去的点位反复排查。
 func (c *Conn) Write(ctx context.Context, reqs []driver.WriteRequest) ([]driver.WriteResult, error) {
 	c.wmu.Lock()
 	defer c.wmu.Unlock()
@@ -462,13 +515,6 @@ func (c *Conn) Write(ctx context.Context, reqs []driver.WriteRequest) ([]driver.
 		results = append(results, res)
 		if err != nil && firstErr == nil {
 			firstErr = err
-		}
-	}
-	if firstErr != nil {
-		for i := range results {
-			if results[i].Err == nil {
-				results[i].Err = firstErr
-			}
 		}
 	}
 	return results, firstErr

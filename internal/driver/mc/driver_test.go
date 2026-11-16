@@ -213,3 +213,49 @@ func TestMetaCapabilities(t *testing.T) {
 		t.Fatalf("multiRead = %s", m.Capabilities.MultiRead)
 	}
 }
+
+// TestWriteFailureKeepsEarlierSuccessesIntact：批量写里后面的条目失败，不能把
+// **已经成功**的条目也标上错误（docs §3.4「逐项返回结果」）。
+//
+// 早先这里做的是「把 firstErr 回填进所有 Err==nil 的结果」。看起来像「整批
+// 失败更安全」，实际后果是：调用方看到的逐项结果全部失败，会去重发一个已经
+// 写下去的点位——对计数类点位就是重复累加；真正失败的那条反而淹没在一片
+// 错误里。
+func TestWriteFailureKeepsEarlierSuccessesIntact(t *testing.T) {
+	stream := &memStream{}
+	// 第一条写成功，需要一帧空数据的正常应答。
+	stream.frames = append(stream.frames, mccodec.BuildResponse(0, nil))
+	stream.pos = append(stream.pos, 0)
+	c := openMem(t, stream)
+
+	res, err := c.Write(context.Background(), []driver.WriteRequest{
+		{
+			PointID:  "ok",
+			Address:  model.Address{Kind: model.AddressRegister, Area: "d", Offset: 0, Length: 1, Bit: -1},
+			DataType: model.TypeUint16,
+			Value:    model.NumValue(model.TypeUint16, 0x1234),
+		},
+		{
+			// 未知软元件：在发帧之前就判地址错，不需要额外应答帧。
+			PointID:  "bad",
+			Address:  model.Address{Kind: model.AddressRegister, Area: "no-such-area", Offset: 0, Bit: -1},
+			DataType: model.TypeUint16,
+			Value:    model.NumValue(model.TypeUint16, 1),
+		},
+	})
+	if err == nil {
+		t.Fatal("a batch with a failing item must return an error")
+	}
+	if len(res) != 2 {
+		t.Fatalf("results = %d, want 2", len(res))
+	}
+	if !res[0].OK || res[0].Err != nil || res[0].Quality != model.QualityGood {
+		t.Fatalf("first item succeeded but was reported as %+v", res[0])
+	}
+	if res[1].OK || res[1].Err == nil {
+		t.Fatalf("second item failed but was reported as %+v", res[1])
+	}
+	if res[1].Quality == "" {
+		t.Fatal("a failed write must carry a quality, not the empty string")
+	}
+}

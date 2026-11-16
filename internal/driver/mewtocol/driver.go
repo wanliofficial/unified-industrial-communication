@@ -574,13 +574,9 @@ func (c *conn) Write(ctx context.Context, reqs []driver.WriteRequest) ([]driver.
 			firstErr = err
 		}
 	}
-	if firstErr != nil {
-		for i := range results {
-			if results[i].Err == nil {
-				results[i].Err = firstErr
-			}
-		}
-	}
+	// 逐项返回（docs §3.4）：成功的条目**不能**因为同批另一条失败而被回填
+	// 上错误。回填会让调用方把一条已经写下去的点位当成失败去重发——对计数
+	// 类点位就是重复累加。
 	return results, firstErr
 }
 
@@ -844,14 +840,17 @@ func (c *conn) classify(op string, err error) error {
 
 // areaOf 把点位的区名解析成区域定义。
 func (c *conn) areaOf(p driver.PointRef) (mewtocol.Area, error) {
-	return c.areaOfName(p.Address.Area, p.ID)
+	return c.areaOfName("read", p.Address.Area, p.ID)
 }
 
 func (c *conn) areaOfRef(req driver.WriteRequest) (mewtocol.Area, error) {
-	return c.areaOfName(req.Address.Area, req.PointID)
+	return c.areaOfName("write", req.Address.Area, req.PointID)
 }
 
-func (c *conn) areaOfName(name, pointID string) (mewtocol.Area, error) {
+// areaOfName 解析区名。op 由调用方给出而不是写死：区名写错是点表问题，
+// 报错里的操作名必须指向**真正失败的那一步**（采集还是写入），否则现场照着
+// 「open 失败」去查建链，永远查不到。
+func (c *conn) areaOfName(op, name, pointID string) (mewtocol.Area, error) {
 	area, ok := mewtocol.Lookup(name)
 	if !ok {
 		msg := fmt.Sprintf("unknown area %q (supported: %s)",
@@ -859,7 +858,7 @@ func (c *conn) areaOfName(name, pointID string) (mewtocol.Area, error) {
 		if pointID != "" {
 			msg = fmt.Sprintf("point %s: %s", pointID, msg)
 		}
-		return mewtocol.Area{}, driver.E(driver.ErrAddress, "open", c.devID, msg, false, nil)
+		return mewtocol.Area{}, driver.E(driver.ErrAddress, op, c.devID, msg, false, nil)
 	}
 	return area, nil
 }

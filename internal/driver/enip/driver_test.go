@@ -500,3 +500,47 @@ func TestReadAllFailedStillReturnsError(t *testing.T) {
 		t.Fatal("全部点位失败时必须返回错误")
 	}
 }
+
+// TestWriteFailureKeepsEarlierSuccessesIntact：批量写里后面的条目失败，不能把
+// **已经成功**的条目也标上错误（docs §3.4「逐项返回结果」）。
+//
+// 早先这里是「把 firstErr 回填进所有 Err==nil 的结果」，后果是调用方会去
+// 重发一个已经写下去的点位——对计数类点位就是重复累加。
+func TestWriteFailureKeepsEarlierSuccessesIntact(t *testing.T) {
+	srv := newSim(t)
+	c := openSim(t, srv)
+
+	res, err := c.Write(context.Background(), []driver.WriteRequest{
+		{
+			PointID:  "ok",
+			Address:  model.Address{Kind: model.AddressRegister, Area: "DINT_TAG", Bit: -1},
+			DataType: model.TypeInt32,
+			Value:    model.NumValue(model.TypeInt32, 7),
+		},
+		{
+			PointID:  "bad",
+			Address:  model.Address{Kind: model.AddressRegister, Area: "NO_SUCH_TAG", Bit: -1},
+			DataType: model.TypeInt32,
+			Value:    model.NumValue(model.TypeInt32, 1),
+		},
+	})
+	if err == nil {
+		t.Fatal("a batch with a failing item must return an error")
+	}
+	if len(res) != 2 {
+		t.Fatalf("results = %d, want 2", len(res))
+	}
+	if !res[0].OK || res[0].Err != nil || res[0].Quality != model.QualityGood {
+		t.Fatalf("first item succeeded but was reported as %+v", res[0])
+	}
+	if res[1].OK || res[1].Err == nil {
+		t.Fatalf("second item failed but was reported as %+v", res[1])
+	}
+	if res[1].Quality == "" {
+		t.Fatal("a failed write must carry a quality, not the empty string")
+	}
+	// 成功的条目确实落到了从站上：逐项语义不能只是「报得好看」。
+	if _, _, data, ok := srv.Tag("DINT_TAG"); !ok || binary.LittleEndian.Uint32(data) != 7 {
+		t.Fatalf("tag data = % x", data)
+	}
+}

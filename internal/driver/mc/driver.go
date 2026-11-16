@@ -369,13 +369,9 @@ func (c *conn) Write(ctx context.Context, reqs []driver.WriteRequest) ([]driver.
 			firstErr = err
 		}
 	}
-	if firstErr != nil {
-		for i := range results {
-			if results[i].Err == nil {
-				results[i].Err = firstErr
-			}
-		}
-	}
+	// 逐项返回（docs §3.4）：成功的条目**不能**因为同批另一条失败而被回填
+	// 上错误。回填会让调用方把一条已经写下去的点位当成失败去重发——对计数
+	// 类点位就是重复累加；真正失败的那条也会淹没在一片错误里。
 	return results, firstErr
 }
 

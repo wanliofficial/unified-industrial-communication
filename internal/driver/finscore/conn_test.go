@@ -24,7 +24,10 @@ type fakeTr struct {
 	writes [][]byte
 	// endCode 非 0 时所有应答都带这个结束码。
 	endCode uint16
-	closed  bool
+	// failOn 非 nil 时，第 failAt 次（1 起算）事务返回它的错误，之后
+	// 恢复正常。用来测「链路级失败必须短路剩余 span」。
+	failOn map[int]error
+	closed bool
 }
 
 func (f *fakeTr) Header() finscodec.Header {
@@ -41,6 +44,9 @@ func (f *fakeTr) RoundTrip(ctx context.Context, req []byte) (finscodec.Frame, er
 		return finscodec.Frame{}, driver.E(driver.ErrTimeout, "request", "d", "ctx", true, err)
 	}
 	f.reqs = append(f.reqs, append([]byte(nil), req...))
+	if err := f.failOn[len(f.reqs)]; err != nil {
+		return finscodec.Frame{}, err
+	}
 	parsed, err := finscodec.Parse(req)
 	if err != nil {
 		return finscodec.Frame{}, driver.E(driver.ErrInternal, "request", "d", err.Error(), false, err)
@@ -235,13 +241,122 @@ func TestReadSpanFailureKeepsOtherSpans(t *testing.T) {
 }
 
 // TestReadAllSpansFailReturnsError：全部失败时必须把错误交出去，否则调度器
-// 会以为设备还好着。
+// 会以为设备还活着。
 func TestReadAllSpansFailReturnsError(t *testing.T) {
 	tr := &fakeTr{endCode: 0x0202}
 	c := newConn(tr, DefaultLimits())
 	_, err := c.Read(context.Background(), []driver.ReadSpan{wordSpan("p", "dm", 0, 1)})
 	if err == nil {
 		t.Fatal("all-failing batch must return an error")
+	}
+}
+
+// TestReadAllPointsBadButSpanOKReturnsError：span 本身没报错、但每个点位都在
+// 解码阶段失败（EM 当前区的 bool 没有位访问码，缺位号只能判坏），整轮结果
+// 里一个成功点位都没有——此时 `Read` 必须返回错误。
+//
+// 按 span 计数会把这个场景判成「成功」（readSpan 返回 nil error），于是上层
+// 看到一台「在采但全坏」的设备，熔断器与告警永远不会动——正是 docs §3.3.1
+// 点名禁止的静默。
+func TestReadAllPointsBadButSpanOKReturnsError(t *testing.T) {
+	tr := &fakeTr{}
+	c := newConn(tr, DefaultLimits())
+	span := driver.ReadSpan{ID: "em", Points: []driver.PointRef{{
+		ID:       "no-bit",
+		Address:  model.Address{Kind: model.AddressRegister, Area: "em", Offset: 0, Bit: -1},
+		DataType: model.TypeBool,
+	}}}
+	samples, err := c.Read(context.Background(), []driver.ReadSpan{span})
+	if err == nil {
+		t.Fatalf("a batch with zero good points must return an error, got samples %+v", samples)
+	}
+	if len(samples) != 1 || samples[0].Quality != model.QualityAddressError {
+		t.Fatalf("samples = %+v", samples)
+	}
+}
+
+// TestReadLinkFailureShortCircuitsRemainingSpans：链路级失败（超时/断连）后
+// 剩余 span 不再发帧（半双工串口上继续等只会把一轮采集拖成 N 倍时长），
+// 并且它们必须显式出现在结果里、标成坏值——消失的点位在采集层看起来像
+// 「设备安静」，会把真正的超时原因盖掉。
+func TestReadLinkFailureShortCircuitsRemainingSpans(t *testing.T) {
+	timeout := driver.E(driver.ErrTimeout, "request", "d", "no response", true, context.DeadlineExceeded)
+	tr := &fakeTr{failOn: map[int]error{2: timeout}}
+	c := newConn(tr, DefaultLimits())
+
+	samples, err := c.Read(context.Background(), []driver.ReadSpan{
+		wordSpan("good", "dm", 0, 1),
+		wordSpan("timeout", "dm", 1, 1),
+		wordSpan("never-sent", "dm", 2, 1),
+	})
+	if err == nil {
+		t.Fatal("a link-level failure must be reported even when earlier spans succeeded")
+	}
+	if got := driver.KindOf(err); got != driver.ErrTimeout {
+		t.Fatalf("kind = %q, want timeout", got)
+	}
+	if len(tr.reqs) != 2 {
+		t.Fatalf("frames = %d, want 2 (the third span must not be sent)", len(tr.reqs))
+	}
+	if len(samples) != 3 {
+		t.Fatalf("samples = %d, want 3 (remaining points must be marked, not dropped)", len(samples))
+	}
+	if samples[0].Quality != model.QualityGood {
+		t.Fatalf("good span quality = %q", samples[0].Quality)
+	}
+	for _, s := range samples[1:] {
+		if s.Quality != model.QualityTimeout {
+			t.Fatalf("point %q quality = %q, want timeout", s.PointID, s.Quality)
+		}
+		if s.Err == nil {
+			t.Fatalf("point %q must carry the link error", s.PointID)
+		}
+	}
+}
+
+// TestReadLinkFailureAfterAllSpansFail…：链路级失败的短路判定不能只看「还有
+// 好样本」。全部 span 都超时时也走同一条分支（不再逐个等超时）。
+func TestReadLinkFailureStopsAfterFirstTimeout(t *testing.T) {
+	timeout := driver.E(driver.ErrTimeout, "request", "d", "no response", true, context.DeadlineExceeded)
+	tr := &fakeTr{failOn: map[int]error{1: timeout}}
+	c := newConn(tr, DefaultLimits())
+
+	_, err := c.Read(context.Background(), []driver.ReadSpan{
+		wordSpan("a", "dm", 0, 1),
+		wordSpan("b", "dm", 1, 1),
+		wordSpan("c", "dm", 2, 1),
+	})
+	if err == nil {
+		t.Fatal("all spans timed out; Read must return an error")
+	}
+	if len(tr.reqs) != 1 {
+		t.Fatalf("frames = %d, want 1 (no point in waiting for the other two timeouts)", len(tr.reqs))
+	}
+}
+
+// TestReadContextDoneMarksRemainingSpans：ctx 已到期时剩余 span 必须显式标坏。
+func TestReadContextDoneMarksRemainingSpans(t *testing.T) {
+	c := newConn(&fakeTr{}, DefaultLimits())
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	samples, err := c.Read(ctx, []driver.ReadSpan{
+		wordSpan("a", "dm", 0, 1),
+		wordSpan("b", "dm", 1, 1),
+	})
+	if err == nil {
+		t.Fatal("a done context must produce an error")
+	}
+	if got := driver.KindOf(err); got != driver.ErrTimeout {
+		t.Fatalf("kind = %q, want timeout", got)
+	}
+	if len(samples) != 2 {
+		t.Fatalf("samples = %d, want 2", len(samples))
+	}
+	for _, s := range samples {
+		if s.Quality != model.QualityTimeout || s.Err == nil {
+			t.Fatalf("point %q = %+v", s.PointID, s)
+		}
 	}
 }
 
@@ -331,9 +446,41 @@ func TestWriteFailsOnUnknownArea(t *testing.T) {
 	}
 }
 
-// TestWriteFailureMarksAllResults：一条写失败后，同一批里「已经成功」的条目
-// 也要带上错误——否则调用方会以为整批只有一条坏了。
-func TestWriteFailureMarksAllResults(t *testing.T) {
+// TestWriteFailureKeepsEarlierSuccessesIntact：批量写里后面的条目失败，不能
+// 把**已经成功**的条目也标上错误（docs §3.4「逐项返回结果」）。
+//
+// 早先这里做的是「把 firstErr 回填进所有 Err==nil 的结果」，看起来像「整批
+// 失败更安全」，实际后果是：调用方拿到的逐项结果全部是失败，会去重发一个
+// 已经写下去的点位——对计数类点位就是重复累加；而真正失败的那条反而淹没在
+// 一片错误里。
+func TestWriteFailureKeepsEarlierSuccessesIntact(t *testing.T) {
+	// 第 2 次事务（第二条写）返回地址错，第 1 次正常。
+	addrErr := endCodeError(0x1103, "address out of range")
+	tr := &fakeTr{failOn: map[int]error{2: addrErr}}
+	c := newConn(tr, DefaultLimits())
+	res, err := c.Write(context.Background(), []driver.WriteRequest{
+		{PointID: "ok", Address: model.Address{Kind: model.AddressRegister, Area: "dm", Offset: 0, Bit: -1}, DataType: model.TypeUint16, Value: model.NumValue(model.TypeUint16, 1)},
+		{PointID: "bad", Address: model.Address{Kind: model.AddressRegister, Area: "dm", Offset: 1, Bit: -1}, DataType: model.TypeUint16, Value: model.NumValue(model.TypeUint16, 2)},
+	})
+	if err == nil {
+		t.Fatal("a batch with a failing item must return an error")
+	}
+	if len(res) != 2 {
+		t.Fatalf("results = %d, want 2", len(res))
+	}
+	if !res[0].OK || res[0].Err != nil || res[0].Quality != model.QualityGood {
+		t.Fatalf("first item succeeded but was reported as %+v", res[0])
+	}
+	if res[1].OK || res[1].Err == nil {
+		t.Fatalf("second item failed but was reported as %+v", res[1])
+	}
+	if res[1].Quality == "" {
+		t.Fatal("a failed write must carry a quality, not the empty string")
+	}
+}
+
+// TestWriteAllFailReturnsFirstError：整批都失败时把第一个错误交出去。
+func TestWriteAllFailReturnsFirstError(t *testing.T) {
 	tr := &fakeTr{endCode: 0x1103}
 	c := newConn(tr, DefaultLimits())
 	res, err := c.Write(context.Background(), []driver.WriteRequest{
@@ -347,8 +494,8 @@ func TestWriteFailureMarksAllResults(t *testing.T) {
 		t.Fatalf("results = %d", len(res))
 	}
 	for i := range res {
-		if res[i].Err == nil {
-			t.Fatalf("result %d has no error: %+v", i, res[i])
+		if res[i].Err == nil || res[i].Quality == "" {
+			t.Fatalf("result %d: %+v", i, res[i])
 		}
 	}
 }

@@ -1,8 +1,10 @@
 package mewtocol
 
 import (
+	"context"
 	"errors"
 	"testing"
+	"time"
 
 	"uic/internal/codec/mewtocol"
 	"uic/internal/driver"
@@ -139,5 +141,87 @@ func TestQualityOfDerivesFromErrorCode(t *testing.T) {
 		if got := qualityOf(ec); got != model.QualityBad {
 			t.Errorf("%02XH: quality = %v, want bad", code, got)
 		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 批量写：逐项返回
+// ---------------------------------------------------------------------------
+
+// scriptLink 是一个最小 link 实现：Write 记录请求并按「回显命令码」现场
+// 生成一条正常完成应答。用它把「批量写怎么逐项汇报」与真实收发分开。
+type scriptLink struct {
+	requests [][]byte
+	reply    []byte
+	pos      int
+	closed   bool
+}
+
+func (l *scriptLink) Write(p []byte) error {
+	l.requests = append(l.requests, append([]byte(nil), p...))
+	// 应答：`%` + 站号 + `$` + 回显码 + BCC + CR。回显码是请求命令码的前
+	// 两个字符（例如 WD… 回显 "WD"），与从站实现同一套规则。
+	echo := mewtocol.EchoCode(string(p[4:6]))
+	l.reply = mewtocol.AppendBCC([]byte("%01$" + echo))
+	l.pos = 0
+	return nil
+}
+
+func (l *scriptLink) ReadFull(n int) ([]byte, error) {
+	if l.pos+n > len(l.reply) {
+		return nil, errors.New("script: reply exhausted")
+	}
+	out := l.reply[l.pos : l.pos+n]
+	l.pos += n
+	return out, nil
+}
+
+func (l *scriptLink) Close() error                { l.closed = true; return nil }
+func (l *scriptLink) SetDeadline(time.Time) error { return nil }
+func (l *scriptLink) Drain() error                { return nil }
+func (l *scriptLink) Lock()                       {}
+func (l *scriptLink) Unlock()                     {}
+
+// TestWriteFailureKeepsEarlierSuccessesIntact：批量写里后面的条目失败，不能把
+// **已经成功**的条目也标上错误（docs §3.4「逐项返回结果」）。
+//
+// 早先这里是「把 firstErr 回填进所有 Err==nil 的结果」，后果是调用方会去
+// 重发一个已经写下去的点位——对计数类点位就是重复累加。
+func TestWriteFailureKeepsEarlierSuccessesIntact(t *testing.T) {
+	l := &scriptLink{}
+	c := &conn{link: l, station: 1, devID: "plc1", timeout: time.Second}
+
+	res, err := c.Write(context.Background(), []driver.WriteRequest{
+		{
+			PointID:  "ok",
+			Address:  model.Address{Kind: model.AddressRegister, Area: "dt", Offset: 0, Bit: -1},
+			DataType: model.TypeUint16,
+			Value:    model.NumValue(model.TypeUint16, 0x1234),
+		},
+		{
+			// 未知区名：在发帧之前就判地址错，不会再消耗一帧应答。
+			PointID:  "bad",
+			Address:  model.Address{Kind: model.AddressRegister, Area: "no-such-area", Offset: 0, Bit: -1},
+			DataType: model.TypeUint16,
+			Value:    model.NumValue(model.TypeUint16, 1),
+		},
+	})
+	if err == nil {
+		t.Fatal("a batch with a failing item must return an error")
+	}
+	if len(res) != 2 {
+		t.Fatalf("results = %d, want 2", len(res))
+	}
+	if !res[0].OK || res[0].Err != nil || res[0].Quality != model.QualityGood {
+		t.Fatalf("first item succeeded but was reported as %+v", res[0])
+	}
+	if res[1].OK || res[1].Err == nil {
+		t.Fatalf("second item failed but was reported as %+v", res[1])
+	}
+	if res[1].Quality == "" {
+		t.Fatal("a failed write must carry a quality, not the empty string")
+	}
+	if len(l.requests) != 1 {
+		t.Fatalf("frames = %d, want 1 (the bad item must not touch the wire)", len(l.requests))
 	}
 }

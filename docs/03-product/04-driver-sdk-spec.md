@@ -273,6 +273,24 @@ type WriteResult struct {
 1. 写入必须**逐项**返回结果，不允许「整批成功/失败」；
 2. `OK=true` 但 `Quality=uncertain` 表示「已下发未确认」；
 3. 写入失败不得 panic，不得静默。
+4. **成功项不得被同批失败「连坐」**：逐项返回的意思是「哪一条成功、哪一条
+   失败」都能回答。禁止这种写法——
+
+   ```go
+   for i := range results {          // ✗ 全仓禁止
+       if results[i].Err == nil {
+           results[i].Err = firstErr // 把「整批失败」硬塞进成功项
+       }
+   }
+   ```
+
+   后果不是「更安全」，而是调用方据 `Err` 去重发一个**已经写下去**的点位：
+   对计数/累计类点位就是重复累加，对脉冲类点位就是多动一次。同批有一半失败
+   时，真正失败的那一条也会淹没在一片错误里，运维无从下手。批级失败只通过
+   第二个返回值（`firstErr`）上抛，`results` 里每一格只描述自己。
+5. **失败项必须带 `Quality`**，不能留空串：`runtime/collector.go` 对
+   `Quality==""` 会兜底成 `bad`，但驱动层留空等于把「为什么坏」这条信息
+   丢了（`qualityOf(err)` 本来能给出 `address_error`/`comm_error`/`timeout`）。
 
 #### 3.4.1 寄存器内的位写（读-改-写）
 
@@ -1216,6 +1234,10 @@ SLMP 的 UDP 形态一律不支持，配置期就拒绝。
 （归一化到「字内大端」），再按用户配置的 `byteOrder` 走 `value.Decode`；默认 `CDAB`。
 字符串/字节类型按地址宽度补零或截断，再按字对调。
 
+**批量写**：`Write` 逐条执行、逐条返回。同批里一条失败**不会**把已经成功的条目标成
+错误（§3.4 规则 4），整批的失败只通过第二个返回值上抛——否则调用方会把一条已经写
+下去的点位当成失败去重发。
+
 **位置**：
 
 | 内容 | 路径 |
@@ -1635,7 +1657,7 @@ curl -H 'Authorization: Bearer dev-token-0123456789' \
 | 层 | 用例 |
 |---|---|
 | `codec/enip` | 封装头/长度语义、CPF 奇数对齐与越界、SendRRData、RegisterSession、CIP 请求/应答、附加状态、符号路径偶对齐、逻辑路径 8/16/32 位、Read/Write Tag 金帧、多服务偏移表、类型表、字符串编解码 |
-| `driver/enip` | 注册与状态、命令/上下文错位、原子类型、大小写、STRING、bytes 两阶段读、数组 offset、位读/位写保邻位、offset 写保前缀、多服务合包与拆批、MSP 自动退回、错类型/越界位/未知标签、会话失效可重试、Probe 容忍不支持、能力声明；**部分失败语义（有成功点则 `err==nil`、全失败才返回整体错误、链路级失败立即返回且剩余 span 的点位显式标坏）** |
+| `driver/enip` | 注册与状态、命令/上下文错位、原子类型、大小写、STRING、bytes 两阶段读、数组 offset、位读/位写保邻位、offset 写保前缀、多服务合包与拆批、MSP 自动退回、错类型/越界位/未知标签、会话失效可重试、Probe 容忍不支持、能力声明；**部分失败语义（有成功点则 `err==nil`、全失败才返回整体错误、链路级失败立即返回且剩余 span 的点位显式标坏）**；**批量写逐项语义（一条成功 + 一条未知标签：成功项不被回填 `Err`、失败项带 `Quality`、且成功项确实落到从站）** |
 | `sim/enip` | 真实 TCP 回环：注册/注销/坏版本/未知命令、Read/Write Tag 与错误码 0x03/0x05/0x13/0x15、STRING 写、多服务与关闭、非符号路径、`SetTag` 校验、默认标签 |
 
 ### 3.10.8 BACnet/IP（对象属性读写，UDP 47808）
@@ -5713,7 +5735,7 @@ Mewtocol 的地址是**寄存器语义**：一个地址 = 一个 16 位字。因
 | 层 | 用例 |
 |---|---|
 | `codec/mewtocol` | 区域表与别名（`d`/`f`/`wx`/`set`/`k`）、站号校验（1..99、`FF`、0 拒绝）；BCC 覆盖 `%` 且不含 CR，手册实例 `%01#RCSX0000` → `1D`；黄金字节逐字节（RD/RCC/RCS/RCP/WCS/WCC/WD/RS/WS/RK/WK/异常应答）；接点编号双向（`001F`/`0163`/`0010`/`0999`，非法进制与越界拒绝）；索引寄存器的「区码 + 9 个 0」；`MaxWords=24` 与 `MaxContacts=8` 的边界（24 通过、25 拒绝；8 通过、9 拒绝）；`ParseRequest` 三字符命令优先于两字符前缀；`ParseResponse` 的 BCC 校验与异常应答；`FrameLen`/`Reader` 的分帧、噪声丢弃与半帧等待 |
-| `driver/mewtocol` | 纯函数：`pointWords`（bool 恒 1 字、显式长度优先、类型宽度回退）、`reqWords`、`orderFor`（32 位 CDAB / 64 位 DCBA / 显式覆盖）、`classify`（66H→address、65H→permission、41H/53H→protocol 可重试、60H→address）、`qualityOf`（address/comm/bad/timeout）+ **派生一致性**（遍历整段链路码 `22`..`38` 与可重试协议/处理码断言一律 `comm_error`，钉住「手抄白名单漏码」这类漂移） |
+| `driver/mewtocol` | 纯函数：`pointWords`（bool 恒 1 字、显式长度优先、类型宽度回退）、`reqWords`、`orderFor`（32 位 CDAB / 64 位 DCBA / 显式覆盖）、`classify`（66H→address、65H→permission、41H/53H→protocol 可重试、60H→address）、`qualityOf`（address/comm/bad/timeout）+ **派生一致性**（遍历整段链路码 `22`..`38` 与可重试协议/处理码断言一律 `comm_error`，钉住「手抄白名单漏码」这类漂移）；**批量写逐项语义**（一条成功 + 一条未知区名：成功项 `OK/Quality=good/Err=nil`、失败项带 `Quality` 与 `Err`、坏条目不上线发帧；把「回填 `firstErr`」加回去必须变红） |
 | `sim/mewtocol` | 真实 TCP 回环：16 位字往返（写 DT0..2 再读回）、接点按字读 + 位提取、`WCS` 单点写后邻位不变、字区位写拒绝（`ErrUnsupported`）、32 位跨字往返（低字在前）、索引寄存器越界 → address/protocol、站号过滤（站号 2 的请求静默、站号 1 有应答）、T/C 按点读（T 与 C 分属两个区，分开读）、T/C 单点写不碰邻号、`WCP` 多接点写（两位同时置 1，同字其余位不变——数据位读反的症状是「写 1 变成写 0」）、**T/C 分组里一个带位号的坏点位不得顶偏后续点位的值**（旧实现按下标遍历含坏点的原组去取 `vals`，坏点会拿到邻点值、真正要读的点反而没样本） |
 | `pointtable` | `PolicyFor("mewtocol")` 是 `WidthRegisters` + 十四个区白名单 + `BitlessAreas` 只含 `t`/`c`；正向 14 例（字区、接点区、字区 bool、T/C、索引、SV、大写区名）× 往返（`Canonical()` 能重新解析成同一地址）；反向 5 例（未知区名、接点区缺位号、位号 16、字区 bool 缺位号、非 bool 带位号）；寄存器协议反向拒 `dt:0` |
 
@@ -5839,31 +5861,19 @@ Host Link 是欧姆龙 CS/CJ/CP 系列 PLC「上位链接端口」用的协议�
 | 报文 | 帧 | 长度 |
 |---|---|---|
 | 读 DM0..DM1（2 字） | `@00FA00000000001018200000000027F*\r` | 34 |
-| 读应答（数据 1234 5678） | `@00FA004000000001010000123456784B*\r` | 35 |
-| 写 DM0=0x1234（1 字） | `@00FA000000000010282000000000112347B*\r` | 38 |
-| 读 CIO0（1 字） | `@00FA0000000000101B0000000000104*\r` | 34 |
-
-对照第一条：`@` `00` `FA` `0` `00` `00` `00` `00` `0101` `82 0000 00 0002`
-`7F` `*` CR。正文 `820000000002` 是「区码 82 + 起始字 0000 + 位号 00 + 数量
-0002」一字节两字符的展开。对照第二条：`FA` 之后先有 `00`（信封结束码），
-再有 `40`（应答 ICF），然后是精简头与 `0000`（FINS 结束码）与数据——
-**请求 34 字符、应答 35 字符，多出的正是那一格结束码**。这个「1 个字符
-的差」就是收发两条独立布局的可执行证据。
-
-本仓库测试逐字节钉住的黄金字节（全部由实现直接打印得到，单元号 0、等待 0）：
-
-| 报文 | 帧 | 长度 |
-|---|---|---|
-| 读 DM0..DM1（2 字） | `@00FA00000000001018200000000027F*\r` | 34 |
 | 读应答（DM0=1234、DM1=5678） | `@00FA004000000001010000123456784B*\r` | 35 |
-| 写 DM0=0x1234 | `@00FA000000000010282000000000112347B*\r` | 38 |
+| 写 DM0=0x1234（1 字） | `@00FA000000000010282000000000112347B*\r` | 38 |
 | 按字读 CIO0（1 字） | `@00FA0000000000101B0000000000104*\r` | 34 |
 
-对照读请求可以看到：`@00FA` 之后是**一位** `0`（等待时间），然后是
-`00000000`（ICF/DA2/SA2/SID），再 `0101`（MRC/SRC）、`82 0000 00 0002`
-（区码 DM + 起始 0 + 位号 0 + 数量 2）、`27`（FCS）、`*`、CR。应答则把
-`FA` 后的两位 `00` 换成了结束码、并在正文末尾多出四位 FINS 结束码。写请求
-把数量换成 1、末尾接数据 `1234`，长度因此比读多 4 个字符。
+对照第一条：`@` `00` `FA` `0`（**一位**等待时间，见第 4 条）`00` `00` `00`
+`00`（ICF/DA2/SA2/SID）`0101`（MRC/SRC）`820000000002`（区码 82 + 起始字
+0000 + 位号 00 + 数量 0002，一字节两字符展开）`7F`（FCS）`*` CR。对照第二
+条：`FA` 之后先有两位 `00`（信封结束码），再有 `40`（应答 ICF），然后才是
+精简头、`0000`（FINS 结束码）与数据 `12345678`。写请求把数量换成 1、末尾接
+数据 `1234`，长度因此比读多 4 个字符。
+
+**请求 34 字符、应答 35 字符，多出的正是那一格结束码**——这个「一个字符的
+差」就是第 1 条「收发两条独立布局」的可执行证据。
 
 #### 3.10.19.3 结束码：信封层与 FINS 层两套
 
@@ -5878,6 +5888,26 @@ Host Link 的错误信息分两层，处置方式完全不同，不能压成一�
 不重发也无意义（`EndCodeError.Format()` 把它们标成「格式错」）。`0x03`
 （写保护）/`0x23`（内存保护）归 `permission`，其余归 `protocol` 并保留一次
 重试。FINS 结束码则交给共用的 FINS 结束码分类，能说出具体是哪类内存错。
+
+**FINS 结束码为什么要按类分，而不是「非零一律协议错」**：结束码表（W342
+§5-1「End Codes」）里主码 `11` 是 Parameter error，子码就是点表的四类地址
+问题——`01` Area classification missing（区码不存在）、`02` Access size error
+（访问宽度不对/奇数字地址）、`03` Address range error（起始地址越界）、`04`
+Address range exceeded（起始 + 数量越界）；`0A` Duplicate data access、`0B`
+Response too long、`0C` Parameter error 属于同一族「参数本身不对」。这些码
+重发一万次结果都相同，且不该计入熔断（`driver.CountsTowardBreaker` 对
+`ErrAddress` 直接返回 false）；主码 `02`（目标节点不在网、单元缺失、路由
+表错）才是「重发一次可能就通了」的链路类。三类映射分别来自
+`finscodec.EndCodeError.Address()` / `Link()`，Host Link 与 FINS/TCP 两个
+驱动因此对同一个码给出同一个 `Kind` 与同一个重试决策——这是把信封差异隔离
+在信封层、语义只留一份的直接收益。
+
+**`0x1108` 为什么不在 `Address()` 里**：手册确实有一处「超过 498 字时按最大
+值读、并以 `1108` 返回」，但它只出现在**参数区读（`02 01`）**的注释里；本驱动
+只做内存区读写（`01 01`/`01 02`），内存区读的单帧上限是 999 字，撞不到那条
+规则。更关键的是 `endCodeError` 的 default 分支给的是 `temporary=false`，
+即「不认识就判坏、不重发、不熔断」——是 fail-closed，不是 fail-open。为一个
+本驱动不会收到的码去扩白名单，只会让分类表与实际命令集脱节。
 
 #### 3.10.19.4 单次上限：读 269 字、写 267 字（不是 999）
 
@@ -6060,7 +6090,7 @@ DM、当前 EM 区 `em`、以及 13 个 bank（`em0`..`em12`）。写错的区�
 |---|---|
 | `codec/hostlink` | `Build`/`ParseRequest`/`ParseResponse` 的黄金字节逐字节钉住；FCS 覆盖 `@` 且不含 `*`/CR；收发两条独立布局（请求无结束码、应答有结束码）；等待时间一位十六进制（0..F 越界拒绝）；单元号两位十进制（0..31）；`FromFINS` 丢弃六个路由字段且 ICF 显式 0x00；`Response.FINS()` 还原标准 FINS 帧；`FrameLen`/`Reader` 的分帧、噪声丢弃与 `*`+CR 定界；结束码 `0x13/0x14/0x15/0x18` 标 `Format()`、`0x03/0x23` 归 permission；`FCSMismatch`/`UnitMismatch` 的 `Comm()` 标记 |
 | `driver/hostlink` | 纯函数：`hostLinkLimits()` 四个上限（269/267/538/534）、`serialDefaults`（仅全空时补 9600-7-E-2，部分配置保留通用缺省 8/N/1）、`unitOf`（0..31、负数与越界拒绝）、`parseOptions`（`gap`/`wait` 边界）、`classifyRead`（超时文案带排查顺序、结束码分层、断链）；`RoundTrip` 对 FINS 结束码按语义分类（地址类 `0x1101..0x1104` → `ErrAddress`/不重试/不计熔断，链路类 `0x0202`/`0x0302` → 可重试，帧长错 `0x18` → 不重试） |
-| `driver/finscore` | `QualityOf`/`endCodeError` 的结束码→质量映射（地址类 `address_error`、链路类 `comm_error`、其余 `bad`）；`*TCPError` 的 `Comm()` 让封装层错误码得 `comm_error` |
+| `driver/finscore` | `QualityOf`/`endCodeError` 的结束码→质量映射（地址类 `address_error`、链路类 `comm_error`、其余 `bad`）；`*TCPError` 的 `Comm()` 让封装层错误码得 `comm_error`；**部分失败语义（docs §3.3.1）**：成功点数按**样本**计数（span 成功但全员解码失败——如 EM 当前区 bool 缺位号——必须上抛错误，不能按 span 当成成功）、链路级失败（超时/断连）短路剩余 span 并把它们显式标坏、`ctx` 到期标坏剩余 span 后立即返回；**写入逐项返回（docs §3.4）**：同批后一条失败不得回填成功项的 `Err`（回归用例 `TestWriteFailureKeepsEarlierSuccessesIntact`，把回填加回去必须变红） |
 | `sim/hostlink` | 真实 TCP 回环：16 位字往返（写 DM0 再读回）、位读写 + 邻位不变、float32 低字在前往返（DM2/DM3）、**EM 当前区位写走读改写往返（0xFFF7→0xFFFF→0xFFF7、只动 bit3）**、单元号不匹配完全沉默、FCS 错回 0x13、头码不对回 0x16、格式错回 0x14、读超 269 字由 finscore 切块 |
 | `cmd/uic` | `hostLinkWriteRequest` 的写路径判定：给了 `-bit` 一律按位写（**不判区有无原生位码**，EM 区也走位写）、`-qty != 1` 的字写直接拒（避免补零清邻字 + 宽度变化切 DCBA 字节序）、字写 `Length=1`/`Bit=-1`、非法布尔量与非数字拒绝 |
 | `pointtable` | `PolicyFor("hostlink")` == `PolicyFor("fins")`（`WidthRegisters` + `finsAreas`）；正向（字区/float32/位点/EM 当前区/EM bank/别名/大写区名）× 往返（`Canonical()` 能重新解析成同一地址）；反向（未知区名 `dmm`、`em13` 越界、bool 缺位号、位号 16、非 bool 带位号）；Modbus/S7/Mewtocol 拒绝 FINS 区名 |
