@@ -7295,9 +7295,25 @@ DIF 的低 4 位不是字节数，而是一个长度**编码**：
 | `00` / `08` | 无数据域 | 选择项 / 保留 |
 | `0F` | 厂商特定 | 按原始字节暴露 |
 
-LVAR 又是一层编码：`≤BFh` 是 ASCII 文本的直接长度，`C0h..C9h` 是 0..9 位数字、
-`D0h..D9h` 补前导零、`E0h..EFh` 带符号，`ECh+n*4`（即 `F0h..F4h`）是 `n*4` 字节，
-`F5h`=48、`F6h`=64。`2Fh` 是按 16 字节对齐时的**填充**而不是记录——把它当记录会
+LVAR 同时编码**长度与形态**（EN 13757-3 §6.5）：
+
+| LVAR | 形态 | 数据域字节数 |
+|---|---|---|
+| `00h..BFh` | ASCII 文本 | = LVAR |
+| `C0h..CFh` | **正 BCD 数**（`(LVAR-C0h)*2` 位十进制） | = LVAR−C0h |
+| `D0h..DFh` | **负 BCD 数** | = LVAR−D0h |
+| `E0h..EFh` | **二进制整数**（小端） | = LVAR−E0h |
+| `F0h..FAh` | 浮点（标准标 "to be defined"） | = LVAR−F0h |
+| `FBh..FFh` | 保留 | — |
+
+驱动按这张表把变长记录分派：`≤BFh` 作文本、`C/D` 段解成有符号 BCD 数（**符号由 C/D 段给出**，与固定宽度 BCD 用末字节 `Fh` 半字节表示符号是两套约定，不能混用）、`E` 段作整数（宽度装不进 `int64` 时退回原始字节，不静默截断）、`F` 段因语义未定按原始字节暴露。`Raw` 一律含 LVAR 首字节，供 `r:` 原始导出。
+
+> 早先实现把 `C/D/E` 段一律当 `KindBinary`（原始字节），且 `F` 段用自造的
+> `(LVAR-0xEC)*4`（`F0h→16`、`F4h→32`）加 `F5h=48`/`F6h=64` 长度表——与标准完全不符。
+> 后果：可变长 BCD 计数器（大电量值常用）被静默降级成字节、4 字节浮点记录因声明 32
+> 字节而整帧解析失败。已修正并加 `TestVariableLengthRecords` 锁四段分派与帧推进。
+
+`2Fh` 是按 16 字节对齐时的**填充**而不是记录——把它当记录会
 读出一条长度 0、量名乱码的假记录，后面整段记录随之错位；字节流里出现 `2Fh` 必须
 直接跳过。
 
@@ -7494,7 +7510,7 @@ VIF 换算）三个注入点，测试只打开自己关心的那一个。
 
 | 层 | 用例 |
 |---|---|
-| `codec/mbus` | 金帧逐字节（SND_NKE / 短帧 / 长帧 / 控制帧）与校验和范围（**不覆盖** L 与起止符）；双 `L` 不等、结束符错、截断 → `ErrIncomplete` vs `ErrFrame` 的区分；`FDh` 次级地址被拒；`E5` 与长帧粘包时先切 `E5`；`BadFrames` 只数内容不对的帧、重同步不计数；VIF 全表与幂次（含相邻编码 10 倍关系、厂商特定 7Fh/FFh、自定义 7Ch、主 VIFE 表 7Dh）；BCD 正负号与非法数字；REAL 不乘 Scale；LVAR 全编码表；Type G/F/I 日期时间与无效位、2 月 30 日拒绝；`2Fh` 填充跳过；`DIF=1Fh` 后续标志；固定结构 16 字节布局与 `type` 字节（含 J 族 `0x0B..0x13` 单调 1e3..1e11）；`q:`/`r:` 选择与失败时报候选；编码↔解码互逆 |
+| `codec/mbus` | 金帧逐字节（SND_NKE / 短帧 / 长帧 / 控制帧）与校验和范围（**不覆盖** L 与起止符）；双 `L` 不等、结束符错、截断 → `ErrIncomplete` vs `ErrFrame` 的区分；`FDh` 次级地址被拒；`E5` 与长帧粘包时先切 `E5`；`BadFrames` 只数内容不对的帧、重同步不计数；VIF 全表与幂次（含相邻编码 10 倍关系、厂商特定 7Fh/FFh、自定义 7Ch、主 VIFE 表 7Dh）；BCD 正负号与非法数字；REAL 不乘 Scale；**LVAR 全编码表（`C/D` 段到 `CF/DF`、`E0..EF` 二进制整数、`F0..FA` 浮点按 LVAR−F0、`FB..FF` 保留）与变长记录形态分派（正/负 BCD→数值、浮点按原始字节暴露、多记录帧推进）**；Type G/F/I 日期时间与无效位、2 月 30 日拒绝；`2Fh` 填充跳过；`DIF=1Fh` 后续标志；固定结构 16 字节布局与 `type` 字节（含 J 族 `0x0B..0x13` 单调 1e3..1e11）；`q:`/`r:` 选择与失败时报候选；编码↔解码互逆 |
 | `driver/mbus` | 真实 TCP 回环读写；`MultiRead` 一条事务覆盖多点；FCB 跨轮翻转、同轮回放（访问号不变的端到端验证）；读取失败后 `SND_NKE` 复位再试；同 FCB 重放不累加访问号；坏帧 → `ErrProtocol` 且文案含波特率提示；完全无应答 → `ErrTimeout`；校验和错**重发到上限**（每轮 `retries+1` 次）与 C/CI 错**不重发**（每轮 1 次）成对断言，后者同时断言 `IsRetryable(err)==false`；状态字应用错误 → uncertain；`Write` 逐项 `ErrUnsupported`；`max-follow` 上限；`q:volume@1` / `q:power-max` / `r:0` 寻址；后续报文记录重新编号；地址 251/253/255 在 `Open` 被拒 |
 | `sim/mbus` | 默认 8 条记录可被 `RecordNames`→`FindRecord` 直接吃回去；同 FCB 重放不改访问号；访问号自增；地址不符静默；坏校验只改校验和；`SetBadCI` 换 CI 后重算校验和（帧完好、语义不支持）；`Reads` 与 `ReqCount` 在重发时分离；`SetStatusError`；`SetSilent`；`DIF=1Fh` 后续报文；`SetValue`/`Value` 与 VIF 换算一致 |
 | `pointtable` | `mbus` 走 `WidthNone + AllowSymbol`；`q:`/`r:` 两种记录寻址都解析成 symbol 且 `Canonical` 往返一致（`r:` 靠策略里的 `SymbolPrefixes` 先一步排除寄存器识别——`r` 同时是 Mewtocol 的接点区名，不排除会被判成「不接受寄存器地址」）；漏写 `q:` 前缀按物理量名处理；`coil:`/`holding:`/`dt:`/`dm:` 与 selector 在导入期拒绝；`length` 列在导入期拒绝；`q:energy` 不被 modbus/s7/iec104/mewtocol/fins 收下，而 `r:16.3` 在 mewtocol 下仍是寄存器位地址 |

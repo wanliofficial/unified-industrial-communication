@@ -97,6 +97,33 @@ func decodeBCD(b []byte) (int64, bool) {
 	return v, true
 }
 
+// decodeBCDDigits 解**纯数字 BCD**：每字节两位十进制、低位在前，但不接受
+// 末字节高半字节的 Fh 符号位。
+//
+// 用于变长记录（LVAR = C0h..DFh）：那里符号由 LVAR 的 C/D 段给出，数据字节
+// 必须是纯数字。若复用 decodeBCD，一条末字节高半字节为 F 的畸形记录会被它
+// 当成负号，再被 D 段取负，负负得正、静默得出一个"看起来合理"的正数。
+// 这里遇到任何非十进制半字节都返回 ok=false，交由调用方按原始字节暴露。
+func decodeBCDDigits(b []byte) (int64, bool) {
+	if len(b) == 0 || len(b) > 8 {
+		return 0, false
+	}
+	var v int64
+	mult := int64(1)
+	for i := 0; i < len(b); i++ {
+		lo := b[i] & 0x0F
+		hi := b[i] >> 4
+		if lo > 9 || hi > 9 {
+			return 0, false
+		}
+		v += int64(lo) * mult
+		mult *= 10
+		v += int64(hi) * mult
+		mult *= 10
+	}
+	return v, true
+}
+
 // decodeDate 解 Type G 日期（2 字节）。
 //
 //	bit 0-4  日
