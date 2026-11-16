@@ -65,7 +65,7 @@ func EchoCode(cmd string) string {
 // 内置从站用它，因此它必须容忍主站侧的合法变化：BCC 可以写成 `**`、
 // 站号可以是 `FF`（广播）。它不接受半帧——收帧的职责在 Reader 里。
 func ParseRequest(raw []byte) (Request, error) {
-	station, rest, err := stripFrame(raw, SymbolCmd)
+	station, rest, err := stripFrame(raw, SymbolCmd, true)
 	if err != nil {
 		return Request{}, err
 	}
@@ -281,8 +281,37 @@ func ParseRequest(raw []byte) (Request, error) {
 	return Request{}, fmt.Errorf("mewtocol: unsupported command %q", cmd)
 }
 
+// bccAtOf 是 BCC 字段在 body 里的起始下标（两位十六进制）。
+func bccAtOf(body []byte) int { return len(body) - 2 }
+
+// checkBCC 校验 body（不含 CR）尾部的 BCC 字段。
+//
+// allowWildcard 只对「解析主站请求」这一侧为 true：手册允许主站用 "**"
+// 代替真实 BCC 表示本帧不做块校验，PLC 照样执行。应答侧恒为 false——
+// 手册里没有给 PLC 这个豁免，应答上的 "**" 是坏帧（ChecksumError，
+// 可重试）。把两侧一视同仁会让一条未校验的字节流（噪声、串话、被中间
+// 设备改写过的帧）静默通过校验层。
+func checkBCC(body []byte, allowWildcard bool) error {
+	at := bccAtOf(body)
+	if body[at] == BCCWildcard && body[at+1] == BCCWildcard {
+		if allowWildcard {
+			return nil
+		}
+		return &ChecksumError{Got: BCC(body[:at]), Note: `frame carries "**" (no block check), ` +
+			"which MEWTOCOL allows only in a command, never in a response"}
+	}
+	want, err := parseHexByte(string(body[at:]))
+	if err != nil {
+		return fmt.Errorf("mewtocol: bad BCC field %q: %w", body[at:], err)
+	}
+	if got := BCC(body[:at]); got != want {
+		return &ChecksumError{Got: got, Want: want}
+	}
+	return nil
+}
+
 // stripFrame 校验外层结构（头、CR、BCC、站号、命令符号）并返回正文。
-func stripFrame(raw []byte, symbol byte) (Station, string, error) {
+func stripFrame(raw []byte, symbol byte, allowWildcard bool) (Station, string, error) {
 	if len(raw) < MinFrame {
 		return 0, "", fmt.Errorf("mewtocol: frame too short (%d bytes)", len(raw))
 	}
@@ -296,15 +325,8 @@ func stripFrame(raw []byte, symbol byte) (Station, string, error) {
 	if len(body) < 7 {
 		return 0, "", fmt.Errorf("mewtocol: frame body too short (%d bytes)", len(body))
 	}
-	bccAt := len(body) - 2
-	if body[bccAt] != BCCWildcard || body[bccAt+1] != BCCWildcard {
-		want, err := parseHexByte(string(body[bccAt:]))
-		if err != nil {
-			return 0, "", fmt.Errorf("mewtocol: bad BCC field %q: %w", body[bccAt:], err)
-		}
-		if got := BCC(body[:bccAt]); got != want {
-			return 0, "", &ChecksumError{Got: got, Want: want}
-		}
+	if err := checkBCC(body, allowWildcard); err != nil {
+		return 0, "", err
 	}
 	station, err := ParseStation(string(body[1:3]))
 	if err != nil {
@@ -313,7 +335,7 @@ func stripFrame(raw []byte, symbol byte) (Station, string, error) {
 	if body[3] != symbol {
 		return 0, "", fmt.Errorf("mewtocol: expected symbol %q, got %q", symbol, body[3])
 	}
-	return station, string(body[4:bccAt]), nil
+	return station, string(body[4:bccAtOf(body)]), nil
 }
 
 // parseDec 取出 n 位十进制字段。

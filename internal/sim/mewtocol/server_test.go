@@ -408,3 +408,75 @@ func mustArea(t *testing.T, key string) mewcodec.Area {
 	}
 	return a
 }
+
+// TestIndexRegistersRoundTrip：索引寄存器的三种形态各自往返。
+//
+// IX/IY 各一个字（uint16），ID 是 32 位（uint32），线上字节数不同：RDIX
+// 回 4 个字符、RDID 回 8 个字符。此前驱动把所有 KindIndex 都按 1 字算，
+// ID 的读会稳定报「response carries 2 words, request asked for 1」，写则
+// 只发 I0 却回成功。
+func TestIndexRegistersRoundTrip(t *testing.T) {
+	srv := newSim(t)
+	c := open(t, srv)
+
+	res, err := c.Write(ctx(), []driver.WriteRequest{
+		{PointID: "ix", Address: model.Address{Kind: model.AddressRegister, Area: "ix", Offset: 0, Length: 1, Bit: -1},
+			DataType: model.TypeUint16, Value: model.NumValue(model.TypeUint16, 0x1234)},
+		{PointID: "iy", Address: model.Address{Kind: model.AddressRegister, Area: "iy", Offset: 0, Length: 1, Bit: -1},
+			DataType: model.TypeUint16, Value: model.NumValue(model.TypeUint16, 0x5678)},
+	})
+	if err != nil {
+		t.Fatalf("write index: %v", err)
+	}
+	for _, r := range res {
+		if !r.OK {
+			t.Fatalf("%s: %v", r.PointID, r.Err)
+		}
+	}
+
+	// 一个 span 只能有一个区（规划层按区聚合），所以 IX 与 IY 分两次读。
+	samples, err := c.Read(ctx(), []driver.ReadSpan{
+		{ID: "six", Points: []driver.PointRef{
+			{ID: "ix", Address: model.Address{Kind: model.AddressRegister, Area: "ix", Offset: 0, Length: 1, Bit: -1}, DataType: model.TypeUint16},
+		}},
+		{ID: "siy", Points: []driver.PointRef{
+			{ID: "iy", Address: model.Address{Kind: model.AddressRegister, Area: "iy", Offset: 0, Length: 1, Bit: -1}, DataType: model.TypeUint16},
+		}},
+	})
+	if err != nil {
+		t.Fatalf("read index: %v", err)
+	}
+	if len(samples) != 2 {
+		t.Fatalf("samples = %d", len(samples))
+	}
+	if samples[0].Value.Num != 0x1234 || samples[1].Value.Num != 0x5678 {
+		t.Fatalf("ix/iy = %v/%v, want 0x1234/0x5678", samples[0].Value.Num, samples[1].Value.Num)
+	}
+
+	// ID 是 IX/IY 这一对的 32 位视图：I0 低位字、I1 高位字。
+	id := driver.ReadSpan{ID: "sid", Points: []driver.PointRef{
+		{ID: "id", Address: model.Address{Kind: model.AddressRegister, Area: "id", Offset: 0, Length: 2, Bit: -1}, DataType: model.TypeUint32},
+	}}
+	got, err := c.Read(ctx(), []driver.ReadSpan{id})
+	if err != nil {
+		t.Fatalf("read id: %v", err)
+	}
+	// 值的排布是「低字在前」：I0=0x1234, I1=0x5678 → 0x56781234。
+	if got[0].Value.Num != 0x56781234 {
+		t.Fatalf("id = %#x, want 0x56781234 (I1<<16 | I0)", uint64(got[0].Value.Num))
+	}
+	if w0, w1 := srv.Word("ix", 0), srv.Word("iy", 0); w0 != 0x1234 || w1 != 0x5678 {
+		t.Fatalf("after reading ID the sim still holds ix=%04X iy=%04X", w0, w1)
+	}
+
+	// 写 ID 必须同时改掉 I0 与 I1。
+	if _, err := c.Write(ctx(), []driver.WriteRequest{
+		{PointID: "id", Address: model.Address{Kind: model.AddressRegister, Area: "id", Offset: 0, Length: 2, Bit: -1},
+			DataType: model.TypeUint32, Value: model.NumValue(model.TypeUint32, 0x00010002)},
+	}); err != nil {
+		t.Fatalf("write id: %v", err)
+	}
+	if w0, w1 := srv.Word("ix", 0), srv.Word("iy", 0); w0 != 0x0002 || w1 != 0x0001 {
+		t.Fatalf("WDID left the sim at ix=%04X iy=%04X, want ix=0002 iy=0001", w0, w1)
+	}
+}

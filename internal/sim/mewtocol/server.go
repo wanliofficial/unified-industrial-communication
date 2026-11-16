@@ -81,12 +81,16 @@ func (s *Server) SetWord(area string, addr int, v uint16) {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	m := s.word[a.Key]
+	key, slot := a.Key, addr
+	if a.Kind == mewcodec.KindIndex {
+		key, slot = indexSlot(a, addr)
+	}
+	m := s.word[key]
 	if m == nil {
 		m = map[int]uint16{}
-		s.word[a.Key] = m
+		s.word[key] = m
 	}
-	m[addr] = v
+	m[slot] = v
 }
 
 // Word 读取一个字区/定时器值区的值。
@@ -97,7 +101,11 @@ func (s *Server) Word(area string, addr int) uint16 {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.word[a.Key][addr]
+	key, slot := a.Key, addr
+	if a.Kind == mewcodec.KindIndex {
+		key, slot = indexSlot(a, addr)
+	}
+	return s.word[key][slot]
 }
 
 // SetBit 预置一个接点。
@@ -244,6 +252,13 @@ func (s *Server) execute(req mewcodec.Request) (string, byte) {
 
 	case mewcodec.CmdWriteData, mewcodec.CmdWriteContactWord,
 		mewcodec.CmdWriteSetValue, mewcodec.CmdWriteElapsed:
+		// 索引寄存器的宽度由区码固定：WDIX/WDIY 带一个字，WDID 带两个字。
+		// 带错宽度是数据错（0x61）而不是地址错，而且必须拒绝——WDID 只带
+		// 一个字会让 I1 留在旧值上却回「写成功」，而 I1 正是 32 位索引的
+		// 高半部分。
+		if req.Area.Kind == mewcodec.KindIndex && req.Words() != mewcodec.IndexWords(req.Area) {
+			return "", 0x61
+		}
 		if !s.writeRange(req) {
 			return "", 0x66
 		}
@@ -327,11 +342,12 @@ func (s *Server) wordAt(area mewcodec.Area, addr int) (uint16, bool) {
 	}
 	switch area.Kind {
 	case mewcodec.KindIndex:
-		// 索引寄存器没有编号：地址恒为 0（id 是 0..1）。
-		if addr > 1 {
+		// 索引寄存器没有编号：地址范围由区宽固定（IX/IY 只有 0，ID 是 0..1）。
+		if addr < 0 || addr >= mewcodec.IndexWords(area) {
 			return 0, false
 		}
-		return s.word[area.Key][addr], true
+		key, slot := indexSlot(area, addr)
+		return s.word[key][slot], true
 	case mewcodec.KindContact:
 		// 不论 X/Y/R/L 还是 T/C，按字读都是「一个字 16 个接点」的位图。
 		// 对 T/C 手册也允许按字读，但会按这种每字 16 点的重新编号，
@@ -354,11 +370,12 @@ func (s *Server) setWordAt(area mewcodec.Area, addr int, v uint16) bool {
 	}
 	switch area.Kind {
 	case mewcodec.KindIndex:
-		if addr > 1 {
+		if addr < 0 || addr >= mewcodec.IndexWords(area) {
 			return false
 		}
-		s.ensureWord(area.Key)
-		s.word[area.Key][addr] = v
+		key, slot := indexSlot(area, addr)
+		s.ensureWord(key)
+		s.word[key][slot] = v
 		return true
 	case mewcodec.KindContact:
 		s.ensureBit(area.Key)
@@ -370,6 +387,22 @@ func (s *Server) setWordAt(area mewcodec.Area, addr int, v uint16) bool {
 	s.ensureWord(area.Key)
 	s.word[area.Key][addr] = v
 	return true
+}
+
+// indexSlot 把索引寄存器的「区 + 字序号」映射到实际存储位置。
+//
+// 真实 PLC 上 ID 不是一个独立寄存器，而是 IX/IY 这一对（I0 低位字、I1
+// 高位字）的 32 位视图：写 ID 会改掉 I0 和 I1。内置从站必须照这个关系
+// 存储，否则「读 ID 拿到的值与读 IX/IY 拿到的值互相矛盾」——自检时两边
+// 都正常，接真机才发现 32 位索引根本对不上。
+func indexSlot(area mewcodec.Area, addr int) (string, int) {
+	if area.Key == "id" {
+		if addr == 0 {
+			return "ix", 0
+		}
+		return "iy", 0
+	}
+	return area.Key, addr
 }
 
 func (s *Server) contactValue(c mewcodec.Contact) bool {

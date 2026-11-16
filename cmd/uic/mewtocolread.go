@@ -29,9 +29,10 @@ import (
 //   - FP7 的 LAN 口设成了「与 FP2-ET-LAN 连接」，帧外多一层 16 字节头，
 //     裸帧发过去 PLC 根本收不下。
 //
-// 这条命令把这几个变量摊开：先探活（读 DT0），再按给定区域做一次读写，
-// 把「发出去的帧」与「收回来的帧」都打出来。原始帧是最有用的诊断信息——
-// 「帧长对不对、BCC 对不对、站号回的是几」看一眼就知道，不需要抓包工具。
+// 这条命令把这几个变量摊开：先探活（读 DT0），再按给定区域做一次读写。
+// `-raw` 打出**线上地址编码**（`D00100`、`001F`、`IX` + 九个 0）与原始字值，
+// 这正是进制混排出错时最需要对照的两样东西：把 `X1F` 当十进制填进 -offset，
+// 打印出来的接点号会是 `0010` 而不是 `001F`，一眼就能看出错在哪。
 //
 // 边界：单次读写、单台设备、不做周期轮询、不做 FP2-ET-LAN 封装模式。
 func mewtocolreadCmd(args []string) {
@@ -51,14 +52,14 @@ func mewtocolreadCmd(args []string) {
 
 	// 点位：区名 + 字地址 + 位号。
 	area := fs.String("area", "dt", "区名：dt/ld/fl（字区） x/y/r/l/t/c（接点区） ix/iy/id（索引） sv/ev（定时器值）")
-	offset := fs.Int("offset", 0, "字地址（十进制）。接点区的 -offset 是「字」，位号由 -bit 给")
+	offset := fs.Int("offset", 0, "字地址（十进制）。接点区的 -offset 是「字」，位号由 -bit 给；索引寄存器恒为 0")
 	bit := fs.Int("bit", -1, "接点区/字区布尔量的位号 0..15；字区整字读取时忽略")
-	qty := fs.Int("qty", 1, "读取数量（字或接点数）")
+	qty := fs.Int("qty", 1, "读取数量（字或接点数）。索引寄存器由区码定宽（IX/IY=1、ID=2），此参数被忽略")
 
 	write := fs.String("write", "", "写入值：字区为十进制/0x 十六进制；布尔量为 on|off|1|0")
 	timeout := fs.Duration("timeout", 3*time.Second, "单次事务超时")
 	asJSON := fs.Bool("json", false, "以 JSON 输出")
-	raw := fs.Bool("raw", false, "打印发出去的请求帧与收回来的应答帧")
+	raw := fs.Bool("raw", false, "额外显示线上地址编码与原始字值（十六进制）：定位进制混排错误最有效")
 	probe := fs.Bool("probe", false, "只做探活（读 DT0），不按 -area 采集")
 	fs.Parse(args)
 
@@ -141,22 +142,10 @@ func mewtocolreadCmd(args []string) {
 }
 
 func runMewRead(ctx context.Context, c driver.Conn, ch model.Channel, area string, offset, bit, qty int, asJSON, raw bool, station int) {
-	span := driver.ReadSpan{ID: "read"}
-	if bit >= 0 {
-		// 指定位号：一个布尔点位。
-		span.Points = append(span.Points, driver.PointRef{
-			ID:       fmt.Sprintf("%s%d.%d", area, offset, bit),
-			Address:  model.Address{Kind: model.AddressRegister, Area: area, Offset: offset, Bit: bit, Length: 1},
-			DataType: model.TypeBool,
-		})
-	} else {
-		for i := 0; i < qty; i++ {
-			span.Points = append(span.Points, driver.PointRef{
-				ID:       fmt.Sprintf("%s%d", area, offset+i),
-				Address:  model.Address{Kind: model.AddressRegister, Area: area, Offset: offset + i, Length: 1, Bit: -1},
-				DataType: model.TypeUint16,
-			})
-		}
+	span, err := mewReadSpan(area, offset, bit, qty)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(2)
 	}
 
 	samples, err := c.Read(ctx, []driver.ReadSpan{span})
@@ -185,14 +174,115 @@ func runMewRead(ctx context.Context, c driver.Conn, ch model.Channel, area strin
 	}
 
 	fmt.Printf("从站 %s 站号=%d 区=%s\n", describeTarget(ch.Transport, ch.Transport.Address), station, area)
+	a, _ := mewcodec.Lookup(area)
+	addrByID := make(map[string]model.Address, len(span.Points))
+	for _, p := range span.Points {
+		addrByID[p.ID] = p.Address
+	}
 	for _, s := range samples {
 		if s.Err != nil {
 			fmt.Printf("%s 错误[%s]: %v\n", s.PointID, s.Quality, s.Err)
 			continue
 		}
+		if raw {
+			fmt.Printf("%s = %s (%s)  [线上 %s, 原始 %s]\n",
+				s.PointID, s.Value.String(), s.Quality, wireAddr(a, addrByID[s.PointID]), rawWord(s.Value))
+			continue
+		}
 		fmt.Printf("%s = %s (%s)\n", s.PointID, s.Value.String(), s.Quality)
 	}
-	_ = raw // 原始帧诊断在驱动内部，命令行只给语义结果
+}
+
+// mewReadSpan 把「区 + 偏移 + 位号 + 数量」翻译成读 span。
+//
+// 索引寄存器是唯一需要特殊处理的一类：它们没有编号，宽度由区码决定
+// （IX/IY 1 字，ID 2 字），所以 -offset 必须是 0、-qty 被忽略。这里显式
+// 拒绝而不是静默吞掉——`-area id -offset 1` 若继续往下走，驱动会读到
+// I0/I1 的对，与用户以为的「第二个索引寄存器」完全不是一回事。
+func mewReadSpan(area string, offset, bit, qty int) (driver.ReadSpan, error) {
+	a, ok := mewcodec.Lookup(area)
+	if !ok {
+		return driver.ReadSpan{}, fmt.Errorf("未知区名 %q", area)
+	}
+	span := driver.ReadSpan{ID: "read"}
+	if a.Kind == mewcodec.KindIndex {
+		if offset != 0 {
+			return driver.ReadSpan{}, fmt.Errorf("%s 没有编号（索引寄存器只有一组），-offset 必须为 0，得到 %d", a.Key, offset)
+		}
+		if bit >= 0 {
+			return driver.ReadSpan{}, fmt.Errorf("%s 是字寄存器，不能按位读（去掉 -bit）", a.Key)
+		}
+		w := mewcodec.IndexWords(a)
+		// 宽度由区码固定；qty 只有两种选择：1（只读低位字 / 整个 IX）或 w。
+		switch {
+		case qty < 1 || qty > w:
+			return driver.ReadSpan{}, fmt.Errorf("%s 是 %d 字寄存器，-qty 只能取 1..%d，得到 %d", a.Key, w, w, qty)
+		}
+		dtype := model.TypeUint16
+		if qty == 2 {
+			dtype = model.TypeUint32
+		}
+		span.Points = []driver.PointRef{{
+			ID:       fmt.Sprintf("%s", a.Key),
+			Address:  model.Address{Kind: model.AddressRegister, Area: a.Key, Offset: 0, Bit: -1, Length: qty},
+			DataType: dtype,
+		}}
+		return span, nil
+	}
+	if bit >= 0 {
+		// 指定位号：一个布尔点位。
+		span.Points = append(span.Points, driver.PointRef{
+			ID:       fmt.Sprintf("%s%d.%d", area, offset, bit),
+			Address:  model.Address{Kind: model.AddressRegister, Area: area, Offset: offset, Bit: bit, Length: 1},
+			DataType: model.TypeBool,
+		})
+		return span, nil
+	}
+	for i := 0; i < qty; i++ {
+		span.Points = append(span.Points, driver.PointRef{
+			ID:       fmt.Sprintf("%s%d", area, offset+i),
+			Address:  model.Address{Kind: model.AddressRegister, Area: area, Offset: offset + i, Length: 1, Bit: -1},
+			DataType: model.TypeUint16,
+		})
+	}
+	return span, nil
+}
+
+// wireAddr 给出点位在线上帧里的地址编码，用于对照「点表写的」与「实际发的」。
+func wireAddr(a mewcodec.Area, addr model.Address) string {
+	switch a.Kind {
+	case mewcodec.KindIndex:
+		return a.Code + "000000000"
+	case mewcodec.KindContact:
+		bit := addr.Bit
+		if a.Code == "T" || a.Code == "C" {
+			bit = 0
+		}
+		if n, err := mewcodec.ContactNumber(a, addr.Offset, bit); err == nil {
+			return a.Code + n
+		}
+	}
+	// 字区/定时器值区：区码(1) + 五位十进制地址。SV/EV 没有区码。
+	if a.Code == "" {
+		return fmt.Sprintf("%04d", addr.Offset)
+	}
+	return fmt.Sprintf("%s%05d", a.Code, addr.Offset)
+}
+
+// rawWord 把样本的原始字值打成十六进制：16 位 4 位、32 位 8 位。
+func rawWord(v model.Value) string {
+	switch v.Type {
+	case model.TypeBool:
+		if v.Bool {
+			return "1"
+		}
+		return "0"
+	case model.TypeUint32, model.TypeInt32:
+		return fmt.Sprintf("%08X", uint32(int64(v.Num)))
+	case model.TypeUint16, model.TypeInt16:
+		return fmt.Sprintf("%04X", uint16(int64(v.Num)))
+	}
+	return "-"
 }
 
 func runMewWrite(ctx context.Context, c driver.Conn, area string, offset, bit, qty int, value string, asJSON, raw bool) {
@@ -222,11 +312,25 @@ func runMewWrite(ctx context.Context, c driver.Conn, area string, offset, bit, q
 			fmt.Fprintf(os.Stderr, "%v\n", err)
 			os.Exit(2)
 		}
+		// 索引寄存器没有编号、宽度由区码固定：-offset 必须为 0，-qty 被忽略
+		// （IX/IY 写 1 字，ID 写 2 字）。WDID 只带一个字会让 I1 留在旧值上
+		// 却回「写成功」，所以这里不能凭 -qty 猜宽度。
+		dtype, length := model.TypeUint16, qty
+		if a.Kind == mewcodec.KindIndex {
+			if offset != 0 {
+				fmt.Fprintf(os.Stderr, "%s 没有编号（索引寄存器只有一组），-offset 必须为 0，得到 %d\n", a.Key, offset)
+				os.Exit(2)
+			}
+			length = mewcodec.IndexWords(a)
+			if length == 2 {
+				dtype = model.TypeUint32
+			}
+		}
 		req = driver.WriteRequest{
 			PointID:  fmt.Sprintf("%s%d", area, offset),
-			Address:  model.Address{Kind: model.AddressRegister, Area: area, Offset: offset, Bit: -1, Length: qty},
-			DataType: model.TypeUint16,
-			Value:    model.NumValue(model.TypeUint16, n),
+			Address:  model.Address{Kind: model.AddressRegister, Area: area, Offset: offset, Bit: -1, Length: length},
+			DataType: dtype,
+			Value:    model.NumValue(dtype, n),
 		}
 	}
 

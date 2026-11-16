@@ -257,31 +257,92 @@ func (c *conn) Read(ctx context.Context, spans []driver.ReadSpan) ([]driver.RawS
 
 	var out []driver.RawSample
 	var firstErr error
-	ok := 0
-	for _, span := range spans {
+	// goodSamples 而不是 goodSpans：一个 span 成功返回不等于其中有点位成功。
+	// readSpan 在解码阶段逐点失败时（bool 缺位号、类型与宽度不符）仍然返回
+	// nil error，于是「全员失败」会被当成成功、Read 返回 nil——上层看到的
+	// 是一台「在采但全坏」的设备，熔断与告警永不触发。见 docs §3.3.1。
+	goodSamples := 0
+	var firstSampleErr error
+	countGood := func(samples []driver.RawSample) {
+		for _, s := range samples {
+			if s.Err == nil && (s.Quality == model.QualityGood || s.Quality == "") {
+				goodSamples++
+				continue
+			}
+			if firstSampleErr != nil {
+				continue
+			}
+			firstSampleErr = s.Err
+			if firstSampleErr == nil {
+				// 质量码说坏、却没有带错误：不能因为「错误是 nil」就让
+				// Read 在这条点位上一路沉默。合成一条，把无声变成可诊断。
+				firstSampleErr = driver.E(driver.ErrProtocol, "read", c.devID,
+					fmt.Sprintf("point %s came back with quality %q but no error", s.PointID, s.Quality),
+					false, nil)
+			}
+		}
+	}
+	// markFailed 把一整个 span 的点位标成失败，但**跳过已经拿到样本的点位**：
+	// 一个 span 可能被切成多个请求（每帧最多 24 字），前面的帧成功了、
+	// 后面的帧失败时，前面的值不该被一起抹掉——它们是真实读到的数据，
+	// 而重复追加还会让同一 ID 出现两个样本。
+	markFailed := func(span driver.ReadSpan, err error) {
+		seen := make(map[string]bool, len(out))
+		for _, s := range out {
+			seen[s.PointID] = true
+		}
+		for _, p := range span.Points {
+			if seen[p.ID] {
+				continue
+			}
+			out = append(out, driver.RawSample{PointID: p.ID, Quality: qualityOf(err), Err: err})
+			if firstSampleErr == nil {
+				firstSampleErr = err
+			}
+		}
+	}
+	// markRemaining 把从 i 开始的所有点位标成失败：链路级失败时它们还没
+	// 发出去，若直接从结果里消失，采集层会当成「设备安静」而不是读失败。
+	markRemaining := func(i int, err error) {
+		for _, span := range spans[i:] {
+			markFailed(span, err)
+		}
+	}
+	for i, span := range spans {
 		if err := ctx.Err(); err != nil {
-			return out, driver.E(driver.ErrTimeout, "read", c.devID, "context done", true, err)
+			linkErr := driver.E(driver.ErrTimeout, "read", c.devID, "context done", true, err)
+			if firstErr == nil {
+				firstErr = linkErr
+			}
+			// 本轮剩余点位一个字节都没发出去，必须显式标坏。
+			markRemaining(i, linkErr)
+			break
 		}
 		samples, err := c.readSpan(ctx, span)
+		// 先收下已经拿到的样本（含多帧 span 里成功的那几帧），再处理失败：
+		// 反过来会把这些值丢掉。
+		countGood(samples)
+		out = append(out, samples...)
 		if err != nil {
 			if firstErr == nil {
 				firstErr = err
 			}
 			// 整段失败时把每个点位都标成失败，而不是让它们从结果里消失：
-			// 消失的点位在采集层表现为「没有新样本」，会被当成设备安静，
-			// 而不是读取失败。
-			for _, p := range span.Points {
-				out = append(out, driver.RawSample{PointID: p.ID, Quality: qualityOf(err), Err: err})
+			// 消失的点位在采集层表现为「没有新样本」，会被当成设备安静。
+			markFailed(span, err)
+			// 链路级失败（超时/断连）短路：继续逐个等完剩余 span 只会把
+			// 一轮采集拖成 N 倍超时，而结果一定是全坏。
+			if driver.IsLinkFailure(err) {
+				markRemaining(i+1, err)
+				break
 			}
 			continue
 		}
-		out = append(out, samples...)
-		ok++
 	}
-	if ok == 0 && firstErr != nil {
-		return out, firstErr
+	if goodSamples == 0 && firstSampleErr == nil {
+		firstSampleErr = firstErr
 	}
-	return out, nil
+	return out, driver.PartialReadError(goodSamples, firstSampleErr)
 }
 
 func (c *conn) readSpan(ctx context.Context, span driver.ReadSpan) ([]driver.RawSample, error) {
@@ -320,23 +381,83 @@ func (c *conn) readSpan(ctx context.Context, span driver.ReadSpan) ([]driver.Raw
 
 	// 一次请求最多 MaxWords 个字。规划层按 125 个寄存器合并，这里必须
 	// 再切：超长的请求会被 PLC 回 41H，而那个错误信息说不清是哪一段太长。
-	var out []driver.RawSample
-	for start := min; start <= max; start += mewtocol.MaxWords {
+	//
+	// 切分之后**先把整段拼进一个连续缓冲、最后统一解码**，而不是「读一帧
+	// 解一帧」。逐帧解码是这一处的原始缺陷：decodeSpan 会遍历 span 里的
+	// **全部**点位，于是前半帧为后面的点位报 "point lies before the
+	// response window"、后半帧为前面的点位报 "response shorter than
+	// requested range"。两半各有一半点位坏，而 Read 因有成功样本仍返回
+	// nil——症状是「连续 24 字以上的点位组每轮坏一半」，静默且无日志。
+	//
+	// 拼接还顺带解决了「单个点位比一帧还宽」：例如 32 字的字符串点位，
+	// 逐帧解码无论怎么对齐都解不出来，拼接之后就是一段连续的字节。
+	total := make([]byte, (max-min+1)*2)
+	nFrames := (max - min + mewtocol.MaxWords) / mewtocol.MaxWords
+	frameErr := make([]error, nFrames)
+	// attempted 区分「读失败」与「根本没发」。少了它，链路级失败后没发出的
+	// 那几帧会被当成成功，points 从全零的缓冲里解出 0 —— 一个假的、看起来
+	// 完全正常的读数。
+	attempted := make([]bool, nFrames)
+	var firstErr error
+	for i := 0; i < nFrames; i++ {
+		start := min + i*mewtocol.MaxWords
 		end := start + mewtocol.MaxWords - 1
 		if end > max {
 			end = max
 		}
+		attempted[i] = true
 		data, err := c.readWords(ctx, area, start, end, "read")
 		if err != nil {
-			return out, err
+			frameErr[i] = err
+			if firstErr == nil {
+				firstErr = err
+			}
+			// 链路级失败后剩下的帧不可能成功，继续发只会把一轮采集拖成
+			// N 倍超时。
+			if driver.IsLinkFailure(err) {
+				break
+			}
+			continue
 		}
-		samples, err := decodeSpan(span, area, start, data)
-		if err != nil {
-			return out, err
-		}
-		out = append(out, samples...)
+		copy(total[(start-min)*2:], data)
 	}
-	return out, nil
+
+	out := make([]driver.RawSample, 0, len(span.Points))
+	for _, p := range span.Points {
+		w := pointWords(p)
+		// 点位覆盖的帧区间：一个点位可以跨帧（拼接缓冲的用途之一），
+		// 但它只有在**覆盖它的每一帧都读成功**时才能解码，否则那半个
+		// 值是「新帧 + 旧帧残留」拼出来的垃圾。
+		first := (p.Address.Offset - min) / mewtocol.MaxWords
+		last := (p.Address.Offset + w - 1 - min) / mewtocol.MaxWords
+		var frameFailure error
+		for f := first; f <= last; f++ {
+			if !attempted[f] {
+				// 这一帧因为前面的链路级失败而没有发出去。
+				frameFailure = firstErr
+				if frameFailure == nil {
+					frameFailure = driver.E(driver.ErrInternal, "read", c.devID,
+						"frame was neither read nor failed", false, nil)
+				}
+				break
+			}
+			if frameErr[f] != nil {
+				frameFailure = frameErr[f]
+				break
+			}
+		}
+		if frameFailure != nil {
+			out = append(out, errSample(p.ID, frameFailure))
+			continue
+		}
+		s, err := decodePoint(area, p, (p.Address.Offset-min)*2, total)
+		if err != nil {
+			out = append(out, errSample(p.ID, err))
+			continue
+		}
+		out = append(out, s)
+	}
+	return out, firstErr
 }
 
 // isTimerContact 判断是不是 T/C 接点区（定时器接点 / 计数器接点）。
@@ -421,10 +542,31 @@ func (c *conn) readTimerContacts(ctx context.Context, span driver.ReadSpan, area
 // spanWordRange 计算 span 覆盖的字地址闭区间。
 //
 // 布尔接点只占一个字的一部分，宽度算 1 个字；其它类型按 length 折算成字。
-// 索引寄存器没有编号，恒为 (0,0)。
+//
+// 索引寄存器没有编号，区间由区宽固定（IX/IY 是 0..0，ID 是 0..1），因此
+// 这里还要把两类配置错误显式拦下——它们此前都被静默忽略：
+//
+//   - offset 非 0：帧里的九个 0 就是「没有编号」的编码，那个 offset 根本
+//     发不出去。忽略它会让一个本该指向 DT100 的点位悄悄读到索引寄存器。
+//   - 点位宽度超过区宽：IX 只有 1 个字，声明成 uint32 就需要 2 个字，而
+//     应答只回 1 个字。不拦的结果是运行期报「response shorter than
+//     requested range」，看不出是哪条配置错了。
 func (c *conn) spanWordRange(span driver.ReadSpan, area mewtocol.Area) (int, int, error) {
 	if area.Kind == mewtocol.KindIndex {
-		return 0, 0, nil
+		w := mewtocol.IndexWords(area)
+		for _, p := range span.Points {
+			if p.Address.Offset != 0 {
+				return 0, 0, driver.E(driver.ErrAddress, "read", c.devID,
+					fmt.Sprintf("point %s: %s has no address (index registers are not numbered), "+
+						"address.offset must be 0, got %d", p.ID, area.Key, p.Address.Offset), false, nil)
+			}
+			if pw := pointWords(p); pw > w {
+				return 0, 0, driver.E(driver.ErrAddress, "read", c.devID,
+					fmt.Sprintf("point %s: %s holds %d word(s), point asks for %d (%s)"+
+						"; declare %s points as uint16", p.ID, area.Key, w, pw, p.DataType, area.Key), false, nil)
+			}
+		}
+		return 0, w - 1, nil
 	}
 	min := -1
 	max := 0
@@ -484,50 +626,40 @@ func (c *conn) readWords(ctx context.Context, area mewtocol.Area, start, end int
 	return data, nil
 }
 
-// decodeSpan 从一段连续的字数据里取出 span 内各点位的值。
-func decodeSpan(span driver.ReadSpan, area mewtocol.Area, base int, data []byte) ([]driver.RawSample, error) {
-	out := make([]driver.RawSample, 0, len(span.Points))
-	for _, p := range span.Points {
-		idx := p.Address.Offset - base
-		if idx < 0 {
-			out = append(out, errSample(p.ID, driver.E(driver.ErrInternal, "decode", "",
-				"point lies before the response window", false, nil)))
-			continue
-		}
-		width := pointWords(p)
-		byteOff := idx * 2
-		if byteOff+width*2 > len(data) {
-			out = append(out, errSample(p.ID, driver.E(driver.ErrProtocol, "decode", "",
-				fmt.Sprintf("response shorter than requested range: need %d bytes at offset %d, have %d",
-					width*2, byteOff, len(data)), false, nil)))
-			continue
-		}
-		raw := data[byteOff : byteOff+width*2]
-
-		if p.DataType == model.TypeBool {
-			bit := p.Address.Bit
-			if bit < 0 || bit > 15 {
-				out = append(out, errSample(p.ID, driver.E(driver.ErrAddress, "decode", "",
-					fmt.Sprintf("bool point on %s needs address.bit 0..15", area.Key), false, nil)))
-				continue
-			}
-			word := uint16(raw[0])<<8 | uint16(raw[1])
-			out = append(out, driver.RawSample{
-				PointID: p.ID,
-				Value:   model.BoolValue(word&(1<<uint(bit)) != 0),
-				Quality: model.QualityGood,
-			})
-			continue
-		}
-
-		v, err := value.Decode(raw, p.DataType, orderFor(width*2, p.ByteOrder))
-		if err != nil {
-			out = append(out, errSample(p.ID, driver.E(driver.ErrProtocol, "decode", p.ID, err.Error(), false, err)))
-			continue
-		}
-		out = append(out, driver.RawSample{PointID: p.ID, Value: v, Quality: model.QualityGood})
+// decodePoint 从一段连续的字数据里取出一个点位的值。
+//
+// byteOff 是该点位在 data 里的字节偏移（已由调用方按 span 起点折算）。
+func decodePoint(area mewtocol.Area, p driver.PointRef, byteOff int, data []byte) (driver.RawSample, error) {
+	width := pointWords(p)
+	if byteOff < 0 || byteOff+width*2 > len(data) {
+		// 走到这里说明 spanWordRange 与实际读取范围不一致，属于内部错误，
+		// 不是设备行为——但也不能静默返回零值。
+		return driver.RawSample{}, driver.E(driver.ErrInternal, "decode", "",
+			fmt.Sprintf("point %s: window %d..%d bytes outside the %d-byte response",
+				p.ID, byteOff, byteOff+width*2, len(data)), false, nil)
 	}
-	return out, nil
+	raw := data[byteOff : byteOff+width*2]
+
+	if p.DataType == model.TypeBool {
+		bit := p.Address.Bit
+		if bit < 0 || bit > 15 {
+			return driver.RawSample{}, driver.E(driver.ErrAddress, "decode", "",
+				fmt.Sprintf("point %s: bool point on %s needs address.bit 0..15, got %d",
+					p.ID, area.Key, bit), false, nil)
+		}
+		word := uint16(raw[0])<<8 | uint16(raw[1])
+		return driver.RawSample{
+			PointID: p.ID,
+			Value:   model.BoolValue(word&(1<<uint(bit)) != 0),
+			Quality: model.QualityGood,
+		}, nil
+	}
+
+	v, err := value.Decode(raw, p.DataType, orderFor(width*2, p.ByteOrder))
+	if err != nil {
+		return driver.RawSample{}, driver.E(driver.ErrProtocol, "decode", p.ID, err.Error(), false, err)
+	}
+	return driver.RawSample{PointID: p.ID, Value: v, Quality: model.QualityGood}, nil
 }
 
 // orderFor 返回多字数值的字节序。
@@ -637,6 +769,21 @@ func (c *conn) writeWords(ctx context.Context, req driver.WriteRequest, area mew
 				req.DataType, words, mewtocol.MaxWords), false, nil)
 		return writeFail(req, err), err
 	}
+	// 索引寄存器的宽度由区码固定（IX/IY 1 字，ID 2 字），写请求必须正好
+	// 是这个宽度：WDID 只带一个字会让 I1 留在旧值上却回「写成功」，而 I1
+	// 正是 32 位索引的高半部分——这类「写成功但只写了一半」的错误在现场
+	// 表现为「索引值偶尔不对」，比直接报错难查得多。
+	if area.Kind == mewtocol.KindIndex {
+		w := mewtocol.IndexWords(area)
+		if words != w {
+			err := driver.E(driver.ErrAddress, "write", c.devID,
+				fmt.Sprintf("point %s: %s is a %d-word register, write carries %d (%s)"+
+					"; declare it as %s", req.PointID, area.Key, w, words, req.DataType,
+					map[int]string{1: "uint16", 2: "uint32"}[w]), false, nil)
+			return writeFail(req, err), err
+		}
+	}
+
 	data, err := value.Encode(req.Value, req.DataType, orderFor(words*2, req.ByteOrder))
 	if err != nil {
 		err = driver.E(driver.ErrUnsupported, "write", c.devID, err.Error(), false, err)

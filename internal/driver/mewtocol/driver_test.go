@@ -3,6 +3,8 @@ package mewtocol
 import (
 	"context"
 	"errors"
+	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -223,5 +225,294 @@ func TestWriteFailureKeepsEarlierSuccessesIntact(t *testing.T) {
 	}
 	if len(l.requests) != 1 {
 		t.Fatalf("frames = %d, want 1 (the bad item must not touch the wire)", len(l.requests))
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 多帧 span：切帧必须按点位边界、拼接后统一解码
+// ---------------------------------------------------------------------------
+
+// timeoutErr 让 link 的读错误落进 isTimeout 分支（→ ErrTimeout，链路级）。
+type timeoutErr struct{}
+
+func (timeoutErr) Error() string   { return "i/o timeout" }
+func (timeoutErr) Timeout() bool   { return true }
+func (timeoutErr) Temporary() bool { return true }
+
+// spanLink 是一条会「按请求里的起止地址」回真实数据的假链路，并能让第 N
+// 个事务失败。用真实帧而不是固定 byte 串，是为了同时验证切帧边界真的落在
+// 协议允许的位置上。
+type spanLink struct {
+	words    map[int]uint16
+	failAt   int // 从 0 开始的事务序号；-1 表示不失败
+	n        int
+	requests []string
+	reply    []byte
+	pos      int
+}
+
+func (l *spanLink) Write(p []byte) error {
+	l.requests = append(l.requests, string(p))
+	idx := l.n
+	l.n++
+	if idx == l.failAt {
+		l.reply, l.pos = nil, 0
+		return nil
+	}
+	// 用协议自己的解析器取出起止地址：手写下标容易把区码也算进去，
+	// 而那样得到的错误是「write failed」，与要验证的东西无关。
+	req, err := mewtocol.ParseRequest(p)
+	if err != nil {
+		return err
+	}
+	if req.Cmd != mewtocol.CmdReadData || req.Area.Key != "dt" {
+		return fmt.Errorf("spanLink only answers RD on dt, got %s on %s", req.Cmd, req.Area.Key)
+	}
+	var sb strings.Builder
+	sb.WriteString("%01$RD")
+	for a := req.Start; a <= req.End; a++ {
+		v := l.words[a]
+		sb.WriteString(fmt.Sprintf("%02X%02X", v&0xFF, v>>8))
+	}
+	l.reply, l.pos = mewtocol.AppendBCC([]byte(sb.String())), 0
+	return nil
+}
+
+func (l *spanLink) ReadFull(n int) ([]byte, error) {
+	if l.reply == nil {
+		return nil, timeoutErr{}
+	}
+	if l.pos+n > len(l.reply) {
+		return nil, errors.New("script: reply exhausted")
+	}
+	out := l.reply[l.pos : l.pos+n]
+	l.pos += n
+	return out, nil
+}
+
+func (l *spanLink) Close() error                { return nil }
+func (l *spanLink) SetDeadline(time.Time) error { return nil }
+func (l *spanLink) Drain() error                { return nil }
+func (l *spanLink) Lock()                       {}
+func (l *spanLink) Unlock()                     {}
+
+func spanConn(l *spanLink) *conn {
+	return &conn{link: l, station: 1, devID: "plc1", timeout: time.Second}
+}
+
+// TestReadSpanAcrossFrames：30 个连续寄存器超过一帧的 24 字上限，必须切成
+// 两帧、拼接后统一解码，且每个点位只出现一次、全部是 good。
+//
+// 变异验证：把 decodeSpan 的逐帧解码还原（每帧对 span 内全部点位解码），
+// 这条测试会看到 8 个坏点位与 24 个重复样本。
+func TestReadSpanAcrossFrames(t *testing.T) {
+	words := map[int]uint16{}
+	points := make([]driver.PointRef, 0, 30)
+	for i := 0; i < 30; i++ {
+		words[i] = uint16(0x1000 + i)
+		points = append(points, driver.PointRef{
+			ID:       fmt.Sprintf("d%d", i),
+			Address:  model.Address{Kind: model.AddressRegister, Area: "dt", Offset: i, Length: 1, Bit: -1},
+			DataType: model.TypeUint16,
+		})
+	}
+	l := &spanLink{words: words, failAt: -1}
+	c := spanConn(l)
+
+	samples, err := c.Read(context.Background(), []driver.ReadSpan{{ID: "s", Points: points}})
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if len(l.requests) != 2 {
+		t.Fatalf("frames = %d, want 2 (24 words + 6 words): %q", len(l.requests), l.requests)
+	}
+	if len(samples) != 30 {
+		t.Fatalf("samples = %d, want 30 (one per point, no duplicates)", len(samples))
+	}
+	seen := map[string]bool{}
+	for _, s := range samples {
+		if seen[s.PointID] {
+			t.Fatalf("point %s appears twice in the result", s.PointID)
+		}
+		seen[s.PointID] = true
+		if s.Err != nil {
+			t.Fatalf("%s: %v", s.PointID, s.Err)
+		}
+		if s.Quality != model.QualityGood {
+			t.Fatalf("%s quality = %v", s.PointID, s.Quality)
+		}
+	}
+	// 顺序与值都要对：切帧之后点位顺序不能乱，值不能串位。
+	for i, s := range samples {
+		if want := float64(0x1000 + i); s.Value.Num != want {
+			t.Fatalf("sample %d (%s) = %v, want %v", i, s.PointID, s.Value.Num, want)
+		}
+	}
+}
+
+// TestReadSpanSecondFrameFails：多帧 span 里后排的帧失败，前排已经读到的值
+// 必须保留（不重复、不被标坏），后排点位标坏。这是「部分失败」在**一个
+// span 内部**的形态，和跨 span 的部分失败同样重要。
+func TestReadSpanSecondFrameFails(t *testing.T) {
+	words := map[int]uint16{}
+	points := make([]driver.PointRef, 0, 30)
+	for i := 0; i < 30; i++ {
+		words[i] = uint16(i)
+		points = append(points, driver.PointRef{
+			ID:       fmt.Sprintf("d%d", i),
+			Address:  model.Address{Kind: model.AddressRegister, Area: "dt", Offset: i, Length: 1, Bit: -1},
+			DataType: model.TypeUint16,
+		})
+	}
+	l := &spanLink{words: words, failAt: 1}
+	c := spanConn(l)
+
+	samples, err := c.Read(context.Background(), []driver.ReadSpan{{ID: "s", Points: points}})
+	if err != nil {
+		t.Fatalf("有成功点时 Read 不该返回错误: %v", err)
+	}
+	if len(samples) != 30 {
+		t.Fatalf("samples = %d, want 30", len(samples))
+	}
+	for i, s := range samples {
+		if i < 24 {
+			if s.Err != nil || s.Quality != model.QualityGood {
+				t.Fatalf("d%d (first frame) should be good: %+v", i, s)
+			}
+			continue
+		}
+		if s.Err == nil {
+			t.Fatalf("d%d (second frame) should carry the timeout: %+v", i, s)
+		}
+		if s.Quality != model.QualityTimeout {
+			t.Fatalf("d%d quality = %v, want timeout", i, s.Quality)
+		}
+	}
+}
+
+// TestReadSpanLinkFailureStops：第一帧就链路级失败时，后面的帧不再发出去
+// （否则一轮采集会被拖成 N 倍超时），且全部点位都带错误——不能从结果里
+// 消失，那会被采集层当成「设备安静」。
+func TestReadSpanLinkFailureStops(t *testing.T) {
+	words := map[int]uint16{}
+	points := make([]driver.PointRef, 0, 30)
+	for i := 0; i < 30; i++ {
+		words[i] = uint16(i)
+		points = append(points, driver.PointRef{
+			ID:       fmt.Sprintf("d%d", i),
+			Address:  model.Address{Kind: model.AddressRegister, Area: "dt", Offset: i, Length: 1, Bit: -1},
+			DataType: model.TypeUint16,
+		})
+	}
+	l := &spanLink{words: words, failAt: 0}
+	c := spanConn(l)
+
+	samples, err := c.Read(context.Background(), []driver.ReadSpan{{ID: "s", Points: points}})
+	if err == nil {
+		t.Fatal("全部点位失败时必须返回错误，让熔断器看到「设备全坏」")
+	}
+	if got := driver.KindOf(err); got != driver.ErrTimeout {
+		t.Fatalf("kind = %v, want timeout", got)
+	}
+	if len(l.requests) != 1 {
+		t.Fatalf("frames = %d, want 1: a link failure must not be followed by more requests", len(l.requests))
+	}
+	if len(samples) != 30 {
+		t.Fatalf("samples = %d, want 30", len(samples))
+	}
+	for _, s := range samples {
+		if s.Err == nil || s.Quality != model.QualityTimeout {
+			t.Fatalf("%s: %+v", s.PointID, s)
+		}
+	}
+}
+
+// TestReadIndexPointConfig：索引寄存器上两类配置错误必须在发帧之前拦下，
+// 而不是静默读到别的东西 / 在运行期报「应答过短」。
+func TestReadIndexPointConfig(t *testing.T) {
+	cases := []struct {
+		name string
+		ref  driver.PointRef
+	}{
+		{"ix with offset", driver.PointRef{
+			ID: "bad", Address: model.Address{Kind: model.AddressRegister, Area: "ix", Offset: 1, Bit: -1},
+			DataType: model.TypeUint16,
+		}},
+		{"ix as uint32", driver.PointRef{
+			ID: "bad", Address: model.Address{Kind: model.AddressRegister, Area: "ix", Offset: 0, Bit: -1},
+			DataType: model.TypeUint32,
+		}},
+	}
+	for _, tc := range cases {
+		l := &spanLink{words: map[int]uint16{}, failAt: -1}
+		c := spanConn(l)
+		samples, err := c.Read(context.Background(), []driver.ReadSpan{{ID: "s", Points: []driver.PointRef{tc.ref}}})
+		if err == nil && (len(samples) == 0 || samples[0].Err == nil) {
+			t.Fatalf("%s: expected an address error, got %+v / %v", tc.name, samples, err)
+		}
+		if len(l.requests) != 0 {
+			t.Fatalf("%s: a bad config must not touch the wire, sent %q", tc.name, l.requests)
+		}
+		var e error
+		if err != nil {
+			e = err
+		} else {
+			e = samples[0].Err
+		}
+		if got := driver.KindOf(e); got != driver.ErrAddress {
+			t.Fatalf("%s: kind = %v, want address", tc.name, got)
+		}
+	}
+}
+
+// TestWriteIndexWidthCheckedLocally：宽度不符的索引写必须在**主站侧**被拒绝，
+// 一个字节都不发。发出去的话，PLC 侧要么回 61H（数据错，看不出哪条配置错），
+// 要么在某些固件上照收——只写 I0，I1 留在旧值，却回「写成功」。
+func TestWriteIndexWidthCheckedLocally(t *testing.T) {
+	cases := []struct {
+		name string
+		req  driver.WriteRequest
+		hint string
+	}{
+		{
+			name: "id as uint16",
+			req: driver.WriteRequest{
+				PointID:  "id16",
+				Address:  model.Address{Kind: model.AddressRegister, Area: "id", Offset: 0, Length: 1, Bit: -1},
+				DataType: model.TypeUint16,
+				Value:    model.NumValue(model.TypeUint16, 9),
+			},
+			hint: "uint32",
+		},
+		{
+			name: "ix as uint32",
+			req: driver.WriteRequest{
+				PointID:  "ix32",
+				Address:  model.Address{Kind: model.AddressRegister, Area: "ix", Offset: 0, Length: 2, Bit: -1},
+				DataType: model.TypeUint32,
+				Value:    model.NumValue(model.TypeUint32, 9),
+			},
+			hint: "uint16",
+		},
+	}
+	for _, tc := range cases {
+		l := &spanLink{words: map[int]uint16{}, failAt: -1}
+		c := spanConn(l)
+		res, err := c.Write(context.Background(), []driver.WriteRequest{tc.req})
+		if err == nil {
+			t.Fatalf("%s: expected an error", tc.name)
+		}
+		if len(l.requests) != 0 {
+			t.Fatalf("%s: a bad width must not touch the wire, sent %q", tc.name, l.requests)
+		}
+		if got := driver.KindOf(err); got != driver.ErrAddress {
+			t.Fatalf("%s: kind = %v, want address", tc.name, got)
+		}
+		if !strings.Contains(err.Error(), tc.hint) {
+			t.Fatalf("%s: error should name the right type (%s): %v", tc.name, tc.hint, err)
+		}
+		if len(res) != 1 || res[0].Quality == "" {
+			t.Fatalf("%s: failed item must carry a quality: %+v", tc.name, res)
+		}
 	}
 }

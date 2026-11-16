@@ -74,8 +74,16 @@ const (
 	SymbolOK   = '$'
 	SymbolErr  = '!'
 	Terminator = '\r'
-	// BCCWildcard 写在 BCC 位上表示「本帧不做块校验」。手册允许发送方
-	// 这么写，接收方仍会在应答里放真实 BCC。
+	// BCCWildcard 是写在 BCC 位上表示「本帧不带块校验」的两个字符（"**"）。
+	//
+	// 手册（WUME-MEWCP-01 §1.1）只在**发送方**这一侧允许它：主站可以用
+	// "**" 代替真实 BCC，PLC 照样执行命令。应答侧没有这条豁免——PLC 的应答
+	// 恒带真实 BCC。
+	//
+	// 因此这个常量只对「解析主站请求」有意义；解析应答时出现 "**" 一律是
+	// 坏帧（ChecksumError，可重试）。旧实现两侧都放行，等于把一条未校验的
+	// 字节流（噪声、别的协议串话、被中间设备改写过的帧）当成合法应答收下，
+	// 而这类帧在总线上出现本身就是链路异常的信号——静默接受比报错危险得多。
 	BCCWildcard = '*'
 )
 
@@ -241,6 +249,28 @@ func Lookup(name string) (Area, bool) {
 // Areas 返回全部区域定义（固定顺序，供枚举与文档使用）。
 func Areas() []Area { return append([]Area(nil), areas...) }
 
+// IndexWords 返回索引寄存器区在线上占的字数；非索引区返回 0。
+//
+// IX/IY 各是一个 16 位寄存器，回 1 字；ID 是 IX+IY 拼成的 32 位寄存器
+// （低位字 = IX），回 2 字。RD 的正文对索引寄存器恒为「区码 + 9 个 0」——
+// 那条命令里没有起止地址，所以**宽度只能由区码决定**，不能由请求里的
+// 地址推出来。
+//
+// 这一条写在手册 §1.3.7 的应答帧图上：`RDID` 的应答是 `Register contents
+// (I0) 4 characters` + `Register contents (I1) 4 characters`，共 8 个字符
+// = 2 个字；`RDIX`/`RDIY` 只有 4 个字符 = 1 个字。把它当成「一个区一种宽度」
+// 而不区分 ID，会让 ID 的读写稳定失败（读：应答 2 字、请求按 1 字校验；
+// 写：只发 I0，I1 保持旧值——而写操作报成功）。
+func IndexWords(a Area) int {
+	if a.Kind != KindIndex {
+		return 0
+	}
+	if a.Code == "ID" {
+		return 2
+	}
+	return 1
+}
+
 // Keys 返回全部规范区名（固定顺序）。
 func Keys() []string {
 	out := make([]string, 0, len(areas))
@@ -340,14 +370,20 @@ func ParseStation(text string) (Station, error) {
 
 // BuildReadWords 构造数据区读（RD），一次读 [start, end] 闭区间。
 //
-// 索引寄存器（IX/IY/ID）没有编号：地址位整体写 9 个 0，此时 start/end
-// 被忽略。
+// 索引寄存器（IX/IY/ID）没有编号：地址位整体写 9 个 0，起止地址由区码
+// 决定（IX/IY 是 0..0，ID 是 0..1）。此时仍要求调用方按 IndexWords 传入
+// 那两个值，而不是「随便传、反正被忽略」——静默忽略地址会让一个偏移量
+// 配错的点位拿到另一个寄存器的值。
 func BuildReadWords(st Station, area Area, start, end int) ([]byte, error) {
 	if err := st.Validate(); err != nil {
 		return nil, err
 	}
 	switch area.Kind {
 	case KindIndex:
+		if w := IndexWords(area); start != 0 || end != w-1 {
+			return nil, fmt.Errorf("mewtocol: %s has no address (index registers are not numbered): "+
+				"read range must be 0..%d, got %d..%d", area.Key, w-1, start, end)
+		}
 		return request(st, CmdReadData, area.Code+"000000000")
 	case KindWord:
 		if start < 0 || start > 99999 {
@@ -372,6 +408,12 @@ func BuildReadWords(st Station, area Area, start, end int) ([]byte, error) {
 // 协议里是冗余的（数据长度已经决定了写到哪），但它必须存在且自洽，
 // 否则 PLC 回 41H 格式错。这里由数据长度反推结束地址，两者不可能不一致。
 //
+// 索引寄存器（IX/IY/ID）没有编号，正文是 `区码 + 9 个 0 + 数据`，而且
+// 数据必须正好是该区的宽度（IX/IY 1 字，ID 2 字）：WDIX 写一个字、WDID
+// 写两个字是同一条命令的两种合法形态，`WDIX` 带两个字或 `WDID` 只带一个
+// 字都不是手册里的帧。尤其是后者——它会把 I1 留在旧值上却报成功，而 I1
+// 恰恰是 32 位索引的高半部分。
+//
 // data 是大端规范化的原始字节，每字 2 字节；本函数负责在线上换成
 // 「低字节在前」。
 func BuildWriteWords(st Station, area Area, start int, data []byte) ([]byte, error) {
@@ -391,6 +433,15 @@ func BuildWriteWords(st Station, area Area, start int, data []byte) ([]byte, err
 	}
 	switch area.Kind {
 	case KindIndex:
+		w := IndexWords(area)
+		if start != 0 {
+			return nil, fmt.Errorf("mewtocol: %s has no address (index registers are not numbered), "+
+				"write offset must be 0, got %d", area.Key, start)
+		}
+		if words != w {
+			return nil, fmt.Errorf("mewtocol: %s is a %d-word register, write carries %d",
+				area.Key, w, words)
+		}
 		return request(st, CmdWriteData, area.Code+"000000000"+body)
 	case KindWord:
 		if start < 0 || start > 99999 || start+words-1 > 99999 {
@@ -879,11 +930,17 @@ var errText = map[byte]string{
 type ChecksumError struct {
 	// Got 是从帧里算出来的 BCC。
 	Got byte
-	// Want 是帧里携带的 BCC。
+	// Want 是帧里携带的 BCC；帧里写的是 "**"（不带块校验）时为 0，
+	// 并由 Note 说明。
 	Want byte
+	// Note 是给人看的补充说明，例如「应答里出现 ** 而本协议不允许」。
+	Note string
 }
 
 func (e *ChecksumError) Error() string {
+	if e.Note != "" {
+		return fmt.Sprintf("mewtocol: BCC mismatch: %s (computed %02XH)", e.Note, e.Got)
+	}
 	return fmt.Sprintf("mewtocol: BCC mismatch: frame carries %02XH, computed %02XH", e.Want, e.Got)
 }
 
@@ -904,25 +961,19 @@ func ParseResponse(raw []byte) (Response, error) {
 	if len(body) < 7 {
 		return Response{}, fmt.Errorf("mewtocol: response body too short (%d bytes)", len(body))
 	}
-	bccAt := len(body) - 2
 	station, err := ParseStation(string(body[1:3]))
 	if err != nil {
 		return Response{}, err
 	}
-	if body[bccAt] != BCCWildcard || body[bccAt+1] != BCCWildcard {
-		want, err := parseHexByte(string(body[bccAt:]))
-		if err != nil {
-			return Response{}, fmt.Errorf("mewtocol: bad BCC field %q: %w", body[bccAt:], err)
-		}
-		if got := BCC(body[:bccAt]); got != want {
-			return Response{}, &ChecksumError{Got: got, Want: want}
-		}
+	// 应答侧不接受 "**"：手册只给主站的命令留了这条豁免。
+	if err := checkBCC(body, false); err != nil {
+		return Response{}, err
 	}
 	switch body[3] {
 	case SymbolOK:
 		return Response{
 			Station: station, Code: string(body[4:6]),
-			Data: string(body[6:bccAt]), Raw: raw,
+			Data: string(body[6:bccAtOf(body)]), Raw: raw,
 		}, nil
 	case SymbolErr:
 		code, err := parseHexByte(string(body[4:6]))

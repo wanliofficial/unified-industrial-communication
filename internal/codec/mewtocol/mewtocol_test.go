@@ -565,15 +565,40 @@ func TestParseResponseError(t *testing.T) {
 	}
 }
 
-func TestParseResponseBCCWildcard(t *testing.T) {
-	// 对端用 `**` 表示不校验；我们按「不校验」接受，但 Raw 保留原样。
-	frame := []byte("%01$RD0063**\r")
-	r, err := ParseResponse(frame)
+// TestParseRequestWildcardBCC 钉住「只有主站可以用 ** 免校验」这一半：
+// 手册允许主站发 `**` 代替真实 BCC，PLC 照样执行命令。内置从站必须认它，
+// 否则自检通过、对接「不校验」的上位机全失败。
+func TestParseRequestWildcardBCC(t *testing.T) {
+	// 末两位是真假 BCC 的帧，把 BCC 换成 ** 之后正文与地址都不变。
+	frame := []byte("%01#RCSX0000**\r")
+	req, err := ParseRequest(frame)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("command with ** BCC should parse: %v", err)
 	}
-	if r.Data != "0063" {
-		t.Fatalf("data = %q", r.Data)
+	if req.Cmd != CmdReadContactOne || req.Start != 0 {
+		t.Fatalf("unexpected request: %+v", req)
+	}
+}
+
+// TestParseResponseRejectsWildcardBCC 钉住另一半：应答侧没有这条豁免。
+//
+// 手册里 `**` 只出现在「主站 → PLC」的说明里，PLC 的应答恒带真实 BCC。
+// 旧实现两侧共用一份校验、对 `**` 一视同仁地放行，等于把一条未校验的
+// 字节流（噪声、别的协议串话、被网关改写过的帧）当成合法应答收下——而这
+// 种帧在总线上出现本身就是链路异常的信号。
+func TestParseResponseRejectsWildcardBCC(t *testing.T) {
+	for _, frame := range [][]byte{
+		[]byte("%01$RD0063**\r"),
+		[]byte("%01!41**\r"),
+	} {
+		_, err := ParseResponse(frame)
+		var ce *ChecksumError
+		if !errors.As(err, &ce) {
+			t.Fatalf("%q: err = %v, want *ChecksumError", frame, err)
+		}
+		if !strings.Contains(err.Error(), "block check") {
+			t.Fatalf("%q: error should explain the wildcard: %v", frame, err)
+		}
 	}
 }
 
@@ -1029,5 +1054,97 @@ func TestBuildWriteContacts(t *testing.T) {
 	}
 	if _, err := BuildWriteContacts(1, many); err == nil {
 		t.Fatal("more than 8 contacts in one WCP should be rejected")
+	}
+}
+
+// TestParseResponseRejectsForcedZeroBCC 钉住「** 的两种合法形态」：
+//
+//   - BCC 恰为 00 时写成 "**" 是合法的省略（TestParseResponseBCCWildcard）；
+//   - 其余情况若 BCC 字段不是真值（包括「传输路径上被强制置零」的网关
+//     写的 "**"），一律报 ChecksumError——把这种帧静默放行等于收下一个
+//     坏字节流，而总线上出现这种帧本身就是链路异常的信号。
+func TestParseResponseRejectsForcedZeroBCC(t *testing.T) {
+	// 正文真 BCC 不是 00：用真值构造一个会被网关「强制置零」的帧。
+	body := []byte("%01$RD0063")
+	real := BCC(body)
+	if real == 0 {
+		t.Skip("构造不出非零 BCC 的样本（正文异或恰为 0），换一条")
+	}
+	frame := append(body, '*', '*', Terminator)
+	_, err := ParseResponse(frame)
+	var ck *ChecksumError
+	if !errors.As(err, &ck) {
+		t.Fatalf("forced-zero ** frame: err = %v, want *ChecksumError", err)
+	}
+	// 且错误语义是「可重试的协议错」而不是静默通过：classify 会把
+	// ChecksumError 映射为 temporary=true 的重发。
+	if !strings.Contains(err.Error(), "BCC") {
+		t.Fatalf("error message should name BCC: %v", err)
+	}
+}
+
+// TestIndexWords 钉住索引寄存器的线上宽度：IX/IY 一个 16 位寄存器（1 字），
+// ID 是 IX+IY 拼成的 32 位寄存器（2 字）。
+//
+// 手册 §1.3.7 的应答帧图：`RDIX`/`RDIY` 只有 4 个字符（`Register contents
+// 4 characters`），`RDID` 是 8 个字符（I0 4 个 + I1 4 个）。这不是「一格
+// 两字」，而是**区码决定宽度**——那条命令里根本没有地址字段可推断宽度。
+func TestIndexWords(t *testing.T) {
+	cases := map[string]int{"ix": 1, "iy": 1, "id": 2, "dt": 0, "x": 0}
+	for key, want := range cases {
+		if got := IndexWords(mustArea(t, key)); got != want {
+			t.Errorf("IndexWords(%s) = %d, want %d", key, got, want)
+		}
+	}
+}
+
+// TestBuildReadIndexRange：索引寄存器没有编号，调用方仍必须按区宽传 0..0
+// （IX/IY）或 0..1（ID）。传别的值是配置错误，不能静默忽略——忽略会让一个
+// 偏移量写错的点位悄悄读到索引寄存器而不是它本该读的区。
+func TestBuildReadIndexRange(t *testing.T) {
+	if _, err := BuildReadWords(1, mustArea(t, "ix"), 0, 0); err != nil {
+		t.Fatalf("IX 0..0 should build: %v", err)
+	}
+	if _, err := BuildReadWords(1, mustArea(t, "id"), 0, 1); err != nil {
+		t.Fatalf("ID 0..1 should build: %v", err)
+	}
+	for _, tc := range []struct {
+		area  string
+		start int
+		end   int
+	}{
+		{"ix", 0, 1},
+		{"ix", 1, 1},
+		{"id", 0, 0},
+	} {
+		_, err := BuildReadWords(1, mustArea(t, tc.area), tc.start, tc.end)
+		if err == nil {
+			t.Fatalf("%s %d..%d: expected an error", tc.area, tc.start, tc.end)
+		}
+		if !strings.Contains(err.Error(), "not numbered") {
+			t.Fatalf("%s %d..%d: error should explain that index registers have no address: %v",
+				tc.area, tc.start, tc.end, err)
+		}
+	}
+}
+
+// TestBuildWriteIndexWidth：WDIX 恒带 1 字、WDID 恒带 2 字。少发一个字会让
+// I1 留在旧值上却回「写成功」，而 I1 正是 32 位索引的高半部分。
+func TestBuildWriteIndexWidth(t *testing.T) {
+	frame, err := BuildWriteWords(1, mustArea(t, "id"), 0, []byte{0, 2, 0, 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := string(frame), "%01#WDID00000000002000100"; !strings.HasPrefix(got, want) {
+		t.Fatalf("frame = %q, want prefix %q", got, want)
+	}
+	if _, err := BuildWriteWords(1, mustArea(t, "id"), 0, []byte{0, 2}); err == nil {
+		t.Fatal("WDID with one word must be rejected")
+	}
+	if _, err := BuildWriteWords(1, mustArea(t, "ix"), 0, []byte{0, 1, 0, 2}); err == nil {
+		t.Fatal("WDIX with two words must be rejected")
+	}
+	if _, err := BuildWriteWords(1, mustArea(t, "ix"), 1, []byte{0, 1}); err == nil {
+		t.Fatal("WDIX with a non-zero offset must be rejected")
 	}
 }
