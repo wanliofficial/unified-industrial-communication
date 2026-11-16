@@ -28,15 +28,17 @@
         ┌─────────▼──────────┐   ┌───────────────────┐
         │ Uic.Driver         │◄──│ Uic.Codec.Modbus   │
         │ 驱动 SDK + 注册表   │   │ Uic.Codec.S7       │
-        └─────────┬──────────┘   │ Uic.Transport      │
-                  │              └───────────────────┘
-        ┌─────────▼──────────┐   ┌───────────────────┐
-        │ Uic.Driver.Modbus  │   │ Uic.Domain         │
-        │ Uic.Driver.S7      │   │ 模型 + 线上契约     │
+        └─────────┬──────────┘   │ Uic.Codec.Bacnet   │
+                  │              │ Uic.Transport      │
+        ┌─────────▼──────────┐   └───────────────────┘
+        │ Uic.Driver.Modbus  │   ┌───────────────────┐
+        │ Uic.Driver.S7      │   │ Uic.Domain         │
+        │ Uic.Driver.Bacnet  │   │ 模型 + 线上契约     │
         │ Uic.Driver.OpcUa   │   └───────────────────┘
         │ Uic.Driver.Virtual │
         │ Uic.Sim.Modbus     │   ← 南向驱动（取数）
         │ Uic.Sim.S7         │
+        │ Uic.Sim.Bacnet     │
         └────────────────────┘
 ```
 
@@ -60,14 +62,17 @@
 | `Uic.Driver` | `IDriver` / `IConn` 接口、驱动元数据、错误分类、协议无关的 `ValueCodec`（字节序 / BCD / 数组） | 具体协议字节 |
 | `Uic.Codec.Modbus` | PDU 编解码、CRC/LRC、批量窗口计算 | socket、重试 |
 | `Uic.Codec.S7` | TPKT/COTP 分帧、S7 PDU 编解码、区名与字节偏移解析 | socket、会话状态 |
+| `Uic.Codec.Bacnet` | BVLC/NPDU 封拆帧、BACnet 应用/上下文标签、ReadProperty/WriteProperty/Who-Is 编解码、对象标识符 | UDP socket、重试 |
 | `Uic.Codec.Mqtt` | MQTT 3.1.1 报文编解码、订阅登记与重发、主题匹配、TLS 装载 | 采集节奏、点位映射 |
 | `Uic.Transport` | 字节流（TCP / 串口 / 内存）、超时、分帧 | 业务语义 |
 | `Uic.Driver.Modbus` | 主站：连接、探活、读写、异常码映射 | 采集节奏 |
 | `Uic.Driver.S7` | 主站：COTP 会话、PDU 协商、按 PDU 切片、位读写 | 采集节奏 |
+| `Uic.Driver.Bacnet` | 主站：Who-Is/I-Am 探活、按 invoke-id 配对、ReadProperty/WriteProperty、错误分类 | 采集节奏、COV 订阅 |
 | `Uic.Driver.OpcUa` | 主站（客户端）：NodeId 寻址、批量读、写、订阅、证书/PKI | 采集节奏、地址空间暴露 |
 | `Uic.Driver.Mqtt` | 订阅方：主题寻址、JSON 字段取值、订阅缓存、质量/过期判定 | 采集节奏、南向命令通道、写点位 |
 | `Uic.Sim.Modbus` | 从站：寄存器模型、异常注入 | 北向 |
-| `Uic.Sim.S7` | 从站：DB/I/Q/M 内存模型、返回码 | 北向 |
+| `Uic.Sim.S7` | 从站：DB/I/Q/M 内存模型、返回码 |
+| `Uic.Sim.Bacnet` | 从站：BACnet 对象/属性内存模型、错误与拒绝响应 | 北向 |
 | `Uic.Driver.Virtual` | 波形生成、故障注入 | 网络 |
 | `Uic.Engine` | 每设备 actor、读规划、加工、死区、缓存 | 序列化、网络出口 |
 | `Uic.Outbox` | 落盘队列、分区确认、三重上限、重放 | 认识 MQTT |
@@ -167,10 +172,12 @@ OPC UA 不走队列：它是「读当前值 + 订阅变化」的拉模型，
 
 ### 6. 一个进程，两种形态
 
-`uic run` 是生产形态；`uic sim` 在同一进程里额外起 Modbus 从站与 S7 从站，
-于是「主站 → TCP → 从站」的完整链路可以无硬件跑通——这条路径同时被测试套件复用。
-两种从站各有一套内存模型：Modbus 是寄存器数组、S7 是字节数组 + 位地址，
-合成一个会让两边的点位互相迁就。
+`uic run` 是生产形态；`uic sim` 在同一进程里额外起 Modbus 从站、S7 从站与
+BACnet/IP 从站，于是「主站 → 网络 → 从站」的完整链路可以无硬件跑通——这条路径同时被测试套件复用。
+三种从站各有一套内存模型：Modbus 是寄存器数组、S7 是字节数组 + 位地址、BACnet 是
+「对象标识符 → 属性」的表（`analogInput:1` 的 present-value 是一个真实的值，而不是某个字节偏移）。
+合成一个会让各协议的点位互相迁就：Modbus 的点位没有「对象」概念，BACnet 的点位也不该被压成
+寄存器窗口。
 
 ## 运行时状态机
 

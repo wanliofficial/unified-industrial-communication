@@ -16,14 +16,17 @@ dotnet run --project tests/Uic.Tests -- --stop-on-fail      # 首个失败即停
 正常输出：
 
 ```
-362 passed, 0 failed, 3 skipped · 220.6s
+390 passed, 0 failed, 3 skipped · 1622.1s
 ```
 
 加 `--opcua` 跑全量（含 3 条需外部 OPC UA 环境的端到端）：
 
 ```
-365 passed, 0 failed, 0 skipped · 289.1s
+393 passed, 0 failed, 0 skipped · 669.5s
 ```
+
+（这 3 条不联网、只用进程内自签证书，但要绑端口并做真实握手：`--opcua --filter opcua`
+单独跑时那 14 条 `opcua/*` 全绿，23.7 s。）
 
 耗时随机器负载波动较大：219 条时在同一台机器上空载量到 65.5 s，233 条在同时跑着
 发布/容器时量到 114.2 s；239 条时空载量到 112.7 s，而机器有 20+ 后台负载时量到 1471 s；
@@ -42,6 +45,11 @@ dotnet run --project tests/Uic.Tests -- --stop-on-fail      # 首个失败即停
 3023.4 s / 759.3 s（那次机器另有别的负载，单条契约用例仍在 90 s 以内——差别是排队）；
 334/337 条在 `load average` 5.5–16 时量到 2206.7 s / 1540.9 s；357/360 条在 `load average` 6 时量到 156.5 s / 170.3 s；361/364 条（补了 4 份文件记录黄金帧）在 `load average` 20–26 时量到 220.6 s / 289.1 s。
 362/365 条（补了 `csv/rejects_non_register_addressing`）在 `load average` 5 时量到 159.1 s / 197.6 s。
+389/392 条（补了 BACnet/IP 核心闭环的 27 条）在 `load average` 7–8 时量到 2545.3 s：
+这一轮 `contract/*` 单个就要 70–140 s，是 CPU/磁盘排队，不是 BACnet 用例慢——同一次里
+27 条 `bacnet/*` 合计 1.7 s。
+390/393 条（再补一条 `uic sim` 端到端，把示例配置、真实从站与真实主站串起来）在
+`load average` 5–6 时量到 1622.1 s，同样以 `contract/*` 排队为主。
 347/350 条在 `load average` 5–7.5（另有数天未退的高 CPU 后台进程）时，全量 5729.1 s、
 其中 15 条 `contract/*` 触到 180 s 硬超时；单独复跑这 43 条契约用例全部通过（790.1 s，
 最慢的 `contract/tls_rest_serves_https` 单条 110 s，是宿主启动 + TLS 握手在排队，不是用例退化），
@@ -92,6 +100,7 @@ NFR 的门槛是 120 s，压测用例、PBKDF2 派生与 TLS 握手是主要开�
 | `loopback/*` | 12 | Modbus 主站 ↔ 内置从站的真实链路 |
 | `s7/*` | 31 | S7comm：17 条手算黄金帧与地址解析（TPKT/COTP 握手、PDU 协商、读/写/位读写、长度字段按传输尺寸解释（0x03–0x07 位 / 0x09 字节）、错误分类、地址字段上限、**项数字段只有一字节（256 项当场失败而不是静默截断）**），14 条主站 ↔ 内置从站回环（探活、DB/I/Q/M 读、位读写、写输入区被拒、越界落 `address_error`、bool 缺 bit 被拒、数组、按 PDU 切片、单点装不下点名失败、沉默 PLC 超时、断线重连） |
 | `serial/*` | 7 | 真实伪终端上的 RTU / ASCII、半双工、帧间静默、deadline、关闭打断读 |
+| `bacnet/*` | 28 | BACnet/IP：17 条手算黄金帧与地址解析（BVLC/NPDU 封拆帧、NPDU 版本必须为 1、ReadProperty/WriteProperty 帧字节、I-Am 设备实例、对象标识符 10/22 位编码、应用标签往返含扩展长度（LVT=5）、类型不符拒绝、NPDU 路由控制字节拒绝、**ACK 值里出现形似关闭标签的字节也不得截断**），10 条主站 ↔ 内置从站回环（Who-Is/I-Am 探活、**按 invoke-id 配对（从站先回一条 invoke-id 不对的响应，取错会读到别的点位的值而质量仍 good）**、多对象读、bool/字符串、写后回读、unknown-object/property 落 `address_error`、沉默设备超时、**实例号核对（配了 deviceInstance 却回错设备即失败，消息带出期望实例号）**、元数据声明 object 寻址与 udp），1 条 `uic sim` 端到端（**拿 DemoConfig 的开发配置起真实从站再用真实主站读一遍：端口/transport/对象号/四个点位全 good**，值域按正弦基线核对） |
 | `mqtt/*` | 34 | 测试内 broker：CONNECT/SUBSCRIBE 字段、QoS0/1、主题渲染、重连补发、**下线设备清 retained `$state`**、**命令去重窗口用单调时钟（校时跳变不会重复执行命令）**、**过期判定用单调「多久没收到报文」（校时跳变不伪造也不放过过期）**、TLS 发布与不可信 CA 拒绝；南向驱动：主题通配匹配、JSON 字段/类型/信封取值、首次读数前 `stale`、QoS0/1 取数、点位字段覆盖、坏载荷与恢复、断线重订阅、订阅被 ACL 拒绝 |
 | `template/*` | 4 | 50 实例批量生成、参数类型/缺失/未知参数拒绝、未声明占位符拒绝；**同一模板产出 Modbus 与 S7 两台设备并同时通过校验**（FR-CFG-01 验收口径） |
 | `csv/*` | 5 | 地址表达式（参考号/区域偏移/分列）、按 id 合并与冲突行号、死区模式与量程列、点位周期列、数组元素个数列 |

@@ -5,6 +5,7 @@ using Uic.Config;
 using Uic.Domain;
 using Uic.Driver;
 using Uic.Driver.Modbus;
+using Uic.Driver.Bacnet;
 using Uic.Driver.Mqtt;
 using Uic.Driver.OpcUa;
 using Uic.Driver.S7;
@@ -366,6 +367,7 @@ internal static class Program
         var drivers = new DriverRegistry();
         drivers.Register(ModbusMasterDriver.Tcp(), ModbusMasterDriver.Rtu(), ModbusMasterDriver.Ascii());
         drivers.Register(new S7MasterDriver());
+        drivers.Register(new BacnetMasterDriver());
         drivers.Register(new OpcUaClientDriver());
         drivers.Register(new MqttClientDriver());
         drivers.Register(new VirtualDriver());
@@ -398,7 +400,8 @@ internal static class Program
         var log = loggerFactory.CreateLogger("uic.host");
 
         ConfigDocument Fallback() =>
-            DemoConfig.Build(simulate, cli.SimPort, simulate, cli.SimS7Port);
+            DemoConfig.Build(simulate, cli.SimPort, simulate, cli.SimS7Port,
+                simulate, cli.SimBacnetPort);
 
         // 先读一次配置：监听地址、静态目录都来自配置，必须在 Build() 之前确定。
         ConfigDocument bootstrap;
@@ -474,7 +477,7 @@ internal static class Program
         if (simulate)
         {
             simulator = new Simulator(
-                cli.SimPort, cli.SimS7Port, loggerFactory.CreateLogger("uic.sim"));
+                cli.SimPort, cli.SimS7Port, cli.SimBacnetPort, loggerFactory.CreateLogger("uic.sim"));
             simulator.Start();
         }
 
@@ -586,7 +589,8 @@ internal static class Program
         }
 
         PrintBanner(log, scheme, listen, dataDir, runtime, hasWeb ? webRoot : null,
-            simulate, cli.SimPort, cli.SimS7Port);
+            simulate ? cli.SimPort : 0, simulate ? cli.SimS7Port : 0,
+            simulate, simulate ? simulator?.BacnetPort ?? cli.SimBacnetPort : 0);
 
         try
         {
@@ -611,9 +615,10 @@ internal static class Program
         string dataDir,
         GatewayRuntime runtime,
         string? webRoot,
-        bool simulate,
         int simPort,
-        int simS7Port)
+        int simS7Port,
+        bool simulate,
+        int simBacnetPort)
     {
         var config = runtime.CurrentConfig;
 
@@ -626,8 +631,9 @@ internal static class Program
         if (simulate)
         {
             log.LogInformation(
-                "simulation mode: embedded slaves on 127.0.0.1 — Modbus TCP {ModbusPort}, S7 {S7Port}",
-                simPort, simS7Port);
+                "simulation mode: embedded slaves on 127.0.0.1 — Modbus TCP {ModbusPort}, " +
+                "S7 {S7Port}, BACnet/IP {BacnetPort}/udp",
+                simPort, simS7Port, simBacnetPort);
         }
 
         // 首次启动会生成 admin 与一个随机初始口令。口令本身不进日志（日志会被收走），

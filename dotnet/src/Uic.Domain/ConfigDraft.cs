@@ -26,6 +26,8 @@ public static class ConfigDraft
         "opcua" => "tcp",
         // MQTT 订阅方连的是 Broker，同样是 TCP 承载，端口默认 1883。
         "mqtt" => "tcp",
+        // BACnet/IP 跑在 UDP 上（Annex J），是唯一非 TCP 的 IP 承载。
+        "bacnet" => "udp",
         _ => "tcp",
     };
 
@@ -39,6 +41,8 @@ public static class ConfigDraft
         "s7" => 102,
         "opcua" => 4840,
         "mqtt" => 1883,
+        // BACnet/IP 的标准端口是 0xBAC0 = 47808。
+        "bacnet" => 47808,
         _ => 502,
     };
 

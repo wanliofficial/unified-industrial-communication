@@ -13,13 +13,16 @@ public static class DemoConfig
     /// <summary>
     /// <paramref name="enableLocalModbus"/> 为 true 时启用指向本机 15020 的 Modbus 设备，
     /// <paramref name="enableLocalS7"/> 为 true 时启用指向本机 15102 的 S7 设备，
+    /// <paramref name="enableLocalBacnet"/> 为 true 时启用指向本机 47810/UDP 的 BACnet/IP 设备，
     /// 供 <c>uic sim</c> 使用：模拟从站与采集主站跑在同一个进程里，开箱即可看到完整闭环。
     /// </summary>
     public static ConfigDocument Build(
         bool enableLocalModbus = false,
         int modbusPort = 15020,
         bool enableLocalS7 = false,
-        int s7Port = 15102) => new()
+        int s7Port = 15102,
+        bool enableLocalBacnet = false,
+        int bacnetPort = 47810) => new()
     {
         SchemaVersion = 1,
         Site = "demo-site",
@@ -57,6 +60,20 @@ public static class DemoConfig
                 ConnectTimeout = TimeSpan.FromSeconds(2),
                 MaxConcurrency = 1,
             },
+            new()
+            {
+                Id = "bacnet-udp-1",
+                Name = "本机 BACnet/IP",
+                Protocol = "bacnet",
+                Transport = "udp",
+                Host = "127.0.0.1",
+                Port = bacnetPort,
+                Timeout = TimeSpan.FromSeconds(2),
+                // BACnet/IP 没有「连接」：每条报文一个数据报，所以连接超时只用于
+                // 「首条报文发出前」的保底，取与响应超时相同的量级即可。
+                ConnectTimeout = TimeSpan.FromSeconds(2),
+                MaxConcurrency = 1,
+            },
         },
         Devices = new List<Device>
         {
@@ -86,8 +103,7 @@ public static class DemoConfig
                         Unit = "°C",
                         Scale = 1,
                         Deadband = 0.05,
-                    },
-                    new()
+                    },                    new()
                     {
                         Id = "pressure",
                         Name = "压力",
@@ -208,6 +224,64 @@ public static class DemoConfig
                         Name = "运行状态",
                         // 位地址：M0.0。bool 点位必须带 bit，否则驱动会拒绝。
                         Address = Address.Register("m", 0, bit: 0),
+                        DataType = DataType.Bool,
+                    },
+                },
+            },
+            new()
+            {
+                Id = "bacnet-1",
+                Name = "本机 BACnet/IP 从站",
+                ChannelId = "bacnet-udp-1",
+                Enabled = enableLocalBacnet,
+                Interval = TimeSpan.FromMilliseconds(500),
+                UnitId = 1,
+                Timeout = TimeSpan.FromSeconds(2),
+                FailureThreshold = 3,
+                RecoverInterval = TimeSpan.FromSeconds(10),
+                // deviceInstance 让探活核对 I-Am 里的实例号：同网段常有多台 BACnet 设备，
+                // 不核对的话「收到任何一台的 I-Am」都会被当成探活成功。
+                Labels = new Dictionary<string, string>(StringComparer.Ordinal)
+                {
+                    ["deviceInstance"] = "1001",
+                },
+                Points = new List<Point>
+                {
+                    // BACnet 的点位是「对象类型 + 实例 + 属性」：
+                    // objectType 0 = analog-input，85 = present-value。
+                    new()
+                    {
+                        Id = "temperature",
+                        Name = "温度",
+                        Address = Address.Object("0", 1, "85"),
+                        DataType = DataType.Float32,
+                        Unit = "°C",
+                        Deadband = 0.05,
+                    },
+                    new()
+                    {
+                        Id = "pressure",
+                        Name = "压力",
+                        Address = Address.Object("0", 2, "85"),
+                        DataType = DataType.Float32,
+                        Unit = "kPa",
+                        Deadband = 0.1,
+                    },
+                    new()
+                    {
+                        Id = "counter",
+                        Name = "累计计数",
+                        Address = Address.Object("0", 3, "85"),
+                        DataType = DataType.UInt32,
+                        Unit = "pcs",
+                    },
+                    new()
+                    {
+                        Id = "running",
+                        Name = "运行状态",
+                        // 3 = binary-input：布尔值在 BACnet 里是「值就在标签头里」的应用标签，
+                        // 没有载荷字节，与寄存器线圈是完全不同的编码。
+                        Address = Address.Object("3", 1, "85"),
                         DataType = DataType.Bool,
                     },
                 },

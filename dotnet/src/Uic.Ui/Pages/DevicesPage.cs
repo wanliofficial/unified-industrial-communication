@@ -22,7 +22,7 @@ namespace Uic.Ui.Pages;
 public sealed class DevicesPage : IPage, IDisposable
 {
     private static readonly string[] Protocols =
-        { "modbus-tcp", "modbus-rtu", "modbus-ascii", "s7", "opcua", "mqtt", "virtual" };
+        { "modbus-tcp", "modbus-rtu", "modbus-ascii", "s7", "bacnet", "opcua", "mqtt", "virtual" };
 
     private static readonly string[] PointTypes =
     {

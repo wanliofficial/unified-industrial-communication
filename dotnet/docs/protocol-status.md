@@ -32,10 +32,11 @@
 | REST + SSE | 北向 | 已实现 | `Uic.Northbound/RestApi*.cs` | FR-NOR-01..03 |
 | S7comm（西门子） | 主站 | 已实现 | `Uic.Codec.S7` + `Uic.Driver.S7` | FR-COL-04 |
 | S7comm | 从站 | 已实现（仅仿真） | `Uic.Sim.S7` | FR-COL-04 的自测 |
+| BACnet/IP | 主站 | 部分实现（核心闭环） | `Uic.Codec.Bacnet` + `Uic.Driver.Bacnet` | FR-CFG-01 的 object 寻址 |
+| BACnet/IP | 从站 | 已实现（仅仿真） | `Uic.Sim.Bacnet` | FR-CFG-01 的自测 |
 | MC 3E（三菱） | 主站 | 未实现 | — | Wave 2 |
 | FINS（欧姆龙） | 主站 | 未实现 | — | Wave 2 |
 | EtherNet/IP + CIP（罗克韦尔/AB） | 主站 | 未实现 | — | Wave 2 |
-| BACnet/IP | 主站 | 未实现 | — | PRD §6.1 明确不做 |
 | IEC 60870-5-104 | 主站 | 未实现 | — | PRD §6.1 明确不做 |
 | IEC 61850 | 客户端 | 未实现 | — | Wave 3 |
 | PROFINET IO | 主站/从站 | 不适合本架构 | — | 全局明确不做 |
@@ -44,14 +45,17 @@
 
 先给结论：
 
-- **能用的是 Modbus 三个变体（主站）+ Modbus TCP 从站 + S7 主站 + OPC UA 客户端 +
-  MQTT 订阅方 + 虚拟设备**，北向是 REST/SSE/MQTT/OPC UA 服务端。这条链路是完整的，
-  带黄金帧和端到端用例。
+- **能用的是 Modbus 三个变体（主站）+ Modbus TCP 从站 + S7 主站 + BACnet/IP 主站 +
+  OPC UA 客户端 + MQTT 订阅方 + 虚拟设备**，北向是 REST/SSE/MQTT/OPC UA 服务端。
+  这条链路是完整的，带黄金帧和端到端用例。
 - **MQTT 南向（FR-COL-06）已实现**：主题过滤器寻址、JSON 字段取值、QoS0/1、TLS、
   断线重订阅。采集主路径仍是调度器轮询，`ReadAsync` 读的是驱动内缓存（见 §3.5）。
 - OPC UA 客户端有两处**已验证边界**，不要当成「全都能接」：订阅没有接入采集主路径
   （仍是轮询），Basic256Sha256 没有仓内端到端（见 §3.4）。
-- **BACnet、IEC 104、CIP、MC、FINS 是 PRD §6.1 明确不做**，属于产品范围决定。
+- **BACnet/IP 已落核心闭环**（ReadProperty/WriteProperty/Who-Is），把 `object` 寻址
+  从「有模型没驱动」变成有驱动消费；COV、分段、ReadPropertyMultiple、数组与跨路由
+  明确不支持并报错（见 §2.4）。
+- **IEC 104、CIP、MC、FINS 是 PRD §6.1 明确不做**，属于产品范围决定。
 - **PROFINET、EtherCAT、GB/T 28181 不在协议路线图内**，原因是它们与轮询式采集模型
   冲突或需要专用硬件，不是「以后补个驱动」的事（见 §4）。
 
@@ -135,6 +139,59 @@ S7 从站，示例配置里的 `s7-1` 设备直连它（DB1 放温度/压力/计
 
 测试证据：`s7/*`（16 条黄金帧与地址解析 + 14 条主站↔从站回环，含 PDU 切片、
 位写只清一位、越界落 `address_error`、沉默 PLC 超时、断线重连）。
+
+## 2.4 BACnet/IP 主站（核心闭环）
+
+`Uic.Codec.Bacnet` 管三层帧（BVLC / NPDU / APDU）与应用标签，`Uic.Driver.Bacnet`
+管 UDP 链路上的请求/响应配对，`Uic.Sim.Bacnet` 是进程内从站。三层与 S7 同构。
+
+这一版只做**采集主路径的最小闭环**，目的是让 `object` 寻址真正有驱动消费：
+
+| 能力 | 实现情况 |
+|---|---|
+| 传输 | UDP（Annex J），端口默认 47808（0xBAC0）。`Uic.Transport` 新增 `UdpByteStream`：一次读 = 一条完整数据报，不做字节流拼接 |
+| 寻址 | `address.objectType`（0..1023，整数类型号）+ `address.instance`（0..4194303）+ `address.property`（属性标识符，缺省 85=present-value）；对象标识符按 10 位类型 / 22 位实例拼 4 字节 |
+| 读 | ReadProperty（确认请求，带 invoke-id）→ ComplexAck 取值；Error 按错误类映射质量码 |
+| 写 | WriteProperty（属性值按 [3] 构造上下文标签封装）；SimpleAck 视为成功 |
+| 发现 | Who-Is（广播）→ I-Am；`labels.deviceInstance` 配了就核对实例号，避免同网段回错设备 |
+| 响应配对 | **按 invoke-id 配对**。UDP 上「上一条请求超时、它的响应晚到」是常态；不配对就会把别的点位的值当成这个点位的值，而质量仍是 `good` |
+| 应用标签 | null / boolean / unsigned / signed / real / double / enumerated / character-string；长度 ≥5 字节走扩展长度（LVT=5） |
+| 错误映射 | object/unknown-object、property/unknown-property、resources → `address_error`（点表写错，不参与熔断）；security → `disabled`；其余 → `bad` |
+| 探活 | 发 Who-Is 等 I-Am；超时明确报「检查 47808/UDP 与网段」 |
+| 明确不支持 | 分段响应（segmented ComplexAck）、ReadPropertyMultiple、COV 订阅、写优先级与数组索引、跨 BACnet 路由器（NPDU 控制字节固定 0）；遇到都明确报错，不静默降级 |
+
+**为什么应用标签必须真的按规范编**：BACnet 的值不是裸字节，是「标签 + 载荷」。
+标签头低 3 位既是长度也是「这是个 boolean 值」的标志；长度 ≥5 时必须换成
+「LVT=5 + 扩展长度字节」。这两处写错的后果不是编译失败，而是「发出去没人理」
+或「读回一个看似合理的错值」——所以黄金帧是逐字节手算的，不是编码一次再解码一次。
+
+**为什么不能逐字节扫描找关闭标签**：ComplexAck 里属性值被一对上下文标签包着
+（打开 `?E` … 关闭 `?F`），看起来「往右找到第一个 `?F` 就是结尾」，但载荷是任意字节，
+完全可能撞上一个合法的关闭标签——real 1.25 的编码是 `44 3F A0 00 00`，第二个字节
+`0x3F` 本身就是「上下文标签 3 的关闭」。正确做法是先解出应用标签拿到确切长度，
+再跳过恰好这么多字节；boolean 与 null 的值就在标签头里、没有载荷字节，按「1+长度」
+算会把后面的关闭标签一起吞掉。`bacnet/ack_value_contains_closing_lookalike` 钉住这条。
+
+**为什么从站必须统一封帧**：各 handler 只返回裸 APDU，由分发处统一加 BVLC/NPDU。
+一旦成功路径封了、错误/拒绝路径漏了，主站看到的是「不是 BACnet 的流量」直接丢弃，
+表现为超时而不是「对象不存在」——同一份点表配错会被误判成网络故障。
+`bacnet/unknown_object_is_address_error`、`bacnet/unknown_property_is_address_error`
+与 `bacnet/read_present_value_as_real` 一起钉住这条（还原成「各 handler 自己封」时三条全挂）。
+
+**为什么读超时归驱动管、不归流层管**：`UdpByteStream` 若自挂 socket 超时，
+它会先于驱动抛出泛化的超时，把「对象不存在」这类已诊断的错误盖成 `Timeout`。
+所以每条请求由驱动按自己的时延预算挂 linked CTS，预算内没等到数据报就交给 deadline 循环收尾，
+诊断消息由驱动按错误类决定。
+
+测试证据：`bacnet/*`（17 条黄金帧与地址解析 + 10 条主站↔从站回环 + 1 条 `uic sim` 端到端）。
+从站 `Uic.Sim.Bacnet` 与主站共用一个进程也能跑：`uic sim` 默认在 127.0.0.1:47810/UDP 起
+BACnet/IP 从站（`--bacnet-port` 可改；不占标准的 47808，那一个常被现场设备或另一个
+仿真实例占着），示例配置里的 `bacnet-1` 设备直连它（`analog-input:1/2/3` 放温度/压力/计数，
+`binary-input:1` 放运行状态）。最后那条用例就是把这条链路串起来跑的——
+编解码与驱动各自绿、`sim` 模式一读就红（端口传错、对象号种错、通道缺 `transport=udp`），
+是这类改动最常见的坏法。
+回环里有一条专测 invoke-id 配对（从站故意先回一条 invoke-id 不对的响应），
+还原成「收到就用」会立刻失败。
 
 ## 3. 北向：只做「网关 → 上位机」，其中只有 OPC UA 是双向的
 
@@ -250,7 +307,7 @@ Basic128Rsa15/Aes 系列策略、结构体/ExtensionObject 类型的值、BCD �
 
 | 项 | 状态 | 说明 |
 |---|---|---|
-| object 寻址的驱动 | 模型已就绪，驱动未做 | 四类寻址的模型与校验已闭环（`config/four_address_kinds_validate`），symbol 由 OPC UA 与 MQTT 消费、file 由 Modbus FC20/21 消费；object 要等 BACnet/CIP 的对象模型 |
+| BACnet/IP 的 COV / 分段 / 多属性读 | 未做 | 核心闭环（ReadProperty/WriteProperty/Who-Is）已落地并有回环用例；COV 订阅、分段重组、ReadPropertyMultiple、写优先级与数组索引都明确报错。补法与 S7 相同：编解码 + 从站 + 用例，不需要改调度 |
 
 **file 寻址已落地**：Modbus（TCP/RTU/ASCII）实现 FC20 读文件记录与 FC21 写文件记录，
 `address.kind = "file"` 的 `fileId` / `recordId` 直接映射到帧里的「文件号 + 记录号」，

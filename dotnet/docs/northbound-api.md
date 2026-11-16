@@ -309,6 +309,42 @@ MQTT 的 TLS 是独立开关（`northbound.mqtt.tls`），语义见
       "description": "S7comm 主站：DB/IB/QB/MB 区、位访问、PDU 自动协商（240/480/960）。"
     },
     {
+      "id": "bacnet",
+      "name": "BACnet/IP 主站",
+      "version": "1.0.0",
+      "sdkVersion": "1.0",
+      "roles": ["master"],
+      "transports": ["udp"],
+      "addressKinds": ["object"],
+      "capabilities": {
+        "read": "supported",
+        "write": "supported",
+        "subscribe": "unsupported",
+        "browse": "unsupported",
+        "discovery": "unsupported",
+        "multiRead": "unsupported",
+        "bitAccess": "unsupported",
+        "structTypes": "unsupported"
+      },
+      "configFields": [
+        { "key": "transport.host", "label": "主机", "type": "string", "required": true, "scope": "channel",
+          "placeholder": "192.168.1.20" },
+        { "key": "transport.port", "label": "端口", "type": "int", "required": true, "default": 47808, "scope": "channel",
+          "help": "BACnet/IP 的标准端口是 47808（0xBAC0）" }
+      ],
+      "pointFields": [
+        { "key": "address.objectType", "label": "对象类型", "type": "int", "required": true, "scope": "point",
+          "placeholder": "0",
+          "help": "BACnet 对象类型号：0=analog-input，1=analog-output，2=analog-value，3=binary-input，8=device" },
+        { "key": "address.instance", "label": "实例号", "type": "int", "required": true, "scope": "point",
+          "help": "对象实例号（0..4194303）" },
+        { "key": "address.property", "label": "属性", "type": "string", "required": true, "scope": "point",
+          "placeholder": "85",
+          "help": "属性标识符：85=present-value，77=object-name，111=status-flags" }
+      ],
+      "description": "BACnet/IP 主站：按对象类型 + 实例 + 属性读单个属性（ReadProperty），支持写（WriteProperty）。"
+    },
+    {
       "id": "opcua",
       "name": "OPC UA 客户端",
       "version": "1.0.0",
@@ -383,9 +419,15 @@ MQTT 的 TLS 是独立开关（`northbound.mqtt.tls`），语义见
 驱动内部维持，`ReadAsync` 读的是最近一条报文的缓存。`addressKinds: ["symbol"]` 说明
 两者只接受符号寻址——寄存器地址（`area` / `offset`）在 UA 与 MQTT 上没有对应物。
 
+`addressKinds: ["object"]` 的 BACnet 也一样：点位只有「对象类型 + 实例 + 属性」三件套，
+`multiRead` 是 `unsupported`（一次 ReadProperty 只读一个属性），`subscribe` 是
+`unsupported`（COV 订阅本轮不做，绝不会谎报成功）。
+
 `configFields` / `pointFields` 是驱动自己声明的表单元数据：控制台据此渲染参数，
 不把协议知识写死在页面里。S7 的 `address.offset` 是**字节**偏移（Modbus 是寄存器序号），
 `labels.rack` / `labels.slot` 是 COTP 建链参数（S7-1200/1500 通常 0/1）。
+BACnet 的 `address.property` 是**属性标识符**（85=present-value），不是属性名——
+对象模型里属性名是给人看的，线上只有编号。
 
 ### 设备与点位
 

@@ -43,6 +43,9 @@
     <ProjectReference Include="..\..\src\Uic.Driver.Virtual\Uic.Driver.Virtual.csproj" />
     <ProjectReference Include="..\..\src\Uic.Sim.Modbus\Uic.Sim.Modbus.csproj" />
     <ProjectReference Include="..\..\src\Uic.Sim.S7\Uic.Sim.S7.csproj" />
+    <ProjectReference Include="..\..\src\Uic.Codec.Bacnet\Uic.Codec.Bacnet.csproj" />
+    <ProjectReference Include="..\..\src\Uic.Driver.Bacnet\Uic.Driver.Bacnet.csproj" />
+    <ProjectReference Include="..\..\src\Uic.Sim.Bacnet\Uic.Sim.Bacnet.csproj" />
     <ProjectReference Include="..\..\src\Uic.Engine\Uic.Engine.csproj" />
     <ProjectReference Include="..\..\src\Uic.Outbox\Uic.Outbox.csproj" />
     <ProjectReference Include="..\..\src\Uic.Config\Uic.Config.csproj" />

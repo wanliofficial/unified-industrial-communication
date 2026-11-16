@@ -23,6 +23,13 @@ public sealed record CliOptions
     /// <summary>sim 模式内置 S7 从站端口。默认 15102：避开需要 root 的 102。</summary>
     public int SimS7Port { get; init; } = 15102;
 
+    /// <summary>
+    /// sim 模式内置 BACnet/IP 从站端口。默认 47810 而不是标准的 47808：
+    /// 后者常被真实现场或另一个仿真实例占着，而「端口被占」表现为读超时，
+    /// 最容易被误判成驱动坏了。
+    /// </summary>
+    public int SimBacnetPort { get; init; } = 47810;
+
     public bool Verbose { get; init; }
 
     public const string Usage = """
@@ -30,7 +37,7 @@ public sealed record CliOptions
 
         用法:
           uic run   [--config <file>] [--data <dir>] [--listen <host:port>] [--web <dir>] [-v]
-          uic sim   [--port <modbus-port>] [--s7-port <s7-port>] [--data <dir>] [--listen <host:port>] [-v]
+          uic sim   [--port <modbus-port>] [--s7-port <s7-port>] [--bacnet-port <bacnet-port>] [--data <dir>] [--listen <host:port>] [-v]
           uic check [--config <file>]
           uic secret keygen [--out <file>]          # 生成 32 字节密封密钥（0600）
           uic secret seal [--key-file <file>]       # 从 stdin 读明文，输出 enc:v1:...
@@ -46,6 +53,7 @@ public sealed record CliOptions
           --web <dir>       覆盖前端静态资源目录
           --port <n>        sim 模式内置 Modbus 从站端口，默认 15020
           --s7-port <n>     sim 模式内置 S7 从站端口，默认 15102
+          --bacnet-port <n> sim 模式内置 BACnet/IP 从站端口（UDP），默认 47810
           --out <file>      keygen 的密钥输出路径；缺省时打印到 stdout
           --key-file <file> seal 使用的密钥文件（缺省读 UIC_SECRET_KEY / UIC_SECRET_KEY_FILE）
           --user <id>       user 子命令要操作的账号
@@ -72,6 +80,7 @@ public sealed record CliOptions
         string? keyFile = null;
         var port = 15020;
         var s7Port = 15102;
+        var bacnetPort = 47810;
         var verbose = false;
 
         for (var i = 0; i < args.Length; i++)
@@ -154,6 +163,10 @@ public sealed record CliOptions
                     s7Port = int.TryParse(Next(args, ref i, arg), out var sp) ? sp : s7Port;
                     break;
 
+                case "--bacnet-port":
+                    bacnetPort = int.TryParse(Next(args, ref i, arg), out var bp) ? bp : bacnetPort;
+                    break;
+
                 default:
                     if (arg.StartsWith("--config=", StringComparison.Ordinal)) config = arg["--config=".Length..];
                     else if (arg.StartsWith("--data=", StringComparison.Ordinal)) data = arg["--data=".Length..];
@@ -189,6 +202,7 @@ public sealed record CliOptions
             KeyFile = keyFile,
             SimPort = port,
             SimS7Port = s7Port,
+            SimBacnetPort = bacnetPort,
             Verbose = verbose,
         };
     }

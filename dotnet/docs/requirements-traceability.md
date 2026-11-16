@@ -7,13 +7,13 @@
 - 「刻意没做」= 有意识不做，给出原因与补法（与 [implementation-notes.md](implementation-notes.md) 的「刻意没做」一致）。
 
 首版的目标范围是 PRD §6.1 的 Wave 1 子集：**Modbus 三封装 + S7 主站 + OPC UA 客户端 + MQTT 南向订阅 + 虚拟设备 + 四北向通道 + 配置治理 + Outbox + 可观测**。
-PRD 中 M 级的采集协议已全部落地，FR-CFG-01 的四类寻址模型也已按验收口径闭环
-（register/symbol/file 都有驱动消费，只差 object，见该行备注）。非 M 级验收里的 12 类故障注入同样全部有了
-可自动跑的用例（见 §7），唯一剩下的延期项是 object 寻址的实际驱动，
-见 [protocol-status.md](protocol-status.md) §4.1。
+PRD 中 M 级的采集协议已全部落地，FR-CFG-01 的四类寻址模型也按验收口径闭环
+（register/symbol/file/object 都有驱动消费；object 由 BACnet/IP 核心闭环实现，
+COV/分段/多属性读仍不做，见 [protocol-status.md](protocol-status.md) §4.1）。非 M 级验收里的 12 类故障注入同样全部有了
+可自动跑的用例（见 §7）。
 
-当前测试基线：**362 passed / 0 failed / 3 skipped**（跳过的是需要 `--opcua` 的 OPC UA 端到端用例）；
-加 `-- --opcua` 跑全量是 **365 passed / 0 failed / 0 skipped**。
+当前测试基线：**390 passed / 0 failed / 3 skipped**（跳过的是需要 `--opcua` 的 OPC UA 端到端用例）；
+加 `-- --opcua` 跑全量是 **393 passed / 0 failed / 0 skipped**。
 
 ## 1. 采集（FR-COL）
 
@@ -30,13 +30,13 @@ PRD 中 M 级的采集协议已全部落地，FR-CFG-01 的四类寻址模型也
 | FR-COL-09 | 批量读规划（合并 / 非法跨越拒绝） | 已实现 | `planner/*` 八条：相邻合并、跨空洞不合并、按寄存器与位上限切分、按区域分离、每点恰好覆盖一次 |
 | FR-COL-10 | 每点位独立采集周期 | 已实现 | `Point.interval` 覆盖设备周期（空/0 表示继承，非 0 时 100ms..24h）；`DeviceActor` 按有效周期分桶，每轮只读到期的桶并合并成一次串行读取，快慢变量互不拖累。证据 `engine/point_interval_overrides_device_period`（1s 设备 + 100ms 点位）、`engine/point_interval_failure_is_scoped_to_due_bucket`、`csv/imports_point_interval`、`schedule/phase_follows_fastest_point`、`contract/points_expose_effective_interval`；看门狗阈值取设备内最慢周期，启动相位取最快周期，点位 DTO 暴露 `interval` 与 `effectiveInterval` |
 | FR-COL-11 | 写入（单点/多点），写后校验与超时 | 已实现 | 单点/多点、逐点裁决、超时三态（`ok`/`disabled`/`timeout`）已实现：`contract/write_returns_per_point_results`。`confirm: true` 在同一个通道租约内立即回读并比较，结果带 `verified`；不一致返回 `ok=false` + `uncertain` + `verify.mismatch`：`engine/write_confirmation_reads_back`、`engine/write_confirmation_detects_mismatch`、`engine/write_without_confirmation_skips_readback`。数组点位的元素个数在**建链前**校验，不符直接拒绝而不是交给驱动：`engine/array_write_shape_is_validated_before_the_device`。值越界（如 70000 写 uint16）与超长文本直接逐点拒绝，不静默取模/截断：`codec/encode_rejects_out_of_range`、`codec/encode_rejects_overlong_text` |
-| FR-COL-12 | 订阅型协议（COV/事件/通知） | 刻意没做（C） | 路线图 Wave 2。`Capabilities.Subscribe` 是四态声明，OPC UA 客户端已声明 `supported` 并通过 `ISubscriptionConn` 提供真实的 MonitoredItem 订阅（`opcua/client_read_write_subscribe`），但**采集主路径仍是按周期轮询**，与 Modbus/S7 一致：把订阅接到调度器需要另一套「推送驱动的重试/熔断/死区」语义，不在本版范围内 |
+| FR-COL-12 | 订阅型协议（COV/事件/通知） | 刻意没做（C） | 路线图 Wave 2。`Capabilities.Subscribe` 是四态声明，OPC UA 客户端已声明 `supported` 并通过 `ISubscriptionConn` 提供真实的 MonitoredItem 订阅（`opcua/client_read_write_subscribe`），但**采集主路径仍是按周期轮询**，与 Modbus/S7 一致：把订阅接到调度器需要另一套「推送驱动的重试/熔断/死区」语义，不在本版范围内。BACnet 的 COV 同样没做：`Capabilities.Subscribe` 声明为 `unsupported`，驱动不会假装订阅成功 |
 
 ## 2. 数据模型与配置（FR-CFG）
 
 | 编号 | 需求 | 状态 | 证据 / 说明 |
 |---|---|---|---|
-| FR-CFG-01 | 四类寻址统一模型 | 已实现 | `Address` 一个结构承载 register/symbol/object/file，四类各自必填与禁止字段由 `Address.Validate` 收口（混填即拒绝并指出多余字段）。**register** 由 Modbus 与 S7 实现；**symbol** 由 OPC UA（`path` 承载 NodeId 文本，`index` 作省略 `ns=` 时的命名空间）与 MQTT 南向（`path` 承载主题过滤器，`property` 承载 JSON 字段）实现；**file** 由 Modbus FC20/21 实现（`fileId`/`recordId` 映射到帧的文件号/记录号，无记录内偏移，`offset` 必须 0）；**object** 模型与校验已就绪，但还没有驱动消费（要等 BACnet/CIP 的对象模型）。验收口径「同一套模板可生成 Modbus 与 S7 设备」由 `template/one_template_targets_modbus_and_s7` 覆盖。证据：`config/four_address_kinds_validate`、`template/one_template_targets_modbus_and_s7`、`opcua/address_parses_node_ids`、`opcua/address_rejects_bad_input`、`mqtt/topic_matcher_follows_wildcard_rules`、`mqtt/driver_uses_point_field_override`、`config/console_draft_builds_a_valid_document`、`codec/file_record_read_frame_shape`、`codec/file_record_write_frame_shape`、`codec/file_record_decode_rejects_bad_frames`、`loopback/file_record_read_and_write_round_trip`、`loopback/missing_file_record_maps_to_address_error`、`loopback/file_offset_is_rejected`、`serial/rtu_file_record_round_trip` |
+| FR-CFG-01 | 四类寻址统一模型 | 已实现 | `Address` 一个结构承载 register/symbol/object/file，四类各自必填与禁止字段由 `Address.Validate` 收口（混填即拒绝并指出多余字段）。**register** 由 Modbus 与 S7 实现；**symbol** 由 OPC UA（`path` 承载 NodeId 文本，`index` 作省略 `ns=` 时的命名空间）与 MQTT 南向（`path` 承载主题过滤器，`property` 承载 JSON 字段）实现；**file** 由 Modbus FC20/21 实现（`fileId`/`recordId` 映射到帧的文件号/记录号，无记录内偏移，`offset` 必须 0）；**object** 由 BACnet/IP 实现（`objectType` 是 10 位类型号、`instance` 是 22 位实例号、`property` 是属性标识符，映射到对象标识符 + ReadProperty/WriteProperty）。验收口径「同一套模板可生成 Modbus 与 S7 设备」由 `template/one_template_targets_modbus_and_s7` 覆盖。证据：`config/four_address_kinds_validate`、`template/one_template_targets_modbus_and_s7`、`opcua/address_parses_node_ids`、`opcua/address_rejects_bad_input`、`mqtt/topic_matcher_follows_wildcard_rules`、`mqtt/driver_uses_point_field_override`、`config/console_draft_builds_a_valid_document`、`codec/file_record_read_frame_shape`、`codec/file_record_write_frame_shape`、`codec/file_record_decode_rejects_bad_frames`、`loopback/file_record_read_and_write_round_trip`、`loopback/missing_file_record_maps_to_address_error`、`loopback/file_offset_is_rejected`、`serial/rtu_file_record_round_trip`、`bacnet/object_id_wire_encoding`、`bacnet/address_validation`、`bacnet/read_present_value_as_real`、`bacnet/write_then_read_back`、`bacnet/read_multiple_objects`、`bacnet/read_bool_and_string`、`bacnet/metadata_declares_object_addressing`、`bacnet/sim_mode_demo_config_reads_every_point` |
 | FR-CFG-02 | 数据类型系统（≥8 类，含数组） | 已实现 | 13 种标量类型（bool/int/uint 16/32/64/float 32/64/string/BCD16/BCD32/bytes/datetime）；datetime 固定 4 寄存器 int64 Unix 毫秒 UTC，北向用 ISO-8601 UTC 文本：`codec/datetime_is_unix_milliseconds`、`json/datavalue_wire_shape_is_stable`、`opcua/anonymous_session_read_write_subscribe`。数组用「元素类型 + 元素个数」正交表达（`dataType` + `count`），只允许定宽数值类型，逐元素套字节序、逐元素缩放、死区取最大变化：`codec/array_roundtrip_per_element_byte_order`、`codec/array_encode_rejects_wrong_element_count`、`codec/array_rejects_non_numeric_element_types`、`json/datavalue_array_shape`、`json/config_point_count_roundtrip`、`pipeline/array_scales_element_wise`、`pipeline/deadband_array_uses_largest_change`、`config/array_count_rules`、`csv/imports_array_count`、`contract/points_expose_array_count_and_values`，另 4 份数组黄金帧 |
 | FR-CFG-03 | 字节序 ABCD/CDAB/BADC/DCBA | 已实现 | 四种排列见 `codec/byte_order_encodes_as_expected`、`codec/byte_order_roundtrip`、`json/enums_are_lowercase_wire_names`；字序只作用于 32/64 位数值，`string`/`bytes` 按原样字节流读写（否则设备级 `byteOrder` 为 `float32` 设成 `cdab` 会把该设备所有文本点位读成乱码）：`codec/byte_order_does_not_scramble_text` |
 | FR-CFG-04 | 设备模板 + 参数化实例化（≥50 实例） | 已实现 | `template/instantiate_fifty_devices`（50 个实例逐个断言）、`contract/template_instantiates_and_applies_devices`、`template/rejects_bad_parameters`、`template/store_rejects_unknown_placeholder` |
@@ -115,7 +115,7 @@ PRD 中 M 级的采集协议已全部落地，FR-CFG-01 的四类寻址模型也
 | FR-SDK-01 | 驱动三层：Codec / Transport / Driver | 已实现 | 项目切分即边界：`Uic.Codec.Modbus` 不依赖 `net`，`Uic.Transport` 只管字节流，`Uic.Driver.Modbus` 组装 |
 | FR-SDK-02 | 能力与地址类型声明 | 已实现 | `DriverMeta.Capabilities`（八项四态，禁止在不确定时声明 Supported）/ `ConfigFields`；`GET /api/v1/drivers` 原样透出：`contract/drivers_expose_capability_states`。注册时能力与传输声明随 `Meta` 一起进入注册表、不做二次推断：`sdk/register_accepts_matching_version` |
 | FR-SDK-03 | 驱动契约语义化版本 | 已实现 | `DriverRegistry.Register` 校验 `DriverMeta.SdkVersion == DriverSdk.Version`，不匹配抛 `InvalidOperationException`，错误消息同时给出驱动声明版本与宿主要求版本，且不留下半注册状态；重复 `meta.id` 同样拒绝、不覆盖先注册的驱动：`sdk/register_rejects_sdk_version_mismatch`、`sdk/register_rejects_duplicate_id` |
-| FR-SDK-04 | 虚拟设备（按协议实现从站） | 已实现 | `Uic.Host/Simulator.cs` 起 Modbus TCP 从站；`loopback/*` 全链路 |
+| FR-SDK-04 | 虚拟设备（按协议实现从站） | 已实现 | `Uic.Host/Simulator.cs` 起 Modbus TCP、S7 与 BACnet/IP 三个从站（同一份正弦脉搏，三条链路可对照）；`loopback/*` 全链路、`s7/*` 主从回环、`bacnet/*` 主从回环，`bacnet/sim_mode_demo_config_reads_every_point` 把示例配置与真实从站、真实主站串起来跑一遍 |
 | FR-SDK-05 | 故障注入（丢包/延迟/错帧/异常码/连接重置） | 已实现 | `Uic.Driver.Virtual` 的五类故障；`loopback/probe_times_out`、`loopback/silent_slave_times_out` |
 | FR-SDK-06 | 金报文测试套件 | 已实现 | `testdata/golden/*.json` 24 份，`golden/*` 逐字节比对（TCP/RTU/ASCII），含 4 份数组帧（读、写、逐元素字节序）与 4 份文件记录帧（FC20 的 TCP/RTU/ASCII 与 FC21 的 TCP；覆盖「记录长度是寄存器数、响应数据长度是字节数」这对容易看混的字段） |
 | FR-SDK-07 | 一致性测试套件（连接/超时/重连/并发/取消） | 已实现 | T1–T18 全部有对应用例，映射表见 [testing.md](testing.md)；`sdk/*` 另覆盖注册期契约（版本不匹配、重复 id） |

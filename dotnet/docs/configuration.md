@@ -219,6 +219,62 @@ Broker 侧用 TLS + 网络 ACL 把订阅方限定到固定网段，与 OPC UA �
 `ProbeAsync` 只验证「连上 Broker + 订阅未被 ACL 拒绝（SUBACK 不是 `0x80`）」，
 不等数据：发布方可能本来就没上线，那属于数据面而不是链路故障。
 
+### BACnet/IP 通道（主站）
+
+`protocol: "bacnet"` 表示网关作为**主站**读 BACnet 设备，`transport` 必须是 `udp`，
+端口默认 **47808**（0xBAC0）。BACnet/IP 没有「连接」：每条报文就是一个独立数据报，
+驱动每次读/写直接发请求，用 invoke-id 把响应配对回请求。
+
+```json
+{
+  "id": "bacnet-ahu",
+  "name": "楼控 AHU",
+  "protocol": "bacnet",
+  "transport": "udp",
+  "host": "192.168.1.40",
+  "port": 47808
+}
+```
+
+设备 `labels` 里放建链/探活参数：
+
+| 键 | 默认 | 说明 |
+|---|---|---|
+| `deviceInstance` | `-1`（不核对） | 期望的 device 对象实例号（0..4194303）。配了 `ProbeAsync` 会核对回来的 I-Am 实例号，避免同网段回错设备 |
+
+点位用 `object` 寻址，三个字段都是**整数或属性标识符**：
+
+| 字段 | 说明 |
+|---|---|
+| `objectType` | 对象类型号（0..1023）：0=analog-input，1=analog-output，2=analog-value，3=binary-input，8=device |
+| `instance` | 对象实例号（0..4194303） |
+| `property` | 属性标识符（缺省 85=present-value）：77=object-name，111=status-flags |
+
+```json
+{
+  "id": "supply-temp",
+  "name": "送风温度",
+  "channelId": "bacnet-ahu",
+  "address": { "kind": "object", "objectType": "0", "instance": "1", "property": "85" },
+  "dataType": "float32"
+}
+```
+
+**为什么响应必须按 invoke-id 配对**：UDP 上「上一条请求超时、它的响应晚到」是常态。
+配对错了，会把上一条（甚至别的点位的）响应当成这个点位的值——而质量仍是 `good`，
+现场极难发现。本驱动每条请求递增 invoke-id，只取匹配的那条，其余丢弃重读。
+
+**`uic sim` 也能跑通这条链路**：`sim` 模式会额外在 `127.0.0.1:47810/UDP` 起一个
+BACnet/IP 从站（端口用 `--bacnet-port` 改；默认不取 47808 是为了不挡住现场或本机
+真实设备），并把示例配置里的 `bacnet-1` 设备启用。从站里种了 `analog-input:1`
+（温度）、`analog-input:2`（压力）、`analog-input:3`（计数）、`binary-input:1`
+（运行状态），值与 Modbus/S7 侧同一条正弦脉搏。`bacnet/sim_mode_demo_config_reads_every_point`
+把「示例配置 → 真实从站 → 真实主站」串起来跑一遍。
+
+**本版本明确不支持并报错**（不静默降级）：分段响应（segmented ComplexAck）、
+ReadPropertyMultiple、COV 订阅、写优先级与数组索引、跨 BACnet 路由器的多跳（NPDU
+控制字节固定为 0）。遇到都明确报错，见 [protocol-status.md](protocol-status.md) §2.4。
+
 ## 设备 `devices[]`
 
 | 字段 | 默认 | 说明 |
