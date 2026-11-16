@@ -88,6 +88,7 @@ internal static class ContractTests
         tests.Add(new TestCase("contract/auth_logout_revokes_session", AuthLogoutRevokesSession));
         tests.Add(new TestCase("contract/rate_limit_returns_429_with_the_shared_code", RateLimitReturns429));
         tests.Add(new TestCase("contract/metrics_report_live_sse_connections", MetricsReportLiveSseConnections));
+        tests.Add(new TestCase("contract/metrics_export_runtime_series", MetricsExportRuntimeSeries));
         tests.Add(new TestCase("contract/stream_filters_by_point_pattern", StreamFiltersByPointPattern));
     }
 
@@ -2736,6 +2737,91 @@ internal static class ContractTests
             var value = double.Parse(line!.Split(' ')[1], CultureInfo.InvariantCulture);
             t.Equal(1d, value, "the gauge counts the live stream");
         });
+    }
+
+    /// <summary>
+    /// `/api/v1/metrics` 必须是一个真正可用的 Prometheus 抓取端点：文本格式（HELP/TYPE）、
+    /// 运行期的 gauge 真的反映当前状态，而不是一串写死的 0。
+    ///
+    /// 为什么单独立一条：`FR-OPS-05` 在追溯矩阵里写的是「已实现、指标都有序列」，
+    /// 但此前唯一沾边的用例只断言了 `uic_sse_connections` 一个 gauge。看板依赖的
+    /// 设备数、采集中的设备数、未配 sink 时的 Outbox 这类序列一条都没被断言过——
+    /// 序列名或标签一漂，端点仍然返回 200，运维只会看到空面板。
+    /// </summary>
+    private static Task MetricsExportRuntimeSeries(TestContext t)
+    {
+        return RunAsync(async () =>
+        {
+            RestApi.ResetRateLimitersForTests();
+            await using var host = await Host.StartAsync(t);
+
+            // 先等设备真正进入 collecting：`uic_devices_collecting` 是运行态快照，
+            // 刚启动时还是 0。不等就断言，用例会随机器负载随机红。
+            await WaitForPointAsync(host, "v1", "temp", t);
+
+            using var request = new HttpRequestMessage(HttpMethod.Get, "/api/v1/metrics");
+            request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", Token);
+            using var response = await host.Client.SendAsync(request, t.Ct);
+
+            t.Equal(HttpStatusCode.OK, response.StatusCode, "the scrape endpoint answers");
+
+            // 内容类型必须带 Prometheus 的文本版本：抓取端靠它判定格式，
+            // 返回 application/json 会被直接丢弃。
+            var mediaType = response.Content.Headers.ContentType?.MediaType ?? string.Empty;
+            t.Equal("text/plain", mediaType, "the endpoint serves the Prometheus text format");
+            var version = response.Content.Headers.ContentType?.Parameters
+                .FirstOrDefault(p => p.Name.Equals("version", StringComparison.OrdinalIgnoreCase))?.Value;
+            t.Equal("0.0.4", version, "the exposition format is declared");
+
+            var body = await response.Content.ReadAsStringAsync(t.Ct);
+
+            // HELP 与 TYPE 是必需的元数据：缺了它们 Grafana 不会报错，只是面板一片空白。
+            t.Contains(body, "# HELP uic_devices_total", "the device gauge carries HELP");
+            t.Contains(body, "# TYPE uic_devices_total gauge", "the device gauge is typed");
+
+            // 最小配置里只有一台虚拟设备：序列必须反映真实数量，写死 0 或 1 都可能碰巧过关，
+            // 所以下面还有一条「采集中」的用例把它钉到运行态上。
+            t.Equal(1d, MetricValue(body, "uic_devices_total"), "uic_devices_total counts configured devices");
+            t.Equal(1d, MetricValue(body, "uic_devices_collecting"),
+                "uic_devices_collecting only counts devices that reached collecting");
+
+            // 每一个数值都必须是合法的 Prometheus 浮点（或 NaN/Inf），不能出现本地化的小数逗号：
+            // 用解析器逐值过一遍，比只 grep 序列名更能挡住格式漂移。
+            foreach (var line in body.Split('\n'))
+            {
+                if (line.Length == 0 || line[0] == '#') continue;
+
+                var space = line.LastIndexOf(' ');
+                t.Ok(space > 0, $"metric line has a value: {line}");
+
+                var number = line[(space + 1)..];
+                t.Ok(double.TryParse(number, NumberStyles.Float, CultureInfo.InvariantCulture, out _),
+                    $"the value of '{line[..Math.Max(0, space)]}' is a Prometheus float, not '{number}'");
+            }
+
+            // 未配置任何北向 sink 时队列必须稳定在 0，而不是缺失：缺失会被当成「没上报」。
+            t.Equal(0d, MetricValue(body, "uic_outbox_pending"), "the outbox backlog is exported even at zero");
+        });
+    }
+
+    /// <summary>
+    /// 取一条无标签 gauge 的值。带标签的序列不是这里的目标，遇到就直接报错——
+    /// 静默取其第一个标签会掩盖「序列形状变了」。
+    /// </summary>
+    private static double MetricValue(string body, string name)
+    {
+        foreach (var line in body.Split('\n'))
+        {
+            if (!line.StartsWith(name + " ", StringComparison.Ordinal)) continue;
+
+            var text = line[(name.Length + 1)..];
+            if (!double.TryParse(text, NumberStyles.Float, CultureInfo.InvariantCulture, out var value))
+                throw new CheckFailedException($"metric '{name}' is not a bare number: '{text}'");
+
+            return value;
+        }
+
+        throw new CheckFailedException($"metric '{name}' is not exported");
     }
 
     private static Task StreamFiltersByPointPattern(TestContext t)

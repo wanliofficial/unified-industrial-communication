@@ -23,6 +23,7 @@ internal static class SdkTests
         tests.Add(new TestCase("sdk/register_accepts_matching_version", RegisterAcceptsMatchingVersion));
         tests.Add(new TestCase("sdk/check_references_flags_unregistered_protocol", CheckReferencesFlagsUnregisteredProtocol));
         tests.Add(new TestCase("sdk/check_command_rejects_unregistered_protocol", CheckCommandRejectsUnregisteredProtocol));
+        tests.Add(new TestCase("sdk/codec_assemblies_do_not_reference_io_layers", CodecAssembliesDoNotReferenceIo));
     }
 
     /// <summary>
@@ -229,5 +230,67 @@ internal static class SdkTests
             Console.SetOut(originalOut);
             Console.SetError(originalError);
         }
+    }
+
+    /// <summary>
+    /// 分层边界（FR-SDK-01）：Codec 程序集只做纯编解码，不许引用字节流层。
+    ///
+    /// 为什么需要一条用例：这条边界以前只写在文档与 csproj 的约定里。
+    /// 约定最容易的退化方式不是多一条没人用的 `ProjectReference`（编译器不会把它
+    /// 写进元数据），而是某个 codec 真的开始用 `Uic.Transport` 的类型去开 socket、
+    /// 自己重试——构建照样通过，编解码从此不能单测。
+    /// 所以这里读的是程序集里**实际**的引用表，而不是 csproj 的声明。
+    ///
+    /// 反向对照同样重要：Codec 必须引用 Domain（否则连地址模型都拿不到），
+    /// 只断言「没引用什么」的话，一个空程序集也能让用例通过。
+    ///
+    /// `Uic.Codec.Mqtt` 不在这个名单里：它刻意同时承载 MQTT 客户端
+    /// （北向 sink 与南向订阅共用同一份 3.1.1 实现），本来就要开 socket。
+    /// 把它也算进来，只能得到一条「要么放宽标准、要么拆项目」的假选择。
+    /// </summary>
+    private static Task CodecAssembliesDoNotReferenceIo(TestContext t)
+    {
+        // 每个纯编解码程序集都必须在，且都不得引用传输/驱动/运行时。
+        var codecs = new[]
+        {
+            typeof(global::Uic.Codec.Modbus.ModbusCodec).Assembly,
+            typeof(global::Uic.Codec.S7.Tpkt).Assembly,
+            typeof(global::Uic.Codec.Bacnet.BacnetFrame).Assembly,
+        };
+
+        // 这些是「I/O 与编排」层：codec 引用它们就意味着它在自己开连接、自己重试。
+        var forbidden = new[]
+        {
+            "Uic.Transport",
+            "Uic.Engine",
+            "Uic.Outbox",
+            "Uic.Runtime",
+            "Uic.Northbound",
+            "Uic.Obs",
+            "Uic.Config",
+            "Uic.Host",
+        };
+
+        foreach (var assembly in codecs)
+        {
+            var name = assembly.GetName().Name!;
+            var references = assembly.GetReferencedAssemblies()
+                .Select(a => a.Name ?? string.Empty)
+                .ToList();
+
+            // 反向对照：codec 确实依赖领域模型，说明这条程序集真的被加载到了。
+            t.Ok(references.Contains("Uic.Domain"), $"{name} 依赖 Uic.Domain（否则它拿不到地址与值模型）");
+
+            foreach (var layer in forbidden)
+            {
+                t.Ok(!references.Contains(layer), $"{name} 不得引用 {layer}：编解码要保持可单测、不碰 I/O");
+            }
+
+            // System.Net 是另一条边界：出现它基本等于「codec 自己开 socket」。
+            t.Ok(!references.Any(r => r.StartsWith("System.Net", StringComparison.Ordinal)),
+                $"{name} 不得引用 System.Net");
+        }
+
+        return Task.CompletedTask;
     }
 }
