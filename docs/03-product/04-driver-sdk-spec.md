@@ -7108,9 +7108,21 @@ APDU 层错误类映射与 BACnet/IP 一致：类 1（OBJECT）→`address`；�
 质量码由分类直接推出：`timeout`→`QualityTimeout`、`address`→`QualityAddressError`、
 `disconnected`→`QualityCommError`、其余→`QualityBad`。
 
-失败传播上有一条与其它轮询驱动相同的规则：**链路级失败时剩余点一并失败**。
-一轮里第 2 个点超时，第 3..N 个点不可能成功；继续逐个等超时只会把一轮采集拖成
-N 倍时长，让「设备掉线」看起来像「网关卡死」。总线上的重试留给下一轮调度。
+失败传播上与其它轮询驱动遵循同一条契约（§3.7.4 / §3.9.5），MS/TP 承载层的
+具体表现是：
+
+- **点级失败不拖垮整轮**：一轮里某个点回 Error(unknown-property) 或地址配错，
+  只把该点标坏（`address_error`）；只要有任意点成功，`Read` 就**不向上返回错误**，
+  好样本照常上送。**全部点位失败**才返回第一个错误，让调度器进入故障/退避——
+  否则一台设备会因为点表里一个写错的属性名被整体判死、指数退避，好的点位也
+  跟着不再采集。
+- **链路级失败时剩余点一并失败**：超时、断连、ctx 到期是链路级，立即返回，
+  并把剩余未发的点位显式标坏。一轮里第 2 个点超时，第 3..N 个点不可能成功；
+  继续逐个等超时只会把一轮采集拖成 N 倍时长，让「设备掉线」看起来像「网关卡死」。
+  总线上的重试留给下一轮调度。
+- **链路级失败绕过上面的闸门**：即便本轮已有好样本，一旦出现超时/断连仍以
+  该错误返回——一轮采集被周期超时打断本身就是「设备太慢」的信号，需要让调度器
+  看到。这与「点级失败看成功计数」是两条独立的判据。
 
 `Probe` 读 `device:1` 的 `object-name`：返回 ComplexACK 说明「总线 + 从站 + BACnet
 层」三段全通；返回 Error/Reject/Abort 说明帧能到设备、只是没有 `device:1`，同样
@@ -7144,7 +7156,7 @@ AV-3 每秒自增），所以同一份点表换承载不用改地址。MAC 默�
 | 层 | 用例 |
 |---|---|
 | `codec/bacnet/mstp.go` | 头 CRC 与数据 CRC 的有效帧残差（`0x55` / `0xF0B8`）；单字节向量 `crcHeaderByte(0,1)=0xFE`、`crcDataByte(0,1)=0x1189`；长度大端与数据 CRC 小端；帧往返；坏 preamble / 坏头 CRC / 坏数据 CRC / 超长数据段；地址分段（`IsMasterMAC` / `IsSlaveMAC`） |
-| `driver/bacnetmstp` | 真实 TCP 回环读写；`Open` 对 0..127 的从站地址、越界主站、非法 `presilence` 报错；超时重试与最终超时；迟到/重发 invoke 丢弃；垃圾字节跳过与半帧续读；被动 Token 应答与事务后交还；无 `nextStation` 时 PollForMaster 现场探测下一主站；ReplyPostponed→protocol；错误来源 MAC 不匹配时忽略；错误类映射（object/property/resources/security/未知）；写标签分支（present-value 由对象决定、其它属性由 dataType 推断）与本地类型/范围拒绝；链路失败时剩余点一并失败 |
+| `driver/bacnetmstp` | 真实 TCP 回环读写；`Open` 对 0..127 的从站地址、越界主站、非法 `presilence` 报错；超时重试与最终超时；迟到/重发 invoke 丢弃；垃圾字节跳过与半帧续读；被动 Token 应答与事务后交还；无 `nextStation` 时 PollForMaster 现场探测下一主站；ReplyPostponed→protocol；错误来源 MAC 不匹配时忽略；错误类映射（object/property/resources/security/未知）；写标签分支（present-value 由对象决定、其它属性由 dataType 推断）与本地类型/范围拒绝；**部分失败语义（有成功点则 `err==nil`、全失败才返回整体错误、链路级失败立即返回并把剩余点标坏）**；链路失败时剩余点一并失败 |
 | `sim/bacnetmstp` | 镜像对象表；数组下标与越界；写权限与类型收敛；未知对象/属性回 Error；畸形 ConfirmedRequest 回 Reject 且不 panic；每秒自增与停止；`SetAnalog`/`SetAnalogValue`/`SetBinary`/`SetString`/`SetValue` 各值类型；垃圾帧重扫 |
 | `pointtable` | `bacnet` / `bacnet-mstp` 共用 `WidthProtocol + AllowObject`；`analog-input:1.present-value` 与 `0:1.present-value` 都能解析；非法类型/实例/下标被拒 |
 | `cmd/uic` | `resolveMSTPPoint` 的对象类型/属性/下标/dtype 组合与拒绝路径；数值写法保留原始文本、标签用规范名 |

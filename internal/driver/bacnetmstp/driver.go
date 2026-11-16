@@ -721,16 +721,16 @@ func (c *connState) Read(ctx context.Context, spans []driver.ReadSpan) ([]driver
 	}
 	out := make([]driver.RawSample, 0, len(points))
 	var firstErr error
+	okSamples := 0
 	for i, p := range points {
 		if err := ctx.Err(); err != nil {
 			e := driver.E(driver.ErrTimeout, "read", c.cfg.Device.ID, "context done", true, err)
 			for _, rest := range points[i:] {
 				out = append(out, errSample(rest.ID, e))
 			}
-			if firstErr == nil {
-				firstErr = e
-			}
-			break
+			// 上下文取消是链路级超时：立即返回，不走下面的 okSamples 闸门——
+			// 一轮采集被周期超时打断本身就是「设备太慢」的信号，需要让调度器看到。
+			return out, e
 		}
 		plan, err := planPoint(p)
 		if err != nil {
@@ -746,19 +746,26 @@ func (c *connState) Read(ctx context.Context, spans []driver.ReadSpan) ([]driver
 			if firstErr == nil {
 				firstErr = err
 			}
-			// 链路级失败时剩下的点不可能成功；继续逐个等超时只会把一轮
-			// 采集拖成 N 倍时长。总线上重试留给下一轮调度。
+			// 链路级失败（超时/断连）时剩下的点不可能成功；立即返回，同样
+			// 不走 okSamples 闸门。总线上重试留给下一轮调度。
 			if driver.KindOf(err) == driver.ErrTimeout || driver.KindOf(err) == driver.ErrDisconnected {
 				for _, rest := range points[i+1:] {
 					out = append(out, errSample(rest.ID, err))
 				}
-				break
+				return out, err
 			}
 			continue
 		}
+		okSamples++
 		out = append(out, driver.RawSample{PointID: p.ID, Value: v, Quality: model.QualityGood})
 	}
-	return out, firstErr
+	// 部分失败语义（docs §3.7.4 / §3.9.5）：只要有任意一项成功，`Read` 就不
+	// 向上返回错误（好样本必须保留）；全部点位失败才返回第一个错误，让设备
+	// 进入故障/退避。链路级错误在上面已提前返回。
+	if okSamples == 0 && firstErr != nil {
+		return out, firstErr
+	}
+	return out, nil
 }
 
 func (c *connState) readOne(ctx context.Context, plan pointPlan) (model.Value, error) {
