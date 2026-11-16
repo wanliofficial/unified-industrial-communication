@@ -36,6 +36,7 @@ import (
 	"fmt"
 	"io"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -283,7 +284,14 @@ func (i *Index) IDs() []string {
 }
 
 func mergeItems(prev, next Item) Item {
-	pc, nc := prev.IsCondition(), next.IsCondition()
+	// 判定「这是条件」用 Category，而不是 IsCondition()。
+	//
+	// IsCondition() 额外要求「已有可识别的级别」，级别缺失时为 false。若用它，
+	// 一条级别读不出来的条件（`<System><BogusLevel>OVERHEAT</BogusLevel></System>`）
+	// 会被当成普通观测，与同一 ID 的采样/事件比序号，从而可能被顶掉——一条
+	// 报警就此消失。语义上它仍然是报警，只是严重度读不出来，必须保留参与合并。
+	pc := prev.Category == CategoryCondition
+	nc := next.Category == CategoryCondition
 	switch {
 	case pc && nc:
 		if rp, rn := conditionRank(prev.Condition), conditionRank(next.Condition); rp != rn {
@@ -309,6 +317,11 @@ func mergeItems(prev, next Item) Item {
 
 // conditionRank 给级别排序。UNAVAILABLE 排在 NORMAL 之上：它表示「不知道」，
 // 比「正常」更需要人看一眼。
+//
+// 级别缺失（空串，或 Agent 写了不认识的名字）排在**最高**：这类观测的语义是
+// 「有报警，但严重度读不出来」，绝不能因为排不出严重度就在合并时输给一条
+// 明确 NORMAL 的记录——那会把 bad 静默变成 good，与驱动层
+// conditionQuality「级别缺失一律判坏」自相矛盾。
 func conditionRank(l ConditionLevel) int {
 	switch l {
 	case ConditionFault:
@@ -320,7 +333,8 @@ func conditionRank(l ConditionLevel) int {
 	case ConditionNormal:
 		return 0
 	}
-	return -1
+	// 未知级别：高于 FAULT，使其在合并中胜出（fail-closed）。
+	return 4
 }
 
 // DataItem 是 `/probe` 里的一条数据项定义（只有模型，没有值）。
@@ -461,10 +475,10 @@ type xmlItem struct {
 	CoordinateSystem string    `xml:"coordinateSystem,attr"`
 	NativeCode       string    `xml:"nativeCode,attr"`
 	SampleRate       string    `xml:"sampleRate,attr"`
-	TimestampText    string    `xml:"timestamp,attr"`
-	Sequence         uint64    `xml:"sequence,attr"`
-	Text             string    `xml:",chardata"`
-	Children         []xmlItem `xml:",any"`
+	TimestampText    string       `xml:"timestamp,attr"`
+	Sequence         tolerantUint `xml:"sequence,attr"`
+	Text             string       `xml:",chardata"`
+	Children         []xmlItem    `xml:",any"`
 }
 
 func (doc *xmlStreams) convert() *Streams {
@@ -511,7 +525,7 @@ func (x xmlItem) convertItem(cat Category) Item {
 		Type:             x.XMLName.Local,
 		Category:         cat,
 		TimestampText:    x.TimestampText,
-		Sequence:         x.Sequence,
+		Sequence:         uint64(x.Sequence),
 		Text:             x.Text,
 	}
 	if ok {
@@ -560,7 +574,7 @@ func (x xmlItem) convertCondition() []Item {
 			it.Timestamp = zeroIfUnset(x.TimestampText, it.Timestamp)
 		}
 		if it.Sequence == 0 {
-			it.Sequence = x.Sequence
+			it.Sequence = uint64(x.Sequence)
 		}
 		if it.Text == "" {
 			it.Text = x.Text
@@ -795,34 +809,34 @@ type xmlError struct {
 // ---------------------------------------------------------------------------
 
 type xmlHeader struct {
-	CreationTime          string `xml:"creationTime,attr"`
-	Sender                string `xml:"sender,attr"`
-	InstanceID            uint64 `xml:"instanceId,attr"`
-	Version               string `xml:"version,attr"`
-	DeviceModelChangeTime string `xml:"deviceModelChangeTime,attr"`
-	TestIndicator         bool   `xml:"testIndicator,attr"`
-	BufferSize            uint64 `xml:"bufferSize,attr"`
-	AssetBufferSize       uint64 `xml:"assetBufferSize,attr"`
-	AssetCount            uint64 `xml:"assetCount,attr"`
-	FirstSequence         uint64 `xml:"firstSequence,attr"`
-	LastSequence          uint64 `xml:"lastSequence,attr"`
-	NextSequence          uint64 `xml:"nextSequence,attr"`
+	CreationTime          string       `xml:"creationTime,attr"`
+	Sender                string       `xml:"sender,attr"`
+	InstanceID            tolerantUint `xml:"instanceId,attr"`
+	Version               string       `xml:"version,attr"`
+	DeviceModelChangeTime string       `xml:"deviceModelChangeTime,attr"`
+	TestIndicator         bool         `xml:"testIndicator,attr"`
+	BufferSize            tolerantUint `xml:"bufferSize,attr"`
+	AssetBufferSize       tolerantUint `xml:"assetBufferSize,attr"`
+	AssetCount            tolerantUint `xml:"assetCount,attr"`
+	FirstSequence         tolerantUint `xml:"firstSequence,attr"`
+	LastSequence          tolerantUint `xml:"lastSequence,attr"`
+	NextSequence          tolerantUint `xml:"nextSequence,attr"`
 }
 
 func (h xmlHeader) convert() Header {
 	out := Header{
 		CreationTime:          h.CreationTime,
 		Sender:                h.Sender,
-		InstanceID:            h.InstanceID,
+		InstanceID:            uint64(h.InstanceID),
 		Version:               h.Version,
 		DeviceModelChangeTime: h.DeviceModelChangeTime,
 		TestIndicator:         h.TestIndicator,
-		BufferSize:            h.BufferSize,
-		AssetBufferSize:       h.AssetBufferSize,
-		AssetCount:            h.AssetCount,
-		FirstSequence:         h.FirstSequence,
-		LastSequence:          h.LastSequence,
-		NextSequence:          h.NextSequence,
+		BufferSize:            uint64(h.BufferSize),
+		AssetBufferSize:       uint64(h.AssetBufferSize),
+		AssetCount:            uint64(h.AssetCount),
+		FirstSequence:         uint64(h.FirstSequence),
+		LastSequence:          uint64(h.LastSequence),
+		NextSequence:          uint64(h.NextSequence),
 	}
 	// 老 Agent 不写 nextSequence：按「最后一条 + 1」补齐，让调用方不必
 	// 到处判断零值。
@@ -864,12 +878,38 @@ func prepare(data []byte) ([]byte, error) {
 // 只用标准库：MTConnect 规范要求 UTF-8，但现场 Agent 的 XML 声明里偶尔
 // 会出现 ISO-8859-1（老版本的工具链）。转码比直接失败更有价值——报警
 // 文字里的一个重音符号不该让整台设备离线。
+//
+// 数值属性（InstanceID/Sequence/…）用 tolerantUint 承接：标准没有为它们定义
+// 空值，但现场 Agent 确实会写出 `sequence=""` 或 `bufferSize="abc"`。若直接用
+// `xml:"x,attr"` 到 uint64，一行坏属性会让整份 /current 解析失败，**全部**点位
+// 每周期都变坏——一条诊断字段的噪声升级成整台设备离线。这里把「非数字」降级成
+// 0（只影响诊断/合并排序，不影响任何采集值），与「单点问题不升级为链路错误」
+// 同一原则。
 func decodeXML(data []byte, v any) error {
 	dec := xml.NewDecoder(bytes.NewReader(data))
 	dec.CharsetReader = charsetReader
 	if err := dec.Decode(v); err != nil {
 		return fmt.Errorf("parse XML: %w", err)
 	}
+	return nil
+}
+
+// tolerantUint 是「尽力而为」的无符号整数属性：空值或非数字解析成 0，绝不
+// 让属性错误中断整份文档。它实现 xml.UnmarshalerAttribute。
+type tolerantUint uint64
+
+func (u *tolerantUint) UnmarshalXMLAttr(attr xml.Attr) error {
+	v := strings.TrimSpace(attr.Value)
+	if v == "" {
+		*u = 0
+		return nil
+	}
+	n, err := strconv.ParseUint(v, 10, 64)
+	if err != nil {
+		*u = 0
+		return nil
+	}
+	*u = tolerantUint(n)
 	return nil
 }
 

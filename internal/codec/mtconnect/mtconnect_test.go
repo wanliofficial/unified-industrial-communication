@@ -278,6 +278,109 @@ func TestParseStreamsConditionMergeTakesWorst(t *testing.T) {
 	}
 }
 
+// TestParseStreamsUnknownLevelConditionSurvivesMerge 锁住「级别读不出来的条件
+// 在合并同一 dataItemId 时不得被 NORMAL 顶掉」。
+//
+// 这是 conditionRank 与 IsCondition 的合用陷阱：未知级别曾被排成 -1（低于
+// NORMAL 的 0），于是 `<System><BogusLevel/></System>`（一条真实报警）与
+// 同一 ID 的一条 `<Normal>` 合并时，Normal 获胜、级别变成 ""，driver 侧
+// 「级别缺失判坏」根本走不到——一条告警被静默吞成看起来正常的记录。
+//
+// 语义上「报警但严重度读不出来」比「明确 NORMAL」更需要人看一眼，因此未知
+// 级别必须排在最前（fail-closed），合并后仍是「无级别」，由驱动判坏。
+func TestParseStreamsUnknownLevelConditionSurvivesMerge(t *testing.T) {
+	doc := `<MTConnectStreams><Header/><Streams><DeviceStream name="d" uuid="u">` +
+		`<ComponentStream component="Controller" name="c"><Conditions>` +
+		// 级别缺失的条件先出现，NORMAL 后出现（序号更大）。
+		`<System dataItemId="alm" type="SYSTEM" sequence="5">` +
+		`<BogusLevel timestamp="t" sequence="5">OVERHEAT</BogusLevel></System>` +
+		`<System dataItemId="alm" type="SYSTEM" sequence="9"><Normal sequence="9">ok</Normal></System>` +
+		`</Conditions></ComponentStream></DeviceStream></Streams></MTConnectStreams>`
+	s, err := ParseStreams([]byte(doc))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	idx := s.Index()
+	it, ok := idx.Lookup("alm")
+	if !ok {
+		t.Fatal("alm 应被索引")
+	}
+	if it.Category != CategoryCondition {
+		t.Fatalf("Category = %q，应为 CONDITION", it.Category)
+	}
+	if it.Condition != "" {
+		t.Fatalf("Condition = %q；未知级别不得被 NORMAL 覆盖成 NORMAL（那会把 bad 变 good）", it.Condition)
+	}
+	if it.LevelKnown() {
+		t.Fatal("LevelKnown 应为 false：合并后仍是「报警但级别读不出来」")
+	}
+	// 反向：即使未知级别出现在后面、NORMAL 在前，也必须保留未知级别。
+	doc2 := `<MTConnectStreams><Header/><Streams><DeviceStream name="d" uuid="u">` +
+		`<ComponentStream component="Controller" name="c"><Conditions>` +
+		`<System dataItemId="alm" type="SYSTEM" sequence="9"><Normal sequence="9">ok</Normal></System>` +
+		`<System dataItemId="alm" type="SYSTEM" sequence="5">` +
+		`<BogusLevel sequence="5">OVERHEAT</BogusLevel></System>` +
+		`</Conditions></ComponentStream></DeviceStream></Streams></MTConnectStreams>`
+	s2, err := ParseStreams([]byte(doc2))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if it2, _ := s2.Index().Lookup("alm"); it2.Condition != "" {
+		t.Fatalf("顺序颠倒后 Condition = %q，未知级别仍不得被 NORMAL 覆盖", it2.Condition)
+	}
+}
+
+// TestParseStreamsTolerantNumericAttrs 锁住「一个非数字的数值属性不得让整份
+// /current 解析失败」。
+//
+// 数值属性（sequence/bufferSize/instanceId/…）用 `xml:",attr"` 到 uint64 时，
+// 任何一个写成空串或非数字都会让 xml.Decode 返回 ParseUint 错误，于是整份
+// 快照解析失败、**全部**点位每周期变坏——一个诊断字段的噪声升级成整台设备
+// 离线。这与驱动「单点问题不升级为链路错误」相悖。
+func TestParseStreamsTolerantNumericAttrs(t *testing.T) {
+	cases := []struct{ name, header, itemAttr string }{
+		{"sequence 非数字", ``, `sequence="abc"`},
+		{"sequence 为空", ``, `sequence=""`},
+		{"bufferSize 非数字 + nextSequence 空", ` bufferSize="lots" nextSequence=""`, `sequence="7"`},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			doc := `<MTConnectStreams><Header creationTime="2024-01-15T10:30:00Z" instanceId="1"` +
+				` version="2.0.0"` + c.header + `/><Streams><DeviceStream name="VMC" uuid="u1">` +
+				`<ComponentStream component="Linear" name="X" componentId="x1"><Samples>` +
+				`<Position dataItemId="Xabs" ` + c.itemAttr + `>12.5</Position></Samples>` +
+				`</ComponentStream></DeviceStream></Streams></MTConnectStreams>`
+			s, err := ParseStreams([]byte(doc))
+			if err != nil {
+				t.Fatalf("一个坏数值属性不应让整份文档失败：%v", err)
+			}
+			items := s.Items()
+			if len(items) != 1 {
+				t.Fatalf("items = %d, want 1", len(items))
+			}
+			// 坏序号降级成 0，但值本身必须完好——采集值不依赖这些属性。
+			if items[0].Value() != "12.5" {
+				t.Errorf("value = %q, want 12.5", items[0].Value())
+			}
+		})
+	}
+	// 良构数值仍必须被正确读入（修复不能把序号一律清零）。
+	good := `<MTConnectStreams><Header instanceId="42" bufferSize="100" lastSequence="9"/>` +
+		`<Streams><DeviceStream name="VMC" uuid="u1"><ComponentStream component="Linear" componentId="x1">` +
+		`<Samples><Position dataItemId="Xabs" sequence="9">12.5</Position></Samples>` +
+		`</ComponentStream></DeviceStream></Streams></MTConnectStreams>`
+	s, err := ParseStreams([]byte(good))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if s.Header.InstanceID != 42 || s.Header.BufferSize != 100 || s.Header.NextSequence != 10 {
+		t.Fatalf("header = %+v，正常数值必须原样读入（nextSequence 由 last+1 补齐）", s.Header)
+	}
+	if it := s.Items()[0]; it.Sequence != 9 {
+		t.Fatalf("sequence = %d, want 9", it.Sequence)
+	}
+}
+
 func TestParseStreamsErrorDocument(t *testing.T) {
 	doc := `<MTConnectStreams><Header/><Streams/></MTConnectStreams>` // valid but empty
 	_, err := ParseStreams([]byte(doc))

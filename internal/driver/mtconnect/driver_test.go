@@ -338,6 +338,43 @@ func TestReadConditionPoint(t *testing.T) {
 	}
 }
 
+// TestReadUnknownLevelConditionMergedWithNormalIsBad 是「单点问题不升级为链路
+// 错误」与「级别缺失判坏」两条规则的交点，也是最隐蔽的一条 fail-open：
+//
+// 同一 dataItemId 上，一条级别读不出来的条件（Agent 用了非标准级别元素名）与
+// 一条 Normal 同时出现时，codec 的合并若让 Normal 胜出，级别就变成 "NORMAL"，
+// 驱动侧「级别缺失判坏」分支根本走不到——一条真实告警被上报成 good，而且
+// 能解析、字段不空、看不出任何异常。
+func TestReadUnknownLevelConditionMergedWithNormalIsBad(t *testing.T) {
+	body := `<MTConnectStreams><Header/><Streams><DeviceStream name="VMC" uuid="u1">` +
+		`<ComponentStream component="Controller" name="c"><Conditions>` +
+		`<System dataItemId="alm" type="SYSTEM" sequence="5">` +
+		`<BogusLevel sequence="5">OVERHEAT</BogusLevel></System>` +
+		`<System dataItemId="alm" type="SYSTEM" sequence="9"><Normal sequence="9">ok</Normal></System>` +
+		`</Conditions></ComponentStream></DeviceStream></Streams></MTConnectStreams>`
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(body))
+	}))
+	defer srv.Close()
+
+	c := openMTConnect(t, srv.URL, deviceWithPoints(pt("alm", "alm", "string")))
+	defer c.Close()
+	out, err := c.Read(context.Background(), span(pt("alm", "alm", "string")))
+	if err != nil {
+		t.Fatalf("Read 不应整体报错（单点问题不升级为链路错误）: %v", err)
+	}
+	if len(out) != 1 {
+		t.Fatalf("got %d samples", len(out))
+	}
+	if out[0].Quality == model.QualityGood {
+		t.Fatalf("未知级别条件与 Normal 合并后 quality=good（fail-open）：value=%v err=%v",
+			out[0].Value, out[0].Err)
+	}
+	if out[0].Err == nil {
+		t.Fatal("应附带「级别读不出来」的诊断")
+	}
+}
+
 func TestReadTypeMismatchIsAddressError(t *testing.T) {
 	// 声明 float64 但 Agent 给了文本，应折成地址错误，而不是崩溃。
 	body := `<MTConnectStreams><Header/><Streams><DeviceStream name="VMC" uuid="u1">` +

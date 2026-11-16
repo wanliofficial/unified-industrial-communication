@@ -6905,6 +6905,47 @@ MTConnect 的条件是两层：**外层元素是条件类型**（`System`/`Actua
 路径钉住它——两层的未知级别名文本落在外层（为空），会被空值分支提前拦成
 `bad`，测不出 fail-open。
 
+**合并阶段的同一 fail-open 陷阱。** 上面的判坏只在「该 ID 最终仍带着级别缺失」时
+才生效。同一 `dataItemId` 出现多条观测时会先经过 `BuildIndex` 的合并，这里若用
+`Item.IsCondition()` 判断「这是不是条件」（它额外要求已有可识别级别），一条级别
+缺失的条件就会被当作普通观测参与序号比较；更糟的是排名函数曾把未知级别排成
+`-1`（低于 `NORMAL` 的 `0`），于是
+
+```
+<System dataItemId="alm"><BogusLevel>OVERHEAT</BogusLevel></System>   ← 真实报警，级别读不出
+<System dataItemId="alm"><Normal>ok</Normal></System>                 ← 同一 ID 的一条 Normal
+```
+
+合并后胜出的是 `NORMAL`，`Condition` 变成 `"NORMAL"`，驱动侧「级别缺失判坏」
+分支根本走不到——最终上报 `good` + `"NORMAL"`。这是全套代码里最隐蔽的一条
+fail-open：单看 codec 的 `LevelKnown` 测试、单看驱动的 `conditionQuality` 都是对的，
+错的只在两者之间的合并。修复有两条，缺一不可：
+
+1. 合并判定改用 `Category == CONDITION`（而不是 `IsCondition()`）——语义上是报警
+   就要参与合并；
+2. 未知级别的排名改成**最高**（`4`，高于 `FAULT` 的 `3`）——「有报警但严重度读不出」
+   比「明确 NORMAL」更需要人看一眼，合并后保持 `Condition == ""`，由驱动判坏。
+
+回归用例 `TestParseStreamsUnknownLevelConditionSurvivesMerge`（两个先后顺序都覆盖）
+与驱动级 `TestReadUnknownLevelConditionMergedWithNormalIsBad`。变异验证：把合并
+判定改回 `IsCondition()` 或把未知排名改回 `-1`，驱动用例立刻报
+`quality=good value=NORMAL`。
+
+#### 3.10.23.3.1 数值属性容错：一个坏属性不得拖垮整份快照
+
+Header 与观测上的数值属性（`instanceId`/`bufferSize`/`firstSequence`/`sequence`…）
+不能直接 `xml:",attr"` 到 `uint64`。实测一个 Agent 只要在某条 `sequence=""` 或
+`sequence="abc"`，`xml.Decode` 就会返回 `strconv.ParseUint` 错误，**整份
+`/current` 解析失败**——一条诊断字段的噪声升级成「全部点位每周期变坏」。这与本驱动
+「单点问题不升级为链路错误」的边界直接冲突：本来只该影响一个排序号的坏值，却让
+整台设备离线。
+
+因此这些属性统一用 `tolerantUint`（实现 `xml.UnmarshalerAttr`）承接：空值或非数字
+解析成 `0`，绝不中断文档。这个降级只影响诊断展示与重复观测的「取更新的一条」排序，
+**不影响任何采集值**——数值正确性来自元素正文，不来自 `sequence`。良构数值仍必须
+原样读入（用例同时断言 `instanceId=42`/`bufferSize=100`/`lastSequence→nextSequence=10`
+与 `sequence=9`，防止修复退化成「一律清零」）。
+
 #### 3.10.23.4 多设备 Agent 必须显式选设备
 
 一条产线常挂多台机床。若都当单设备读，`A` 机床的 `Xabs` 会覆盖 `B` 机床的
@@ -6936,8 +6977,8 @@ HTML / 延迟 / 省略数据项 / 全 `UNAVAILABLE` / 条件）各自独立，�
 
 | 层 | 用例 |
 |---|---|
-| `codec/mtconnect` | 按本地名匹配忽略命名空间；Header 序号与 `nextSequence` 补齐；Samples/Events/Conditions 三类观测；两层与平铺条件写法归一到同一级别并按严重度合并；**条件缺级别**（未知级别元素名/外层无内层/平铺未知元素名）保留 `Category=CONDITION` 且 `LevelKnown()==false`、`IsCondition()==false`；带合法级别的条件与非条件观测 `LevelKnown()==true`；`/probe` 设备模型；`MTConnectError` 文档；ISO-8859-1/latin-1/windows-1252 与 UTF-8 BOM 往返 |
-| `driver/mtconnect` | 一条 `/current` 覆盖多点的 `MultiRead`；单点 `UNAVAILABLE`→bad、ID 不存在/类型解析失败→address_error 都只写该点；条件级别→质量四态（Fault→bad / Warning→uncertain / Normal→good / Unavailable→bad）；**条件缺级别 fail-closed**：平铺未知元素名必须判 bad 且诊断不得误报成「空值」（变异验证：删掉防护即报 `quality="good" value=OVERHEAT`）；多设备未选报地址错误并列可选设备；省略端口补 5000；拒绝凭据/query/fragment；`/probe` 404 退回 `/current`；文档上限 32 MiB；`/sample` count 越界报 `unsupported`；对接真实 sim 的集成测试 |
+| `codec/mtconnect` | 按本地名匹配忽略命名空间；Header 序号与 `nextSequence` 补齐；Samples/Events/Conditions 三类观测；两层与平铺条件写法归一到同一级别并按严重度合并；**条件缺级别**（未知级别元素名/外层无内层/平铺未知元素名）保留 `Category=CONDITION` 且 `LevelKnown()==false`、`IsCondition()==false`；带合法级别的条件与非条件观测 `LevelKnown()==true`；**未知级别条件与同 ID 的 NORMAL 合并后仍保持级别缺失（不得被 NORMAL 顶掉成 good，两个先后顺序都覆盖）**；**空/非数字数值属性（`sequence`/`bufferSize`/`instanceId`）降级为 0 而不使整份文档失败，良构数值原样读入**；`/probe` 设备模型；`MTConnectError` 文档；ISO-8859-1/latin-1/windows-1252 与 UTF-8 BOM 往返 |
+| `driver/mtconnect` | 一条 `/current` 覆盖多点的 `MultiRead`；单点 `UNAVAILABLE`→bad、ID 不存在/类型解析失败→address_error 都只写该点；条件级别→质量四态（Fault→bad / Warning→uncertain / Normal→good / Unavailable→bad）；**条件缺级别 fail-closed**：平铺未知元素名必须判 bad 且诊断不得误报成「空值」（变异验证：删掉防护即报 `quality="good" value=OVERHEAT`）；**未知级别条件与同 ID 的 NORMAL 合并后仍判 bad（变异验证：合并判定改回 `IsCondition()` 或未知排名改回 -1，即报 `good value=NORMAL`）**；多设备未选报地址错误并列可选设备；省略端口补 5000；拒绝凭据/query/fragment；`/probe` 404 退回 `/current`；文档上限 32 MiB；`/sample` count 越界报 `unsupported`；对接真实 sim 的集成测试 |
 | `sim/mtconnect` | 三轴 Agent；`/probe`/`/current`/`/sample` 序号窗口；两层条件渲染；`toolOffset` 初始 `UNAVAILABLE`；gzip 与子路径；七类故障注入各自独立 |
 | `cmd/uic` | `-id` 折参、CSV→索引；自检命令三入口（probe/current/sample） |
 
