@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"strings"
 	"testing"
 
@@ -68,5 +69,37 @@ func TestSNMPRowDisplay(t *testing.T) {
 	r.Error = "boom"
 	if got := r.display(); got != "错误: boom" {
 		t.Fatalf("error display = %q", got)
+	}
+}
+
+// TestSNMPReadFailed 钉住自检读的退出码判据。
+//
+// 三档必须分清，混在一起会让脚本把两类完全不同的故障当成同一种：
+//
+//   - 全部失败（okCount==0）→ 非零：设备一个 OID 都不认，采集等于没做；
+//   - 部分成功 + 链路错误 → 非零：后半段根本没读，这一轮不完整；
+//   - 部分成功 + 无链路错误 → 零：§3.3.1 的部分失败语义。
+//
+// 「有错误就非零」是容易漏的那一档：只看 okCount 会把「读到 3 个点后链路
+// 断开」判成成功，脚本随后拿这 3 个点当全量结果。
+func TestSNMPReadFailed(t *testing.T) {
+	linkErr := errors.New("dev1 read timeout")
+	cases := []struct {
+		name    string
+		okCount int
+		err     error
+		want    bool
+	}{
+		{"all good", 3, nil, false},
+		{"partial without link error", 1, nil, false},
+		{"all failed", 0, nil, true},
+		{"partial with link error", 2, linkErr, true},
+		{"all failed with link error", 0, linkErr, true},
+	}
+	for _, tc := range cases {
+		if got := snmpReadFailed(tc.okCount, tc.err); got != tc.want {
+			t.Errorf("%s: snmpReadFailed(%d, %v) = %v, want %v",
+				tc.name, tc.okCount, tc.err, got, tc.want)
+		}
 	}
 }

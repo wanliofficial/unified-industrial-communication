@@ -20,7 +20,13 @@ type OID []uint32
 //   - 至少两个弧（`1.3`）：SNMP 的 OID 必须有对象与分支，单个数字不是 OID；
 //   - 首弧 0..2，且首弧小于 2 时次弧 ≤ 39：这是 BER 第一字节的编码前提；
 //   - 不带前导零（`1.03`）：前导零是八进制写法的残留，转成 3 还是 03 全靠猜；
-//   - 每弧 ≤ 2^32-1：子标识符用 32 位 base-128 编码，超出就无法落线。
+//   - 每弧 ≤ 2^32-1：子标识符用 32 位 base-128 编码，超出就无法落线；
+//   - 不超过 128 个弧：RFC 2578 §3.5 的 SMIv2 上限（校验在 Validate 里）。
+//
+// 注意「每弧 ≤ 2^32-1」限制的是弧，不是子标识符：RFC 2578 §3.5 同样要求
+// 每个子标识符 ≤ 2^32-1，但首个子标识符是前两弧的合成值 40*arc1+arc2，
+// arc1=2 时为 2^32+79，本来就合法地超过 32 位，靠 5 字节 base-128 落线，
+// 见 encodeOID / decodeOID 的两档上限。
 func ParseOID(s string) (OID, error) {
 	s = strings.TrimSpace(s)
 	s = strings.TrimPrefix(s, ".")
@@ -61,9 +67,17 @@ func MustParseOID(s string) OID {
 }
 
 // Validate 校验 OID 的编码前提。
+//
+// 除前两弧的规则外，还卡住 RFC 2578 §3.5 的「一个 OBJECT IDENTIFIER 最多
+// 128 个子标识符」。这条上限不是理论洁癖：超长 OID 只会出现在「把整张表
+// 的一行拼错」或自动生成器出 bug 的时候，线上发出去既浪费报文预算，也
+// 只会换来代理的 genErr / tooBig——在本地就拒绝，错误信息才能指到那个点。
 func (o OID) Validate() error {
 	if len(o) < 2 {
 		return fmt.Errorf("snmp: OID %s needs at least two arcs", o)
+	}
+	if len(o) > 128 {
+		return fmt.Errorf("snmp: OID has %d arcs, RFC 2578 allows at most 128", len(o))
 	}
 	if o[0] > 2 {
 		return fmt.Errorf("snmp: OID %s: first arc must be 0..2, got %d", o, o[0])
@@ -137,8 +151,18 @@ func encodeOID(o OID) []byte {
 		return nil
 	}
 	out := make([]byte, 0, 2*len(o))
-	// 前两个弧压进第一个子标识符。
-	out = appendSubID(out, o[0]*40+o[1])
+	// 前两个弧压进第一个子标识符：值 = 40*arc1 + arc2。
+	//
+	// 这里**必须**用 uint64 计算：RFC 1155 规定 arc1=2 时 arc2 没有上界，
+	// 于是首子标识符可达 40*2 + (2^32-1) = 2^32+79，**超出 uint32**。若按
+	// uint32 计算（o[0]*40+o[1]），这个值会回绕成一个小数——例如
+	// {2, 4294967295} 会回绕成 79，与 {1,39} 撞车，编出来的报文解码回来是
+	// 一台完全不同的设备。静默回绕属于最坏的一类缺陷：不报错、不截断，只是
+	// 悄悄指向别的对象。
+	//
+	// 用 appendSubID64 承载（最多 5 字节），普通情形（arc1<2 时 arc2<=39）
+	// 仍是单字节，编码结果不变。
+	out = appendSubID64(out, uint64(o[0])*40+uint64(o[1]))
 	for _, v := range o[2:] {
 		out = appendSubID(out, v)
 	}
@@ -157,6 +181,21 @@ func appendSubID(dst []byte, v uint32) []byte {
 	return append(dst, b[i:]...)
 }
 
+// appendSubID64 追加一个可能超过 32 位的 base-128 子标识符。
+//
+// 只有首子标识符（40*arc1+arc2）会走到这里，且上限是 2^32+79，5 字节足够；
+// 留 10 字节只是为了让「以后别再有人改回 uint32」这件事有个显式的余量。
+func appendSubID64(dst []byte, v uint64) []byte {
+	var b [10]byte
+	i := len(b) - 1
+	b[i] = byte(v & 0x7F)
+	for v >>= 7; v > 0; v >>= 7 {
+		i--
+		b[i] = byte(v&0x7F) | 0x80
+	}
+	return append(dst, b[i:]...)
+}
+
 // decodeOID 解析 BER 内容字节。
 func decodeOID(b []byte) (OID, error) {
 	if len(b) == 0 {
@@ -165,12 +204,25 @@ func decodeOID(b []byte) (OID, error) {
 	var out OID
 	var cur uint64
 	started := false
+	// 上限分两档，必须与编码侧严格对称：
+	//   首个子标识符 = 40*arc1+arc2，arc1=2 时 arc2 无上界
+	//                  → 最大 40*2+(2^32-1) = 2^32+79；
+	//   其余子标识符是 32 位 → 最大 2^32-1。
+	//
+	// 若这里统一按 32 位限死，编码侧刚修好的 {2, 大弧} 会在解回时被误判为
+	// 溢出——那是「写得出、读不回」的单向不兼容。
+	const maxFirstSubID = uint64(0xFFFFFFFF) + 80 // 2^32+79
+	limit := maxFirstSubID
 	for _, x := range b {
-		if !started {
-			started = true
-		}
+		started = true
+		// 逐字节检查，而不是等凑齐再查：一旦越界立刻返回，cur 就不会累积
+		// 到能溢出 uint64 的量级（否则超长续字节会让 cur 静默回绕，又变成
+		// 一次静默损坏）。
 		cur = cur<<7 | uint64(x&0x7F)
-		if cur > 0xFFFFFFFF {
+		if cur > limit {
+			if out == nil {
+				return nil, fmt.Errorf("snmp: OID first sub-identifier exceeds 40*2+2^32-1 (%d)", cur)
+			}
 			return nil, errors.New("snmp: OID sub-identifier overflows 32 bits")
 		}
 		if x&0x80 != 0 {
@@ -183,7 +235,13 @@ func decodeOID(b []byte) (OID, error) {
 				first, second = 2, cur-80
 			}
 			out = append(out, uint32(first), uint32(second))
+			limit = 0xFFFFFFFF
 		} else {
+			// RFC 2578 §3.5：最多 128 个子标识符。线上超过这个数只可能是
+			// 生成器出错或报文被拼接，继续解析下去没有意义。
+			if len(out) >= 128 {
+				return nil, errors.New("snmp: OID has more than 128 arcs")
+			}
 			out = append(out, uint32(cur))
 		}
 		cur = 0

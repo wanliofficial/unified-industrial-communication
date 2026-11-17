@@ -3083,10 +3083,10 @@ curl -s -H 'Authorization: Bearer dev-token-0123456789' localhost:8094/api/v1/po
 | 团体名（community） | ✓ 明文 | ✓ 明文 | ✗ |
 
 v3 的外层报文与 v1/v2c 完全不同（`HeaderData` + `msgSecurityParameters` + 数据部分），
-因此 `Build` / `Parse` 仍只处理 v1/v2c：`ParseVersion` 接受 `1` 与 `2c`，遇到 `3` 报
-`unsupported` 并把调用方指向 `BuildV3`/`ParseV3`。**不退回 v2c 碰运气**——用 v2c 的
-报文去连一个只开 v3 的代理，得到的是超时；现场会把它误判成「网络不通」，而真正的
-原因是版本配错。
+因此 `Build` / `Parse` 仍只处理 v1/v2c：`Build`/`Parse` 遇到版本 3 直接报错并把调用方
+指向 `BuildV3`/`ParseV3`（`ParseVersion` 本身接受 `3`，由驱动决定走哪条路径）。
+**不退回 v2c 碰运气**——用 v2c 的报文去连一个只开 v3 的代理，得到的是超时；现场会
+把它误判成「网络不通」，而真正的原因是版本配错。
 
 团体名按凭据对待：`labels.community` 在配置表单里是 `password` 类型（界面掩码），
 默认值 `public` 只是「第一次接通最少配置」，不是安全默认。文档与失败提示都要求
@@ -3166,6 +3166,17 @@ OID 的每个子标识符用 base-128 变长编码，**最高位为 1 表示还�
 （`0x4F` 是 79，对应 `1.39`）。首弧大于 2 的写法在标准里不合法，但现场确实存在；
 解析器按「2.(值-80)」宽松接受，**编码器只产生合法值**。
 
+首个子标识符还有一条容易被漏掉的边界：它是 `40 × 第一弧 + 第二弧` 的**合成值**，
+当第一弧为 2 时第二弧没有上界，于是这个值最大可到 `40×2 + (2^32-1) = 2^32+79`，
+**超过 32 位**。若按 32 位计算，`2.4294967295` 会回绕成 79，编出来的字节与
+`1.39` 完全相同——报文合法、代理不报错，数据却悄悄落到另一个对象上。因此编码侧
+用 64 位计算首个子标识符（5 字节 base-128），解码侧对首个子标识符放到 `2^32+79`、
+对其余子标识符仍卡 32 位：两侧上限必须严格对称，否则就是「写得出、读不回」。
+
+单个 OID 最多 128 个子标识符（RFC 2578 §3.5）。超长 OID 只会来自自动生成的拼接
+错误或人为拼包，本地直接拒绝并指到那个点位，比发出去换一个 `tooBig`/`genErr`
+更容易定位。
+
 点表里一个 SNMP 点位长这样：
 
 ```json
@@ -3243,7 +3254,11 @@ Counter64 经转换会丢低位。这不是实现疏漏，而是数值模型决�
 3. 线类型能被点表 `dataType` 接受（§3.10.12.4）。
 
 链路级失败（超时、断链）会让**本轮剩余批次全部快速失败**，不再逐批等超时，并
-立即以该错误返回（§3.3.1 的例外条款）。地址级错误只标记该点，不影响其它点位的
+立即以该错误返回（§3.3.1 的例外条款）。这条规则同样适用于 §3.10.12.6 的 v1 逐点
+退化路径：退化到一半超时，**前半段已经读到的点位必须保留**，只把剩下的标坏并立刻
+结束本轮；不能因为「这条路径最终返回了错误」就把同批的成功样本一起丢掉。
+
+地址级错误只标记该点，不影响其它点位的
 质量码，也不进入 `Read` 的汇总错误；其余点级错误（如线类型与 `dataType` 不符
 → `protocol`）同样只标该点——只要还有一个点位成功，整轮就是 `err == nil`。
 全部点位失败才上抛第一个错误，让熔断器看到「这台设备全坏了」。
@@ -3307,6 +3322,11 @@ v1 没有 per-varbind 异常。批量 GET 里只要有一个 OID 不存在，代
    接受了请求但按自己的解释改了值」（例如把 1 收敛成 100）当场暴露，而不是等下
    一轮采集才发现值不对。
 
+写失败的结果同样带质量码，按 §3.10.12.8 的映射给出（`address` → `address_error`、
+超时 → `timeout`、断链 → `comm_error`、其余 → `bad`）。**不留空**：上层 collector
+对空值会补 `bad`，那样「点位写错」「设备拒写」「超时」在下游就成了同一个值，而
+现场排查最先要分的正是这三类。读路径的 `errSample` 一直如此，写路径没有理由例外。
+
 #### 3.10.12.8 错误分类：error-status 与异常标记
 
 分类决定「要不要重试、要不要熔断、质量码是什么」。SNMP 的错误码比其它协议多，
@@ -3358,7 +3378,7 @@ UDP 没有连接，请求与应答靠 `request-id` 配对。驱动把整条会�
 
 | 不做 | 原因 |
 |---|---|
-| v3 / USM | 另一套认证加密与密钥管理；配置期显式拒绝，不退回 v2c |
+| v3 / USM（在本层） | 外层报文结构完全不同，单独在 §3.10.22 实现；本层遇到版本 3 显式拒绝，不退回 v2c |
 | Trap 接收 | 轮询主站的采集语义与「设备主动推」不同；v1 Trap 结构特殊，解析层直接拒绝 |
 | MIB 编译 / 名字解析 | 需要一整套 MIB 文件与解析器；点表只认数字 OID |
 | GetBulk 作为生产读 | 语义是「按字典序连续取」，与点表的「明确 OID」相反；只在自检遍历里用 GETNEXT |
@@ -3376,8 +3396,14 @@ UDP 没有连接，请求与应答靠 `request-id` 配对。驱动把整条会�
 |---|---|
 | 编解码 | `internal/codec/snmp`（`Parse`/`Build`/`GetRequest`/`GetNextRequest`/`SetRequest`/`GetBulkRequest`/`ParseOID`/`OID.Compare`/`OID.HasPrefix`/`ParseVersion`/`ParseOIDList`/`ErrorStatus.Kind`） |
 | 主站驱动 | `internal/driver/snmp`（`Meta`/`Open`/`Probe`/`Read`/`Write`，自检用 `GetRaw`/`Walk`；内部 `parseOptions`/`readBatch`/`readOneByOne`/`decodeValue`/`encodeWriteValue`/`statusError`/`exchange`） |
-| 内置代理 | `internal/sim/snmp`（`NewServer`/`NewServerWithOptions`/`Addr`/`Get`/`Set`/`SetWritable`/`Requests`/`Writes`/`Close`） |
-| CLI | `uic snmpread`（`-probe`/`-oid`/`-walk`/`-max-walk`/`-set`/`-setType`/`-retries`/`-raw`/`-json`） |
+| 内置代理 | `internal/sim/snmp`（`NewServer`/`NewServerWithOptions`/`Addr`/`Get`/`Set`/`SetWritable`/`Requests`/`Writes`/`Dropped`/`Close`；`Options{Community,MaxBulk,V3,V3Only}`，`V3Only` 用于复现「只开 v3」的代理：v1/v2c 静默丢弃） |
+| CLI | `uic snmpread`（`-probe`/`-oid`/`-walk`/`-max-walk`/`-set`/`-setType`/`-retries`/`-raw`/`-json`）；退出码约定见下 |
+
+**自检 CLI 的退出码**：`0` = 至少读到一个点且没有链路级失败；`1` = 一个点都没
+读到，或出现链路级错误（超时/断链），或在 v1 退化路径中途断掉。部分成功且无链路
+错误仍是 `0`，与 §3.3.1 的部分失败语义一致——但「读到一半链路断」不算部分成功：
+这一轮不完整，脚本不能拿它当全读到了。JSON 输出同步带 `ok`（成功行数）与 `error`
+（链路错误文本，无错误时为 `null`），供脚本精确判断。
 | 示例 | `examples/snmp.json`（9 点位：sysDescr/UpTime/Name/Services、可写 sysContact/sysLocation、ifNumber、ifInOctets、ifAdminStatus） |
 
 内置代理默认 community `public`，预置：
@@ -3452,9 +3478,9 @@ curl -s -X POST -H 'Authorization: Bearer dev-token-0123456789' \
 
 | 层 | 用例 |
 |---|---|
-| `codec/snmp` | GET/应答金帧、INTEGER 最短编码与负数、无符号前导零（`0x80000000`）、OID base-128（`2.39.1`→`77 01`）、OID 排序与前缀、非法 OID、版本解析（v3 拒绝）、异常标记只允许出现在应答、GetBulk 线格式、错误码分类、字符串/字节值、截断错误可识别 |
-| `driver/snmp` | 五种线类型解码、MultiRead 一条 GET、按 maxOids 与字节预算分批（顺序不变、每条 ≤1400 字节）、v1 `noSuchName` 逐点重发、写类型映射与回显校验、类型/范围拒绝不发包、9 种 error-status 分类、SET 回显被收敛、Probe 接受异常标记/超时提示、request-id 陈旧应答丢弃、链路失败停止后续批次、坏地址与线类型不符、Counter64 精度边界、`GetRaw`/`Walk`（子树边界、max、v1 表尾）；**部分失败语义（好点 + protocol 错时 `err==nil`、全失败才返回错误）** |
-| `sim/snmp` | 真实 UDP 回环：GET 与计数器、错 community 静默、v1/v2c 缺 OID 差异、GETNEXT 遍历与表尾、GETBULK 三行递增、SET 可写与回读、只读/类型错/不存在、SET 原子性、坏报文与非请求丢弃、`Set`/`SetWritable`/`Close` 幂等 |
+| `codec/snmp` | GET/应答金帧、INTEGER 最短编码与负数、无符号前导零（`0x80000000`）、OID base-128（`2.39.1`→`77 01`）、OID 排序与前缀、非法 OID、**首个子标识符的 `2^32+79` 边界（`2.4294967295` 往返、与 `1.39` 不撞车、越界与超长续字节拒绝）**、**128 弧上限（编解码两侧）**、版本解析（v3 拒绝）、异常标记只允许出现在应答、GetBulk 线格式（**负数计数拒绝**）、错误码分类、字符串/字节值、截断错误可识别 |
+| `driver/snmp` | 五种线类型解码、MultiRead 一条 GET、按 maxOids 与字节预算分批（顺序不变、每条 ≤1400 字节）、v1 `noSuchName` 逐点重发、**v1 退化中途超时保留已读样本并短路后续批次**、写类型映射与回显校验、**写失败带质量码（timeout/address/bad 三档）**、类型/范围拒绝不发包、9 种 error-status 分类、SET 回显被收敛、Probe 接受异常标记/超时提示、request-id 陈旧应答丢弃、链路失败停止后续批次、坏地址与线类型不符、Counter64 精度边界、`GetRaw`/`Walk`（子树边界、max、v1 表尾）；**部分失败语义（好点 + protocol 错时 `err==nil`、全失败才返回错误）** |
+| `sim/snmp` | 真实 UDP 回环：GET 与计数器、错 community 静默、v1/v2c 缺 OID 差异、GETNEXT 遍历与表尾、GETBULK 三行递增、SET 可写与回读、只读/类型错/不存在、SET 原子性、坏报文与非请求丢弃、**`V3Only` 只开 v3（v1/v2c 静默丢弃 + v3 仍可用）**、`Set`/`SetWritable`/`Close` 幂等 |
 | 点表/规划 | `PolicyFor("snmp")` 只允许 symbol、selector/寄存器/对象地址在导入期拒绝、`examples/snmp.json` 通过 `-check`（当时 21 个驱动） |
 | `cmd/uic` | `-set` 值解析（bool/int/uint/string/bytes、进制、越界、float/BCD 拒绝）、`snmpRow` 的 raw/error 显示 |
 

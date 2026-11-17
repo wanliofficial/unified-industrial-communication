@@ -216,6 +216,12 @@ func encodePDU(p PDU) ([]byte, error) {
 	body = appendTLV(body, tagInteger, encodeInt(int64(p.RequestID)))
 	switch p.Type {
 	case PDUGetBulk:
+		// 两个字段在线格式上是 INTEGER，但语义是「计数」：负数没有意义，
+		// 代理只会丢掉整条请求。与 parsePDU 的检查对称，避免自己发出
+		// 一条自己都不接受的东西。
+		if p.NonRepeaters < 0 || p.MaxRepetitions < 0 {
+			return nil, fmt.Errorf("snmp: negative non-repeaters/max-repetitions (%d/%d)", p.NonRepeaters, p.MaxRepetitions)
+		}
 		body = appendTLV(body, tagInteger, encodeInt(int64(p.NonRepeaters)))
 		body = appendTLV(body, tagInteger, encodeInt(int64(p.MaxRepetitions)))
 	default:

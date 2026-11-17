@@ -47,6 +47,13 @@ type Options struct {
 	// 需要能构造「只开 v3」的场景来验证 v1/v2c 的报文确实被拒绝，
 	// 反过来也一样。显式打开比隐式猜测更好测。
 	V3 *USMConfig
+
+	// V3Only 为 true 时只接受 v3：v1/v2c 报文静默丢弃（即使 V3 也配了）。
+	//
+	// 真实代理可以「只开 v3」——USM 用户配了、community 映射没配；这时
+	// v1/v2c 客户端拿到的是**超时**而不是错误，现场最容易误判成「网络
+	// 不通 / 端口没开」。这个开关让测试能构造那台设备，钉住驱动的诊断。
+	V3Only bool
 }
 
 // USMConfig 是内置代理的 USM 用户表与引擎参数。
@@ -98,6 +105,8 @@ type Server struct {
 	conn      *net.UDPConn
 	community string
 	maxBulk   int
+	// v3Only 拒绝一切 v1/v2c 报文（见 Options.V3Only）。
+	v3Only bool
 
 	// usm 非 nil 时启用 v3/USM。
 	usm *usmState
@@ -107,7 +116,10 @@ type Server struct {
 	sorted   []snmpcodec.OID
 	requests int
 	writes   int
-	closed   bool
+	// dropped 是 v1/v2c 被静默丢弃的条数（V3Only）；v3 的丢弃计数在
+	// usm.dropped 里，Dropped() 把两者相加，测试只关心「有没有丢」。
+	dropped int
+	closed  bool
 }
 
 // usmState 是 v3 的引擎与用户表状态。
@@ -146,7 +158,7 @@ func NewServerWithOptions(addr string, opt Options) (*Server, error) {
 	if maxBulk <= 0 {
 		maxBulk = 64
 	}
-	s := &Server{conn: conn, community: community, maxBulk: maxBulk, table: map[string]entry{}}
+	s := &Server{conn: conn, community: community, maxBulk: maxBulk, v3Only: opt.V3Only, table: map[string]entry{}}
 	if opt.V3 != nil {
 		u := &usmState{cfg: *opt.V3}
 		u.engine = append([]byte(nil), opt.V3.EngineID...)
@@ -212,9 +224,9 @@ func (s *Server) Dropped() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.usm == nil {
-		return 0
+		return s.dropped
 	}
-	return s.usm.dropped
+	return s.dropped + s.usm.dropped
 }
 
 // Addr 返回实际监听地址（端口 0 时用得到）。
@@ -360,10 +372,10 @@ func (s *Server) handle(datagram []byte) []byte {
 	if ver == snmpcodec.V3 {
 		return s.handleV3(datagram)
 	}
-	if s.usm != nil && !s.allowCommunity() {
-		// 只开了 v3 的代理：v1/v2c 一律静默丢弃。
+	if s.v3Only {
+		// 只开了 v3 的代理：v1/v2c 一律静默丢弃（与真实设备一致）。
 		s.mu.Lock()
-		s.usm.dropped++
+		s.dropped++
 		s.mu.Unlock()
 		return nil
 	}
@@ -393,11 +405,6 @@ func (s *Server) handle(datagram []byte) []byte {
 	s.mu.Unlock()
 	return s.buildCommunityResponse(msg, vbs, status, index)
 }
-
-// allowCommunity 表示 v3 与 v1/v2c 是否共存。
-//
-// 内置代理在启用 USM 时仍然接受 v1/v2c（真实代理的常见默认）。
-func (s *Server) allowCommunity() bool { return true }
 
 // dispatch 按 PDU 类型执行读/写，返回应答 varbind 与错误状态。
 //

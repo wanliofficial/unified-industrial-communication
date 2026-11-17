@@ -273,7 +273,7 @@ func parseOptions(dev model.Device) (Options, error) {
 			opt.MaxOids = n
 		default:
 			return opt, driver.E(driver.ErrUnsupported, "open", dev.ID,
-				fmt.Sprintf("未知的 options 项 %q（支持 retries / maxOids / engineID）", key), false, nil)
+				fmt.Sprintf("未知的 options 项 %q（只支持 retries / maxOids；engineID 是 labels 顶层的独立字段）", key), false, nil)
 		}
 	}
 
@@ -864,12 +864,11 @@ func (c *connState) Read(ctx context.Context, spans []driver.ReadSpan) ([]driver
 		if len(batch) == 0 {
 			return true
 		}
+		batchEnd := start + len(batch)
 		res, err := c.readBatch(ctx, points, batch)
-		if err != nil {
-			failRest(start, err)
-			linkErr = err
-			return false
-		}
+		// **先吸收本批已拿到的结果，再看链路错误**：v1 的逐点退化路径可能在
+		// 读到一半时超时，前半段的成功样本必须留下。早先这里是「有 err 就
+		// 整批标坏」，一次中途超时会把已经读到的值全部丢掉。
 		for _, r := range res {
 			if r.err != nil {
 				out[r.pos] = errSample(points[r.pos].ID, r.err)
@@ -885,6 +884,18 @@ func (c *connState) Read(ctx context.Context, spans []driver.ReadSpan) ([]driver
 		}
 		batch = batch[:0]
 		estimate = 48
+		if err != nil {
+			// 链路级失败：本批没有结果的点位与后续所有批次都显式标坏。
+			for _, it := range items[start:batchEnd] {
+				if !filled[it.pos] {
+					out[it.pos] = errSample(points[it.pos].ID, err)
+					filled[it.pos] = true
+				}
+			}
+			failRest(batchEnd, err)
+			linkErr = err
+			return false
+		}
 		return true
 	}
 
@@ -981,7 +992,9 @@ func (c *connState) readOneByOne(ctx context.Context, points []driver.PointRef, 
 			for _, rest := range batch[i:] {
 				res = append(res, batchResult{pos: rest.pos, err: e})
 			}
-			return res, nil
+			// 把链路错误交还给调用方：逐点退化可能已经读到几个点位，
+			// 但剩下的不可能再成功，继续发下一批只会把一次超时拖成 N 次。
+			return res, e
 		}
 		id := c.nextID()
 		req, err := snmpcodec.NewRequestPDU(snmpcodec.PDUGet, id, []snmpcodec.OID{it.oid})
@@ -995,7 +1008,7 @@ func (c *connState) readOneByOne(ctx context.Context, points []driver.PointRef, 
 				for _, rest := range batch[i:] {
 					res = append(res, batchResult{pos: rest.pos, err: err})
 				}
-				return res, nil
+				return res, err
 			}
 			res = append(res, batchResult{pos: it.pos, err: err})
 			continue
@@ -1130,48 +1143,49 @@ func (c *connState) Write(ctx context.Context, reqs []driver.WriteRequest) ([]dr
 
 func (c *connState) writeOne(ctx context.Context, req driver.WriteRequest) driver.WriteResult {
 	res := driver.WriteResult{PointID: req.PointID}
-	if req.Address.Kind != model.AddressSymbol {
-		res.Err = driver.E(driver.ErrAddress, "write", c.cfg.Device.ID,
-			fmt.Sprintf("point %q: snmp requires symbol (OID) addressing, got %q", req.PointID, req.Address.Kind), false, nil)
+	// 失败路径必须带质量位。留空会让上层各自补默认值（collector 补 bad），
+	// 于是「超时」「地址写错」「设备拒绝」在下游看起来一模一样——现场排查
+	// 时最需要区分的恰恰就是这三类。读路径的 errSample 一直是这样做的，
+	// 写路径不能例外。
+	fail := func(err error) driver.WriteResult {
+		res.Err = err
+		res.Quality = qualityOf(err)
 		return res
+	}
+	if req.Address.Kind != model.AddressSymbol {
+		return fail(driver.E(driver.ErrAddress, "write", c.cfg.Device.ID,
+			fmt.Sprintf("point %q: snmp requires symbol (OID) addressing, got %q", req.PointID, req.Address.Kind), false, nil))
 	}
 	oid, err := parseOID(req.Address)
 	if err != nil {
-		res.Err = err
-		return res
+		return fail(err)
 	}
 	val, err := encodeWriteValue(req)
 	if err != nil {
-		res.Err = err
-		return res
+		return fail(err)
 	}
 	id := c.nextID()
 	pdu, err := snmpcodec.NewSetPDU(id, []snmpcodec.Varbind{{OID: oid, Value: val}})
 	if err != nil {
-		res.Err = driver.E(driver.ErrInternal, "write", c.cfg.Device.ID, err.Error(), false, err)
-		return res
+		return fail(driver.E(driver.ErrInternal, "write", c.cfg.Device.ID, err.Error(), false, err))
 	}
 	resp, err := c.do(ctx, pdu, "write")
 	if err != nil {
-		res.Err = err
-		return res
+		return fail(err)
 	}
 	if st := snmpcodec.ErrorStatus(resp.ErrorStatus); st != snmpcodec.ErrNoError {
-		res.Err = c.statusError("write", st, oid, resp.ErrorIndex)
-		return res
+		return fail(c.statusError("write", st, oid, resp.ErrorIndex))
 	}
 	if len(resp.Varbinds) != 1 || resp.Varbinds[0].OID.Compare(oid) != 0 {
-		res.Err = driver.E(driver.ErrProtocol, "write", c.cfg.Device.ID,
-			"SET response does not echo the written OID", false, nil)
-		return res
+		return fail(driver.E(driver.ErrProtocol, "write", c.cfg.Device.ID,
+			"SET response does not echo the written OID", false, nil))
 	}
 	// 标准要求 SET 应答回显写入后的值。校验它能把「设备接受了请求
 	// 但按自己的解释改了值」（例如把 1 写成 100）当场暴露出来。
 	if !valueEqual(resp.Varbinds[0].Value, val) {
-		res.Err = driver.E(driver.ErrProtocol, "write", c.cfg.Device.ID,
+		return fail(driver.E(driver.ErrProtocol, "write", c.cfg.Device.ID,
 			fmt.Sprintf("SET echoed %s, want %s (device may have coerced the value)",
-				resp.Varbinds[0].Value, val), false, nil)
-		return res
+				resp.Varbinds[0].Value, val), false, nil))
 	}
 	res.OK = true
 	res.Quality = model.QualityGood

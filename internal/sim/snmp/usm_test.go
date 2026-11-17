@@ -547,6 +547,43 @@ func TestV3CoexistsWithCommunity(t *testing.T) {
 	}
 }
 
+// TestV3OnlyDropsCommunity：只开 v3 的代理对 v1/v2c 一律静默丢弃，
+// 而 v3 仍然正常。
+//
+// 这条开关不是「为了完整」：真机上「USM 配了、community 映射没配」很常见，
+// 此时 v1/v2c 客户端拿到的是超时，运维最容易归因到网络/端口。测试要能
+// 复现这种设备，驱动那边的诊断文案才有意义。
+func TestV3OnlyDropsCommunity(t *testing.T) {
+	srv := v3Sim(t, Options{V3Only: true, V3: &USMConfig{Users: map[string]USMUser{
+		"monitor": {Name: "monitor", Auth: snmpcodec.AuthSHA1, AuthPassword: "authpass123"},
+	}}})
+	if _, err := dialAgent(t, srv).send(getReq(t, snmpcodec.V2c, DefaultCommunity, "1.3.6.1.2.1.1.1.0"), 300*time.Millisecond); err == nil {
+		t.Fatal("v2c must be dropped on a v3-only agent")
+	}
+	if srv.Dropped() == 0 {
+		t.Fatal("dropped counter did not move")
+	}
+
+	// v3 不受影响：空 engineID 的发现请求仍然换回 Report。
+	pdu, err := snmpcodec.NewRequestPDU(snmpcodec.PDUGet, 3, []snmpcodec.OID{snmpcodec.MustParseOID("1.3.6.1.2.1.1.1.0")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	scoped, err := snmpcodec.BuildScopedPDU(nil, "", pdu)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := snmpcodec.BuildV3(
+		snmpcodec.HeaderData{MsgID: 1, MaxSize: 1400, Flags: snmpcodec.FlagReportable, SecModel: snmpcodec.SecurityModelUSM},
+		snmpcodec.USMSecurityParameters{UserName: "monitor"}, scoped, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m := sendV3(t, srv, raw); m.PDU.Type != snmpcodec.PDUReport {
+		t.Fatalf("v3 on a v3-only agent = %s", m.PDU.Type)
+	}
+}
+
 // TestV3EngineIDOverride：配置里给了 engineID 就用它。
 func TestV3EngineIDOverride(t *testing.T) {
 	custom := []byte{0x80, 0x00, 0x1F, 0x88, 0x04, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06}

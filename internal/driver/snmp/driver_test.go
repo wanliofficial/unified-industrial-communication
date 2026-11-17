@@ -617,6 +617,121 @@ func TestReadLinkFailureStopsRemainingBatches(t *testing.T) {
 	}
 }
 
+// TestWriteFailureCarriesQuality 钉住写路径的质量码：失败结果不能留空。
+//
+// 留空时 collector 会补成 bad，于是「超时」「地址写错」「设备拒写」在下游
+// 变成同一个值。读路径的 errSample 一直按 kind 给质量码，写路径必须一致。
+func TestWriteFailureCarriesQuality(t *testing.T) {
+	writeReq := func(id string, addr model.Address) driver.WriteRequest {
+		return driver.WriteRequest{PointID: id, DataType: model.TypeUint32,
+			Address: addr, Value: model.NumValue(model.TypeUint32, 1)}
+	}
+	sym := func(oid string) model.Address {
+		return model.Address{Kind: model.AddressSymbol, Path: oid, Index: -1}
+	}
+
+	cases := []struct {
+		name   string
+		status snmpcodec.ErrorStatus
+		want   model.Quality
+	}{
+		{"readOnly", snmpcodec.ErrReadOnly, model.QualityBad},
+		{"genErr", snmpcodec.ErrGenErr, model.QualityBad},
+		{"noSuchName", snmpcodec.ErrNoSuchName, model.QualityAddressError},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := &fakeDatagram{handler: func(req snmpcodec.Message) [][]byte {
+				return [][]byte{reply(t, req, req.PDU.Varbinds, int(tc.status), 1)}
+			}}
+			c := openTest(t, f, testConfig(nil))
+			out, err := c.Write(context.Background(), []driver.WriteRequest{
+				writeReq("p", sym("1.3.6.1.2.1.1.4.0"))})
+			if err != nil {
+				t.Fatalf("write: %v", err)
+			}
+			if out[0].OK || out[0].Err == nil {
+				t.Fatalf("result = %+v", out[0])
+			}
+			if out[0].Quality != tc.want {
+				t.Fatalf("quality = %q, want %q", out[0].Quality, tc.want)
+			}
+		})
+	}
+
+	t.Run("timeout", func(t *testing.T) {
+		f := &fakeDatagram{handler: func(snmpcodec.Message) [][]byte { return nil }}
+		c := openTest(t, f, testConfig(map[string]string{"options": "retries=0"}))
+		out, _ := c.Write(context.Background(), []driver.WriteRequest{
+			writeReq("p", sym("1.3.6.1.2.1.1.4.0"))})
+		if out[0].Quality != model.QualityTimeout {
+			t.Fatalf("timeout quality = %q", out[0].Quality)
+		}
+	})
+
+	t.Run("bad address kind", func(t *testing.T) {
+		f := &fakeDatagram{}
+		c := openTest(t, f, testConfig(nil))
+		out, _ := c.Write(context.Background(), []driver.WriteRequest{
+			writeReq("p", model.Address{Kind: model.AddressRegister, Area: "holding"})})
+		if out[0].Quality != model.QualityAddressError {
+			t.Fatalf("address quality = %q", out[0].Quality)
+		}
+	})
+
+	t.Run("unsupported data type", func(t *testing.T) {
+		f := &fakeDatagram{}
+		c := openTest(t, f, testConfig(nil))
+		req := writeReq("p", sym("1.3.6.1.2.1.1.4.0"))
+		req.DataType = model.TypeFloat64
+		req.Value = model.NumValue(model.TypeFloat64, 1.5)
+		out, _ := c.Write(context.Background(), []driver.WriteRequest{req})
+		if out[0].Quality != model.QualityBad {
+			t.Fatalf("unsupported-type quality = %q", out[0].Quality)
+		}
+	})
+}
+
+// TestV1FallbackLinkFailureKeepsGoodSamples：v1 的逐点退化路径中途超时，
+// 已经读到的样本必须留下，同时链路错误必须抛出去，后续批次不再尝试。
+//
+// 早先这条路径把「剩余点位标坏」之后返回 nil 错误，Read 会把下一批也发
+// 出去，每次都要等满一个超时；而如果改成「有错就整批丢弃」，前半段的
+// 成功样本又会一起丢掉。两件事必须同时成立。
+func TestV1FallbackLinkFailureKeepsGoodSamples(t *testing.T) {
+	table := map[string]snmpcodec.Value{
+		"1.3.6.1.2.1.1.1.0": snmpcodec.String("ok"),
+	}
+	inner := tableAgent(t, table)
+	calls := 0
+	f := &fakeDatagram{handler: func(req snmpcodec.Message) [][]byte {
+		calls++
+		if calls == 3 { // 批 + 单点 a + 单点 b：第 3 次交互链路断掉
+			return nil
+		}
+		return inner(req)
+	}}
+	c := openTest(t, f, testConfig(map[string]string{"version": "1", "options": "retries=0,maxOids=2"}))
+	pts := []driver.PointRef{
+		point("a", "1.3.6.1.2.1.1.1.0", model.TypeString),
+		point("b", "1.3.6.1.2.1.1.9.0", model.TypeString),
+		point("c", "1.3.6.1.2.1.1.5.0", model.TypeString),
+	}
+	out, err := c.Read(context.Background(), []driver.ReadSpan{{ID: "s", Points: pts}})
+	if driver.KindOf(err) != driver.ErrTimeout {
+		t.Fatalf("err = %v, want a link timeout", err)
+	}
+	if out[0].Quality != model.QualityGood || out[0].Value.Text != "ok" {
+		t.Fatalf("sample read before the timeout was lost: %+v", out[0])
+	}
+	if out[1].Quality != model.QualityTimeout || out[2].Quality != model.QualityTimeout {
+		t.Fatalf("remaining samples = %+v / %+v", out[1], out[2])
+	}
+	if calls != 3 {
+		t.Fatalf("interactions = %d; nothing may be sent after the link failed", calls)
+	}
+}
+
 func TestReadRejectsBadAddressAndWrongWireType(t *testing.T) {
 	table := map[string]snmpcodec.Value{
 		"1.3.6.1.2.1.1.1.0": snmpcodec.Octets([]byte("not a number")),

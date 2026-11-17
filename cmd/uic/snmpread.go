@@ -302,11 +302,30 @@ func runSNMPGet(ctx context.Context, c driver.Conn, oids []snmpcodec.OID, showRa
 	}
 
 	rows := make([]snmpRow, 0, len(results))
+	okCount := 0
 	for _, res := range results {
+		if res.Err == nil {
+			okCount++
+		}
 		rows = append(rows, snmpRowOf(res, showRaw))
 	}
+	// 退出码要能当判据用：一个 OID 都读不到、或链路级失败时返回 1（部分
+	// 成功且无链路错误仍是 0，与 §3.3.1 的部分失败语义一致）。全部失败还
+	// 返回 0，脚本会把「设备不认这些 OID」当成成功。
+	failed := snmpReadFailed(okCount, err)
 	if asJSON {
-		emitJSON(map[string]any{"read": len(rows), "rows": rows})
+		payload := map[string]any{"read": len(rows), "ok": okCount, "rows": rows}
+		// error 为 null 才是「没有链路错误」；写成字符串会把「无错」表达成
+		// "unknown" 这类非空值，脚本判空就会误报。
+		if err != nil {
+			payload["error"] = err.Error()
+		} else {
+			payload["error"] = nil
+		}
+		emitJSON(payload)
+		if failed {
+			os.Exit(1)
+		}
 		return
 	}
 	if showRaw {
@@ -314,13 +333,27 @@ func runSNMPGet(ctx context.Context, c driver.Conn, oids []snmpcodec.OID, showRa
 		for _, r := range rows {
 			printRow([]int{40, 14, 42, 12}, r.OID, r.Type, r.display(), r.Quality)
 		}
-		return
+	} else {
+		printRow([]int{40, 44}, "OID", "值")
+		for _, r := range rows {
+			printRow([]int{40, 44}, r.OID, r.display())
+		}
 	}
-	printRow([]int{40, 44}, "OID", "值")
-	for _, r := range rows {
-		printRow([]int{40, 44}, r.OID, r.display())
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "读取中断: %v\n", err)
+		os.Exit(1)
+	}
+	if okCount == 0 {
+		fmt.Fprintln(os.Stderr, "全部 OID 读取失败（逐行的质量码见上）")
+		os.Exit(1)
 	}
 }
+
+// snmpReadFailed 判断一次自检读是否该以非零退出。
+//
+// 部分成功仍然算成功（§3.3.1），但有链路级错误时即使读到了几个点也要报错：
+// 那说明这一轮并不完整，脚本拿它当「全读到了」会漏掉后面的点位。
+func snmpReadFailed(okCount int, err error) bool { return okCount == 0 || err != nil }
 
 func runSNMPWalk(ctx context.Context, c driver.Conn, prefix snmpcodec.OID, max int, showRaw, asJSON bool) {
 	w, ok := c.(snmpWalker)
