@@ -2455,6 +2455,12 @@ D0..D7 标注（D7 是保留位、D0 是「其它错误」，早期文档把 D0 
 一位、DI 写错一位、或点表引用了这块表不支持的数据项。其余错误更可能是设备状态或
 权限问题，处置方式不同。
 
+异常应答是**合法帧**，因此驱动按点级处理而不是链路故障：它本身不影响后续事务，也
+不该触发重连。唯一要区分的是「重发有没有意义」——`Probe` 的读通信地址若收到异常，
+说明表收到了命令但拒绝执行（例如不被允许的口令/命令组合），重发结果完全相同，因此
+按**不可重试**上报；`dlt645.Exception` 这个具体类型就是用来把这种情况与「帧本身坏了」
+分开的，后者可能只是线路噪声，仍保留可重试。
+
 #### 3.10.10.5 值编码：压缩 BCD、低字节在前、小数位在 DI 表
 
 | 数据项 | 宽度 | 编码 |
@@ -2514,16 +2520,18 @@ D0..D7 标注（D7 是保留位、D0 是「其它错误」，早期文档把 D0 
 #### 3.10.10.6 读：逐点串行、跟完后续帧、链路短路
 
 ```
-for each span:            # 规划层保证同一 DI 的点在同一 span
-  for each point:         # 但驱动仍逐点发，DI 之间没有「连续」概念
-    if linkErr: 标记坏点，continue
-    send 0x11 (DI)
-    if 异常: 标记坏点，continue
-    while 应答有后续帧:
-      send 0x12 (DI, SEQ++)
-      append 数据
-    校验长度（非数据块必须等于 DI 宽度）
-    解码 → 平台值
+points = flatten(spans)   # 摊平后才能「从任意下标把剩下的点标坏」
+for i, point := range points:
+  if ctx 到期:        标记 i.. 全部坏点，立即上抛 timeout
+  if linkErr != nil:  标记 i.. 全部坏点，立即上抛该错误
+  send 0x11 (DI)
+  if 异常:            标记该点坏（address_error / permission），continue
+  while 应答有后续帧:
+    send 0x12 (DI, SEQ++)
+    append 数据
+  校验长度（非数据块必须精确等于 DI 宽度）
+  解码 → 平台值
+if 无成功点: 上抛第一个错误
 ```
 
 三处刻意的设计：
@@ -2536,11 +2544,20 @@ for each span:            # 规划层保证同一 DI 的点在同一 span
   （`maxFollow`，默认 64 帧）与累计字节数（`MaxData × maxFollow`，约 12.8KB）。
   只做字节上限挡不住「每帧只回 1 字节、且永远置后续位」的坏表——按每次超时窗口
   算，一轮采集会从几十秒拖成几十分钟；只做帧数上限则挡不住满帧。
-- **链路级故障短路整轮。** 超时/断开后，剩余点位快速标记为同样的错误，而不是每个点
-  都等一次超时。300 个点位挂在 2400bps 总线上，一轮本该几十秒——再乘以点数就是事故。
+- **链路级故障短路整轮，并把收尾说完整。** 超时/断开/`ctx` 到期后，剩余点位快速
+  标记为同样的错误，而不是每个点都等一次超时。300 个点位挂在 2400bps 总线上，一轮
+  本该几十秒——再乘以点数就是事故。收尾必须同时满足三件事：已读到的样本**原样保留**、
+  剩余点位**显式补 `bad` 样本**、链路错误**即使有成功点也要上抛**（`driver.PartialReadError`
+  只管「点级失败」的部分失败语义，链路级是它的例外，见 §3.3.1）。少给样本会被采集器
+  当成「驱动漏报」，而吞掉链路错误会让调度器看不见已经断掉的链路。
+- **质量码按错误种类派生**（`timeout` / `comm_error` / `address_error` / `bad`），
+  不一律写 `comm_error`。运维看到 `comm_error` 会去查线路，而真正要改的可能只是点表。
 
 长度校验落在驱动而不是 codec：codec 只负责「这一段字节是什么」，驱动才知道「这个
-DI 按标准应该多宽」。
+DI 按标准应该多宽」。但 codec 自己也守一道**精确宽度**：`Decode` 拿到与 `Item.Width`
+不符的字节数直接报错（数据块除外，其宽度由请求决定），`ParseTime` 也只接受 6 字节。
+早先这几处只检查下界，多给的字节会被静默忽略——时间/日期/地址/需量都只取前 N 字节，
+于是「DI + 时间」整段误传也能解出一个看起来正常的时间。
 
 #### 3.10.10.7 写：三道闸门 + 一个被拒绝的开关
 
@@ -2580,6 +2597,12 @@ DI(4) | PA P0 P1 P2(4) | C0 C1 C2 C3(4) | 参数(m)
 - `PA` 高 4 位是密码权限（`0x02` = 普通表明文），低 4 位是密码等级；
 - `P0..P2` 是密码，来自 `options` 的 `password=`（6 位十六进制）；
 - `C0..C3` 是操作者代码，仅用于设备侧追溯，驱动默认全 0。
+
+写结果是**逐项结果**：失败项必须带 `Quality`（`timeout` / `address_error` / `bad`），
+留空会被 `runtime/collector.go` 兜底成 `bad`，于是「超时」「参数被拒」「设备不认这个
+DI」在下游分不出来。链路级失败（超时/断开）时，同批剩余写命令不再发送、逐项标坏，
+并把这个错误经 `Write` 的第二个返回值上抛；`ctx` 到期同样一次收尾，而不是把「超时」
+乘以条数。已经成功的条目保持 `OK=true`，不得被回填成失败（§3.4 规则 4）。
 
 #### 3.10.10.8 两种承载：RS-485 与串口服务器
 
@@ -2634,8 +2657,8 @@ D7=1，因此回显可以被无条件识别。驱动在事务层跳过 D7=0 的�
 | 内容 | 路径 |
 |---|---|
 | 编解码 | `internal/codec/dlt645`（`Parse`/`Build`/`ReadRequest`/`ReadNextRequest`/`ReadAddrRequest`/`WriteRequest`/`BroadcastTimeRequest`/`RelayRequest`/`ParseReadReply`/`ParseReadNextReply`/`ParseAddrReply`/`WriteAck`/`DIFromBytes`/`ParseDI`/`Lookup`/`Width`/`Decode`/`Format`/`EncodeValue`/`EncodeTime`/`ParseTime`/`EncodeAddr`/`Sum`/`Reader.Next`） |
-| 主站驱动 | `internal/driver/dlt645`（`Meta`/`Open`/`Probe`/`Read`/`Write`，内部 `exchange`/`readPoint`/`readNext`/`sample`/`classify`/`resolve`/`parseOptions`） |
-| 内置从站 | `internal/sim/dlt645`（`NewServer`/`ServeStream`/`SetValue`/`Value`/`Relay`/`Writes`/`Address`） |
+| 主站驱动 | `internal/driver/dlt645`（`Meta`/`Open`/`Probe`/`Read`/`Write`，内部 `exchange`/`readPoint`/`readNext`/`sample`/`classify`/`qualityOf`/`resolve`/`parseOptions`） |
+| 内置从站 | `internal/sim/dlt645`（`NewServer`/`ServeStream`/`SetValue`/`Value`/`Relay`/`Writes`/`Requests`/`Address`，选项 `WithAddress`/`WithPassword`/`WithDropAfter`/`WithoutValue`） |
 | CLI | `uic dlt645read`（`-probe`/`-di`/`-write`/`-raw`/`-json`，`serial`/`tcp` 双承载） |
 | 示例 | `examples/dlt645.json`（13 点位：电能/电压/电流/功率/功率因数/频率/需量/时钟/状态字/数据块/结算日） |
 
@@ -2691,6 +2714,11 @@ curl -s -H 'Authorization: Bearer dev-token-0123456789' localhost:8093/api/v1/po
 （高位由主站补 `AA` 通配），但写进表里等于把表号改成 `AA AA AA AA AA 42`——之后除了
 通配读就再也点不到它。CLI 与驱动两层都拒绝这种写法。
 
+`dlt645read` 的退出码可以当判据用：一个数据项都读不到、或出现链路级错误时返回 1；
+部分成功且无链路错误仍是 0（§3.3.1）。JSON 输出带 `ok`（成功条数）与 `error`
+（无错时为 `null`，而不是 `"unknown"` 这类非空值）。全失败也返回 0 会让脚本把「表
+不认这些 DI」当成成功，这正是自检工具最不该有的行为。
+
 `dlt645read` 的排查顺序内建在失败提示里：**波特率/校验位 → 表地址 → 前导字节 → A/B
 接线**。这四步覆盖了 RS-485 上「不通」的绝大多数原因，而且每一步都能用同一条命令
 单独验证（`-baud`/`-parity`/`-address`/`-preamble 0`），不需要另装抓包工具。
@@ -2704,10 +2732,10 @@ curl -s -H 'Authorization: Bearer dev-token-0123456789' localhost:8093/api/v1/po
 | 层 | 用例 |
 |---|---|
 | `codec/dlt645` | 金帧（读/读后续/读地址/写/拉合闸/广播校时）、前导不进校验和、地址低字节先传、`+0x33` 往返、CS 覆盖范围、L 上限（读 200/写 50）、异常位解析、DI 表宽度与小数位、压缩 BCD 符号位、3 字节量、时间 6 字节往返、4 字节日期、地址格式化、收帧扫描与截断/坏校验 |
-| `driver/dlt645` | 元数据与能力声明、探针成功/错表拒绝、电能/电压/电流/需量解码、未收录 DI、未知 DI→`address_error`、后续帧（250 字节重组 + 前 4 字节校验）、写需 opt-in、写时钟往返、结算日 8 位值原样写回、非法日期（13 月/2 月 30 日）本地拒绝、只读 DI（含状态字）拒绝、缺 `labels.address`、超时分类、链路失败短路、异常位→错误分类 |
-| `sim/dlt645` | 真实 TCP 回环：标准宽度、忽略他表地址、无数据异常位、写权限/密码/只读、后续帧拆分与重组（500 字节）、读地址、广播校时静默且生效、拉合闸 + 非法动作拒绝、`Close` 幂等、`ServeStream` over `net.Pipe` |
+| `driver/dlt645` | 元数据与能力声明、探针成功/错表拒绝、**探针异常应答不可重试**、电能/电压/电流/需量解码、未收录 DI、未知 DI→`address_error`、后续帧（250 字节重组 + 前 4 字节校验）、写需 opt-in、写时钟往返、结算日 8 位值原样写回、非法日期（13 月/2 月 30 日）本地拒绝、只读 DI（含状态字）拒绝、缺 `labels.address`、超时分类、**部分失败语义（坏 DI + 好点 `err==nil`、全失败上抛）**、链路中断保留已读样本并把剩余点标坏后上抛、`ctx` 到期把剩余点标坏、**写失败质量码**（`timeout`）、写链路失败中止剩余并经第二返回值上抛且不连坐已成功项、异常位→错误分类 |
+| `sim/dlt645` | 真实 TCP 回环：标准宽度、忽略他表地址、无数据异常位、写权限/密码/只读、后续帧拆分与重组（500 字节）、读地址、广播校时静默且生效、拉合闸 + 非法动作拒绝、`Close` 幂等、`ServeStream` over `net.Pipe`、`WithDropAfter` 模拟中途断链、`WithoutValue` 只让单个 DI 回异常而其余 DI 仍正常 |
 | 点表/规划 | DI 三种写法与全部拒绝路径、`WidthProtocol` 策略、不同 DI 不合并、同 DI 同 span |
-| `cmd/uic` | DI 列表去重/非法 DI/全 FF 拒绝、时间五种写法与非法日期拒绝、日期类 8 位 `MMDDhhmm` 与完整时间、地址缩位写拒绝、数据块走 `bytes`、传输方式按参数推断 |
+| `cmd/uic` | DI 列表去重/非法 DI/全 FF 拒绝、时间五种写法与非法日期拒绝、日期类 8 位 `MMDDhhmm` 与完整时间、地址缩位写拒绝、数据块走 `bytes`、传输方式按参数推断、`dlt645ReadFailed` 退出码（全失败/链路错误 → 1，部分成功 → 0） |
 
 ### 3.10.11 CJ/T 188-2004（户用计量仪表：水表 / 燃气表 / 热量表）
 

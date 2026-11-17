@@ -385,6 +385,75 @@ func TestSimRelayCommand(t *testing.T) {
 	}
 }
 
+// TestSimWithoutValueReturnsException 未实现的数据标识必须回异常应答，且只
+// 影响那一个 DI：主站据此把它判成点级错误，而不是整台表都不可用。
+func TestSimWithoutValueReturnsException(t *testing.T) {
+	srv, err := NewServer("127.0.0.1:0", WithoutValue("02010100"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = srv.Close() }()
+	c, done := dialSim(t, srv)
+	defer done()
+
+	addr := simAddr(t, "000000000042")
+	req, err := dlt.ReadRequest(addr, mustDI(t, "02010100"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	fr, ok := roundTrip(t, c, req)
+	if !ok {
+		t.Fatal("no reply")
+	}
+	if !fr.IsError() {
+		t.Fatalf("ctrl = %02X, want exception", fr.Ctrl)
+	}
+	if !fr.Exception().Has(dlt.ErrNoData) {
+		t.Fatalf("exception = %02X, want 无请求数据位", fr.Exception().Code)
+	}
+
+	// 同一块表的其它数据项仍然正常：异常是点级事实，不是表级故障。
+	ok2, _ := dlt.ReadRequest(addr, mustDI(t, "02020100"))
+	fr2, ok := roundTrip(t, c, ok2)
+	if !ok || fr2.IsError() {
+		t.Fatalf("C 相电压应正常应答: ok=%v ctrl=%02X", ok, fr2.Ctrl)
+	}
+}
+
+// TestSimDropAfterClosesConnection 掉线开关必须在第 n 次应答之后才断开，
+// 这样驱动侧的用例才能精确构造「读到一半链路没了」。
+func TestSimDropAfterClosesConnection(t *testing.T) {
+	srv, err := NewServer("127.0.0.1:0", WithDropAfter(1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = srv.Close() }()
+	c, done := dialSim(t, srv)
+	defer done()
+
+	addr := simAddr(t, "000000000042")
+	first, _ := dlt.ReadRequest(addr, mustDI(t, "00000000"))
+	if _, ok := roundTrip(t, c, first); !ok {
+		t.Fatal("first transaction got no reply")
+	}
+	// 第一次应答已经发出，连接随后被从站关闭：第二次事务必须失败。
+	second, _ := dlt.ReadRequest(addr, mustDI(t, "02010100"))
+	if _, err := c.Write(second); err != nil {
+		return // 写直接失败也算断开
+	}
+	_ = c.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
+	buf := make([]byte, 64)
+	for {
+		if _, err := c.Read(buf); err != nil {
+			var ne net.Error
+			if errors.As(err, &ne) && ne.Timeout() {
+				t.Fatal("slave kept the connection open after dropAfter=1")
+			}
+			return
+		}
+	}
+}
+
 func TestSimCloseIsIdempotent(t *testing.T) {
 	srv, err := NewServer("127.0.0.1:0")
 	if err != nil {

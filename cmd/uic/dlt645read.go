@@ -153,12 +153,9 @@ func dlt645readCmd(args []string) {
 		spans = append(spans, driver.ReadSpan{ID: di.String(), Points: []driver.PointRef{ref}})
 	}
 	samples, rerr := c.Read(ctx, spans)
-	if rerr != nil && len(samples) == 0 {
-		fmt.Fprintf(os.Stderr, "读取失败: %v\n", rerr)
-		os.Exit(1)
-	}
 
 	rows := make([]dlt645Row, 0, len(samples))
+	okCount := 0
 	for _, s := range samples {
 		row := dlt645Row{DI: s.PointID}
 		item, known := dlt645codec.Lookup(mustDIQuiet(s.PointID))
@@ -172,6 +169,7 @@ func dlt645readCmd(args []string) {
 			rows = append(rows, row)
 			continue
 		}
+		okCount++
 		row.Type = string(s.Value.Type)
 		if s.Value.Type == model.TypeBytes {
 			// 字节串直接按十六进制显示：它本来就不是文本，当成字符串输出
@@ -187,11 +185,26 @@ func dlt645readCmd(args []string) {
 		rows = append(rows, row)
 	}
 
+	// 退出码要能当判据用：一个数据项都读不到、或出现链路级错误时返回 1
+	// （部分成功且无链路错误仍是 0，与 docs §3.3.1 的部分失败语义一致）。
+	// 全部失败还返回 0，脚本会把「表不认这些 DI」当成成功。
+	failed := dlt645ReadFailed(okCount, rerr)
 	if *asJSON {
-		emitJSON(map[string]any{
+		payload := map[string]any{
 			"transport": ch.Transport.Kind, "address": *address,
-			"link": "up", "read": len(rows), "rows": rows,
-		})
+			"link": "up", "read": len(rows), "ok": okCount, "rows": rows,
+		}
+		// error 为 null 才是「没有链路错误」；字符串会把「无错」表达成
+		// "unknown" 这类非空值，脚本判空就会误报。
+		if rerr != nil {
+			payload["error"] = rerr.Error()
+		} else {
+			payload["error"] = nil
+		}
+		emitJSON(payload)
+		if failed {
+			os.Exit(1)
+		}
 		return
 	}
 
@@ -201,13 +214,27 @@ func dlt645readCmd(args []string) {
 		for _, r := range rows {
 			printRow([]int{10, 28, 20, 12}, r.DI, r.Name, r.display(), r.Quality)
 		}
-		return
+	} else {
+		printRow([]int{10, 28, 20}, "DI", "数据项", "值")
+		for _, r := range rows {
+			printRow([]int{10, 28, 20}, r.DI, r.Name, r.display())
+		}
 	}
-	printRow([]int{10, 28, 20}, "DI", "数据项", "值")
-	for _, r := range rows {
-		printRow([]int{10, 28, 20}, r.DI, r.Name, r.display())
+	if rerr != nil {
+		fmt.Fprintf(os.Stderr, "读取中断: %v\n", rerr)
+		os.Exit(1)
+	}
+	if okCount == 0 {
+		fmt.Fprintln(os.Stderr, "全部数据项读取失败（逐行的质量码见上）")
+		os.Exit(1)
 	}
 }
+
+// dlt645ReadFailed 判断一次自检读是否该以非零退出。
+//
+// 部分成功仍然算成功（docs §3.3.1），但有链路级错误时即使读到了几个数据项
+// 也要报错：那说明这一轮并不完整，脚本拿它当「全读到了」会漏掉后面的点位。
+func dlt645ReadFailed(okCount int, err error) bool { return okCount == 0 || err != nil }
 
 // inferTransport 按「用户给了哪组参数」推断传输方式。
 //

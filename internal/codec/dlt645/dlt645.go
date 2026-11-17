@@ -537,7 +537,9 @@ func ValidDateParts(mon, day, hour, min, sec int) error {
 // 的数据项之一——读到一个假的 07:06 比读不到更危险，因为它会被当成真实事件
 // 时间参与结算与统计。
 func ParseTime(b []byte) (time.Time, error) {
-	if len(b) < 6 {
+	// 必须精确 6 字节：多给的字节属于下一个数据项。只检查下界会让
+	// 「DI + 时间」这种整段误传的调用悄悄成功（例如广播校时帧多带一字节）。
+	if len(b) != 6 {
 		return time.Time{}, fmt.Errorf("dlt645: 时间需要 6 字节，实际 %d", len(b))
 	}
 	v := make([]int, 6)

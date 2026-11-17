@@ -28,6 +28,13 @@ func Decode(it Item, raw []byte) (float64, error) {
 	if len(raw) == 0 {
 		return 0, fmt.Errorf("dlt645: %s 数据域为空", it.Name)
 	}
+	// 宽度必须精确匹配。多给字节等于把相邻数据项当成这一项的一部分（时间/
+	// 日期/地址/需量这几个分支只取前 N 字节），少给则会把一个更窄的数当成
+	// 正确读数——两种都会给出「看起来合理」的错值，比报错难查得多。
+	// 数据块（Width=0）的宽度由请求/应答决定，不在这里约束。
+	if it.Width > 0 && len(raw) != it.Width {
+		return 0, fmt.Errorf("dlt645: %s 需要 %d 字节，实际 %d", it.Name, it.Width, len(raw))
+	}
 	switch it.Kind {
 	case KindTime:
 		t, err := ParseTime(raw)

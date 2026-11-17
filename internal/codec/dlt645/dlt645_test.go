@@ -296,6 +296,40 @@ func TestDecodeDemand(t *testing.T) {
 	}
 }
 
+// TestDecodeRejectsWrongWidth 数据域宽度必须精确等于数据项宽度：
+// 多给字节等于把相邻数据项当成这一项的一部分，少给则把更窄的数当读数。
+// 两种都会产出「看起来合理」的错值，必须在解码层拦住。
+func TestDecodeRejectsWrongWidth(t *testing.T) {
+	tm, _ := Lookup(mustDI(t, "04000101")) // 6 字节时间
+	if _, err := Decode(tm, []byte{0x07, 0x30, 0x12, 0x11, 0x11, 0x26, 0x00}); err == nil {
+		t.Fatal("时间数据项接受了 7 字节")
+	}
+	if _, err := Decode(tm, []byte{0x07, 0x30, 0x12, 0x11, 0x11}); err == nil {
+		t.Fatal("时间数据项接受了 5 字节")
+	}
+
+	addrItem, _ := Lookup(mustDI(t, "04000401")) // 6 字节地址
+	if _, err := Decode(addrItem, []byte{0x42, 0, 0, 0, 0, 0, 0xAA}); err == nil {
+		t.Fatal("地址数据项接受了 7 字节")
+	}
+
+	energy, _ := Lookup(mustDI(t, "00000000")) // 4 字节电能
+	if _, err := Decode(energy, []byte{0x78, 0x56, 0x34, 0x12, 0x00}); err == nil {
+		t.Fatal("电能数据项接受了 5 字节")
+	}
+}
+
+// TestParseTimeRejectsExtraBytes 时间必须精确 6 字节：多带字节说明调用方
+// 传进来的不是「一个时间字段」，静默取前 6 字节会把后面的数据项一起吃掉。
+func TestParseTimeRejectsExtraBytes(t *testing.T) {
+	if _, err := ParseTime([]byte{0x07, 0x30, 0x12, 0x11, 0x11, 0x26, 0x00}); err == nil {
+		t.Fatal("ParseTime accepted 7 bytes")
+	}
+	if _, err := ParseTime([]byte{0x07, 0x30, 0x12, 0x11, 0x11, 0x26}); err != nil {
+		t.Fatalf("valid 6-byte time rejected: %v", err)
+	}
+}
+
 func TestEncodeRoundTrip(t *testing.T) {
 	volt, _ := Lookup(mustDI(t, "02010100"))
 	b, err := EncodeValue(volt, 228.7)

@@ -3,11 +3,14 @@ package dlt645
 import (
 	"context"
 	"errors"
+	"io"
 	"net"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
+	dlt645codec "uic/internal/codec/dlt645"
 	"uic/internal/driver"
 	"uic/internal/model"
 	dlt645sim "uic/internal/sim/dlt645"
@@ -51,6 +54,29 @@ func openConn(t *testing.T, addr string, di ...string) driver.Conn {
 		Channel: model.Channel{ID: "ch", Protocol: "dlt645",
 			Transport: model.Transport{Kind: "tcp", Address: addr},
 			Timeout:   model.Duration(2 * time.Second)},
+		Device: dev,
+	})
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	t.Cleanup(func() { _ = c.Close() })
+	return c
+}
+
+// openConnTimeout 与 openConn 同构，但允许把单次事务超时压短：
+// 「链路失败」类用例必须等满一个超时窗口，用默认 2s 会让用例变慢。
+func openConnTimeout(t *testing.T, addr string, timeout time.Duration) driver.Conn {
+	t.Helper()
+	dev := model.Device{
+		ID: "meter", ChannelID: "ch", Enabled: true,
+		Interval: model.Duration(time.Second),
+		Timeout:  model.Duration(timeout),
+		Labels:   map[string]string{"address": "000000000042"},
+	}
+	c, err := New().Open(context.Background(), driver.OpenConfig{
+		Channel: model.Channel{ID: "ch", Protocol: "dlt645",
+			Transport: model.Transport{Kind: "tcp", Address: addr},
+			Timeout:   model.Duration(timeout)},
 		Device: dev,
 	})
 	if err != nil {
@@ -757,5 +783,241 @@ func TestWriteTimeRejectsInvalidDate(t *testing.T) {
 	}
 	if srv.Writes() != 0 {
 		t.Fatalf("slave saw %d writes, want 0", srv.Writes())
+	}
+}
+
+// allowWrite 在测试里打开写闸门。真实的权限配置来自设备标签 options；
+// 这几条用例关心的是失败时的质量码与批级上抛，不是闸门本身（后者由
+// TestWriteRequiresOptIn 覆盖）。
+func allowWrite(t *testing.T, c driver.Conn) {
+	t.Helper()
+	cc, ok := c.(*conn)
+	if !ok {
+		t.Fatalf("unexpected conn type %T", c)
+	}
+	cc.opt.AllowWrite = true
+}
+
+// scriptedLink 是一条按脚本应答的假链路：Write 时把预置帧放进接收缓冲，
+// 供需要构造「合法但语义异常」应答的用例使用（内置从站只会正常应答）。
+type scriptedLink struct {
+	mu   sync.Mutex
+	buf  []byte
+	resp func(req []byte) []byte
+}
+
+func (l *scriptedLink) Write(p []byte) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.buf = l.resp(append([]byte(nil), p...))
+	return nil
+}
+
+func (l *scriptedLink) ReadFull(n int) ([]byte, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if len(l.buf) < n {
+		return nil, io.ErrUnexpectedEOF
+	}
+	out := l.buf[:n]
+	l.buf = l.buf[n:]
+	return out, nil
+}
+
+func (l *scriptedLink) SetDeadline(time.Time) error { return nil }
+func (l *scriptedLink) Drain() error                { return nil }
+func (l *scriptedLink) Lock()                       {}
+func (l *scriptedLink) Unlock()                     {}
+func (l *scriptedLink) Close() error                { return nil }
+
+// TestProbeExceptionIsNotRetryable 表收到读通信地址命令却回异常应答时，重发
+// 结果不会变：探测必须按不可重试上报，否则上层会一轮轮白等超时。
+func TestProbeExceptionIsNotRetryable(t *testing.T) {
+	addr, err := dlt645codec.ParseAddr("000000000042")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 异常应答：控制码 = 0x13|0x80|0x40，数据域 1 字节错误信息字。
+	frame, err := dlt645codec.Build(addr, dlt645codec.CtrlReadAddr|dlt645codec.BitReply|dlt645codec.BitError,
+		[]byte{dlt645codec.ErrNoData})
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	c := &conn{
+		link:    &scriptedLink{resp: func([]byte) []byte { return frame }},
+		addr:    addr,
+		devID:   "meter",
+		timeout: time.Second,
+	}
+	err = c.Probe(context.Background())
+	if err == nil {
+		t.Fatal("probe accepted an exception reply")
+	}
+	if driver.KindOf(err) != driver.ErrProtocol {
+		t.Fatalf("kind = %v, want protocol", driver.KindOf(err))
+	}
+	if driver.IsRetryable(err) {
+		t.Fatalf("异常应答被标成可重试：%v", err)
+	}
+}
+
+// TestReadBadDIDoesNotBreakRound 一个表不支持的数据项只应让那一个点位变坏：
+// 同轮其它数据项照常读、不重连、不熔断。
+func TestReadBadDIDoesNotBreakRound(t *testing.T) {
+	srv := startSim(t, dlt645sim.WithoutValue("02010100"))
+	c := openConn(t, srv.Addr(), "00000000", "02010100", "02020100")
+	got, err := c.Read(context.Background(), points("00000000", "02010100", "02020100"))
+	if err != nil {
+		t.Fatalf("partial success must not return an error: %v", err)
+	}
+	if len(got) != 3 {
+		t.Fatalf("got %d samples, want 3", len(got))
+	}
+	if got[0].Quality != model.QualityGood || got[2].Quality != model.QualityGood {
+		t.Fatalf("好点被连坐: %s=%s %s=%s", got[0].PointID, got[0].Quality, got[2].PointID, got[2].Quality)
+	}
+	if got[1].Quality != model.QualityAddressError {
+		t.Fatalf("坏 DI 质量 = %s, want address_error", got[1].Quality)
+	}
+	if driver.KindOf(got[1].Err) != driver.ErrAddress {
+		t.Fatalf("坏 DI 类别 = %v", driver.KindOf(got[1].Err))
+	}
+}
+
+// TestReadAllFailedReturnsError 全轮都失败时必须上抛第一个错误：否则调度器
+// 看不见故障，设备会一直以「成功但有坏点」的状态挂着。
+func TestReadAllFailedReturnsError(t *testing.T) {
+	srv := startSim(t, dlt645sim.WithoutValue("02010100"), dlt645sim.WithoutValue("02020100"))
+	c := openConn(t, srv.Addr(), "02010100", "02020100")
+	got, err := c.Read(context.Background(), points("02010100", "02020100"))
+	if err == nil {
+		t.Fatal("all-failed round returned success")
+	}
+	if driver.KindOf(err) != driver.ErrAddress {
+		t.Fatalf("kind = %v", driver.KindOf(err))
+	}
+	if len(got) != 2 {
+		t.Fatalf("got %d samples, want 2", len(got))
+	}
+	for _, s := range got {
+		if s.Err == nil || s.Quality != model.QualityAddressError {
+			t.Fatalf("%s: err=%v quality=%s", s.PointID, s.Err, s.Quality)
+		}
+	}
+}
+
+// TestReadLinkFailureKeepsGoodSamples 一轮读途中对端掉线时，已读到的样本必须
+// 保留、剩余点位显式标坏，并且立即返回链路错误（有成功点也返回）。
+func TestReadLinkFailureKeepsGoodSamples(t *testing.T) {
+	srv := startSim(t, dlt645sim.WithDropAfter(1))
+	// 从站在第一条应答发出后立即断开：读的第一个 DI 必然成功，第二个开始
+	// 只能看到 EOF/超时——这正是「一轮采集中途断链」的现场形状。
+	c := openConnTimeout(t, srv.Addr(), 300*time.Millisecond)
+	start := time.Now()
+	got, err := c.Read(context.Background(), points("00000000", "02010100", "02020100"))
+	if err == nil {
+		t.Fatal("link failure did not surface")
+	}
+	if !driver.IsLinkFailure(err) {
+		t.Fatalf("kind = %v, want link failure", driver.KindOf(err))
+	}
+	if elapsed := time.Since(start); elapsed > 3*time.Second {
+		t.Fatalf("read took %v; link failure should abort the round", elapsed)
+	}
+	if len(got) != 3 {
+		t.Fatalf("got %d samples, want 3", len(got))
+	}
+	if got[0].Quality != model.QualityGood {
+		t.Fatalf("第一个成功点被丢了: quality=%s", got[0].Quality)
+	}
+	for _, s := range got[1:] {
+		if s.Err == nil || s.Quality == model.QualityGood {
+			t.Fatalf("%s: err=%v quality=%s", s.PointID, s.Err, s.Quality)
+		}
+		if driver.KindOf(s.Err) != driver.KindOf(err) {
+			t.Fatalf("%s kind = %v, batch err = %v", s.PointID, driver.KindOf(s.Err), driver.KindOf(err))
+		}
+	}
+}
+
+// TestReadCanceledContextMarksRemaining ctx 已到期时不该发任何帧，但每个点
+// 都要有结果——少给样本会被采集器当成驱动漏报。
+func TestReadCanceledContextMarksRemaining(t *testing.T) {
+	srv := startSim(t)
+	c := openConn(t, srv.Addr(), "00000000", "02010100")
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	got, err := c.Read(ctx, points("00000000", "02010100"))
+	if err == nil || driver.KindOf(err) != driver.ErrTimeout {
+		t.Fatalf("err = %v, want timeout", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("got %d samples, want 2", len(got))
+	}
+	for _, s := range got {
+		if s.Quality != model.QualityTimeout || s.Err == nil {
+			t.Fatalf("%s: quality=%s err=%v", s.PointID, s.Quality, s.Err)
+		}
+	}
+	if srv.Requests() != 0 {
+		t.Fatalf("driver sent %d requests after ctx was done", srv.Requests())
+	}
+}
+
+// TestWriteLinkFailureStopsRemaining 写链路中断时剩余写命令不再发送，已成功
+// 的那条保持 OK，批级错误经第二个返回值上抛。
+func TestWriteLinkFailureStopsRemaining(t *testing.T) {
+	srv := startSim(t, dlt645sim.WithDropAfter(1))
+	c := openConnTimeout(t, srv.Addr(), 300*time.Millisecond)
+	reqs := []driver.WriteRequest{
+		{PointID: "clock", Address: model.Address{Kind: model.AddressRegister, Area: "04000101", Bit: -1},
+			Value: model.NumValue(model.TypeFloat64, 20270102030405)},
+		{PointID: "date", Address: model.Address{Kind: model.AddressRegister, Area: "04000B01", Bit: -1},
+			Value: model.NumValue(model.TypeFloat64, 12312359)},
+	}
+	allowWrite(t, c)
+	res, err := c.Write(context.Background(), reqs)
+	if err == nil {
+		t.Fatal("link failure did not surface")
+	}
+	if !driver.IsLinkFailure(err) {
+		t.Fatalf("kind = %v, want link failure", driver.KindOf(err))
+	}
+	if len(res) != 2 {
+		t.Fatalf("got %d results, want 2", len(res))
+	}
+	if !res[0].OK {
+		t.Fatalf("first write should be kept: %v", res[0].Err)
+	}
+	if res[1].OK || res[1].Err == nil || res[1].Quality == model.QualityGood {
+		t.Fatalf("remaining write not marked bad: %+v", res[1])
+	}
+	if srv.Writes() != 1 {
+		t.Fatalf("slave saw %d writes, want 1", srv.Writes())
+	}
+}
+
+// TestWriteTimeoutCarriesQuality 写超时时必须带 timeout 质量码，而不是让
+// 上层兜底成 bad——「设备慢」与「参数不对」在下游要能区分。
+func TestWriteTimeoutCarriesQuality(t *testing.T) {
+	srv := startSim(t, dlt645sim.WithAddress("000000000099"))
+	c := openConnTimeout(t, srv.Addr(), 300*time.Millisecond)
+	allowWrite(t, c)
+	res, err := c.Write(context.Background(), []driver.WriteRequest{{
+		PointID: "clock",
+		Address: model.Address{Kind: model.AddressRegister, Area: "04000101", Bit: -1},
+		Value:   model.NumValue(model.TypeFloat64, 20270102030405),
+	}})
+	if err == nil {
+		t.Fatal("write to another meter succeeded")
+	}
+	if len(res) != 1 {
+		t.Fatalf("got %d results", len(res))
+	}
+	if res[0].Quality != model.QualityTimeout {
+		t.Fatalf("quality = %s, want timeout", res[0].Quality)
+	}
+	if driver.KindOf(res[0].Err) != driver.ErrTimeout {
+		t.Fatalf("kind = %v", driver.KindOf(res[0].Err))
 	}
 }

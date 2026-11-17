@@ -47,6 +47,10 @@ type Server struct {
 	clock    time.Time
 	writes   int
 	requests int64
+	// dropAfter > 0 时，从站在成功应答这么多次后主动断开当前连接。
+	dropAfter int
+	// missing 是「表不支持」的数据标识：收到请求时回异常应答。
+	missing []dlt.DI
 
 	ln     net.Listener
 	conns  map[net.Conn]struct{}
@@ -71,6 +75,28 @@ func WithAddress(s string) Option {
 // WithPassword 要求写/控制命令携带指定密码（3 字节真值）。
 func WithPassword(p [3]byte) Option {
 	return func(srv *Server) { srv.password = p[:] }
+}
+
+// WithDropAfter 让从站在成功应答 n 次后主动断开当前连接（0 = 不断开）。
+//
+// 用于自检「一轮采集途中链路断开」的处置：驱动必须保留已读到的样本，
+// 把剩余点位显式标坏后立即返回，而不是逐个等到超时。
+func WithDropAfter(n int) Option {
+	return func(srv *Server) { srv.dropAfter = n }
+}
+
+// WithoutValue 让从站假装没有实现某个数据标识（收到请求时回异常应答）。
+// 真实的电表只会实现标准的一个子集：点表里配了该表不支持的数据标识，得到
+// 的是异常应答而不是超时——这正是「一个坏 DI 不该把整台表拖成每周期重连」
+// 那条契约的现场来源，因此从站必须能复现它。
+func WithoutValue(di string) Option {
+	return func(srv *Server) {
+		d, err := dlt.ParseDI(di)
+		if err != nil {
+			panic("sim/dlt645: WithoutValue: " + err.Error())
+		}
+		srv.missing = append(srv.missing, d)
+	}
 }
 
 // NewServer 创建并启动 TCP 从站；addr 为 "127.0.0.1:0" 时自动分配端口。
@@ -204,6 +230,16 @@ func (s *Server) Relay() (byte, time.Time) {
 	return s.relay, s.relayAt
 }
 
+// Requests 返回收到的请求帧数（含地址不匹配被静默丢弃的帧）。
+//
+// 自检里用它区分「主站根本没发」与「发了但被从站丢弃」——这两种情况在
+// 主站侧都表现成超时，只看超时无法归因。
+func (s *Server) Requests() int64 {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.requests
+}
+
 // Writes 返回成功写入的次数，供测试断言「主站确实写进来了」。
 func (s *Server) Writes() int {
 	s.mu.RLock()
@@ -276,6 +312,7 @@ func (s *Server) serveConn(c net.Conn) {
 // ServeStream 在一条字节流上跑从站循环。串口/pty 与 TCP 共用它。
 func (s *Server) ServeStream(st transport.Stream) error {
 	rd := dlt.NewReader(st)
+	replies := 0
 	for {
 		fr, err := rd.Next()
 		if err != nil {
@@ -291,6 +328,12 @@ func (s *Server) ServeStream(st transport.Stream) error {
 		// 从站不应答时也把请求算作「收到过」，便于诊断「请求到了但被丢弃」。
 		if err := st.Write(resp); err != nil {
 			return err
+		}
+		replies++
+		if s.dropAfter > 0 && replies >= s.dropAfter {
+			// 模拟串口服务器/DTU 掉线：这一次应答已经发出，下一帧不再
+			// 有对端。返回后由 serveConn 关闭底层连接。
+			return nil
 		}
 	}
 }
@@ -336,6 +379,17 @@ func (s *Server) handle(fr dlt.Frame) ([]byte, bool) {
 	return nil, true
 }
 
+// missingDI 表示该数据标识被 WithoutValue 标记为「表不支持」。
+// s.missing 只在构造期写入，读侧不需要额外加锁。
+func (s *Server) missingDI(di dlt.DI) bool {
+	for _, m := range s.missing {
+		if m == di {
+			return true
+		}
+	}
+	return false
+}
+
 func (s *Server) handleRead(fr dlt.Frame) ([]byte, bool) {
 	if len(fr.Data) < 4 {
 		return s.exception(fr, dlt.CtrlRead, dlt.ErrOther), false
@@ -347,8 +401,9 @@ func (s *Server) handleRead(fr dlt.Frame) ([]byte, bool) {
 	s.mu.RLock()
 	v, ok := s.values[di]
 	clock := s.clock
+	missing := s.missingDI(di)
 	s.mu.RUnlock()
-	if !ok {
+	if !ok || missing {
 		// 「无请求数据」——这是标准里该场景唯一正确的错误位。
 		return s.exception(fr, dlt.CtrlRead, dlt.ErrNoData), false
 	}
@@ -380,8 +435,9 @@ func (s *Server) handleReadNext(fr dlt.Frame) ([]byte, bool) {
 	seq := fr.Data[4]
 	s.mu.RLock()
 	v, ok := s.values[di]
+	missing := s.missingDI(di)
 	s.mu.RUnlock()
-	if !ok {
+	if !ok || missing {
 		return s.exception(fr, dlt.CtrlReadNext, dlt.ErrNoData), false
 	}
 	// 从站把「已发出多少」编码进序号：序号 n 对应第 n 段之后的位置。

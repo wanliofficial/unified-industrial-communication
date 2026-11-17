@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"flag"
 	"testing"
 
@@ -179,6 +180,29 @@ func TestDLT645TransportInference(t *testing.T) {
 		got := inferTransport(func(name string) bool { return flagSet(fs, name) }, *tr)
 		if got != tc.want {
 			t.Fatalf("%v -> %q, want %q", tc.args, got, tc.want)
+		}
+	}
+}
+
+// dlt645ReadFailed 决定自检读的退出码：全部失败或出现链路级错误必须非零，
+// 部分成功仍是 0（docs §3.3.1）。全失败返回 0 时脚本会把「表不认这些 DI」
+// 当成成功。
+func TestDLT645ReadFailed(t *testing.T) {
+	linkErr := errors.New("read timeout")
+	cases := []struct {
+		ok   int
+		err  error
+		want bool
+	}{
+		{0, nil, true},
+		{0, linkErr, true},
+		{2, linkErr, true},
+		{1, nil, false},
+		{3, nil, false},
+	}
+	for _, tc := range cases {
+		if got := dlt645ReadFailed(tc.ok, tc.err); got != tc.want {
+			t.Fatalf("ok=%d err=%v -> %v, want %v", tc.ok, tc.err, got, tc.want)
 		}
 	}
 }

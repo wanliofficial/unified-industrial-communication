@@ -341,7 +341,12 @@ func (c *conn) Probe(ctx context.Context) error {
 	}
 	got, err := dlt645.ParseAddrReply(fr)
 	if err != nil {
-		return driver.E(driver.ErrProtocol, "probe", c.devID, err.Error(), true, err)
+		// 异常应答说明表收到了读通信地址命令但拒绝执行：重发结果相同，不能
+		// 标成可重试（否则探测会白等多轮超时）。帧结构错则可能只是线路噪声，
+		// 保留可重试——两者的区别由 Exception 类型承载。
+		var ex *dlt645.Exception
+		temporary := !errors.As(err, &ex)
+		return driver.E(driver.ErrProtocol, "probe", c.devID, err.Error(), temporary, err)
 	}
 	if want := c.addr; want[0] != dlt645.Wildcard && !dlt645.MatchAddr(got, want) {
 		return driver.E(driver.ErrProtocol, "probe", c.devID,
@@ -363,46 +368,65 @@ func (c *conn) Read(ctx context.Context, spans []driver.ReadSpan) ([]driver.RawS
 		return nil, driver.E(driver.ErrDisconnected, "read", c.devID, "connection closed", false, nil)
 	}
 
-	var out []driver.RawSample
+	// 先把 span 摊平：后面要在任意下标处「把剩下的点全部标坏」，嵌套循环
+	// 做不到这件事而又不写两套收尾逻辑。
+	var points []driver.PointRef
+	for _, span := range spans {
+		points = append(points, span.Points...)
+	}
+
+	out := make([]driver.RawSample, 0, len(points))
 	var firstErr error
 	ok := 0
-	for _, span := range spans {
-		for _, ref := range span.Points {
-			if err := ctx.Err(); err != nil {
-				return out, driver.E(driver.ErrTimeout, "read", c.devID, "context done", true, err)
-			}
-			// 链路级故障（超时/断开）不是「这个点没有」，继续发请求只会
-			// 让一轮采集把设备超时乘以点数。读到第一个链路错误就中止，
-			// 剩下的点标记为坏——这与 IEC 104 的处置一致。
-			if c.linkErr != nil {
-				out = append(out, bad(ref, c.linkErr))
-				continue
-			}
-			s, err := c.readPoint(ctx, ref)
-			if err != nil {
-				out = append(out, bad(ref, err))
-				if firstErr == nil {
-					firstErr = err
-				}
-				if isLinkFailure(err) {
-					c.linkErr = err
-					continue
-				}
-				continue
-			}
-			ok++
-			out = append(out, s)
+
+	// failRest 把 from 之后的点位显式标坏。
+	//
+	// 链路已经断了还逐点发请求，代价是「点数 × 设备超时」；而少给样本
+	// 又会被采集器当成「驱动漏报」——两种处理都会把一次断线放大成一轮
+	// 静默故障。显式补坏样本是唯一既不撒谎又不拖延的收尾方式。
+	failRest := func(from int, err error) {
+		for _, ref := range points[from:] {
+			out = append(out, bad(ref, err))
 		}
 	}
-	if ok == 0 && firstErr != nil {
-		return out, firstErr
+
+	for i, ref := range points {
+		if err := ctx.Err(); err != nil {
+			e := driver.E(driver.ErrTimeout, "read", c.devID, "context done", true, err)
+			failRest(i, e)
+			return out, e
+		}
+		// linkErr 是上一次事务留下的链路级故障（exchange 成功时会清空）。
+		// 它同样属于「这一轮别再发了」，按链路级例外立即收尾。
+		if c.linkErr != nil {
+			failRest(i, c.linkErr)
+			return out, c.linkErr
+		}
+		s, err := c.readPoint(ctx, ref)
+		if err != nil {
+			out = append(out, bad(ref, err))
+			if firstErr == nil {
+				firstErr = err
+			}
+			if driver.IsLinkFailure(err) {
+				// 链路级失败是「有成功点也返回错误」的例外（docs §3.3.1）：
+				// 设备太慢/已断开必须让调度器看见，不能混在部分失败里。
+				c.linkErr = err
+				failRest(i+1, err)
+				return out, err
+			}
+			continue
+		}
+		ok++
+		out = append(out, s)
 	}
-	return out, nil
+	// 部分失败语义（docs §3.3.1）：有成功点就不向上返回错误。
+	return out, driver.PartialReadError(ok, firstErr)
 }
 
 // readPoint 读一个 DI，自动跟随后续帧。
 func (c *conn) readPoint(ctx context.Context, ref driver.PointRef) (driver.RawSample, error) {
-	di, item, err := resolve(ref)
+	di, item, err := c.resolve(ref)
 	if err != nil {
 		return driver.RawSample{}, err
 	}
@@ -561,21 +585,37 @@ func (c *conn) Write(ctx context.Context, reqs []driver.WriteRequest) ([]driver.
 		return nil, driver.E(driver.ErrDisconnected, "write", c.devID, "connection closed", false, nil)
 	}
 	out := make([]driver.WriteResult, 0, len(reqs))
-	for _, req := range reqs {
+	for i, req := range reqs {
 		if err := ctx.Err(); err != nil {
+			// ctx 到期后剩下的每一条都注定失败。逐条重试只会把「超时」
+			// 乘以条数；但也不能少给结果——逐项返回是写路径的硬契约。
 			e := driver.E(driver.ErrTimeout, "write", c.devID, "context done", true, err)
-			out = append(out, driver.WriteResult{PointID: req.PointID,
-				Quality: qualityOf(e), Err: e})
-			continue
+			for _, rest := range reqs[i:] {
+				out = append(out, driver.WriteResult{
+					PointID: rest.PointID, Quality: qualityOf(e), Err: e,
+				})
+			}
+			return out, e
 		}
-		out = append(out, c.writeOne(ctx, req))
+		res := c.writeOne(ctx, req)
+		out = append(out, res)
+		if driver.IsLinkFailure(res.Err) {
+			// 链路级失败：剩余写请求不可能成功，标坏后把批级错误经第二个
+			// 返回值上抛（docs §3.4 规则 4）。已成功的条目保持原样。
+			for _, rest := range reqs[i+1:] {
+				out = append(out, driver.WriteResult{
+					PointID: rest.PointID, Quality: qualityOf(res.Err), Err: res.Err,
+				})
+			}
+			return out, res.Err
+		}
 	}
 	return out, nil
 }
 
 func (c *conn) writeOne(ctx context.Context, req driver.WriteRequest) driver.WriteResult {
 	res := driver.WriteResult{PointID: req.PointID}
-	di, item, err := resolveWrite(req)
+	di, item, err := c.resolveWrite(req)
 	if err != nil {
 		res.Err = err
 		res.Quality = qualityOf(err)
@@ -825,7 +865,7 @@ func (c *conn) exchange(ctx context.Context, req []byte, op string) (reply, erro
 		fr, err := rd.Next()
 		if err != nil {
 			e := c.readError(op, err, ctx)
-			if isLinkFailure(e) {
+			if driver.IsLinkFailure(e) {
 				c.linkErr = e
 			}
 			return reply{}, e
@@ -896,14 +936,14 @@ func (c *conn) classify(di dlt645.DI, op string, err error) error {
 // ---------------------------------------------------------------------------
 
 // resolve 把点表地址解析成 DI 与数据项定义。
-func resolve(ref driver.PointRef) (dlt645.DI, dlt645.Item, error) {
-	di, err := parseDI(ref.Address.Area)
+func (c *conn) resolve(ref driver.PointRef) (dlt645.DI, dlt645.Item, error) {
+	di, err := c.parseDI("read", ref.Address.Area)
 	if err != nil {
 		return dlt645.DI{}, dlt645.Item{}, err
 	}
 	item, ok := dlt645.Lookup(di)
 	if !ok {
-		return dlt645.DI{}, dlt645.Item{}, driver.E(driver.ErrAddress, "read", "",
+		return dlt645.DI{}, dlt645.Item{}, driver.E(driver.ErrAddress, "read", c.devID,
 			fmt.Sprintf("未收录的数据标识 %s（点表需改用标准 DI）", di), false, nil)
 	}
 	// 数据块由点表给长度；非数据块的宽度以 DI 表为准，点表写错在这里
@@ -916,14 +956,14 @@ func resolve(ref driver.PointRef) (dlt645.DI, dlt645.Item, error) {
 	return di, item, nil
 }
 
-func resolveWrite(req driver.WriteRequest) (dlt645.DI, dlt645.Item, error) {
-	di, err := parseDI(req.Address.Area)
+func (c *conn) resolveWrite(req driver.WriteRequest) (dlt645.DI, dlt645.Item, error) {
+	di, err := c.parseDI("write", req.Address.Area)
 	if err != nil {
 		return dlt645.DI{}, dlt645.Item{}, err
 	}
 	item, ok := dlt645.Lookup(di)
 	if !ok {
-		return dlt645.DI{}, dlt645.Item{}, driver.E(driver.ErrAddress, "write", "",
+		return dlt645.DI{}, dlt645.Item{}, driver.E(driver.ErrAddress, "write", c.devID,
 			fmt.Sprintf("未收录的数据标识 %s", di), false, nil)
 	}
 	if item.Width == 0 && req.Address.Length > 0 {
@@ -932,10 +972,10 @@ func resolveWrite(req driver.WriteRequest) (dlt645.DI, dlt645.Item, error) {
 	return di, item, nil
 }
 
-func parseDI(s string) (dlt645.DI, error) {
+func (c *conn) parseDI(op, s string) (dlt645.DI, error) {
 	di, err := dlt645.ParseDI(s)
 	if err != nil {
-		return dlt645.DI{}, driver.E(driver.ErrAddress, "read", "", err.Error(), false, err)
+		return dlt645.DI{}, driver.E(driver.ErrAddress, op, c.devID, err.Error(), false, err)
 	}
 	return di, nil
 }
@@ -968,15 +1008,6 @@ func qualityOf(err error) model.Quality {
 		return model.QualityBad
 	}
 	return model.QualityBad
-}
-
-// isLinkFailure 判断错误是否意味着「这一轮别再发了」。
-func isLinkFailure(err error) bool {
-	switch driver.KindOf(err) {
-	case driver.ErrTimeout, driver.ErrDisconnected:
-		return true
-	}
-	return false
 }
 
 func isTimeout(err error) bool {
