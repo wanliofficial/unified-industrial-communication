@@ -2836,6 +2836,13 @@ FE FE 68 10 01 00 00 05 08 00 00 01 03 90 1F 00 39 16
 被拒」只能由主站从「命令 + 参数」推断。驱动的错误信息因此保留 DI 与 SER，便于对照
 是哪一次请求。
 
+异常应答是**合法的帧**，因此驱动按「点级/命令级」处理，不当成链路故障：读数据收到
+异常只把该点标 `address_error`，不重试、不计入熔断，同轮其余点照常读；写数据收到
+异常标 `bad`，同样不重试（同一条被拒的命令重发多少次都是同一个结果）；`Probe` 的
+读地址收到异常则按**不可重试**上报——否则上层会对着一台明确拒绝的表反复探测，每轮
+都白等到超时。三种处置共用 `cjt188.Exception` 这个类型来区分「表拒绝执行」与「帧
+本身坏了」：后者可能只是线路噪声，仍保留可重试。
+
 #### 3.10.11.5 DI 与字段 schema
 
 点表里一个 188 点位长这样：
@@ -2928,8 +2935,18 @@ D2 为电池欠压；第二字节厂商自定义。驱动只按 `uint16` 交付�
 2. DI 与 SER 回显一致（防止把上一次的迟到应答当成这一次的）；
 3. 数据域长度等于 schema 推导的总宽（防止表返回旧版/裁剪版布局）。
 
-任一条不满足都归为 `protocol` 错误，并保留原始字节用于排查。链路级故障（超时、
-断开）在本轮剩余点上快速失败，不再逐点等超时。
+任一条不满足都归为 `protocol` 错误，并保留原始字节用于排查。
+
+`Read` 的收尾遵循 §3.3.1 的统一契约，不是本协议自定的口味：
+
+- 地址/字段/协议错只标当前点，其余点照常读；全轮都失败才把第一个错误上抛；
+- 链路级故障（超时、断开、`ctx` 到期）**立即收尾**：已经读到的样本原样保留，
+  剩余未发出的点位显式补 `bad` 样本并带上同一错误，然后把错误上抛——有成功点
+  也不例外。少给样本会被采集器当成「驱动漏报」，而逐个等超时会把一轮采集拖成
+  「点数 × 设备超时」；
+- 失败样本的 `Quality` 按错误种类派生（`timeout` / `comm_error` /
+  `address_error` / `bad`），不能一律写 `comm_error`：下游的告警分级与熔断计数
+  依赖这个区分。
 
 #### 3.10.11.8 写与闸门
 
@@ -2949,6 +2966,12 @@ D2 为电池欠压；第二字节厂商自定义。驱动只按 `uint16` 交付�
 
 写应答必须是「请求控制码 + `0x80`」，且 DI 与 SER 回显一致；异常位则带出 DI 与 SER
 供定位。
+
+写失败同样是**逐项结果**：`OK=false` 时必须带 `Quality`（`timeout` /
+`address_error` / `bad`），留空会让 `runtime/collector.go` 兜底成 `bad`，于是
+「超时」「地址写错」「权限不足」在下游分不出来。链路级失败（超时/断开）时，同批
+剩余写命令不再发送，逐项标坏，并把这个错误经 `Write` 的第二个返回值上抛；已经成功
+的条目保持 `OK=true`，不得被回填成失败（§3.4 规则 4）。
 
 #### 3.10.11.9 两种承载
 
@@ -2981,8 +3004,8 @@ D2 为电池欠压；第二字节厂商自定义。驱动只按 `uint16` 交付�
 | 内容 | 路径 |
 |---|---|
 | 编解码 | `internal/codec/cjt188`（`Parse`/`Build`/`ReadRequest`/`ReadAddrRequest`/`ValveRequest`/`WriteAddrRequest`/`ParseReadReply`/`ParseAddrReply`/`ParseErrorReply`/`ParseAddr`/`ParseDI`/`Fields`/`LookupField`/`TotalWidth`/`DecodeField`/`ParseTime`/`UnitFactor`/`Reader.Next`） |
-| 主站驱动 | `internal/driver/cjt188`（`Meta`/`Open`/`Probe`/`Read`/`Write`，内部 `readDI`/`readPoint`/`resolveRead`/`writeValve`/`writeAddr`/`exchange`/`parseOptions`） |
-| 内置从站 | `internal/sim/cjt188`（`NewServer`/`ServeStream`/`SetClock`/`SetValue`/`Value`/`Valve`/`Writes`/`Requests`/`Address`/`Type`） |
+| 主站驱动 | `internal/driver/cjt188`（`Meta`/`Open`/`Probe`/`Read`/`Write`，内部 `readDI`/`readPoint`/`resolveRead`/`writeValve`/`writeAddr`/`exchange`/`parseOptions`/`qualityOf`） |
+| 内置从站 | `internal/sim/cjt188`（`NewServer`/`ServeStream`/`SetClock`/`SetValue`/`Value`/`Valve`/`Writes`/`Requests`/`Address`/`Type`，选项 `WithAddress`/`WithType`/`WithDropAfter`/`WithoutValue`） |
 | 共享链路 | `internal/driver/link`（serial/tcp 统一建链、`Drain`/`SetDeadline`/总线锁） |
 | CLI | `uic cjt188read`（`-probe`/`-di DI[:offset]`/`-write`/`-raw`/`-json`，`serial`/`tcp` 双承载） |
 | 示例 | `examples/cjt188.json`（8 点位：当前/结算日流量、时间、状态、上 1 月/上 12 月、阀门与表地址写命令） |
@@ -3033,6 +3056,12 @@ D2 为电池欠压；第二字节厂商自定义。驱动只按 `uint16` 交付�
 curl -s -H 'Authorization: Bearer dev-token-0123456789' localhost:8094/api/v1/points
 ```
 
+自检命令的退出码可以当判据用：`0` 表示至少读到一个字段且没有链路级错误；全部字段
+失败、或出现链路级错误（即便部分字段已成功）都返回 `1`。只把「全部失败」当失败会
+让脚本把「设备不认这些 DI」和「读到一半断链」当成一次成功的抄表。写权限也按报文
+标识分别授予：`A017` 只开 `allow-control`，`A018` 只开 `allow-write`，不会因为
+「这次有写操作」就同时打开两个闸门。
+
 示例配置里阀门与表地址两个写命令点位默认 `enabled: false`：它们是**写命令**，没有
 可读数据域，若默认启用，每个采集周期都会产生一条 `address_error`。要演示写入，把
 `enabled` 改为 `true` 再重启网关（写表地址后还要同步修改 `labels.address`，否则下次
@@ -3046,11 +3075,11 @@ curl -s -H 'Authorization: Bearer dev-token-0123456789' localhost:8094/api/v1/po
 
 | 层 | 用例 |
 |---|---|
-| `codec/cjt188` | 金帧（读请求/水表应答/读地址）、单 `68`、数据域无 `0x33`、CS 不含前导、地址 BCD 低字节先传、BCD 半字节校验（`FF`/`A` 拒绝）、时间 7 字节往返与非法日期、901F 水/热两套 schema 与总宽（19/43）、D120..D12B、单位换算表与未知代号拒绝、状态字文本、异常应答、噪声恢复、写阀门/写地址帧 |
-| `driver/cjt188` | 探针成功/错表拒绝、水表四字段共享一次事务、时间与状态、历史月量、热量表全字段、单位换算、阀门权限与开/关、写地址后连接切换、短地址拒绝、非支持 DI、错误 offset、长度不符、错地址超时、前导 0/4、坏配置拒绝、链路失败短路 |
-| `sim/cjt188` | 真实 TCP 回环：标准宽度、地址过滤静默、读地址用真实地址、阀门写与状态刷新、未知命令异常、写地址后新址可读旧地址静默、通配写地址拒绝、`SetClock` 刷新、`SetValue`、`ServeStream` over `net.Pipe`、`Close` 幂等 |
+| `codec/cjt188` | 金帧（读请求/水表应答/读地址）、单 `68`、数据域无 `0x33`、CS 不含前导、地址 BCD 低字节先传、BCD 半字节校验（`FF`/`A` 拒绝）、时间 7 字节往返与非法日期、901F 水/热两套 schema 与总宽（19/43）、D120..D12B、单位换算表与未知代号拒绝、状态字文本、异常应答、噪声恢复、`Parse` 的 `consumed` 契约（带前导噪声时返回 `start+总长`，不只返回 `total`）、写阀门/写地址帧 |
+| `driver/cjt188` | 探针成功/错表拒绝、水表四字段共享一次事务、时间与状态、历史月量、热量表全字段、单位换算、阀门权限与开/关、写地址后连接切换、短地址拒绝、非支持 DI、错误 offset、长度不符、错地址超时（样本质量为 `timeout`）、前导 0/4、坏配置拒绝、**部分失败语义（坏地址+好点 `err==nil`、全失败上抛）**、链路中断保留已读样本并把剩余点标坏后上抛、**写失败质量码**（`address_error`/`bad`/`timeout`）、写链路失败中止剩余并经第二返回值上抛且不连坐已成功项、异常应答的点级归属（读→`address_error` 不重试、写→`bad` 不重试、探针→不可重试）、异常应答不打断链路 |
+| `sim/cjt188` | 真实 TCP 回环：标准宽度、地址过滤静默、读地址用真实地址、阀门写与状态刷新、未知命令异常、写地址后新址可读旧地址静默、通配写地址拒绝、`SetClock` 刷新、`SetValue`、`ServeStream` over `net.Pipe`、`Close` 幂等、`WithDropAfter` 模拟中途断链、`WithoutValue` 只让单个 DI 回异常而其余 DI 仍正常 |
 | 点表/规划 | 4 位 DI、字段偏移允许非 0、8 位 DI 与全 `FFFF` 拒绝、bool 拒绝、`WidthProtocol` 策略、不同 DI 不合并 |
-| `cmd/uic` | 类型解析、`DI[:offset[:length]]`、偏移越界/长度不符/未收录 DI、历史 DI、status 走 `uint16`、阀门值 open/close、写 DI 只认 A017/A018、传输方式按参数推断 |
+| `cmd/uic` | 类型解析、`DI[:offset[:length]]`、偏移越界/长度不符/未收录 DI、历史 DI、status 走 `uint16`、阀门值 open/close、写 DI 只认 A017/A018、传输方式按参数推断、自检退出码（全失败或链路错误 → `1`） |
 
 ### 3.10.12 SNMP v1/v2c（UDP 161）
 

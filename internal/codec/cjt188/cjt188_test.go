@@ -67,9 +67,11 @@ func TestReadReplyGolden(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parse: %v", err)
 	}
-	// consumed 是整帧长度，不含前导；前导只是被跳过的噪声。
-	if consumed != 35 {
-		t.Fatalf("consumed = %d, want 35", consumed)
+	// consumed 从缓冲区开头起算：4 字节前导 + 35 字节整帧 = 39。这样调用方
+	// 写 `buf = buf[consumed:]` 才能恰好停在帧尾；只返回 35 会把前导留在
+	// 头部、同时砍掉帧尾 4 字节（校验/结束符），下一帧从此错位。
+	if consumed != 39 {
+		t.Fatalf("consumed = %d, want 39", consumed)
 	}
 	if fr.Type != 0x10 {
 		t.Fatalf("type = %02X", fr.Type)
@@ -163,6 +165,22 @@ func TestHeatSchema(t *testing.T) {
 	}
 	if got := FormatField(supply, mustHex(t, "005500")); got != "55 ℃" {
 		t.Fatalf("supply format = %q", got)
+	}
+}
+
+// TestDecodeFieldRejectsWrongWidth 字段切片宽度必须精确匹配 schema：
+// 多给一个字节同样要拒绝。静默截断会让「切错边界」看起来像正常读数，
+// 而错位读出的 BCD 往往仍然合法。
+func TestDecodeFieldRejectsWrongWidth(t *testing.T) {
+	vol, err := LookupField(0x10, DIReadData, 0) // 4 BCD + 单位 = 5 字节
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := DecodeField(vol, mustHex(t, "56341200"+"2C")); err != nil {
+		t.Fatalf("exact width: %v", err)
+	}
+	if _, err := DecodeField(vol, mustHex(t, "56341200"+"2C"+"00")); err == nil {
+		t.Fatal("多余字节必须拒绝，不能静默截断")
 	}
 }
 

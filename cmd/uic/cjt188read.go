@@ -65,10 +65,23 @@ func cjt188readCmd(args []string) {
 	}
 
 	opts := []string{fmt.Sprintf("preamble=%d", *preamble), "gap=" + gap.String()}
+	// 写权限按报文标识分别给：阀门只开 allow-control，写地址只开 allow-write。
+	// 「有写操作就同时打开两个闸门」会让一次阀门操作顺带具备改表地址的能力。
+	var writeDI cj.DI
 	if *write != "" {
-		opts = append(opts, "allow-write")
-		if *allowControl {
-			opts = append(opts, "allow-control")
+		di, err := parseWriteDI(*diList)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "%v\n", err)
+			os.Exit(2)
+		}
+		writeDI = di
+		switch di {
+		case cj.DIValve:
+			if *allowControl {
+				opts = append(opts, "allow-control")
+			}
+		case cj.DIWriteAddr:
+			opts = append(opts, "allow-write")
 		}
 	}
 	labels := map[string]string{
@@ -132,12 +145,7 @@ func cjt188readCmd(args []string) {
 	// 写命令的报文标识（A017/A018）不是可读数据项，不能走字段 schema；
 	// 先分流，免得给阀门写一个「未收录的数据标识」的误导性错误。
 	if *write != "" {
-		di, err := parseWriteDI(*diList)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "%v\n", err)
-			os.Exit(2)
-		}
-		runCJT188Write(ctx, c, di, *write, *allowControl, *asJSON)
+		runCJT188Write(ctx, c, writeDI, *write, *allowControl, *asJSON)
 		return
 	}
 
@@ -160,6 +168,7 @@ func cjt188readCmd(args []string) {
 	}
 
 	rows := make([]cjt188Row, 0, len(samples))
+	okCount := 0
 	for i, s := range samples {
 		row := cjt188Row{DI: fields[i].DI.String(), Offset: fields[i].Offset}
 		row.Name = fields[i].Name
@@ -172,6 +181,7 @@ func cjt188readCmd(args []string) {
 			rows = append(rows, row)
 			continue
 		}
+		okCount++
 		row.Type = string(s.Value.Type)
 		switch fields[i].Kind {
 		case cj.FieldTime:
@@ -193,12 +203,27 @@ func cjt188readCmd(args []string) {
 		rows = append(rows, row)
 	}
 
+	// 退出码要能当判据用：一个字段都读不到、或出现链路级错误时返回 1
+	// （部分成功且无链路错误仍是 0，与 docs §3.3.1 的部分失败语义一致）。
+	// 全部失败还返回 0，脚本会把「设备不认这些 DI」当成成功。
+	failed := cjt188ReadFailed(okCount, rerr)
 	if *asJSON {
-		emitJSON(map[string]any{
+		payload := map[string]any{
 			"transport": ch.Transport.Kind, "address": *address,
 			"type": strings.ToUpper(*meterType), "link": "up",
-			"read": len(rows), "rows": rows,
-		})
+			"read": len(rows), "ok": okCount, "rows": rows,
+		}
+		// error 为 null 才是「没有链路错误」；字符串会把「无错」表达成
+		// "unknown" 这类非空值，脚本判空就会误报。
+		if rerr != nil {
+			payload["error"] = rerr.Error()
+		} else {
+			payload["error"] = nil
+		}
+		emitJSON(payload)
+		if failed {
+			os.Exit(1)
+		}
 		return
 	}
 
@@ -210,13 +235,27 @@ func cjt188readCmd(args []string) {
 			printRow([]int{8, 8, 22, 18, 10, 16, 10},
 				r.DI, strconv.Itoa(r.Offset), r.Name, r.rawValue(), r.Type, r.display(), r.Quality)
 		}
-		return
+	} else {
+		printRow([]int{8, 8, 22, 22}, "DI", "偏移", "字段", "值")
+		for _, r := range rows {
+			printRow([]int{8, 8, 22, 22}, r.DI, strconv.Itoa(r.Offset), r.Name, r.display())
+		}
 	}
-	printRow([]int{8, 8, 22, 22}, "DI", "偏移", "字段", "值")
-	for _, r := range rows {
-		printRow([]int{8, 8, 22, 22}, r.DI, strconv.Itoa(r.Offset), r.Name, r.display())
+	if rerr != nil {
+		fmt.Fprintf(os.Stderr, "读取中断: %v\n", rerr)
+		os.Exit(1)
+	}
+	if okCount == 0 {
+		fmt.Fprintln(os.Stderr, "全部字段读取失败（逐行的质量码见上）")
+		os.Exit(1)
 	}
 }
+
+// cjt188ReadFailed 判断一次自检读是否该以非零退出。
+//
+// 部分成功仍然算成功（docs §3.3.1），但有链路级错误时即使读到了几个字段
+// 也要报错：那说明这一轮并不完整，脚本拿它当「全读到了」会漏掉后面的点位。
+func cjt188ReadFailed(okCount int, err error) bool { return okCount == 0 || err != nil }
 
 // cjt188Row 是自检输出的一行。
 type cjt188Row struct {

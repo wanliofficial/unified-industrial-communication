@@ -300,7 +300,12 @@ func (c *conn) Probe(ctx context.Context) error {
 	}
 	typ, got, err := cjt188.ParseAddrReply(fr)
 	if err != nil {
-		return driver.E(driver.ErrProtocol, "probe", c.devID, err.Error(), true, err)
+		// 异常应答说明表收到了读地址命令但拒绝执行：重发结果相同，不能标成
+		// 可重试（否则探测会白等多轮超时）。帧结构错则可能只是线路噪声，保留
+		// 可重试——两者的区别正好由 Exception 类型承载。
+		var ex *cjt188.Exception
+		temporary := !errors.As(err, &ex)
+		return driver.E(driver.ErrProtocol, "probe", c.devID, err.Error(), temporary, err)
 	}
 	if got != c.addr {
 		return driver.E(driver.ErrProtocol, "probe", c.devID,
@@ -328,38 +333,61 @@ func (c *conn) Read(ctx context.Context, spans []driver.ReadSpan) ([]driver.RawS
 		return nil, driver.E(driver.ErrDisconnected, "read", c.devID, "connection closed", false, nil)
 	}
 
+	// 先把 span 摊平：后面要在任意下标处「把剩下的点全部标坏」，嵌套循环
+	// 做不到这件事而又不写两套收尾逻辑。
+	var points []driver.PointRef
+	for _, span := range spans {
+		points = append(points, span.Points...)
+	}
+
 	cache := make(map[cjt188.DI][]byte)
-	var out []driver.RawSample
+	out := make([]driver.RawSample, 0, len(points))
 	var firstErr error
 	ok := 0
-	for _, span := range spans {
-		for _, ref := range span.Points {
-			if err := ctx.Err(); err != nil {
-				return out, driver.E(driver.ErrTimeout, "read", c.devID, "context done", true, err)
-			}
-			if c.linkErr != nil {
-				out = append(out, bad(ref, c.linkErr))
-				continue
-			}
-			s, err := c.readPoint(ctx, ref, cache)
-			if err != nil {
-				out = append(out, bad(ref, err))
-				if firstErr == nil {
-					firstErr = err
-				}
-				if isLinkFailure(err) {
-					c.linkErr = err
-				}
-				continue
-			}
-			ok++
-			out = append(out, s)
+
+	// failRest 把 from 之后的点位显式标坏。
+	//
+	// 链路已经断了还逐点发请求，代价是「点数 × 设备超时」；而少给样本
+	// 又会被采集器当成「驱动漏报」——两种处理都会把一次断线放大成一轮
+	// 静默故障。显式补坏样本是唯一既不撒谎又不拖延的收尾方式。
+	failRest := func(from int, err error) {
+		for _, ref := range points[from:] {
+			out = append(out, bad(ref, err))
 		}
 	}
-	if ok == 0 && firstErr != nil {
-		return out, firstErr
+
+	for i, ref := range points {
+		if err := ctx.Err(); err != nil {
+			e := driver.E(driver.ErrTimeout, "read", c.devID, "context done", true, err)
+			failRest(i, e)
+			return out, e
+		}
+		// linkErr 是上一次事务留下的链路级故障（exchange 成功时会清空）。
+		// 它同样属于「这一轮别再发了」，按链路级例外立即收尾。
+		if c.linkErr != nil {
+			failRest(i, c.linkErr)
+			return out, c.linkErr
+		}
+		s, err := c.readPoint(ctx, ref, cache)
+		if err != nil {
+			out = append(out, bad(ref, err))
+			if firstErr == nil {
+				firstErr = err
+			}
+			if driver.IsLinkFailure(err) {
+				// 链路级失败是「有成功点也返回错误」的例外（docs §3.3.1）：
+				// 设备太慢/已断开必须让调度器看见，不能混在部分失败里。
+				c.linkErr = err
+				failRest(i+1, err)
+				return out, err
+			}
+			continue
+		}
+		ok++
+		out = append(out, s)
 	}
-	return out, nil
+	// 部分失败语义（docs §3.3.1）：有成功点就不向上返回错误。
+	return out, driver.PartialReadError(ok, firstErr)
 }
 
 func (c *conn) readPoint(ctx context.Context, ref driver.PointRef, cache map[cjt188.DI][]byte) (driver.RawSample, error) {
@@ -435,7 +463,7 @@ func (c *conn) readDI(ctx context.Context, di cjt188.DI) ([]byte, error) {
 
 // resolveRead 把点表地址解析成 DI 与字段定义。
 func (c *conn) resolveRead(ref driver.PointRef) (cjt188.DI, cjt188.Field, error) {
-	di, err := parseDI(ref.Address.Area)
+	di, err := c.parseDI("read", ref.Address.Area)
 	if err != nil {
 		return cjt188.DI{}, cjt188.Field{}, err
 	}
@@ -464,22 +492,40 @@ func (c *conn) Write(ctx context.Context, reqs []driver.WriteRequest) ([]driver.
 		return nil, driver.E(driver.ErrDisconnected, "write", c.devID, "connection closed", false, nil)
 	}
 	out := make([]driver.WriteResult, 0, len(reqs))
-	for _, req := range reqs {
+	for i, req := range reqs {
 		if err := ctx.Err(); err != nil {
-			out = append(out, driver.WriteResult{PointID: req.PointID,
-				Err: driver.E(driver.ErrTimeout, "write", c.devID, "context done", true, err)})
-			continue
+			// ctx 到期后剩下的每一条都注定失败。逐条重试只会把「超时」
+			// 乘以条数；但也不能少给结果——逐项返回是写路径的硬契约。
+			e := driver.E(driver.ErrTimeout, "write", c.devID, "context done", true, err)
+			for _, rest := range reqs[i:] {
+				out = append(out, driver.WriteResult{
+					PointID: rest.PointID, Quality: qualityOf(e), Err: e,
+				})
+			}
+			return out, e
 		}
-		out = append(out, c.writeOne(ctx, req))
+		res := c.writeOne(ctx, req)
+		out = append(out, res)
+		if driver.IsLinkFailure(res.Err) {
+			// 链路级失败：剩余写请求不可能成功，标坏后把批级错误经第二个
+			// 返回值上抛（docs §3.4 规则 4）。已成功的条目保持原样。
+			for _, rest := range reqs[i+1:] {
+				out = append(out, driver.WriteResult{
+					PointID: rest.PointID, Quality: qualityOf(res.Err), Err: res.Err,
+				})
+			}
+			return out, res.Err
+		}
 	}
 	return out, nil
 }
 
 func (c *conn) writeOne(ctx context.Context, req driver.WriteRequest) driver.WriteResult {
 	res := driver.WriteResult{PointID: req.PointID}
-	di, err := parseDI(req.Address.Area)
+	di, err := c.parseDI("write", req.Address.Area)
 	if err != nil {
 		res.Err = err
+		res.Quality = qualityOf(err)
 		return res
 	}
 	switch di {
@@ -491,10 +537,14 @@ func (c *conn) writeOne(ctx context.Context, req driver.WriteRequest) driver.Wri
 		res.Err = driver.E(driver.ErrUnsupported, "write", c.devID,
 			fmt.Sprintf("CJ/T 188 只支持写阀门（A017）与写地址（A018），不支持写 %s", di), false, nil)
 	}
-	if res.Err == nil {
-		res.OK = true
-		res.Quality = model.QualityGood
+	if res.Err != nil {
+		// 失败项必须带质量码：留空会让上层兜底成 bad，于是「超时」「地址
+		// 写错」「设备拒绝」在下游看起来一模一样（docs §3.4 规则 5）。
+		res.Quality = qualityOf(res.Err)
+		return res
 	}
+	res.OK = true
+	res.Quality = model.QualityGood
 	return res
 }
 
@@ -566,19 +616,21 @@ func (c *conn) writeAddr(ctx context.Context, req driver.WriteRequest) error {
 // checkWriteAck 校验写应答：控制码必须是「请求 + 0x80」，DI 与 SER 回显一致。
 func (c *conn) checkWriteAck(fr cjt188.Frame, ctrl byte, want cjt188.DI, ser byte, what string) error {
 	if fr.IsError() {
+		// 写被拒同样按点级处理（ErrPermission 更贴切：这是「表不允许这次写」，
+		// 不是链路坏了，也不该重连）。188 没有错误码，只能说明是哪条写命令。
 		er, err := cjt188.ParseErrorReply(fr)
 		if err != nil {
-			return driver.E(driver.ErrProtocol, "write", c.devID, err.Error(), true, err)
+			return driver.E(driver.ErrProtocol, "write", c.devID, err.Error(), false, err)
 		}
-		return driver.E(driver.ErrProtocol, "write", c.devID,
-			fmt.Sprintf("%s被拒绝（DI %s，SER %d）", what, er.DI, er.SER), true, nil)
+		return driver.E(driver.ErrPermission, "write", c.devID,
+			fmt.Sprintf("%s被拒绝（DI %s，SER %d）", what, er.DI, er.SER), false, nil)
 	}
 	if fr.Ctrl != ctrl {
 		return driver.E(driver.ErrProtocol, "write", c.devID,
-			fmt.Sprintf("%s应答控制码 %02X，应为 %02X", what, fr.Ctrl, ctrl), true, nil)
+			fmt.Sprintf("%s应答控制码 %02X，应为 %02X", what, fr.Ctrl, ctrl), false, nil)
 	}
 	if _, err := cjt188.ParseReadReply(fr, want, ser); err != nil {
-		return driver.E(driver.ErrProtocol, "write", c.devID, err.Error(), true, err)
+		return driver.E(driver.ErrProtocol, "write", c.devID, err.Error(), false, err)
 	}
 	return nil
 }
@@ -672,7 +724,7 @@ func (c *conn) exchange(ctx context.Context, req []byte, op string) (reply, erro
 	fr, err := rd.Next()
 	if err != nil {
 		e := c.readError(op, err, ctx)
-		if isLinkFailure(e) {
+		if driver.IsLinkFailure(e) {
 			c.linkErr = e
 		}
 		return reply{}, e
@@ -709,19 +761,36 @@ func (c *conn) checkAddr(fr cjt188.Frame, op string) error {
 }
 
 // classify 把编解码层/异常应答映射为驱动错误分类。
+//
+// CJ/T 188 的异常应答**不带错误码**：数据域只有 DI + SER，主站只能从「是哪条
+// 命令、什么参数」推断原因。因此这里的分类必须保守地按「点级」处理：
+//
+//   - 异常应答（控制码 D6=1）说明表收到了请求但拒绝执行。最典型的来源是点表
+//     里配了一个该表不支持的数据标识——这是**点表问题**，不是链路故障。归成
+//     ErrProtocol + temporary 会让采集器每周期丢弃连接重连一次，还会被
+//     CountsTowardBreaker 计入熔断：一个写错的 DI 就能把整台正常的表标成坏设备。
+//     按 ErrAddress（不重试、不熔断、点级）上报，剩下点位照常读。
+//   - 帧结构类错误（DI/SER 不匹配、控制码不对）说明这一帧应答与请求配不上，
+//     但在「一问一答 + 排空 + 地址校验」之下下一帧是独立的，同样按点级处理；
+//     只有 exchange 层的超时/断连才是链路级。
 func (c *conn) classify(di cjt188.DI, op string, err error) error {
+	var ex *cjt188.Exception
+	if errors.As(err, &ex) {
+		return driver.E(driver.ErrAddress, op, c.devID,
+			fmt.Sprintf("%s：%s", di, ex.Error()), false, err)
+	}
 	return driver.E(driver.ErrProtocol, op, c.devID,
-		fmt.Sprintf("%s：%v", di, err), true, err)
+		fmt.Sprintf("%s：%v", di, err), false, err)
 }
 
 // ---------------------------------------------------------------------------
 // 便利函数
 // ---------------------------------------------------------------------------
 
-func parseDI(s string) (cjt188.DI, error) {
+func (c *conn) parseDI(op, s string) (cjt188.DI, error) {
 	di, err := cjt188.ParseDI(s)
 	if err != nil {
-		return cjt188.DI{}, driver.E(driver.ErrAddress, "read", "", err.Error(), false, err)
+		return cjt188.DI{}, driver.E(driver.ErrAddress, op, c.devID, err.Error(), false, err)
 	}
 	return di, nil
 }
@@ -738,17 +807,28 @@ func numericType(dt model.DataType) model.DataType {
 func bad(ref driver.PointRef, err error) driver.RawSample {
 	return driver.RawSample{
 		PointID: ref.ID,
-		Quality: model.QualityCommError,
+		Quality: qualityOf(err),
 		Err:     err,
 	}
 }
 
-func isLinkFailure(err error) bool {
+// qualityOf 把驱动错误分类映射为质量码。
+//
+// 写死 comm_error 会把「超时」「地址错」「权限不足」一起说成通讯故障：
+// 下游据此做的告警分级、熔断计数与现场排查方向全部出错。同一条错误在
+// 「错误码」与「质量」两个维度上必须给出一致结论。
+func qualityOf(err error) model.Quality {
 	switch driver.KindOf(err) {
-	case driver.ErrTimeout, driver.ErrDisconnected:
-		return true
+	case driver.ErrTimeout:
+		return model.QualityTimeout
+	case driver.ErrAddress, driver.ErrUnsupported:
+		return model.QualityAddressError
+	case driver.ErrDisconnected:
+		return model.QualityCommError
+	case driver.ErrPermission:
+		return model.QualityBad
 	}
-	return false
+	return model.QualityBad
 }
 
 func isTimeout(err error) bool {

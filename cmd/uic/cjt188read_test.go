@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"testing"
 
 	"uic/internal/codec/cjt188"
@@ -196,6 +197,29 @@ func TestParseWriteDI(t *testing.T) {
 	for _, bad := range []string{"A017,A018", "901F", "02010100", "A01", "ZZZZ", ""} {
 		if _, err := parseWriteDI(bad); err == nil {
 			t.Fatalf("%q must fail", bad)
+		}
+	}
+}
+
+// TestCJT188ReadFailed 自检命令的退出码必须能当判据用：全失败要报错，
+// 有链路级错误时即便读到了几个字段也要报错（那一轮并不完整）。
+func TestCJT188ReadFailed(t *testing.T) {
+	linkErr := errors.New("read: 等待应答超时")
+	cases := []struct {
+		name string
+		ok   int
+		err  error
+		want bool
+	}{
+		{"全部成功", 3, nil, false},
+		{"部分成功", 2, nil, false},
+		{"全部失败", 0, nil, true},
+		{"全失败带错误", 0, linkErr, true},
+		{"部分成功但链路中断", 2, linkErr, true},
+	}
+	for _, tc := range cases {
+		if got := cjt188ReadFailed(tc.ok, tc.err); got != tc.want {
+			t.Fatalf("%s: cjt188ReadFailed(%d, %v) = %v, want %v", tc.name, tc.ok, tc.err, got, tc.want)
 		}
 	}
 }

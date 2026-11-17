@@ -200,9 +200,11 @@ func Build(t byte, addr Addr, ctrl byte, data []byte) ([]byte, error) {
 
 // Parse 从字节流中找出一帧。
 //
-// 返回值 consumed 是「应当从缓冲区开头丢弃多少字节」：成功时等于整帧
-// 长度；ErrIncomplete 时等于起始符之前的噪声字节数；其它错误时至少为 1。
-// 这个契约让调用方只写一个循环，不必自己判断该丢多少。
+// 返回值 consumed 是「应当从缓冲区开头丢弃多少字节」，成功时等于
+// start + total（起始符之前的噪声 + 整帧）；ErrIncomplete 时等于起始符
+// 之前的噪声字节数（起始符本身留在缓冲区里等后续字节）；其它错误时至少
+// 为 start+1。这个契约让调用方只写一个循环 `buf = buf[consumed:]`：若成功
+// 时只返回 total，前导噪声会留在缓冲区头部、同时帧尾等长的真实字节被砍掉。
 func Parse(buf []byte) (Frame, int, error) {
 	start := -1
 	for i, b := range buf {
@@ -245,7 +247,7 @@ func Parse(buf []byte) (Frame, int, error) {
 		Addr: addr,
 		Ctrl: raw[9],
 		Data: append([]byte(nil), raw[11:11+l]...),
-	}, total, nil
+	}, start + total, nil
 }
 
 // FrameLen 根据已收到的字节推算整帧长度；数据不足时 ok=false。
@@ -342,7 +344,9 @@ type Reply struct {
 // 不是这个协议，直接判错——把短帧当成「没有数据」会让上层以为设备正常。
 func ParseReply(fr Frame) (Reply, error) {
 	if fr.IsError() {
-		return Reply{}, fmt.Errorf("cjt188: 这是异常应答（控制码 %02X）", fr.Ctrl)
+		// 返回带类型的 *Exception：驱动靠 errors.As 把它归为「表拒绝执行」
+		// 的点级错误，而不是「帧坏了」的协议错。
+		return Reply{}, ExceptionOf(fr)
 	}
 	if !fr.IsReply() {
 		return Reply{}, fmt.Errorf("cjt188: 不是应答帧（控制码 %02X）", fr.Ctrl)
@@ -381,6 +385,25 @@ type ErrorReply struct {
 	SER byte
 }
 
+// Exception 是从站异常应答（控制码 D6=1）对应的错误。
+//
+// 单独成类型而不是一个 fmt.Errorf：驱动要靠类型把「表拒绝执行」与「帧本身
+// 坏了」分成两类处置——前者是点级问题（多半是点表配了表不支持的数据标识），
+// 不该重连、不该熔断；后者才需要看帧边界是否还可信。
+type Exception struct {
+	Ctrl byte
+	DI   DI
+	SER  byte
+}
+
+// Error 输出便于对照请求的错误文本。
+//
+// 188 的异常应答没有错误码，因此文案只能说清「哪条命令被拒」——把 DI 与 SER
+// 都带上，现场才查得到是点表里的哪一行。
+func (e *Exception) Error() string {
+	return fmt.Sprintf("cjt188: 从站拒绝执行（控制码 %02X，DI %s，SER %d）", e.Ctrl, e.DI, e.SER)
+}
+
 // ParseErrorReply 解析异常应答（0xC1 / 0xC4 …）。
 func ParseErrorReply(fr Frame) (ErrorReply, error) {
 	if !fr.IsError() {
@@ -396,13 +419,30 @@ func ParseErrorReply(fr Frame) (ErrorReply, error) {
 	}
 }
 
+// ExceptionOf 把异常应答转成 *Exception 错误；不是异常应答时返回 nil。
+//
+// 与 ParseErrorReply 的分工：后者是「能解析出什么」，本函数是「如何向上
+// 报告」。驱动不该自己拼一条 fmt.Errorf——那样 errors.As 就拿不到类型，
+// 分类只能靠字符串匹配。
+func ExceptionOf(fr Frame) error {
+	if !fr.IsError() {
+		return nil
+	}
+	ex := &Exception{Ctrl: fr.Ctrl}
+	if er, err := ParseErrorReply(fr); err == nil {
+		ex.DI = er.DI
+		ex.SER = er.SER
+	}
+	return ex
+}
+
 // ParseAddrReply 从读地址应答里取出仪表类型与地址。
 //
 // 地址来自**帧头**而不是数据域：请求用全 AA，从站用自己的真实地址应答，
 // 这正是主站「问一台表你是谁」的全部机制。
 func ParseAddrReply(fr Frame) (byte, Addr, error) {
 	if fr.IsError() {
-		return 0, Addr{}, fmt.Errorf("cjt188: 读地址被拒绝（控制码 %02X）", fr.Ctrl)
+		return 0, Addr{}, ExceptionOf(fr)
 	}
 	if !fr.IsReply() {
 		return 0, Addr{}, fmt.Errorf("cjt188: 不是应答帧（控制码 %02X）", fr.Ctrl)

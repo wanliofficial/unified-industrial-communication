@@ -25,7 +25,9 @@ import (
 // 返回的 float64 已经换算到规范单位（m³ / m³/h / GJ / kW），**未**施加
 // 点位 Scale/Bias——那一步由采集管线统一做。
 func DecodeField(f Field, raw []byte) (float64, error) {
-	if len(raw) < f.Width() {
+	if len(raw) != f.Width() {
+		// 多一个字节也拒绝：静默截断会让「切错字段边界」看起来像一次
+		// 正常读数，而错位读出的值往往仍是合法 BCD。
 		return 0, fmt.Errorf("cjt188: %s 需要 %d 字节，实际 %d", f.Name, f.Width(), len(raw))
 	}
 	switch f.Kind {

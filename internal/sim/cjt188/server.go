@@ -37,6 +37,10 @@ type Server struct {
 	valveAt  time.Time
 	writes   int
 	requests int64
+	// dropAfter > 0 时，从站在成功应答这么多次后主动断开当前连接。
+	dropAfter int
+	// missing 是「表不支持」的数据标识：收到请求时回异常应答。
+	missing []cj.DI
 
 	ln     net.Listener
 	conns  map[net.Conn]struct{}
@@ -60,6 +64,28 @@ func WithAddress(s string) Option {
 // WithType 设置仪表类型 T（10 冷水/20 热量/30 燃气…）。
 func WithType(t byte) Option {
 	return func(srv *Server) { srv.mtype = t }
+}
+
+// WithDropAfter 让从站在成功应答 n 次后主动断开当前连接（0 = 不断开）。
+//
+// 用于自检「一轮采集途中链路断开」的处置：驱动必须保留已读到的样本，
+// 并把剩余点位显式标坏后立即返回，而不是逐个等到超时。
+func WithDropAfter(n int) Option {
+	return func(srv *Server) { srv.dropAfter = n }
+}
+
+// WithoutValue 让从站假装没有实现某个数据标识（收到请求时回异常应答）。
+// 真实的表几乎都只实现标准的一个子集：点表里配了一个该表不支持的数据标识，
+// 得到的是异常应答而不是超时。这正是「一个坏 DI 不该把整台表拖成每周期重连」
+// 那条契约的现场来源，因此从站必须能复现它。
+func WithoutValue(di string) Option {
+	return func(srv *Server) {
+		d, err := cj.ParseDI(di)
+		if err != nil {
+			panic("sim/cjt188: WithoutValue: " + err.Error())
+		}
+		srv.missing = append(srv.missing, d)
+	}
 }
 
 // NewServer 创建并启动 TCP 从站；addr 为 "127.0.0.1:0" 时自动分配端口。
@@ -305,6 +331,7 @@ func (s *Server) ServeStream(st transport.Stream) error {
 	s.mu.Unlock()
 
 	rd := cj.NewReader(st)
+	replies := 0
 	for {
 		fr, err := rd.Next()
 		if err != nil {
@@ -319,6 +346,12 @@ func (s *Server) ServeStream(st transport.Stream) error {
 		}
 		if err := st.Write(resp); err != nil {
 			return err
+		}
+		replies++
+		if s.dropAfter > 0 && replies >= s.dropAfter {
+			// 模拟串口服务器/DTU 掉线：这一次应答已经发出，下一帧不再
+			// 有对端。返回后由 serveConn 关闭底层连接。
+			return nil
 		}
 	}
 }
@@ -377,8 +410,15 @@ func (s *Server) handleRead(fr cj.Frame) ([]byte, bool) {
 	out := append([]byte(nil), payload...)
 	clock := s.clock
 	valve := s.valve
+	missing := false
+	for _, m := range s.missing {
+		if m == di {
+			missing = true
+			break
+		}
+	}
 	s.mu.RUnlock()
-	if !ok {
+	if missing || !ok {
 		return s.exception(fr), false
 	}
 	// 时间与状态是「活的值」：SetClock/写阀门之后必须能从 901F 读回来，
