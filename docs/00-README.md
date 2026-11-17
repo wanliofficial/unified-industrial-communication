@@ -1145,16 +1145,24 @@ mosquitto_sub -h 127.0.0.1 -t 'uic/mqtt-lab/#' -v
 ./uic -check -config examples/sparkplug.json
 ./uic -config examples/sparkplug.json
 #   任意 Sparkplug B 消费端订阅 spBv1.0/plant-a/#
-#   顺序：STATE(online) → NBIRTH(gw-line1) → DBIRTH(line-a) → DDATA…
+#   顺序：NBIRTH(gw-line1) → DBIRTH(line-a) → DDATA…
 #         → DBIRTH(line-b) → DDATA…
 ```
 
 它和 json 格式**互斥**，不是「多带几个字段」：`format: "sparkplug-b"` 时主题由
 `groupId/nodeId/设备名` 拼出，`topic` 必须留空（配了会启动报错），`retain` 必须
-为 false（只有 STATE 用 retained）。序号是节点级的（节点消息与全部设备消息
-共用一个 0..255 计数器，NBIRTH 为 0 并重置），NDEATH 不带序号；
-重连、NCMD `Node Control/Rebirth`、设备从故障恢复都会重发 BIRTH。质量非 good
-用 `is_null` 表达——把断线前的旧值当新值发出去，比不发更危险。
+为 false、`qos` 必须省略（都配了会启动报错）——Sparkplug 对每类消息逐条规定了
+QoS 与 retain，做成可配只会让人配出一个「本地正常、严格 Host 直接丢弃」的部署。
+本平台只扮演**边缘节点**，不发布 `spBv1.0/STATE/{host_id}`（那是 Host 的出生/
+死亡证书），在线语义由 NBIRTH/NDEATH 表达。
+
+序号是节点级的（节点消息与全部设备消息共用一个 0..255 计数器，NBIRTH 为 0 并
+重置），NDEATH 不带序号；`bdSeq` 是另一套计数，**每个新 MQTT CONNECT 前进一格**
+并同时出现在遗嘱与 NBIRTH 里，Host 靠它配对「生—死」。重连、
+NCMD `Node Control/Rebirth`、设备从故障或配置删除后恢复都会重发 BIRTH；设备被
+从配置里删掉时先发 DDEATH 并忘掉点位，否则重连的 DBIRTH 会把不存在的设备重新
+宣布为在线。质量非 good 用 `is_null` 表达——把断线前的旧值当新值发出去，比不发
+更危险。
 
 点位值映射按 Sparkplug DataType 走，`bytes` 用 Bytes (17) + `bytes_value`
 字段保留原始字节（声明成 String 会被 UTF-8 改写）；BCD 按 Double 发。DataSet、模板、别名、
@@ -1463,7 +1471,7 @@ docs/
 | REST | 配置、查询、写入、命令 | ✅ 完整 |
 | SSE | 实时观察（浏览器/curl 友好） | ✅ 完整 |
 | MQTT | 变化上报 + 设备状态 | ✅ 完整（QoS0/1、retained `$state`/`$birth`、LWT `$death`、断线补投；不支持 QoS2/TLS/WebSocket） |
-| MQTT · Sparkplug B | 与 SCADA/IIoT 平台的标准化生命周期 | ✅ `format: "sparkplug-b"`：NBIRTH/NDEATH/DBIRTH/DDEATH/DDATA、STATE、序号与 bdSeq、NCMD/DCMD Rebirth、重连补 BIRTH；手写 Protobuf，不做 DataSet/模板/别名 |
+| MQTT · Sparkplug B | 与 SCADA/IIoT 平台的标准化生命周期 | ✅ `format: "sparkplug-b"`（只扮演 Edge Node）：NBIRTH/NDEATH/DBIRTH/DDEATH/DDATA、序号与 bdSeq、NCMD/DCMD Rebirth、重连补 BIRTH、删除点位发 DDEATH；手写 Protobuf；不发 Host 的 `spBv1.0/STATE/{host_id}`；不做 DataSet/模板/别名 |
 | OPC UA | 被 SCADA 集成 | ✅ 服务端地址空间（`Root/Objects/{site}/{device}/{point}`，`ns=2;s=...`）；质量码走 `DataValue.Status`；写入穿透到南向设备；支持订阅推送；None/None + 匿名，不支持证书/历史/方法/事件 |
 
 > 注意方向的对称性：MQTT 与 OPC UA 都**同时出现在南向和北向**，但这是两条独立的链路。
@@ -1548,7 +1556,7 @@ obs  ← 所有包（不依赖任何内部包）
 | `internal/sim/s7` | 内置 S7 从站（内存 DB/M/I/Q 区；块目录/属性/上传） | 与主站共用 codec/s7；输入区只读；位写保邻位；DB 块内容直接从内存区域反向暴露，与读点位看到同一份数据；上传会话按连接隔离，End 后立即失效 | 80% |
 | `internal/opcuaserver` | 可复用的 OPC UA 服务端内核（地址空间、订阅/发布、标准节点） | 与主站共用 codec/opcua；未激活会话拒绝读写；Variant 类型必须与节点 DataType 一致；Publish 在独立 goroutine，响应按 RequestId 乱序返回；`NewSimulator` 提供演示地址空间 | 82.2% |
 | `internal/northbound/opcua` | OPC UA 北向：点位表 → 地址空间 | 一点一变量；质量码映射到 `DataValue.Status`；写入过 `Runtime.Write`（设备 actor + 幂等）；配置变更按指纹重建，抢不到端口回退上一份配置 | 82.4% |
-| `internal/sim/mqtt` | 内置 MQTT 3.1.1 Broker，兼 `uic sim -protocol mqtt` 运行时 | 全项目唯一一份 Broker 实现；不做 QoS2/持久会话/TLS；QoS2 授予时降级为 1 | 79.3% |
+| `internal/sim/mqtt` | 内置 MQTT 3.1.1 Broker，兼 `uic sim -protocol mqtt` 运行时 | 全项目唯一一份 Broker 实现；不做 QoS2/持久会话/TLS；QoS2 授予时降级为 1；解析 CONNECT 并记录 `ConnectInfo`，**在非正常断开时代发遗嘱**（收到 DISCONNECT 则不代发），retained 消息在 SUBSCRIBE 后补发 | 79.3% |
 | `internal/slave/modbus` | Modbus 从站（TCP / RTU / ASCII，把点位暴露给外部主站） | 读走 cache、写走 Runtime.Write；未映射地址报错不补零；坏质量保留最后值并计数；RTU 按功能码推导帧长、ASCII 以 CRLF 分帧；非本机地址静默、广播只写不回；诊断与设备识别（FC8/11/17/43） | 81.4% |
 | `internal/alarm` | 报警引擎：五态机、阈值/滞回/延时、表达式规则（含历史窗口）、确认、订阅 | 输入不可信时绝不改状态机；延时是「连续满足」；`cleared` 与 `active` 都要确认；状态只在内存；窗口无样本时判 unknown 而不是「不满足」 | 93.8% |
 | `internal/history` | 有界采样日志：NDJSON 分段、整段淘汰、原始查询、定步长聚合与窗口摘要 | 一条记录不跨段；永远保留至少一段；末尾半行触发新段；查询升序、桶对齐、桶质量取最差；非数值点位不产出 `min/max/avg`；`WindowStats` 只统计 good 的数值样本，空窗口返回 `Count=0` 而非错误 | 84% |
@@ -1641,9 +1649,9 @@ obs  ← 所有包（不依赖任何内部包）
 | `internal/audit` | 审计存储：NDJSON 分段 + SHA-256 哈希链 + 查询/校验 | 序号连续；字段边界用「长度:内容」编码；整段淘汰后链仍可校验；尾部半行触发新段 | 80.7% |
 | `internal/northbound/httpapi` | REST + SSE + 认证/授权 + 错误码 | 错误码稳定；响应不泄露凭据；未知角色全拒；401 与 403 在审计里区分；报警/历史查询的未知参数取值必须报错而不是静默忽略 | 83.4% |
 | `internal/codec/sparkplug` | Sparkplug B 载荷的纯函数 Protobuf 编解码（varint/长度前缀/定长、Metric oneof、PropertySet、未知字段跳过） | 无第三方 protobuf 运行时；未知字段按规则跳过（对端升级 schema 不应让解析失败）；oneof 值字段即使为 0/false 也必须显式编码；`seq` 同样不能按「0 即缺省」省略（NBIRTH/DBIRTH 的序号就是 0，proto2 里「字段缺失」≠「值为 0」），NDEATH 则必须不带序号；声明类型与承载字段冲突时报错；PropertySet 是平行数组，键必须排序才能确定性编码 | 86.3% |
-| `internal/sparkplug` | Sparkplug B 生命周期状态机（主题、NBIRTH/NDEATH/DBIRTH/DDEATH/DDATA、序号与回绕、bdSeq、NCMD/DCMD 解析、指标映射） | 序号是**边缘节点级**的（节点消息与全部设备消息共用 0..255，只有 NBIRTH 重置为 0）；NDEATH 不带也不消耗序号；NDEATH 遗嘱在 CONNECT 前就能生成；非 good 质量用 `is_null` + `quality` 属性；bytes 走 `bytes_value`；命令只认 Rebirth | 96.4% |
-| `internal/mqtt` | MQTT 3.1.1 客户端（北向发布 + 南向订阅共用，纯 Go 零依赖） | 单 goroutine 读 socket；QoS1 必须等到 PUBACK；`Ping` 必须等到 PINGRESP（写成功不算活着）；断线立即失败而非超时；`Epoch` 暴露连接代数，供订阅方区分「新会话的第一条消息」 | 70.3% |
-| `internal/mqtt/mqtttest` | 测试封装：`internal/sim/mqtt` 的 `*testing.T` 生命周期 + 等待断言 | 不另写 Broker（两份实现必然长歪）；开关一律走 setup 函数而非直接赋字段 | — |
+| `internal/sparkplug` | Sparkplug B **Edge Node** 生命周期状态机（主题、NBIRTH/NDEATH/DBIRTH/DDEATH/DDATA、序号与回绕、bdSeq、NCMD/DCMD 解析、指标映射） | 只扮演 Edge Node，**不发布 Host 的 STATE 主题**（在线语义由 NBIRTH/NDEATH 表达）；序号是**边缘节点级**的（节点消息与全部设备消息共用 0..255，只有 NBIRTH 重置为 0）；NDEATH 不带也不消耗序号；bdSeq **每个 CONNECT +1**（`BeginSession`）并同时用于遗嘱与 NBIRTH；QoS/retain 按消息类型定死（数据/出生 0、NDEATH 1、订阅 1），不是配置项；非 good 质量用 `is_null` + `quality` 属性；bytes 走 `bytes_value`；命令只认 Rebirth | 96.4% |
+| `internal/mqtt` | MQTT 3.1.1 客户端（北向发布 + 南向订阅共用，纯 Go 零依赖） | 单 goroutine 读 socket；QoS1 必须等到 PUBACK；`Ping` 必须等到 PINGRESP（写成功不算活着）；断线立即失败而非超时；`Epoch` 暴露连接代数，供订阅方区分「新会话的第一条消息」；`CleanSession` 恒为 true；遗嘱是 `Options.Will func() *Will`，**每次 CONNECT 重新求值**（bdSeq 必须递增），`ParseConnect` 让 Broker 侧能断言线上承诺 | 70.3% |
+| `internal/mqtt/mqtttest` | 测试封装：`internal/sim/mqtt` 的 `*testing.T` 生命周期 + 等待断言 | 不另写 Broker（两份实现必然长歪）；开关一律走 setup 函数而非直接赋字段；`WaitConnections`/`WaitWills` 让测试能断言「线上到底承诺了什么」（CleanSession、遗嘱 QoS/retain、bdSeq 递增） | — |
 | `internal/runtime` | 唯一编排层 + 后端实现 + 看门狗 + 审计埋点 + 窗口缓存 | 启动/关闭顺序（失败逆序收口）；`configuredState` 与 `runtimeState` 分离；协议/传输匹配在装配期校验；只向驱动与报警引擎注入只读 `cache.Get` 与窗口数据源；北向 OPC UA 启停与热重建；凭据表热替换后旧用户立即失效；MQTT 北向以 `northboundSink` 接口隔离 json 与 sparkplug-b | 81.1% |
 | `cmd/uic` | 单入口：run / sim / mbread / mcread / finsread / hostlinkread / enipread / bacread / mstpread / iec104read / iec101read / mewtocolread / dnp3read / coapread / knxread / iec61850read / uaread / dlt645read / cjt188read / mbusread / dlmsread / sl651read / toledoread / snmpread / adsread / secsread / mtconnectread / s7blocks / s7upload / instantiate / import / token / check / version | 关闭预算 10 秒；`uaread`、`mbread`、`mcread`、`finsread`、`enipread`、`bacread`、`mstpread`、`iec104read`、`iec101read`、`mewtocolread`、`dnp3read`、`coapread`、`knxread`、`iec61850read`、`dlt645read`、`cjt188read`、`mbusread`、`dlmsread`、`sl651read`、`toledoread`、`snmpread`、`adsread`、`secsread`、`mtconnectread` 是不装第三方客户端即可自证链路的自检工具；`toledoread -raw` 额外打印收帧统计（读到字节/噪声/坏帧/最近帧龄/最近一帧原文）——Toledo 只有推送没有命令可发，线上字节是唯一可观测面；块服务放在 CLI 而不是北向 API（动作重、数据大、归操作系统账号管）；模板实例化与点表导入只产出文件，不在运行期动态生成设备 | — |
 

@@ -89,10 +89,17 @@ type Options struct {
 //
 // json 与 sparkplug-b 共用 Broker 连接、凭据和 Outbox，但生命周期差异
 // 很大：前者一条采样一条消息，后者要先 BIRTH 再 DDATA。把差异关在接口
-// 后面，runtime 只认识「投递 / 状态 / 报警 / 关闭」四件事。
+// 后面，runtime 只认识「投递 / 状态 / 删除 / 报警 / 关闭」几件事。
+//
+// onRemove 是设备从配置里被整体删掉时（reload 检测到 desired 集合里不再有
+// 它）的回调。json 格式没有设备生命周期，删除只是清掉自己缓存的状态；但
+// Sparkplug 不行——DBIRTH 会把它列出的全部点位重新告诉消费方，设备早已
+// 不在配置里却还在「出生」，Host 会一直以为它在线。所以删除必须显式
+// 走 onRemove 发 DDEATH、忘掉它的点位，而不是等下一次重连补发陈旧 BIRTH。
 type northboundSink interface {
 	deliver(ctx context.Context, recs []outbox.Record) (int, error)
 	onState(ev scheduler.StateEvent)
+	onRemove(deviceID string)
 	onAlarmEvent(ev alarm.Event)
 	seedAlarms(statuses []alarm.Status)
 	setMetrics(m *obs.Metrics)
@@ -129,6 +136,12 @@ type Runtime struct {
 	// 调 syncOPCUA，再拿一次就是自锁。
 	nbMu    sync.Mutex
 	nbOPCUA *opcuaNorthbound
+
+	// reloadMu 串行化整次热更新（含释放 mu 之后的北向通知）。配置应用与
+	// 回滚可以并发进来：若不串行化，两次 reload 交错执行时，「删除设备」
+	// 与「同 ID 重配」两条路径的 notifyRemoved 顺序可能颠倒，sink 会为
+	// 一台刚重建的设备补发 DDEATH。
+	reloadMu sync.Mutex
 
 	mu          sync.Mutex
 	collectors  map[string]*collector
@@ -266,11 +279,7 @@ func New(opt Options) (*Runtime, error) {
 	r.sched = scheduler.New(scheduler.Options{
 		// 设备运行态变化同时投递到 MQTT（retained）。scheduler 用独立
 		// goroutine 串行回调，所以即使 Broker 慢也不会拖住采集。
-		OnState: func(ev scheduler.StateEvent) {
-			if s := r.mqttSink; s != nil {
-				s.onState(ev)
-			}
-		},
+		OnState: r.onDeviceState,
 	}, logger, met)
 
 	// 启动失败的每一步都走同一个收口：逐个 case 手写 Close 会漏——每加一个
@@ -420,6 +429,17 @@ func (r *Runtime) markDisabled(dev model.Device) {
 			Value:       model.Value{Type: p.DataType},
 			CollectedAt: now, Error: "device disabled",
 		})
+	}
+}
+
+// notifyRemoved 把「一台设备已从配置里消失」告诉北向 sink。
+//
+// 必须在持有 r.mu 的情况下调用（调用点都在 reload 的临界区内）。sink 各自
+// 负责把自己与设备相关的状态清干净——json 格式只丢状态快照，Sparkplug 要
+// 补一条 DDEATH 并忘掉点位。sink 为 nil（还没开出北向通道）时无需通知。
+func (r *Runtime) notifyRemoved(id string) {
+	if s := r.mqttSink; s != nil {
+		s.onRemove(id)
 	}
 }
 
@@ -697,6 +717,9 @@ func (r *Runtime) Rollback(ctx context.Context, version string) (config.ApplyRes
 
 // reload 只重建「指纹变化」的设备，未变化的设备连接与死区状态保持不变。
 func (r *Runtime) reload(before *config.File) []string {
+	r.reloadMu.Lock()
+	defer r.reloadMu.Unlock()
+
 	after := r.cfg.Current()
 	if err := r.buildAuth(after); err != nil {
 		// 不回滚整次 Apply（配置已落盘，业务面要继续服务），但凭据必须
@@ -719,14 +742,19 @@ func (r *Runtime) reload(before *config.File) []string {
 	}
 
 	r.mu.Lock()
-	defer r.mu.Unlock()
 
 	var restarted []string
+	// removed 收集「需要告诉北向 sink 的设备」。实际通知放在释放 r.mu 之后：
+	// notifyRemoved 会走网络（Sparkplug 补 DDEATH、json 清 retained 状态），
+	// 带 3 秒超时。在锁里做网络 IO 会让一次配置变更把所有 collector 查找
+	// 阻塞到 Broker 超时，那是「改个配置，采集停摆三秒」。
+	var removed []string
 	for id, c := range r.collectors {
 		nd, keep := desired[id]
 		if !keep {
 			r.sched.Remove(id)
 			delete(r.collectors, id)
+			removed = append(removed, id)
 			restarted = append(restarted, id)
 			continue
 		}
@@ -736,6 +764,10 @@ func (r *Runtime) reload(before *config.File) []string {
 		}
 		r.sched.Remove(id)
 		delete(r.collectors, id)
+		// 设备以同一 ID 重启（改了点位/通道）。它不是「消失」，但点位集合
+		// 可能变了：先让 sink 忘掉旧点位（发 DDEATH），下一轮采集就会为它
+		// 重新 DBIRTH 一份完整且正确的点位表，而不是沿用删掉的旧点位。
+		removed = append(removed, id)
 		if nc, err := newCollector(r, nd, nch); err == nil {
 			if err := r.sched.Add(nd, nch, nc); err == nil {
 				r.collectors[id] = nc
@@ -778,6 +810,15 @@ func (r *Runtime) reload(before *config.File) []string {
 	// 北向 OPC UA 的地址空间在启动时固化，配置变了只能重建。这里做在
 	// 设备重建之后：新地址空间的种子值要来自最新的点位表。
 	r.syncOPCUA(after, before)
+	r.mu.Unlock()
+
+	// 通知放在锁外：它会走网络（Sparkplug 补 DDEATH、json 清 retained
+	// 状态），带 3 秒超时。持锁做网络 IO 会让一次配置变更把所有 collector
+	// 查找阻塞到 Broker 超时。
+	for _, id := range removed {
+		r.notifyRemoved(id)
+	}
+
 	sort.Strings(restarted)
 	if len(restarted) > 0 {
 		r.log.Info("config_applied", "version", r.cfg.Version(), "restarted", restarted)
@@ -791,6 +832,28 @@ func (r *Runtime) collector(id string) (*collector, bool) {
 	defer r.mu.Unlock()
 	c, ok := r.collectors[id]
 	return c, ok
+}
+
+// onDeviceState 把调度器的设备状态迁移交给北向 sink。
+//
+// 这里必须按配置核对设备是否还活着：调度器的状态事件是异步派发的，reload
+// 删掉设备之后，队列里可能还压着它的事件，会在 onRemove 之后才被派发。放行
+// 这样一条事件，就会在北向上重新写出一条 retained `$state`——而 onRemove
+// 已经清掉了待补发记录，这条幽灵再也没有人负责清理，看板上会永远挂着一台
+// 不存在的设备。
+//
+// 核对放在 runtime 而不是 sink：sink 分辨不了「删除」与「同 ID 重配后重新
+// 出现」，只有配置是唯一事实。设备仍在配置里才放行，sink 就不必自己维护
+// 墓碑，也就不会把重新配置的设备永久静音。
+func (r *Runtime) onDeviceState(ev scheduler.StateEvent) {
+	s := r.mqttSink
+	if s == nil {
+		return
+	}
+	if _, _, ok := r.deviceConfig(ev.DeviceID); !ok {
+		return
+	}
+	s.onState(ev)
 }
 
 func (r *Runtime) deviceConfig(id string) (model.Device, model.Channel, bool) {

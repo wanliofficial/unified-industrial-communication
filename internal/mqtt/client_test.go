@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -215,19 +216,147 @@ func TestClientKeepaliveSendsPing(t *testing.T) {
 }
 
 // 遗嘱必须出现在 CONNECT 里，否则 Broker 无法在掉线时代发 $death。
+//
+// 断言从 Broker 侧做（解析 CONNECT 体），而不是只看本地 Options：
+// 本地字段写对了但编码写错，本地断言依然全绿。
 func TestClientWillIsSentInConnect(t *testing.T) {
 	b := mqtttest.New(t, nil)
 	c := mqtt.New(mqtt.Options{
-		Addr: b.Addr(), ClientID: "gw",
-		WillTopic: "uic/site/$death", WillPayload: []byte(`{"online":false}`),
-		WillQoS: 1, WillRetain: true, ConnectTimeout: 2 * time.Second,
+		Addr: b.Addr(), ClientID: "gw", ConnectTimeout: 2 * time.Second,
+		Will: func() *mqtt.Will {
+			return &mqtt.Will{
+				Topic:   "uic/site/$death",
+				Payload: []byte(`{"online":false}`),
+				QoS:     1,
+				Retain:  true,
+			}
+		},
 	})
 	defer c.Close()
 	if err := c.Connect(context.Background()); err != nil {
 		t.Fatalf("connect: %v", err)
 	}
-	if b.Connects() != 1 {
-		t.Fatalf("connects = %d", b.Connects())
+	infos := b.WaitConnections(t, 1)
+	ci := infos[0]
+	if !ci.HasWill {
+		t.Fatal("will flag not set in CONNECT")
+	}
+	if ci.Will.Topic != "uic/site/$death" {
+		t.Fatalf("will topic = %q", ci.Will.Topic)
+	}
+	if string(ci.Will.Payload) != `{"online":false}` {
+		t.Fatalf("will payload = %q", ci.Will.Payload)
+	}
+	if ci.Will.QoS != 1 {
+		t.Fatalf("will qos = %d", ci.Will.QoS)
+	}
+	if !ci.Will.Retain {
+		t.Fatal("will retain lost")
+	}
+	// 客户端固定 CleanSession=true：false 会让 Broker 保留上一次会话的
+	// 离线消息与订阅，重连后 Sparkplug 的 BIRTH 语义就乱了。
+	if !ci.CleanSession {
+		t.Fatal("clean session must be true")
+	}
+}
+
+// 正常关闭（DISCONNECT）绝不能触发遗嘱。
+//
+// 漏掉这个判定，每次优雅重启都会在 Broker 侧被当成一次掉线：本地测试
+// 全绿，现场却每个发布窗口都报一次假告警。这里的断言是「代发遗嘱数为
+// 零」，而不是「没收到消息」——后者会被正常的 PUBLISH 掩盖。
+func TestClientWillNotFiredOnGracefulClose(t *testing.T) {
+	b := mqtttest.New(t, nil)
+	c := mqtt.New(mqtt.Options{
+		Addr: b.Addr(), ClientID: "gw", ConnectTimeout: 2 * time.Second,
+		Will: func() *mqtt.Will {
+			return &mqtt.Will{Topic: "uic/site/$death", Payload: []byte("x"), QoS: 1}
+		},
+	})
+	if err := c.Connect(context.Background()); err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	b.WaitConnections(t, 1)
+	if err := c.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	// 等 DISCONNECT 真的被 Broker 读到，再看遗嘱。
+	b.WaitDisconnects(t, 1)
+	// 遗嘱由 Broker 的连接收尾协程代发，与在 serve 里读到 DISCONNECT 之间
+	// 有一个调度间隙。等一小段再查，否则「还没发」会被误认为「不会发」。
+	time.Sleep(150 * time.Millisecond)
+	if got := b.Wills(); len(got) != 0 {
+		t.Fatalf("graceful close fired %d will(s): %+v", len(got), got)
+	}
+}
+
+// 异常断开（对端直接掐线）必须触发遗嘱：这条路径覆盖「进程被 kill -9」。
+func TestClientWillFiredOnAbnormalClose(t *testing.T) {
+	b := mqtttest.New(t, nil)
+	c := mqtt.New(mqtt.Options{
+		Addr: b.Addr(), ClientID: "gw", ConnectTimeout: 2 * time.Second,
+		Will: func() *mqtt.Will {
+			return &mqtt.Will{Topic: "uic/site/$death", Payload: []byte("dead"), QoS: 1}
+		},
+	})
+	defer c.Close()
+	if err := c.Connect(context.Background()); err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	b.WaitConnections(t, 1)
+
+	b.DropAll()
+
+	wills := b.WaitWills(t, 1)
+	if wills[0].Topic != "uic/site/$death" || string(wills[0].Payload) != "dead" {
+		t.Fatalf("will = %+v", wills[0])
+	}
+}
+
+// 遗嘱回调每次 CONNECT 都要重新求值：Sparkplug 的 bdSeq 必须每次 +1。
+//
+// 这是「遗嘱做成 func() *Will 而不是常量字段」的直接理由：常量会让重连
+// 之后所有 NDEATH 带同一个 bdSeq，Host 无法区分这次掉线与上一次的旧遗嘱。
+func TestClientWillReevaluatedPerConnect(t *testing.T) {
+	b := mqtttest.New(t, nil)
+	var (
+		mu  sync.Mutex
+		seq uint64
+	)
+	c := mqtt.New(mqtt.Options{
+		Addr: b.Addr(), ClientID: "gw", ConnectTimeout: 2 * time.Second,
+		Will: func() *mqtt.Will {
+			mu.Lock()
+			defer mu.Unlock()
+			v := seq
+			seq++
+			return &mqtt.Will{Topic: "uic/site/$death", Payload: []byte{byte(v)}, QoS: 1}
+		},
+	})
+	defer c.Close()
+
+	for i := 0; i < 3; i++ {
+		if i > 0 {
+			b.DropAll()
+			// 等客户端发现断链（读循环 EOF → dropConn）。
+			deadline := time.Now().Add(3 * time.Second)
+			for c.Stats().Connected && time.Now().Before(deadline) {
+				time.Sleep(5 * time.Millisecond)
+			}
+		}
+		if err := c.Connect(context.Background()); err != nil {
+			t.Fatalf("connect %d: %v", i, err)
+		}
+	}
+
+	infos := b.WaitConnections(t, 3)
+	for i, ci := range infos {
+		if !ci.HasWill {
+			t.Fatalf("connect %d: will missing", i)
+		}
+		if got := ci.Will.Payload; len(got) != 1 || got[0] != byte(i) {
+			t.Fatalf("connect %d: will payload = %v, want [%d]", i, got, i)
+		}
 	}
 }
 

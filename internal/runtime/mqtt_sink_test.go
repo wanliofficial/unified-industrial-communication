@@ -407,3 +407,215 @@ func TestMQTTClosePublishesDeath(t *testing.T) {
 		t.Fatalf("$death payload = %s, want online=false", death.Payload)
 	}
 }
+
+// 设备被从配置里删除时，Broker 上那条 retained 的 $state 必须真的消失。
+//
+// 只删本地快照是不够的：retained 是 Broker 侧的事实，新接入的消费方照样
+// 会读到一台已经不存在的设备。唯一能删掉它的手段是发零长度 retained 载荷。
+func TestMQTTRemoveClearsRetainedState(t *testing.T) {
+	b := mqtttest.New(t, nil)
+	s, err := newMQTTSink(config.MQTT{Enabled: true, Broker: b.URL()}, "plant-a", "uic-plant-a")
+	if err != nil {
+		t.Fatalf("sink: %v", err)
+	}
+	defer s.close()
+
+	topic := "uic/plant-a/dev1/$state"
+	s.onState(scheduler.StateEvent{
+		DeviceID: "dev1", From: scheduler.StateConnecting, To: scheduler.StateCollecting,
+		At: time.Now(),
+	})
+	waitRetained(t, b, topic)
+
+	s.onRemove("dev1")
+
+	b.WaitRetainedGone(t, topic)
+	// 本地快照也必须清掉：留着的话下一次 republish 会把幽灵重新发出去。
+	s.stateMu.Lock()
+	_, hadState := s.states["dev1"]
+	_, pending := s.stateCleared["dev1"]
+	s.stateMu.Unlock()
+	if hadState {
+		t.Fatal("state snapshot survived the removal")
+	}
+	if pending {
+		t.Fatal("cleared marker survived: republish would clear a device that no longer exists")
+	}
+}
+
+// 断线期间删除设备：清空消息发不出去，必须在重连后补发。
+//
+// 丢弃这个记录会让幽灵 retained 永久留在 Broker 上——Broker 重启之前
+// 再也没有机会清理它，而「重连后看板上多出一台已删设备」正是最难解释的
+// 一类现场问题。
+func TestMQTTRemoveWhileOfflineIsResentOnReconnect(t *testing.T) {
+	b := mqtttest.New(t, nil)
+	s, err := newMQTTSink(config.MQTT{Enabled: true, Broker: b.URL()}, "plant-a", "uic-plant-a")
+	if err != nil {
+		t.Fatalf("sink: %v", err)
+	}
+	defer s.close()
+
+	topic := "uic/plant-a/dev1/$state"
+	s.onState(scheduler.StateEvent{
+		DeviceID: "dev1", From: scheduler.StateConnecting, To: scheduler.StateCollecting,
+		At: time.Now(),
+	})
+	waitRetained(t, b, topic)
+
+	// 制造一个确定性的离线窗口：后续每一次 CONNECT 都被 Broker 立刻关闭，
+	// 因此 onRemove 的那次清空发布必然失败，只能落成待补发记录。
+	b.SetDropOnConnect(true)
+	b.DropAll()
+
+	// onRemove 此刻发出的清空一定失败（Broker 不接受连接），因此必须留下
+	// 一条 pending 记录，而不是静默丢掉。
+	s.onRemove("dev1")
+	s.stateMu.Lock()
+	pending := s.stateCleared["dev1"]
+	had := false
+	if _, ok := s.states["dev1"]; ok {
+		had = true
+	}
+	s.stateMu.Unlock()
+	if had {
+		t.Fatal("state snapshot survived the removal")
+	}
+	if !pending {
+		t.Fatal("offline removal did not leave a pending clear: the ghost retained would never be cleaned up")
+	}
+	// 幽灵此刻确实还在：这正是「发不出去」的含义。
+	if !retainedHas(b, topic) {
+		t.Fatal("retained state vanished while the broker was refusing connections")
+	}
+
+	// 恢复可达性：重连后 republish 必须把待补发的清空发出去。
+	b.SetDropOnConnect(false)
+	// 触发一次重连（任何一条成功发布都会建链并触发 OnConnect）。
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := s.client.Publish(ctx, mqtt.Message{Topic: "probe", Payload: []byte("x"), QoS: 1}); err != nil {
+		t.Fatalf("publish after reconnect: %v", err)
+	}
+
+	b.WaitRetainedGone(t, topic)
+
+	// republish 的顺序是「先发清空，再删记录」，因此保留消息消失的那一刻
+	// 记录可能还在。等它也被清掉才是终态——否则下一次重连会为这台已经不
+	// 存在的设备再补发一次清空。
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		s.stateMu.Lock()
+		pending = s.stateCleared["dev1"]
+		s.stateMu.Unlock()
+		if !pending {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("cleared marker never consumed: republish keeps re-clearing a device that no longer exists")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// retainedHas 报告某个主题当前是否有保留消息。
+func retainedHas(b *mqtttest.Broker, topic string) bool {
+	for _, m := range b.Retained() {
+		if m.Topic == topic {
+			return true
+		}
+	}
+	return false
+}
+
+// waitRetained 等到某个主题的保留消息出现在 Broker 上。
+func waitRetained(t *testing.T, b *mqtttest.Broker, topic string) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		for _, m := range b.Retained() {
+			if m.Topic == topic {
+				return
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("retained %q never appeared; holding %v", topic, b.RetainedTopics())
+}
+
+// 端到端：通过 API 删除设备后，消费方不应再读到它的 retained 状态。
+//
+// 这条用例把整条链路串起来（配置热更新 → reload → sink.onRemove → Broker
+// 删除保留消息），是「删设备」这个动作唯一有意义的验收标准：本地对象清空
+// 只证明本进程忘了，消费方能不能读到才是结果。
+func TestMQTTRemoveDeviceViaConfigClearsRetainedState(t *testing.T) {
+	b := mqtttest.New(t, nil)
+	h := newHarness(t, withMQTT(b.URL(), nil))
+	h.waitPointGood("sim01", "reg0")
+
+	topic := "uic/test-site/sim01/$state"
+	waitRetained(t, b, topic)
+
+	raw, err := h.rt.Config()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var cfg map[string]any
+	if err := json.Unmarshal(raw, &cfg); err != nil {
+		t.Fatal(err)
+	}
+	cfg["devices"] = []any{} // 删掉唯一的设备
+	patched, _ := json.Marshal(cfg)
+	if code, body := h.do(http.MethodPost, "/api/v1/config/apply", string(patched)); code != 200 {
+		t.Fatalf("apply = %d %s", code, body)
+	}
+
+	b.WaitRetainedGone(t, topic)
+}
+
+// 删除设备后，一条迟到的状态事件不得把它复活。
+//
+// 现实路径：调度器的状态事件是异步派发的，reload 删掉设备时队列里可能还压着
+// 该设备的事件。若放行，Broker 上会重新出现一条 retained `$state`，而
+// onRemove 已经清掉了待补发记录——这条幽灵再也没有人负责清理，看板上会
+// 永远挂着一台不存在的设备。
+//
+// 断言在 runtime 的入口上（onDeviceState）：它按配置核对设备是否还在，这正是
+// 真实链路里状态事件的唯一入口。sink 自己不设门槛，因为它分辨不了「删除」
+// 与「同 ID 重配后重新出现」。
+func TestLateStateEventForRemovedDeviceIsDropped(t *testing.T) {
+	b := mqtttest.New(t, nil)
+	h := newHarness(t, withMQTT(b.URL(), nil))
+	h.waitPointGood("sim01", "reg0")
+
+	topic := "uic/test-site/sim01/$state"
+	waitRetained(t, b, topic)
+
+	// 通过 API 删掉唯一的设备，Broker 上的 retained 状态随之消失。
+	raw, err := h.rt.Config()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var cfg map[string]any
+	if err := json.Unmarshal(raw, &cfg); err != nil {
+		t.Fatal(err)
+	}
+	cfg["devices"] = []any{}
+	patched, _ := json.Marshal(cfg)
+	if code, body := h.do(http.MethodPost, "/api/v1/config/apply", string(patched)); code != 200 {
+		t.Fatalf("apply = %d %s", code, body)
+	}
+	b.WaitRetainedGone(t, topic)
+
+	// 模拟调度器队列里那条迟到的事件，从真实入口投递。
+	h.rt.onDeviceState(scheduler.StateEvent{
+		DeviceID: "sim01", From: scheduler.StateCollecting, To: scheduler.StateFaulted,
+		At: time.Now(),
+	})
+
+	time.Sleep(200 * time.Millisecond)
+	if retainedHas(b, topic) {
+		t.Fatalf("late state event resurrected a removed device; retained now %v",
+			b.RetainedTopics())
+	}
+}

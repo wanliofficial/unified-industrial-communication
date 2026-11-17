@@ -284,3 +284,183 @@ func TestDataTypeString(t *testing.T) {
 		t.Fatalf("unknown datatype = %q", got)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Metric 解码加严
+// ---------------------------------------------------------------------------
+
+// pbMetric 手工拼一条 Metric 子消息，让测试能写出「编码器永远不会产生、
+// 但对端可能发来」的畸形报文。
+//
+// 直接用 Encode 造不出这些用例：编码器（validate）已经把非法组合挡掉了，
+// 拿它生成夹具只能证明「自己发的自己能读」，证明不了「别人的坏报文会被
+// 拒绝」。所以这里逐字节构造。
+func pbMetric(fields ...[]byte) []byte {
+	var body []byte
+	for _, f := range fields {
+		body = append(body, f...)
+	}
+	return body
+}
+
+// pbUvarint 编码一个 protobuf varint。field 号大于 15 时标签本身就要占
+// 两个字节（16<<3|0 = 128），所以标签也必须走同一条编码，不能直接转 byte。
+func pbUvarint(v uint64) []byte {
+	var out []byte
+	for v >= 0x80 {
+		out = append(out, byte(v)|0x80)
+		v >>= 7
+	}
+	return append(out, byte(v))
+}
+
+func pbTag(field, wire int) []byte {
+	return pbUvarint(uint64(field)<<3 | uint64(wire))
+}
+
+func pbVarint(field int, v uint64) []byte {
+	out := pbTag(field, wireVarint)
+	return append(out, pbUvarint(v)...)
+}
+
+func pbFixed32(field int, bits uint32) []byte {
+	out := pbTag(field, wireFixed32)
+	return append(out, byte(bits), byte(bits>>8), byte(bits>>16), byte(bits>>24))
+}
+
+func pbFixed64(field int, bits uint64) []byte {
+	out := pbTag(field, wireFixed64)
+	for i := 0; i < 8; i++ {
+		out = append(out, byte(bits>>(8*uint(i))))
+	}
+	return out
+}
+
+func pbBytes(field int, b []byte) []byte {
+	out := pbTag(field, wireBytes)
+	out = append(out, pbUvarint(uint64(len(b)))...)
+	return append(out, b...)
+}
+
+func pbName(name string) []byte { return pbBytes(1, []byte(name)) }
+
+// datatype 在 Sparkplug 的 Metric 里是字段 4（1=name 2=alias 3=timestamp
+// 4=datatype ... 10..16=值）。
+func pbType(dt DataType) []byte { return pbVarint(4, uint64(dt)) }
+
+// pbPayload 把 Metric 子消息包进 Payload（字段 2 = metrics）。
+func pbPayload(metrics ...[]byte) []byte {
+	var out []byte
+	for _, m := range metrics {
+		out = append(out, pbBytes(2, m)...)
+	}
+	return out
+}
+
+// oneof 只能有一个成员。同时带两个值时，protobuf 语义是「后者覆盖前者」，
+// 而覆盖顺序是解析器实现细节——两个实现可能读到不同的值。必须拒绝。
+func TestDecodeMetricRejectsMultipleValueFields(t *testing.T) {
+	raw := pbPayload(pbMetric(
+		pbName("x"),
+		pbType(TypeInt32),
+		pbVarint(10, 5),      // int_value
+		pbFixed64(13, 1<<62), // double_value（同一个 oneof）
+	))
+	if _, err := Decode(raw); err == nil || !strings.Contains(err.Error(), "at most one") {
+		t.Fatalf("two value fields accepted: %v", err)
+	}
+}
+
+// 每个承载字段的线类型必须与字段号匹配（12=fixed32、13=fixed64、
+// 其余 varint/bytes）。线类型错位说明对端的 schema 与我们对不上。
+func TestDecodeMetricRejectsWireTypeMismatch(t *testing.T) {
+	cases := map[string][]byte{
+		// float_value 必须是 fixed32，这里用 varint。
+		"float as varint": pbPayload(pbMetric(pbName("x"), pbType(TypeFloat), pbVarint(12, 1))),
+		// double_value 必须是 fixed64，这里用 fixed32。
+		"double as fixed32": pbPayload(pbMetric(pbName("x"), pbType(TypeDouble), pbFixed32(13, 1))),
+		// int_value 必须是 varint，这里用 bytes。
+		"int as bytes": pbPayload(pbMetric(pbName("x"), pbType(TypeInt32), pbBytes(10, []byte{1}))),
+		// boolean_value 必须是 varint。
+		"bool as bytes": pbPayload(pbMetric(pbName("x"), pbType(TypeBoolean), pbBytes(14, []byte{1}))),
+		// string_value 必须是 bytes。
+		"string as varint": pbPayload(pbMetric(pbName("x"), pbType(TypeString), pbVarint(15, 1))),
+		// bytes_value 必须是 bytes。
+		"bytes as varint": pbPayload(pbMetric(pbName("x"), pbType(TypeBytes), pbVarint(16, 1))),
+		// long_value 必须是 varint。
+		"long as fixed64": pbPayload(pbMetric(pbName("x"), pbType(TypeInt64), pbFixed64(11, 1))),
+	}
+	for name, raw := range cases {
+		if _, err := Decode(raw); err == nil || !strings.Contains(err.Error(), "wire type") {
+			t.Fatalf("%s: %v", name, err)
+		}
+	}
+}
+
+// 声明的 datatype 必须与承载字段一致。
+//
+// `int_value` 是 int32 语义、`long_value` 是 int64 语义。声明 Int64 却用
+// int_value 会让超过 32 位的值被静默截断——编码侧 validate 已经拒绝这种
+// 组合，解码侧不校验就成了「自己发不出去，别人发过来照收」。
+func TestDecodeMetricRejectsTypeFieldMismatch(t *testing.T) {
+	cases := map[string][]byte{
+		"Int64 in int_value":    pbPayload(pbMetric(pbName("x"), pbType(TypeInt64), pbVarint(10, 1))),
+		"Int16 in long_value":   pbPayload(pbMetric(pbName("x"), pbType(TypeInt16), pbVarint(11, 1))),
+		"Int32 in float_value":  pbPayload(pbMetric(pbName("x"), pbType(TypeInt32), pbFixed32(12, 0x3f800000))),
+		"Double in int_value":   pbPayload(pbMetric(pbName("x"), pbType(TypeDouble), pbVarint(10, 1))),
+		"String in bytes_value": pbPayload(pbMetric(pbName("x"), pbType(TypeString), pbBytes(16, []byte("a")))),
+		"Bytes in string_value": pbPayload(pbMetric(pbName("x"), pbType(TypeBytes), pbBytes(15, []byte("a")))),
+		"Boolean in int_value":  pbPayload(pbMetric(pbName("x"), pbType(TypeBoolean), pbVarint(10, 1))),
+	}
+	for name, raw := range cases {
+		if _, err := Decode(raw); err == nil || !strings.Contains(err.Error(), "declares") {
+			t.Fatalf("%s: %v", name, err)
+		}
+	}
+}
+
+// protobuf 的 bool 只允许 0/1。别的值说明生产者写坏了——按 true 处理
+// 等于替对方猜，而布尔恰恰是最不能猜的类型。
+func TestDecodeMetricRejectsInvalidBoolean(t *testing.T) {
+	for _, v := range []uint64{2, 7, 255} {
+		raw := pbPayload(pbMetric(pbName("x"), pbType(TypeBoolean), pbVarint(14, v)))
+		if _, err := Decode(raw); err == nil || !strings.Contains(err.Error(), "0 or 1") {
+			t.Fatalf("boolean_value=%d: %v", v, err)
+		}
+	}
+	// 0 与 1 必须正常解出 false/true。
+	for _, c := range []struct {
+		v    uint64
+		want bool
+	}{{0, false}, {1, true}} {
+		raw := pbPayload(pbMetric(pbName("x"), pbType(TypeBoolean), pbVarint(14, c.v)))
+		p, err := Decode(raw)
+		if err != nil {
+			t.Fatalf("boolean_value=%d: %v", c.v, err)
+		}
+		if len(p.Metrics) != 1 || p.Metrics[0].Value != c.want {
+			t.Fatalf("boolean_value=%d = %+v", c.v, p.Metrics)
+		}
+	}
+}
+
+// 声明了标量类型却一个承载字段都没有：消费方会把这条指标当成「无值」，
+// 而 NBIRTH/DBIRTH 要求每条指标都必须带当前值。
+func TestDecodeMetricRejectsMissingValueField(t *testing.T) {
+	for _, dt := range []DataType{TypeInt16, TypeUInt32, TypeInt64, TypeFloat,
+		TypeDouble, TypeBoolean, TypeString, TypeDateTime, TypeBytes} {
+		raw := pbPayload(pbMetric(pbName("x"), pbType(dt)))
+		if _, err := Decode(raw); err == nil || !strings.Contains(err.Error(), "no value field") {
+			t.Fatalf("%v without value: %v", dt, err)
+		}
+	}
+	// TypeUnknown 没有承诺类型，不带值是合法的（is_null 的指标就是这样）。
+	raw := pbPayload(pbMetric(pbName("x")))
+	p, err := Decode(raw)
+	if err != nil {
+		t.Fatalf("unknown type without value: %v", err)
+	}
+	if len(p.Metrics) != 1 {
+		t.Fatalf("metrics = %+v", p.Metrics)
+	}
+}

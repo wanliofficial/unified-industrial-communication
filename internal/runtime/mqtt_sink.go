@@ -35,6 +35,24 @@ type mqttSink struct {
 	// 靠这份缓存把当前状态补发回去，否则消费方会一直看到旧状态。
 	stateMu sync.Mutex
 	states  map[string]sinkState
+	// stateCleared 记录「设备已删除但清空消息还没发出去」的 ID。
+	//
+	// retained 是双向的：删掉本地快照只让本进程不再补发，Broker 上那条
+	// `.../$state` 仍然挂着，新接入的消费方照样会读到一台已经不存在的
+	// 设备。唯一能让它消失的手段是发一条零长度 retained 载荷（MQTT 规范
+	// 定义的「删除该主题的保留消息」）。断线时删除设备会发不出去，所以
+	// 必须记下来，在下次（重）连后补发。
+	stateCleared map[string]bool
+
+	// sendMu 串行化「对外发送设备状态/清空」的全部动作：onRemove、onState
+	// 的即时发布，以及重连后的 republish 整体补发。
+	//
+	// 只用 stateMu 保护内存快照不够：republish 先在锁内快照、锁外逐条发送，
+	// 而 onRemove 可能在快照之后、发送之前记录一次删除——此时 republish 会
+	// 按旧快照把刚删掉的设备状态又发回 Broker，制造一条删不掉的幽灵 retained，
+	// 而本地各处都以为清理已经完成。把「快照 + 发送」整体放进 sendMu，就让
+	// 补发与删除严格互斥：谁后拿锁，谁的结果就是 Broker 上最终的真相。
+	sendMu sync.Mutex
 
 	// 报警是「当前状态」而不是数据流：发布时不进 Outbox，走 retained，
 	// 并在（重）连后整体重发。积压一条过期报警毫无价值，而漏掉「当前正在
@@ -82,6 +100,7 @@ func newMQTTSink(cfg config.MQTT, site, gatewayID string) (*mqttSink, error) {
 		qos:           byte(cfg.EffectiveQoS()),
 		retain:        cfg.Retain,
 		states:        map[string]sinkState{},
+		stateCleared:  map[string]bool{},
 		alarmStates:   map[string]alarm.Status{},
 		alarmCleared:  map[string]bool{},
 	}
@@ -97,10 +116,14 @@ func newMQTTSink(cfg config.MQTT, site, gatewayID string) (*mqttSink, error) {
 		AckTimeout: 3 * time.Second,
 		// Broker 在网关异常掉线时代发 $death（retained），消费方因此不必
 		// 依赖超时猜测网关是否在线。
-		WillTopic:   fmt.Sprintf("uic/%s/$death", sanitizeTopicLevel(site)),
-		WillPayload: []byte(`{"schemaVersion":1,"online":false}`),
-		WillQoS:     1,
-		WillRetain:  true,
+		Will: func() *mqtt.Will {
+			return &mqtt.Will{
+				Topic:   fmt.Sprintf("uic/%s/$death", sanitizeTopicLevel(site)),
+				Payload: []byte(`{"schemaVersion":1,"online":false}`),
+				QoS:     1,
+				Retain:  true,
+			}
+		},
 		// 重连（含 Broker 重启）后补发 birth 与全部设备状态。
 		OnConnect: func() { s.republish(context.Background()) },
 	})
@@ -176,6 +199,16 @@ func (m *mqttSink) deliver(ctx context.Context, recs []outbox.Record) (int, erro
 // 用 retained 表达比要求消费方回放历史更可靠。
 func (m *mqttSink) onState(ev scheduler.StateEvent) {
 	st := sinkState{State: string(ev.To), Previous: string(ev.From), At: ev.At.UTC(), Error: ev.Error}
+
+	// 与 onRemove / republish 互斥：状态更新必须和删除、整体补发排成一条线，
+	// 否则一次并发的删除会被这次「照旧发布」覆盖回 Broker。
+	//
+	// 这里不判断「设备是否已被删除」：sink 分辨不了删除与「同 ID 重配后重新
+	// 出现」，设个墓碑反而会把重新配置的设备一直静音。删除之后迟到的事件由
+	// 调用方（runtime.onDeviceState）按配置拦掉，配置是唯一事实。
+	m.sendMu.Lock()
+	defer m.sendMu.Unlock()
+
 	m.stateMu.Lock()
 	m.states[ev.DeviceID] = st
 	m.stateMu.Unlock()
@@ -190,6 +223,41 @@ func (m *mqttSink) onState(ev scheduler.StateEvent) {
 	}
 }
 
+// onRemove 在设备从配置里消失时清掉它的 retained 状态消息。
+//
+// json 格式没有「设备出生/死亡」的概念：一条采样一条消息，设备没了自然
+// 就没有新消息了。但 `.../$state` 是 retained 的，它会一直挂在 Broker 上，
+// 新接入的消费方照样会读到一台已经不存在的设备——所以只删本地快照不够，
+// 必须发一条零长度 retained 载荷把 Broker 上那条删掉（与报警的
+// `alarmCleared` 完全同构）。
+//
+// 发送失败（典型情况是此刻断线）就记进 stateCleared，重连后由 republish
+// 补发。丢弃这个记录会让幽灵状态永久留在 Broker 上，且再也没有机会清理。
+func (m *mqttSink) onRemove(deviceID string) {
+	m.stateMu.Lock()
+	delete(m.states, deviceID)
+	// 先记 pending 再发：即使发送成功也要先占位，避免并发的 onState 在
+	// 这两步之间把状态写回 Broker。
+	m.stateCleared[deviceID] = true
+	m.stateMu.Unlock()
+
+	// 与 onState / republish 互斥，保证「删除」要么完全在补发之前发生，
+	// 要么完全在其之后——不会出现「补发按旧快照写回、删除以为自己清完了」。
+	m.sendMu.Lock()
+	defer m.sendMu.Unlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if err := m.publishStateID(ctx, deviceID, nil); err != nil {
+		m.failed.Add(1)
+		m.count("state_error")
+		return
+	}
+	m.stateMu.Lock()
+	delete(m.stateCleared, deviceID)
+	m.stateMu.Unlock()
+}
+
 func (m *mqttSink) publishState(ctx context.Context, device string, st sinkState) error {
 	payload, err := json.Marshal(struct {
 		SchemaVersion int `json:"schemaVersion"`
@@ -198,6 +266,15 @@ func (m *mqttSink) publishState(ctx context.Context, device string, st sinkState
 	if err != nil {
 		return err
 	}
+	return m.publishStateID(ctx, device, payload)
+}
+
+// publishStateID 发布一条设备状态消息；payload 为 nil 表示清空 retained。
+//
+// 零长度 retained 载荷是 MQTT 规范里「删除该主题的保留消息」的唯一手段。
+// 设备被删除时这是让消费方不再看见它的唯一方式——只删本地快照，Broker 上
+// 那条旧状态会一直挂着。
+func (m *mqttSink) publishStateID(ctx context.Context, device string, payload []byte) error {
 	topic := fmt.Sprintf("uic/%s/%s/$state", sanitizeTopicLevel(m.site), sanitizeTopicLevel(device))
 	return m.client.Publish(ctx, mqtt.Message{
 		Topic: topic, Payload: payload, QoS: m.qos, Retain: true,
@@ -221,12 +298,32 @@ func (m *mqttSink) republish(ctx context.Context) {
 		return
 	}
 
+	// 与 onRemove / onState 互斥：补发是「按快照重写 Broker 上的当前事实」，
+	// 必须与删除排成一条线，否则旧快照会被写回去。
+	m.sendMu.Lock()
+	defer m.sendMu.Unlock()
+
 	m.stateMu.Lock()
 	snapshot := make(map[string]sinkState, len(m.states))
 	for k, v := range m.states {
 		snapshot[k] = v
 	}
+	cleared := make([]string, 0, len(m.stateCleared))
+	for id := range m.stateCleared {
+		cleared = append(cleared, id)
+	}
 	m.stateMu.Unlock()
+
+	// 先补清空，再补当前状态：一台设备可能先后经历「删除」与「同 ID 重配」，
+	// 顺序反了会把刚重配出来的状态又清掉。
+	for _, id := range cleared {
+		if err := m.publishStateID(ctx, id, nil); err != nil {
+			return
+		}
+		m.stateMu.Lock()
+		delete(m.stateCleared, id)
+		m.stateMu.Unlock()
+	}
 
 	for device, st := range snapshot {
 		if err := m.publishState(ctx, device, st); err != nil {

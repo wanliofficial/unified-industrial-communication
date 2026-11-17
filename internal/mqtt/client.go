@@ -70,11 +70,15 @@ type Options struct {
 	AckTimeout time.Duration
 	// MaxPacket 限制入站报文大小。
 	MaxPacket int
-	// Will 相关：让 Broker 在异常掉线时代发 $death。
-	WillTopic   string
-	WillPayload []byte
-	WillQoS     byte
-	WillRetain  bool
+	// Will 返回本次 CONNECT 要登记的遗嘱；nil 表示不带遗嘱。
+	//
+	// 做成回调而不是常量字段，是因为遗嘱内容**每次都不同**：Sparkplug 要求
+	// 每个新 CONNECT 的 bdSeq 比上一个 +1（255 后回绕 0），而 bdSeq 就写在
+	// NDEATH 遗嘱载荷里。用常量字段会在第一次重连之后就让所有 NDEATH 带上
+	// 同一个 bdSeq，Host 无法区分「这次掉线」与「上一次掉线」的旧消息。
+	//
+	// 回调在持有连接锁的情况下调用，必须快速返回且不能回调进客户端。
+	Will func() *Will
 
 	// OnConnect 在每次 CONNECT/CONNACK 成功后调用（含重连）。它由独立
 	// goroutine 执行，因此可以安全地调用 Publish——但不要在这里做长阻塞。
@@ -156,10 +160,7 @@ func (c *Client) Connect(ctx context.Context) error {
 		Password:     c.opt.Password,
 		KeepAlive:    uint16(c.opt.KeepAlive / time.Second),
 		CleanSession: true,
-		WillTopic:    c.opt.WillTopic,
-		WillPayload:  c.opt.WillPayload,
-		WillQoS:      c.opt.WillQoS,
-		WillRetain:   c.opt.WillRetain,
+		Will:         c.pendingWill(),
 	})
 	if err != nil {
 		_ = conn.Close()
@@ -217,6 +218,14 @@ func (c *Client) Connect(ctx context.Context) error {
 		go c.opt.OnConnect()
 	}
 	return nil
+}
+
+// pendingWill 取本次 CONNECT 的遗嘱。回调可能为 nil（不发遗嘱）。
+func (c *Client) pendingWill() *Will {
+	if c.opt.Will == nil {
+		return nil
+	}
+	return c.opt.Will()
 }
 
 // subscribeLocked 在已持有 c.mu 的情况下发 SUBSCRIBE 并等 SUBACK。

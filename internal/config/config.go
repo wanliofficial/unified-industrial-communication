@@ -885,7 +885,13 @@ func (f *File) validateNorthbound() error {
 				return errors.New("northbound.mqtt.topic must be empty when format is sparkplug-b: Sparkplug derives topics from groupId/nodeId/device")
 			}
 			if m.Retain {
-				return errors.New("northbound.mqtt.retain must be false when format is sparkplug-b: only the STATE topic is retained")
+				return errors.New("northbound.mqtt.retain must be false when format is sparkplug-b: every edge-node message is non-retained (only a Host Application's STATE topic is retained)")
+			}
+			// QoS 在 Sparkplug 里由消息类型定死（数据/出生 0、NDEATH 遗嘱 1、
+			// 命令订阅 1）。允许配置等于允许用户配出一个「本地看起来正常、
+			// 严格 Host 直接丢弃」的部署，所以显式拒绝而不是静默忽略。
+			if m.QoS != nil {
+				return errors.New("northbound.mqtt.qos must be omitted when format is sparkplug-b: QoS is fixed per message type by the specification")
 			}
 			if err := validateSparkplugLevel("groupId", m.GroupID); err != nil {
 				return err

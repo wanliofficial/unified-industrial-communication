@@ -76,10 +76,12 @@ func TestConnectPacketWithAuthAndWill(t *testing.T) {
 		Password:     "p",
 		KeepAlive:    60,
 		CleanSession: true,
-		WillTopic:    "uic/site/$death",
-		WillPayload:  []byte(`{"online":false}`),
-		WillQoS:      1,
-		WillRetain:   true,
+		Will: &Will{
+			Topic:   "uic/site/$death",
+			Payload: []byte(`{"online":false}`),
+			QoS:     1,
+			Retain:  true,
+		},
 	})
 	if err != nil {
 		t.Fatalf("encode: %v", err)
@@ -105,8 +107,8 @@ func TestConnectPacketValidation(t *testing.T) {
 	cases := []ConnectOptions{
 		{},                             // 无 clientId
 		{ClientID: "a", Password: "p"}, // 有密码无用户名
-		{ClientID: "a", WillPayload: []byte("x")}, // 有遗嘱体无主题
-		{ClientID: "a", WillTopic: "t", WillQoS: 3},
+		{ClientID: "a", Will: &Will{Payload: []byte("x")}}, // 有遗嘱体无主题
+		{ClientID: "a", Will: &Will{Topic: "t", QoS: 3}},
 	}
 	for i, c := range cases {
 		if _, err := ConnectPacket(c); err == nil {
@@ -363,5 +365,118 @@ func TestPublishQoS2IsRejectedLocally(t *testing.T) {
 	// 本地直接拒绝，好过发出去之后被 Broker 断链。
 	if _, err := PublishPacket(Message{Topic: "t", QoS: 2}, 1); err == nil {
 		t.Fatal("qos2 must be rejected at the codec layer")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// ParseConnect
+// ---------------------------------------------------------------------------
+
+// connectBody 由 ConnectPacket 之外的路径构造：直接从我们自己的编码器取
+// 报文体（跳过固定头），这样 golden 里出现的仍是「客户端实际发出的字节」。
+func connectBody(t *testing.T, o ConnectOptions) []byte {
+	t.Helper()
+	pkt, err := ConnectPacket(o)
+	if err != nil {
+		t.Fatalf("encode connect: %v", err)
+	}
+	n, err := readLength(bytes.NewReader(pkt[1:]))
+	if err != nil {
+		t.Fatalf("read remaining length: %v", err)
+	}
+	hlen := 1 + len(appendLength(nil, n))
+	return pkt[hlen:]
+}
+
+func TestParseConnectRoundTrip(t *testing.T) {
+	body := connectBody(t, ConnectOptions{
+		ClientID:     "gw",
+		Username:     "u",
+		Password:     "p",
+		KeepAlive:    45,
+		CleanSession: true,
+		Will:         &Will{Topic: "spBv1.0/g/NDEATH/n", Payload: []byte{0x01, 0x02}, QoS: 1},
+	})
+	ci, err := ParseConnect(body)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if ci.ClientID != "gw" || ci.Username != "u" || !ci.HasPassword {
+		t.Fatalf("credentials = %+v", ci)
+	}
+	if ci.KeepAlive != 45 {
+		t.Fatalf("keepalive = %d", ci.KeepAlive)
+	}
+	// CleanSession 必须是 true：false 会让 Broker 保留上一次会话的离线消息
+	// 与订阅，重连后 Sparkplug 的 BIRTH 语义就乱了。
+	if !ci.CleanSession {
+		t.Fatal("clean session lost")
+	}
+	if !ci.HasWill {
+		t.Fatal("will not parsed")
+	}
+	if ci.Will.Topic != "spBv1.0/g/NDEATH/n" {
+		t.Fatalf("will topic = %q", ci.Will.Topic)
+	}
+	if !bytes.Equal(ci.Will.Payload, []byte{0x01, 0x02}) {
+		t.Fatalf("will payload = %x", ci.Will.Payload)
+	}
+	// 遗嘱 QoS 必须是 1（[tck-id-payloads-ndeath-will-message-qos]）。
+	if ci.Will.QoS != 1 {
+		t.Fatalf("will qos = %d", ci.Will.QoS)
+	}
+	// 遗嘱 retain 必须是 false，否则 NDEATH 会一直挂在 Broker 上，
+	// 之后每个订阅方都会读到一条几小时前的死亡记录。
+	if ci.Will.Retain {
+		t.Fatal("will retain must be false for NDEATH")
+	}
+}
+
+func TestParseConnectRejects(t *testing.T) {
+	valid := connectBody(t, ConnectOptions{ClientID: "a", CleanSession: true})
+	mutate := func(fn func([]byte) []byte) []byte {
+		b := append([]byte(nil), valid...)
+		return fn(b)
+	}
+
+	cases := []struct {
+		name string
+		body []byte
+	}{
+		{"empty", nil},
+		{"truncated protocol name", []byte{0x00, 0x04, 'M', 'Q'}},
+		{"bad protocol name", mutate(func(b []byte) []byte {
+			c := append([]byte(nil), b...)
+			c[2] = 'X'
+			return c
+		})},
+		{"bad protocol level", append([]byte{0x00, 0x04, 'M', 'Q', 'T', 'T', 0x05, 0x02, 0x00, 0x00, 0x00, 0x01, 'a'}, nil...)},
+		{"reserved flag set", []byte{0x00, 0x04, 'M', 'Q', 'T', 'T', 0x04, 0x03, 0x00, 0x1E, 0x00, 0x01, 'a'}},
+		{"bad will qos", []byte{0x00, 0x04, 'M', 'Q', 'T', 'T', 0x04, 0x04 | 0x18, 0x00, 0x1E, 0x00, 0x01, 'a'}},
+		{"truncated will topic", mutate(func(b []byte) []byte {
+			// 打开 will flag 但不给出遗嘱段。
+			c := append([]byte(nil), b[:8]...)
+			c[7] |= 0x04
+			return c
+		})},
+	}
+	for _, c := range cases {
+		if _, err := ParseConnect(c.body); err == nil {
+			t.Fatalf("%s: must be rejected", c.name)
+		}
+	}
+}
+
+func TestParseConnectNoWill(t *testing.T) {
+	body := connectBody(t, ConnectOptions{ClientID: "a", CleanSession: true})
+	ci, err := ParseConnect(body)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if ci.HasWill {
+		t.Fatal("will flag set without will")
+	}
+	if ci.Will.Topic != "" {
+		t.Fatalf("will topic = %q", ci.Will.Topic)
 	}
 }

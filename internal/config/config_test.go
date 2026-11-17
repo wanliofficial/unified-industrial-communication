@@ -1264,6 +1264,15 @@ func TestValidateSparkplugNorthbound(t *testing.T) {
 				Retain: true, GroupID: "g", NodeID: "n",
 			}
 		}, "retain must be false"},
+		{"explicit qos", func(f *File) {
+			// QoS 由消息类型定死，不是一个可调项。静默忽略等于允许配出
+			// 一个「本地正常、严格 Host 丢弃」的部署。
+			q := 1
+			f.Northbound.MQTT = MQTT{
+				Enabled: true, Broker: "broker:1883", Format: MQTTFormatSparkplugB,
+				QoS: &q, GroupID: "g", NodeID: "n",
+			}
+		}, "qos must be omitted"},
 		{"bad format", func(f *File) {
 			f.Northbound.MQTT = MQTT{
 				Enabled: true, Broker: "broker:1883", Format: "sparkplug-c",

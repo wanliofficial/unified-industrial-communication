@@ -61,6 +61,17 @@ type Broker struct {
 	last     map[string]Message
 	subs     []string
 	closed   bool
+	// infos 记录每条 CONNECT 的解析结果，wills 记录 Broker 代发的遗嘱。
+	//
+	// 两者都只服务于测试断言：客户端「本地看起来正确」不代表线上字节对，
+	// 比如 CleanSession、遗嘱 QoS/retain、bdSeq 这些契约只有从对端看才
+	// 能确认。badConnects 记解析失败的次数——一个坏 CONNECT 被当成「没
+	// 遗嘱」静默接受，会让「遗嘱没送达」看起来像 Broker 的问题。
+	infos       []mqttc.ConnectInfo
+	wills       []Message
+	badConnects int
+	// retained 保存 retain=true 的消息，供新订阅方在 SUBSCRIBE 时补发。
+	retained []Message
 	wg       sync.WaitGroup
 }
 
@@ -72,6 +83,11 @@ type conn struct {
 	writeMu sync.Mutex
 	mu      sync.Mutex
 	filters []mqttc.TopicFilter
+
+	// will 是这条连接在 CONNECT 里登记的遗嘱；graceful 表示收到了
+	// DISCONNECT（正常结束）——此时按 MQTT 规范**不得**代发遗嘱。
+	will     *mqttc.Will
+	graceful bool
 }
 
 func (c *conn) write(b []byte) error {
@@ -198,17 +214,39 @@ func (b *Broker) serve(c *conn) {
 		}
 		b.mu.Unlock()
 		_ = c.Close()
+		// 遗嘱只在「非正常断开」时代发：收到 DISCONNECT 才算正常结束。
+		// 漏掉 graceful 判定，正常关机会被消费方看成一次掉线——本地测试
+		// 全绿，现场却每次重启都报一次假告警。
+		if c.will != nil && !c.graceful {
+			b.publishWill(*c.will)
+		}
 	}()
 
 	pkt, err := mqttc.ReadPacket(c, 1<<20)
 	if err != nil || pkt.Type != mqttc.TypeConnect {
 		return
 	}
+	// 解析 CONNECT 体以取得遗嘱与 CleanSession。解析失败说明对面发的不是
+	// 我们能理解的 3.1.1 报文：计数后拒绝，而不是当成「没有遗嘱」继续，
+	// 否则测试会静默通过。
+	info, cerr := mqttc.ParseConnect(pkt.Body)
 	b.mu.Lock()
 	b.connects++
 	drop := b.dropOnConnect
 	code := b.connackCode
+	if cerr != nil {
+		b.badConnects++
+	} else {
+		b.infos = append(b.infos, info)
+	}
 	b.mu.Unlock()
+	if cerr != nil {
+		return
+	}
+	if info.HasWill {
+		w := info.Will
+		c.will = &w
+	}
 	if drop {
 		return
 	}
@@ -237,6 +275,20 @@ func (b *Broker) serve(c *conn) {
 			b.mu.Lock()
 			b.msgs = append(b.msgs, msg)
 			b.last[msg.Topic] = msg
+			// retained 必须在这里落账：真实 Broker 会保存它并投给后来的
+			// 订阅方。漏掉这一步，测试就只能验证「本进程发了字节」，
+			// 验证不了「消费方真的能读到」。
+			//
+			// 零长度载荷 + retain 是 MQTT 规范里**删除**保留消息的唯一
+			// 手段。不处理它，被删除的设备/报警会永远留在 Broker 上，
+			// 而发送方以为自己已经清理干净了。
+			if msg.Retain {
+				if len(msg.Payload) == 0 {
+					b.dropRetainedLocked(msg.Topic)
+				} else {
+					b.setRetainedLocked(msg)
+				}
+			}
 			ack := b.ackPublish
 			onMsg := b.onMessage
 			b.mu.Unlock()
@@ -265,10 +317,55 @@ func (b *Broker) serve(c *conn) {
 			b.mu.Lock()
 			b.closes++
 			b.mu.Unlock()
+			c.graceful = true
 			return
 		}
 	}
 }
+
+// setRetainedLocked 保存一条保留消息，覆盖同主题的旧值（MQTT 语义：一个
+// 主题只有一条保留消息）。调用方必须持有 b.mu。
+func (b *Broker) setRetainedLocked(m Message) {
+	for i, old := range b.retained {
+		if old.Topic == m.Topic {
+			b.retained[i] = m
+			return
+		}
+	}
+	b.retained = append(b.retained, m)
+}
+
+// dropRetainedLocked 删除某个主题的保留消息。调用方必须持有 b.mu。
+func (b *Broker) dropRetainedLocked(topic string) {
+	for i, old := range b.retained {
+		if old.Topic == topic {
+			b.retained = append(b.retained[:i], b.retained[i+1:]...)
+			return
+		}
+	}
+}
+
+// publishWill 按遗嘱的 QoS/retain 代发一条消息，并把它投给订阅者。
+//
+// 真正的 Broker 会把遗嘱投递到订阅方；这里同时记进 msgs/last，
+// 因为测试关注的是「Broker 有没有代发、发的是什么」，订阅方投递可以
+// 用返回的连接数单独断言。
+func (b *Broker) publishWill(w mqttc.Will) {
+	b.mu.Lock()
+	m := Message{Topic: w.Topic, Payload: append([]byte(nil), w.Payload...), QoS: w.QoS, Retain: w.Retain}
+	b.wills = append(b.wills, m)
+	b.msgs = append(b.msgs, m)
+	b.last[m.Topic] = m
+	if w.Retain {
+		// retained 遗嘱要留在内存里，供后续订阅方在 SUBSCRIBE 时取到。
+		b.setRetainedLocked(m)
+	}
+	b.mu.Unlock()
+	b.deliver(m)
+}
+
+// deliver 把一条已落账的消息推给所有匹配的订阅者。
+func (b *Broker) deliver(m Message) { _ = b.deliverCount(m) }
 
 // parseIncoming 解析客户端发来的 PUBLISH。
 func parseIncoming(pkt mqttc.Packet) (Message, uint16, error) {
@@ -310,6 +407,17 @@ func (b *Broker) handleSubscribe(c *conn, pkt mqttc.Packet) bool {
 	for _, f := range filters {
 		b.subs = append(b.subs, f.Filter)
 	}
+	// 新订阅方要立刻拿到 retained 消息，否则「连上就看不到当前状态」。
+	// 这也是测试里验证「保留消息确实存在」的唯一途径。
+	var replay []Message
+	for _, m := range b.retained {
+		for _, f := range filters {
+			if TopicMatches(f.Filter, m.Topic) {
+				replay = append(replay, m)
+				break
+			}
+		}
+	}
 	b.mu.Unlock()
 
 	body := []byte{byte(pid >> 8), byte(pid)}
@@ -317,7 +425,28 @@ func (b *Broker) handleSubscribe(c *conn, pkt mqttc.Packet) bool {
 	out := []byte{mqttc.TypeSuback << 4}
 	out = append(out, encodeRemainingLen(len(body))...)
 	out = append(out, body...)
-	return c.write(out) == nil
+	if err := c.write(out); err != nil {
+		return false
+	}
+	// retained 必须在 SUBACK 之后发：客户端在等 SUBACK 时也会分发 PUBLISH，
+	// 但先发 SUBACK 能让「订阅已建立」与「收到历史值」的因果顺序确定。
+	for _, m := range replay {
+		q := m.QoS
+		var rpid uint16
+		if q > 0 {
+			rpid = 1
+		}
+		pkt, err := mqttc.PublishPacket(mqttc.Message{
+			Topic: m.Topic, Payload: m.Payload, QoS: q, Retain: true,
+		}, rpid)
+		if err != nil {
+			continue
+		}
+		if err := c.write(pkt); err != nil {
+			return false
+		}
+	}
+	return true
 }
 
 // encodeRemainingLen 编码 MQTT 变长剩余长度。
@@ -392,17 +521,32 @@ func TopicMatches(filter, topic string) bool {
 
 // Publish 向所有匹配的订阅者推送一条消息，返回投递的连接数。
 func (b *Broker) Publish(topic string, payload []byte, qos byte, retain bool) int {
+	m := Message{Topic: topic, Payload: append([]byte(nil), payload...), QoS: qos, Retain: retain}
+	b.mu.Lock()
+	if retain {
+		if len(payload) == 0 {
+			b.dropRetainedLocked(topic)
+		} else {
+			b.setRetainedLocked(m)
+		}
+	}
+	b.mu.Unlock()
+	return b.deliverCount(m)
+}
+
+// deliverCount 与 deliver 相同，但返回投递成功的连接数。
+func (b *Broker) deliverCount(m Message) int {
 	b.mu.Lock()
 	clients := append([]*conn(nil), b.clients...)
 	b.mu.Unlock()
 
 	sent := 0
 	for _, c := range clients {
-		granted := c.grantedQoS(topic)
+		granted := c.grantedQoS(m.Topic)
 		if granted == 255 {
 			continue
 		}
-		q := qos
+		q := m.QoS
 		if granted < q {
 			q = granted
 		}
@@ -411,7 +555,7 @@ func (b *Broker) Publish(topic string, payload []byte, qos byte, retain bool) in
 			pid = 1
 		}
 		pkt, err := mqttc.PublishPacket(mqttc.Message{
-			Topic: topic, Payload: payload, QoS: q, Retain: retain,
+			Topic: m.Topic, Payload: m.Payload, QoS: q, Retain: m.Retain,
 		}, pid)
 		if err != nil {
 			continue
@@ -459,6 +603,54 @@ func (b *Broker) Connects() int {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	return b.connects
+}
+
+// ConnectInfos 返回每条成功解析的 CONNECT（按到达顺序）。
+//
+// 测试用它断言「客户端线上到底承诺了什么」：CleanSession 是否为 true、
+// 遗嘱 QoS 是否 1、retain 是否 false、Will 载荷里的 bdSeq 是否每次递增。
+// 这些契约只看本地状态无法确认——本地对象可以是对的，字节是错的。
+func (b *Broker) ConnectInfos() []mqttc.ConnectInfo {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return append([]mqttc.ConnectInfo(nil), b.infos...)
+}
+
+// BadConnects 返回解析失败的 CONNECT 数量。
+func (b *Broker) BadConnects() int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.badConnects
+}
+
+// Wills 返回 Broker 代发的遗嘱（按代发顺序）。
+func (b *Broker) Wills() []Message {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return append([]Message(nil), b.wills...)
+}
+
+// Retained 返回当前保存在 Broker 上的保留消息（按主题排序）。
+//
+// 这是验证「消费方到底能读到什么」的唯一可靠途径：客户端发了 retain=true
+// 的零长度载荷只说明它想删除，Broker 是否真的删掉了要看这里。设备/报警
+// 被删除后仍留在 retained 表里，本地测试全绿、现场看板却显示一台不存在的
+// 设备——这类缺陷只有从这个角度才看得见。
+func (b *Broker) Retained() []Message {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	out := append([]Message(nil), b.retained...)
+	sort.Slice(out, func(i, j int) bool { return out[i].Topic < out[j].Topic })
+	return out
+}
+
+// RetainedTopics 返回当前保留消息的主题列表（按主题排序）。
+func (b *Broker) RetainedTopics() []string {
+	out := make([]string, 0, 8)
+	for _, m := range b.Retained() {
+		out = append(out, m.Topic)
+	}
+	return out
 }
 
 // Pings 返回累计 PINGREQ 次数。

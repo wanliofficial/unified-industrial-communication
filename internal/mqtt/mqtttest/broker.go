@@ -11,11 +11,15 @@ import (
 	"testing"
 	"time"
 
+	mqttc "uic/internal/mqtt"
 	broker "uic/internal/sim/mqtt"
 )
 
 // Message 是 Broker 收到（或推送）的一条消息。
 type Message = broker.Message
+
+// ConnectInfo 是一条已解析的 CONNECT 报文（含遗嘱与 CleanSession）。
+type ConnectInfo = mqttc.ConnectInfo
 
 // TopicMatches 判断主题是否匹配过滤器（支持 + 与 #）。
 var TopicMatches = broker.TopicMatches
@@ -96,6 +100,77 @@ func (b *Broker) WaitSubscriptions(t *testing.T, n int) []string {
 	}
 	t.Fatalf("mqtttest: subscriptions = %v, want >= %d", b.Subscriptions(), n)
 	return nil
+}
+
+// WaitConnections 等到 Broker 解析到的 CONNECT 数量达到 n，并返回它们。
+//
+// 与 WaitConnects 的区别：后者数的是「收到多少个 CONNECT 报文」，后者
+// （Connects）在解析失败时也会 +1；WaitConnections 只数成功解析的，
+// 因此能用它断言「客户端发出的是合法 3.1.1 报文」。
+func (b *Broker) WaitConnections(t *testing.T, n int) []ConnectInfo {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if infos := b.ConnectInfos(); len(infos) >= n {
+			return infos
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("mqtttest: parsed connects = %d, want >= %d (bad=%d)",
+		len(b.ConnectInfos()), n, b.BadConnects())
+	return nil
+}
+
+// WaitDisconnects 等到累计 DISCONNECT 次数达到 n。
+func (b *Broker) WaitDisconnects(t *testing.T, n int) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if b.Disconnects() >= n {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("mqtttest: disconnects = %d, want >= %d", b.Disconnects(), n)
+}
+
+// WaitWills 等到 Broker 代发了至少 n 条遗嘱，并返回它们。
+func (b *Broker) WaitWills(t *testing.T, n int) []Message {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if wills := b.Wills(); len(wills) >= n {
+			return wills
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("mqtttest: wills = %d, want >= %d", len(b.Wills()), n)
+	return nil
+}
+
+// WaitRetainedGone 等到某个主题的保留消息从 Broker 上消失。
+//
+// 「发了零长度 retained」与「保留消息真的没了」是两件事：前者只证明客户端
+// 发出了删除请求，后者才是消费方看到的结果。删除设备/报警的用例必须用
+// 这个断言，否则 Broker 侧漏实现也会让测试通过。
+func (b *Broker) WaitRetainedGone(t *testing.T, topic string) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		found := false
+		for _, m := range b.Retained() {
+			if m.Topic == topic {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("mqtttest: retained message on %q was never removed; still holding %v",
+		topic, b.RetainedTopics())
 }
 
 // 以下 setup 函数用于在客户端连接之前设定 Broker 行为。

@@ -266,7 +266,9 @@ MC 3E、FINS、EtherNet/IP + CIP、BACnet/IP、IEC 104、DL/T 645、CJ/T 188、A
 > Sparkplug B 补的是「北向语义」而不是又一个南向协议：它把 MQTT 从「一条采样一条
 > 消息」升级成带生命周期与序号的节点模型。值映射与 JSON 格式共用同一份 Sample 契约，
 > 但 BIRTH/DEATH、序号回绕、bdSeq 与重连重发都要单独处理；因此编解码与状态机拆成
-> 两个包，前者可以脱网做金帧测试，后者可以脱 Broker 做序号测试。DataSet、模板、
+> 两个包，前者可以脱网做金帧测试，后者可以脱 Broker 做序号测试。本平台只扮演
+> **Edge Node**：不发布 `spBv1.0/STATE/{host_id}`（那是 Host 的出生/死亡证书，
+> 边缘节点发它就是冒用身份），在线语义由 NBIRTH/NDEATH 表达。DataSet、模板、
 > 别名、报警出口都不做——它们各自是另一套状态机，半成品比不做更难排查。
 >
 > **CoAP**（编解码 + 主站 + 内置服务端 + `uic coapread` + `examples/coap.json`）补的是

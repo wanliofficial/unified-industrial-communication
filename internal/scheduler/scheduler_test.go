@@ -140,9 +140,12 @@ func TestDeviceActorSerializesCollects(t *testing.T) {
 	if st.Stats.Skipped == 0 {
 		t.Fatalf("expected skipped ticks while busy, got %+v", st.Stats)
 	}
-	if st.RuntimeState != StateCollecting && st.RuntimeState != StateDegraded {
-		t.Fatalf("state = %s", st.RuntimeState)
-	}
+	// 注册时是 connecting，第一次成功采集之后才转 collecting；这里要等
+	// 那一次迁移真的发生，而不是依赖「Add 时就已经是 collecting」。
+	waitFor(t, "collecting after unblock", func() bool {
+		cur, ok := s.StatusOf("d1")
+		return ok && (cur.RuntimeState == StateCollecting || cur.RuntimeState == StateDegraded)
+	})
 }
 
 func TestFailureDegradesThenBreaks(t *testing.T) {
@@ -478,5 +481,58 @@ func TestStateEventsWithoutHook(t *testing.T) {
 	waitFor(t, "collecting", func() bool { return tgt.collects.Load() >= 2 })
 	if n := len(s.events); n != 0 {
 		t.Fatalf("events queued without hook: %d", n)
+	}
+}
+
+// 注册设备时必须发布一次初始状态事件。
+//
+// 这不是「锦上添花」：北向的 `.../$state` 是 retained 的当前事实，消费方
+// 第一次连上时要能读到每台设备是否在线。若注册时静默把状态设为 collecting
+// 且不发事件，一台从未失败过的设备就永远不会有状态消息——看板上它看起来
+// 像「网关根本没在采」，而实际采集一切正常。
+func TestAddPublishesInitialState(t *testing.T) {
+	got := make(chan StateEvent, 8)
+	s, _ := startSched(t, Options{
+		Tick:    2 * time.Millisecond,
+		OnState: func(ev StateEvent) { got <- ev },
+	})
+	if err := s.Add(dev("d1", 20*time.Millisecond, true), chan1(1), &fakeTarget{}); err != nil {
+		t.Fatalf("add: %v", err)
+	}
+	select {
+	case ev := <-got:
+		if ev.DeviceID != "d1" {
+			t.Fatalf("event = %+v", ev)
+		}
+		if ev.From != "" {
+			t.Fatalf("initial event From = %q, want empty", ev.From)
+		}
+		// 注册时设备还没读过一次，不能声称「正在正常采集」。
+		if ev.To != StateConnecting {
+			t.Fatalf("initial state = %q, want %q", ev.To, StateConnecting)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("no initial state event on Add: retained $state would never exist")
+	}
+}
+
+// 停用的设备注册时也必须发一次，且直接是 disabled：
+// 消费方要能区分「没这台设备」与「这台设备被停用了」。
+func TestAddDisabledDevicePublishesDisabled(t *testing.T) {
+	got := make(chan StateEvent, 8)
+	s, _ := startSched(t, Options{
+		Tick:    2 * time.Millisecond,
+		OnState: func(ev StateEvent) { got <- ev },
+	})
+	if err := s.Add(dev("d1", 20*time.Millisecond, false), chan1(1), &fakeTarget{}); err != nil {
+		t.Fatalf("add: %v", err)
+	}
+	select {
+	case ev := <-got:
+		if ev.To != StateDisabled {
+			t.Fatalf("state = %q, want disabled", ev.To)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("no initial state event for a disabled device")
 	}
 }

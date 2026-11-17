@@ -58,12 +58,13 @@ type ConnectOptions struct {
 	KeepAlive    uint16 // 秒；0 表示关闭 keepalive
 	CleanSession bool
 
-	// Will（遗嘱）用于让 Broker 在客户端异常掉线时代发一条消息。
-	// 北向用它维护 $death，让消费方不必依赖超时猜测网关是否在线。
-	WillTopic   string
-	WillPayload []byte
-	WillQoS     byte
-	WillRetain  bool
+	// Will 是本次 CONNECT 登记的遗嘱，nil 表示不带遗嘱。
+	//
+	// 用指针而不是四个平铺字段：遗嘱在 MQTT 里是「CONNECT 报文的一部分」，
+	// 要么整条存在要么整条不存在。拆成 WillTopic/WillPayload/WillQoS/
+	// WillRetain 之后，「有 topic 没 payload」这种半成品状态必须靠运行时
+	// 校验挡，而它恰恰是最容易漏的一种（改了 topic 忘了改 payload）。
+	Will *Will
 }
 
 // Message 是一条待发布消息。
@@ -72,6 +73,34 @@ type Message struct {
 	Payload []byte
 	QoS     byte
 	Retain  bool
+}
+
+// Will 是 MQTT 遗嘱（CONNECT 里登记的 Will Message）。
+//
+// 单独成型是因为它必须在**每次** CONNECT 之前重新取值：Sparkplug 要求
+// Will 载荷里的 bdSeq 比上一个 CONNECT 的 +1（255 后回绕 0），所以遗嘱
+// 不是进程级常量。
+type Will struct {
+	Topic   string
+	Payload []byte
+	QoS     byte
+	Retain  bool
+}
+
+// ConnectInfo 是一条已解析的 CONNECT 报文。
+//
+// 生产代码不发 CONNECT（客户端只构造），这个类型的存在意义是让 Broker
+// 侧（演示从站与测试）能断言客户端**实际**发了什么：CleanSession 是否为
+// true、遗嘱的 QoS/retain/bdSeq 是否符合协议，都是只看本地状态无法确认
+// 的契约。
+type ConnectInfo struct {
+	ClientID     string
+	CleanSession bool
+	KeepAlive    uint16
+	Username     string
+	HasPassword  bool
+	Will         Will
+	HasWill      bool
 }
 
 // ---------------------------------------------------------------------------
@@ -111,22 +140,20 @@ func ConnectPacket(o ConnectOptions) ([]byte, error) {
 		// 3.1.1 规定 password flag 只能在 username flag 置位时使用。
 		return nil, errors.New("mqtt: password requires username")
 	}
-	if o.WillTopic != "" {
-		if o.WillQoS > 2 {
-			return nil, fmt.Errorf("mqtt: will qos %d out of range", o.WillQoS)
+	if o.Will != nil {
+		if err := o.Will.validate(); err != nil {
+			return nil, err
 		}
-	} else if len(o.WillPayload) > 0 || o.WillQoS != 0 || o.WillRetain {
-		return nil, errors.New("mqtt: will payload/qos/retain without will topic")
 	}
 
 	var flags byte
 	if o.CleanSession {
 		flags |= 0x02
 	}
-	if o.WillTopic != "" {
+	if o.Will != nil {
 		flags |= 0x04
-		flags |= o.WillQoS << 3
-		if o.WillRetain {
+		flags |= o.Will.QoS << 3
+		if o.Will.Retain {
 			flags |= 0x20
 		}
 	}
@@ -145,15 +172,12 @@ func ConnectPacket(o ConnectOptions) ([]byte, error) {
 	if body, err = appendString(body, o.ClientID); err != nil {
 		return nil, err
 	}
-	if o.WillTopic != "" {
-		if body, err = appendString(body, o.WillTopic); err != nil {
+	if o.Will != nil {
+		if body, err = appendString(body, o.Will.Topic); err != nil {
 			return nil, err
 		}
-		if len(o.WillPayload) > 65535 {
-			return nil, fmt.Errorf("mqtt: will payload too long (%d bytes)", len(o.WillPayload))
-		}
-		body = append(body, byte(len(o.WillPayload)>>8), byte(len(o.WillPayload)))
-		body = append(body, o.WillPayload...)
+		body = append(body, byte(len(o.Will.Payload)>>8), byte(len(o.Will.Payload)))
+		body = append(body, o.Will.Payload...)
 	}
 	if o.Username != "" {
 		if body, err = appendString(body, o.Username); err != nil {
@@ -169,6 +193,105 @@ func ConnectPacket(o ConnectOptions) ([]byte, error) {
 	out := []byte{TypeConnect << 4}
 	out = appendLength(out, len(body))
 	return append(out, body...), nil
+}
+
+// validate 检查遗嘱能否出现在 CONNECT 里。
+//
+// 空 topic 是硬错误：MQTT 的 Will Topic 是 UTF-8 字符串，空串会让 Broker
+// 在掉线时代发一条「发布到空主题」的消息，多数 Broker 会直接断开新连接。
+// 这种配错在本地完全看不出来，所以要在这里挡住。
+func (w Will) validate() error {
+	if w.Topic == "" {
+		return errors.New("mqtt: will topic required")
+	}
+	if w.QoS > 2 {
+		return fmt.Errorf("mqtt: will qos %d out of range", w.QoS)
+	}
+	if len(w.Payload) > 65535 {
+		return fmt.Errorf("mqtt: will payload too long (%d bytes)", len(w.Payload))
+	}
+	return nil
+}
+
+// ParseConnect 解析 CONNECT 报文体（不含固定头）。
+//
+// 只解析 Broker 需要断言的字段：CleanSession、keepalive、遗嘱与凭据。
+// 未知/多余字段直接忽略——CONNECT 没有可扩展区域，但宽容的解析器不会
+// 比严格的解析器更危险：调用方看到的每个字段都是独立校验过的。
+func ParseConnect(body []byte) (ConnectInfo, error) {
+	var ci ConnectInfo
+	rest := body
+	str := func() (string, error) {
+		if len(rest) < 2 {
+			return "", errors.New("mqtt: connect payload truncated (length prefix)")
+		}
+		n := int(binary.BigEndian.Uint16(rest[:2]))
+		rest = rest[2:]
+		if len(rest) < n {
+			return "", fmt.Errorf("mqtt: connect payload truncated (want %d bytes, have %d)", n, len(rest))
+		}
+		s := string(rest[:n])
+		rest = rest[n:]
+		return s, nil
+	}
+
+	proto, err := str()
+	if err != nil {
+		return ci, err
+	}
+	// 名字与版本一起校验：v3.1（"MQIsdp"/3）与 v5 的 CONNECT 结构不同，
+	// 按 3.1.1 解析 v5 报文会把密码段读成垃圾。
+	if proto != "MQTT" {
+		return ci, fmt.Errorf("mqtt: unexpected protocol name %q", proto)
+	}
+	if len(rest) < 4 {
+		return ci, errors.New("mqtt: connect payload truncated (level/flags/keepalive)")
+	}
+	level := rest[0]
+	flags := rest[1]
+	ci.KeepAlive = binary.BigEndian.Uint16(rest[2:4])
+	rest = rest[4:]
+	if level != ProtocolLevel {
+		return ci, fmt.Errorf("mqtt: protocol level %d, only 4 (3.1.1) is supported", level)
+	}
+	if flags&0x01 != 0 {
+		return ci, errors.New("mqtt: connect reserved flag set")
+	}
+	ci.CleanSession = flags&0x02 != 0
+
+	if ci.ClientID, err = str(); err != nil {
+		return ci, err
+	}
+	if flags&0x04 != 0 {
+		willQoS := (flags >> 3) & 0x03
+		if willQoS > 2 {
+			return ci, fmt.Errorf("mqtt: will qos %d out of range", willQoS)
+		}
+		topic, err := str()
+		if err != nil {
+			return ci, err
+		}
+		payload, err := str()
+		if err != nil {
+			return ci, err
+		}
+		ci.Will = Will{Topic: topic, Payload: []byte(payload), QoS: willQoS, Retain: flags&0x20 != 0}
+		ci.HasWill = true
+	}
+	if flags&0x80 != 0 {
+		if ci.Username, err = str(); err != nil {
+			return ci, err
+		}
+	}
+	if flags&0x40 != 0 {
+		// 密码是二进制而不是字符串，不能按 UTF-8 读——只是这里两者都按
+		// 长度前缀取字节，用同一个辅助函数是安全的。
+		if _, err := str(); err != nil {
+			return ci, err
+		}
+		ci.HasPassword = true
+	}
+	return ci, nil
 }
 
 // PublishPacket 生成 PUBLISH 报文。pid 仅在 QoS>0 时使用且必须非零。

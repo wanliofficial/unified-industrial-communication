@@ -499,17 +499,53 @@ func decodeMetric(b []byte) (Metric, error) {
 		return m, nil
 	}
 
-	// oneof：最多一个 value 字段。按线类型取，而不是只信任 datatype——
-	// 一条声明 Int16 却带 double_value 的报文是损坏的，必须报错。
+	// oneof：最多一个 value 字段。
+	//
+	// 三个约束必须同时成立，缺一个就会把损坏的报文当成合法值：
+	//
+	//  1. oneof 只能出现一个 member。同时带 int_value 与 double_value 的
+	//     报文在 protobuf 语义下是「后者覆盖前者」，但覆盖顺序是解析器实现
+	//     细节，两边可能读到不同的值。
+	//  2. 线类型必须与字段号匹配（字段 12 是 fixed32，13 是 fixed64，其余
+	//     是 varint / bytes）。线类型错位说明生产者用的 schema 与我们对不上。
+	//  3. 声明的 datatype 必须与承载字段一致。`int_value` 是 int32 语义、
+	//     `long_value` 是 int64 语义，声明 Int64 却用 int_value 会让超过
+	//     32 位的值被静默截断——编码侧（validate）已经拒绝这种组合，
+	//     解码侧不校验就成了「自己发不出去，别人发过来照收」。
+	present := 0
+	for _, f := range []int{10, 11, 12, 13, 14, 15, 16} {
+		if _, ok := fields[f]; ok {
+			present++
+		}
+	}
+	if present > 1 {
+		return Metric{}, fmt.Errorf("sparkplug: metric %q carries %d value fields; the value oneof allows at most one", m.Name, present)
+	}
+
 	if v, ok := last(fields, 10); ok {
+		if v.wire != wireVarint {
+			return Metric{}, fmt.Errorf("sparkplug: metric %q field 10 (int_value) has wire type %d, want varint", m.Name, v.wire)
+		}
+		if !declaresInt32(m.DataType) {
+			return Metric{}, fmt.Errorf("sparkplug: metric %q declares %v but carries int_value", m.Name, m.DataType)
+		}
 		m.Value = valueForInt(m.DataType, uint32(v.varint))
 		return m, nil
 	}
 	if v, ok := last(fields, 11); ok {
+		if v.wire != wireVarint {
+			return Metric{}, fmt.Errorf("sparkplug: metric %q field 11 (long_value) has wire type %d, want varint", m.Name, v.wire)
+		}
+		if !declaresInt64(m.DataType) {
+			return Metric{}, fmt.Errorf("sparkplug: metric %q declares %v but carries long_value", m.Name, m.DataType)
+		}
 		m.Value = valueForLong(m.DataType, v.varint)
 		return m, nil
 	}
 	if v, ok := last(fields, 12); ok {
+		if v.wire != wireFixed32 {
+			return Metric{}, fmt.Errorf("sparkplug: metric %q field 12 (float_value) has wire type %d, want fixed32", m.Name, v.wire)
+		}
 		if m.DataType != TypeFloat && m.DataType != TypeUnknown {
 			return Metric{}, fmt.Errorf("sparkplug: metric %q declares %v but carries float_value", m.Name, m.DataType)
 		}
@@ -517,6 +553,9 @@ func decodeMetric(b []byte) (Metric, error) {
 		return m, nil
 	}
 	if v, ok := last(fields, 13); ok {
+		if v.wire != wireFixed64 {
+			return Metric{}, fmt.Errorf("sparkplug: metric %q field 13 (double_value) has wire type %d, want fixed64", m.Name, v.wire)
+		}
 		if m.DataType != TypeDouble && m.DataType != TypeUnknown {
 			return Metric{}, fmt.Errorf("sparkplug: metric %q declares %v but carries double_value", m.Name, m.DataType)
 		}
@@ -524,18 +563,71 @@ func decodeMetric(b []byte) (Metric, error) {
 		return m, nil
 	}
 	if v, ok := last(fields, 14); ok {
+		if v.wire != wireVarint {
+			return Metric{}, fmt.Errorf("sparkplug: metric %q field 14 (boolean_value) has wire type %d, want varint", m.Name, v.wire)
+		}
+		if m.DataType != TypeBoolean && m.DataType != TypeUnknown {
+			return Metric{}, fmt.Errorf("sparkplug: metric %q declares %v but carries boolean_value", m.Name, m.DataType)
+		}
+		// Protobuf 的 bool 只允许 0/1。别的值说明生产者写坏了——按 true
+		// 处理等于替对方猜，而布尔恰恰是最不能猜的类型。
+		if v.varint > 1 {
+			return Metric{}, fmt.Errorf("sparkplug: metric %q boolean_value = %d, want 0 or 1", m.Name, v.varint)
+		}
 		m.Value = v.varint != 0
 		return m, nil
 	}
 	if v, ok := last(fields, 15); ok {
+		if v.wire != wireBytes {
+			return Metric{}, fmt.Errorf("sparkplug: metric %q field 15 (string_value) has wire type %d, want bytes", m.Name, v.wire)
+		}
+		if m.DataType != TypeString && m.DataType != TypeText && m.DataType != TypeUnknown {
+			return Metric{}, fmt.Errorf("sparkplug: metric %q declares %v but carries string_value", m.Name, m.DataType)
+		}
 		m.Value = string(v.bytes)
 		return m, nil
 	}
 	if v, ok := last(fields, 16); ok {
+		if v.wire != wireBytes {
+			return Metric{}, fmt.Errorf("sparkplug: metric %q field 16 (bytes_value) has wire type %d, want bytes", m.Name, v.wire)
+		}
+		if m.DataType != TypeBytes && m.DataType != TypeUnknown {
+			return Metric{}, fmt.Errorf("sparkplug: metric %q declares %v but carries bytes_value", m.Name, m.DataType)
+		}
 		m.Value = append([]byte(nil), v.bytes...)
 		return m, nil
 	}
+	// 声明了值类型却一个承载字段都没有：消费方会把这条指标当成「无值」，
+	// 而 NBIRTH/DBIRTH 要求每条指标都必须带当前值
+	// （[tck-id-topics-nbirth-metrics]）。这是编码方的错，不能静默放过。
+	if isValueType(m.DataType) {
+		return Metric{}, fmt.Errorf("sparkplug: metric %q declares %v but carries no value field", m.Name, m.DataType)
+	}
 	return m, nil
+}
+
+// declaresInt32 判断 datatype 是否适合用 int_value（int32 语义）承载。
+func declaresInt32(dt DataType) bool {
+	return dt == TypeUnknown || dt == TypeInt8 || dt == TypeInt16 ||
+		dt == TypeInt32 || dt == TypeUInt8 || dt == TypeUInt16 || dt == TypeUInt32
+}
+
+// declaresInt64 判断 datatype 是否适合用 long_value（int64 语义）承载。
+func declaresInt64(dt DataType) bool {
+	return dt == TypeUnknown || dt == TypeInt64 || dt == TypeDateTime || dt == TypeUInt64
+}
+
+// isValueType 报告 datatype 是否表示「必须带值」的标量类型。
+//
+// 排除 TypeUnknown（对端没写类型）与 DataSet/Template 这类结构化类型：
+// 它们的值不在 oneof 的标量分支里。
+func isValueType(dt DataType) bool {
+	switch dt {
+	case TypeInt8, TypeInt16, TypeInt32, TypeInt64, TypeUInt8, TypeUInt16, TypeUInt32,
+		TypeUInt64, TypeFloat, TypeDouble, TypeBoolean, TypeString, TypeDateTime, TypeText, TypeBytes:
+		return true
+	}
+	return false
 }
 
 // decodeProperties 解析 PropertySet：keys 是字符串数组，values 是按下标

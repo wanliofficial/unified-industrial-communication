@@ -494,8 +494,11 @@ func checkConfig(path string) int {
 	fmt.Printf("  outbox      %v\n", sinks)
 	if m := f.Northbound.MQTT; m.Enabled {
 		if m.Format == config.MQTTFormatSparkplugB {
-			fmt.Printf("  mqtt        %s（qos %d，sparkplug-b %s/%s）\n",
-				m.Broker, m.EffectiveQoS(), m.GroupID, m.NodeID)
+			// 不打印 qos：Sparkplug 的 QoS 由消息类型定死（数据/出生 0、
+			// NDEATH 1、订阅 1），配置层已禁止写 qos。这里再显示一个
+			// EffectiveQoS() 的默认值 1，会让运维以为它是可调项。
+			fmt.Printf("  mqtt        %s（sparkplug-b %s/%s）\n",
+				m.Broker, m.GroupID, m.NodeID)
 		} else {
 			fmt.Printf("  mqtt        %s（qos %d，json %s）\n", m.Broker, m.EffectiveQoS(), m.Topic)
 		}

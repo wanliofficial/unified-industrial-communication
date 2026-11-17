@@ -1222,7 +1222,7 @@ LWT；而 `$birth` 是 retained 的，不补一条 `online=false` 就会让消�
 | `groupId` | 否 | `site` | 仅 `sparkplug-b`；不得含 `/`、`+`、`#` |
 | `nodeId` | 否 | `uic-{site}` | 仅 `sparkplug-b`；规则同上 |
 | `topic` | 否 | `uic/{site}/{device}/{point}/value` | 必须含 `{device}` 与 `{point}`；`sparkplug-b` 下必须留空 |
-| `qos` | 否 | `1` | 仅 0/1；写 2 直接报错 |
+| `qos` | 否 | `1` | 仅 0/1；写 2 直接报错；`sparkplug-b` 下必须省略（QoS 由消息类型定死） |
 | `retain` | 否 | `false` | 只作用于 `value`；`$state`/`$birth`/`$death` 恒为 retained；`sparkplug-b` 下必须为 false |
 | `username` / `password` | 否 | — | 只配 `password` 不配 `username` 会被拒绝（3.1.1 规定） |
 
@@ -1255,6 +1255,22 @@ LWT；而 `$birth` 是 retained 的，不补一条 `online=false` 就会让消�
 因此客户端每次 CONNECT 成功后都会补发 `$birth` 与全部已知 `$state`（缓存最后
 一次状态），而不是只在启动时发一次。
 
+**删除设备/点位时要清掉 retained**：retained 是双向的。删掉本地快照只让本进程
+不再补发，Broker 上那条 `.../$state`（或报警状态）仍然挂着，新接入的消费方照样
+会读到一台已经不存在的设备。唯一能让它消失的手段是发一条**零长度 retained
+载荷**（MQTT 规范定义的「删除该主题的保留消息」）。断线时删除会发不出去，因此
+必须记下待清理的 ID，在下次（重）连后补发；丢弃这个记录会让幽灵状态永久留在
+Broker 上。
+
+补发与删除必须互斥（sink 内 `sendMu`）：补发是「按快照重写 Broker 上的当前
+事实」，若与删除并发，「按旧快照写回」会让刚清掉的幽灵复活，而本地各处都以为
+清理已经完成。
+
+删除之后**迟到**的状态事件同样要拦：调度器的状态事件是异步派发的，reload 删掉
+设备时队列里可能还压着它的事件。拦住的位置是 runtime（`onDeviceState`），因为它
+按配置核对设备是否还在——只有配置能区分「删除」与「同 ID 重配后重新出现」；
+若在 sink 里设墓碑，重新配置的设备会被永久静音。
+
 ### 6.5 边界（明确不支持）
 
 | 能力 | 状态 | 原因 |
@@ -1280,6 +1296,15 @@ Sparkplug B 不是一个「换一种 JSON 结构」的选项，而是一套**基
 DDATA；每条消息带序号，序号断了消费方就有权丢弃整段数据。所以它被实现为
 MQTT 北向的第二种格式，与 json 格式**互斥**，共用 Broker、凭据与 Outbox。
 
+本平台只扮演 **Edge Node（边缘节点）**，不扮演 Host Application。这个边界决定
+了几件事：
+
+- 出生/死亡用 NBIRTH/NDEATH 表达，设备用 DBIRTH/DDEATH；
+- **不发布 STATE 主题**。`spBv1.0/STATE/{host_id}` 是 Host 的出生/死亡证书，
+  由 Host 发布、`retain=true`。边缘节点发它就是冒用一个自己并不具备的身份，
+  真正的 Host 会据此认为「有一个 Host 在线」。边缘节点是否在线，Host 只看
+  NBIRTH/NDEATH。
+
 ```json
 {
   "northbound": {
@@ -1289,9 +1314,7 @@ MQTT 北向的第二种格式，与 json 格式**互斥**，共用 Broker、凭�
       "broker": "tcp://192.168.1.10:1883",
       "clientId": "uic-plant-a",
       "groupId": "plant-a",
-      "nodeId": "gw-line1",
-      "qos": 1,
-      "retain": false
+      "nodeId": "gw-line1"
     }
   }
 }
@@ -1303,8 +1326,12 @@ MQTT 北向的第二种格式，与 json 格式**互斥**，共用 Broker、凭�
 | `groupId` | 否 | `site` | 现场命名空间；不得含 `/`、`+`、`#` |
 | `nodeId` | 否 | `uic-{site}` | 本网关在组内的唯一名；规则同上 |
 | `topic` | 否 | 空 | Sparkplug 下**必须留空**：主题由组/节点/设备拼出，模板会破坏契约 |
-| `retain` | 否 | `false` | Sparkplug 下必须为 `false`：只有 STATE 允许 retained |
-| `qos` | 否 | `1` | 仍然只支持 0/1 |
+| `retain` | 否 | `false` | Sparkplug 下**必须为 `false`**：边缘节点的每类消息都是非保留的 |
+| `qos` | 否 | — | Sparkplug 下**必须省略**：QoS 由消息类型定死（见 §6.6.2） |
+
+后三项都是「配置了就会生效」的字段，所以在 Sparkplug 下**显式拒绝**而不是
+静默忽略：静默忽略等于允许配出一个「本地看起来正常、严格 Host 直接丢弃」的
+部署，而现场完全看不出问题。
 
 `clientId` 在 Sparkplug 下缺省取 `nodeId`（不是站点名）：同一站点内两台网关
 配了不同 `nodeId` 却忘了 `clientId` 时，用站点名会让它们的 MQTT 会话互相顶掉，
@@ -1320,8 +1347,10 @@ spBv1.0/{group}/DDEATH/{node}/{device}
 spBv1.0/{group}/DDATA/{node}/{device}
 spBv1.0/{group}/NCMD/{node}
 spBv1.0/{group}/DCMD/{node}/{device}
-spBv1.0/{group}/STATE/{node}          # retained JSON，不是 Protobuf
 ```
+
+只有这 7 类。`spBv1.0/STATE/{host_id}` 属于 Host，本平台既不发布也不解析
+（`ParseTopic` 对它返回「不认识」，调用方据此忽略）。
 
 | Sparkplug 概念 | 平台概念 |
 |---|---|
@@ -1337,18 +1366,44 @@ spBv1.0/{group}/STATE/{node}          # retained JSON，不是 Protobuf
 编号表，而点位表可以在运行时增删；用名字虽然字节多一点，但永远不会出现
 「编号 7 在两次重启后指向不同点位」这类无法排查的问题。
 
-#### 6.6.2 生命周期与序号
+#### 6.6.2 生命周期、QoS 与序号
 
 | 时机 | 发出的消息 |
 |---|---|
-| MQTT 连接建立 | STATE `online=true`（retained）→ NBIRTH → 全部已知设备 DBIRTH |
+| MQTT 连接建立（每次 CONNECT） | NBIRTH → 全部已知设备 DBIRTH |
 | 首个点位/新增点位 | 该设备的 DBIRTH（完整点位表）→ DDATA |
 | 常规变化 | DDATA |
 | 设备进入 `faulted`/`disabled` | DDEATH，并忘掉该设备的点位缓存 |
+| 设备从配置中删除，或同 ID 重配 | DDEATH，并忘掉该设备的点位缓存 |
 | 设备恢复采集 | 下一条数据触发新的 DBIRTH → DDATA |
 | 收到 NCMD `Node Control/Rebirth=true` | NBIRTH + 全部 DBIRTH |
 | 收到 DCMD `Device Control/Rebirth=true` | 该设备 DBIRTH |
-| 正常停机 | STATE `online=false` → NDEATH → DISCONNECT |
+| 正常停机 | NDEATH（主动发布）→ DISCONNECT |
+| 异常断链（进程被杀/网络断） | Broker 代发 CONNECT 里登记的 NDEATH 遗嘱 |
+
+**QoS 与 retain 由消息类型定死，不是配置项。** 规范对每类消息逐条给出 MUST：
+
+| 消息 | QoS | retain | 依据 |
+|---|---|---|---|
+| NBIRTH / DBIRTH / DDATA / DDEATH | 0 | false | `[tck-id-topics-nbirth-mqtt]` 等逐条 MUST |
+| NDEATH（遗嘱与主动发布同值） | 1 | false | `[tck-id-payloads-ndeath-will-message-qos]` / `-retain` |
+| NCMD / DCMD 订阅 | 1 | — | `[tck-id-message-flow-edge-node-ncmd-subscribe]` / `-dcmd-subscribe` |
+
+NDEATH 主动发布沿用遗嘱的 QoS 1：否则「主动告知的死亡」反而比「Broker 代发
+的遗嘱」更容易丢。命令订阅必须是 QoS1：QoS0 的订阅会在链路抖动时静默丢掉
+重生请求，表现为「点了重生没反应」。
+
+**`degraded` 不发 DDEATH。** 运行态与 Sparkplug 语义的对应关系只有三种：
+
+| 运行态 | Sparkplug 动作 |
+|---|---|
+| `collecting` | 无（下一条 DDATA 会带值；若此前已 DDEATH，则由它触发新 DBIRTH） |
+| `faulted` / `disabled` | DDEATH，并忘掉点位 |
+| `connecting` / `degraded` / `configured` | 无 |
+
+`degraded` 是「部分点位失败、其余仍在采集」。发 DDEATH 会让 Host 把整台设备
+从模型里摘掉，正在正常上报的点位也跟着消失——这比不发严重得多。单个点位
+没有好值这件事，已经由 DDATA 里的 `is_null` 表达（见 §6.6.3）。
 
 序号规则（**一个边缘节点一个计数器**，不是每台设备一个）：
 
@@ -1374,9 +1429,18 @@ Edge Node」，并有三条可测的 TCK 约束：
   会是 `0,1,0,1`；严格的主机把「序号不连续」当成丢包，会请求重生或丢弃数据，
   而发送方完全看不出问题。
 
-`bdSeq` 在进程启动时生成一次，整个会话期间不变：NDEATH 遗嘱在 CONNECT 时就
-已经固定，重连后的 NBIRTH 必须能用同一个值把「生—死」配对。遗嘱消息的 QoS 为
-1、**不 retained**——retained 的 NDEATH 会让新订阅者把一次历史掉线当成当前状态。
+**`bdSeq` 每个 CONNECT 前进一格**（从 0 开始、255 之后回绕 0），同时出现在该次
+CONNECT 的 NDEATH 遗嘱载荷与随后的 NBIRTH 里
+（`[tck-id-topics-nbirth-bdseq-increment]`、`[tck-id-payloads-ndeath-bdseq]`）。
+Host 靠它把一对 NDEATH/NBIRTH 配对，并在消息乱序时区分「这次掉线」与「上一次
+的旧遗嘱」。所以它**不能**是进程级常量：常量会让重连之后所有死亡消息都带同一
+个 bdSeq，Host 无法分辨。实现上 MQTT 客户端的遗嘱是 `Options.Will func() *Will`
+回调，每次构造 CONNECT 时重新求值，回调里调用 `Node.BeginSession()` 同时推进并
+记录 bdSeq。
+
+`CleanSession` 恒为 `true` 且 CONNECT 必须带遗嘱：前者保证 Broker 不保留上一次
+会话的离线消息与订阅（否则 BIRTH 语义就乱了），后者是 Broker 能代发 NDEATH 的
+唯一途径。
 
 **为什么 BIRTH 必须带完整点位表**：DBIRTH 是消费方建立「设备有哪些指标」的
 唯一时机——指标名、datatype 与别名的解析都在这一步完成，DDATA 只负责更新值。
@@ -1384,6 +1448,13 @@ Edge Node」，并有三条可测的 TCK 约束：
 从未声明过的指标名，只能当成未知数据丢弃（再去补一帧 BIRTH 也没用，那一帧
 DDATA 已经过去了）。实现上为每台设备保存「最后一个采样」，点位集合变化时
 重发完整 BIRTH，再发 DDATA。
+
+**为什么点位删除必须走 DDEATH**：DBIRTH 会把它列出的全部点位重新告诉消费方。
+设备已从配置里删掉、点位已从设备上删掉，但点位缓存还留着的话，下一次（重连
+的）DBIRTH 就会把一台不存在的设备 / 一批不存在的点位重新宣布为在线。所以
+配置热加载检测到「设备消失」或「同 ID 重配」时，会先 DDEATH 并清空该设备的
+点位表，之后的新数据重新走「完整 BIRTH」。规范允许设备被整体移除时发 DDEATH
+（`op.adoc` 的 device-removal 段落）。
 
 **为什么等待重连后要重发 BIRTH**：MQTT 会话是 `CleanSession=true`，Broker
 重启后订阅与 retained 状态都可能丢失。`OnConnect` 回调是异步的，不能保证它
@@ -1444,9 +1515,10 @@ Sparkplug 没有质量位。把断线前的旧值当成新值发出去，比不�
 
 | 能力 | 状态 | 原因 |
 |---|---|---|
+| Host Application 角色（STATE 主题） | 不做 | STATE 是 Host 的出生/死亡证书（`spBv1.0/STATE/{host_id}`）。边缘节点发它就是冒用身份，真正的 Host 会以为「有一个 Host 在线」。本节点在线与否由 NBIRTH/NDEATH 表达 |
 | DataSet / 模板 / 别名 | 不做 | 需要跨会话稳定的编号与模板管理；点位表可变时半成品比不做更难排查 |
-| STATE 之外 retained | 不做，配置即拒绝 | 生命周期消息 retained 会让新订阅者看到没有上下文的历史状态 |
-| 遗嘱 retained | 不做 | 同上：一次历史掉线不能变成当前状态 |
+| retained 生命周期消息 | 不做，配置即拒绝 | 边缘节点的每类消息规范要求 QoS0 且非保留；retained 会让新订阅者看到没有上下文的历史状态 |
+| 可配 QoS | 不做，配置即拒绝 | QoS 由消息类型定死；做成可配等于允许配出一个「本地正常、严格 Host 丢弃」的部署 |
 | 报警出口 | 不做 | Sparkplug 没有报警主题；硬塞进 DDATA 会污染指标空间。需要报警请用 json 格式或 REST/SSE |
 | 自定义主题模板 | 不做，配置即拒绝 | 主题是协议契约的一部分，模板化等于允许配出一个「本地正常、对端收不到」的现场 |
 
@@ -1457,16 +1529,39 @@ Sparkplug 没有质量位。把断线前的旧值当成新值发出去，比不�
 ./uic -check -config examples/sparkplug.json
 ./uic -config examples/sparkplug.json
 #   用任意 Sparkplug B 消费端订阅 spBv1.0/plant-a/#
-#   期望顺序：STATE → NBIRTH → DBIRTH(line-a) → DDATA…
+#   期望顺序：NBIRTH → DBIRTH(line-a) → DDATA…
 #             → DBIRTH(line-b) → DDATA…
 ```
 
-集成测试 (`internal/runtime/sparkplug_sink_test.go`) 覆盖：BIRTH 顺序、DBIRTH
-完整点位表、STATE retained、DDEATH、NCMD 重生、断线后重发 BIRTH、停机 STATE
-offline 与 NDEATH，以及**两台设备交替发布时的序号连续性**（节点级计数器，
-不允许各自从 0 开始）。编解码金帧与「序号 0 必须出现在线上」在
-`internal/codec/sparkplug`；序号规则本身在 `internal/sparkplug` 的状态机单测里
-（含 NDEATH 不带序号、255 回绕、NBIRTH 重置）。
+集成测试（`internal/runtime/sparkplug_sink_test.go`）覆盖：BIRTH 顺序、DBIRTH
+完整点位表、DDEATH（faulted / disabled / 配置删除）、`degraded` 不误杀设备、
+NCMD 重生、断线后重发 BIRTH、停机 NDEATH 与 DISCONNECT、异常断链时 Broker
+代发遗嘱、**每次 CONNECT 的遗嘱 bdSeq 递增且与 NBIRTH 一致**，以及**两台设备
+交替发布时的序号连续性**（节点级计数器，不允许各自从 0 开始）。
+
+编解码金帧、`ParseConnect` 的遗嘱/CleanSession 校验在 `internal/codec/sparkplug`
+与 `internal/mqtt`；序号与 bdSeq 规则本身在 `internal/sparkplug` 的状态机单测里
+（含 NDEATH 不带序号、两种计数器各自的 255 回绕、NBIRTH 重置序号）。
+
+`Metric` 解码是**加严**的，三层校验缺一不可：oneof 只能有一个成员、每个承载
+字段的线类型必须与字段号匹配、声明的 datatype 必须与承载字段一致（`int_value`
+是 int32 语义、`long_value` 是 int64 语义）。编码侧 `validate` 已经拒绝非法
+组合，解码侧不校验就成了「自己发不出去，别人发过来照收」。
+
+#### 6.6.7 点位缓存不随配置删除收缩
+
+`internal/cache` 只提供 `Set`/`Get`/`List`/`Count`/`Subscribe`，**没有 `Delete`**。
+删点或删设备之后，那份快照仍留在内存里，不会再被任何人读到：
+
+- `Points()` / `Point()` / `markStale` / OPC UA 地址空间 / 从站映射全部按**配置
+  枚举**再 `cache.Get`，配置里没有的键永远不会被取出来；
+- 因此陈旧条目只占内存，不会出现在 REST、SSE、历史或任何北向出口上。
+
+这是有意的取舍：缓存里存的是「点位当前值」，不是「点位清单」，清单的唯一事实
+是配置。为此补一个 `Delete` 只会引入「谁负责在什么时机删」的一致性负担，而收益
+是回收几 KB 内存。代价要说清楚：**长时间反复增删大量点位会缓慢增长内存**，且
+这些字节不会被任何指标暴露。若将来出现「配置频繁大批量变更」的现场，正确的做法
+是按配置定期重建缓存（`Cache` 换新），而不是给每次删除都加一条同步删键路径。
 
 ### 6.7 本地 journal 兜底（`storage.journal`）
 

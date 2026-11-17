@@ -1,7 +1,6 @@
 package sparkplug
 
 import (
-	"encoding/json"
 	"strings"
 	"testing"
 	"time"
@@ -17,13 +16,17 @@ func fixedClock(ms int64) func() time.Time {
 
 func newTestNode(t *testing.T) *Node {
 	t.Helper()
-	n := NewNode("plant-a", "gw-01", 7)
+	n := NewNode("plant-a", "gw-01")
 	n.SetClock(fixedClock(1700000000000))
+	// 真实调用点（MQTT 客户端构造 CONNECT 时）一定会先 BeginSession，
+	// 单测也必须照做，否则 NBIRTH 里的 bdSeq 是「没上过线的 0」，
+	// 与「刚上线过一次的 0」看起来一样，测不出状态机是否推进。
+	n.BeginSession()
 	return n
 }
 
 // 主题是 Sparkplug 唯一的「信封」：拼错一个斜杠对端就完全看不到数据，
-// 而本地不会报任何错。这一组用例把 8 种主题逐字钉死。
+// 而本地不会报任何错。这一组用例把 Edge Node 的 7 种主题逐字钉死。
 func TestTopic(t *testing.T) {
 	cases := []struct {
 		group, kind, node, device, want string
@@ -35,7 +38,6 @@ func TestTopic(t *testing.T) {
 		{"g", KindDDATA, "n", "d", "spBv1.0/g/DDATA/n/d"},
 		{"g", KindNCMD, "n", "", "spBv1.0/g/NCMD/n"},
 		{"g", KindDCMD, "n", "d", "spBv1.0/g/DCMD/n/d"},
-		{"g", KindSTATE, "n", "", "spBv1.0/g/STATE/n"},
 	}
 	for _, c := range cases {
 		if got := Topic(c.group, c.kind, c.node, c.device); got != c.want {
@@ -44,6 +46,23 @@ func TestTopic(t *testing.T) {
 		g, k, n, d, ok := ParseTopic(c.want)
 		if !ok || g != c.group || k != c.kind || n != c.node || d != c.device {
 			t.Fatalf("ParseTopic(%q) = %q,%q,%q,%q,%v", c.want, g, k, n, d, ok)
+		}
+	}
+}
+
+// STATE 属于 Host Application，不属于 Edge Node。
+//
+// 本包刻意不产生 STATE：它是 Host 的出生/死亡证书，主题只有
+// spBv1.0/STATE/{host_id}（4 段、没有 group 段）。边缘节点发它就是冒用
+// 一个自己没有的身份，真正的 Host 会据此认为「有个 Host 在线」。所以
+// ParseTopic 必须把它当成「不认识的主题」，而不是解析出一个 group。
+func TestStateTopicIsNotEdgeNodeSyntax(t *testing.T) {
+	for _, topic := range []string{
+		"spBv1.0/STATE/host-1",
+		"spBv1.0/g/STATE/n",
+	} {
+		if _, _, _, _, ok := ParseTopic(topic); ok {
+			t.Fatalf("%q parsed as an edge-node topic; STATE belongs to the Host", topic)
 		}
 	}
 }
@@ -193,14 +212,16 @@ func TestBirthPayloads(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if msg.Topic != "spBv1.0/plant-a/NBIRTH/gw-01" || msg.Retain {
-		t.Fatalf("NBIRTH = %+v", msg)
+	// retain 恒为 false：Message 里没有这个字段，这里顺带断言 QoS 也由
+	// 消息类型定死（出生消息必须是 QoS 0）。
+	if msg.Topic != "spBv1.0/plant-a/NBIRTH/gw-01" || msg.QoS != 0 {
+		t.Fatalf("NBIRTH = %s qos=%d", msg.Topic, msg.QoS)
 	}
 	p := decodePayload(t, msg)
 	if len(p.Metrics) != 2 {
 		t.Fatalf("NBIRTH metrics = %d", len(p.Metrics))
 	}
-	if p.Metrics[0].Name != "bdSeq" || p.Metrics[0].Value != int64(7) {
+	if p.Metrics[0].Name != "bdSeq" || p.Metrics[0].Value != int64(0) {
 		t.Fatalf("bdSeq = %+v", p.Metrics[0])
 	}
 	if p.Metrics[1].Name != "Node Control/Rebirth" || p.Metrics[1].Value != false {
@@ -220,28 +241,118 @@ func TestBirthPayloads(t *testing.T) {
 	}
 }
 
-// STATE 是 JSON 而不是 Protobuf，而且必须 retained。
-func TestState(t *testing.T) {
-	n := newTestNode(t)
-	for _, online := range []bool{true, false} {
-		msg, err := n.State(online)
+// bdSeq 是「每个新 CONNECT +1、0 开始、255 后回绕 0」，并且必须同时出现在
+// CONNECT 的遗嘱载荷与随后的 NBIRTH 里（[tck-id-payloads-ndeath-bdseq]）。
+//
+// 这条用例同时钉住三个容易写错的地方：
+//   - bdSeq 不能是进程级常量（重连后 NDEATH/NBIRTH 会一直停在同一个值）；
+//   - BeginSession 必须同时推进与记录，否则 NDEATH 与 NBIRTH 用的是两个值，
+//     Host 无法把这对消息配起来；
+//   - 回绕必须落在 0 而不是越界到 256。
+func TestBdSeqPerSession(t *testing.T) {
+	n := NewNode("g", "n")
+	n.SetClock(fixedClock(1700000000000))
+
+	// 未上线时 BdSeq 是 0，这只表示「还没有会话」，不能与「第一次会话的
+	// bdSeq=0」混淆——所以真正的断言全靠下面的 BeginSession 返回值。
+	if got := n.BdSeq(); got != 0 {
+		t.Fatalf("initial bdSeq = %d", got)
+	}
+
+	for want := uint64(0); want < 3; want++ {
+		got := n.BeginSession()
+		if got != want {
+			t.Fatalf("BeginSession #%d = %d, want %d", want, got, want)
+		}
+		if n.BdSeq() != want {
+			t.Fatalf("BdSeq after session %d = %d", want, n.BdSeq())
+		}
+		// 同一次会话里的 NDEATH 与 NBIRTH 必须是同一个值。
+		death, err := n.NDEATH()
 		if err != nil {
 			t.Fatal(err)
 		}
-		if msg.Topic != "spBv1.0/plant-a/STATE/gw-01" || !msg.Retain {
-			t.Fatalf("STATE = %+v", msg)
+		dp := decodePayload(t, death)
+		if len(dp.Metrics) != 1 || dp.Metrics[0].Name != "bdSeq" {
+			t.Fatalf("NDEATH metrics = %+v", dp.Metrics)
 		}
-		var got struct {
-			Timestamp int64 `json:"timestamp"`
-			Online    bool  `json:"online"`
-			BdSeq     int   `json:"bdSeq"`
+		if dp.Metrics[0].Value != int64(want) {
+			t.Fatalf("NDEATH bdSeq = %v, want %d", dp.Metrics[0].Value, want)
 		}
-		if err := json.Unmarshal(msg.Payload, &got); err != nil {
-			t.Fatalf("STATE payload %q: %v", msg.Payload, err)
+
+		birth, err := n.NBIRTH()
+		if err != nil {
+			t.Fatal(err)
 		}
-		if got.Online != online || got.BdSeq != 7 || got.Timestamp != 1700000000000 {
-			t.Fatalf("STATE = %+v", got)
+		bp := decodePayload(t, birth)
+		if bp.Metrics[0].Name != "bdSeq" || bp.Metrics[0].Value != int64(want) {
+			t.Fatalf("NBIRTH bdSeq = %+v, want %d", bp.Metrics[0], want)
 		}
+	}
+}
+
+// bdSeq 回绕：255 之后是 0，不能变成 256 或停在 255。
+func TestBdSeqWrap(t *testing.T) {
+	n := NewNode("g", "n")
+	for want := uint64(0); want <= 255; want++ {
+		if got := n.BeginSession(); got != want {
+			t.Fatalf("session %d bdSeq = %d", want, got)
+		}
+	}
+	if got := n.BeginSession(); got != 0 {
+		t.Fatalf("bdSeq after 255 = %d, want 0", got)
+	}
+}
+
+// 每类消息的 QoS 由规范按类型定死，不是配置项。
+//
+// 数据与出生消息 QoS 0；NDEATH 的遗嘱要求 QoS 1，断开前的主动发布沿用
+// 同一个值。把它做成可配，就等于允许用户配出一个「本地看起来正常、
+// 严格 Host 直接丢弃」的部署。
+func TestQoSByMessageKind(t *testing.T) {
+	n := newTestNode(t)
+
+	born, err := n.NBIRTH()
+	if err != nil {
+		t.Fatal(err)
+	}
+	device, err := n.DBIRTH("dev", []model.Sample{sample("p", 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := n.DDATA("dev", sample("p", 2))
+	if err != nil {
+		t.Fatal(err)
+	}
+	deviceDeath, err := n.DDEATH("dev")
+	if err != nil {
+		t.Fatal(err)
+	}
+	death, err := n.NDEATH()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, c := range []struct {
+		name string
+		msg  Message
+		want byte
+	}{
+		{"NBIRTH", born, 0},
+		{"DBIRTH", device, 0},
+		{"DDATA", data, 0},
+		{"DDEATH", deviceDeath, 0},
+		// 遗嘱本身要求 QoS1；主动发布与遗嘱必须同值，否则「主动告知的
+		// 死亡」反而比「Broker 代发的遗嘱」更容易丢。
+		{"NDEATH", death, 1},
+	} {
+		if c.msg.QoS != c.want {
+			t.Fatalf("%s qos = %d, want %d", c.name, c.msg.QoS, c.want)
+		}
+	}
+	// 订阅命令一律 QoS1：QoS0 会在链路抖动时静默丢掉重生请求。
+	if SubscribeQoS != 1 {
+		t.Fatalf("SubscribeQoS = %d", SubscribeQoS)
 	}
 }
 
@@ -389,7 +500,7 @@ func TestMetricForSampleTypes(t *testing.T) {
 			Value: c.v, Quality: model.QualityGood, CollectedAt: now,
 		})
 	}
-	n := NewNode("g", "n", 0)
+	n := NewNode("g", "n")
 	n.SetClock(func() time.Time { return now })
 	msg, err := n.DBIRTH("d", samples)
 	if err != nil {

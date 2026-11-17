@@ -516,12 +516,18 @@ func (s *Scheduler) Add(dev model.Device, ch model.Channel, target Target) error
 	}
 	now := s.now()
 	d := &device{
-		id:      dev.ID,
-		dev:     dev,
-		ch:      ch,
-		target:  target,
-		slot:    make(chan struct{}, 1),
-		state:   StateCollecting,
+		id:     dev.ID,
+		dev:    dev,
+		ch:     ch,
+		target: target,
+		slot:   make(chan struct{}, 1),
+		// 初始态是 connecting（「正在建链/探活」），不是 collecting。
+		// 直接写成 collecting 会让它在第一次尝试之前就对外声称「正在正常
+		// 采集」；而更严重的是，那样一来从 Add 到第一次成功之间没有任何
+		// 状态**变化**，一台从未失败过的设备就永远不会产生状态事件——
+		// retained 的 `.../$state` 也就永远不存在，消费方首次连上时对这台
+		// 设备一无所知（看起来像「网关根本没在采它」）。
+		state:   StateConnecting,
 		since:   now,
 		nextDue: now,
 	}
@@ -541,10 +547,11 @@ func (s *Scheduler) Add(dev model.Device, ch model.Channel, target Target) error
 	}
 	s.mu.Unlock()
 
+	// 注册即发布一次初始状态（From 为空）。这是「消费方第一次连上就能
+	// 看到这台设备」的唯一时机：之后只有状态**变化**才会再发。
 	d.mu.Lock()
-	st := d.state
-	d.mu.Unlock()
-	s.set("uic_device_state", 1, obs.Labels{"device": dev.ID, "state": string(st)})
+	defer d.mu.Unlock()
+	s.stateChanged(d, "")
 	return nil
 }
 
