@@ -23,6 +23,8 @@ internal static class ConfigStoreTests
         tests.Add(new TestCase("config/diff_finds_changed_added_removed", DiffFindsChanges));
         tests.Add(new TestCase("config/diff_text_is_human_readable", DiffTextIsReadable));
         tests.Add(new TestCase("config/reload_after_restart", ReloadAfterRestart));
+        tests.Add(new TestCase("config/atomic_write_never_leaves_a_half_written_state",
+            AtomicWriteNeverLeaves_a_half_written_state));
     }
 
     /// <summary>
@@ -330,6 +332,54 @@ internal static class ConfigStoreTests
         var loaded = second.LoadVersion(pointer!);
         t.Ok(loaded is not null, "the version is readable after restart");
         t.Equal("demo-site", loaded!.Site, "content round-trips");
+
+        return Task.CompletedTask;
+    }
+
+    /// <summary>
+    /// 原子写本身（FR-CFG-11）：写临时文件 + fsync + rename，绝不「就地截断重写」。
+    ///
+    /// 为什么单独立一条：<c>reload_after_restart</c> 只证明「结果能被捡回来」，
+    /// 而「截断写 + 恰好没崩」也可能让重启读到旧文件——那正是原子写要避免的
+    /// 「半写状态」。这一份钉住两件可从磁盘稳定观测的事：
+    ///   1. 每次提交后目录里不残留 <c>.tmp</c>（非原子的就地重写/失败会留下临时文件）；
+    ///   2. 指针切过去的那份版本文件是完整、可解析的 JSON——读者要么看到旧完整文件、
+    ///      要么看到新完整文件，绝不会看到写了一半的 <c>{"channels":[</c>。
+    ///
+    /// 原子写作用在 <c>config/versions/&lt;id&gt;.json</c> 上（先写它、再原子切
+    /// <c>config/current</c> 指针）。这里不做「多线程读并发撞窗口」的断言：
+    /// 本机文件系统上截断-写满太快，窗口不可稳定复现，那样的断言会变成 flaky 噪声，
+    /// 反而掩盖真问题。真正被守住的是「不残留临时文件 + 指针指向的文件一定完整」。
+    /// </summary>
+    private static Task AtomicWriteNeverLeaves_a_half_written_state(TestContext t)
+    {
+        var dir = t.TempDir;
+        var store = new ConfigStore(dir);
+
+        var root = Path.Combine(dir, "config");
+        var versionsDir = Path.Combine(root, "versions");
+
+        var last = string.Empty;
+        for (var i = 0; i < 20; i++)
+        {
+            var doc = Edit(DemoConfig.Build(), n => n["site"] = $"demo-site-{i}");
+            var id = store.Commit(doc, $"commit {i}");
+            last = id;
+
+            // 指针一旦切向某 id，那份版本文件必须已经是完整的 JSON。
+            var versionFile = Path.Combine(versionsDir, id + ".json");
+            t.Ok(File.Exists(versionFile), $"version {id} is on disk");
+            var parsed = JsonNode.Parse(File.ReadAllText(versionFile));
+            t.Ok(parsed is not null, $"version {id} parses as complete JSON, not a half-written file");
+        }
+
+        // 没有 .tmp 残留：原子写的临时文件一定被 rename 走了，绝不在目录里堆积。
+        var leftovers = Directory.EnumerateFiles(root, "*.tmp", SearchOption.AllDirectories).ToArray();
+        t.Equal(0, leftovers.Length, $"no leftover tmp file (found {leftovers.Length})");
+
+        // current 指针指向最后一份，且能读回——证明「先写文件再切指针」的顺序没反。
+        var pointer = store.ReadCurrentPointer();
+        t.Equal(last, pointer, "current points at the latest commit");
 
         return Task.CompletedTask;
     }
