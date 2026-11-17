@@ -18,6 +18,7 @@ internal static class EngineTests
     public static void Register(List<TestCase> tests)
     {
         tests.Add(new TestCase("engine/conn_is_never_called_concurrently", NeverCalledConcurrently));
+        tests.Add(new TestCase("engine/channel_gate_lets_queued_writes_go_first", ChannelGateLetsQueuedWritesGoFirst));
         tests.Add(new TestCase("engine/actor_reports_state_and_generation", ReportsStateAndGeneration));
         tests.Add(new TestCase("engine/transient_failure_is_retried", TransientFailureIsRetried));
         tests.Add(new TestCase("engine/bad_quality_batch_is_retried", BadQualityBatchIsRetried));
@@ -30,6 +31,82 @@ internal static class EngineTests
         tests.Add(new TestCase("engine/array_write_shape_is_validated_before_the_device", ArrayWriteShapeIsValidated));
         tests.Add(new TestCase("engine/point_interval_overrides_device_period", PointIntervalOverridesDevicePeriod));
         tests.Add(new TestCase("engine/point_interval_failure_is_scoped_to_due_bucket", PointIntervalFailureIsScoped));
+    }
+
+    /// <summary>
+    /// 通道闸门的「写优先」（FR-RUN-03）：写是人的操作、延迟可感知；读是后台任务，晚一点无所谓。
+    /// 已经进入临界区的读不会被抢占（不中断在途请求），但**新来的读**必须给排队中的写让路。
+    ///
+    /// 为什么单独立一条：<c>engine/conn_is_never_called_concurrently</c> 只验证「不重叠」，
+    /// <c>lifecycle/channel_concurrency_follows_hot_update</c> 只验证「换了闸门」。
+    /// 把 <c>ChannelGate</c> 里那段 <c>_writesWaiting</c> 自旋整个删掉，这两条都不会失败——
+    /// 也就是说矩阵里写着的「写优先」此前没有任何断言。
+    /// </summary>
+    private static Task ChannelGateLetsQueuedWritesGoFirst(TestContext t)
+    {
+        return RunAsync(async () =>
+        {
+            using var gate = new ChannelGate(2);
+
+            // 先把两个槽位占满（用读占：读不抬高 _writesWaiting）。
+            var held1 = await gate.EnterReadAsync(t.Ct);
+            var held2 = await gate.EnterReadAsync(t.Ct);
+
+            var order = new List<string>();
+            var orderLock = new object();
+            void Record(string who)
+            {
+                lock (orderLock) order.Add(who);
+            }
+
+            // 写排在信号量的队首。
+            var writerReady = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            var writer = Task.Run(async () =>
+            {
+                writerReady.SetResult();
+                using (await gate.EnterWriteAsync(t.Ct))
+                {
+                    Record("write");
+                    // 持有槽位一小会儿，制造一个「写进行中」的窗口。
+                    await Task.Delay(300, t.Ct);
+                }
+            });
+            await writerReady.Task;
+            await Task.Delay(80, t.Ct); // 确保写已 Increment 并阻塞在信号量上
+
+            // 写排队之后才来的读：必须等写完成。
+            var readerEntered = 0;
+            var reader = Task.Run(async () =>
+            {
+                using (await gate.EnterReadAsync(t.Ct))
+                {
+                    Interlocked.Exchange(ref readerEntered, 1);
+                    Record("read");
+                }
+            });
+            await Task.Delay(120, t.Ct);
+
+            // 放掉一个槽位：写应当拿到它（它在队列里排第一）。
+            held1.Dispose();
+            await Task.Delay(120, t.Ct);
+            t.Equal(0, Volatile.Read(ref readerEntered),
+                "a read that arrived after the write must not slip in while the write runs");
+
+            // 再放掉第二个槽位：写仍在持有（_writesWaiting 还没归零），新读仍不得占用空出来的槽位。
+            // 这正是区分「写优先」与「只是并发上限」的地方：没有优先级时，
+            // 这个读会立刻拿走第二个空槽位，与写并发。
+            held2.Dispose();
+            await Task.Delay(150, t.Ct);
+            t.Equal(0, Volatile.Read(ref readerEntered),
+                "a queued write holds a second free slot back from new reads");
+
+            await writer.WaitAsync(TimeSpan.FromSeconds(10), t.Ct);
+            await reader.WaitAsync(TimeSpan.FromSeconds(10), t.Ct);
+
+            string joined;
+            lock (orderLock) joined = string.Join(",", order);
+            t.Equal("write,read", joined, "the write goes first, the read only after it finished");
+        });
     }
 
     /// <summary>

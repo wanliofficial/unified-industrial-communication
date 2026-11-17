@@ -16,10 +16,9 @@ dotnet run --project tests/Uic.Tests -- --stop-on-fail      # 首个失败即停
 正常输出：
 
 ```
-402 passed, 0 failed, 3 skipped · 218.5s
+403 passed, 0 failed, 3 skipped · 1280.4s
 ```
-
-加 `--opcua` 跑全量（含 3 条需外部 OPC UA 环境的端到端），全部 405 条都会跑。
+加 `--opcua` 跑全量（含 3 条需外部 OPC UA 环境的端到端），全部 406 条都会跑。
 不带 `--opcua` 时那 3 条显示 `skip`（原因 `requires --opcua`），不计入通过数。
 `load average` 5 左右那次实测 `401 passed, 2 failed`：两条失败都是 `contract/*`
 触到 180 s 硬超时，单独复跑分别 119.0 s / 109.6 s 全过——先腾空再判红，
@@ -62,6 +61,11 @@ dotnet run --project tests/Uic.Tests -- --stop-on-fail      # 首个失败即停
 2–11 s（最慢 `contract/tls_rest_serves_https` 11.3 s）。**同一个代码在两轮之间差 13 倍**
 （2878.4 s vs 218.5 s），差别全在机器上还有没有别的负载——所以别拿某一次的绝对秒数
 当回归基线，看的是「有没有单条触到 180 s 硬超时」和「失败数是否为零」。
+406 条（补了 `engine/channel_gate_lets_queued_writes_go_first`）在 `load average` 10–14
+时量到 1280.4 s，`403 passed, 0 failed, 3 skipped`：同一份 `contract/*` 这一轮单条
+3–39 s（最慢 `contract/idempotency_key_rejects_a_different_body` 39.1 s），又回到「有别的
+负载就整体排队」的节奏。这三轮每轮只多一条用例，耗时却是 218.5 / 1280.4 / 2878.4 s
+——差别只在机器，不在代码。
 `--opcua` 变体在同一份代码上 401 passed / 2 failed / 2972.4 s：两条失败都是
 180 s 硬超时（`contract/rate_limit_returns_429_with_the_shared_code`、
 `contract/metrics_report_live_sse_connections`），机器当时 `load average` 4.9–6.5；
@@ -110,7 +114,7 @@ NFR 的门槛是 120 s，压测用例、PBKDF2 派生与 TLS 握手是主要开�
 | `json/*` | 11 | 时长、枚举、值形状、数组值形状、`count` 往返、UTC、往返稳定、前向兼容 |
 | `logs/*` | 7 | JSON 行字段、轮转不丢行、归档裁剪、默认关闭、热更新开关、非法配置拒绝、环形缓冲顺序与过滤 |
 | `resources/*` | 5 | 磁盘/内存进入与恢复回差、探针不可读不误报、降级时文件日志暂停、非法水位配置拒绝 |
-| `engine/*` | 13 | 同连接永不并发、状态机与代次、临时失败重试、坏质量整批重试、deadline 超时重试、确定性错误不重试、重试次数有限、写后回读一致/不一致/不开启、数组写入形状校验、点位周期覆盖设备周期、快慢桶失败互不牵连 |
+| `engine/*` | 14 | 同连接永不并发、状态机与代次、临时失败重试、坏质量整批重试、deadline 超时重试、确定性错误不重试、重试次数有限、写后回读一致/不一致/不开启、数组写入形状校验、点位周期覆盖设备周期、快慢桶失败互不牵连、**通道闸门写优先（排队中的写占住槽位，写结束后才来的读不得抢第二个空槽位——删掉自旋等待即失效）** |
 | `virtual/*` | 8 | 虚拟设备的故障注入（`FR-COL-07`）：`timeout`/`drop` 归为临时性超时、`address` 归为永久性且落 `address_error`、`bad` **不抛异常**（采样保留、值为空、带原因，避免一个坏点让整批重试）、`disconnect` 持续失败（不是抖一次）、`faultAt` 只注入第 N 次而前后两次正常、缺省不注入、常量波形写后回读 |
 | `schedule/*` | 5 | 启动相位均匀铺开、单调时间换算与到期边界、调度器实际分配相位、相位按设备内最快点位周期、**uptime 用单调时钟**（校时跳变不会让它凭空多出一小时） |
 | `sdk/*` | 6 | 驱动注册契约：**SDK 版本不匹配直接拒绝**（错误消息里同时给出驱动声明与宿主要求的版本，且不留半注册状态）、**重复 id 拒绝且不覆盖先注册的驱动**、版本匹配时正常注册并把能力/传输声明原样透出；`check` 与启动共用同一份引用检查：**协议没注册时 `uic check` 退出码 2 并指出 `channels[x].protocol`**（同一份配置换成已注册驱动则通过），同一条通道只报一次；**分层边界由程序集实际引用表钉住**（Modbus/S7/BACnet 三个 codec 的实际引用里不得出现 `Uic.Transport`/`Engine`/`Runtime` 等 I/O 层、不得出现 `System.Net`，且必须依赖 `Uic.Domain` 作为反向对照） |
