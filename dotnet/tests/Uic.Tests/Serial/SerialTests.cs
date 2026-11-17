@@ -29,6 +29,7 @@ internal static class SerialTests
         tests.Add(new TestCase("serial/close_interrupts_blocked_read", CloseInterruptsBlockedRead));
         tests.Add(new TestCase("serial/half_duplex_does_not_cross_responses", HalfDuplexDoesNotCrossResponses));
         tests.Add(new TestCase("serial/rtu_waits_between_frames", RtuWaitsBetweenFrames));
+        tests.Add(new TestCase("serial/frame_gap_scales_then_floors_at_19200", FrameGapScalesThenFloors));
         tests.Add(new TestCase("serial/rtu_file_record_round_trip", RtuFileRecordRoundTrip));
     }
 
@@ -396,6 +397,37 @@ internal static class SerialTests
                 "the FC20 request on the wire has the documented shape");
 
             t.Ok(slave.Fault is null, $"the fake slave stayed healthy: {slave.Fault}");
+        });
+    }
+
+    /// <summary>
+    /// 帧间静默的取值规则（FR-COL-02）：低速链路按 3.5 个字符时间随波特率缩放，
+    /// 但 &gt;19200 bps 的链路规范规定固定 1.75 ms，不再缩放。
+    ///
+    /// 为什么单独立一条：<c>serial/rtu_waits_between_frames</c> 只在 300 bps 下量到
+    /// 「两次请求间隔 ≥100 ms」，验证的是「按波特率缩放」那一半；矩阵里写着的
+    /// 「&gt;19200 bps 固定 1.75 ms」这个上限分支此前没有任何断言——
+    /// 把它删掉（让高速链路也按字符时间缩放，在 115200 bps 下只有 0.33 ms）不会有用例失败。
+    /// </summary>
+    private static Task FrameGapScalesThenFloors(TestContext t)
+    {
+        return RunAsync(async () =>
+        {
+            // 300 bps：3.5 字符 × 11 位 / 300 bps ≈ 128.3 ms。
+            var slow = ModbusSerialTiming.FrameGap(300);
+            t.Close(128.3, slow.TotalMilliseconds, 0.5, "3.5 character times at 300 bps");
+
+            // 19200 bps 仍在缩放区间：3.5 × 11 / 19200 ≈ 2.005 ms。
+            var atFloor = ModbusSerialTiming.FrameGap(19200);
+            t.Close(2.005, atFloor.TotalMilliseconds, 0.05, "19200 bps is still scaled");
+
+            // >19200 bps：固定 1.75 ms，与波特率无关。
+            t.Close(1.75, ModbusSerialTiming.FrameGap(38400).TotalMilliseconds, 0.0001,
+                "38400 bps is floored at 1.75 ms");
+            t.Close(1.75, ModbusSerialTiming.FrameGap(921600).TotalMilliseconds, 0.0001,
+                "921600 bps is floored at 1.75 ms");
+
+            await Task.CompletedTask;
         });
     }
 

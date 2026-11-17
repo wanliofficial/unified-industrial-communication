@@ -88,6 +88,7 @@ internal static class ContractTests
         tests.Add(new TestCase("contract/auth_logout_revokes_session", AuthLogoutRevokesSession));
         tests.Add(new TestCase("contract/rate_limit_returns_429_with_the_shared_code", RateLimitReturns429));
         tests.Add(new TestCase("contract/metrics_report_live_sse_connections", MetricsReportLiveSseConnections));
+        tests.Add(new TestCase("contract/sse_refuses_the_connection_past_the_cap", SseRefusesTheConnectionPastTheCap));
         tests.Add(new TestCase("contract/metrics_export_runtime_series", MetricsExportRuntimeSeries));
         tests.Add(new TestCase("contract/stream_filters_by_point_pattern", StreamFiltersByPointPattern));
     }
@@ -2764,6 +2765,129 @@ internal static class ContractTests
             var value = double.Parse(line!.Split(' ')[1], CultureInfo.InvariantCulture);
             t.Equal(1d, value, "the gauge counts the live stream");
         });
+    }
+
+    /// <summary>
+    /// SSE 并发上限（`FR-NOR-03` 声称的「50 路并发上限」）：第 51 条必须被拒（429），
+    /// 而不是悄悄建一条永远收不到样本的流。
+    ///
+    /// 为什么单独立一条：`metrics_report_live_sse_connections` 的注释里写着「连接已经
+    /// 接近 50 上限」，但它只开了一条流。把 `MapStream` 里那句
+    /// `if (hub.ConnectionCount >= MaxSseConnections)` 整个删掉，此前没有任何用例会失败。
+    ///
+    /// 50 条流**并发**建立而不是串行：串行时每条都要等一次响应头，在负载重的机器上
+    /// 50 次累加会把这条用例拖到分钟级（实测出现过 35 s，甚至在重负载下触到 180 s 硬超时）。
+    /// 并发之后总耗时约等于最慢的那一条，用例才稳定。每条 `heartbeat=300` 建好后挂着不读，
+    /// 连接确实被占住。`ResponseHeadersRead` 在服务端 flush 首个 hello 后才返回，而
+    /// `hub.Subscribe` 就发生在写 hello 之前——所以「50 条都拿到响应头」等价于「50 条都已订阅」，
+    /// 再用 `uic_sse_connections` 复核连接数。
+    /// </summary>
+    private static Task SseRefusesTheConnectionPastTheCap(TestContext t)
+    {
+        return RunAsync(async () =>
+        {
+            RestApi.ResetRateLimitersForTests();
+            await using var host = await Host.StartAsync(t);
+
+            const int cap = 50;
+            var held = new List<HttpResponseMessage>(cap);
+            var requests = new List<HttpRequestMessage>(cap);
+
+            // 这条用例把 50 条流持住若干秒，而 Host 的 HttpClient 带 10 s 的 Timeout：
+            // 超时对 ResponseHeadersRead 之后的流式读取仍然生效，持流期间一旦被掐断，
+            // 连接数会掉下去，第 51 条就可能反过来被接受。所以单独用一个不设超时的客户端
+            // （取消仍由 t.Ct 控制，不会真的挂死）。
+            using var streamClient = new HttpClient
+            {
+                BaseAddress = host.Client.BaseAddress,
+                Timeout = Timeout.InfiniteTimeSpan,
+            };
+
+            try
+            {
+                // 并发建流：总耗时由最慢的一条决定，而不是 50 条相加。
+                var pending = new List<Task<HttpResponseMessage>>(cap);
+                for (var i = 0; i < cap; i++)
+                {
+                    var request = new HttpRequestMessage(HttpMethod.Get, "/api/v1/stream?heartbeat=300");
+                    request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", Token);
+                    request.Headers.Accept.ParseAdd("text/event-stream");
+                    pending.Add(streamClient.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, t.Ct));
+                    requests.Add(request);
+                }
+
+                var responses = await Task.WhenAll(pending);
+                held.AddRange(responses);
+                foreach (var response in responses)
+                    t.Equal(HttpStatusCode.OK, response.StatusCode, "every stream up to the cap is accepted");
+
+                // 都拿到响应头说明都已订阅；用指标复核连接数确实到 50。
+                await WaitForSseGaugeAsync(t, host, cap, "all streams are counted as live");
+
+                // 第 51 条：必须被拒。服务端在写响应头之前就抛 TooManyRequests，
+                // 所以拿不到 200。给它 20 s 上限：上限被删掉时它会一直挂着等 hello，
+                // 用例在这里判负而不是卡死。
+                using var overflow = new HttpRequestMessage(HttpMethod.Get, "/api/v1/stream?heartbeat=300");
+                overflow.Headers.Authorization = new AuthenticationHeaderValue("Bearer", Token);
+                overflow.Headers.Accept.ParseAdd("text/event-stream");
+
+                var sendTask = streamClient.SendAsync(overflow, HttpCompletionOption.ResponseHeadersRead, t.Ct);
+                if (await Task.WhenAny(sendTask, Task.Delay(TimeSpan.FromSeconds(20), t.Ct)) != sendTask)
+                    t.Fail("the 51st connection should be refused immediately, not hang waiting for hello");
+
+                using var rejected = await sendTask;
+                t.Equal((HttpStatusCode)429, rejected.StatusCode,
+                    "a connection past the cap is refused, not silently accepted");
+
+                using var envelope = await ReadJsonAsync(t, rejected);
+                t.Equal("request.rate_limited",
+                    envelope.RootElement.GetProperty("error").GetProperty("code").GetString(),
+                    "the refusal uses the shared throttling code");
+            }
+            finally
+            {
+                foreach (var response in held) response.Dispose();
+                foreach (var request in requests) request.Dispose();
+            }
+
+            // 名额必须能回收：全部释放后 gauge 归零，再连一条应当成功。
+            // 这条挡住「上限只增不减」或「释放时不减」的计数实现错误。
+            await WaitForSseGaugeAsync(t, host, 0, "the hub drained its subscribers after they disconnected");
+
+            using var again = new HttpRequestMessage(HttpMethod.Get, "/api/v1/stream?heartbeat=300");
+            again.Headers.Authorization = new AuthenticationHeaderValue("Bearer", Token);
+            again.Headers.Accept.ParseAdd("text/event-stream");
+            using var reconnected = await streamClient.SendAsync(
+                again, HttpCompletionOption.ResponseHeadersRead, t.Ct);
+            t.Equal(HttpStatusCode.OK, reconnected.StatusCode,
+                "a slot freed by a disconnect is usable again");
+        });
+    }
+
+    /// <summary>
+    /// 轮询 `/api/v1/metrics` 的 `uic_sse_connections`，等它走到期望值。
+    /// 用指标而不是 `SseHub` 实例：hub 在 `UseNorthbound` 内部创建，`Host` 拿不到引用。
+    /// </summary>
+    private static async Task WaitForSseGaugeAsync(TestContext t, Host host, double expected, string what)
+    {
+        var deadline = Stopwatch.StartNew();
+        string? line = null;
+
+        while (true)
+        {
+            var text = await host.Client.GetStringAsync("/api/v1/metrics", t.Ct);
+            line = text.Split('\n')
+                .FirstOrDefault(l => l.StartsWith("uic_sse_connections ", StringComparison.Ordinal));
+
+            if (line is not null &&
+                double.Parse(line.Split(' ')[1], CultureInfo.InvariantCulture) == expected)
+                return;
+
+            if (deadline.Elapsed > TimeSpan.FromSeconds(30))
+                t.Fail($"{what}: expected uic_sse_connections == {expected}, last saw {(line ?? "no series")}");
+
+            await Task.Delay(50, t.Ct);
+        }
     }
 
     /// <summary>

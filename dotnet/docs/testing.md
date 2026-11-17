@@ -16,9 +16,9 @@ dotnet run --project tests/Uic.Tests -- --stop-on-fail      # 首个失败即停
 正常输出：
 
 ```
-403 passed, 0 failed, 3 skipped · 1280.4s
+405 passed, 0 failed, 3 skipped · 725.7s
 ```
-加 `--opcua` 跑全量（含 3 条需外部 OPC UA 环境的端到端），全部 406 条都会跑。
+加 `--opcua` 跑全量（含 3 条需外部 OPC UA 环境的端到端），全部 408 条都会跑。
 不带 `--opcua` 时那 3 条显示 `skip`（原因 `requires --opcua`），不计入通过数。
 `load average` 5 左右那次实测 `401 passed, 2 failed`：两条失败都是 `contract/*`
 触到 180 s 硬超时，单独复跑分别 119.0 s / 109.6 s 全过——先腾空再判红，
@@ -66,6 +66,13 @@ dotnet run --project tests/Uic.Tests -- --stop-on-fail      # 首个失败即停
 3–39 s（最慢 `contract/idempotency_key_rejects_a_different_body` 39.1 s），又回到「有别的
 负载就整体排队」的节奏。这三轮每轮只多一条用例，耗时却是 218.5 / 1280.4 / 2878.4 s
 ——差别只在机器，不在代码。
+408 条（补了 SSE 50 路上限与串口帧间静默取值规则各一条）在 `load average` 5.3–6.4
+时量到 **725.7 s**，`405 passed, 0 failed, 3 skipped`。新增的两条差别极大：
+`serial/frame_gap_scales_then_floors_at_19200` 是纯函数，**2 ms**；`contract/sse_refuses_the_connection_past_the_cap`
+要真开满 50 条流，38.7 s。后者最初写成串行建流，读到 35.5 s、在重负载下甚至被 180 s
+硬超时截断——改成 50 条**并发**建流（`ResponseHeadersRead` 在服务端 flush 首个 hello 后才
+返回，而 `hub.Subscribe` 在写 hello 之前，所以「拿到响应头」即「已订阅」）之后，总耗时
+约等于最慢的那一条，才稳定下来。这也是本文档反复强调「别拿单次绝对秒数当基线」的又一个实例。
 `--opcua` 变体在同一份代码上 401 passed / 2 failed / 2972.4 s：两条失败都是
 180 s 硬超时（`contract/rate_limit_returns_429_with_the_shared_code`、
 `contract/metrics_report_live_sse_connections`），机器当时 `load average` 4.9–6.5；
@@ -120,12 +127,12 @@ NFR 的门槛是 120 s，压测用例、PBKDF2 派生与 TLS 握手是主要开�
 | `sdk/*` | 6 | 驱动注册契约：**SDK 版本不匹配直接拒绝**（错误消息里同时给出驱动声明与宿主要求的版本，且不留半注册状态）、**重复 id 拒绝且不覆盖先注册的驱动**、版本匹配时正常注册并把能力/传输声明原样透出；`check` 与启动共用同一份引用检查：**协议没注册时 `uic check` 退出码 2 并指出 `channels[x].protocol`**（同一份配置换成已注册驱动则通过），同一条通道只报一次；**分层边界由程序集实际引用表钉住**（Modbus/S7/BACnet 三个 codec 的实际引用里不得出现 `Uic.Transport`/`Engine`/`Runtime` 等 I/O 层、不得出现 `System.Net`，且必须依赖 `Uic.Domain` 作为反向对照） |
 | `loopback/*` | 16 | Modbus 主站 ↔ 内置从站的真实链路；含**指向未监听端口的真实连接拒绝**（`SocketException` → `comm_error`、可重试、消息带出端点、且立即返回而不是等到 `connectTimeout`） |
 | `s7/*` | 31 | S7comm：17 条手算黄金帧与地址解析（TPKT/COTP 握手、PDU 协商、读/写/位读写、长度字段按传输尺寸解释（0x03–0x07 位 / 0x09 字节）、错误分类、地址字段上限、**项数字段只有一字节（256 项当场失败而不是静默截断）**），14 条主站 ↔ 内置从站回环（探活、DB/I/Q/M 读、位读写、写输入区被拒、越界落 `address_error`、bool 缺 bit 被拒、数组、按 PDU 切片、单点装不下点名失败、沉默 PLC 超时、断线重连） |
-| `serial/*` | 8 | 真实伪终端上的 RTU / ASCII、半双工、帧间静默、deadline、关闭打断读 |
+| `serial/*` | 9 | 真实伪终端上的 RTU / ASCII、半双工、帧间静默、deadline、关闭打断读；帧间静默的取值规则（低速按 3.5 字符时间缩放、>19200 bps 固定 1.75 ms）用纯函数断言，不需要 pty |
 | `bacnet/*` | 28 | BACnet/IP：16 条手算黄金帧与地址解析（BVLC/NPDU 封拆帧、NPDU 版本必须为 1、ReadProperty/WriteProperty 帧字节、I-Am 设备实例、对象标识符 10/22 位编码、应用标签往返含扩展长度（LVT=5）、类型不符拒绝、NPDU 路由控制字节拒绝、**ACK 值里出现形似关闭标签的字节也不得截断**），11 条主站 ↔ 内置从站回环（Who-Is/I-Am 探活、**按 invoke-id 配对（从站先回一条 invoke-id 不对的响应，取错会读到别的点位的值而质量仍 good）**、多对象读、bool/字符串、写后回读、unknown-object/property 落 `address_error`、沉默设备超时、**实例号核对（配了 deviceInstance 却回错设备即失败，消息带出期望实例号）**、元数据声明 object 寻址与 udp），1 条 `uic sim` 端到端（**拿 DemoConfig 的开发配置起真实从站再用真实主站读一遍：端口/transport/对象号/四个点位全 good**，值域按正弦基线核对） |
 | `mqtt/*` | 34 | 测试内 broker：CONNECT/SUBSCRIBE 字段、QoS0/1、主题渲染、重连补发、**下线设备清 retained `$state`**、**命令去重窗口用单调时钟（校时跳变不会重复执行命令）**、**过期判定用单调「多久没收到报文」（校时跳变不伪造也不放过过期）**、TLS 发布与不可信 CA 拒绝；南向驱动：主题通配匹配、JSON 字段/类型/信封取值、首次读数前 `stale`、QoS0/1 取数、点位字段覆盖、坏载荷与恢复、断线重订阅、订阅被 ACL 拒绝 |
 | `template/*` | 4 | 50 实例批量生成、参数类型/缺失/未知参数拒绝、未声明占位符拒绝；**同一模板产出 Modbus 与 S7 两台设备并同时通过校验**（FR-CFG-01 验收口径） |
 | `csv/*` | 6 | 地址表达式（参考号/区域偏移/分列）、按 id 合并与冲突行号、死区模式与量程列、点位周期列、数组元素个数列 |
-| `contract/*` | 44 | 进程内真实 Kestrel 的 REST 契约（含驱动能力、**Prometheus 抓取端点的真实运行期序列**（HELP/TYPE、设备数与采集中设备数、无 sink 时仍导出 0、逐值可解析）、模板、CSV、导入导出、单点幂等、**幂等窗口用单调时钟**（校时跳变既不重复执行写命令、也不会永不失效）、**同一幂等键配另一份请求体返回 409**、**幂等台账随运行时实例走**（进程级静态字典会让新实例把重投当成重放、返回另一台网关的结果）、资源降级联动、脱敏配置往返、明文凭据被拒、journal 历史查询、审计写入/导出/拒绝留痕、点位有效周期、数组元素个数与值形态、**写入值按 scale/offset 反算成原始值**、**每个凭据字段（含 certificatePassword）在读写两侧都脱敏**、**驱动没注册时 apply 返回 422 并指出通道**（不是 500，也不会把在跑的设备拆掉）、**分页游标不合法时 400 而不是静默重来**、**超配额返回 429 且与登录锁定同 code**、**`uic_sse_connections` 反映真实连接数**（写死成 0 时看板永远显示没人订阅）、**SSE 按 `device/point` 过滤**（分隔符写错只是静默不出样本，所以质量码写错改为 400；未知 `quality` 不再建一条永远空的流）、**写请求体语法错误归 400 `request.invalid_json` 而不是冒成 500**（`JsonException` 不是 `ApiException`，不就地翻译就会被最外层兜底 catch 当成网关故障返回 500，污染告警与错误看板——配置导入早就归 422/400，写接口必须一致）、**v0 旧字段写成非字符串归 422/`valid:false` 而不是冒成 500**（迁移链 `GetValue<string>()` 遇数字/对象会抛裸 `InvalidOperationException`，REST 只按 `ConfigException` 分类「配置非法」，裸异常会冒成网关故障——和写请求体语法错误同类）、**`outbox.droppedLastHour` 是一小时窗口而不是累计值**、**停用设备仍在列表里但两个 state 分开表达**、HTTPS 监听、控制台新建设备的完整链路；认证的 5 条见 `contract/auth_*`） |
+| `contract/*` | 45 | 进程内真实 Kestrel 的 REST 契约（含驱动能力、**Prometheus 抓取端点的真实运行期序列**（HELP/TYPE、设备数与采集中设备数、无 sink 时仍导出 0、逐值可解析）、模板、CSV、导入导出、单点幂等、**幂等窗口用单调时钟**（校时跳变既不重复执行写命令、也不会永不失效）、**同一幂等键配另一份请求体返回 409**、**幂等台账随运行时实例走**（进程级静态字典会让新实例把重投当成重放、返回另一台网关的结果）、资源降级联动、脱敏配置往返、明文凭据被拒、journal 历史查询、审计写入/导出/拒绝留痕、点位有效周期、数组元素个数与值形态、**写入值按 scale/offset 反算成原始值**、**每个凭据字段（含 certificatePassword）在读写两侧都脱敏**、**驱动没注册时 apply 返回 422 并指出通道**（不是 500，也不会把在跑的设备拆掉）、**分页游标不合法时 400 而不是静默重来**、**超配额返回 429 且与登录锁定同 code**、**`uic_sse_connections` 反映真实连接数**（写死成 0 时看板永远显示没人订阅）、**SSE 按 `device/point` 过滤**（分隔符写错只是静默不出样本，所以质量码写错改为 400；未知 `quality` 不再建一条永远空的流）、**SSE 50 路并发上限**（真开满 50 条流 → 第 51 条 429 `request.rate_limited`，全部释放后名额可复用；删掉上限判断则第 51 条会挂死等 hello，用例用 10 s 保护判 FAIL）、**写请求体语法错误归 400 `request.invalid_json` 而不是冒成 500**（`JsonException` 不是 `ApiException`，不就地翻译就会被最外层兜底 catch 当成网关故障返回 500，污染告警与错误看板——配置导入早就归 422/400，写接口必须一致）、**v0 旧字段写成非字符串归 422/`valid:false` 而不是冒成 500**（迁移链 `GetValue<string>()` 遇数字/对象会抛裸 `InvalidOperationException`，REST 只按 `ConfigException` 分类「配置非法」，裸异常会冒成网关故障——和写请求体语法错误同类）、**`outbox.droppedLastHour` 是一小时窗口而不是累计值**、**停用设备仍在列表里但两个 state 分开表达**、HTTPS 监听、控制台新建设备的完整链路；认证的 5 条见 `contract/auth_*`） |
 | `secret/*` | 9 | 凭据引用：环境变量 / 密钥文件解析、缺失变量硬失败（不能静默变成空令牌）、明文被拒、空值合法、`enc:v1` 封解与篡改拒绝、未知方案与版本、摘要不泄露明文 |
 | `tls/*` | 4 | 证书必填且可读、PFX 口令必须是引用、`insecureSkipVerify` 依赖 `tls.enabled`；证书/CA 不接受凭据引用；**CA 文件内容不是 PEM 时拒绝**（`ImportFromPemFile` 对非 PEM 内容不抛异常、只导入 0 张证书，等于静默退回系统信任库），空文件仍是「显式不配 CA」 |
 | `audit/*` | 7 | 审计落盘：按动作/结果/身份查询、重启后序号单调且旧记录可查、按大小轮转与保留只删旧文件、禁用时不写盘、断电半行跳过、按文件名日期跳过无关归档、分页最新在前 |
