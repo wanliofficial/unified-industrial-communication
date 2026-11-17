@@ -79,6 +79,23 @@ public sealed class OpcUaClientDriver : IDriver
         },
     };
 
+    /// <summary>一次 Read/Write 里最多带多少个节点；服务端未声明上限、或声明的上限更大时用它。</summary>
+    internal const int DefaultBatchNodes = 500;
+
+    /// <summary>
+    /// 单次 Read / Write 服务的节点上限：服务端声明的 <c>MaxNodesPerRead</c> 若比默认批量小就用它，
+    /// 否则用默认批量。**返回值始终 ≥1**——调用方按这个步长递增偏移，返回 0 会让分片循环原地打转
+    /// （不是慢，是永久卡住本轮采集）。服务端根本不声明上限时也必须回落到正的默认值。
+    ///
+    /// 放在驱动类上而不是会话类上：它是一条与"怎么连"无关的批处理规则，
+    /// 抽成纯函数才能被用例直接钉住（缺失 / 0 / 超大三种输入）。
+    /// </summary>
+    internal static int MaxNodes(uint? operationLimit)
+    {
+        var limit = operationLimit ?? 0;
+        return limit is > 0 and < DefaultBatchNodes ? (int)limit : DefaultBatchNodes;
+    }
+
     public IConn Open(OpenContext context) => new OpcUaConn(context);
 }
 
@@ -93,9 +110,6 @@ internal sealed class OpcUaConn : ISubscriptionConn
     /// 初始化串行化，代价只是首连时几十毫秒。
     /// </summary>
     private static readonly SemaphoreSlim CertGate = new(1, 1);
-
-    /// <summary>一次 Read/Write 里最多带多少个节点；服务端上限未知时的保守值。</summary>
-    private const int DefaultBatchNodes = 500;
 
     private readonly OpenContext _ctx;
     private readonly OpcUaClientOptions _options;
@@ -172,7 +186,7 @@ internal sealed class OpcUaConn : ISubscriptionConn
         if (pending.Count == 0) return samples;
 
         var session = await EnsureSessionAsync(ct).ConfigureAwait(false);
-        var batch = MaxNodes(session);
+        var batch = OpcUaClientDriver.MaxNodes(session.OperationLimits?.MaxNodesPerRead);
 
         try
         {
@@ -242,7 +256,7 @@ internal sealed class OpcUaConn : ISubscriptionConn
         if (pending.Count == 0) return results.Select(r => r!).ToArray();
 
         var session = await EnsureSessionAsync(ct).ConfigureAwait(false);
-        var batch = MaxNodes(session);
+        var batch = OpcUaClientDriver.MaxNodes(session.OperationLimits?.MaxNodesPerRead);
 
         try
         {
@@ -620,12 +634,6 @@ internal sealed class OpcUaConn : ISubscriptionConn
             error = ex.Message;
             return false;
         }
-    }
-
-    private static int MaxNodes(ISession session)
-    {
-        var limit = session.OperationLimits?.MaxNodesPerRead ?? 0;
-        return limit is > 0 and < DefaultBatchNodes ? (int)limit : DefaultBatchNodes;
     }
 
     private DriverException Translate(Exception ex, string op)

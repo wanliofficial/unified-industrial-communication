@@ -49,6 +49,7 @@ public sealed class AuditLog : IDisposable
 
     private readonly object _gate = new();
     private readonly string _dataDir;
+    private readonly TimeProvider _time;
 
     private AuditOptions _options;
     private string _directory;
@@ -61,10 +62,11 @@ public sealed class AuditLog : IDisposable
     private int _warned;
     private int _disposed;
 
-    public AuditLog(string dataDir, AuditOptions? options = null)
+    public AuditLog(string dataDir, AuditOptions? options = null, TimeProvider? time = null)
     {
         _dataDir = dataDir;
         _options = options ?? new AuditOptions();
+        _time = time ?? TimeProvider.System;
         _directory = Resolve(_options.Directory);
 
         if (_options.Enabled)
@@ -147,7 +149,7 @@ public sealed class AuditLog : IDisposable
     {
         var entry = new AuditEntry(
             Interlocked.Increment(ref _seq),
-            DateTimeOffset.UtcNow,
+            _time.GetUtcNow(),
             action,
             result,
             actor,
@@ -172,7 +174,10 @@ public sealed class AuditLog : IDisposable
         {
             if (_disposed != 0) return;
 
-            var now = DateTimeOffset.UtcNow;
+            // 用条目自己的时间戳驱动切分，而不是再取一次时钟：两次取时钟之间若被
+            // 校时拨过午夜，会出现「文件按新的一天命名、条目却记着旧的一天」——
+            // 按日期归档的审计读起来会自相矛盾。同一个时间戳只取一次。
+            var now = entry.At;
             if (!EnsureOpenLocked(now)) return;
 
             // 先判断再写：只有在「这一行会超限」时才换文件，不产生一个超限文件。

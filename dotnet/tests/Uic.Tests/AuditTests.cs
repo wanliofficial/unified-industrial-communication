@@ -16,6 +16,8 @@ internal static class AuditTests
         tests.Add(new TestCase("audit/entries_are_queryable", EntriesAreQueryable));
         tests.Add(new TestCase("audit/survives_restart", SurvivesRestart));
         tests.Add(new TestCase("audit/rotates_and_prunes", RotatesAndPrunes));
+        tests.Add(new TestCase("audit/new_file_at_utc_midnight", NewFileAtUtcMidnight));
+        tests.Add(new TestCase("audit/failed_writes_degrade_instead_of_throwing", FailedWritesDegradeInsteadOfThrowing));
         tests.Add(new TestCase("audit/disabled_writes_nothing", DisabledWritesNothing));
         tests.Add(new TestCase("audit/corrupt_tail_is_ignored", CorruptTailIsIgnored));
         tests.Add(new TestCase("audit/file_date_skips_unrelated_archives", FileDateSkipsUnrelatedArchives));
@@ -103,9 +105,92 @@ internal static class AuditTests
         t.Equal("v1/p99", page.Items[0].Target, "the last written record is not pruned");
     }
 
-    private static async Task DisabledWritesNothing(TestContext t)
+    /// <summary>
+    /// 按 UTC 日切分审计文件（FR-OPS-04）：跨零点时换一个新文件，而不是继续往当天的文件里追加。
+    ///
+    /// 为什么单独立一条：FR-OPS-04 声称「按天 + 按大小切分」，但此前的用例只覆盖了按大小
+    /// 轮转（<c>audit/rotates_and_prunes</c>）和查询侧按文件日期跳过无关归档
+    /// （<c>audit/file_date_skips_unrelated_archives</c>）。没有一条断言「写入跨过 UTC
+    /// 零点时真的换文件」。<c>AuditLog</c> 原本直接读 <c>DateTimeOffset.UtcNow</c>，
+    /// 切分时刻无法被用例拨动——先给审计日志注入一个可拨的 <see cref="TimeProvider"/>，
+    /// 这条规则才可被钉住。切分按 UTC 日做（文件名里的日期戳也是 UTC）。
+    /// </summary>
+    private static async Task NewFileAtUtcMidnight(TestContext t)
     {
-        using var log = new AuditLog(t.TempDir, new AuditOptions { Enabled = false });
+        var clock = new FakeClock();
+        using var log = new AuditLog(t.TempDir, null, clock);
+
+        log.Write("point.write", "ok", "bearer", "rest", target: "v1/before-midnight");
+        var firstPath = log.ActivePath;
+        t.Ok(firstPath is not null, "the first write opened a file");
+
+        // 直接拨到「下一个 UTC 午夜之后」，而不是固定加 5 分钟：FakeClock 从真实
+        // 当前时刻起，加固定时长只在真实时间恰好临近午夜时才跨天——那样的用例
+        // 一天里只有几分钟能过。按「到下一个整点日界的距离」推进，任何时刻跑都跨天。
+        var now = clock.GetUtcNow();
+        var nextMidnight = new DateTimeOffset(now.UtcDateTime.Date.AddDays(1), TimeSpan.Zero);
+        var toMidnight = nextMidnight - now + TimeSpan.FromSeconds(30);
+        clock.Advance(toMidnight, toMidnight);
+
+        log.Write("point.write", "ok", "bearer", "rest", target: "v1/after-midnight");
+        var secondPath = log.ActivePath;
+
+        t.Ok(secondPath is not null, "the write after midnight opened a file");
+        t.Ok(!string.Equals(firstPath, secondPath, StringComparison.Ordinal),
+            "crossing UTC midnight opens a new file instead of appending to the old one");
+
+        // 旧文件里的记录仍然可读、seq 继续累加，不因换文件而回退。
+        // 查询窗口必须跟着拨过的时钟走：模块级的 From/To 取自真实当前时间，
+        // 而这两条记录已被拨到「次日」，用默认窗口只会查到第二天这一条。
+        var after = clock.GetUtcNow();
+        var page = await log.QueryAsync(new AuditQuery(
+            null, null, null, null, after.AddHours(-30), after.AddMinutes(5), 100));
+        t.Equal(2, page.Total, "both days' records remain queryable");
+        t.Equal("v1/after-midnight", page.Items[0].Target, "the newest record comes first");
+    }
+
+    /// <summary>
+    /// 审计写不进去时降级而不是把业务拖下水（FR-OPS-04）：目录建不出来（只读挂载、权限错、
+    /// 磁盘满）时，<c>Write</c> **仍然返回条目、不抛异常**，只是把失败计入
+    /// <c>WriteFailures</c>（指标暴露成 <c>uic_audit_write_failures</c>）并告警一次。
+    ///
+    /// 为什么单独立一条：这是「审计是观测，不是业务前置条件」这句话唯一可被证伪的地方。
+    /// 反过来写（抛异常）会让一次点位写入或一次配置生效因为磁盘满而失败——用一个观测问题
+    /// 制造一次生产事故。把目录指到一个已存在的**普通文件**上，`CreateDirectory` 必然失败，
+    /// 这就是真实的注入点，不需要改权限或造磁盘满。
+    /// </summary>
+    private static Task FailedWritesDegradeInsteadOfThrowing(TestContext t)
+    {
+        // 建一个普通文件，再把「审计目录」指到它上面：目录建不出来。
+        var blocker = Path.Combine(t.TempDir, "not-a-directory");
+        File.WriteAllText(blocker, "occupied");
+
+        using var log = new AuditLog(t.TempDir, new AuditOptions { Directory = blocker });
+
+        AuditEntry? first = null;
+        var threw = false;
+        try
+        {
+            first = log.Write("point.write", "ok", "bearer", "rest", target: "v1/a");
+            log.Write("point.write", "ok", "bearer", "rest", target: "v1/b");
+        }
+        catch
+        {
+            threw = true;
+        }
+
+        t.Ok(!threw, "a failing audit sink never throws into the business path");
+        t.Ok(first is not null, "the entry is still handed back to the caller");
+        t.Ok(first!.Seq > 0, "sequence numbers keep advancing even when nothing lands on disk");
+        t.Ok(log.WriteFailures > 0,
+            $"the failure is counted for the metric, got {log.WriteFailures}");
+        t.Equal(0, log.Files().Count, "no file was created for the unwritable directory");
+
+        return Task.CompletedTask;
+    }
+
+    private static async Task DisabledWritesNothing(TestContext t)
+    {        using var log = new AuditLog(t.TempDir, new AuditOptions { Enabled = false });
 
         var entry = log.Write("point.write", "ok", "bearer", "rest", target: "v1/temp");
 

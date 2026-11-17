@@ -127,7 +127,8 @@ public sealed class GatewayRuntime : IGatewayControl, IAsyncDisposable
         _engine.Start(config);
 
         // 审计随数据目录走，默认开启：它是「谁改了什么」的唯一落盘记录。
-        _audit = new AuditLog(dataDir, config.Storage.Audit);
+        // 时钟与运行时同源：审计按天切分的日界要和其它按天逻辑一致，且用例能拨动它。
+        _audit = new AuditLog(dataDir, config.Storage.Audit, clock ?? TimeProvider.System);
 
         // 账号库与审计放在同一层「运行期状态」：都不属于配置文件，也不参与版本回滚。
         _auth = new AuthService(dataDir, message => logs.CreateLogger("uic.security").LogWarning("{Message}", message));

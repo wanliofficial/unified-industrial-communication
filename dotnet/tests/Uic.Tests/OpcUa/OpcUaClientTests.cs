@@ -30,6 +30,7 @@ internal static class OpcUaClientTests
         tests.Add(new TestCase("opcua/options_from_channel_and_labels", OptionsFromChannelAndLabels));
         tests.Add(new TestCase("opcua/options_reject_bad_config", OptionsRejectsBadConfig));
         tests.Add(new TestCase("opcua/endpoint_selection_never_downgrades", EndpointSelectionNeverDowngrades));
+        tests.Add(new TestCase("opcua/batch_size_never_zero_and_follows_operation_limit", BatchSizeNeverZeroAndFollowsOperationLimit));
     }
 
     // ------------------------------------------------------------------
@@ -552,6 +553,38 @@ internal static class OpcUaClientTests
         t.Equal("Basic256Sha256", OpcUaClientOptions.PolicyName(SecurityPolicies.Basic256Sha256),
             "policy URIs shorten to their name");
         t.Equal("None", OpcUaClientOptions.PolicyName(null), "a missing URI means None");
+
+        return Task.CompletedTask;
+    }
+
+    /// <summary>
+    /// 单次服务的节点批量（FR-COL-05 的「按 <c>MaxNodesPerRead</c> 分片」）：
+    /// 服务端声明的上限比默认批量小时按上限切，否则按默认批量；**任何输入都不得返回 0**。
+    ///
+    /// 为什么单独立一条：批量大小决定「一轮采集要发几次 Read 服务调用」。这个值若退化成 0，
+    /// <c>for (offset += batch)</c> 的循环会原地打转——不是慢，是永久卡住本轮采集。
+    /// 服务端不声明上限（内置服务端就是这样）也必须回落到一个正的默认值。
+    /// </summary>
+    private static Task BatchSizeNeverZeroAndFollowsOperationLimit(TestContext t)
+    {
+        var fallback = OpcUaClientDriver.DefaultBatchNodes;
+
+        t.Equal(fallback, OpcUaClientDriver.MaxNodes(null),
+            "a server that does not advertise a limit falls back to the default batch");
+        t.Equal(fallback, OpcUaClientDriver.MaxNodes(0u),
+            "zero is not a usable batch; it must not be returned as-is");
+
+        t.Equal(5, OpcUaClientDriver.MaxNodes(5u), "a smaller advertised limit is honoured");
+        t.Equal(1, OpcUaClientDriver.MaxNodes(1u), "the smallest usable batch is still 1");
+
+        t.Equal(fallback, OpcUaClientDriver.MaxNodes((uint)fallback),
+            "a limit exactly equal to the default keeps the default");
+        t.Equal(fallback, OpcUaClientDriver.MaxNodes(100_000u),
+            "a limit larger than the default does not inflate the batch");
+
+        foreach (var limit in new uint?[] { null, 0, 1, 5, 499, 500, 501, uint.MaxValue })
+            t.Ok(OpcUaClientDriver.MaxNodes(limit) >= 1,
+                $"batch is never zero (limit {limit?.ToString() ?? "null"})");
 
         return Task.CompletedTask;
     }

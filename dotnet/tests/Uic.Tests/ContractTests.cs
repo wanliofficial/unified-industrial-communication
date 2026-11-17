@@ -1898,6 +1898,30 @@ internal static class ContractTests
 
             t.Equal(HttpStatusCode.UnprocessableEntity, duplicate.StatusCode,
                 "duplicate device ids are rejected");
+
+            // 模板实例化会改设备表，必须在审计里点名到具体设备与模板；
+            // 预览（apply=false）不改配置，不该留痕。重复 apply 在进入审计包装之前
+            // 就被校验拒绝（422），因此也不产生记录——这里的 1 条正好同时证明这两件事。
+            using (var audit = await ReadJsonAsync(t,
+                       await host.Client.SendAsync(
+                           Get("/api/v1/audit?action=config.template_instantiate"), t.Ct)))
+            {
+                t.Equal(1, audit.RootElement.GetProperty("total").GetInt32(),
+                    "only the applied run is recorded; the preview and the rejected duplicate are not");
+
+                var entry = audit.RootElement.GetProperty("items")[0];
+                t.Equal("ok", entry.GetProperty("result").GetString(), "the applied run is recorded as ok");
+
+                var detail = entry.GetProperty("detail");
+                t.Equal("virtual-meter", detail.GetProperty("template").GetString(),
+                    "the record names the template");
+                t.Ok(detail.GetProperty("devices").EnumerateArray()
+                        .Select(d => d.GetString()).OrderBy(d => d, StringComparer.Ordinal)
+                        .SequenceEqual(new[] { "meter-1", "meter-2" }),
+                    "the record names every device it created");
+                t.Ok(entry.GetProperty("target").GetString()!.StartsWith('v'),
+                    "the record points at the version it produced");
+            }
         });
     }
 
@@ -1960,6 +1984,22 @@ internal static class ContractTests
                 t.Contains(document.RootElement.GetProperty("problems")[0].GetProperty("path").GetString()!,
                     "line 2", "the problem points at the offending line");
             }
+
+            // 点表导入是批量改动点位，审计要能回答「给哪台设备加了几个点」。
+            // 预览不改配置、坏行被拒也不改配置，两者都不该留痕。
+            using (var audit = await ReadJsonAsync(t,
+                       await host.Client.SendAsync(
+                           Get("/api/v1/audit?action=config.points_import"), t.Ct)))
+            {
+                t.Equal(1, audit.RootElement.GetProperty("total").GetInt32(),
+                    "only the applied import is recorded; preview and rejected rows are not");
+
+                var entry = audit.RootElement.GetProperty("items")[0];
+                t.Equal("v1", entry.GetProperty("target").GetString(),
+                    "the record names the device whose point table changed");
+                t.Equal(4, entry.GetProperty("detail").GetProperty("total").GetInt32(),
+                    "the record counts the point table after the import");
+            }
         });
     }
 
@@ -2006,6 +2046,26 @@ internal static class ContractTests
                     result.RootElement.GetProperty("config").GetProperty("northbound")
                         .GetProperty("rest").GetProperty("token").GetString(),
                     "the bearer token never leaves the gateway by default");
+            }
+
+            // 未脱敏导出会把凭据引用带出机器，必须留痕；默认的脱敏导出不写这条。
+            // 没有这条断言，「谁把凭据带走了」就只能靠人记得去读代码。
+            using (var audit = await ReadJsonAsync(t,
+                       await host.Client.SendAsync(Get("/api/v1/audit?action=config.export"), t.Ct)))
+            {
+                t.Equal(1, audit.RootElement.GetProperty("total").GetInt32(),
+                    "only the unredacted export is recorded; the default one is not");
+                t.Equal("config",
+                    audit.RootElement.GetProperty("items")[0].GetProperty("target").GetString(),
+                    "the export record points at the whole configuration");
+            }
+
+            // 导入会整体替换配置，是最需要留痕的一条：谁、从哪儿、换成哪个版本。
+            using (var audit = await ReadJsonAsync(t,
+                       await host.Client.SendAsync(Get("/api/v1/audit?action=config.import"), t.Ct)))
+            {
+                t.Equal(1, audit.RootElement.GetProperty("total").GetInt32(),
+                    "the applied import is recorded exactly once");
             }
         });
     }
