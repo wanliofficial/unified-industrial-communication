@@ -127,6 +127,49 @@ func decodeSIQQuality(b byte) Quality {
 	return Quality((b >> 3) & byte(siqQualityMask))
 }
 
+// BCR（二进制计数器读数）第 5 字节里的标志位。低 5 位是序号，不是品质。
+const (
+	bcrSeqMask  = 0x1F
+	bcrCarry    = 1 << 5 // CY：计数期间发生进位（已溢出）
+	bcrAdjusted = 1 << 6 // CA：计数器被人工调整过
+	bcrInvalid  = 1 << 7 // IV：读数无效
+)
+
+// decodeBCRQuality 把 BCR 的标志位折成本包的品质位集合。
+//
+// IV 是「这个读数不能信」，必须落成 QInvalid（→ bad）。CY/CA 不是坏值，
+// 但它们说明这个计数与上一周期不可比：进位让增量算成了负数，人工调整让
+// 差值为假。两者都落成 uncertain，绝不能悄悄算成 good——电能量结算按
+// 增量计费，一个假的增量就是一笔错账。
+func decodeBCRQuality(b byte) Quality {
+	var q Quality
+	if b&bcrCarry != 0 {
+		q |= QOverflow
+	}
+	if b&bcrAdjusted != 0 {
+		q |= QSubstituted
+	}
+	if b&bcrInvalid != 0 {
+		q |= QInvalid
+	}
+	return q
+}
+
+// encodeBCRQuality 是 decodeBCRQuality 的逆运算，保留原始序号位。
+func encodeBCRQuality(raw byte, q Quality) byte {
+	out := raw & bcrSeqMask
+	if q.Has(QOverflow) {
+		out |= bcrCarry
+	}
+	if q.Has(QSubstituted) {
+		out |= bcrAdjusted
+	}
+	if q.Has(QInvalid) {
+		out |= bcrInvalid
+	}
+	return out
+}
+
 // encodeSIQQuality 把归一化品质位写进 SIQ/DIQ 字节的高 4 位。
 func encodeSIQQuality(q Quality) byte {
 	return byte(q&siqQualityMask) << 3
@@ -143,7 +186,7 @@ func encodeSIQQuality(q Quality) byte {
 //	归一化     Num（-1..1）/ Quality / Time
 //	标度化     Num（int16）/ Quality / Time
 //	短浮点     Num / Quality / Time
-//	累计量     Uint / Raw（序号字节）
+//	累计量     Uint / Raw（BCR 序号，低 5 位）/ Quality（CY/CA/IV）
 //	命令       Bool 或 Uint 或 Num / Select / Qualifier
 //	召唤/同步  Qualifier 或 Time
 type Object struct {
@@ -535,7 +578,15 @@ func decodeElement(typeID byte, b []byte) (Object, int, error) {
 			Time: decodeCP56Time2a(b[5:12]),
 		}, size, nil
 	case TypeIntegratedTotals:
-		return Object{Uint: binary.LittleEndian.Uint32(b[0:4]), Raw: b[4]}, size, nil
+		// BCR（二进制计数器读数）第 5 字节：低 5 位是序号 SQ，bit5=CY
+		// （进位）、bit6=CA（计数器被调整）、bit7=IV（值无效）。
+		// 只取低 32 位而把这一字节整个丢掉，等于把设备明确标注的
+		// 「这个累计量已经不可信」翻译成 good——电能量结算场景下这是
+		// 最不该静默的一类错误（钱算错了没人会发现）。
+		return Object{
+			Uint: binary.LittleEndian.Uint32(b[0:4]),
+			Raw:  b[4], Quality: decodeBCRQuality(b[4]),
+		}, size, nil
 	case TypeSingleCommand:
 		return Object{Bool: b[0]&0x01 != 0, Select: b[0]&0x80 != 0, Qualifier: (b[0] >> 2) & 0x1F}, size, nil
 	case TypeDoubleCommand:
@@ -610,7 +661,7 @@ func appendElement(b []byte, typeID byte, o Object) ([]byte, error) {
 		return b, nil
 	case TypeIntegratedTotals:
 		b = binary.LittleEndian.AppendUint32(b, o.Uint)
-		return append(b, o.Raw), nil
+		return append(b, encodeBCRQuality(o.Raw, o.Quality)), nil
 	case TypeSingleCommand:
 		var v byte
 		if o.Bool {
@@ -661,10 +712,25 @@ func appendElement(b []byte, typeID byte, o Object) ([]byte, error) {
 	return nil, fmt.Errorf("unsupported type %d", typeID)
 }
 
+// normalized 把 16 位定点数还原成 -1..1 的浮点。
+//
+// 除数是 32768 而不是 32767：标准里归一化值的定义就是 N/32768，因此
+// 取值范围是 -1 .. 1-2^-15，「+1」本身不可表示。用 32767 当分母会让
+// 每一个值都比标准值大 0.003%，而满量程 32767 会「刚好」显示成 1.0，
+// 看起来更漂亮，实际是把设备的定标悄悄改了。
 func normalized(b []byte) float64 {
 	return float64(int16(binary.LittleEndian.Uint16(b))) / 32768
 }
 
+// encodeNormalized 是 normalized 的逆运算：同样按 32768 定标。
+//
+// 编码与解码必须用同一个分母。用 32767 编码、32768 解码（一份很常见的
+// 「对称看起来差不多」的写法）会让每一个读写往返都缩小 0.003%：读回
+// 来的值再写下去、再读回来，数值会缓慢爬向 0。这点误差在单点上确实
+// 看不出来，但斜坡给定、闭环调试这类场景会持续累积。
+//
+// 夹紧是必须的：round(1.0*32768) = 32768 已经溢出 int16，直接转 uint16
+// 会回绕成 -32768，也就是把「满量程」写成「负满量程」。
 func encodeNormalized(v float64) uint16 {
 	if v > 1 {
 		v = 1
@@ -672,7 +738,14 @@ func encodeNormalized(v float64) uint16 {
 	if v < -1 {
 		v = -1
 	}
-	return uint16(int16(math.Round(v * 32767)))
+	n := int(math.Round(v * 32768))
+	if n > math.MaxInt16 {
+		n = math.MaxInt16
+	}
+	if n < math.MinInt16 {
+		n = math.MinInt16
+	}
+	return uint16(int16(n))
 }
 
 // ---------------------------------------------------------------------------
@@ -722,12 +795,22 @@ func decodeCP56Time2a(b []byte) *time.Time {
 	hour := int(b[3] & 0x1F)
 	day := int(b[4] & 0x1F)
 	month := int(b[5] & 0x0F)
-	year := 2000 + int(b[6])
+	// 年字节只有低 7 位有定义，最高位是保留位。不掩掉它，一个把保留位
+	// 置 1 的从站会让「2026 年」变成「2126 年」——而 2126 是一个语法上
+	// 完全合法的时间，下游没有任何理由拒绝它。
+	year := 2000 + int(b[6]&0x7F)
 	if minute > 59 || hour > 23 || day < 1 || day > 31 || month < 1 || month > 12 {
 		return nil
 	}
 	t := time.Date(year, time.Month(month), day, hour, minute,
 		ms/1000, (ms%1000)*int(time.Millisecond), time.Local)
+	// time.Date 会把越界日期**静默规范化**：2 月 31 日变成 3 月 3 日。
+	// 那是把「设备给了一个非法时间」改写成「一个合法但错误的时间」，比
+	// 直接判无效危险得多。回读一次，只接受原样保留的日期。
+	if t.Year() != year || int(t.Month()) != month || t.Day() != day ||
+		t.Hour() != hour || t.Minute() != minute {
+		return nil
+	}
 	return &t
 }
 

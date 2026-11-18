@@ -111,6 +111,7 @@ func newTestConn(t *testing.T, w *wireLink, dev model.Device) *conn {
 		ackCh:    make(chan struct{}, 1),
 		started:  make(chan struct{}),
 		pending:  map[uint32]chan iec104.ASDU{},
+		dead:     make(chan struct{}),
 	}
 	c.lastRecv.Store(time.Now().UnixNano())
 	return c
@@ -845,13 +846,15 @@ func TestSendASDUWindowReopensOnAck(t *testing.T) {
 	w := newWireLink()
 	c := newTestConn(t, w, testDevice(pt("f", AreaIOA, 1, model.TypeFloat32, false)))
 	c.timeout = time.Second
+	// 模拟「已经发出 12 帧、一帧都没被确认」：sendSeq=12、ackPoint=0。
+	c.sendSeq = defaultK
 	c.unacked = defaultK
 	asdu, _ := iec104.BuildInterrogation(1, iec104.QOIStation)
 
 	done := make(chan error, 1)
 	go func() { done <- c.sendASDU(asdu) }()
 	time.Sleep(30 * time.Millisecond)
-	c.noteAck()
+	c.noteAck(defaultK)
 	select {
 	case err := <-done:
 		if err != nil {
@@ -860,8 +863,40 @@ func TestSendASDUWindowReopensOnAck(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("send did not resume after ack")
 	}
-	if c.sendSeq != 1 {
+	if c.sendSeq != defaultK+1 {
 		t.Fatalf("sendSeq = %d", c.sendSeq)
+	}
+}
+
+// 只确认了一部分的 S 帧不得把整个窗口打开：一个「只到第 3 帧」的确认
+// 不能让我们以为 12 帧都被确认了。这是 k 窗口唯一有意义的语义。
+func TestNoteAckOnlyAdvancesByConfirmedCount(t *testing.T) {
+	c := newTestConn(t, newWireLink(), testDevice(pt("f", AreaIOA, 1, model.TypeFloat32, false)))
+	c.sendSeq = 12
+	c.unacked = 12
+	c.ackPoint = 0
+
+	c.noteAck(3)
+	if c.unacked != 9 {
+		t.Fatalf("unacked = %d, want 9 (only 3 frames confirmed)", c.unacked)
+	}
+	if c.ackPoint != 3 {
+		t.Fatalf("ackPoint = %d, want 3", c.ackPoint)
+	}
+	// 迟到的旧确认（ack 更小）不得改变窗口。
+	c.noteAck(1)
+	if c.unacked != 9 || c.ackPoint != 3 {
+		t.Fatalf("stale ack moved the window: unacked=%d ackPoint=%d", c.unacked, c.ackPoint)
+	}
+	// 全部确认。
+	c.noteAck(12)
+	if c.unacked != 0 || c.ackPoint != 12 {
+		t.Fatalf("unacked=%d ackPoint=%d", c.unacked, c.ackPoint)
+	}
+	// 确认越过已发送的序号必须被忽略（不能把窗口算成负的）。
+	c.noteAck(20)
+	if c.unacked != 0 || c.ackPoint != 12 {
+		t.Fatalf("over-ack accepted: unacked=%d ackPoint=%d", c.unacked, c.ackPoint)
 	}
 }
 
@@ -934,11 +969,13 @@ func TestKeeperContinuesAfterAck(t *testing.T) {
 	w := newWireLink()
 	c := newTestConn(t, w, testDevice(pt("f", AreaIOA, 1, model.TypeFloat32, false)))
 	c.testIdle = time.Hour
+	c.t2 = 20 * time.Millisecond
 	go c.keeper()
 	defer c.Close()
 
 	// 让接收到的 I 帧累积一次待确认，keeper 应当发 S 帧。
 	c.pendingAck.Add(1)
+	c.ackSince.Store(time.Now().UnixNano())
 	waitFor(t, "S frame", func() bool {
 		got := w.last()
 		return len(got) >= 6 && got[2] == 0x01
@@ -946,6 +983,53 @@ func TestKeeperContinuesAfterAck(t *testing.T) {
 	if c.pendingAck.Load() != 0 {
 		t.Fatalf("pendingAck = %d", c.pendingAck.Load())
 	}
+}
+
+// 待确认帧数达到 w 时必须**立刻**确认，不必等 t2。只按 t2 确认会让一条
+// 突发上送密集的链路把对端的发送窗口拖住（对端同样有 w 帧上限）。
+func TestKeeperAcksAtWindowWithoutWaitingT2(t *testing.T) {
+	w := newWireLink()
+	c := newTestConn(t, w, testDevice(pt("f", AreaIOA, 1, model.TypeFloat32, false)))
+	c.testIdle = time.Hour
+	c.t2 = time.Minute // 故意拉长：只有 w 判据能触发
+	go c.keeper()
+	defer c.Close()
+
+	c.pendingAck.Store(int32(defaultW))
+	c.ackSince.Store(time.Now().UnixNano())
+	start := time.Now()
+	waitFor(t, "S frame on w", func() bool {
+		got := w.last()
+		return len(got) >= 6 && got[2] == 0x01
+	})
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Fatalf("ack took %v", elapsed)
+	}
+	if c.pendingAck.Load() != 0 {
+		t.Fatalf("pendingAck = %d", c.pendingAck.Load())
+	}
+}
+
+// 单帧待确认时不得立刻确认，而要等满 t2——这是「多帧共享一个 S 帧」的
+// 唯一来源。t2 是收到数据后算起的延迟上限，不是从上次确认算起。
+func TestKeeperDelaysAckUntilT2(t *testing.T) {
+	w := newWireLink()
+	c := newTestConn(t, w, testDevice(pt("f", AreaIOA, 1, model.TypeFloat32, false)))
+	c.testIdle = time.Hour
+	c.t2 = 400 * time.Millisecond
+	go c.keeper()
+	defer c.Close()
+
+	c.pendingAck.Store(1)
+	c.ackSince.Store(time.Now().UnixNano())
+	time.Sleep(120 * time.Millisecond) // < t2 - 一个轮询周期
+	if got := len(w.frames()); got != 0 {
+		t.Fatalf("acked %d frame(s) before t2 elapsed", got)
+	}
+	waitFor(t, "S frame after t2", func() bool {
+		got := w.last()
+		return len(got) >= 6 && got[2] == 0x01
+	})
 }
 
 // ---------------------------------------------------------------------------
@@ -1167,10 +1251,15 @@ func TestReadUnknownPointIsAddressError(t *testing.T) {
 	out, err := c.Read(context.Background(), []driver.ReadSpan{{
 		Points: []driver.PointRef{{ID: "ghost"}},
 	}})
-	if err != nil {
-		t.Fatalf("read: %v", err)
+	// 单点全失败 → 按 §3.3.1 必须上抛（地址错误不熔断，但要让调度器看见
+	// 「这一轮什么都没读到」）。
+	if err == nil || driver.KindOf(err) != driver.ErrAddress {
+		t.Fatalf("err = %v / %v", err, driver.KindOf(err))
 	}
-	if len(out) != 1 || out[0].Quality != model.QualityAddressError {
+	if driver.CountsTowardBreaker(err) {
+		t.Fatal("an address error must not trip the breaker")
+	}
+	if len(out) != 1 || out[0].Quality != model.QualityAddressError || out[0].Err == nil {
 		t.Fatalf("out = %+v", out)
 	}
 }
@@ -1185,8 +1274,8 @@ func TestReadInvalidQuality(t *testing.T) {
 	out, err := c.Read(context.Background(), []driver.ReadSpan{{
 		Points: []driver.PointRef{{ID: "f"}},
 	}})
-	if err != nil {
-		t.Fatalf("read: %v", err)
+	if err == nil || driver.KindOf(err) != driver.ErrProtocol {
+		t.Fatalf("err = %v / %v", err, driver.KindOf(err))
 	}
 	if out[0].Quality != model.QualityBad || out[0].Err == nil {
 		t.Fatalf("out = %+v", out[0])
@@ -1199,8 +1288,8 @@ func TestReadNeverSeenPoint(t *testing.T) {
 	out, err := c.Read(context.Background(), []driver.ReadSpan{{
 		Points: []driver.PointRef{{ID: "f"}},
 	}})
-	if err != nil {
-		t.Fatalf("read: %v", err)
+	if err == nil {
+		t.Fatal("a round with zero usable samples must report an error")
 	}
 	if out[0].Quality != model.QualityBad || out[0].Err == nil {
 		t.Fatalf("out = %+v", out[0])
@@ -1428,8 +1517,9 @@ func TestReadControlDirectionPointExplainsItself(t *testing.T) {
 		pt("sp", AreaSetpointFloat, 4002, model.TypeFloat32, true),
 	))
 	out, err := c.Read(context.Background(), []driver.ReadSpan{{Points: []driver.PointRef{{ID: "sp"}}}})
-	if err != nil {
-		t.Fatalf("read: %v", err)
+	// 单点全失败 → 上抛（§3.3.1），但样本里要带那句专用说明。
+	if err == nil {
+		t.Fatal("a round with zero usable samples must report an error")
 	}
 	if out[0].Quality != model.QualityBad || out[0].Err == nil {
 		t.Fatalf("out = %+v", out[0])
@@ -1443,11 +1533,8 @@ func TestReadControlDirectionPointExplainsItself(t *testing.T) {
 		pt("sp", AreaSetpointFloat, 4002, model.TypeFloat32, true),
 		pt("fb", AreaIOA, 4002, model.TypeFloat32, false),
 	))
-	out, err = c2.Read(context.Background(), []driver.ReadSpan{{Points: []driver.PointRef{{ID: "sp"}}}})
-	if err != nil {
-		t.Fatalf("read: %v", err)
-	}
-	if !strings.Contains(out[0].Err.Error(), "no data received") {
+	out, _ = c2.Read(context.Background(), []driver.ReadSpan{{Points: []driver.PointRef{{ID: "sp"}}}})
+	if out[0].Err == nil || !strings.Contains(out[0].Err.Error(), "no data received") {
 		t.Fatalf("err = %v", out[0].Err)
 	}
 }
@@ -1504,5 +1591,281 @@ func TestWriteDoesNotOverwriteNewerSpontaneousValue(t *testing.T) {
 	}
 	if cv.q != model.QualityGood {
 		t.Fatalf("cache quality = %s, want good (real upstream quality must survive)", cv.q)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// §3.3.1 部分失败契约 / 链路级失败
+// ---------------------------------------------------------------------------
+
+// 一个点位坏（从未收到过值）不得把整轮升级成错误：104 的 Read 只读本地表，
+// 每个坏点都有自己的原因。全轮都坏时必须返回错误（否则熔断器永远看不到）。
+func TestReadPartialFailureContract(t *testing.T) {
+	dev := testDevice(
+		pt("good", AreaIOA, 1001, model.TypeFloat32, false),
+		pt("never", AreaIOA, 1002, model.TypeFloat32, false),
+	)
+	c := newTestConn(t, newWireLink(), dev)
+	c.mu.Lock()
+	c.values["good"] = cachedValue{
+		value: model.NumValue(model.TypeFloat32, 42.5), q: model.QualityGood, at: time.Now()}
+	c.mu.Unlock()
+
+	spans := []driver.ReadSpan{{Points: []driver.PointRef{{ID: "good"}, {ID: "never"}}}}
+	out, err := c.Read(context.Background(), spans)
+	if err != nil {
+		t.Fatalf("one good point must not surface an error, got %v", err)
+	}
+	if len(out) != 2 {
+		t.Fatalf("samples = %d, want 2", len(out))
+	}
+	if out[0].Quality != model.QualityGood || out[0].Err != nil {
+		t.Fatalf("good sample = %+v", out[0])
+	}
+	if out[1].Quality != model.QualityBad || out[1].Err == nil {
+		t.Fatalf("bad sample = %+v", out[1])
+	}
+
+	// 只剩坏点时整体必须报错。
+	_, err = c.Read(context.Background(), []driver.ReadSpan{{Points: []driver.PointRef{{ID: "never"}}}})
+	if err == nil {
+		t.Fatal("all points failed: Read must return an error so the breaker can see it")
+	}
+}
+
+// 链路判死后 Read 必须返回错误，并把每个点位显式标坏——缓存里的值是
+// 「不知道多久以前的」，继续标 good 等于撒谎（§3.10.9.7）。
+func TestReadLinkDownMarksEveryPointBad(t *testing.T) {
+	dev := testDevice(
+		pt("a", AreaIOA, 1001, model.TypeFloat32, false),
+		pt("b", AreaIOA, 1002, model.TypeFloat32, false),
+	)
+	c := newTestConn(t, newWireLink(), dev)
+	c.mu.Lock()
+	now := time.Now()
+	c.values["a"] = cachedValue{value: model.NumValue(model.TypeFloat32, 1), q: model.QualityGood, at: now}
+	c.values["b"] = cachedValue{value: model.NumValue(model.TypeFloat32, 2), q: model.QualityGood, at: now}
+	c.mu.Unlock()
+	c.fail(errors.New("peer reset"))
+
+	spans := []driver.ReadSpan{{Points: []driver.PointRef{{ID: "a"}, {ID: "b"}}}}
+	out, err := c.Read(context.Background(), spans)
+	if err == nil || driver.KindOf(err) != driver.ErrDisconnected {
+		t.Fatalf("err = %v / %v", err, driver.KindOf(err))
+	}
+	if len(out) != 2 {
+		t.Fatalf("samples = %d, want 2 (a missing sample would be re-labelled by the collector)", len(out))
+	}
+	for _, s := range out {
+		if s.Quality != model.QualityCommError || s.Err == nil {
+			t.Fatalf("sample %s = %+v, want comm_error with the link error attached", s.PointID, s)
+		}
+	}
+}
+
+// ctx 已到期时 Read 也要补齐样本，不能只返回一个 error 让采集器去猜。
+func TestReadCanceledContextStillReturnsSamples(t *testing.T) {
+	dev := testDevice(
+		pt("a", AreaIOA, 1001, model.TypeFloat32, false),
+		pt("b", AreaIOA, 1002, model.TypeFloat32, false),
+	)
+	c := newTestConn(t, newWireLink(), dev)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	out, err := c.Read(ctx, []driver.ReadSpan{{Points: []driver.PointRef{{ID: "a"}, {ID: "b"}}}})
+	if err == nil || driver.KindOf(err) != driver.ErrTimeout {
+		t.Fatalf("err = %v / %v", err, driver.KindOf(err))
+	}
+	if len(out) != 2 || out[0].Quality != model.QualityCommError || out[1].Quality != model.QualityCommError {
+		t.Fatalf("out = %+v", out)
+	}
+}
+
+// 链路在命令等待确认期间断掉时，命令必须立刻返回断连，而不是挂满整个
+// c.timeout——现场表现是「点一次按钮要转 15 秒才有反应」。
+func TestWriteAbortsImmediatelyWhenLinkDies(t *testing.T) {
+	dev := testDevice(pt("c", AreaSingleCommand, 4001, model.TypeBool, true))
+	w := newWireLink()
+	c := newTestConn(t, w, dev)
+	c.timeout = 10 * time.Second // 故意拉长：靠 dead 通道而不是超时收尾
+	go c.readLoop()
+	defer c.Close()
+
+	done := make(chan struct{})
+	var res []driver.WriteResult
+	var err error
+	go func() {
+		res, err = c.Write(context.Background(), []driver.WriteRequest{{
+			PointID: "c", DataType: model.TypeBool,
+			Address: model.Address{Kind: model.AddressRegister, Area: AreaSingleCommand, Offset: 4001, Bit: -1},
+			Value:   model.BoolValue(true),
+		}})
+		close(done)
+	}()
+
+	waitFor(t, "command frame", func() bool { return len(w.frames()) > 0 })
+	start := time.Now()
+	c.fail(errors.New("peer reset"))
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("write hung for %v after the link died", time.Since(start))
+	}
+	if err == nil || driver.KindOf(err) != driver.ErrDisconnected {
+		t.Fatalf("err = %v / %v", err, driver.KindOf(err))
+	}
+	if res[0].OK || res[0].Quality != model.QualityCommError {
+		t.Fatalf("res = %+v", res[0])
+	}
+}
+
+// 链路级失败必须中止同批剩余命令，并给它们逐项结果（§3.4 规则 1/4）。
+func TestWriteLinkFailureStopsRemaining(t *testing.T) {
+	dev := testDevice(
+		pt("a", AreaSingleCommand, 4001, model.TypeBool, true),
+		pt("b", AreaSingleCommand, 4002, model.TypeBool, true),
+		pt("c", AreaSingleCommand, 4003, model.TypeBool, true),
+	)
+	w := newWireLink()
+	c := newTestConn(t, w, dev)
+	c.timeout = 10 * time.Second
+	go c.readLoop()
+	defer c.Close()
+
+	reqs := []driver.WriteRequest{
+		{PointID: "a", DataType: model.TypeBool,
+			Address: model.Address{Kind: model.AddressRegister, Area: AreaSingleCommand, Offset: 4001, Bit: -1},
+			Value:   model.BoolValue(true)},
+		{PointID: "b", DataType: model.TypeBool,
+			Address: model.Address{Kind: model.AddressRegister, Area: AreaSingleCommand, Offset: 4002, Bit: -1},
+			Value:   model.BoolValue(true)},
+		{PointID: "c", DataType: model.TypeBool,
+			Address: model.Address{Kind: model.AddressRegister, Area: AreaSingleCommand, Offset: 4003, Bit: -1},
+			Value:   model.BoolValue(true)},
+	}
+	done := make(chan struct{})
+	var res []driver.WriteResult
+	var err error
+	go func() {
+		res, err = c.Write(context.Background(), reqs)
+		close(done)
+	}()
+	waitFor(t, "first command frame", func() bool { return len(w.frames()) > 0 })
+	c.fail(errors.New("peer reset"))
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("Write did not abort after the link died")
+	}
+	if err == nil {
+		t.Fatal("firstErr must be returned")
+	}
+	if len(res) != 3 {
+		t.Fatalf("results = %d, want one per request", len(res))
+	}
+	for _, r := range res {
+		if r.OK || r.Quality == "" {
+			t.Fatalf("result %s = %+v, want a failed entry with an explicit quality", r.PointID, r)
+		}
+	}
+	// 剩下的命令不该再发到已经死掉的链路上。
+	if got := len(w.frames()); got > 2 {
+		t.Fatalf("%d frames written, want at most 2 (command + maybe STOPDT)", got)
+	}
+}
+
+// ctx 到期时同批剩余命令也要逐项标坏。
+func TestWriteCanceledContextMarksRemaining(t *testing.T) {
+	dev := testDevice(
+		pt("a", AreaSingleCommand, 4001, model.TypeBool, true),
+		pt("b", AreaSingleCommand, 4002, model.TypeBool, true),
+	)
+	c := newTestConn(t, newWireLink(), dev)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	res, err := c.Write(ctx, []driver.WriteRequest{
+		{PointID: "a", DataType: model.TypeBool,
+			Address: model.Address{Kind: model.AddressRegister, Area: AreaSingleCommand, Offset: 4001, Bit: -1},
+			Value:   model.BoolValue(true)},
+		{PointID: "b", DataType: model.TypeBool,
+			Address: model.Address{Kind: model.AddressRegister, Area: AreaSingleCommand, Offset: 4002, Bit: -1},
+			Value:   model.BoolValue(true)},
+	})
+	if err == nil || driver.KindOf(err) != driver.ErrTimeout {
+		t.Fatalf("err = %v / %v", err, driver.KindOf(err))
+	}
+	if len(res) != 2 {
+		t.Fatalf("results = %d, want 2", len(res))
+	}
+	for _, r := range res {
+		if r.OK || r.Quality != model.QualityTimeout {
+			t.Fatalf("result %s = %+v", r.PointID, r)
+		}
+	}
+}
+
+// 发送阶段自己超时（k 窗口打满）时，质量码必须是 timeout 而不是
+// comm_error——上层据质量码决定「可以重试」还是「链路坏了」。
+func TestWriteSendTimeoutCarriesTimeoutQuality(t *testing.T) {
+	dev := testDevice(pt("c", AreaSingleCommand, 4001, model.TypeBool, true))
+	c := newTestConn(t, newWireLink(), dev)
+	c.timeout = 60 * time.Millisecond
+	c.unacked = defaultK // 窗口已满且没有对端确认
+	res, err := c.Write(context.Background(), []driver.WriteRequest{{
+		PointID: "c", DataType: model.TypeBool,
+		Address: model.Address{Kind: model.AddressRegister, Area: AreaSingleCommand, Offset: 4001, Bit: -1},
+		Value:   model.BoolValue(true),
+	}})
+	if err == nil || driver.KindOf(err) != driver.ErrTimeout {
+		t.Fatalf("err = %v / %v", err, driver.KindOf(err))
+	}
+	if res[0].OK || res[0].Quality != model.QualityTimeout {
+		t.Fatalf("res = %+v, want a failed entry with timeout quality", res[0])
+	}
+}
+
+// 链路级失败不等同于「链路已经判死」：发送阶段的超时（k 窗口打满）也是
+// 链路级（§3.3.1 用 IsLinkFailure 定义）。它不会设 linkErr，所以剩下的
+// 命令若逐条再发，就会把一次故障放大成「点数 × 超时」的时长——现场表现
+// 是「批量下发卡住好几分钟」。
+func TestWriteLinkLevelTimeoutStopsRemaining(t *testing.T) {
+	dev := testDevice(
+		pt("a", AreaSingleCommand, 4001, model.TypeBool, true),
+		pt("b", AreaSingleCommand, 4002, model.TypeBool, true),
+		pt("c", AreaSingleCommand, 4003, model.TypeBool, true),
+	)
+	c := newTestConn(t, newWireLink(), dev)
+	c.timeout = 150 * time.Millisecond
+	c.unacked = defaultK // 窗口打满，对端不确认 → 每次发送都超时
+
+	reqs := []driver.WriteRequest{
+		{PointID: "a", DataType: model.TypeBool,
+			Address: model.Address{Kind: model.AddressRegister, Area: AreaSingleCommand, Offset: 4001, Bit: -1},
+			Value:   model.BoolValue(true)},
+		{PointID: "b", DataType: model.TypeBool,
+			Address: model.Address{Kind: model.AddressRegister, Area: AreaSingleCommand, Offset: 4002, Bit: -1},
+			Value:   model.BoolValue(true)},
+		{PointID: "c", DataType: model.TypeBool,
+			Address: model.Address{Kind: model.AddressRegister, Area: AreaSingleCommand, Offset: 4003, Bit: -1},
+			Value:   model.BoolValue(true)},
+	}
+	start := time.Now()
+	res, err := c.Write(context.Background(), reqs)
+	elapsed := time.Since(start)
+	if err == nil {
+		t.Fatal("a link-level timeout must be reported")
+	}
+	if len(res) != 3 {
+		t.Fatalf("results = %d, want one per request", len(res))
+	}
+	for _, r := range res {
+		if r.OK || r.Quality == "" {
+			t.Fatalf("result %s = %+v", r.PointID, r)
+		}
+	}
+	// 中止剩余：只需等一次超时。逐条等三次就会到 ~450ms。
+	if elapsed > 400*time.Millisecond {
+		t.Fatalf("Write took %v: it kept trying the remaining commands after a link-level timeout", elapsed)
 	}
 }

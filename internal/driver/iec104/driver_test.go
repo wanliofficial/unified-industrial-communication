@@ -80,15 +80,16 @@ func (hh *h) open() *conn {
 }
 
 // waitRead 轮询直到指定点位拿到可用质量，或超时。
+//
+// 不能把 Read 的错误当成硬失败：按 §3.3.1，只要这一轮一个点位都没成功，
+// Read 就必须上抛错误（否则熔断器看不到异常）。启动初期「只配了点但还没
+// 收到总召唤快照」正是这种情形，它是正常的过渡态，不是故障。
 func (hh *h) waitRead(c *conn, want ...string) map[string]driver.RawSample {
 	hh.t.Helper()
 	deadline := time.Now().Add(5 * time.Second)
 	var last []driver.RawSample
 	for time.Now().Before(deadline) {
-		out, err := c.Read(context.Background(), c.plan())
-		if err != nil {
-			hh.t.Fatalf("read: %v", err)
-		}
+		out, _ := c.Read(context.Background(), c.plan())
 		last = out
 		seen := map[string]bool{}
 		for _, s := range out {
@@ -114,6 +115,15 @@ func (hh *h) waitRead(c *conn, want ...string) map[string]driver.RawSample {
 	}
 	hh.t.Fatalf("points never became usable: %+v", last)
 	return nil
+}
+
+// planPoints 返回 plan() 里全部点位的引用，用于校验样本数量。
+func (c *conn) planPoints() []driver.PointRef {
+	var out []driver.PointRef
+	for _, span := range c.plan() {
+		out = append(out, span.Points...)
+	}
+	return out
 }
 
 // plan 把设备点位按类别分组，模拟 planner 的输出。
@@ -205,13 +215,13 @@ func TestReadTimeTaggedValue(t *testing.T) {
 	}
 }
 
-// 未配置的点位必须报地址错，而不是空值。
+// 未配置的点位必须报地址错，而不是空值。单点全失败要上抛（§3.3.1）。
 func TestReadUnknownPoint(t *testing.T) {
 	hh := newH(t)
 	c := hh.open()
 	out, err := c.Read(context.Background(), []driver.ReadSpan{{Points: []driver.PointRef{{ID: "ghost"}}}})
-	if err != nil {
-		t.Fatalf("read: %v", err)
+	if err == nil || driver.KindOf(err) != driver.ErrAddress {
+		t.Fatalf("err = %v / %v", err, driver.KindOf(err))
 	}
 	if len(out) != 1 || out[0].Quality != model.QualityAddressError {
 		t.Fatalf("out = %+v", out)
@@ -267,10 +277,13 @@ func TestWriteSingleCommand(t *testing.T) {
 	if len(res) != 1 || !res[0].OK {
 		t.Fatalf("res = %+v", res)
 	}
-	info, ok := hh.srv.Value(4001)
-	if !ok || !info.Bool {
-		t.Fatalf("sim value = %+v", info)
-	}
+	// 激活确认（原因 7）只说明设备「接受了命令」，实际改写发生在它之后：
+	// sim 按标准顺序先回确认、再落值、最后回激活终止。这里必须轮询，否则
+	// 测试会随「确认与落值谁先到达」抖动。
+	waitFor(t, "sim to apply the command", func() bool {
+		info, ok := hh.srv.Value(4001)
+		return ok && info.Bool
+	})
 }
 
 func TestWriteSetpointAndReadBack(t *testing.T) {
@@ -300,7 +313,10 @@ func TestWriteSetpointAndReadBack(t *testing.T) {
 	}
 	info, _ := hh.srv.Value(4002)
 	if info.Num != 55.5 {
-		t.Fatalf("sim value = %+v", info)
+		waitFor(t, "sim to apply the float setpoint", func() bool {
+			i, ok := hh.srv.Value(4002)
+			return ok && i.Num == 55.5
+		})
 	}
 }
 
@@ -316,10 +332,10 @@ func TestWriteScaledSetpoint(t *testing.T) {
 	if err != nil || !res[0].OK {
 		t.Fatalf("write = %+v %v", res, err)
 	}
-	info, _ := hh.srv.Value(4003)
-	if info.Num != 777 {
-		t.Fatalf("sim value = %+v", info)
-	}
+	waitFor(t, "sim to apply the scaled setpoint", func() bool {
+		info, ok := hh.srv.Value(4003)
+		return ok && info.Num == 777
+	})
 }
 
 // 只读对象写入必须得到地址错（设备回「未知 IOA」），而不是笼统的失败。
@@ -397,10 +413,10 @@ func TestWriteAreaIOADerivesCommand(t *testing.T) {
 	if err != nil || !res[0].OK {
 		t.Fatalf("write = %+v %v", res, err)
 	}
-	info, _ := hh.srv.Value(4001)
-	if !info.Bool {
-		t.Fatalf("sim value = %+v", info)
-	}
+	waitFor(t, "sim to apply the derived command", func() bool {
+		info, ok := hh.srv.Value(4001)
+		return ok && info.Bool
+	})
 }
 
 // ---------------------------------------------------------------------------
@@ -533,13 +549,23 @@ func TestOpenDialFailure(t *testing.T) {
 func TestReadReportsBrokenLink(t *testing.T) {
 	hh := newH(t)
 	c := hh.open()
-	hh.waitRead(c, "temp")
+	hh.waitRead(c, "temp", "flow", "scaled", "subst", "ts", "run", "stopped", "breaker", "counter")
 	_ = hh.srv.Close()
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
-		if _, err := c.Read(context.Background(), c.plan()); err != nil {
+		out, err := c.Read(context.Background(), c.plan())
+		if err != nil {
 			if driver.KindOf(err) != driver.ErrDisconnected {
 				t.Fatalf("kind = %v", driver.KindOf(err))
+			}
+			// 链路级失败必须给每个点位一条坏样本，不能只回一个 error。
+			if len(out) != len(c.planPoints()) {
+				t.Fatalf("samples = %d, want %d", len(out), len(c.planPoints()))
+			}
+			for _, s := range out {
+				if s.Quality != model.QualityCommError || s.Err == nil {
+					t.Fatalf("sample %s = %+v", s.PointID, s)
+				}
 			}
 			return
 		}
@@ -792,5 +818,37 @@ func TestSendFrameWrites(t *testing.T) {
 	}
 	if len(f.last()) != 6 || f.last()[2] != 0x01 {
 		t.Fatalf("S frame = % X", f.last())
+	}
+}
+
+// 累计量的 IV 位必须一路走到点位质量：设备说「这个读数无效」，驱动不能
+// 把它的值当 good 报上去（电能量结算按增量计费，一个假增量就是一笔错账）。
+// 这条覆盖 codec → 驱动缓存 → Read 的整条链路，而不只是 codec 的单元。
+func TestReadCounterInvalidQualityIsBad(t *testing.T) {
+	hh := newH(t)
+	c := hh.open()
+	hh.waitRead(c, "counter")
+
+	if err := hh.srv.SetValue(3001, sim.Info{Counter: 4321, Quality: iec104.QInvalid}); err != nil {
+		t.Fatalf("set value: %v", err)
+	}
+	// 计数变化会触发一次突发上送；等到质量位到达。
+	deadline := time.Now().Add(3 * time.Second)
+	var last driver.RawSample
+	for time.Now().Before(deadline) {
+		out, _ := c.Read(context.Background(), []driver.ReadSpan{{
+			Points: []driver.PointRef{{ID: "counter"}},
+		}})
+		last = out[0]
+		if last.Quality == model.QualityBad {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if last.Quality != model.QualityBad {
+		t.Fatalf("counter quality = %s (want bad: the station flagged IV)", last.Quality)
+	}
+	if last.Err == nil {
+		t.Fatal("a bad counter must carry a diagnostic error")
 	}
 }

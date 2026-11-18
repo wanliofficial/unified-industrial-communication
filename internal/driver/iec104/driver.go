@@ -44,9 +44,17 @@ import (
 // 默认定时参数。k/w 是「未确认 I 帧数」而不是字节数；t1/t2 分别对应
 // 「发送后等确认」与「收到数据后最迟确认」。
 const (
-	defaultK  = 12
+	defaultK = 12
+	// defaultW 是接收窗口：未确认的收到帧达到这个数就立即确认，不必等
+	// t2。标准把「等满 w 帧」与「等满 t2」并列为确认时机，两者缺一都
+	// 会在对端窗口上出问题。
+	defaultW  = 8
 	defaultT1 = 15 * time.Second
-	defaultT2 = 10 * time.Second
+	// defaultT2 是「收到数据后最多延迟多久确认」。标准默认 10 秒，这里
+	// 取 1 秒：t2 只是**上限**，早确认永远合法，而 10 秒的延迟会让对端
+	// 的发送窗口（同样 12 帧）在整个周期里处于半空状态，一条突发上送
+	// 密集的链路会明显降速。
+	defaultT2 = 1 * time.Second
 	// defaultTestIdle 是链路上没有任何报文多久之后发一次 TESTFR act。
 	// 选 20 秒：远小于绝大多数 NAT 表项的空闲超时（通常 2–10 分钟），
 	// 又不会让一条安静但健康的链路每分钟都被打扰。
@@ -231,6 +239,7 @@ func (d *Driver) Open(ctx context.Context, cfg driver.OpenConfig) (driver.Conn, 
 		ackCh:    make(chan struct{}, 1),
 		started:  make(chan struct{}),
 		pending:  map[uint32]chan iec104.ASDU{},
+		dead:     make(chan struct{}),
 	}
 	if d.testIdle > 0 {
 		c.testIdle = d.testIdle
@@ -369,12 +378,24 @@ type conn struct {
 	recvSeq    atomic.Uint32
 	pendingAck atomic.Int32
 	lastRecv   atomic.Int64
+	// ackSince 是「当前这批待确认帧里最早那一帧的到达时刻」。t2 是**从
+	// 收到数据算起**的延迟上限，不是从上一次确认算起——用后者会让一条
+	// 稀疏但持续的上送流永远等不到确认。
+	ackSince atomic.Int64
+	// t2 是收到数据后最多延迟多久确认（0 表示用 defaultT2）。测试里可以
+	// 调小，验证「不确认就会被判死」。
+	t2 time.Duration
 
 	// wmu 串行化「分配 N(S) + 写帧」。104 没有帧内事务号，两个 I 帧交错
 	// 写入会让序号与实际到达顺序不一致，错误现象是「偶尔丢一条命令」。
 	wmu     sync.Mutex
 	sendSeq uint16
-	unacked int
+	// unacked 是「已发出、对端尚未确认」的 I 帧数。它必须按对端的 N(R)
+	// 精确递减，不能收到任何一帧就清零：一个只确认到更早一帧的 S 帧会把
+	// 整个窗口打开，k 就形同虚设，序号会一路写穿到回绕。
+	// 由 wmu 保护（与 sendSeq 同一把锁，二者总是一起变）。
+	unacked  int
+	ackPoint uint16 // 对端已确认到的下一个 N(S)（即最新 N(R)）
 
 	// cmu 串行化命令：同一时刻只允许一条待确认命令，避免确认报文与命令
 	// 张冠李戴。设备 actor 本身已经串行，这一层是给直接调用（自检 CLI）
@@ -390,6 +411,11 @@ type conn struct {
 	started   chan struct{}
 	startOnce sync.Once
 	ackCh     chan struct{}
+	// dead 在链路第一次判死时关闭。done 只在驱动被 Close（通常是驱动整体
+	// 卸载）时关，两者语义不同：链路断了但驱动还活着（下一轮会重连），
+	// 正在等确认的命令必须立刻醒来返回断连，而不是挂满整个 c.timeout。
+	dead     chan struct{}
+	deadOnce sync.Once
 }
 
 // startDataTransfer 发送 STARTDT act 并等待 con。
@@ -468,6 +494,11 @@ func (c *conn) Close() error {
 		c.closed = true
 		c.mu.Unlock()
 		close(c.done)
+		// 关闭也是「链路不再可用」，等确认的命令同样要立刻醒来。
+		// dead 为 nil 只可能出现在测试直接构造的 conn 上。
+		if c.dead != nil {
+			c.deadOnce.Do(func() { close(c.dead) })
+		}
 		// 尽力发 STOPDT act 再断开；失败无所谓——链路可能已经死了。
 		_ = c.sendU(iec104.UStopAct)
 		err = c.link.Close()
@@ -509,6 +540,11 @@ func (c *conn) Probe(ctx context.Context) error {
 		return err
 	case <-c.done:
 		return driver.E(driver.ErrDisconnected, "probe", c.deviceID, "connection closed", true, nil)
+	case <-c.dead:
+		c.mu.Lock()
+		inner := c.linkErr
+		c.mu.Unlock()
+		return driver.E(driver.ErrDisconnected, "probe", c.deviceID, "link is down", true, inner)
 	case <-timer.C:
 		return driver.E(driver.ErrTimeout, "probe", c.deviceID,
 			fmt.Sprintf("no TESTFR con within %s", c.timeout), true, nil)
@@ -521,28 +557,65 @@ func (c *conn) Probe(ctx context.Context) error {
 // 读
 // ---------------------------------------------------------------------------
 
-// Read 从本地最新值表取数，不做任何网络交互。
+// Read 从本地最新值表取数，不做任何网络交互（§3.10.9）。
+//
+// 因此它天然满足 §3.3.1 的「有成功点就返回 nil」：每个点位的坏都有自己的
+// 原因（没收到过 / 控制方向 IOA / 设备上报 IV），全部写进各自的样本，不会
+// 升级成整轮错误；而「一个点位都没成功」时按契约上抛第一个错误，否则熔断
+// 器与告警永远看不到异常。**链路判死**是例外：即便样本看起来都是好的也要
+// 上抛，见下方注释。
 func (c *conn) Read(ctx context.Context, spans []driver.ReadSpan) ([]driver.RawSample, error) {
 	if err := ctx.Err(); err != nil {
-		return nil, driver.E(driver.ErrTimeout, "read", c.deviceID, "context done", true, err)
+		e := driver.E(driver.ErrTimeout, "read", c.deviceID, "context done", true, err)
+		return c.markAllBad(spans, e), e
 	}
 	c.mu.Lock()
 	closed, linkErr := c.closed, c.linkErr
 	out := make([]driver.RawSample, 0, len(spans))
+	firstErr := error(nil)
+	good := 0
 	for _, span := range spans {
 		for _, p := range span.Points {
-			out = append(out, c.lookupLocked(p.ID))
+			s := c.lookupLocked(p.ID)
+			if s.Quality == model.QualityGood || s.Quality == model.QualityUncertain ||
+				s.Quality == model.QualityStale {
+				good++
+			} else if firstErr == nil {
+				firstErr = s.Err
+			}
+			out = append(out, s)
 		}
 	}
 	c.mu.Unlock()
 
 	if closed {
-		return out, driver.E(driver.ErrDisconnected, "read", c.deviceID, "connection closed", true, nil)
+		e := driver.E(driver.ErrDisconnected, "read", c.deviceID, "connection closed", true, nil)
+		return c.markAllBad(spans, e), e
 	}
 	if linkErr != nil {
-		return out, driver.E(driver.ErrDisconnected, "read", c.deviceID, "link is down", true, linkErr)
+		e := driver.E(driver.ErrDisconnected, "read", c.deviceID, "link is down", true, linkErr)
+		// 链路级失败：整轮样本显式标坏再上抛（§3.3.1 的例外分支）。不这
+		// 样做的话，一批可能是几小时前的值会带着 good 继续进缓存与告警。
+		return c.markAllBad(spans, e), e
 	}
-	return out, nil
+	return out, driver.PartialReadError(good, firstErr)
+}
+
+// markAllBad 为 spans 里的每个点位生成一条坏样本。
+//
+// 数量必须与传入点位一一对应：采集器对「驱动返回的点位少了」的处理是再补
+// 一条 protocol/bad（runtime/collector.go），那条兜底消息会把真正的原因
+// （断链/超时）盖掉。
+func (c *conn) markAllBad(spans []driver.ReadSpan, e error) []driver.RawSample {
+	out := make([]driver.RawSample, 0, len(spans))
+	for _, span := range spans {
+		for _, p := range span.Points {
+			out = append(out, driver.RawSample{
+				PointID: p.ID, Quality: model.QualityCommError, Err: e,
+			})
+		}
+	}
+	return out
 }
 
 func (c *conn) lookupLocked(id string) driver.RawSample {
@@ -606,17 +679,47 @@ func (c *conn) monitoredLocked(ioa uint32) bool {
 func (c *conn) Write(ctx context.Context, reqs []driver.WriteRequest) ([]driver.WriteResult, error) {
 	results := make([]driver.WriteResult, 0, len(reqs))
 	var firstErr error
-	for _, req := range reqs {
+	for i, req := range reqs {
+		if err := ctx.Err(); err != nil {
+			// ctx 到期：剩余项一次性标坏，已下发的项保留自己的结果。
+			e := driver.E(driver.ErrTimeout, "write", c.deviceID, "context done", true, err)
+			for _, rest := range reqs[i:] {
+				results = append(results, driver.WriteResult{PointID: rest.PointID, OK: false,
+					Quality: model.QualityTimeout, Err: e})
+			}
+			if firstErr == nil {
+				firstErr = e
+			}
+			return results, firstErr
+		}
 		res, err := c.writeOne(ctx, req)
 		results = append(results, res)
-		if err != nil && firstErr == nil {
-			firstErr = err
+		if err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			// 链路级失败：后续命令不可能成功，逐项标坏后立即上抛，
+			// 不再对着一根死链路逐条等超时。
+			if driver.IsLinkFailure(err) && i+1 < len(reqs) {
+				for _, rest := range reqs[i+1:] {
+					e := driver.E(driver.ErrDisconnected, "write", c.deviceID,
+						"link is down", true, err)
+					results = append(results, driver.WriteResult{PointID: rest.PointID, OK: false,
+						Quality: model.QualityCommError, Err: e})
+				}
+				return results, firstErr
+			}
 		}
 	}
 	return results, firstErr
 }
 
 func (c *conn) writeOne(ctx context.Context, req driver.WriteRequest) (driver.WriteResult, error) {
+	if err := ctx.Err(); err != nil {
+		e := driver.E(driver.ErrTimeout, "write", c.deviceID, "context done", true, err)
+		return driver.WriteResult{PointID: req.PointID, OK: false,
+			Quality: model.QualityTimeout, Err: e}, e
+	}
 	c.cmu.Lock()
 	defer c.cmu.Unlock()
 
@@ -655,8 +758,15 @@ func (c *conn) writeOne(ctx context.Context, req driver.WriteRequest) (driver.Wr
 	// 而 104 只在变化时上送，被覆盖的值可能很久都不会再来一条。
 	sentAt := time.Now()
 	if err := c.sendASDU(comm.asdu); err != nil {
+		// 发送失败的错误种类决定质量码：写超时是暂时性（可重试），
+		// 链路断连是永久。不能一律写成 comm_error，否则上层会把一个
+		// 本可重试的软超时当成硬故障处理。
+		q := model.QualityCommError
+		if driver.KindOf(err) == driver.ErrTimeout {
+			q = model.QualityTimeout
+		}
 		return driver.WriteResult{PointID: req.PointID, OK: false,
-			Quality: model.QualityCommError, Err: err}, err
+			Quality: q, Err: err}, err
 	}
 
 	timer := time.NewTimer(c.timeout)
@@ -691,6 +801,17 @@ func (c *conn) writeOne(ctx context.Context, req driver.WriteRequest) (driver.Wr
 				Quality: model.QualityGood}, nil
 		case <-c.done:
 			e := driver.E(driver.ErrDisconnected, "write", c.deviceID, "connection closed", true, nil)
+			return driver.WriteResult{PointID: req.PointID, OK: false,
+				Quality: model.QualityCommError, Err: e}, e
+		case <-c.dead:
+			// 链路判死：不必等满 c.timeout。真实原因（超时探测失败/序号
+			// 错位/对端关闭）在 linkErr 里，原样带出去，别改写成笼统的
+			// 「写失败」。
+			var inner error
+			c.mu.Lock()
+			inner = c.linkErr
+			c.mu.Unlock()
+			e := driver.E(driver.ErrDisconnected, "write", c.deviceID, "link is down", true, inner)
 			return driver.WriteResult{PointID: req.PointID, OK: false,
 				Quality: model.QualityCommError, Err: e}, e
 		case <-timer.C:
@@ -787,6 +908,11 @@ func (c *conn) sendASDU(asdu []byte) error {
 		case <-c.ackCh:
 		case <-c.done:
 			return driver.E(driver.ErrDisconnected, "write", c.deviceID, "connection closed", true, nil)
+		case <-c.dead:
+			c.mu.Lock()
+			inner := c.linkErr
+			c.mu.Unlock()
+			return driver.E(driver.ErrDisconnected, "write", c.deviceID, "link is down", true, inner)
 		case <-time.After(20 * time.Millisecond):
 		}
 	}
@@ -854,8 +980,12 @@ func (c *conn) handleFrame(f iec104.Frame) error {
 			return fmt.Errorf("I frame out of order: want N(S)=%d, got %d", c.recvSeq.Load(), f.SendSeq)
 		}
 		c.recvSeq.Store(uint32((f.SendSeq + 1) & 0x7FFF))
-		c.pendingAck.Add(1)
-		c.noteAck()
+		// 记录本批第一帧的到达时刻，供 t2 延迟确认使用。
+		if c.pendingAck.Add(1) == 1 {
+			c.ackSince.Store(time.Now().UnixNano())
+		}
+		// I 帧捎带的 N(R) 同样是对我们的确认。
+		c.noteAck(f.RecvSeq)
 		if len(f.ASDU) > 0 {
 			c.dispatch(f.ASDU)
 		}
@@ -863,7 +993,7 @@ func (c *conn) handleFrame(f iec104.Frame) error {
 		if !withinAck(f.RecvSeq, c.sentSeq()) {
 			return fmt.Errorf("S frame acknowledges N(S)=%d beyond our sent %d", f.RecvSeq, c.sentSeq())
 		}
-		c.noteAck()
+		c.noteAck(f.RecvSeq)
 	case iec104.KindU:
 		switch f.UFunc {
 		case iec104.UStartCon:
@@ -903,13 +1033,23 @@ func (c *conn) sentSeq() uint16 {
 	return c.sendSeq
 }
 
-// noteAck 在收到任何带 N(R) 的帧时清空发送窗口并唤醒等待者。
-func (c *conn) noteAck() {
-	// 命令是一条一条发的，且每条都等到确认才返回，因此「收到任意带序号
-	// 的帧」等价于「窗口已经清空」。不要改成按帧递减：S 帧携带的 N(R)
-	// 可能只确认到更早的一帧，递减会让我们误以为窗口更大。
+// noteAck 处理对端帧里携带的 N(R)：把发送窗口前移到 ack，并唤醒等待者。
+//
+// ack 是「对端下一个期望收到的 N(S)」，因此它之前的帧都已经确认。窗口里
+// 未确认的帧数是 sendSeq-ack（模 32768）。不能像早期实现那样「收到任何帧
+// 就清零」：S 帧可能只确认到更早的一帧（对端可以延迟确认），清零会让 k
+// 失效，进而把 15 位序号一路写穿——现象是「偶发丢命令」，而日志里一切正常。
+func (c *conn) noteAck(ack uint16) {
 	c.wmu.Lock()
-	c.unacked = 0
+	// 只接受单调前进的确认：对端可以延迟确认，一个只确认到更早一帧的
+	// 迟到 N(R) 不得把窗口宽度算大。
+	if withinAck(ack, c.sendSeq) {
+		acked := int(uint16((ack - c.ackPoint) & 0x7FFF))
+		if acked > 0 && acked <= c.unacked {
+			c.unacked -= acked
+			c.ackPoint = ack
+		}
+	}
 	c.wmu.Unlock()
 	select {
 	case c.ackCh <- struct{}{}:
@@ -1061,23 +1201,40 @@ func worse(a, b model.Quality) model.Quality { return iec60870.Worse(a, b) }
 // keeper 负责接收循环不能阻塞去做的三件事：确认收到的帧、空闲时发测试帧、
 // 把「对端已经很久不说话」变成一条明确的链路错误。
 func (c *conn) keeper() {
-	t := time.NewTicker(500 * time.Millisecond)
+	// 轮询周期取 t2 的 1/4：t2 是延迟上限，晚一个周期确认仍然合法，但
+	// 周期若接近 t2 就会让实际延迟在 t2..2*t2 之间抖动。上限留在 500ms
+	// 是为了在 t2 很大时也不会让 TESTFR 的判死判断太迟。
+	tick := c.effectiveT2() / 4
+	if tick > 500*time.Millisecond {
+		tick = 500 * time.Millisecond
+	}
+	if tick < time.Millisecond {
+		tick = time.Millisecond
+	}
+	t := time.NewTicker(tick)
 	defer t.Stop()
-	// 确认的时机由 t2 决定：收到数据后等一会儿再确认，让多个 I 帧共享
-	// 一个 S 帧。这里用固定 500ms 轮询近似，误差远小于 t2。
-	_ = defaultT2
 	for {
 		select {
 		case <-c.done:
 			return
 		case <-t.C:
 		}
-		if c.pendingAck.Load() > 0 {
-			if err := c.sendS(); err != nil {
-				c.fail(err)
-				return
+		// 确认时机（§5.3）：待确认帧数达到 w，或最早一帧已等满 t2。
+		// 只按 t2 判断会让一条突发上送密集的链路（一周期几十帧）把对端
+		// 的发送窗口拖住——对端同样有 w 帧上限。
+		if n := c.pendingAck.Load(); n > 0 {
+			due := n >= defaultW
+			if !due {
+				since := time.Unix(0, c.ackSince.Load())
+				due = time.Since(since) >= c.effectiveT2()
 			}
-			c.pendingAck.Store(0)
+			if due {
+				if err := c.sendS(); err != nil {
+					c.fail(err)
+					return
+				}
+				c.pendingAck.Store(0)
+			}
 		}
 		now := time.Now()
 		last := time.Unix(0, c.lastRecv.Load())
@@ -1099,6 +1256,14 @@ func (c *conn) keeper() {
 	}
 }
 
+// effectiveT2 返回实际使用的 t2 延迟。
+func (c *conn) effectiveT2() time.Duration {
+	if c.t2 > 0 {
+		return c.t2
+	}
+	return defaultT2
+}
+
 // fail 记录链路错误、唤醒等待者并关闭连接。
 func (c *conn) fail(err error) {
 	c.mu.Lock()
@@ -1112,6 +1277,9 @@ func (c *conn) fail(err error) {
 	ch := c.testWait
 	c.testWait = nil
 	c.mu.Unlock()
+	if c.dead != nil {
+		c.deadOnce.Do(func() { close(c.dead) })
+	}
 	if ch != nil {
 		e := driver.E(driver.ErrDisconnected, "probe", c.deviceID, "link is down", true, err)
 		select {

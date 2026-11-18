@@ -1,9 +1,12 @@
 package iec60870
 
 import (
+	"encoding/binary"
 	"math"
 	"testing"
 	"time"
+
+	"uic/internal/model"
 )
 
 // ---------------------------------------------------------------------------
@@ -284,6 +287,81 @@ func TestCP56Time2aSundayIsSeven(t *testing.T) {
 	}
 }
 
+// 年字节只有低 7 位有定义，最高位是保留位。不掩掉它，一个把保留位置 1
+// 的从站会让 2026 年变成 2126 年——而 2126 是语法上完全合法的时间，下游
+// 没有任何理由拒绝它，于是「时标错了一百年」会静默进入历史库。
+func TestCP56Time2aMasksYearReservedBit(t *testing.T) {
+	in := time.Date(2026, 11, 7, 13, 45, 12, 0, time.Local)
+	b := EncodeCP56Time2a(in)
+	b[6] |= 0x80
+	out, ok := DecodeCP56Time2a(b)
+	if !ok {
+		t.Fatal("a set reserved bit must not invalidate the timestamp")
+	}
+	if out.Year() != 2026 {
+		t.Fatalf("year = %d, want 2026 (reserved bit must be masked)", out.Year())
+	}
+}
+
+// time.Date 会把越界日期静默规范化（2 月 30 日 → 3 月 2 日）。那是把「设备
+// 给了非法时间」改写成「一个合法但错误的时间」，必须判无效。
+func TestCP56Time2aRejectsImpossibleDate(t *testing.T) {
+	for _, mk := range []func([]byte){
+		func(b []byte) { b[4] = 30; b[5] = 2 },            // 2 月 30 日
+		func(b []byte) { b[4] = 31; b[5] = 4 },            // 4 月 31 日
+		func(b []byte) { b[4] = 29; b[5] = 2; b[6] = 26 }, // 2026-02-29（非闰年）
+		func(b []byte) { b[4] = 0 },                       // 日 0
+		func(b []byte) { b[3] = 24 },                      // 时 24
+	} {
+		b := EncodeCP56Time2a(time.Date(2026, 11, 7, 13, 45, 12, 0, time.Local))
+		mk(b)
+		if _, ok := DecodeCP56Time2a(b); ok {
+			t.Fatalf("impossible date/time accepted: % X", b)
+		}
+	}
+}
+
+// 归一化编解码必须用同一个分母（32768）。用 32767 编码会让每次读写往返
+// 都缩小一点，反复往返后数值会持续爬向 0。
+func TestNormalizedRoundTripIsStable(t *testing.T) {
+	for _, want := range []float64{0, 0.5, -0.5, 1, -1, 0.123} {
+		raw, err := BuildASDU(ASDU{TypeID: TypeMeasuredNormalized, Cause: CausePeriodic,
+			CommonAddr: 1, Objects: []Object{{IOA: 1, Num: want}}})
+		if err != nil {
+			t.Fatalf("build %v: %v", want, err)
+		}
+		got, err := ParseASDU(raw)
+		if err != nil {
+			t.Fatalf("parse: %v", err)
+		}
+		v := got.Objects[0].Num
+		if want == 1 {
+			// +1 在 N/32768 定标下不可表示，上限是 1-2^-15。要求的是
+			// 「接近 1 且不是负数」——旧实现在这里会回绕成 -1。
+			if v <= 0.99 {
+				t.Fatalf("normalized %v decoded to %v (sign flip on full scale?)", want, v)
+			}
+			continue
+		}
+		if math.Abs(v-want) > 1e-4 {
+			t.Fatalf("normalized %v decoded to %v", want, v)
+		}
+		// 再往返一次，值必须稳定（不许持续漂移）。
+		raw2, err := BuildASDU(ASDU{TypeID: TypeMeasuredNormalized, Cause: CausePeriodic,
+			CommonAddr: 1, Objects: []Object{{IOA: 1, Num: v}}})
+		if err != nil {
+			t.Fatalf("rebuild: %v", err)
+		}
+		got2, err := ParseASDU(raw2)
+		if err != nil {
+			t.Fatalf("reparse: %v", err)
+		}
+		if got2.Objects[0].Num != v {
+			t.Fatalf("value drifted across a round trip: %v -> %v", v, got2.Objects[0].Num)
+		}
+	}
+}
+
 // ---------------------------------------------------------------------------
 // 请求构造
 // ---------------------------------------------------------------------------
@@ -463,5 +541,72 @@ func TestSIQQualityShift(t *testing.T) {
 	}
 	if siq&0x80 == 0 {
 		t.Fatalf("IV must land in bit 7: %02X", siq)
+	}
+}
+
+// 累计量（BCR）第 5 字节里的 IV/CY/CA 是设备对「这个读数还能不能用来结算」
+// 的明确表态。整体丢弃这一字节，等于把「无效的读数」翻译成 good。
+func TestIntegratedTotalsKeepsBCRFlags(t *testing.T) {
+	cases := []struct {
+		bcr  byte
+		want Quality
+	}{
+		{0x00, 0},
+		{0x05, 0}, // 只有序号位，不是品质
+		{0x80, QInvalid},
+		{0x20, QOverflow},
+		{0x40, QSubstituted},
+		{0xE5, QInvalid | QOverflow | QSubstituted},
+	}
+	for _, c := range cases {
+		// 直接构造报文元素：低 4 字节计数 + 第 5 字节 BCR 标志。
+		var elem []byte
+		elem = binary.LittleEndian.AppendUint32(elem, 1234)
+		elem = append(elem, c.bcr)
+		raw, err := BuildASDU(ASDU{TypeID: TypeIntegratedTotals, Cause: CauseSpontaneous,
+			CommonAddr: 1, Objects: []Object{{IOA: 300, Uint: 1234, Raw: c.bcr & 0x1F,
+				Quality: decodeBCRQuality(c.bcr)}}})
+		if err != nil {
+			t.Fatalf("build: %v", err)
+		}
+		// 编码侧的 BCR 字节必须与输入一致（标志位不能丢）。
+		if got := raw[len(raw)-1]; got != c.bcr {
+			t.Fatalf("bcr 0x%02X: encoded byte = 0x%02X", c.bcr, got)
+		}
+		out, err := ParseASDU(raw)
+		if err != nil {
+			t.Fatalf("parse: %v", err)
+		}
+		o := out.Objects[0]
+		if o.Quality != c.want {
+			t.Fatalf("bcr 0x%02X: quality = %q, want %q", c.bcr, o.Quality, c.want)
+		}
+		if o.Uint != 1234 {
+			t.Fatalf("bcr 0x%02X: counter = %d", c.bcr, o.Uint)
+		}
+		if o.Raw&0x1F != c.bcr&0x1F {
+			t.Fatalf("bcr 0x%02X: sequence bits = 0x%02X", c.bcr, o.Raw&0x1F)
+		}
+		// 再从设备原始字节解码一遍，确认解码侧认这三位。
+		decoded, n, err := decodeElement(TypeIntegratedTotals, elem)
+		if err != nil || n != 5 {
+			t.Fatalf("bcr 0x%02X: decodeElement = %v, %d", c.bcr, err, n)
+		}
+		if decoded.Quality != c.want {
+			t.Fatalf("bcr 0x%02X: decodeElement quality = %q, want %q", c.bcr, decoded.Quality, c.want)
+		}
+	}
+}
+
+// IV 的累计量必须折算成 bad，而不是跟着「值不为 0」一起当 good 上报。
+func TestIntegratedTotalsInvalidQualityConvertsToBad(t *testing.T) {
+	o := Object{IOA: 300, Uint: 99, Raw: 0x80}
+	o.Quality = decodeBCRQuality(0x80)
+	_, q, ok := Convert(o, TypeIntegratedTotals, model.TypeUint32)
+	if !ok {
+		t.Fatal("convert failed")
+	}
+	if q != model.QualityBad {
+		t.Fatalf("quality = %s, want bad", q)
 	}
 }
