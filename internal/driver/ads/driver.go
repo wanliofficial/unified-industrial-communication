@@ -649,7 +649,7 @@ func (c *connState) readOne(ctx context.Context, p driver.PointRef) (driver.RawS
 	if err != nil {
 		return errSample(p.ID, err), nil
 	}
-	length, err := c.valueLen(p.Address, p.DataType)
+	length, err := c.valueLen("read", p.Address, p.DataType)
 	if err != nil {
 		return errSample(p.ID, err), nil
 	}
@@ -673,9 +673,6 @@ func (c *connState) readOne(ctx context.Context, p driver.PointRef) (driver.RawS
 		if err != nil {
 			return errSample(p.ID, err), linkFailure(err)
 		}
-	}
-	if err != nil {
-		return errSample(p.ID, err), nil
 	}
 	if code != adscodec.CodeOK {
 		return errSample(p.ID, c.codeError("read", code, name)), nil
@@ -822,7 +819,7 @@ func (c *connState) writeOne(ctx context.Context, req driver.WriteRequest) (driv
 // ---------------------------------------------------------------------------
 
 // valueLen 返回该点位在线上占用的字节数。
-func (c *connState) valueLen(a model.Address, dt model.DataType) (int, error) {
+func (c *connState) valueLen(op string, a model.Address, dt model.DataType) (int, error) {
 	var n int
 	switch dt {
 	case model.TypeBool:
@@ -833,17 +830,17 @@ func (c *connState) valueLen(a model.Address, dt model.DataType) (int, error) {
 			n = c.strlen
 		}
 	case model.TypeBCD16, model.TypeBCD32:
-		return 0, driver.E(driver.ErrUnsupported, "read", c.cfg.Device.ID,
+		return 0, driver.E(driver.ErrUnsupported, op, c.cfg.Device.ID,
 			"ADS 没有 BCD 线类型；点表请改成 uint16/uint32/bytes", false, nil)
 	default:
 		n = dt.Bytes()
 	}
 	if n <= 0 {
-		return 0, driver.E(driver.ErrUnsupported, "read", c.cfg.Device.ID,
+		return 0, driver.E(driver.ErrUnsupported, op, c.cfg.Device.ID,
 			fmt.Sprintf("dataType %q 没有确定的字节宽度", dt), false, nil)
 	}
 	if n > maxValueLen {
-		return 0, driver.E(driver.ErrUnsupported, "read", c.cfg.Device.ID,
+		return 0, driver.E(driver.ErrUnsupported, op, c.cfg.Device.ID,
 			fmt.Sprintf("读取长度 %d 超过上限 %d", n, maxValueLen), false, nil)
 	}
 	return n, nil
@@ -860,10 +857,9 @@ func (c *connState) encodeValue(req driver.WriteRequest) ([]byte, error) {
 		}
 		return []byte{b}, nil
 	case model.TypeString, model.TypeBytes:
-		n, err := c.valueLen(req.Address, dt)
+		n, err := c.valueLen("write", req.Address, dt)
 		if err != nil {
-			e := driver.E(driver.ErrUnsupported, "write", c.cfg.Device.ID, err.Error(), false, err)
-			return nil, e
+			return nil, err
 		}
 		raw := []byte(req.Value.Text)
 		if len(raw) > n {
@@ -924,6 +920,23 @@ func checkRange(dt model.DataType, v float64) error {
 		if v != math.Trunc(v) || v < 0 || v >= 18446744073709551616.0 {
 			return fmt.Errorf("%v 超出 uint64 范围或不是整数", v)
 		}
+	case model.TypeFloat32:
+		// codec/value 的 Encode 用 `float32(v)` 强制落地：1e300 会被静默
+		// 写成 +Inf，1e-50 会被静默写成 0。和整数越界一样，这种「写下去的
+		// 值已经不是调用方给的值」的缺陷必须在发报文前拦下（对比 DNP3
+		// 驱动的 `analogFitsWire` 对 float32 做的同一类检查）。
+		if math.IsNaN(v) || math.IsInf(v, 0) {
+			return fmt.Errorf("%v 不是有限浮点数，无法写入 %s", v, dt)
+		}
+		if f := float32(v); math.IsInf(float64(f), 0) {
+			return fmt.Errorf("%v 超出 float32 幅度（会溢出成 Inf），无法写入 %s", v, dt)
+		} else if f == 0 && v != 0 {
+			return fmt.Errorf("%v 低于 float32 最小可表示值（会静默变成 0），无法写入 %s", v, dt)
+		}
+	case model.TypeFloat64:
+		if math.IsNaN(v) || math.IsInf(v, 0) {
+			return fmt.Errorf("%v 不是有限浮点数，无法写入 %s", v, dt)
+		}
 	}
 	return nil
 }
@@ -943,7 +956,13 @@ func decodeValue(data []byte, dt model.DataType) (model.Value, error) {
 		}
 		return model.Value{}, fmt.Errorf("BOOLean byte 0x%02X is neither 0 nor 1", data[0])
 	case model.TypeString:
-		return model.TextValue(dt, strings.TrimRight(string(data), "\x00")), nil
+		// PLC 的 STRING(n) 是**定长缓冲 + NUL 结尾**：第一个 NUL 之后是填充，
+		// 不属于字符串内容。这里必须按「首个 NUL 截断」处理，不能用
+		// `TrimRight(s, "\x00")`——那只去尾部 NUL，会把缓冲区里残留的字节
+		// 连同内嵌 NUL 一起当成值（`"batch-42\x00\x00junk"` 变成携带控制
+		// 字符的字符串，落到 JSON 日志/OPC UA 里各家长度语义还不一样）。
+		// 同包 codec 的 `cString` 对符号名用的就是这个语义。
+		return model.TextValue(dt, firstNUL(string(data))), nil
 	case model.TypeBytes:
 		return model.BytesValue(append([]byte(nil), data...)), nil
 	case model.TypeBCD16, model.TypeBCD32:
@@ -955,6 +974,14 @@ func decodeValue(data []byte, dt model.DataType) (model.Value, error) {
 // ---------------------------------------------------------------------------
 // 辅助
 // ---------------------------------------------------------------------------
+
+// firstNUL 在 NUL 处截断字符串，NUL 之后的字节是定长缓冲区的填充/残留。
+func firstNUL(s string) string {
+	if i := strings.IndexByte(s, 0); i >= 0 {
+		return s[:i]
+	}
+	return s
+}
 
 // symbolName 把点位地址还原成 PLC 符号名（数组元素带 [index]）。
 func (c *connState) symbolName(a model.Address) (string, error) {
@@ -1007,10 +1034,34 @@ func linkFailure(err error) error {
 	return err
 }
 
+// qualityOf 按错误种类派生质量码。
+//
+// 质量码不是「展示层的事」：`pipeline.Apply` 直接取样本里的 `Quality`
+// （只有空串才兜成 `good`），`runtime/collector` 对写结果同样只兜空串，
+// 下游 OPC UA（`timeout → BadTimeout`、`comm_error → BadNoCommunication`、
+// `address_error → BadNodeIDUnknown`）、历史查询与报警分级都按质量码区分。
+//
+// 早先这里的 `errSample`/`writeErr` 写死 `bad`，于是「PLC 没应答」、「变量名
+// 写错」、「没有权限」在运行时侧全变成同一个值：OPC UA 客户端看到的是
+// `BadNoData` 而不是 `BadTimeout`，运维也就无从判断该查网络还是查点表。
+// 这与 docs §3.4 规则 5 冲突——`qualityOf(err)` 本来就能给出更准确的码。
+func qualityOf(err error) model.Quality {
+	switch driver.KindOf(err) {
+	case driver.ErrTimeout:
+		return model.QualityTimeout
+	case driver.ErrAddress:
+		return model.QualityAddressError
+	case driver.ErrDisconnected:
+		return model.QualityCommError
+	}
+	// 权限/不支持/协议/内部错误：点位级坏值，没有更细的码可用。
+	return model.QualityBad
+}
+
 func errSample(id string, err error) driver.RawSample {
-	return driver.RawSample{PointID: id, Quality: model.QualityBad, Err: err}
+	return driver.RawSample{PointID: id, Quality: qualityOf(err), Err: err}
 }
 
 func writeErr(id string, err error) driver.WriteResult {
-	return driver.WriteResult{PointID: id, Quality: model.QualityBad, Err: err}
+	return driver.WriteResult{PointID: id, Quality: qualityOf(err), Err: err}
 }

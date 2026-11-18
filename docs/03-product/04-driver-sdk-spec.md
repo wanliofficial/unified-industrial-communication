@@ -3763,9 +3763,22 @@ Write(IG=0xF005, offset=handle, length=n, data)    → result
 | `int64` / `uint64` | 8 | 小端 |
 | `float32` | 4 | IEEE-754，小端 |
 | `float64` | 8 | IEEE-754，小端 |
-| `string` | 点表长度或 `strlen` | 写入时右侧补 NUL；字符串刚好占满整段时拒绝（没有结尾 NUL） |
-| `bytes` | 点表长度或 `strlen` | 写入时右侧补 0；允许刚好占满 |
+| `string` | 点表长度或 `strlen` | 读：定长缓冲按**首个 NUL** 截断；写：右侧补 NUL，刚好占满整段时拒绝（没有结尾 NUL） |
+| `bytes` | 点表长度或 `strlen` | 读：原样返回；写：右侧补 0，允许刚好占满 |
 | `bcd16` / `bcd32` | — | ADS 没有 BCD 线类型，读写在发报文前报 `unsupported` |
+
+数值用 `codec/value` 的 `Encode`/`Decode` 配合 `model.OrderDCBA`：`DCBA` 表示
+「整体倒序」，对一个纯小端数值等价于不做字内交换。把这段逻辑放在统一的 value 层，
+是为了保证 ADS 与 Modbus/S7 对同一个字节串的解释只在字节序上不同，而不是各写一份
+符号扩展。
+
+写入前做范围检查（`checkRange`）：`70000` 写进 INT16 会被强制转换静默变成
+`4464`，写入「成功」了，但设备上的值已经不是调用方给的值。这类错误比写入失败
+更难发现，必须在发报文之前拦下。整型的非整数值（`1.5`）同样拒绝。**浮点同样要
+查**：`float32` 走 `codec/value` 的 `float32(v)` 强制落地，`1e300` 会被静默写成
+`+Inf`、`1e-50` 会被静默写成 `0`（与 DNP3 的 `analogFitsWire` 同一类检查）；
+`NaN`/`Inf` 无论 float32 还是 float64 都拒绝——一个 PLC 变量上的「非有限值」
+几乎一定是上游算错了，落库后还会把 JSON 编码打成非法值。
 
 数值用 `codec/value` 的 `Encode`/`Decode` 配合 `model.OrderDCBA`：`DCBA` 表示
 「整体倒序」，对一个纯小端数值等价于不做字内交换。把这段逻辑放在统一的 value 层，
@@ -3801,6 +3814,12 @@ AMS 头里的 error 表示「报文没有被目标处理」；ADS 载荷里的 r
 错误分三类处置：地址/权限/不支持只影响当前点位，不进入整轮 `firstErr`，也不熔断
 设备；超时/断链会停止本轮剩余点位（链路已经不可继续，判据是 `driver.IsLinkFailure`）。
 这条区分让「一个变量名写错」不会把整台 PLC 标红。
+
+失败样本的**质量码按错误种类派生**（`qualityOf`，与 `runtime/collector` 同口径）：
+超时 → `timeout`、变量名写错 → `address_error`、断链 → `comm_error`、权限/不支持/
+协议 → `bad`。这与读路径的 `errSample`、写路径的 `writeErr` 都走同一函数。早期这两处
+写死 `bad`，导致「PLC 没应答」与「符号写错」在运行时侧无法区分——OPC UA 客户端只能看到
+`BadNoData` 而不是 `BadTimeout`/`BadNodeIDUnknown`（违反 §3.4 规则 5）。
 
 汇总按 §3.3.1：`goodSamples > 0` 时 `Read` 返回 `nil`——否则 `collector` 会按错误
 分类 `Close()` 连接，一个 `BCD`/宽度配错的点位就能让整台 PLC 每周期重新走 AMS
@@ -3919,7 +3938,7 @@ result，没有回显），但缓存里的值要等下一轮采集才刷新；�
 | 层 | 用例 |
 |---|---|
 | `codec/ads` | AMS/TCP 与 AMS 头金帧（HandleByName `MAIN.nCounter`）、两层长度一致性、reserved 非零拒绝、NetID 解析（6 段/0..255/非法）、7 类请求构造、Read/Write/ReadWrite/DeviceInfo/State/Control 应答解析、错误码分类与临时性、Command/State 字符串 |
-| `driver/ads` | 真实 TCP 回环：9 种类型读写、数组与字符串、地址/权限/宽度错误逐点隔离、坏 NetId/端口、握手超时、Close 幂等、句柄失效重解析（读与写）、类型范围/小数/BCD/字符串 NUL 拒绝、脚本化服务端：临时 AMS 错误重试、通知帧与陈旧 invoke 丢弃、畸形帧、句柄 0/短句柄、设备信息/状态/控制的 AMS 错误与短载荷、ctx 超时、拨号失败；**部分失败语义（好点 + unsupported 错时 `err==nil`、全失败才返回错误）** |
+| `driver/ads` | 真实 TCP 回环：9 种类型读写、数组与字符串、地址/权限/宽度错误逐点隔离、坏 NetId/端口、握手超时、Close 幂等、句柄失效重解析（读与写）、类型范围/小数/BCD/字符串 NUL/float32 溢出与 NaN 拒绝、脚本化服务端：临时 AMS 错误重试、通知帧与陈旧 invoke 丢弃、畸形帧、句柄 0/短句柄、设备信息/状态/控制的 AMS 错误与短载荷、ctx 超时、拨号失败；**部分失败语义（好点 + unsupported 错时 `err==nil`、全失败才返回错误）**；**失败样本质量码按错误种类派生（未知符号 → `address_error`、超时 → `timeout`）；定长字符串按首个 NUL 截断、拒绝内嵌 NUL；`valueLen` 错误只包一层（op 标 write、信息不二次嵌套）** |
 | `sim/ads` | 真实 TCP 回环：默认变量表、GET/PUT 夹具、句柄分配/释放/失效、只读与宽度校验、数组仅 `[2]` 可写、字符串/浮点、错误 NetId/端口、未知命令、通知不应答、畸形载荷、坏帧断链后仍可服务、Close 幂等 |
 | 点表/规划 | `PolicyFor("ads")` 只允许 symbol、`NAME:81` 与 length 列、`MAIN.arr[2]` 保留在 path、寄存器/selector 在导入期拒绝、`examples/ads.json` 通过 `-check`（当时 21 个驱动） |
 | `cmd/uic` | `-symbol` 声明解析（类型/长度/错误写法）、`-set` 值解析（bool/int/uint/float/string/bytes、进制、越界、BCD 拒绝）、`-control` 映射、行显示与错误质量 |

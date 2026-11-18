@@ -110,6 +110,9 @@ func TestCheckRange(t *testing.T) {
 		{model.TypeUint32, -1}, {model.TypeUint32, math.MaxUint32 + 1},
 		{model.TypeInt64, 9223372036854775808.0}, {model.TypeInt64, -1e300},
 		{model.TypeUint64, -1}, {model.TypeUint64, 18446744073709551616.0},
+		{model.TypeFloat32, 1e300}, {model.TypeFloat32, math.Inf(1)}, {model.TypeFloat32, math.NaN()},
+		{model.TypeFloat32, 1e-50},
+		{model.TypeFloat64, math.Inf(1)}, {model.TypeFloat64, math.NaN()},
 	}
 	for _, c := range bad {
 		if err := checkRange(c.dt, c.v); err == nil {
@@ -179,6 +182,34 @@ func TestEncodeValueTypes(t *testing.T) {
 		}
 		if got.Num != tc.value.Num {
 			t.Fatalf("%s round trip = %v, want %v", tc.dt, got.Num, tc.value.Num)
+		}
+	}
+}
+
+// TestDecodeStringTruncatesAtFirstNUL 钉住「定长缓冲按首个 NUL 截断」的语义：
+// PLC 的 STRING(n) 第一个 NUL 之后是填充，旧实现用 TrimRight 只去尾部 NUL，
+// 会把残留字节（甚至内嵌 NUL）当值——下游各家长度语义还不一样。
+func TestDecodeStringTruncatesAtFirstNUL(t *testing.T) {
+	cases := []struct {
+		name string
+		data []byte
+		want string
+	}{
+		{"plain", []byte("batch-42"), "batch-42"},
+		{"trailing nul", []byte("batch\x00\x00\x00"), "batch"},
+		{"junk after nul", append([]byte("batch-42\x00"), make([]byte, 20)...), "batch-42"},
+		{"nul then text", []byte("a\x00b\x00c"), "a"},
+	}
+	for _, tc := range cases {
+		got, err := decodeValue(tc.data, model.TypeString)
+		if err != nil {
+			t.Fatalf("%s: %v", tc.name, err)
+		}
+		if got.Text != tc.want {
+			t.Fatalf("%s: = %q, want %q", tc.name, got.Text, tc.want)
+		}
+		if strings.ContainsRune(got.Text, 0) {
+			t.Fatalf("%s: value still contains embedded NUL: %q", tc.name, got.Text)
 		}
 	}
 }
@@ -266,34 +297,34 @@ func TestDecodeValueErrors(t *testing.T) {
 func TestValueLen(t *testing.T) {
 	c := bareConn(t)
 	addr := model.Address{Kind: model.AddressSymbol, Path: "MAIN.x", Index: -1}
-	if n, err := c.valueLen(addr, model.TypeBool); err != nil || n != 1 {
+	if n, err := c.valueLen("read", addr, model.TypeBool); err != nil || n != 1 {
 		t.Fatalf("bool = %d %v", n, err)
 	}
-	if n, err := c.valueLen(addr, model.TypeFloat64); err != nil || n != 8 {
+	if n, err := c.valueLen("read", addr, model.TypeFloat64); err != nil || n != 8 {
 		t.Fatalf("float64 = %d %v", n, err)
 	}
-	if n, err := c.valueLen(addr, model.TypeString); err != nil || n != 81 {
+	if n, err := c.valueLen("read", addr, model.TypeString); err != nil || n != 81 {
 		t.Fatalf("string default = %d %v", n, err)
 	}
 	addr.Length = 4
-	if n, err := c.valueLen(addr, model.TypeBytes); err != nil || n != 4 {
+	if n, err := c.valueLen("read", addr, model.TypeBytes); err != nil || n != 4 {
 		t.Fatalf("bytes length = %d %v", n, err)
 	}
 	addr.Length = 0
-	if _, err := c.valueLen(addr, model.TypeString); err != nil {
+	if _, err := c.valueLen("read", addr, model.TypeString); err != nil {
 		t.Fatal(err)
 	}
 	c.strlen = 0
-	if _, err := c.valueLen(addr, model.TypeString); err == nil ||
+	if _, err := c.valueLen("read", addr, model.TypeString); err == nil ||
 		!strings.Contains(err.Error(), "没有确定的字节宽度") {
 		t.Fatalf("zero strlen: %v", err)
 	}
 	addr.Length = maxValueLen + 1
-	if _, err := c.valueLen(addr, model.TypeBytes); err == nil ||
+	if _, err := c.valueLen("read", addr, model.TypeBytes); err == nil ||
 		!strings.Contains(err.Error(), "超过上限") {
 		t.Fatalf("oversized length: %v", err)
 	}
-	if _, err := c.valueLen(addr, model.TypeBCD32); err == nil ||
+	if _, err := c.valueLen("read", addr, model.TypeBCD32); err == nil ||
 		!strings.Contains(err.Error(), "BCD") {
 		t.Fatalf("BCD: %v", err)
 	}
@@ -989,5 +1020,91 @@ func TestDialFailure(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "connect") {
 		t.Fatalf("message = %v", err)
+	}
+}
+
+// TestReadSampleQualityFollowsError 钉住「失败样本的质量码按错误种类派生」：
+// 旧实现 errSample 硬编码 bad，于是「变量名写错」在运行时侧与「PLC 没应答」
+// 显示成同一个值，下游 OPC UA/历史/报警分级全部失真。
+func TestReadSampleQualityFollowsError(t *testing.T) {
+	srv := startSim(t)
+	c := openTest(t, srv)
+
+	// 未知符号 → ErrAddress → QualityAddressError（旧实现给的是 bad）。
+	// 注意：ADS 的 firstErr 刻意排除 ErrAddress（点表写错不该熔断设备），
+	// 所以整轮 err 可能是 nil，样本质量码才是判据。
+	out, err := c.Read(context.Background(), []driver.ReadSpan{{ID: "s",
+		Points: []driver.PointRef{sym("MAIN.nope", model.TypeInt16)}}})
+	_ = err
+	if len(out) != 1 || driver.KindOf(out[0].Err) != driver.ErrAddress {
+		t.Fatalf("期望 address 样本，得到 %+v", out)
+	}
+	if out[0].Quality != model.QualityAddressError {
+		t.Fatalf("未知符号的质量 = %q, want address_error", out[0].Quality)
+	}
+
+	// 好点 + 未知点混合：整体 nil，坏点仍是 address_error 而不是 bad。
+	out, err = c.Read(context.Background(), []driver.ReadSpan{{ID: "s",
+		Points: []driver.PointRef{
+			sym("MAIN.nCounter", model.TypeInt16),
+			sym("MAIN.nope", model.TypeInt16),
+		}}})
+	if err != nil {
+		t.Fatalf("有成功点时 err 应为 nil: %v", err)
+	}
+	if out[0].Quality != model.QualityGood {
+		t.Fatalf("好点质量 = %q, want good", out[0].Quality)
+	}
+	if out[1].Quality != model.QualityAddressError {
+		t.Fatalf("坏点质量 = %q, want address_error", out[1].Quality)
+	}
+}
+
+// TestReadTimeoutSampleQuality 钉住超时样本得到 timeout 质量码（旧实现给 bad）。
+func TestReadTimeoutSampleQuality(t *testing.T) {
+	s := startScripted(t, func(req adscodec.Frame) [][]byte {
+		// 握手正常应答；此后对任何请求不回应，让 exchange 等满超时。
+		if req.Command == adscodec.CmdReadDeviceInfo {
+			return encodeFrames(okDeviceInfo(req))
+		}
+		return nil
+	})
+	cfg := s.config(t)
+	cfg.Channel.Timeout = model.Duration(300 * time.Millisecond)
+	c, err := New().Open(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer c.Close()
+
+	out, _ := c.Read(context.Background(), []driver.ReadSpan{{ID: "s",
+		Points: []driver.PointRef{sym("MAIN.nCounter", model.TypeInt16)}}})
+	if out[0].Err == nil {
+		t.Fatal("期望超时错误")
+	}
+	if out[0].Quality != model.QualityTimeout {
+		t.Fatalf("超时样本质量 = %q, want timeout", out[0].Quality)
+	}
+}
+
+// TestEncodeValueErrorNotDoubleWrapped 钉住「valueLen 的错误只包一层」：
+// 旧实现 valueLen 返回带 unsupported 分类的 OpError，调用方又包一层，
+// 于是 op 错标 read、信息出现两次「unsupported」。这里用超长 bytes 触发
+// valueLen 的长度上限错误（BCD 在 encodeValue 里短路、不经过 valueLen）。
+func TestEncodeValueErrorNotDoubleWrapped(t *testing.T) {
+	c := bareConn(t)
+	addr := model.Address{Kind: model.AddressSymbol, Path: "MAIN.x", Index: -1, Length: maxValueLen + 1}
+	_, err := c.encodeValue(driver.WriteRequest{
+		PointID: "p", Address: addr, DataType: model.TypeBytes,
+		Value: model.BytesValue([]byte{1, 2, 3}),
+	})
+	if err == nil {
+		t.Fatal("超长 bytes 应被拒")
+	}
+	if got := strings.Count(err.Error(), "unsupported"); got != 1 {
+		t.Fatalf("错误信息应只出现一次 unsupported，出现 %d 次: %v", got, err)
+	}
+	if driver.KindOf(err) != driver.ErrUnsupported {
+		t.Fatalf("kind = %v, want unsupported", driver.KindOf(err))
 	}
 }
