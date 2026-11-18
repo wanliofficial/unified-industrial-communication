@@ -91,6 +91,7 @@ internal static class ContractTests
         tests.Add(new TestCase("contract/sse_refuses_the_connection_past_the_cap", SseRefusesTheConnectionPastTheCap));
         tests.Add(new TestCase("contract/metrics_export_runtime_series", MetricsExportRuntimeSeries));
         tests.Add(new TestCase("contract/stream_filters_by_point_pattern", StreamFiltersByPointPattern));
+        tests.Add(new TestCase("contract/diagnostics_bundle_carries_the_four_parts", DiagnosticsBundleCarriesTheFourParts));
     }
 
     // ------------------------------------------------------------------
@@ -3033,6 +3034,77 @@ internal static class ContractTests
         }
 
         throw new CheckFailedException($"metric '{name}' is not exported");
+    }
+
+    /// <summary>
+    /// 诊断包（FR-OPS-07）：一次导出要能替现场回答「你那份配置长什么样、指标如何、
+    /// 日志说了什么、版本是哪个」。
+    ///
+    /// 为什么单独立一条：此前只有 <c>mqtt/command_diag_bundle_is_whitelisted</c> 证明
+    /// 「这个命令允许调」，包里的内容一个字都没被断言过——而排障时真正被打开看的正是内容。
+    /// 尤其两件必须钉死的事：
+    /// 1. 配置是**脱敏**的（投屏、贴进工单的场景里不能带明文口令）；
+    /// 2. 指标/日志不是空壳（空文件也能过「响应是 zip」这种浅断言）。
+    /// </summary>
+    private static Task DiagnosticsBundleCarriesTheFourParts(TestContext t)
+    {
+        return RunAsync(async () =>
+        {
+            await using var host = await Host.StartAsync(t);
+
+            using var response = await host.Client.SendAsync(Get("/api/v1/diagnostics/bundle"), t.Ct);
+            t.Equal(HttpStatusCode.OK, response.StatusCode, "the bundle endpoint answers");
+            t.Equal("application/zip", response.Content.Headers.ContentType?.MediaType,
+                "the bundle is served as a zip");
+
+            var bytes = await response.Content.ReadAsByteArrayAsync(t.Ct);
+            using var zip = new System.IO.Compression.ZipArchive(new MemoryStream(bytes));
+
+            string Read(string name)
+            {
+                var entry = zip.GetEntry(name);
+                t.Ok(entry is not null, $"the bundle contains {name}");
+                using var stream = entry!.Open();
+                using var reader = new StreamReader(stream, Encoding.UTF8);
+                return reader.ReadToEnd();
+            }
+
+            // 版本：排障第一问是「跑的是哪个版本」。
+            using var manifest = JsonDocument.Parse(Read("manifest.json"));
+            var manifestRoot = manifest.RootElement;
+            t.Equal("0.0.0-test", manifestRoot.GetProperty("gateway").GetString(),
+                "the manifest names the running gateway version");
+            t.Equal(RestApi.ApiVersion, manifestRoot.GetProperty("apiVersion").GetString(),
+                "the manifest names the API version");
+            t.Equal("contract-site", manifestRoot.GetProperty("site").GetString(),
+                "the manifest names the site");
+
+            // 配置：必须是脱敏的。明文只在环境变量里，包里出现即失败。
+            var config = Read("config.redacted.json");
+            t.Contains(config, "\"***\"", "credential fields are redacted");
+            t.Ok(!config.Contains(Token, StringComparison.Ordinal),
+                "the plaintext token never reaches the bundle");
+
+            // 指标：真实序列而不是空壳。
+            var metrics = Read("metrics.txt");
+            t.Contains(metrics, "# TYPE uic_devices_total", "metrics carry Prometheus metadata");
+            t.Contains(metrics, "uic_devices_total ", "metrics carry at least one device series");
+
+            // 日志：这个宿主默认不产生告警级事件（启动顺利、无资源压力），
+            // 所以日志段可能为空——那本身不是缺陷。真正要钉死的是脱敏：
+            // 排障包会被原样转给别人，日志里绝不能带明文令牌。
+            var logs = Read("logs/uic.log");
+            t.Ok(!logs.Contains(Token, StringComparison.Ordinal),
+                "the log section never carries the plaintext token");
+
+            // 健康与设备快照：排障时用来对齐「那一刻系统怎么想」。
+            using var health = JsonDocument.Parse(Read("health.json"));
+            t.Ok(health.RootElement.TryGetProperty("status", out _), "health.json carries the aggregated status");
+            using var devices = JsonDocument.Parse(Read("devices.json"));
+            t.Ok(devices.RootElement.ValueKind == JsonValueKind.Array
+                 && devices.RootElement.GetArrayLength() > 0,
+                "devices.json lists the configured devices");
+        });
     }
 
     private static Task StreamFiltersByPointPattern(TestContext t)

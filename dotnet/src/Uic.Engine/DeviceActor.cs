@@ -87,9 +87,6 @@ public sealed record SchedulerOptions
     /// <summary>读请求整体超时（含重试）。</summary>
     public TimeSpan ReadTimeout { get; init; } = TimeSpan.FromSeconds(5);
 
-    /// <summary>探活间隔（熔断后）。</summary>
-    public TimeSpan ProbeInterval { get; init; } = TimeSpan.FromSeconds(30);
-
     /// <summary>
     /// 数据目录。需要落本地文件的协议（证书库）通过 <see cref="OpenContext"/> 拿到它，
     /// 而不是去读进程的当前目录——驱动的输入必须全部来自显式参数。
@@ -389,15 +386,11 @@ public sealed class DeviceActor : IAsyncDisposable
     /// <summary>
     /// 失败退避：按最快周期的 2^n 增长，上限取恢复间隔。
     /// 基数用最快周期而不是设备周期——点位覆盖后两者可能差几个数量级。
+    /// 公式本体在 <see cref="ScheduleMath.Backoff"/>（纯函数，便于直接断言增长与封顶）。
     /// </summary>
     private TimeSpan BackoffDelay()
-    {
-        var baseMs = _baseInterval.TotalMilliseconds;
-        var ceiling = Math.Max(baseMs, _device.RecoverInterval.TotalMilliseconds);
-        var backoffMs = Math.Min(baseMs * Math.Pow(2, Math.Min(_consecutiveFailures, 6)), ceiling);
-        var jitter = Random.Shared.NextDouble() * 0.1 * backoffMs;
-        return TimeSpan.FromMilliseconds(backoffMs + jitter);
-    }
+        => ScheduleMath.Backoff(_consecutiveFailures, _baseInterval, _device.RecoverInterval,
+            Random.Shared.NextDouble());
 
     private async Task CollectOnceAsync(IReadOnlyList<ReadSpan> spans, CancellationToken ct)
     {

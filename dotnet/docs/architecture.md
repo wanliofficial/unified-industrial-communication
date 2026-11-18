@@ -98,8 +98,9 @@
 7. `SampleFanout` 把变化序列化成一行 JSON，追加到每个 sink 的分区。
 
 失败路径同样是数据：驱动异常被折成质量码（`timeout` / `comm_error` / `address_error` …），
-整轮采集不中断；连续失败达到阈值后设备转 `degraded`，再失败转 `faulted` 并停止采集，
-之后按 `probeInterval` 探活，恢复后自动回到 `collecting`。
+整轮采集不中断；连续失败达到 `failureThreshold` 后设备转 `degraded`，再失败转 `faulted`
+并断开连接、停止采集，之后按退避重连继续探活（间隔「最快点位周期 × 2^n」，上限
+`recoverInterval`），恢复后自动回到 `collecting`。
 
 ### 北向：一次上报
 
@@ -194,7 +195,9 @@ Configured ──start──► Connecting ──probe ok──► Collecting
 ```
 
 - `Configured` / `Disabled`：配置态与运行态分离，「配置了但没采」能被看见；
-- `Faulted` 只探活不采集，恢复后自动回到 `Collecting`；
+- `Faulted` 只探活不采集，恢复后自动回到 `Collecting`；探活就是「按退避重连」——
+  连续失败 n 次后间隔为「最快点位周期 × 2^n」，上限 `recoverInterval`，
+  没有独立的探活定时器（现场也不需要两个旋钮去调同一件事）；
 - 进 `Degraded` 的门槛是「连续通信失败」；`address` 类错误（点表地址不存在）
   不计入这个计数，设备保持 `Collecting`，错误只体现在点位质量上；
 - 每次重启设备 actor 递增 `generation`，旧 actor 的迟到回调按代次丢弃，

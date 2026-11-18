@@ -34,4 +34,32 @@ public static class ScheduleMath
         var slot = Math.Clamp(index, 0, count - 1);
         return TimeSpan.FromMilliseconds(interval.TotalMilliseconds * slot / count);
     }
+
+    /// <summary>
+    /// 失败退避：按最快周期的 2^n 增长，上限取恢复间隔；再叠加最多 10% 的正向抖动。
+    ///
+    /// 为什么是纯函数：这条公式是「设备彻底离线后多久试一次」的唯一决定因素，
+    /// 却被熔在 actor 里，只能靠「等两次重连的间隔」间接猜——那个量既受机器负载
+    /// 影响，又要跑上好几秒才能观察一档。抽成纯函数后，2^n 增长、上限封顶、
+    /// 抖动落在 [0, 10%] 三个性质都能直接断言，而不必去赌时序。
+    ///
+    /// 抖动只加不减：退避是「最少等这么久」，减抖动等于允许比约定更早去打一台
+    /// 已经出问题的设备；正向抖动只是把同时失败的设备错开，避免整批同时重连。
+    /// </summary>
+    /// <param name="failures">连续失败次数（已按上限 6 档截断，避免 2^n 溢出）。</param>
+    /// <param name="baseInterval">基数：设备/最快点位的采集周期。</param>
+    /// <param name="recoverInterval">上限：退避不会超过它（与基数取较大者，防止基数大于上限时退避反而变短）。</param>
+    /// <param name="jitterSample">[0,1) 的随机采样；传 0 表示不要抖动（便于断言基数）。</param>
+    public static TimeSpan Backoff(int failures, TimeSpan baseInterval, TimeSpan recoverInterval, double jitterSample)
+    {
+        var baseMs = baseInterval.TotalMilliseconds;
+        if (baseMs <= 0) return TimeSpan.Zero;
+
+        var ceiling = Math.Max(baseMs, recoverInterval.TotalMilliseconds);
+        var scaled = baseMs * Math.Pow(2, Math.Clamp(failures, 0, 6));
+        var backoffMs = Math.Min(scaled, ceiling);
+
+        var jitter = Math.Clamp(jitterSample, 0, 0.999_999) * 0.1 * backoffMs;
+        return TimeSpan.FromMilliseconds(backoffMs + jitter);
+    }
 }

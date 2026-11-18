@@ -22,6 +22,55 @@ internal static class ScheduleTests
         tests.Add(new TestCase("schedule/scheduler_assigns_phases", SchedulerAssignsPhases));
         tests.Add(new TestCase("schedule/phase_follows_fastest_point", PhaseFollowsFastestPoint));
         tests.Add(new TestCase("schedule/uptime_ignores_a_clock_jump", UptimeIgnoresClockJump));
+        tests.Add(new TestCase("schedule/backoff_grows_then_caps", BackoffGrowsThenCaps));
+    }
+
+    /// <summary>
+    /// 失败退避：2^n 增长、到上限封顶、抖动只加不减且不超过 10%。
+    ///
+    /// 这条公式决定「设备彻底离线后多久试一次」。此前它埋在 actor 里，矩阵写着
+    /// 「interval × 2^failures，上限 recoverInterval，叠加 10% 抖动」，却没有任何用例
+    /// 断言过这个算术——能点名的都是「重试几次」的语义用例。公式写错（比如 2^n 写成
+    /// n²、上限取错、抖动摇成 [−10%, 0]）不会有任何红。
+    ///
+    /// 抽成纯函数后直接算，不赌时序；<paramref name="jitterSample"/> 传 0 就得到基值，
+    /// 传接近 1 就得到抖动上界，两者都精确可断言。
+    /// </summary>
+    private static Task BackoffGrowsThenCaps(TestContext t)
+    {
+        var baseInterval = TimeSpan.FromMilliseconds(100);
+        var recover = TimeSpan.FromMilliseconds(1000);
+
+        // 抖动取 0：得到「纯 2^n」的序列，逐档核对。
+        t.Close(100, ScheduleMath.Backoff(0, baseInterval, recover, 0).TotalMilliseconds, 0.001,
+            "no failures yet: wait exactly one base interval");
+        t.Close(200, ScheduleMath.Backoff(1, baseInterval, recover, 0).TotalMilliseconds, 0.001,
+            "one failure: 2x the base interval");
+        t.Close(400, ScheduleMath.Backoff(2, baseInterval, recover, 0).TotalMilliseconds, 0.001,
+            "two failures: 4x");
+
+        // 上限：2^6 = 6400ms 远超 1000ms，必须被 recoverInterval 截住。
+        t.Close(1000, ScheduleMath.Backoff(6, baseInterval, recover, 0).TotalMilliseconds, 0.001,
+            "the backoff is capped at recoverInterval, not 2^6 x base");
+
+        // 抖动：全部落在 [基值, 基值 × 1.1] 内，且确实会变大（不是恒定的）。
+        var low = ScheduleMath.Backoff(3, baseInterval, recover, 0);          // 800ms
+        var high = ScheduleMath.Backoff(3, baseInterval, recover, 0.999_999); // ~880ms
+        t.Ok(high > low, $"jitter only adds, never subtracts ({low.TotalMilliseconds:0.#} → {high.TotalMilliseconds:0.#} ms)");
+        t.Ok(high.TotalMilliseconds <= 800 * 1.1 + 0.001,
+            $"jitter stays within 10% ({high.TotalMilliseconds:0.#} ms <= 880 ms)");
+
+        // 上限也参与抖动：封顶后的值同样不得越过 ceiling × 1.1。
+        var cappedHigh = ScheduleMath.Backoff(6, baseInterval, recover, 0.999_999);
+        t.Ok(cappedHigh.TotalMilliseconds <= 1000 * 1.1 + 0.001,
+            $"a capped backoff still keeps jitter bounded ({cappedHigh.TotalMilliseconds:0.#} ms)");
+
+        // 基数大于上限时（点位周期比 recoverInterval 还长），上限取基数，
+        // 退避不能比一个正常周期还短——否则所谓「退避」反而在加快速率。
+        t.Close(500, ScheduleMath.Backoff(0, TimeSpan.FromMilliseconds(500), TimeSpan.FromMilliseconds(100), 0).TotalMilliseconds, 0.001,
+            "a base larger than recoverInterval is not shortened by the ceiling");
+
+        return Task.CompletedTask;
     }
 
     /// <summary>

@@ -26,6 +26,7 @@ internal static class FaultTests
     {
         tests.Add(new TestCase("fault/collection_stall_is_reported", CollectionStallIsReported));
         tests.Add(new TestCase("fault/clock_jump_does_not_fake_a_stall", ClockJumpDoesNotFakeStall));
+        tests.Add(new TestCase("fault/stall_threshold_follows_the_slowest_point", StallThresholdFollowsSlowestPoint));
         tests.Add(new TestCase("fault/outbox_ttl_ignores_a_clock_jump", OutboxTtlIgnoresClockJump));
         tests.Add(new TestCase("fault/outbox_permission_error_is_counted", OutboxPermissionErrorIsCounted));
     }
@@ -87,8 +88,12 @@ internal static class FaultTests
         }
     }
 
-    private static async Task<(Scheduler Engine, DeviceActor Actor, WedgeDriver Driver, FakeClock Clock)> StartWedgeAsync(
+    private static Task<(Scheduler Engine, DeviceActor Actor, WedgeDriver Driver, FakeClock Clock)> StartWedgeAsync(
         TestContext t)
+        => StartWedgeAsync(t, TimeSpan.FromMilliseconds(100));
+
+    private static async Task<(Scheduler Engine, DeviceActor Actor, WedgeDriver Driver, FakeClock Clock)> StartWedgeAsync(
+        TestContext t, TimeSpan pointInterval)
     {
         var registry = new DriverRegistry();
         var driver = new WedgeDriver();
@@ -116,7 +121,7 @@ internal static class FaultTests
                 {
                     Id = "d1",
                     ChannelId = "ch",
-                    Interval = TimeSpan.FromMilliseconds(100),
+                    Interval = pointInterval,
                     Timeout = TimeSpan.FromMilliseconds(200),
                     Retries = 0,
                     Points =
@@ -126,7 +131,7 @@ internal static class FaultTests
                             Id = "p1",
                             Address = Address.Register("holding", 0),
                             DataType = DataType.UInt16,
-                            Interval = TimeSpan.FromMilliseconds(100),
+                            Interval = pointInterval,
                         },
                     },
                 },
@@ -189,6 +194,55 @@ internal static class FaultTests
         await watcher.TickAsync(t.Ct);
         t.Equal(2d, metrics.CounterValue("uic_watchdog_stale_total", labels),
             "a persistent stall is re-reported after the dedup window");
+
+        driver.Release();
+        await engine.DisposeAsync();
+    }
+
+    /// <summary>
+    /// 停滞阈值取 <c>max(30 秒, 10 × 设备内最慢点位周期)</c>，而不是固定的 30 秒（FR-RUN-10）。
+    ///
+    /// 为什么单独立一条：另外两条看门狗用例都把 <c>MinimumStaleAge</c> 设成 1 秒好让用例跑得快，
+    /// 于是「10 × 周期」那一支从未被执行过——它们证明的是「能报警」，不是「阈值按周期放宽」。
+    /// 一台只挂 10 秒慢变量的设备，正常采集时两次样本之间就有 10 秒空档；按 30 秒判，
+    /// 任何一次采集稍有延迟都会误报，运维从此不再信这个指标。
+    ///
+    /// 用默认的 30 秒下限 + 10 秒点位周期，阈值应是 100 秒：停 60 秒不该报，停 110 秒必须报。
+    /// 若阈值退化成固定的 30 秒，第一次断言就会失败。
+    /// </summary>
+    private static async Task StallThresholdFollowsSlowestPoint(TestContext t)
+    {
+        // 点位周期 10s ⇒ 阈值 = max(30s, 100s) = 100s。用例不等待真实时间，
+        // 只拨 FakeClock（墙钟与单调时钟一起拨，模拟「真的过了这么久」）。
+        var (engine, actor, driver, clock) = await StartWedgeAsync(t, TimeSpan.FromSeconds(10));
+        var metrics = new MetricsRegistry();
+
+        await using var watcher = new DeviceStateWatcher(engine, () => null, NullLogger.Instance, metrics)
+        {
+            // 保持默认的 30s 下限：要验的正是「周期更长时阈值跟着放宽」。
+            Time = clock,
+        };
+
+        var labels = new Dictionary<string, string> { ["device"] = "d1" };
+
+        t.Equal(TimeSpan.FromSeconds(10), actor.SlowestInterval,
+            "the slowest point drives the threshold, not the fast device cycle");
+        t.Equal(RuntimeState.Collecting, actor.State, "the device is collecting");
+
+        // 建立观察起点。
+        await watcher.TickAsync(t.Ct);
+
+        // 60 秒：超过 30 秒下限，但还没到 10 × 周期的 100 秒 → 不能报。
+        clock.Advance(TimeSpan.FromSeconds(60), TimeSpan.FromSeconds(60));
+        await watcher.TickAsync(t.Ct);
+        t.Equal(0d, metrics.CounterValue("uic_watchdog_stale_total", labels),
+            "60s is past the 30s floor but inside 10 × the 10s point cycle");
+
+        // 再往前 50 秒（累计 110 秒）：越过 100 秒 → 必须报。
+        clock.Advance(TimeSpan.FromSeconds(50), TimeSpan.FromSeconds(50));
+        await watcher.TickAsync(t.Ct);
+        t.Equal(1d, metrics.CounterValue("uic_watchdog_stale_total", labels),
+            "past 10 × the slowest cycle the stall is reported");
 
         driver.Release();
         await engine.DisposeAsync();

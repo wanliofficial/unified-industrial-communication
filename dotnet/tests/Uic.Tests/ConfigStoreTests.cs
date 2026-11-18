@@ -238,6 +238,25 @@ internal static class ConfigStoreTests
             }, "northbound.opcUa.securityPolicy"),
             ("negative memory watermark", n => n["storage"]!["maxMemoryBytes"] = -1,
                 "storage.maxMemoryBytes"),
+
+            // 命名唯一性（FR-CFG-06）：三类各自独立查重。重复 id 不会在语法层暴露，
+            // 只会在语义层被拒——漏了就会让「同名通道/设备/点位」静默覆盖彼此，
+            // 现场表现为某些点位永远读不到值，却没有任何报错。
+            ("duplicate channel id", n =>
+            {
+                var copy = n["channels"]![0]!.DeepClone().AsObject();
+                n["channels"]!.AsArray().Add(copy);
+            }, "channels[virtual-bus].id"),
+            ("duplicate device id", n =>
+            {
+                var copy = n["devices"]![0]!.DeepClone().AsObject();
+                n["devices"]!.AsArray().Add(copy);
+            }, "devices[virtual-1].id"),
+            ("duplicate point id in one device", n =>
+            {
+                var points = n["devices"]![0]!["points"]!.AsArray();
+                points.Add(points[0]!.DeepClone());
+            }, "devices[virtual-1].points[temperature].id"),
         };
 
         t.Ok(cases.Length >= 20, $"the matrix covers at least twenty classes (got {cases.Length})");

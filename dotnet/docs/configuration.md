@@ -288,8 +288,8 @@ ReadPropertyMultiple、COV 订阅、写优先级与数组索引、跨 BACnet 路
 | `retries` | `0` | 0..10，仅对**临时性失败**（超时、链路断开）重试；地址错、协议错不重试 |
 | `unitId` | `1` | Modbus 从站地址 1..255 |
 | `byteOrder` | `abcd` | `abcd` / `cdab` / `badc` / `dcba`，点位可覆盖；只影响 32/64 位数值，`string`/`bytes` 不重排 |
-| `failureThreshold` | `3` | 连续失败多少次进入降级 |
-| `recoverInterval` | `30s` | 降级后探活间隔 |
+| `failureThreshold` | `3` | 连续失败多少次进入降级；到阈值转熔断态并断开连接 |
+| `recoverInterval` | `30s` | 退避重连的上限。没有单独的探活定时器：熔断后仍靠退避重连去试，间隔从最快点位周期按 2^n 增长，涨到这里封顶 |
 | `labels` | `{}` | 驱动私有参数 |
 | `points` | 必填 | 至少一个 |
 

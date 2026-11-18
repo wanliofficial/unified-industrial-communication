@@ -18,6 +18,7 @@ internal static class EngineTests
     public static void Register(List<TestCase> tests)
     {
         tests.Add(new TestCase("engine/conn_is_never_called_concurrently", NeverCalledConcurrently));
+        tests.Add(new TestCase("engine/devices_collect_in_parallel", DevicesCollectInParallel));
         tests.Add(new TestCase("engine/channel_gate_lets_queued_writes_go_first", ChannelGateLetsQueuedWritesGoFirst));
         tests.Add(new TestCase("engine/actor_reports_state_and_generation", ReportsStateAndGeneration));
         tests.Add(new TestCase("engine/transient_failure_is_retried", TransientFailureIsRetried));
@@ -25,6 +26,7 @@ internal static class EngineTests
         tests.Add(new TestCase("engine/deadline_is_retried_as_timeout", DeadlineIsRetriedAsTimeout));
         tests.Add(new TestCase("engine/permanent_failure_is_not_retried", PermanentFailureIsNotRetried));
         tests.Add(new TestCase("engine/retries_are_finite", RetriesAreFinite));
+        tests.Add(new TestCase("engine/failure_threshold_trips_the_breaker", FailureThresholdTripsTheBreaker));
         tests.Add(new TestCase("engine/write_confirmation_reads_back", WriteConfirmationReadsBack));
         tests.Add(new TestCase("engine/write_confirmation_detects_mismatch", WriteConfirmationDetectsMismatch));
         tests.Add(new TestCase("engine/write_without_confirmation_skips_readback", WriteWithoutConfirmationSkipsReadback));
@@ -753,8 +755,174 @@ internal static class EngineTests
         }
     }
 
-    private static Device BuildDevice(int retries = 0, TimeSpan? interval = null) => new()
+    /// <summary>
+    /// 跨设备并行（FR-RUN-02 的另一半）：两台设备各自跑自己的采集循环，互不等待。
+    ///
+    /// 为什么单独立一条：矩阵写的是「每设备串行、跨设备并行」，但此前只有
+    /// <c>engine/conn_is_never_called_concurrently</c>——它证明的是「同一连接不并发」，
+    /// 属于串行那半。跨设备并发一旦退化成「整台调度器一把锁」，那半句就没有任何红。
+    /// 现场影响很直接：一台慢设备会把所有设备一起拖慢，100 台设备等于串成一条队列。
+    ///
+    /// 用屏障而不是计时：两台设备的读都在屏障前等对方，只有真并行才能各自放行。
+    /// 若调度退化成串行，第一台永远等不到第二台，用例以明确失败（而不是偶发超时）收场。
+    /// </summary>
+    private static Task DevicesCollectInParallel(TestContext t)
     {
+        return RunAsync(async () =>
+        {
+            var driver = new BarrierDriver(parties: 2);
+
+            var config = new ConfigDocument
+            {
+                SchemaVersion = 1,
+                Site = "parallel-site",
+                Channels =
+                {
+                    // 两条通道、各自并发上限 1：跨设备能否并行只能靠「不同通道/设备不互相锁」。
+                    new Channel
+                    {
+                        Id = "ch-a", Protocol = "barrier", Transport = "none",
+                        MaxConcurrency = 1, Timeout = TimeSpan.FromSeconds(20),
+                    },
+                    new Channel
+                    {
+                        Id = "ch-b", Protocol = "barrier", Transport = "none",
+                        MaxConcurrency = 1, Timeout = TimeSpan.FromSeconds(20),
+                    },
+                },
+                Devices =
+                {
+                    DeviceFor("dev-a", "ch-a"),
+                    DeviceFor("dev-b", "ch-b"),
+                },
+            };
+
+            var registry = new DriverRegistry();
+            registry.Register(driver);
+
+            await using var engine = new Scheduler(
+                registry, new PointCache(), NullLoggerFactory.Instance,
+                new SchedulerOptions { Tick = TimeSpan.FromMilliseconds(5) });
+
+            engine.Start(config);
+
+            // 两台设备都通过屏障＝两次读在同一时刻同时在跑。
+            // 屏障有超时，串行时不会挂死：会以「没有并发」的明确消息失败。
+            var overlapped = await driver.WaitForOverlapAsync(TimeSpan.FromSeconds(15), t.Ct);
+
+            t.Ok(overlapped,
+                "two devices on separate channels collect concurrently, not one after another "
+                + $"(arrived={driver.Arrived}, overlaps={driver.Overlaps})");
+            t.Ok(driver.Overlaps >= 1,
+                $"at least one pair of reads was in flight together (overlaps={driver.Overlaps})");
+
+            var a = engine.Find("dev-a");
+            var b = engine.Find("dev-b");
+            t.Ok(a is not null && b is not null, "both devices were started");
+            t.Ok(a!.State is RuntimeState.Collecting or RuntimeState.Connecting,
+                $"device a is running (state={a.State})");
+            t.Ok(b!.State is RuntimeState.Collecting or RuntimeState.Connecting,
+                $"device b is running (state={b.State})");
+        });
+
+        static Device DeviceFor(string id, string channelId) => new()
+        {
+            Id = id,
+            ChannelId = channelId,
+            Interval = TimeSpan.FromMilliseconds(50),
+            Timeout = TimeSpan.FromSeconds(20),
+            Points = new List<Point>
+            {
+                new() { Id = "p", Address = Address.Register("holding", 0), DataType = DataType.UInt16 },
+            },
+        };
+    }
+
+    /// <summary>
+    /// 每次读都在屏障前等「另一个设备也来读」。两个都到了才一起放行，
+    /// 于是「两个读的存活区间是否重叠」变成一个确定事实，不靠时序去猜。
+    /// </summary>
+    private sealed class BarrierDriver(int parties) : IDriver
+    {
+        private readonly SemaphoreSlim _arrived = new(0);
+        private int _arrivedCount;
+        private int _overlaps;
+        private int _inFlight;
+
+        public int Arrived => Volatile.Read(ref _arrivedCount);
+        public int Overlaps => Volatile.Read(ref _overlaps);
+
+        public DriverMeta Meta { get; } = new()
+        {
+            Id = "barrier",
+            Name = "屏障驱动",
+            Transports = new[] { "none" },
+            Roles = new[] { DriverRole.Master },
+        };
+
+        public IConn Open(OpenContext context) => new Conn(this);
+
+        /// <summary>等到出现一次「两个读同时在飞」；超时返回 false（说明没有并发）。</summary>
+        public async Task<bool> WaitForOverlapAsync(TimeSpan timeout, CancellationToken ct)
+        {
+            var clock = Stopwatch.StartNew();
+            while (Volatile.Read(ref _overlaps) == 0)
+            {
+                if (clock.Elapsed > timeout) return false;
+                await Task.Delay(5, ct);
+            }
+
+            return true;
+        }
+
+        private async Task ReadAsync(CancellationToken ct)
+        {
+            var inFlight = Interlocked.Increment(ref _inFlight);
+            if (inFlight > 1) Interlocked.Increment(ref _overlaps);
+
+            Interlocked.Increment(ref _arrivedCount);
+            _arrived.Release();
+
+            // 等其余设备到齐（最多等超时的一半，留出余量给上层超时）。
+            var remaining = parties - inFlight;
+            for (var i = 0; i < Math.Max(0, remaining); i++)
+            {
+                if (!await _arrived.WaitAsync(TimeSpan.FromSeconds(10), ct).ConfigureAwait(false))
+                    break;
+            }
+
+            // 稍留片刻，确保两次读的存活区间真的重叠，而不是擦肩而过。
+            await Task.Delay(30, ct).ConfigureAwait(false);
+
+            Interlocked.Decrement(ref _inFlight);
+        }
+
+        private sealed class Conn(BarrierDriver owner) : IConn
+        {
+            public Task ProbeAsync(CancellationToken ct) => Task.CompletedTask;
+
+            public async Task<IReadOnlyList<RawSample>> ReadAsync(
+                IReadOnlyList<ReadSpan> spans, CancellationToken ct)
+            {
+                await owner.ReadAsync(ct).ConfigureAwait(false);
+
+                return spans
+                    .SelectMany(s => s.Points)
+                    .Select(p => new RawSample(p.Id, DataValue.Number(p.DataType, 1), Quality.Good, null))
+                    .ToArray();
+            }
+
+            public Task<IReadOnlyList<WriteResult>> WriteAsync(
+                IReadOnlyList<WriteCommand> commands, CancellationToken ct)
+                => Task.FromResult<IReadOnlyList<WriteResult>>(commands
+                    .Select(c => new WriteResult(c.Point.Id, true, Quality.Good, DateTimeOffset.UtcNow))
+                    .ToArray());
+
+            public ValueTask DisposeAsync() => ValueTask.CompletedTask;
+        }
+    }
+
+    private static Device BuildDevice(int retries = 0, TimeSpan? interval = null) => new()    {
         Id = "dev-1",
         ChannelId = "ch-1",
         // 默认快速轮询，够并发用例取到多次采样；重试用例传长间隔，只跑一轮才好数「读了几次」。
@@ -984,6 +1152,201 @@ internal static class EngineTests
         });
     }
 
+    /// <summary>
+    /// 熔断阈值（FR-RUN-05）：连续失败达到 <c>FailureThreshold</c> 判「降级 → 熔断」。
+    ///
+    /// 为什么单独立一条：此前全仓只有 <c>engine/retries_are_finite</c> 断言到 <c>Degraded</c>——
+    /// 那证明的是「一轮用完重试后降级」，既没到阈值，也从未断言过 <c>Faulted</c>。
+    /// 熔断态是运维「这台设备别再试了」的唯一信号，它不出现在断言里就等于没人验证过：
+    /// 阈值比较写反，或熔断后不关旧连接，用例都发现不了。
+    ///
+    /// 驱动每轮读取都要用例显式放行，因此「第 N 次失败之后状态是什么」是确定事实，
+    /// 不靠 sleep 去猜。失败用非临时错误（协议错），这样连接不会被重连打断：
+    /// 重连会把状态改成 <c>Connecting</c>，而我们正要观察的是降级/熔断。
+    /// </summary>
+    private static Task FailureThresholdTripsTheBreaker(TestContext t)
+    {
+        return RunAsync(async () =>
+        {
+            const int threshold = 3;
+            var driver = new GatedFailureDriver();
+
+            var device = new Device
+            {
+                Id = "dev-1",
+                ChannelId = "ch-1",
+                // 周期 100ms：退避按 2^n 增长，几次失败之间只隔几百毫秒，
+                // 用例整体不拖时间；节奏仍由「逐轮放行」控制，不靠这个数去卡时序。
+                Interval = TimeSpan.FromMilliseconds(100),
+                // 读超时放到足够长：用例要靠「放行」控制节奏，不该被通道超时抢先判成超时。
+                Timeout = TimeSpan.FromSeconds(30),
+                FailureThreshold = threshold,
+                RecoverInterval = TimeSpan.FromMilliseconds(400),
+                Points = new List<Point>
+                {
+                    new() { Id = "a", Address = Address.Register("holding", 0), DataType = DataType.UInt16 },
+                },
+            };
+
+            var actor = new DeviceActor(
+                device,
+                BuildChannel(),
+                driver,
+                new PointCache(),
+                new ChannelGate(1),
+                NullLogger.Instance,
+                new SchedulerOptions { Tick = TimeSpan.FromMilliseconds(5) });
+
+            actor.Start();
+
+            var generationBeforeTrip = 0;
+
+            try
+            {
+                // 每轮都先拿到「读进入」这个确定的交接点：
+                // 此时上一轮的失败已经记完账、这一轮还没开始。
+                // 第 1 轮跳过状态断言：那时连接还在建立，状态本来就是 Connecting。
+                for (var round = 1; round <= threshold; round++)
+                {
+                    await driver.WaitForReadAsync(t);
+
+                    if (round > 1)
+                    {
+                        var failuresSoFar = round - 1;
+                        t.Equal(RuntimeState.Degraded, actor.State,
+                            $"{failuresSoFar} of {threshold} failures degrades but does not trip the breaker");
+                    }
+
+                    if (round == threshold) generationBeforeTrip = actor.Generation;
+
+                    driver.NextReadFails();
+                }
+
+                // 达到阈值必须熔断：降级是「有点问题」，熔断是「别再试了」。
+                await WaitForStateAsync(t, actor, RuntimeState.Faulted);
+
+                // 紧跟着取一次快照：这一刻还没走完退避，不会混进第 4 轮。
+                var failedAtTrip = actor.Stats.ReadsFailed;
+                t.Equal((long)threshold, failedAtTrip,
+                    "the breaker trips on exactly the threshold-th consecutive failure");
+
+                // 关连接是 fire-and-forget，换代次紧随其后，稍等它落地。
+                await WaitForAsync(t, () => actor.Generation > generationBeforeTrip,
+                    $"tripping the breaker closes the link so late results are discarded "
+                    + $"(generation {generationBeforeTrip} → {actor.Generation})");
+
+                // 熔断后没有独立的「探活定时器」：仍按退避重连去试，
+                // 重连成功才会把状态拉回采集。这里验证它确实又开了一次连接。
+                await driver.WaitForReadAsync(t);
+                t.Ok(driver.Opens >= 2,
+                    $"a faulted device keeps probing by reconnecting (opens={driver.Opens})");
+            }
+            finally
+            {
+                driver.ReleaseAll();
+                await actor.StopAsync();
+            }
+        });
+    }
+
+    /// <summary>等到设备进入指定运行态；超时即失败，避免用例挂死。</summary>
+    private static async Task WaitForStateAsync(TestContext t, DeviceActor actor, RuntimeState want)
+    {
+        var clock = Stopwatch.StartNew();
+        while (actor.State != want)
+        {
+            if (clock.ElapsedMilliseconds > 10_000)
+                t.Fail($"the device never reached {want} (still {actor.State} after {clock.ElapsedMilliseconds} ms)");
+
+            await Task.Delay(10, t.Ct);
+        }
+    }
+
+    /// <summary>等到某个条件成立；不成立就带着当时的实际值失败。</summary>
+    private static async Task WaitForAsync(TestContext t, Func<bool> condition, string what)
+    {
+        var clock = Stopwatch.StartNew();
+        while (!condition())
+        {
+            if (clock.ElapsedMilliseconds > 10_000) t.Fail($"{what} (waited {clock.ElapsedMilliseconds} ms)");
+
+            await Task.Delay(10, t.Ct);
+        }
+    }
+
+    /// <summary>
+    /// 每一轮读取都等用例放行，然后按用例的指令失败。
+    ///
+    /// 不用「自动连续失败 + sleep 后看状态」是因为那要靠猜：失败之间的退避会随
+    /// 失败次数增长，机器一忙就可能只跑了两轮，断言「已经熔断」就会偶发失败。
+    /// 这里把每轮的交接点显式化，状态断言就落在确定的位置上。
+    /// </summary>
+    private sealed class GatedFailureDriver : IDriver
+    {
+        private readonly SemaphoreSlim _readGate = new(0);
+        private readonly SemaphoreSlim _entered = new(0);
+        private int _reads;
+        private int _opens;
+
+        public int Reads => Volatile.Read(ref _reads);
+        public int Opens => Volatile.Read(ref _opens);
+
+        public DriverMeta Meta { get; } = new()
+        {
+            Id = "gated",
+            Name = "逐轮放行驱动",
+            Transports = new[] { "none" },
+            Roles = new[] { DriverRole.Master },
+        };
+
+        public IConn Open(OpenContext context)
+        {
+            Interlocked.Increment(ref _opens);
+            return new Conn(this);
+        }
+
+        /// <summary>等下一轮读取进入，超时即失败。</summary>
+        public async Task WaitForReadAsync(TestContext t)
+        {
+            if (!await _entered.WaitAsync(TimeSpan.FromSeconds(10), t.Ct).ConfigureAwait(false))
+                t.Fail("the collection loop stopped asking for reads");
+        }
+
+        /// <summary>放行当前这轮读取，并让它失败。</summary>
+        public void NextReadFails() => _readGate.Release();
+
+        /// <summary>收尾用：不再阻塞任何在途读取。</summary>
+        public void ReleaseAll()
+        {
+            for (var i = 0; i < 64; i++) _readGate.Release();
+        }
+
+        private sealed class Conn(GatedFailureDriver owner) : IConn
+        {
+            public Task ProbeAsync(CancellationToken ct) => Task.CompletedTask;
+
+            public async Task<IReadOnlyList<RawSample>> ReadAsync(
+                IReadOnlyList<ReadSpan> spans, CancellationToken ct)
+            {
+                Interlocked.Increment(ref owner._reads);
+                owner._entered.Release();
+
+                // 等用例放行：这一步让「失败发生在什么状态之后」变成确定顺序。
+                await owner._readGate.WaitAsync(ct).ConfigureAwait(false);
+
+                throw DriverException.ProtocolError("gated", "read", "injected read failure");
+            }
+
+            public Task<IReadOnlyList<WriteResult>> WriteAsync(
+                IReadOnlyList<WriteCommand> commands, CancellationToken ct)
+                => Task.FromResult<IReadOnlyList<WriteResult>>(commands
+                    .Select(c => new WriteResult(c.Point.Id, true, Quality.Good, DateTimeOffset.UtcNow))
+                    .ToArray());
+
+            public ValueTask DisposeAsync() => ValueTask.CompletedTask;
+        }
+    }
+
     private static DeviceActor BuildActor(ScriptedDriver driver, int retries, PointCache cache) => new(
         BuildDevice(retries: retries, interval: TimeSpan.FromSeconds(10)),
         BuildChannel(),
@@ -993,11 +1356,31 @@ internal static class EngineTests
         NullLogger.Instance,
         new SchedulerOptions { Tick = TimeSpan.FromMilliseconds(5) });
 
-    /// <summary>间隔设成 10 秒，所以启动后只会有一次采集；等它跑完再断言。</summary>
-    private static Task StartAndSettleAsync(DeviceActor actor, TestContext t)
+    /// <summary>
+    /// 间隔设成 10 秒，所以启动后只会有一次采集：等「这一轮真的走完」再断言。
+    ///
+    /// 早先这里是死等 200 ms——机器空闲时够用，`load average` 上到十几个以后
+    /// 一次读都可能排不到，于是「重试了一次」被误判成「只读了一次」。
+    /// 判据取 <see cref="DeviceStats.ReadsTotal"/>（一轮采集完成才自增），
+    /// 与机器快慢无关；上限留着，真挂住时给出明确失败而不是一直等。
+    ///
+    /// 计数在记账之前自增，所以还要等状态从 `Connecting` 落定——
+    /// 否则可能正好撞上「计数已加、状态未写」的那一瞬间。
+    /// </summary>
+    private static async Task StartAndSettleAsync(DeviceActor actor, TestContext t)
     {
         actor.Start();
-        return Task.Delay(200, t.Ct);
+
+        var clock = Stopwatch.StartNew();
+
+        while (actor.Stats.ReadsTotal < 1 || actor.State == RuntimeState.Connecting)
+        {
+            if (clock.ElapsedMilliseconds > 15_000)
+                t.Fail($"no collection cycle settled in {clock.ElapsedMilliseconds} ms "
+                       + $"(reads={actor.Stats.ReadsTotal}, state={actor.State})");
+
+            await Task.Delay(10, t.Ct);
+        }
     }
 
     private static Task RunAsync(Func<Task> body) => body();

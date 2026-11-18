@@ -189,8 +189,14 @@ public sealed class Device
     public int UnitId { get; init; } = 1;
     public ByteOrder ByteOrder { get; init; } = ByteOrder.ABCD;
 
-    /// <summary>连续失败多少次后进入降级（熔断），之后按探活周期恢复。</summary>
+    /// <summary>连续失败多少次后进入降级（熔断），到阈值则判为熔断态。</summary>
     public int FailureThreshold { get; init; } = 3;
+
+    /// <summary>
+    /// 失败退避的上限。没有独立的「探活周期」：熔断之后仍然靠退避重连去试，
+    /// 间隔从最快周期按 2^n 增长，涨到这里为止。所以这个值实际决定的是
+    /// 「设备彻底离线后多久试一次」，而不是恢复探测的固定节拍。
+    /// </summary>
     public TimeSpan RecoverInterval { get; init; } = TimeSpan.FromSeconds(30);
 
     /// <summary>驱动私有参数（波形、故障注入、方言开关等）。键名由驱动 ConfigFields 声明。</summary>
