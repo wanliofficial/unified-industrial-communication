@@ -430,11 +430,12 @@ func (s *Server) multiple(req enipcodec.Request) []byte {
 	if tableEnd > len(req.Data) {
 		return mustReply(req.Service, 0x03, nil, nil)
 	}
-	base := tableEnd
+	// 偏移相对数据区起点（条数字段在偏移 0），第一条至少是 2+2n。
+	// 这是 1756-PM020/pycomm3 的约定，与 codec 的 BuildMultiple 一致。
 	offsets := make([]int, count)
 	for i := 0; i < count; i++ {
 		offsets[i] = int(binary.LittleEndian.Uint16(req.Data[2+2*i:]))
-		if offsets[i] < 0 || base+offsets[i] > len(req.Data) {
+		if offsets[i] < tableEnd || offsets[i] > len(req.Data) {
 			return mustReply(req.Service, 0x03, nil, nil)
 		}
 		if i > 0 && offsets[i] < offsets[i-1] {
@@ -443,10 +444,10 @@ func (s *Server) multiple(req enipcodec.Request) []byte {
 	}
 	replies := make([][]byte, count)
 	for i := 0; i < count; i++ {
-		start := base + offsets[i]
+		start := offsets[i]
 		end := len(req.Data)
 		if i+1 < count {
-			end = base + offsets[i+1]
+			end = offsets[i+1]
 		}
 		if end < start || end > len(req.Data) {
 			return mustReply(req.Service, 0x03, nil, nil)
@@ -459,7 +460,7 @@ func (s *Server) multiple(req enipcodec.Request) []byte {
 	}
 	body := make([]byte, 2+2*count, bodyLen)
 	binary.LittleEndian.PutUint16(body, uint16(count))
-	off := 0
+	off := 2 + 2*count
 	for i, r := range replies {
 		binary.LittleEndian.PutUint16(body[2+2*i:], uint16(off))
 		off += len(r)

@@ -331,15 +331,40 @@ func (s *Server) replyStatus(c net.Conn, dm secscodec.DataMessage, object string
 	if err != nil {
 		return
 	}
+	// 每个请求编号都必须有应答位：S1F4 是按位置的纯值列表，省略未知
+	// 编号会让后面所有值错位。未知编号用零长 Binary 占位，主站按
+	// 「空二进制 = 不存在」归类为地址错误。
 	vals := make([]secscodec.StatusValue, 0, len(ids))
 	s.mu.Lock()
 	for _, id := range ids {
 		if v, ok := s.vars[vkey{object: object, id: id}]; ok {
 			vals = append(vals, secscodec.StatusValue{ID: id, Value: v.value})
+		} else {
+			vals = append(vals, secscodec.StatusValue{ID: id,
+				Value: secscodec.Binary(nil)})
 		}
 	}
 	s.mu.Unlock()
-	body, err := secscodec.EncodeStatusReply(vals)
+	// S1F4 = L,n{V}（不回显 SVID）；S2F14 = L,n{L,2{ECID,V}}（回显 ECID）。
+	// 两条路径的应答体不同是 SEMI E5 的规定，不是可以共用的实现细节。
+	var body []byte
+	if dm.Stream == 1 {
+		items := make([]*secscodec.Item, 0, len(vals))
+		for _, v := range vals {
+			items = append(items, v.Value)
+		}
+		var e error
+		body, e = secscodec.EncodeValueReply(items)
+		if e != nil {
+			return
+		}
+	} else {
+		var e error
+		body, e = secscodec.EncodeStatusReply(vals)
+		if e != nil {
+			return
+		}
+	}
 	if err != nil {
 		return
 	}

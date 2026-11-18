@@ -113,12 +113,13 @@ func TestServerCustomVariableVisible(t *testing.T) {
 		Body: must(secscodec.EncodeIDList([]uint32{20})),
 	}.ToMessage())
 	d, _ = secscodec.ParseData(cl.recv())
-	vals, err := secscodec.DecodeStatusReply(d.Body)
+	// S1F4 = L,n{V}：按位置的纯值列表，不回显 SVID。
+	items, err := secscodec.DecodeValueReply(d.Body)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(vals) != 1 || vals[0].Value.Format != secscodec.FormatF8 {
-		t.Fatalf("取值 = %+v", vals)
+	if len(items) != 1 || items[0].Format != secscodec.FormatF8 {
+		t.Fatalf("取值 = %+v", items)
 	}
 }
 
@@ -177,12 +178,13 @@ func TestServerUnknownSVIDReturnsEmpty(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	vals, err := secscodec.DecodeStatusReply(d.Body)
+	items, err := secscodec.DecodeValueReply(d.Body)
 	if err != nil {
-		t.Fatalf("空列表应能解码: %v", err)
+		t.Fatalf("应答应能解码: %v", err)
 	}
-	if len(vals) != 0 {
-		t.Fatalf("未知编号不该有值: %+v", vals)
+	// 未知编号占一个位：零长 Binary（主站按「不存在」归为地址错误）。
+	if len(items) != 1 || items[0].Format != secscodec.FormatBinary || len(items[0].Raw) != 0 {
+		t.Fatalf("未知编号应是零长 B 占位: %+v", items)
 	}
 }
 

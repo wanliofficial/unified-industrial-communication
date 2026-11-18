@@ -25,7 +25,7 @@ func TestBuildReadGolden(t *testing.T) {
 	if err != nil {
 		t.Fatalf("build: %v", err)
 	}
-	want := "005000FFFF03000C00100001040000A86400000200"
+	want := "500000FFFF03000C00100001040000A86400000200"
 	if got := hex(frame); got != want {
 		t.Fatalf("read frame = %s, want %s", got, want)
 	}
@@ -40,7 +40,7 @@ func TestBuildReadBitGolden(t *testing.T) {
 	if err != nil {
 		t.Fatalf("build: %v", err)
 	}
-	want := "005000FFFF03000C00100001040100900000001000"
+	want := "500000FFFF03000C00100001040100900000001000"
 	if got := hex(frame); got != want {
 		t.Fatalf("bit read frame = %s, want %s", got, want)
 	}
@@ -53,7 +53,7 @@ func TestBuildWriteGolden(t *testing.T) {
 	if err != nil {
 		t.Fatalf("build: %v", err)
 	}
-	want := "005000FFFF03000E00100001140000A800000001003412"
+	want := "500000FFFF03000E00100001140000A800000001003412"
 	if got := hex(frame); got != want {
 		t.Fatalf("write frame = %s, want %s", got, want)
 	}

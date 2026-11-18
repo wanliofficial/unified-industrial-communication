@@ -2,6 +2,7 @@ package opcua
 
 import (
 	"encoding/base64"
+	"encoding/binary"
 	"fmt"
 	"math"
 	"strconv"
@@ -191,7 +192,13 @@ func (n NodeID) Encode(e *encoder) {
 	case NodeIDGUID:
 		e.Byte(0x04)
 		e.U16(n.Namespace)
-		e.b = append(e.b, n.GUID[:]...)
+		// GUID 的线序（Part 6 §5.1.4）：Data1/Data2/Data3 是**小端**，
+		// Data4 原样。struct 里按文本序（大端）存，写出时翻前 8 字节——
+		// 直接 append 原字节会与任何标准实现交换出不同的 GUID。
+		e.U32(binary.BigEndian.Uint32(n.GUID[0:4]))
+		e.U16(binary.BigEndian.Uint16(n.GUID[4:6]))
+		e.U16(binary.BigEndian.Uint16(n.GUID[6:8]))
+		e.b = append(e.b, n.GUID[8:16]...)
 	case NodeIDByteString:
 		e.Byte(0x05)
 		e.U16(n.Namespace)
@@ -223,9 +230,13 @@ func (d *decoder) NodeID() NodeID {
 		return StringNode(ns, d.String())
 	case 0x04:
 		ns := d.U16()
+		// 与 Encode 对称：线上 Data1/Data2/Data3 小端，文本序大端存储。
 		var g [16]byte
-		if b := d.take(16); b != nil {
-			copy(g[:], b)
+		binary.BigEndian.PutUint32(g[0:4], d.U32())
+		binary.BigEndian.PutUint16(g[4:6], d.U16())
+		binary.BigEndian.PutUint16(g[6:8], d.U16())
+		if b := d.take(8); b != nil {
+			copy(g[8:], b)
 		}
 		return NodeID{Kind: NodeIDGUID, Namespace: ns, GUID: g}
 	case 0x05:

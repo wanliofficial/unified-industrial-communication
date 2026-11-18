@@ -221,7 +221,13 @@ func (s *Server) handle(pdu []byte) []byte {
 }
 
 func (s *Server) readRegs(fc byte, regs []uint16, addr, qty int) []byte {
-	if qty <= 0 || qty > 125 || addr < 0 || addr+qty > len(regs) {
+	// 数量值非法（0 或超过 125）与地址越界是两类异常：前者回 03
+	// （Illegal Data Value），后者才回 02（Illegal Data Address）——
+	// Modbus V1.1b3 §6.12 如此区分，libmodbus 同此。
+	if qty <= 0 || qty > 125 {
+		return mbcodec.ExceptionPDU(fc, 3)
+	}
+	if addr < 0 || addr+qty > len(regs) {
 		return mbcodec.ExceptionPDU(fc, 2)
 	}
 	out := make([]byte, 2+qty*2)
@@ -234,7 +240,11 @@ func (s *Server) readRegs(fc byte, regs []uint16, addr, qty int) []byte {
 }
 
 func (s *Server) readBits(fc byte, bits []bool, addr, qty int) []byte {
-	if qty <= 0 || qty > 2000 || addr < 0 || addr+qty > len(bits) {
+	// 数量非法回 03、地址越界回 02，与读寄存器同一区分（V1.1b3 §6.11）。
+	if qty <= 0 || qty > 2000 {
+		return mbcodec.ExceptionPDU(fc, 3)
+	}
+	if addr < 0 || addr+qty > len(bits) {
 		return mbcodec.ExceptionPDU(fc, 2)
 	}
 	n := (qty + 7) / 8

@@ -378,15 +378,15 @@ func TestExchangeIgnoresStaleSecondary(t *testing.T) {
 		// 先回一条系统字节错、值也错的应答。
 		writeMsg(c, secscodec.DataMessage{
 			SystemBytes: req.SystemBytes + 1, Stream: 1, Function: 4,
-			Body: mustEncode(secscodec.EncodeStatusReply([]secscodec.StatusValue{
-				{ID: 1, Value: secscodec.Int(secscodec.FormatU4, 999)},
+			Body: mustEncode(secscodec.EncodeValueReply([]*secscodec.Item{
+				secscodec.Int(secscodec.FormatU4, 999),
 			})),
 		}.ToMessage())
 		// 再回正确的应答。
 		writeMsg(c, secscodec.DataMessage{
 			SystemBytes: req.SystemBytes, Stream: 1, Function: 4,
-			Body: mustEncode(secscodec.EncodeStatusReply([]secscodec.StatusValue{
-				{ID: 1, Value: secscodec.Int(secscodec.FormatU4, 25)},
+			Body: mustEncode(secscodec.EncodeValueReply([]*secscodec.Item{
+				secscodec.Int(secscodec.FormatU4, 25),
 			})),
 		}.ToMessage())
 	})

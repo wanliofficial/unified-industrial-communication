@@ -226,8 +226,10 @@ func TestReaderBadFCS(t *testing.T) {
 // 成功，换一台表就"自己好了"。
 func TestReaderFrameContainingFlagByte(t *testing.T) {
 	apdu := GetRequest{Attribute: AttributeDescriptor{
-		ClassID:    ClassRegister,
-		InstanceID: [6]byte{1, 0, 13, 7, 0, 255},
+		ClassID: ClassRegister,
+		// OBIS 0.0.126.7.0.255：126 = 0x7E,让标志字节合法出现在正文里
+		//（地址/正文/CRC 三个位置都可能出 7E,这里是正文）。
+		InstanceID: [6]byte{1, 0, 0x7E, 7, 0, 255},
 		Attribute:  AttrScalerUnit,
 	}}.Encode()
 	fr := Frame{
@@ -240,10 +242,17 @@ func TestReaderFrameContainingFlagByte(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Encode: %v", err)
 	}
-	// 锁死这一帧的 FCS：如果哪天 CRC 或组帧改了，这个用例会立刻提醒我们
-	// 它已经不再覆盖"帧内含 7E"这个要害。
-	if fcs := body[len(body)-2:]; fcs[0] != Flag || fcs[1] != 0x64 {
-		t.Fatalf("FCS = % X，应含 7E（这一帧正是现场踩到的那一帧）", fcs)
+	// 锁死"正文含 7E"这个要害：如果哪天组帧改了，这个用例会立刻提醒我们
+	// 它已经不再覆盖"帧内含 7E"。
+	hasFlag := false
+	for _, b := range body[1 : len(body)-2] {
+		if b == Flag {
+			hasFlag = true
+			break
+		}
+	}
+	if !hasFlag {
+		t.Fatal("正文里应含 7E（这一帧正是现场踩到的那一类）")
 	}
 
 	raw := append([]byte{Flag}, body...)
@@ -370,11 +379,12 @@ func TestControlUFramesFixed(t *testing.T) {
 		kind FrameKind
 		want byte
 	}{
+		// 全部取 F=1（应答侧把探询位翻成 1）的标准形态。
 		{KindSNRM, 0x93},
-		{KindUA, 0x63},
-		{KindDM, 0x0F},
+		{KindUA, 0x73},
+		{KindDM, 0x1F},
 		{KindDISC, 0x53},
-		{KindFRMR, 0x87},
+		{KindFRMR, 0x97},
 		{KindUI, 0x03},
 	}
 	for _, c := range cases {

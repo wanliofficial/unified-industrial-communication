@@ -301,6 +301,35 @@ func TestSessionConnectShape(t *testing.T) {
 	}
 }
 
+// BER 长形式必须用 X.690 标准编码（0x81/0x82 前缀 + 低 7 位 = 后续长度
+// 字节数），不能借用会话层 LI 的 0xFF 前缀约定。真 IED 的 AARE/读响应
+// 几乎必然超过 127 字节——这层错了短报文能过、长报文双向不通。
+func TestBERStandardLongFormRoundTrip(t *testing.T) {
+	// 200 字节内容：必须编成 `A2 81 C8 <200 字节>`。
+	big := bytes.Repeat([]byte{0x41}, 200)
+	tlv := appendTLV(nil, 0xA2, big)
+	want := append([]byte{0xA2, 0x81, 0xC8}, big...)
+	if !bytes.Equal(tlv, want) {
+		t.Fatalf("TLV = % X…, want A2 81 C8 …", tlv[:6])
+	}
+	e, err := parseElement(tlv)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if !bytes.Equal(e.data, big) {
+		t.Fatal("内容不匹配")
+	}
+	// 1000 字节：两字节长形式 0x82 0x03 0xE8。
+	bigger := bytes.Repeat([]byte{0x42}, 1000)
+	tlv2 := appendTLV(nil, 0xA2, bigger)
+	if tlv2[1] != 0x82 || tlv2[2] != 0x03 || tlv2[3] != 0xE8 {
+		t.Fatalf("1000 字节的长形式 = % X…, want 82 03 E8", tlv2[:4])
+	}
+	if e2, err := parseElement(tlv2); err != nil || !bytes.Equal(e2.data, bigger) {
+		t.Fatalf("1000 字节往返失败: %v", err)
+	}
+}
+
 func TestSessionConnectUsesExtendedUserData(t *testing.T) {
 	// 超过 254 字节必须换成扩展用户数据（0xC2），否则对端按 LI 读完会把
 	// 多出来的部分当成下一个参数。

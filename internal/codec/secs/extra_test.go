@@ -13,14 +13,12 @@ import (
 // 全部输出，漏测会让「看起来能用」的假象留在人面前。
 
 func TestAllTypeNames(t *testing.T) {
+	// E37 全部 9 个 SType + 保留值 8/10/0x7F。
 	types := []uint8{
 		secscodec.MsgTypeDataMsg, secscodec.MsgTypeSelectReq, secscodec.MsgTypeSelectRsp,
 		secscodec.MsgTypeDeselectReq, secscodec.MsgTypeDeselectRsp, secscodec.MsgTypeLinktestReq,
-		secscodec.MsgTypeLinktestRsp, secscodec.MsgTypeSeparateReq, secscodec.MsgTypeNotSelectReq,
-		secscodec.MsgTypeNotSelectRsp, secscodec.MsgTypeRejectReq, secscodec.MsgTypeRejectRsp,
-		secscodec.MsgTypeDataDelimReq, secscodec.MsgTypeDataDelimAck, secscodec.MsgTypePrimaryEnq,
-		secscodec.MsgTypePrimaryRecvd, secscodec.MsgTypeSecondaryEnq, secscodec.MsgTypeSecondaryRsp,
-		secscodec.MsgTypeSecondaryRecvd, secscodec.MsgTypePingReq, secscodec.MsgTypePingRsp,
+		secscodec.MsgTypeLinktestRsp, secscodec.MsgTypeRejectReq, secscodec.MsgTypeSeparateReq,
+		0x08, 0x0A, 0x7F,
 	}
 	seen := map[string]bool{}
 	for _, typ := range types {

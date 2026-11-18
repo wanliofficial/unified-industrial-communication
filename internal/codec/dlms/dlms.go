@@ -92,18 +92,20 @@ const (
 // 控制域（§6.4.3 Table 6）。这里是单向 NRM（normal response mode）轮询下
 // 用得到的几个。
 const (
-	// CtrlSNRM 是置为正常响应模式（set normal response mode）。
+	// CtrlSNRM 是置为正常响应模式（set normal response mode），请求侧 P=1。
 	CtrlSNRM byte = 0x93
-	// CtrlSNRME 是带扩展编号（modulo 128）的 SNRM。DLMS profile 不用。
-	CtrlSNRME byte = 0x93
 	// CtrlUA 是未编号确认（unnumbered acknowledgement），SNRM/DISC 的应答。
-	CtrlUA byte = 0x63
-	// CtrlDM 是断开模式（disconnected mode）：服务端拒绝建链。
-	CtrlDM byte = 0x0F
-	// CtrlDISC 是断链。
+	//
+	// UA 必须取 **F=1** 的形态 0x73：UA 是对 P=1 的 SNRM/DISC 的应答，
+	// HDLC 规定应答把探询位翻成 F=1。0x63 是 F=0 变体，真表回的 0x73
+	// 会落到 S 帧分支被误判成 RR——症状是「链路永远建不起来」。
+	CtrlUA byte = 0x73
+	// CtrlDM 是断开模式（disconnected mode）：服务端拒绝建链，F=1。
+	CtrlDM byte = 0x1F
+	// CtrlDISC 是断链（请求侧 P=1）。
 	CtrlDISC byte = 0x53
-	// CtrlFRMR 是帧拒绝（frame reject）。
-	CtrlFRMR byte = 0x87
+	// CtrlFRMR 是帧拒绝（F=1）。
+	CtrlFRMR byte = 0x97
 	// CtrlUI 是未编号信息帧，用于事件上报（本包只解析，不主动发）。
 	CtrlUI byte = 0x03
 
@@ -351,8 +353,9 @@ type Control struct {
 // 判定顺序很关键：I 帧的 bit0=0，其余都是 bit0=1 的 U/S 帧。先判 bit0 再
 // 判具体值，否则 0x00（I 帧 NS=0）会被误认为某个未编号帧。
 //
-// U 帧（SNRM/UA/DISC/DM/FRMR/UI）的控制域是**固定值**，其 bit4 也参与编码
-// （例如 SNRM=0x93、UA=0x63），因此 P/F 必须按位取出，不能假定"都是 1"。
+// U 帧（SNRM/UA/DISC/DM/FRMR/UI）的控制域是**固定值**，bit4 承载 P/F——
+// SNRM 请求取 P=1（0x93），UA/DM/FRMR 应答取 F=1（0x73/0x1F/0x97）。
+// 因此 P/F 按位取出，U 帧按含 P/F 的完整字节精确匹配。
 // S 帧（RR/RNR）的 bit0-1 是 01/11 两态，用 `c&0x0F` 而不是 `c&0x03` 判定，
 // 否则 0x05（RNR + NR=0）会被 0x03 掩码读成 RR。
 func ParseControl(c byte) Control {
@@ -547,7 +550,7 @@ func header(dest, src []byte, ctl byte, seg bool, length int) []byte {
 //
 //	7E A0 07 03 21 93 0F 01 7E
 //
-// 其中 A0 07 = 长度 7；dest=0x03（客户端地址 1）、src=0x21（逻辑设备 1）、
+// 其中 A0 07 = 长度 7；dest=0x03（客户端地址 1）、src=0x21（按 7 位解码是客户端 16；此示例字节取自 IEC 62056-46 §6.4.2.3）、
 // control=0x93（SNRM），HCS 覆盖 A0 07 03 21 93 得 `0F 01`。
 func (f Frame) Encode() ([]byte, error) {
 	dest, err := f.Dest.Encode()

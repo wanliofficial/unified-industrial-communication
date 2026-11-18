@@ -211,8 +211,10 @@ func (s *Server) handle(datagram []byte) []byte {
 	}
 	if req.Segmented {
 		// 我们只接受单段请求：分段需要段窗口与重组，超出从站范围。
+		// 「收到不支持的分段报文」按标准回 Abort(segmentation-not-supported)，
+		// 不是 Reject——Reject 表里没有这个原因。
 		return bacnetcodec.BuildMessage(1, bacnetcodec.NPDUControlExpectReply,
-			bacnetcodec.BuildReject(req.InvokeID, bacnetcodec.RejectReasonSegmentedNotSup))
+			bacnetcodec.BuildAbort(true, req.InvokeID, bacnetcodec.AbortReasonSegmentationNotSup))
 	}
 
 	var resp []byte
@@ -234,7 +236,7 @@ func (s *Server) handle(datagram []byte) []byte {
 func (s *Server) readProperty(req bacnetcodec.ConfirmedRequest) []byte {
 	objType, instance, property, index, err := bacnetcodec.ReadPropertyRequestParams(req.Params)
 	if err != nil {
-		return bacnetcodec.BuildReject(req.InvokeID, bacnetcodec.RejectReasonInvalidAPDU)
+		return bacnetcodec.BuildReject(req.InvokeID, bacnetcodec.RejectReasonInvalidTag)
 	}
 	s.mu.Lock()
 	p, ec, ecode := s.lookup(objType, instance, property, index)
@@ -269,7 +271,7 @@ func (s *Server) readProperty(req bacnetcodec.ConfirmedRequest) []byte {
 	resp, err := bacnetcodec.BuildComplexACK(bacnetcodec.ServiceReadProperty, req.InvokeID,
 		objType, instance, property, encoded)
 	if err != nil {
-		return bacnetcodec.BuildReject(req.InvokeID, bacnetcodec.RejectReasonInvalidAPDU)
+		return bacnetcodec.BuildReject(req.InvokeID, bacnetcodec.RejectReasonInvalidTag)
 	}
 	return resp
 }
@@ -290,7 +292,7 @@ func (s *Server) lookup(objType, instance, property, index int) (*prop, byte, by
 func (s *Server) writeProperty(req bacnetcodec.ConfirmedRequest) []byte {
 	objType, instance, property, _, value, err := bacnetcodec.WritePropertyRequestParams(req.Params)
 	if err != nil {
-		return bacnetcodec.BuildReject(req.InvokeID, bacnetcodec.RejectReasonInvalidAPDU)
+		return bacnetcodec.BuildReject(req.InvokeID, bacnetcodec.RejectReasonInvalidTag)
 	}
 	// 数组下标单独取：WritePropertyRequestParams 丢弃了它。
 	_, _, indexBytes, _, _, splitErr := bacnetcodec.SplitWritePropertyParams(req.Params)

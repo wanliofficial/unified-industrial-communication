@@ -25,7 +25,7 @@ func TestFCSAnnexA(t *testing.T) {
 //
 //	长度 A0 07 = 7（格式 2 + dest 1 + src 1 + ctl 1 + 校验 2）
 //	dest 0x03 = 客户端地址 1（bit0=1 结束，低 7 位 = 1）
-//	src 0x21 = 逻辑设备 1（低 7 位 = 1）
+//	src 0x21 = 按 7 位地址解码是 16（客户端地址；示例取自标准 §6.4.2.3 的字节形态）
 //	ctl 0x93 = SNRM
 //	HCS 覆盖 A0 07 03 21 93 → 0F 01（无信息域时它就是唯一校验序列）
 func TestSNRMGolden(t *testing.T) {

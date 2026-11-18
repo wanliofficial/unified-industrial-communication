@@ -264,11 +264,11 @@ func TestServerRejectsSegmentedRequest(t *testing.T) {
 	req[0] |= 0x08
 	datagram := talk(t, s, req)
 	apdu, _, _ := bacnetcodec.ParseMessage(datagram)
-	if bacnetcodec.ClassifyAPDU(apdu[0]) != bacnetcodec.APDUKindReject {
+	if bacnetcodec.ClassifyAPDU(apdu[0]) != bacnetcodec.APDUKindAbort {
 		t.Fatalf("APDU = % X", apdu)
 	}
-	_, reason, _ := bacnetcodec.ParseReject(apdu)
-	if reason != bacnetcodec.RejectReasonSegmentedNotSup {
+	_, reason, _ := bacnetcodec.ParseAbort(apdu)
+	if reason != bacnetcodec.AbortReasonSegmentationNotSup {
 		t.Fatalf("reason = 0x%02X", reason)
 	}
 }

@@ -104,7 +104,26 @@ type StatusValue struct {
 	Value *Item
 }
 
-// EncodeStatusReply 构造 `L,n { L,2 { U4, value } }`（S1F4 / S2F14 共用）。
+// EncodeValueReply 构造 `L,n { V }`——S1F4 的应答体。
+//
+// S1F4 **不回显 SVID**（SEMI E5：`S1F4 W` = L,n 纯值列表，值与 S1F3 请求的
+// 编号一一对应、按位置配对）。把 S2F14 的 `L,2{ECID,V}` 套到 S1F4 上，真机
+// 主机会把每个 L,2 当作一条值解析失败。
+func EncodeValueReply(items []*Item) ([]byte, error) {
+	for i, it := range items {
+		if it == nil {
+			return nil, fmt.Errorf("secscodec: 第 %d 个值缺失", i+1)
+		}
+	}
+	b, err := EncodeItem(List(items...))
+	if err != nil {
+		return nil, err
+	}
+	return b, nil
+}
+
+// EncodeStatusReply 构造 `L,n { L,2 { U4, value } }`——S2F14 的应答体
+// （设备常数应答按标准回显 ECID；S1F4 用 EncodeValueReply）。
 func EncodeStatusReply(vals []StatusValue) ([]byte, error) {
 	items := make([]*Item, 0, len(vals))
 	for _, v := range vals {
@@ -116,10 +135,23 @@ func EncodeStatusReply(vals []StatusValue) ([]byte, error) {
 	return EncodeItem(List(items...))
 }
 
-// DecodeStatusReply 解析 `L,n { L,2 { U4, value } }`。
+// DecodeValueReply 解析 `L,n { V }`——S1F4 的应答体，按位置与请求的
+// SVID 列表配对。
+func DecodeValueReply(body []byte) ([]*Item, error) {
+	it, err := decodeSingle(body)
+	if err != nil {
+		return nil, err
+	}
+	if it.Format != FormatList {
+		return nil, formatErr(FormatList, it.Format)
+	}
+	return it.Children, nil
+}
+
+// DecodeStatusReply 解析 `L,n { L,2 { U4, value } }`（S2F14）。
 //
-// 严格按「两个子项」校验：少一项说明对端把 S1F4 与 S2F14 的布局搞混了，
-// 这时按位置硬猜只会把值配错点位。
+// 严格按「两个子项」校验：少一项说明对端没有按标准回显 ECID，这时按
+// 位置硬猜只会把值配错点位。
 func DecodeStatusReply(body []byte) ([]StatusValue, error) {
 	it, err := decodeSingle(body)
 	if err != nil {

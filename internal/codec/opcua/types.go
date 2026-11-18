@@ -37,7 +37,7 @@ const (
 // 常用状态码。完整表在规范 Part 4；这里只收录会影响错误分类的那些。
 const (
 	StatusGood                  StatusCode = 0x00000000
-	StatusGoodClamped           StatusCode = 0x00000200
+	StatusGoodClamped           StatusCode = 0x00300000
 	StatusUncertain             StatusCode = 0x40000000
 	StatusBadUnexpectedError    StatusCode = 0x80010000
 	StatusBadInternalError      StatusCode = 0x80020000
@@ -314,12 +314,19 @@ func (v Variant) Encode(e *encoder) {
 	}
 	e.Byte(mask)
 	if v.Array {
+		// 数组的元素按内置类型**裸编码**（Part 6 §5.2.2.16）：
+		// Int32 数组 = 长度 + n 个 4 字节，没有逐元素的 EncodingByte。
+		// 每个元素再套一层 Variant 头是自创格式，真实服务器解出来是垃圾。
 		e.ArrayLength(len(v.Values))
 		for _, item := range v.Values {
-			item.Encode(e)
+			encodeBare(e, item)
 		}
 		return
 	}
+	encodeBare(e, v)
+}
+
+func encodeBare(e *encoder, v Variant) {
 	switch v.Type {
 	case TypeBoolean:
 		e.Bool(v.Bool)
@@ -378,8 +385,7 @@ func (d *decoder) Variant() Variant {
 		n := d.decodeArrayLen(65535)
 		v.Values = make([]Variant, 0, n)
 		for i := 0; i < n && d.err == nil; i++ {
-			item := d.Variant()
-			item.Array = false
+			item := decodeBare(d, v.Type)
 			v.Values = append(v.Values, item)
 		}
 		if mask&0x40 != 0 {
@@ -390,7 +396,13 @@ func (d *decoder) Variant() Variant {
 		}
 		return v
 	}
-	switch v.Type {
+	return decodeBare(d, v.Type)
+}
+
+// decodeBare 按内置类型读一个值（标量 Variant 的正文，或数组的元素）。
+func decodeBare(d *decoder, typ byte) Variant {
+	v := Variant{Type: typ}
+	switch typ {
 	case TypeBoolean:
 		v.Bool = d.Bool()
 	case TypeSByte:
@@ -442,7 +454,7 @@ func (d *decoder) Variant() Variant {
 	case TypeDiagnostic:
 		d.diagnosticInfo(0)
 	default:
-		d.fail(fmt.Errorf("opcua: unsupported variant type %d", v.Type))
+		d.fail(fmt.Errorf("opcua: unsupported variant type %d", typ))
 	}
 	return v
 }

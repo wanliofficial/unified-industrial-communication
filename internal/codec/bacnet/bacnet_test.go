@@ -75,7 +75,8 @@ func TestParseMessageErrors(t *testing.T) {
 
 func TestParseMessageDestinationRoute(t *testing.T) {
 	apdu := []byte{APDUComplexACK, ServiceReadProperty, 1}
-	npdu := []byte{1, 0x20, 0x02, 0x01, 0xAA} // version, control(bit5=有目的端), DNET, dlen, DADR
+	// version, control(bit5=有目的端), DNET(2 字节), DLEN, DADR(DLEN), Hop Count
+	npdu := []byte{1, 0x20, 0x02, 0x01, 0x02, 0xAA, 0xBB, 0x20}
 	body := append(npdu, apdu...)
 	msg := []byte{0x81, BVLCOriginalUnicast, byte(len(body) >> 8), byte(len(body))}
 	msg = append(msg, body...)
@@ -103,8 +104,8 @@ func TestParseNPDUPriorityBitIsNotRouting(t *testing.T) {
 
 func TestParseMessageSourceRoute(t *testing.T) {
 	apdu := []byte{APDUComplexACK, ServiceReadProperty, 1}
-	// control bit3 = 源路由：SNET + slen + SADR + hop count
-	npdu := []byte{1, 0x08, 0x03, 0x02, 0xAA, 0xBB, 0x02}
+	// control bit3 = 源路由：SNET(2 字节) + SLEN(1) + SADR(SLEN)
+	npdu := []byte{1, 0x08, 0x03, 0x00, 0x02, 0xAA, 0xBB}
 	body := append(npdu, apdu...)
 	msg := []byte{0x81, BVLCOriginalUnicast, byte(len(body) >> 8), byte(len(body))}
 	msg = append(msg, body...)
@@ -470,8 +471,8 @@ func TestReadPropertyRequest(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ReadPropertyRequest: %v", err)
 	}
-	// 00 00 2A 0C | 0C 00 80 00 03 | 19 55
-	want := mustHex(t, "00 00 2A 0C 0C 00 80 00 03 19 55")
+	// 00 05 2A 0C | 0C 00 80 00 03 | 19 55（0x05 = 不分段 + 最大 APDU 1476）
+	want := mustHex(t, "00 05 2A 0C 0C 00 80 00 03 19 55")
 	if !bytes.Equal(req, want) {
 		t.Fatalf("request = % X, want % X", req, want)
 	}
@@ -506,8 +507,8 @@ func TestWritePropertyRequest(t *testing.T) {
 	if err != nil {
 		t.Fatalf("WritePropertyRequest: %v", err)
 	}
-	// 00 00 07 0F | 0C 00 80 00 01 | 19 55 | 3E 44 41 48 00 00 3F | 49 10
-	want := mustHex(t, "00 00 07 0F 0C 00 80 00 01 19 55 3E 44 41 48 00 00 3F 49 10")
+	// 00 05 07 0F | 0C 00 80 00 01 | 19 55 | 3E 44 41 48 00 00 3F | 49 10
+	want := mustHex(t, "00 05 07 0F 0C 00 80 00 01 19 55 3E 44 41 48 00 00 3F 49 10")
 	if !bytes.Equal(req, want) {
 		t.Fatalf("request = % X, want % X", req, want)
 	}
@@ -567,16 +568,18 @@ func TestClassifyAPDU(t *testing.T) {
 	}{
 		{0x00, APDUKindConfirmedRequest},
 		{0x08, APDUKindConfirmedRequest},
-		{0x10, APDUKindSimpleACK},
+		{0x10, APDUKindUnconfirmed},
+		{0x20, APDUKindSimpleACK},
+		{0x40, APDUKindSegmentACK},
 		{0x12, APDUKindUnconfirmed},
-		{0x20, APDUKindComplexACK},
-		{0x28, APDUKindComplexACK},
+		{0x30, APDUKindComplexACK},
+		{0x38, APDUKindComplexACK},
 		{0x50, APDUKindError},
 		{0x60, APDUKindReject},
 		{0x70, APDUKindAbort},
 		{0x71, APDUKindAbort},
-		{0x30, APDUKind(0)},
-		{0x40, APDUKind(0)},
+		{0x80, APDUKind(0)},
+		{0xC0, APDUKind(0)},
 	}
 	for _, tc := range cases {
 		if got := ClassifyAPDU(tc.first); got != tc.want {
@@ -629,8 +632,8 @@ func TestBuildAndParseComplexACK(t *testing.T) {
 	if err != nil {
 		t.Fatalf("BuildComplexACK: %v", err)
 	}
-	// 20 09 0C | 0C 00 00 00 01 | 19 55 | 3E 44 42 2A 00 00 3F
-	want := mustHex(t, "20 09 0C 0C 00 00 00 01 19 55 3E 44 42 2A 00 00 3F")
+	// 30 09 0C | 0C 00 00 00 01 | 19 55 | 3E 44 42 2A 00 00 3F
+	want := mustHex(t, "30 09 0C 0C 00 00 00 01 19 55 3E 44 42 2A 00 00 3F")
 	if !bytes.Equal(ack, want) {
 		t.Fatalf("ack = % X, want % X", ack, want)
 	}
@@ -720,7 +723,7 @@ func TestReadPropertyACKErrors(t *testing.T) {
 
 func TestBuildSimpleACK(t *testing.T) {
 	ack := BuildSimpleACK(ServiceWriteProperty, 9)
-	if want := mustHex(t, "10 09 0F"); !bytes.Equal(ack, want) {
+	if want := mustHex(t, "20 09 0F"); !bytes.Equal(ack, want) {
 		t.Fatalf("SimpleACK = % X, want % X", ack, want)
 	}
 	kind, svc, invoke, payload, err := ParseACK(ack)
@@ -756,8 +759,8 @@ func TestParseErrorErrors(t *testing.T) {
 }
 
 func TestParseRejectAndAbort(t *testing.T) {
-	invoke, reason, err := ParseReject(BuildReject(3, RejectReasonInvalidAPDU))
-	if err != nil || invoke != 3 || reason != RejectReasonInvalidAPDU {
+	invoke, reason, err := ParseReject(BuildReject(3, RejectReasonInvalidTag))
+	if err != nil || invoke != 3 || reason != RejectReasonInvalidTag {
 		t.Fatalf("reject = %d/%d err=%v", invoke, reason, err)
 	}
 	invoke, reason, err = ParseAbort(BuildAbort(true, 4, RejectReasonBufferOverflow))

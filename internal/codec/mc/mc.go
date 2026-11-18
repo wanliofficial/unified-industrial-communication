@@ -26,8 +26,13 @@ import (
 
 // 帧常量。
 const (
-	SubheaderRequest  = 0x5000 // 线上字节 50 00
-	SubheaderResponse = 0xD000 // 线上字节 D0 00
+	// 副头部线上字节序是 50 00 / D0 00（首字节 0x50/0xD0）。MC 3E 二进制帧
+	// 的其余多字节字段（命令、点数、软元件号）确实都是小端，唯独副头部
+	// 不是——三菱 SLMP 规范的参考帧以 `50 00 00 FF FF 03 00 …` 开头，照
+	// 「全帧小端」的直觉写常量会编出 00 50，真 PLC 会因副头部不识别而
+	// 拒收。下面的数值按「小端编码后得到 50 00」来取，PutUint16 直接用。
+	SubheaderRequest  = 0x0050 // LE 编码 → 线上 50 00
+	SubheaderResponse = 0x00D0 // LE 编码 → 线上 D0 00
 
 	CommandRead  = 0x0401
 	CommandWrite = 0x1401

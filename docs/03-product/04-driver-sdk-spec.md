@@ -1144,7 +1144,7 @@ selector 支持 `a.b.c` 与 `values[0].v` 两种段：**先按键名下钻，再
    按错的数字决策，比没有数据更糟。`int64`/`uint64` 同样按各自的边界判（`int64`
    的上界是开区间，因为 `float64` 表示不了 `MaxInt64`），`NaN`/`±Inf` 一律判坏——
    `strconv.ParseFloat` 接受 `"NaN"`/`"Inf"` 字面量，不显式挡住就会进到模型里。
-2. **布尔接受常见写法**：`true/false`、`1/0`、`ON/OFF`、`on/off`。
+2. **布尔接受常见写法**：`true/false`、`1/0`、`ON/OFF`、`on/off`、`yes/no`。
 3. **写入整数不带小数点**：`uint16` 写 `7` 发 `"7"` 而不是 `"7.0"`——大量设备
    用 `strconv` 严格解析，`7.0` 会被拒。
 
@@ -4519,7 +4519,7 @@ JSON。`bcd16`/`bcd32` 是编码方式而不是文本类型，CoAP 不接受。
 也是正确行为，因为设备没有声明它是 JSON。
 
 JSON 的标量规则集中在 `internal/codec/textval`，MQTT 与 CoAP 共用：布尔接受
-`true/false/on/off/1/0`（大小写不敏感），数值接受十进制与科学计数法，字符串接受
+`true/false/on/off/yes/no/1/0`（大小写不敏感），数值接受十进制与科学计数法，字符串接受
 JSON 字符串或裸文本。把这条规则复制两份，迟早会出现「同样的 `"on"` 在 MQTT 里是
 `true`、在 CoAP 里报错」的分裂。
 

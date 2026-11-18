@@ -301,7 +301,7 @@ func (s *Server) handleAPDU(apdu []byte) []byte {
 		return nil
 	}
 	if req.Segmented {
-		return bacnetcodec.BuildReject(req.InvokeID, bacnetcodec.RejectReasonSegmentedNotSup)
+		return bacnetcodec.BuildAbort(true, req.InvokeID, bacnetcodec.AbortReasonSegmentationNotSup)
 	}
 	switch req.Service {
 	case bacnetcodec.ServiceReadProperty:
@@ -316,7 +316,7 @@ func (s *Server) handleAPDU(apdu []byte) []byte {
 func (s *Server) readProperty(req bacnetcodec.ConfirmedRequest) []byte {
 	objType, instance, property, index, err := bacnetcodec.ReadPropertyRequestParams(req.Params)
 	if err != nil {
-		return bacnetcodec.BuildReject(req.InvokeID, bacnetcodec.RejectReasonInvalidAPDU)
+		return bacnetcodec.BuildReject(req.InvokeID, bacnetcodec.RejectReasonInvalidTag)
 	}
 	s.mu.Lock()
 	p, ec, ecode := s.lookup(objType, instance, property)
@@ -349,7 +349,7 @@ func (s *Server) readProperty(req bacnetcodec.ConfirmedRequest) []byte {
 	resp, err := bacnetcodec.BuildComplexACK(bacnetcodec.ServiceReadProperty, req.InvokeID,
 		objType, instance, property, encoded)
 	if err != nil {
-		return bacnetcodec.BuildReject(req.InvokeID, bacnetcodec.RejectReasonInvalidAPDU)
+		return bacnetcodec.BuildReject(req.InvokeID, bacnetcodec.RejectReasonInvalidTag)
 	}
 	return resp
 }
@@ -369,7 +369,7 @@ func (s *Server) lookup(objType, instance, property int) (*prop, byte, byte) {
 func (s *Server) writeProperty(req bacnetcodec.ConfirmedRequest) []byte {
 	objType, instance, property, _, value, err := bacnetcodec.WritePropertyRequestParams(req.Params)
 	if err != nil {
-		return bacnetcodec.BuildReject(req.InvokeID, bacnetcodec.RejectReasonInvalidAPDU)
+		return bacnetcodec.BuildReject(req.InvokeID, bacnetcodec.RejectReasonInvalidTag)
 	}
 	// WritePropertyRequestParams 丢弃数组下标，这里单独取。
 	_, _, indexBytes, _, _, splitErr := bacnetcodec.SplitWritePropertyParams(req.Params)

@@ -10,31 +10,32 @@ import (
 
 func TestMaxPayloadGuard(t *testing.T) {
 	head := make([]byte, FrameLen)
-	head[6], head[7], head[8], head[9] = 0xFF, 0xFF, 0xFF, 0xFF
+	// 长度前缀写 0xFFFFFFFF：必被上限拦住。
+	putLen(head, 0xFFFFFFFF)
 	if _, err := FrameDataLen(head); err == nil {
 		t.Fatal("长度 0xFFFFFFFF 必须被上限拦住")
 	} else if !strings.Contains(err.Error(), "上限") {
 		t.Fatalf("错误信息应说明上限: %v", err)
 	}
 
-	// 边界：正好等于上限放行，超一字节拒绝。
+	// 边界：载荷正好等于上限放行（前缀 = MaxPayload + 10 字节头），超一拒绝。
 	atMax := make([]byte, FrameLen)
-	putLen(atMax, MaxPayload)
+	putLen(atMax, MaxPayload+headerLen)
 	if n, err := FrameDataLen(atMax); err != nil || n != MaxPayload {
 		t.Fatalf("恰好上限应放行: %d %v", n, err)
 	}
 	over := make([]byte, FrameLen)
-	putLen(over, MaxPayload+1)
+	putLen(over, MaxPayload+headerLen+1)
 	if _, err := FrameDataLen(over); err == nil {
 		t.Fatal("超上限必须拒绝")
 	}
 }
 
 func putLen(b []byte, n int) {
-	b[6] = byte(n >> 24)
-	b[7] = byte(n >> 16)
-	b[8] = byte(n >> 8)
-	b[9] = byte(n)
+	b[0] = byte(n >> 24)
+	b[1] = byte(n >> 16)
+	b[2] = byte(n >> 8)
+	b[3] = byte(n)
 }
 
 func TestEncodeRejectsOversizePayload(t *testing.T) {

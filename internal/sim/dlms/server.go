@@ -592,7 +592,14 @@ func (s *Server) handleAPDU(apdu []byte) []byte {
 		reject := s.rejectAssociation
 		s.mu.Unlock()
 		return s.handleAARQ(apdu, reject)
-	case dl.TagGetRequestNormal:
+	case dl.TagGetRequest:
+		if len(apdu) < 2 {
+			return dl.EncodeGetResponseResult(0, dl.DARTypeUnmatched)
+		}
+		if apdu[1] != dl.GetKindNormal {
+			// 02=取后续数据块、03=带清单：声明不做。
+			return dl.EncodeGetResponseResult(invokeOf(apdu), dl.DARDataBlockUnavailable)
+		}
 		s.mu.Lock()
 		s.getCount++
 		assoc := s.associated
@@ -600,13 +607,19 @@ func (s *Server) handleAPDU(apdu []byte) []byte {
 		if !assoc {
 			// 未建关联就读：回 read-write-denied。真实表在多数情况下直接
 			// 回 DM 或不回，但回一个明确的结果码对自检更有价值。
-			return dl.EncodeGetResponseResult(dl.DARReadWriteDenied)
+			return dl.EncodeGetResponseResult(invokeOf(apdu), dl.DARReadWriteDenied)
 		}
 		return s.handleGet(apdu)
-	case dl.TagGetRequestNext, dl.TagGetRequestWithList:
-		return dl.EncodeGetResponseResult(dl.DARDataBlockUnavailable)
 	}
 	return nil
+}
+
+// invokeOf 从请求 APDU 里取 invoke 字节（C0/C4 之后第 3 字节）；取不到按 0。
+func invokeOf(apdu []byte) byte {
+	if len(apdu) >= 3 {
+		return apdu[2]
+	}
+	return 0
 }
 
 // handleAARQ 回应 AARQ。
@@ -656,21 +669,13 @@ func buildAARE(accepted bool, result, diag int, maxPDU uint16) []byte {
 
 // handleGet 处理 Get-Request-Normal。
 func (s *Server) handleGet(apdu []byte) []byte {
-	if len(apdu) < 3 {
-		return dl.EncodeGetResponseResult(dl.DARTypeUnmatched)
+	// 请求线上 = C0 01 <invoke> <9 字节描述符>（无长度字节）。
+	if len(apdu) < 12 {
+		return dl.EncodeGetResponseResult(invokeOf(apdu), dl.DARTypeUnmatched)
 	}
-	ln := int(apdu[1])
-	if len(apdu) < 2+ln {
-		return dl.EncodeGetResponseResult(dl.DARTypeUnmatched)
-	}
-	body := apdu[2 : 2+ln]
-	// body = invoke(1) + descriptor(9)
-	if len(body) < 10 {
-		return dl.EncodeGetResponseResult(dl.DARTypeUnmatched)
-	}
-	desc, _, err := dl.DecodeAttributeDescriptor(body[1:])
+	desc, _, err := dl.DecodeAttributeDescriptor(apdu[3:])
 	if err != nil {
-		return dl.EncodeGetResponseResult(dl.DARTypeUnmatched)
+		return dl.EncodeGetResponseResult(invokeOf(apdu), dl.DARTypeUnmatched)
 	}
 	var obis dl.OBIS
 	copy(obis[:], desc.InstanceID[:])
@@ -692,13 +697,13 @@ func (s *Server) handleGet(apdu []byte) []byte {
 		}
 		s.mu.RUnlock()
 		if anyClass {
-			return dl.EncodeGetResponseResult(dl.DARObjectClassInconsistent)
+			return dl.EncodeGetResponseResult(apdu[2], dl.DARObjectClassInconsistent)
 		}
-		return dl.EncodeGetResponseResult(dl.DARObjectUndefined)
+		return dl.EncodeGetResponseResult(apdu[2], dl.DARObjectUndefined)
 	}
-	apduOut, err := dl.EncodeGetResponseNormal(obj.Value)
+	apduOut, err := dl.EncodeGetResponseNormal(apdu[2], obj.Value)
 	if err != nil {
-		return dl.EncodeGetResponseResult(dl.DARHardwareFault)
+		return dl.EncodeGetResponseResult(apdu[2], dl.DARHardwareFault)
 	}
 	return apduOut
 }

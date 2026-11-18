@@ -90,9 +90,12 @@ func parseElement(b []byte) (element, error) {
 
 // parseLength 解析长度字段，返回长度值与它占用的字节数。
 //
-// 短形式（<0x80）与「0xFF + 1~3 字节」长形式都接受。0x80（不定长）与
-// 0x81~0x84（BER 长形式）一律拒绝：IEC 61850 不使用它们，而接受它们会
-// 让一个前面某个字节写错的报文被当成合法报文读完再报一句无关的解码失败。
+// 按 X.690：短形式（首字节 <0x80）直接是内容长度；长形式首字节 0x81..0xFE
+// 的低 7 位是「后续长度字节的个数」（0x81=再跟 1 字节、0x82=两字节…）。
+// 0x80（不定长）拒绝：IEC 61850 不使用它，支持它要求「找结束标记」的扫描。
+// 会话层的 LI 是另一套编码（0xFF + 恰好两字节，见 session.go），两者不能
+// 混用——把会话的约定搬进 BER，短报文能过、长报文（真 IED 的 AARE/读响应
+// 几乎必然 >127 字节）会双向不通。
 func parseLength(b []byte) (n, hdr int, err error) {
 	if len(b) == 0 {
 		return 0, 0, ErrTruncated
@@ -102,21 +105,25 @@ func parseLength(b []byte) (n, hdr int, err error) {
 		// 短形式：内容长度就是这一个字节。
 		return int(first), 1, nil
 	}
-	if first == 0xFF {
-		count := 2 // 长形式固定两字节：0xFF <hi> <lo>。
-		if len(b) < 1+count {
-			return 0, 0, ErrTruncated
-		}
-		v := int(b[1])<<8 | int(b[2])
-		if v > maxBERLength {
-			return 0, 0, fmt.Errorf("iec61850: ber length %d exceeds the %d limit", v, maxBERLength)
-		}
-		return v, 1 + count, nil
-	}
 	if first == 0x80 {
 		return 0, 0, errIndefinite
 	}
-	return 0, 0, fmt.Errorf("iec61850: unsupported ber length form 0x%02X", first)
+	// 长形式：低 7 位是后续长度字节数。
+	count := int(first & 0x7F)
+	if count == 0 || count > 3 {
+		return 0, 0, fmt.Errorf("iec61850: unsupported ber length form 0x%02X", first)
+	}
+	if len(b) < 1+count {
+		return 0, 0, ErrTruncated
+	}
+	v := 0
+	for _, c := range b[1 : 1+count] {
+		v = v<<8 | int(c)
+	}
+	if v > maxBERLength {
+		return 0, 0, fmt.Errorf("iec61850: ber length %d exceeds the %d limit", v, maxBERLength)
+	}
+	return v, 1 + count, nil
 }
 
 // appendTLV 追加一个 TLV。
@@ -126,21 +133,20 @@ func appendTLV(dst []byte, tag byte, content []byte) []byte {
 	return append(dst, content...)
 }
 
-// appendLength 追加 BER 长度字段。
-//
-// 短形式与「0xFF + 1~3 字节」长形式：与会话层的 LI 是同一套编码。写错宽
-// 度会让对端把后续字节误读为长度的一部分。
+// appendLength 追加 BER 长度字段（X.690 长形式：0x81/0x82/0x83 前缀 +
+// 1/2/3 字节大端长度）。会话层的 LI 用的是 0xFF 前缀那套（ISO 8327），
+// 两套编码各归各，绝不能互通。
 func appendLength(dst []byte, n int) []byte {
 	if n < 0x80 {
 		return append(dst, byte(n))
 	}
 	if n <= 0xFF {
-		return append(dst, 0xFF, byte(n))
+		return append(dst, 0x81, byte(n))
 	}
 	if n <= 0xFFFF {
-		return append(dst, 0xFF, byte(n>>8), byte(n))
+		return append(dst, 0x82, byte(n>>8), byte(n))
 	}
-	return append(dst, 0xFF, byte(n>>16), byte(n>>8), byte(n))
+	return append(dst, 0x83, byte(n>>16), byte(n>>8), byte(n))
 }
 
 // lengthSize 返回 appendLength 会写多少字节。构造外层长度时需要先知道它。

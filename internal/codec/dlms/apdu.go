@@ -57,13 +57,20 @@ const (
 	TagConformance  byte = 0x5F // Conformance 标签的第一字节
 	TagConformance2 byte = 0x1F // Conformance 标签的第二字节（[APPLICATION 31]）
 
-	// Get 服务。
-	TagGetRequestNormal   byte = 0xC0 // [1] Get-Request-Normal
-	TagGetRequestNext     byte = 0xC1 // [2]
-	TagGetRequestWithList byte = 0xC2 // [3]
-	TagGetResponseNormal  byte = 0xC4 // [1] Get-Response-Normal
-	TagGetResponseBlock   byte = 0xC5 // [2] Get-Response-With-Datablock
-	TagGetResponseList    byte = 0xC6 // [3] Get-Response-With-List
+	// xDLMS APDU 标签（IEC 62056-53）。与 AARQ/AARE 的 BER 带长度不同，
+	// Get/Set 这些 xDLMS APDU 走 A-XDR：标签后**没有长度字节**，紧跟类型
+	// 字节与正文。normal/next/with-list 之争发生在标签之后的类型字节上，
+	// 不是独立的 APDU 标签——0xC1 是 Set-Request、0xC5 是 Set-Response，
+	// 把它们当「Get 的变体」解析会把 Set 应答读成数据块。
+	TagGetRequest  byte = 0xC0 // get-Request
+	TagSetRequest  byte = 0xC1 // set-Request（声明不做）
+	TagGetResponse byte = 0xC4 // get-Response
+	TagSetResponse byte = 0xC5 // set-Response（声明不做）
+
+	// Get 请求/应答共用的类型字节（APDU 标签之后的第一个字节）。
+	GetKindNormal byte = 0x01 // normal
+	GetKindNext   byte = 0x02 // 取后续数据块（声明不做，解析侧明确报错）
+	GetKindList   byte = 0x03 // 带清单（声明不做）
 
 	// Get-Data-Result。
 	TagData             byte = 0x00 // [0] Data
@@ -501,17 +508,25 @@ type GetRequest struct {
 
 // Encode 输出 Get-Request-Normal APDU：
 //
-//	C0 01 81 00 03 01 08 00 FF 02
-//	│  │  │  │  │  │  │  │  │  └ attribute-id = 2（value）
-//	│  │  │  │  │  │  │  │  └─── OBIS 1.0.1.8.0.255 的末字节
-//	│  │  │  │  │  │  └───────── 1.0.1.8.0.255 的 8
-//	│  │  │  │  │  └──────────── class-id 3（Register）高位
-//	│  │  │  └────────────── invoke-id-and-priority
-//	│  └────────────── 长度 = 9（描述符）+ 1（invoke）= 10
-//	└─────────────── [1] Get-Request-Normal
+//	C0 01 81 00 03 01 00 01 08 00 FF 02
+//	│  │  │  │  │  │  │  │  │  │  │  └ attribute-id = 2（value）
+//	│  │  │  │  │  │  │  │  │  │  └─── OBIS 1.0.1.8.0.255 的末字节
+//	│  │  │  │  │  │  │  │  │  └───── OBIS 1.0.1.8.0.255 的 8
+//	│  │  │  │  │  │  │  │  └──────── OBIS 1.0.1.8.0.255 的 1
+//	│  │  │  │  │  │  └────────────── OBIS 1.0.1.8.0.255 的 C
+//	│  │  │  │  │  └───────────────── class-id 3（Register）低位
+//	│  │  │  │  └──────────────────── class-id 3（Register）高位
+//	│  │  └────────────────── invoke-id-and-priority
+//	│  └────────────── 请求类型 = 1（normal；02=取后续块、03=带清单）
+//	└─────────────── get-Request APDU 标签
+//
+// 与 AARQ/AARE 的 BER 编码不同，xDLMS APDU 走 A-XDR：标签后没有长度
+// 字节（Gurux 等实机栈组帧亦如此，见 IEC 62056-53 的 Get-Request 定义）。
+// 在这里写一个长度字节，真表会把长度值当成请求类型——0x0A 不在 1/2/3
+// 里，请求被静默丢弃，症状是「链路正常、读表无应答」。
 func (g GetRequest) Encode() []byte {
 	desc := g.Attribute.Encode()
-	out := []byte{TagGetRequestNormal, byte(1 + len(desc)), InvokeID}
+	out := []byte{TagGetRequest, GetKindNormal, InvokeID}
 	return append(out, desc...)
 }
 
@@ -566,30 +581,26 @@ type DataBlock struct {
 // 内容，由驱动决定是拼块还是明确报告"需要缩小 PDU 或改用分块读"。
 func ParseGetResponse(b []byte) (GetResponse, error) {
 	var out GetResponse
-	if len(b) < 2 {
+	// 线上 = C4 <类型> <invoke> <正文>。0xC5 是 Set-Response、0xC6 是
+	// DataNotification——把它们当 Get 变体解析会读出垃圾，必须明确报错。
+	if len(b) < 3 {
 		return out, ErrIncomplete
 	}
-	tag := b[0]
-	ln := int(b[1])
-	if len(b) < 2+ln {
-		return out, ErrIncomplete
+	if b[0] != TagGetResponse {
+		return out, fmt.Errorf("%w: 不是 Get-Response 标签 %02X", ErrAPDU, b[0])
 	}
-	body := b[2 : 2+ln]
-	switch tag {
-	case TagGetResponseNormal:
+	switch b[1] {
+	case GetKindNormal:
 		out.Kind = 1
-	case TagGetResponseBlock:
+	case GetKindNext:
 		out.Kind = 2
-	case TagGetResponseList:
+	case GetKindList:
 		out.Kind = 3
 	default:
-		return out, fmt.Errorf("%w: 不是 Get-Response 标签 %02X", ErrAPDU, tag)
-	}
-	if len(body) < 1 {
-		return out, ErrIncomplete
+		return out, fmt.Errorf("%w: Get-Response 类型 %02X", ErrAPDU, b[1])
 	}
 	// 跳过 invoke-id-and-priority。不校验取值（见 InvokeID 注释）。
-	body = body[1:]
+	body := b[3:]
 	switch out.Kind {
 	case 1:
 		dr, used, err := parseGetDataResult(body)
@@ -694,23 +705,24 @@ func parseDataBlock(b []byte) (DataBlock, int, error) {
 
 // EncodeGetResponseNormal 组一个 Get-Response-Normal。
 //
+// 线上 = `C4 01 <invoke> 00 <A-XDR Data>`：结果字节 0 表示 data 分支，
+// 其后是不带任何额外标签的 A-XDR 值。invoke 原样回显请求里的字节。
+//
 // 本包用它实现内置从站；主站侧只需要解析，不需要组应答。
-func EncodeGetResponseNormal(data Value) ([]byte, error) {
+func EncodeGetResponseNormal(invoke byte, data Value) ([]byte, error) {
 	enc, err := data.Encode()
 	if err != nil {
 		return nil, err
 	}
-	body := []byte{InvokeID, TagData}
-	body = append(body, enc...)
-	return append([]byte{TagGetResponseNormal, byte(len(body))}, body...), nil
+	out := []byte{TagGetResponse, GetKindNormal, invoke, TagData}
+	return append(out, enc...), nil
 }
 
 // EncodeGetResponseResult 组一个带失败结果码的 Get-Response-Normal。
 //
-// 线上形态是 `C4 03 81 01 <结果码>`：Get-Data-Result 走
+// 线上形态是 `C4 01 <invoke> 01 <结果码>`：Get-Data-Result 走
 // `data-access-result [1] IMPLICIT` 分支，A-XDR 下 ENUMERATED 定长 8 位、
-// 无长度前缀，因此标签后紧跟一个字节的结果码。
-func EncodeGetResponseResult(r DataAccessResult) []byte {
-	body := []byte{InvokeID, TagDataAccessResult, byte(r)}
-	return append([]byte{TagGetResponseNormal, byte(len(body))}, body...)
+// 无长度前缀，因此分支标签后紧跟一个字节的结果码。
+func EncodeGetResponseResult(invoke byte, r DataAccessResult) []byte {
+	return []byte{TagGetResponse, GetKindNormal, invoke, TagDataAccessResult, byte(r)}
 }

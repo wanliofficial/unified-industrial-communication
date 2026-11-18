@@ -7,11 +7,25 @@
 //
 // 包内只做纯函数：无 I/O、无时钟、无可变状态。
 //
-// 分层与 TCP 上的其它协议一样清楚：HSMS 帧头 12 字节 = 4 字节消息头
-// （Stream/W 位、Function、系统字节）+ 4 字节数据长度 + 1 字节消息类型 +
-// 1 字节字节顺序。系统字节（SystemBytes）由发送方选择、接收方原样回显，
-// 它是「这一帧属于哪一次请求」的唯一标识——与 ADS 的 invoke、CoAP 的
-// MID/Token 是同一类东西。
+// 分层与 TCP 上的其它协议一样清楚。SEMI E37 的线上帧是：
+//
+//	[0..3]   长度（大端 4 字节）= 10 字节头 + 载荷，**不含长度前缀本身**
+//	[4..13]  10 字节头：
+//	  [4..5]  SessionID（数据消息=设备 ID；控制消息固定 0xFFFF）
+//	  [6]     头字节 2：数据消息 = Stream(7 位) | W 位；控制消息 = 0
+//	          （Reject.req 例外：这里放被拒消息的 SType）
+//	  [7]     头字节 3：数据消息 = Function；Select/Deselect.rsp = 状态码；
+//	          Reject.req = 拒绝原因；其余控制消息 = 0
+//	  [8]     PType = 0（SECS-II 编码）
+//	  [9]     SType = 消息类型（0=DATA、1/2=Select.req/rsp、3/4=Deselect、
+//	          5/6=Linktest、7=Reject.req、9=Separate.req）
+//	  [10..13] 系统字节（大端）
+//	[14..]   载荷（仅 DATA 消息允许携带）
+//
+// 系统字节（SystemBytes）由发送方选择、接收方原样回显，它是「这一帧属于
+// 哪一次请求」的唯一标识——与 ADS 的 invoke、CoAP 的 MID/Token 同类。
+// 长度「含头」这一点最容易写错：写成只算载荷，任何标准对端都会把
+// 4 字节前缀 + 头错位成另一条消息。
 //
 // SECS-II 的格式字节最容易写错：它是「6 位格式码 << 2 | 长度字节数」，长度
 // 字节数取值 1..3（0 非法），不是「格式码 | 长度字节数」。写成后者时，
@@ -28,9 +42,13 @@ import (
 // DefaultPort 是 HSMS/TCP 的默认端口。
 const DefaultPort = 5000
 
-// FrameLen 是 HSMS 帧的固定开销：4 字节消息头 + 4 字节数据长度 +
-// 1 字节消息类型 + 1 字节字节顺序。
-const FrameLen = 12
+// FrameLen 是 HSMS 帧的固定开销：4 字节长度前缀 + 10 字节头 = 14 字节。
+// 前缀里的长度值含这 10 字节头（SEMI E37 / Wireshark dissector 的
+// 「length + 4 == 整帧长」判定）。
+const FrameLen = 14
+
+// headerLen 是长度前缀之后的固定头长。
+const headerLen = 10
 
 // MaxPayload 是一条消息数据区的上限（16 MiB）。
 //
@@ -40,30 +58,18 @@ const FrameLen = 12
 // 超限按协议错误处理，而不是「再等等看」。
 const MaxPayload = 16 << 20
 
-// 消息类型（Message Type）。HSMS 用它区分「数据消息」「控制消息」
-// （Select/Deselect/Linktest/Reject）与各类事件通知。
+// 消息类型（SEMI E37 的 SType）。8 保留未用、10..127 为伴生标准保留；
+// 「未选中」不靠独立消息表达，而是 Select.rsp 里的非零状态码。
 const (
-	MsgTypeDataMsg        uint8 = 0x00
-	MsgTypeSelectReq      uint8 = 0x01
-	MsgTypeSelectRsp      uint8 = 0x02
-	MsgTypeDeselectReq    uint8 = 0x03
-	MsgTypeDeselectRsp    uint8 = 0x04
-	MsgTypeLinktestReq    uint8 = 0x05
-	MsgTypeLinktestRsp    uint8 = 0x06
-	MsgTypeSeparateReq    uint8 = 0x07
-	MsgTypeNotSelectReq   uint8 = 0x08
-	MsgTypeNotSelectRsp   uint8 = 0x09
-	MsgTypeRejectReq      uint8 = 0x0A
-	MsgTypeRejectRsp      uint8 = 0x0B
-	MsgTypeDataDelimReq   uint8 = 0x0C
-	MsgTypeDataDelimAck   uint8 = 0x0D
-	MsgTypePrimaryEnq     uint8 = 0x10
-	MsgTypePrimaryRecvd   uint8 = 0x11
-	MsgTypeSecondaryEnq   uint8 = 0x12
-	MsgTypeSecondaryRsp   uint8 = 0x13
-	MsgTypeSecondaryRecvd uint8 = 0x14
-	MsgTypePingReq        uint8 = 0x18
-	MsgTypePingRsp        uint8 = 0x19
+	MsgTypeDataMsg     uint8 = 0x00
+	MsgTypeSelectReq   uint8 = 0x01
+	MsgTypeSelectRsp   uint8 = 0x02
+	MsgTypeDeselectReq uint8 = 0x03
+	MsgTypeDeselectRsp uint8 = 0x04
+	MsgTypeLinktestReq uint8 = 0x05
+	MsgTypeLinktestRsp uint8 = 0x06
+	MsgTypeRejectReq   uint8 = 0x07
+	MsgTypeSeparateReq uint8 = 0x09
 )
 
 // HSMS 状态（Select/Deselect/Linktest/Reject 的应答里携带）。
@@ -98,32 +104,8 @@ func TypeName(t uint8) string {
 		return "LinktestRsp"
 	case MsgTypeSeparateReq:
 		return "SeparateReq"
-	case MsgTypeNotSelectReq:
-		return "NotSelectReq"
-	case MsgTypeNotSelectRsp:
-		return "NotSelectRsp"
 	case MsgTypeRejectReq:
 		return "RejectReq"
-	case MsgTypeRejectRsp:
-		return "RejectRsp"
-	case MsgTypeDataDelimReq:
-		return "DataDelimReq"
-	case MsgTypeDataDelimAck:
-		return "DataDelimAck"
-	case MsgTypePrimaryEnq:
-		return "PrimaryEnq"
-	case MsgTypePrimaryRecvd:
-		return "PrimaryRecvd"
-	case MsgTypeSecondaryEnq:
-		return "SecondaryEnq"
-	case MsgTypeSecondaryRsp:
-		return "SecondaryRsp"
-	case MsgTypeSecondaryRecvd:
-		return "SecondaryRecvd"
-	case MsgTypePingReq:
-		return "PingReq"
-	case MsgTypePingRsp:
-		return "PingRsp"
 	}
 	return fmt.Sprintf("Unknown(0x%02x)", t)
 }
@@ -159,11 +141,13 @@ func StatusName(s uint16) string {
 // 配对请求与应答的唯一依据。
 type Message struct {
 	SystemBytes uint32 // 系统字节：事务配对
-	Stream      uint8  // 1..15
-	Function    uint8  // 0..255
+	SessionID   uint16 // 数据消息 = 设备 ID；控制消息固定 0xFFFF（Encode 强制）
+	Stream      uint8  // 1..127（Reject.req 时是被拒消息的 SType）
+	Function    uint8  // 0..255（Select/Deselect.rsp 时是状态码；Reject.req 时是拒绝原因）
 	WBit        bool   // 该 Primary 期待一条 Secondary 应答
-	MsgType     uint8  // 消息类型
-	Payload     []byte // DATA 消息是 SECS-II 数据；控制消息是状态码等
+	MsgType     uint8  // 消息类型（E37 SType）
+	RspStatus   uint8  // Select.rsp / Deselect.rsp 在头字节 3 携带的状态码
+	Payload     []byte // 仅 DATA 消息允许携带（E37：控制消息无载荷）
 }
 
 // IsData 报告这是不是一条数据消息（而非 Select/Deselect/Linktest 等控制消息）。
@@ -182,90 +166,122 @@ func (m Message) String() string {
 		TypeName(m.MsgType), m.SystemBytes, m.Status(), StatusName(m.Status()))
 }
 
-// Status 取控制消息里的 2 字节状态码（大端）。
+// Status 取 Select.rsp / Deselect.rsp 头字节 3 里的状态码。
+// 其它消息没有状态字节，返回 StatusUnknown。
 func (m Message) Status() uint16 {
-	if len(m.Payload) < 2 {
-		return StatusUnknown
+	if m.MsgType == MsgTypeSelectRsp || m.MsgType == MsgTypeDeselectRsp {
+		return uint16(m.RspStatus)
 	}
-	return binary.BigEndian.Uint16(m.Payload)
+	return StatusUnknown
 }
 
 // ---------------------------------------------------------------------------
 // HSMS 帧编解码
 // ---------------------------------------------------------------------------
 
-// Encode 把一条消息编成 HSMS 帧（12 字节头 + 数据）。
+// Encode 把一条消息编成 E37 HSMS 帧（4 字节长度前缀 + 10 字节头 + 载荷）。
 //
-// 帧布局（大端）：
-//
-//	[0]  Stream | (W<<7)  [1]  Function  [2..5] SystemBytes
-//	[6..9] 数据长度（只算数据）  [10] 消息类型  [11] 字节顺序(=1)
-//	[12..] 数据
+// 长度前缀 = 10 + len(载荷)——含头。控制消息不携带载荷（E37 如此，
+// Wireshark 对「控制消息带数据」直接判坏帧）；控制消息的 SessionID 固定
+// 0xFFFF，头字节 2/3 的取值见表头注释。
 func Encode(m Message) ([]byte, error) {
 	if len(m.Payload) > MaxPayload {
 		return nil, fmt.Errorf("secscodec: 数据长度 %d 超过上限 %d", len(m.Payload), MaxPayload)
 	}
-	buf := make([]byte, FrameLen+len(m.Payload))
-	if m.IsData() {
-		// 只有 DATA 消息才有真实的 Stream/Function，才做范围校验。
-		if m.Stream == 0 || m.Stream > 15 {
-			return nil, fmt.Errorf("secscodec: Stream %d 必须在 1..15", m.Stream)
-		}
-		buf[0] = m.Stream & 0x7f
-		if m.WBit {
-			buf[0] |= 0x80
-		}
-		buf[1] = m.Function
-	} else {
-		// 控制消息的 Stream/Function 无意义，按惯例填 0xFF。
-		buf[0], buf[1] = 0xFF, 0xFF
+	if !m.IsData() && len(m.Payload) != 0 {
+		return nil, fmt.Errorf("secscodec: 控制消息 %s 不携带载荷", TypeName(m.MsgType))
 	}
-	binary.BigEndian.PutUint32(buf[2:6], m.SystemBytes)
-	binary.BigEndian.PutUint32(buf[6:10], uint32(len(m.Payload)))
-	buf[10] = m.MsgType
-	buf[11] = 1 // ByteOrder：HSMS 只定义 1（大端）
+	if m.IsData() && (m.Stream == 0 || m.Stream > 127) {
+		return nil, fmt.Errorf("secscodec: Stream %d 必须在 1..127", m.Stream)
+	}
+	buf := make([]byte, FrameLen+len(m.Payload))
+	// 长度前缀：10 字节头 + 载荷。
+	binary.BigEndian.PutUint32(buf[0:4], uint32(headerLen+len(m.Payload)))
+	// 头：SessionID。控制消息固定 0xFFFF（Wireshark/SEMI E37 均如此校验）。
+	session := m.SessionID
+	if !m.IsData() {
+		session = 0xFFFF
+	}
+	binary.BigEndian.PutUint16(buf[4:6], session)
+	// 头字节 2/3。
+	switch {
+	case m.IsData():
+		b2 := m.Stream & 0x7f
+		if m.WBit {
+			b2 |= 0x80
+		}
+		buf[6] = b2
+		buf[7] = m.Function
+	case m.MsgType == MsgTypeSelectRsp || m.MsgType == MsgTypeDeselectRsp:
+		buf[7] = m.RspStatus // 状态在头字节 3
+	case m.MsgType == MsgTypeRejectReq:
+		buf[6] = m.Stream   // 被拒消息的 SType
+		buf[7] = m.Function // 拒绝原因
+	}
+	buf[8] = 0         // PType：SECS-II 编码
+	buf[9] = m.MsgType // SType
+	binary.BigEndian.PutUint32(buf[10:14], m.SystemBytes)
 	copy(buf[FrameLen:], m.Payload)
 	return buf, nil
 }
 
-// Decode 把一段完整字节解成消息。
+// Decode 把一段完整帧解成消息（输入长度必须正好 = 4 + 长度前缀）。
 func Decode(b []byte) (Message, error) {
 	var m Message
 	if len(b) < FrameLen {
 		return m, fmt.Errorf("secscodec: frame %d bytes, need %d", len(b), FrameLen)
 	}
-	m.Stream = b[0] & 0x7f
-	m.WBit = b[0]&0x80 != 0
-	m.Function = b[1]
-	m.SystemBytes = binary.BigEndian.Uint32(b[2:6])
-	n := binary.BigEndian.Uint32(b[6:10])
-	if int(n) != len(b)-FrameLen {
-		return m, fmt.Errorf("secscodec: 长度字段 %d 与实际数据 %d 不一致", n, len(b)-FrameLen)
+	n := binary.BigEndian.Uint32(b[0:4])
+	if int(n) != len(b)-4 {
+		return m, fmt.Errorf("secscodec: 长度字段 %d 与实际数据 %d 不一致（长度含 10 字节头）",
+			n, len(b)-4)
 	}
-	if n > MaxPayload {
-		return m, fmt.Errorf("secscodec: 数据长度 %d 超过上限 %d", n, MaxPayload)
+	payloadLen := int(n) - headerLen
+	if payloadLen < 0 || payloadLen > MaxPayload {
+		return m, fmt.Errorf("secscodec: 数据长度 %d 超过上限 %d", payloadLen, MaxPayload)
 	}
-	m.MsgType = b[10]
-	if b[11] != 1 {
-		return m, fmt.Errorf("secscodec: 不支持的字节顺序 %d（只定义了 1）", b[11])
+	m.SessionID = binary.BigEndian.Uint16(b[4:6])
+	m.MsgType = b[9]
+	if b[8] != 0 {
+		return m, fmt.Errorf("secscodec: 不支持的 PType %d（本包只解 SECS-II = 0）", b[8])
 	}
-	if n > 0 {
-		m.Payload = make([]byte, n)
+	if m.IsData() {
+		m.Stream = b[6] & 0x7f
+		m.WBit = b[6]&0x80 != 0
+		m.Function = b[7]
+	} else {
+		switch m.MsgType {
+		case MsgTypeSelectRsp, MsgTypeDeselectRsp:
+			m.RspStatus = b[7] // 状态在头字节 3
+		case MsgTypeRejectReq:
+			m.Stream = b[6]   // 被拒消息的 SType
+			m.Function = b[7] // 拒绝原因
+		}
+	}
+	m.SystemBytes = binary.BigEndian.Uint32(b[10:14])
+	if payloadLen > 0 {
+		m.Payload = make([]byte, payloadLen)
 		copy(m.Payload, b[FrameLen:])
 	}
 	return m, nil
 }
 
-// FrameDataLen 从帧头取数据长度（读循环用它决定还要读多少字节）。
+// FrameDataLen 从帧头取载荷长度（读循环用它决定还要读多少字节）。
+//
+// 前缀的长度值含 10 字节头，因此载荷 = 前缀 - headerLen。
 func FrameDataLen(b []byte) (uint32, error) {
 	if len(b) < FrameLen {
 		return 0, fmt.Errorf("secscodec: header %d bytes, need %d", len(b), FrameLen)
 	}
-	n := binary.BigEndian.Uint32(b[6:10])
-	if n > MaxPayload {
-		return 0, fmt.Errorf("secscodec: 数据长度 %d 超过上限 %d", n, MaxPayload)
+	n := binary.BigEndian.Uint32(b[0:4])
+	if n < headerLen {
+		return 0, fmt.Errorf("secscodec: 长度字段 %d 小于 10 字节头", n)
 	}
-	return n, nil
+	plen := n - headerLen
+	if plen > MaxPayload {
+		return 0, fmt.Errorf("secscodec: 数据长度 %d 超过上限 %d", plen, MaxPayload)
+	}
+	return plen, nil
 }
 
 // ErrTruncated 表示「字节还不够」；读循环据此继续等待而不是报错。
@@ -280,12 +296,16 @@ func ParseFrame(b []byte) (Message, int, error) {
 	if len(b) < FrameLen {
 		return Message{}, 0, ErrTruncated
 	}
-	n := binary.BigEndian.Uint32(b[6:10])
-	if n > MaxPayload {
-		return Message{}, 0, fmt.Errorf("secscodec: 数据长度 %d 超过上限 %d", n, MaxPayload)
+	n := binary.BigEndian.Uint32(b[0:4])
+	if n < headerLen {
+		return Message{}, 0, fmt.Errorf("secscodec: 长度字段 %d 小于 10 字节头", n)
 	}
-	total := FrameLen + int(n)
-	if total < FrameLen {
+	plen := int(n) - headerLen
+	if plen > MaxPayload {
+		return Message{}, 0, fmt.Errorf("secscodec: 数据长度 %d 超过上限 %d", plen, MaxPayload)
+	}
+	total := 4 + int(n)
+	if total < 4 {
 		return Message{}, 0, fmt.Errorf("secscodec: 长度字段 %d 溢出", n)
 	}
 	if len(b) < total {
@@ -308,9 +328,10 @@ func NewSelectReq(sys uint32) Message {
 	return Message{SystemBytes: sys, MsgType: MsgTypeSelectReq}
 }
 
-// NewSelectRsp 构造 Select.rsp：status 为 0 表示选中成功。
+// NewSelectRsp 构造 Select.rsp：status 为 0 表示选中成功，非零（如 1）
+// 表示「未被选中」。E37 把状态放在头字节 3，控制消息不携带载荷。
 func NewSelectRsp(sys uint32, status uint16) Message {
-	return Message{SystemBytes: sys, MsgType: MsgTypeSelectRsp, Payload: statusPayload(status)}
+	return Message{SystemBytes: sys, MsgType: MsgTypeSelectRsp, RspStatus: byte(status)}
 }
 
 // NewDeselectReq 构造 Deselect.req：通信结束前请求回到未选中状态。
@@ -320,7 +341,7 @@ func NewDeselectReq(sys uint32) Message {
 
 // NewDeselectRsp 构造 Deselect.rsp。
 func NewDeselectRsp(sys uint32, status uint16) Message {
-	return Message{SystemBytes: sys, MsgType: MsgTypeDeselectRsp, Payload: statusPayload(status)}
+	return Message{SystemBytes: sys, MsgType: MsgTypeDeselectRsp, RspStatus: byte(status)}
 }
 
 // NewLinktestReq 构造 Linktest.req：探活。与 Select 不同，Linktest 不改变
@@ -329,9 +350,10 @@ func NewLinktestReq(sys uint32) Message {
 	return Message{SystemBytes: sys, MsgType: MsgTypeLinktestReq}
 }
 
-// NewLinktestRsp 构造 Linktest.rsp。
+// NewLinktestRsp 构造 Linktest.rsp。E37 里 Linktest.rsp 没有状态字段
+// （字节 2/3 必须为 0），参数仅为兼容保留、必须传 0。
 func NewLinktestRsp(sys uint32, status uint16) Message {
-	return Message{SystemBytes: sys, MsgType: MsgTypeLinktestRsp, Payload: statusPayload(status)}
+	return Message{SystemBytes: sys, MsgType: MsgTypeLinktestRsp}
 }
 
 // NewSeparateReq 构造 Separate.req：告诉对端「我要走了」，随后关闭 TCP。
@@ -339,16 +361,11 @@ func NewSeparateReq(sys uint32) Message {
 	return Message{SystemBytes: sys, MsgType: MsgTypeSeparateReq}
 }
 
-// NewRejectReq 构造 Reject.req：对端发现一条它无法处理的消息时回这条，
-// 并说明原因（被拒消息的类型 SType 与原因码 SCode）。
+// NewRejectReq 构造 Reject.req：对端发现一条它无法处理的消息时回这条。
+// 被拒消息的 SType 放头字节 2、拒绝原因放头字节 3，载荷为空；SessionID
+// 由 Encode 强制为 0xFFFF。
 func NewRejectReq(sys uint32, sType, sCode uint8) Message {
-	return Message{SystemBytes: sys, MsgType: MsgTypeRejectReq, Payload: []byte{sType, sCode}}
-}
-
-func statusPayload(status uint16) []byte {
-	b := make([]byte, 2)
-	binary.BigEndian.PutUint16(b, status)
-	return b
+	return Message{SystemBytes: sys, MsgType: MsgTypeRejectReq, Stream: sType, Function: sCode}
 }
 
 // ---------------------------------------------------------------------------

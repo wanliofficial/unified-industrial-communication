@@ -142,7 +142,7 @@ func TestAPDUErrorRejectAndAbort(t *testing.T) {
 	plan := pointPlan{objType: bacnetcodec.ObjectAnalogInput, instance: 1,
 		property: bacnetcodec.PropPresentValue}
 
-	reject := bacnetcodec.BuildReject(1, bacnetcodec.RejectReasonInvalidAPDU)
+	reject := bacnetcodec.BuildReject(1, bacnetcodec.RejectReasonInvalidTag)
 	if err := c.apduError("read", reject, plan); driver.KindOf(err) != driver.ErrProtocol {
 		t.Fatalf("reject kind = %s", driver.KindOf(err))
 	}

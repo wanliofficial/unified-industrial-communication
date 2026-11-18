@@ -112,8 +112,9 @@ func ParseTPKT(b []byte) ([]byte, error) {
 
 // COTPConnect 返回建立 ISO 连接的 COTP CR（已含 TPKT）。
 //
-// 参数是行业里通行的最小集合：class 0、TPDU 256、TSAP 0x0100/0x0102。
-// S7-300/400/1200/1500 都接受这组；改成别的值不会更通用，只会更难排查。
+// 参数是行业里通行的最小集合：class 0、源 TSAP 0x0100（PG/编程器）、
+// 目标 TSAP 0x0102（rack 0 / slot 2）、TPDU size 1024。与 snap7 的
+// CliConnect 组帧逐字节同构；S7-300/400/1200/1500 都接受这组。
 func COTPConnect() []byte { return COTPConnectWith(0, 2) }
 
 // COTPConnectWith 按机架/槽号生成 COTP CR。
@@ -121,6 +122,12 @@ func COTPConnect() []byte { return COTPConnectWith(0, 2) }
 // 目标 TSAP = 0x0100 + rack×32 + slot：这是 S7 协议把「CPU 在机架上的
 // 物理位置」编码进 TSAP 的方式，不是厂商私有约定。同一台 PLC 换个槽位
 // 就必须改这个值，否则连接请求会被 CPU 直接拒绝。
+//
+// COTP 参数区每项都是「参数码 + 长度 + 值」：0xC1 源 TSAP、0xC2 目标
+// TSAP、0xC0 TPDU size（**长度恒 1 字节**，值 0x07..0x0D 是 2 的幂编码，
+// 0x0A = 1024）。参数装错位置不会报错——PLC 只认 0xC2 里的值，rack/slot
+// 装进 0xC0 的症状是「配置写对了、CPU 却说找不到」。整帧 22 字节、
+// LI = COTP 头 6 + 参数区 11 = 17。
 func COTPConnectWith(rack, slot int) []byte {
 	if rack < 0 || rack > 7 {
 		rack = 0
@@ -134,10 +141,9 @@ func COTPConnectWith(rack, slot int) []byte {
 		0x00, 0x00, // dst ref
 		0x00, 0x01, // src ref
 		0x00,                   // class 0
-		0xC1, 0x02, 0x01, 0x00, // TPDU size 256
-		0xC2, 0x02, 0x01, 0x00, // src TSAP（PG/编程器）
-		// 目的 TSAP = 0x0100 + rack×32 + slot，见官方 TSAP 结构说明。
-		0xC0, 0x02, byte(dstTSAP >> 8), byte(dstTSAP),
+		0xC1, 0x02, 0x01, 0x00, // 源 TSAP = 0x0100（PG/编程器）
+		0xC2, 0x02, byte(dstTSAP >> 8), byte(dstTSAP), // 目标 TSAP
+		0xC0, 0x01, 0x0A, // TPDU size = 1024（编码值 0x0A）
 	})
 }
 

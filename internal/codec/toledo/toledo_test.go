@@ -180,7 +180,7 @@ func TestParse_LbOzDualUnit(t *testing.T) {
 func TestParse_BinarySTXRejected(t *testing.T) {
 	// 二进制 TOLEDO 连续帧以 STX(0x02) 开头。这里识别并给出可执行指引，而不是
 	// 当 ASCII 硬解出垃圾值。
-	line, _ := hex.DecodeString("0255430300303030303030303030300DXX")
+	line, _ := hex.DecodeString("0255430300303030303030303030300D00")
 	_, err := Parse(line)
 	if err == nil {
 		t.Fatal("二进制 STX 帧应被拒绝")

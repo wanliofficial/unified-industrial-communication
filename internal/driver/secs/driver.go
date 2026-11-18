@@ -665,15 +665,40 @@ func (c *conn) readGroup(ctx context.Context, g readGroupReq, out *[]driver.RawS
 		}
 		return nil
 	}
-	vals, derr := secscodec.DecodeStatusReply(dm.Body)
-	if derr != nil {
-		fail(driver.ErrProtocol, driver.E(driver.ErrProtocol, "read", c.devID,
-			fmt.Sprintf("decode %s", sf), false, derr))
-		return nil
-	}
-	byID := make(map[uint32]secscodec.StatusValue, len(vals))
-	for _, v := range vals {
-		byID[v.ID] = v
+	// S1F4 是按位置的纯值列表（E5 不回显 SVID）；S2F14 才按 ECID 配对。
+	var byID map[uint32]secscodec.StatusValue
+	if obj == objectSVID {
+		items, derr := secscodec.DecodeValueReply(dm.Body)
+		if derr != nil {
+			fail(driver.ErrProtocol, driver.E(driver.ErrProtocol, "read", c.devID,
+				fmt.Sprintf("decode %s", sf), false, derr))
+			return nil
+		}
+		if len(items) != len(ids) {
+			fail(driver.ErrProtocol, driver.E(driver.ErrProtocol, "read", c.devID,
+				fmt.Sprintf("S1F4 元素数 %d 与请求数 %d 不一致", len(items), len(ids)), false, nil))
+			return nil
+		}
+		byID = make(map[uint32]secscodec.StatusValue, len(ids))
+		for i, id := range ids {
+			it := items[i]
+			// 零长 Binary 是内置从站的「编号不存在」占位。
+			if it.Format == secscodec.FormatBinary && len(it.Raw) == 0 {
+				continue
+			}
+			byID[id] = secscodec.StatusValue{ID: id, Value: it}
+		}
+	} else {
+		vals, derr := secscodec.DecodeStatusReply(dm.Body)
+		if derr != nil {
+			fail(driver.ErrProtocol, driver.E(driver.ErrProtocol, "read", c.devID,
+				fmt.Sprintf("decode %s", sf), false, derr))
+			return nil
+		}
+		byID = make(map[uint32]secscodec.StatusValue, len(vals))
+		for _, v := range vals {
+			byID[v.ID] = v
+		}
 	}
 
 	for _, plan := range g.plans {
@@ -843,14 +868,11 @@ func (c *conn) Probe(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	if !strings.HasPrefix(secscodec.TypeName(m.MsgType), "LinktestRsp") {
+	// E37 里 Linktest.rsp 没有状态字段——收到它本身就是「链路活着」的
+	// 全部语义，额外的状态检查只会把好消息当坏消息。
+	if m.MsgType != secscodec.MsgTypeLinktestRsp {
 		return driver.E(driver.ErrProtocol, "probe", c.devID,
 			fmt.Sprintf("expected Linktest.rsp, got %s", m.String()), false, nil)
-	}
-	if m.Status() != secscodec.StatusOK {
-		return driver.E(driver.ErrDisconnected, "probe", c.devID,
-			fmt.Sprintf("Linktest failed: status=%d(%s)",
-				m.Status(), secscodec.StatusName(m.Status())), true, nil)
 	}
 	return nil
 }
@@ -932,6 +954,24 @@ func (c *conn) RawRead(ctx context.Context, object string, id uint32) (*secscode
 	dm, err := c.exchange(ctx, sf, body, "read:"+object)
 	if err != nil {
 		return nil, err
+	}
+	if object == objectSVID {
+		// S1F4 = L,n{V} 按位置对应；零长 Binary 是「编号不存在」占位。
+		items, derr := secscodec.DecodeValueReply(dm.Body)
+		if derr != nil {
+			return nil, driver.E(driver.ErrProtocol, "read", c.devID,
+				"decode "+sf.String()+": "+derr.Error(), false, derr)
+		}
+		if len(items) == 1 {
+			it := items[0]
+			if it.Format == secscodec.FormatBinary && len(it.Raw) == 0 {
+				return nil, driver.E(driver.ErrAddress, "read", c.devID,
+					fmt.Sprintf("%s: device has no SVID %d", sf, id), false, nil)
+			}
+			return it, nil
+		}
+		return nil, driver.E(driver.ErrProtocol, "read", c.devID,
+			fmt.Sprintf("%s reply has %d items, want 1", sf, len(items)), false, nil)
 	}
 	vals, derr := secscodec.DecodeStatusReply(dm.Body)
 	if derr != nil {

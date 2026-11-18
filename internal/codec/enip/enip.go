@@ -43,7 +43,7 @@ const (
 	CmdRegisterSession uint16 = 0x0065
 	CmdUnregister      uint16 = 0x0066
 	CmdSendRRData      uint16 = 0x006F
-	CmdSendUnitData    uint16 = 0x0070
+	CmdSendUnitData    uint16 = 0x0072
 )
 
 // CPF 条目类型。
@@ -633,7 +633,10 @@ func ParseWriteTagReply(reply Reply) (dataType byte, count uint16, err error) {
 // BuildMultiple 生成 Multiple Service Packet 请求（服务 0x0A）。
 //
 // 路径固定指向 Message Router（class 0x02 / instance 0x01）。请求数据是
-// 「条数 + 每条相对偏移 + 嵌入报文」，偏移相对嵌入区起点（即偏移表之后）。
+// 「条数 + 每条相对偏移 + 嵌入报文」。偏移的基准是 **数据区起点**（条数
+// 字段在偏移 0），所以第一条偏移 = 2+2n 而不是 0——Rockwell 1756-PM020
+// 的逐字节示例与 pycomm3 的实现都是这一种。按「偏移表之后」起算，PLC
+// 会把条数字段当成第一条嵌入报文去解析，多读整批失败且没有明确错误。
 func BuildMultiple(requests [][]byte) ([]byte, error) {
 	if len(requests) == 0 {
 		return nil, errors.New("enip: multiple service packet needs at least one request")
@@ -651,7 +654,7 @@ func BuildMultiple(requests [][]byte) ([]byte, error) {
 	}
 	body := make([]byte, 2+2*len(requests), bodyLen)
 	binary.LittleEndian.PutUint16(body, uint16(len(requests)))
-	off := 0
+	off := 2 + 2*len(requests)
 	for i, r := range requests {
 		if off > 0xFFFF {
 			return nil, errors.New("enip: embedded request offset overflow")
@@ -681,11 +684,13 @@ func ParseMultipleReply(reply Reply) ([][]byte, error) {
 	if tableEnd > len(reply.Data) {
 		return nil, errors.New("enip: multiple service offset table truncated")
 	}
-	base := tableEnd
+	// 偏移相对数据区起点（条数字段在偏移 0），与 BuildMultiple 同一约定；
+	// 第一条偏移应至少是 2+2n（跳过条数与偏移表本身）。
+	base := 0
 	out := make([][]byte, 0, count)
 	for i := 0; i < count; i++ {
 		start := int(binary.LittleEndian.Uint16(reply.Data[2+2*i:]))
-		if start < 0 || base+start > len(reply.Data) {
+		if start < tableEnd || base+start > len(reply.Data) {
 			return nil, fmt.Errorf("enip: embedded reply %d offset %d out of range", i, start)
 		}
 		end := len(reply.Data)

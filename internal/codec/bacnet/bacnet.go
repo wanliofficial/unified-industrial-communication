@@ -36,21 +36,37 @@ const (
 	NPDUControlExpectReply = 0x04
 	NPDUControlNone        = 0x00
 
-	// APDU 类型（首字节高 4 位）。
+	// APDU 类型（首字节高 4 位，ASHRAE 135 §20.1）。
+	//
+	// 这四个 ACK 型取值不能「看起来差不多就够」：SimpleACK=0x20、
+	// ComplexACK=0x30、SegmentACK=0x40 是标准固定值，错一位在回环里看
+	// 不出来（两端用同一份常量），对任何标准设备/客户端第一笔交互就断。
 	APDUConfirmedRequest   = 0x00 // 0000
 	APDUUnconfirmedRequest = 0x10 // 0001
-	APDUSimpleACK          = 0x10 // 0001（与 unconfirmed 同高 4 位，靠低 3 位区分）
-	APDUComplexACK         = 0x20 // 0010
+	APDUSimpleACK          = 0x20 // 0010
+	APDUComplexACK         = 0x30 // 0011
+	APDUSegmentACK         = 0x40 // 0100（不做分段，解析时明确报「不支持」）
 	APDUError              = 0x50 // 0101
 	APDUReject             = 0x60 // 0110
 	APDUAbort              = 0x70 // 0111
 
-	// 拒绝/中止原因（Reject 与 Abort 复用）。
-	RejectReasonBufferOverflow  = 0x01
-	RejectReasonInvalidAPDU     = 0x02
-	RejectReasonSegmentedNotSup = 0x03
-	RejectReasonSecurityNotSup  = 0x05
-	RejectReasonSynchronization = 0x0A
+	// Reject 原因（ASHRAE 135 §20.6）。与 Abort 是两张不同的表，不能复用：
+	// 同一个数值在两边语义不同（Abort 的 2=invalid-APDU-in-this-state）。
+	RejectReasonBufferOverflow           = 0x01
+	RejectReasonInconsistentParameters   = 0x02
+	RejectReasonInvalidParameterDatatype = 0x03
+	RejectReasonInvalidTag               = 0x04
+	RejectReasonTooManyArguments         = 0x05
+	RejectReasonUndefinedEnumeration     = 0x06
+	RejectReasonUnrecognizedService      = 0x08
+
+	// Abort 原因（ASHRAE 135 §20.7）。
+	AbortReasonBufferOverflow     = 0x01
+	AbortReasonInvalidAPDUInState = 0x02
+	AbortReasonServerTimeout      = 0x03
+	AbortReasonSegmentationNotSup = 0x04
+	AbortReasonSecurityError      = 0x05
+	AbortReasonOther              = 0x06
 
 	// 服务选择码（ConfirmedRequest 的 serviceChoice，以及应答里的 serviceChoice）。
 	ServiceReadProperty  = 0x0C
@@ -271,9 +287,10 @@ func BuildNPDU(npduVersion byte, npduControl byte, apdu []byte) []byte {
 
 // ParseNPDU 解析 NPDU，跳过可选路由字段后返回 APDU 与 control 字节。
 //
-// 路由字段的跳过逻辑与标准一致：control bit5 (0x20) 表示带目的地址，
-// 格式为 DNET(1) + DADR(len-1)；bit3 (0x08) 表示带源地址，格式为
-// SNET(1) + SADR(len-1) + hop count(1)。本平台不生成路由报文，但真实
+// 路由字段的跳过逻辑与标准一致（ASHRAE 135 §6.2.2）：control bit5 (0x20)
+// 表示带目的地址，格式为 DNET(2) + DLEN(1) + DADR(DLEN，DLEN>0 时) +
+// Hop Count(1)；bit3 (0x08) 表示带源地址，格式为 SNET(2) + SLEN(1) +
+// SADR(SLEN，SLEN>0 时)。本平台不生成路由报文，但真实
 // 设备可能经过路由器回包，因此解析侧必须能跳过而不是报错。注意 bit1
 // (0x02) 是网络优先级、不是目的地址标志——按 0x02 跳过 DNET/DADR 会让
 // 经路由器回包的应答整体错位。
@@ -287,27 +304,45 @@ func ParseNPDU(npdu []byte) (apdu []byte, npduControl byte, err error) {
 	npduControl = npdu[1]
 	// NPDU 头：version(1) + control(1)，之后才是 APDU。
 	apduStart := 2
-	// 跳过 DNET/DADR（有目的端时）：1 字节 DNET + (len-1) 字节 DADR。
+	// 网络层报文（bit7）：Message Type(1) + Vendor ID(1)。
+	if npduControl&0x80 != 0 {
+		if len(npdu) < apduStart+2 {
+			return nil, 0, proto("NPDU with network layer message truncated")
+		}
+		apduStart += 2
+	}
+	// 跳过目的地址（bit5）：DNET(2) + DLEN(1) + DADR(DLEN) + Hop Count(1)。
+	// hop count 是目的规格的一部分，只要 bit5 置位就必有。
 	if npduControl&0x20 != 0 {
-		if len(npdu) < apduStart+1 {
+		if len(npdu) < apduStart+3 {
 			return nil, 0, proto("NPDU with destination truncated")
 		}
-		dlen := int(npdu[apduStart])
-		if len(npdu) < apduStart+1+dlen {
-			return nil, 0, proto("NPDU destination address truncated")
+		dlen := int(npdu[apduStart+2])
+		apduStart += 3
+		if dlen > 0 {
+			if len(npdu) < apduStart+dlen {
+				return nil, 0, proto("NPDU destination address truncated")
+			}
+			apduStart += dlen
 		}
-		apduStart += 1 + dlen
-	}
-	// 跳过 SNET/SADR（有源路由时）：1 字节 SNET + (len-1) 字节 SADR + 1 字节 hops。
-	if npduControl&0x08 != 0 {
 		if len(npdu) < apduStart+1 {
+			return nil, 0, proto("NPDU hop count truncated")
+		}
+		apduStart += 1
+	}
+	// 跳过源地址（bit3）：SNET(2) + SLEN(1) + SADR(SLEN)。
+	if npduControl&0x08 != 0 {
+		if len(npdu) < apduStart+3 {
 			return nil, 0, proto("NPDU with source route truncated")
 		}
-		slen := int(npdu[apduStart])
-		if len(npdu) < apduStart+1+slen+1 {
-			return nil, 0, proto("NPDU source route truncated")
+		slen := int(npdu[apduStart+2])
+		apduStart += 3
+		if slen > 0 {
+			if len(npdu) < apduStart+slen {
+				return nil, 0, proto("NPDU source address truncated")
+			}
+			apduStart += slen
 		}
-		apduStart += 1 + slen + 1
 	}
 	if apduStart >= len(npdu) {
 		return nil, 0, proto("NPDU consumed entire message, no APDU")
@@ -734,15 +769,17 @@ func DecodeObjectID(b []byte) (objType, instance int, err error) {
 // confirmedRequestHeader 组装 ConfirmedRequest 的 APDU 头。
 //
 //	[0] 0x00（ConfirmedRequest，不分段）
-//	[1] MAX-SEGMENTS-ACCEPTED(高 4 位) + MAX-APDU-SIZE-ACCEPTED(低 4 位) = 0x00
-//	    0 表示「不接受分段」与「最大 APDU 1476 字节」，是不分段实现的标准取值。
+//	[1] MAX-SEGMENTS-ACCEPTED(高 4 位) + MAX-APDU-SIZE-ACCEPTED(低 4 位) = 0x05
+//	    高 4 位 0 = 不接受分段；低 4 位 5 = 最大 APDU 1476 字节。标准编码表
+//	    里 0 是「最多 50 字节」——按 0x00 发送，设备回一个长一点的
+//	    object-name 就会 Abort(buffer-overflow)。
 //	[2] invoke ID
 //	[3] 服务选择码
 //
 // 设备若非要分段应答只能回 Reject/Abort，驱动会把它映射成协议错误——
 // 比悄悄拼出一个不完整的值安全。
 func confirmedRequestHeader(service, invokeID byte) []byte {
-	return []byte{APDUConfirmedRequest, 0x00, invokeID, service}
+	return []byte{APDUConfirmedRequest, 0x05, invokeID, service}
 }
 
 // ReadPropertyRequest 构造 ReadProperty 的 ConfirmedRequest APDU。
@@ -852,6 +889,7 @@ const (
 	APDUKindAbort
 	APDUKindUnconfirmed
 	APDUKindConfirmedRequest
+	APDUKindSegmentACK
 )
 
 func (k APDUKind) String() string {
@@ -860,6 +898,8 @@ func (k APDUKind) String() string {
 		return "complex-ack"
 	case APDUKindSimpleACK:
 		return "simple-ack"
+	case APDUKindSegmentACK:
+		return "segment-ack"
 	case APDUKindError:
 		return "error"
 	case APDUKindReject:
@@ -883,14 +923,13 @@ func ClassifyAPDU(first byte) APDUKind {
 	case 0x00:
 		return APDUKindConfirmedRequest
 	case 0x10:
-		if first&0x02 != 0 {
-			// UnconfirmedRequest 的 bit1 是「是否有更多分段」；
-			// SimpleACK 的 bit1 固定为 0。
-			return APDUKindUnconfirmed
-		}
-		return APDUKindSimpleACK
+		return APDUKindUnconfirmed
 	case 0x20:
+		return APDUKindSimpleACK
+	case 0x30:
 		return APDUKindComplexACK
+	case 0x40:
+		return APDUKindSegmentACK
 	case 0x50:
 		return APDUKindError
 	case 0x60:
@@ -903,8 +942,8 @@ func ClassifyAPDU(first byte) APDUKind {
 
 // ParseACK 解析 ComplexACK / SimpleACK 的公共头。
 //
-//	ComplexACK: [0]=0x2X [1]=invokeID [2]=service [3..]=应答数据
-//	SimpleACK:  [0]=0x10 [1]=invokeID [2]=service
+//	ComplexACK: [0]=0x3X [1]=invokeID [2]=service [3..]=应答数据
+//	SimpleACK:  [0]=0x20 [1]=invokeID [2]=service
 //
 // 分段标志（ComplexACK 首字节 bit3、invoke ID 后的 sequence number 等）
 // 不在支持范围内，命中直接报错。
@@ -919,10 +958,12 @@ func ParseACK(apdu []byte) (kind APDUKind, service byte, invokeID byte, payload 
 			return 0, 0, 0, nil, proto("segmented ComplexACK is not supported")
 		}
 	case APDUKindSimpleACK:
-		// SimpleACK 首字节固定 0x10，低 4 位必须全 0。
+		// SimpleACK 首字节固定 0x20，低 4 位必须全 0。
 		if apdu[0]&0x0F != 0 {
 			return 0, 0, 0, nil, proto("unexpected SimpleACK header 0x%02X", apdu[0])
 		}
+	case APDUKindSegmentACK:
+		return 0, 0, 0, nil, proto("segmented responses are not supported (SegmentACK 0x%02X)", apdu[0])
 	default:
 		return 0, 0, 0, nil, proto("unexpected ACK type 0x%02X (%s)", apdu[0], kind)
 	}

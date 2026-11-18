@@ -808,8 +808,9 @@ UIC_SNMP_AUTH_PASSWORD=authpass123 UIC_SNMP_PRIV_PASSWORD=privpass123 \
 
 v3 的三件事全部用标准库实现，没有 CGO 也没有第三方依赖：USM 口令本地化为密钥
 （1 MiB 扩展 + `H(Ku||engineID||Ku)`）、HMAC 认证（MD5/SHA-1/SHA-224/256/384/512，
-截断长度 = 摘要长度的一半）、DES/AES-128/192/256 加密（含 3DES 之外的 CFB/CBC 与
-SNMPv3 特有的 salt-IV 构造）。认证摘要对「authParameters 清零后的原始字节」计算，
+截断长度按两张固定表：MD5/SHA-1 是 RFC 3414 的 96 位 = 12 字节，SHA-2 系列是
+RFC 7860 的 16/24/32/48 字节——**不是**「摘要长度的一半」）、DES/AES-128/192/256
+加密（含 3DES 之外的 CFB/CBC 与 SNMPv3 特有的 salt-IV 构造）。认证摘要对「authParameters 清零后的原始字节」计算，
 比对用 `subtle.ConstantTimeCompare`；加密时 `msgData` 外面还套一层 OCTET STRING，
 解密后按外层 SEQUENCE 长度截断以抵消 CBC 补齐。
 
@@ -1441,7 +1442,7 @@ go test -race -count=1 ./...
 | `internal/codec/sl651` | SL 651 纯函数编解码（按长度字段分帧而非扫 `7E` / 长度字段语义与 `17+长度` / CRC-16/MODBUS 变体不取反且高位在前 / 上下行地址字段反序 / 附录 C 131 项引导符全表 / 引导符类固定宽度与固定定义字节 / 数据定义字节 `(字节数<<3)|小数位` / 批量要素 `Slot` 段宽与 `DRP[11]` 段寻址 / DRP·DRZ·ZT 按 HEX 解并填缺测而非 9999 / 均匀时段报 31H 与小时报 34H / 查询帧 37H·38H·3AH 构造 / ASCII 帧与 M3 多包显式拒绝） |
 | `internal/driver/sl651` | SL 651 中心站驱动（一次 37H 取整帧全部要素、应答沿用查询功能码、`<要素>` 与 `<要素>[<段号>]` 地址、`VT` 走 `Report.Voltage` 兜底、缺测降 `quality=bad`、坏帧计数区分「无字节」与「有字节不成帧」、链路错误缓存；自检 `Report`） |
 | `internal/sim/sl651` | SL 651 内置遥测站（7 要素覆盖 BCD/HEX/状态字/整组缺测四分支、37H·38H·3AH 分派、自报帧 2F·30·32·34、密码与站号过滤静默、坏校验注入、值可变） |
-| `internal/codec/secs` | SECS 纯函数编解码（12 字节 HSMS 帧头 / 控制消息 / SECS-II 项编解码 / `MaxPayload` 上限 / SxFy 消息体语义） |
+| `internal/codec/secs` | SECS 纯函数编解码（SEMI E37 HSMS 帧：4 字节长度前缀（含 10 字节头）+ SessionID/PType/SType / 控制消息 / SECS-II 项编解码 / `MaxPayload` 上限 / SxFy 消息体语义） |
 | `internal/driver/secs` | HSMS 主站（Select 握手、SystemBytes 配对、按对象分组批量读、S2F15 写常数、Linktest 探活、自检 `Describe`/`RawRead`） |
 | `internal/sim/secs` | HSMS 内置设备（SVID/ECID 双编号空间 / Select 门控 / 常数写拒绝未知编号 / 事件与报警推送） |
 | `internal/codec/mtconnect` | MTConnect 纯函数编解码（按本地名匹配、忽略命名空间 / Header 序号与 nextSequence 补齐 / Samples、Events、Conditions 三类观测 / 两层与平铺条件写法与按严重度合并 / `/probe` 设备模型 / MTConnectError 文档 / ISO-8859-1、latin-1、windows-1252 与 UTF-8 BOM 字符集） |

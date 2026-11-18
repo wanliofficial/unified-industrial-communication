@@ -56,24 +56,54 @@ func TestHSMSFrameRoundTrip(t *testing.T) {
 	}
 }
 
-// TestHSMSHeaderGolden 钉住 12 字节固定头：4 字节消息头 + 4 字节数据长度 +
-// 1 字节消息类型 + 1 字节字节顺序。
+// TestHSMSHeaderGolden 钉住 E37 的 14 字节固定区：4 字节长度前缀（含
+// 10 字节头）+ SessionID + Stream/W + Function + PType + SType + SystemBytes。
 func TestHSMSHeaderGolden(t *testing.T) {
-	m := secscodec.Message{SystemBytes: 0x0A0B0C0D, Stream: 2, Function: 14,
+	m := secscodec.Message{SystemBytes: 0x0A0B0C0D, SessionID: 0x0001, Stream: 2, Function: 14,
 		MsgType: secscodec.MsgTypeDataMsg, Payload: []byte{0xAA, 0xBB}}
 	raw, err := secscodec.Encode(m)
 	if err != nil {
 		t.Fatal(err)
 	}
 	want := []byte{
-		0x02, 0x0E, 0x0A, 0x0B, 0x0C, 0x0D, // Stream=2, Function=14, SystemBytes
-		0x00, 0x00, 0x00, 0x02, // 数据长度 2
-		0x00,       // MsgType = DATA
-		0x01,       // ByteOrder
+		0x00, 0x00, 0x00, 0x0C, // 长度 = 10 字节头 + 2 字节载荷
+		0x00, 0x01, // SessionID = 1（设备 ID）
+		0x02,                   // Stream = 2（无 W 位）
+		0x0E,                   // Function = 14
+		0x00,                   // PType = 0（SECS-II）
+		0x00,                   // SType = 0（DATA）
+		0x0A, 0x0B, 0x0C, 0x0D, // SystemBytes
 		0xAA, 0xBB, // 数据
 	}
 	if !bytes.Equal(raw, want) {
 		t.Fatalf("frame = % x, want % x", raw, want)
+	}
+	// Select.req 的金字节：SessionID 固 0xFFFF、字节 2/3 全 0、SType=1。
+	sel, err := secscodec.Encode(secscodec.NewSelectReq(0x11))
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantSel := []byte{
+		0x00, 0x00, 0x00, 0x0A, // 长度 = 10（只有头，无载荷）
+		0xFF, 0xFF, // SessionID
+		0x00, 0x00, // 头字节 2/3 = 0
+		0x00,                   // PType
+		0x01,                   // SType = Select.req
+		0x00, 0x00, 0x00, 0x11, // SystemBytes
+	}
+	if !bytes.Equal(sel, wantSel) {
+		t.Fatalf("select req = % x, want % x", sel, wantSel)
+	}
+	// Select.rsp 的状态在头字节 3。
+	rsp, err := secscodec.Encode(secscodec.NewSelectRsp(0x11, secscodec.StatusTooMuch))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rsp[7] != byte(secscodec.StatusTooMuch) || rsp[9] != secscodec.MsgTypeSelectRsp {
+		t.Fatalf("select rsp header = % x", rsp[4:14])
+	}
+	if len(rsp) != secscodec.FrameLen {
+		t.Fatalf("控制消息不应有载荷：len=%d", len(rsp))
 	}
 }
 
@@ -81,19 +111,19 @@ func TestHSMSBoundsAndWBit(t *testing.T) {
 	if _, err := secscodec.Encode(secscodec.Message{Stream: 0, MsgType: secscodec.MsgTypeDataMsg}); err == nil {
 		t.Error("Stream=0 必须失败")
 	}
-	if _, err := secscodec.Encode(secscodec.Message{Stream: 16, MsgType: secscodec.MsgTypeDataMsg}); err == nil {
-		t.Error("Stream=16 必须失败")
+	if _, err := secscodec.Encode(secscodec.Message{Stream: 128, MsgType: secscodec.MsgTypeDataMsg}); err == nil {
+		t.Error("Stream=128 必须失败")
 	}
-	// Stream 的最高位是 W 位：Stream=15 + W=1 时首字节是 0x8F。
+	// Stream 的最高位是 W 位：Stream=15 + W=1 时头字节 2 是 0x8F。
 	raw, err := secscodec.Encode(secscodec.Message{Stream: 15, WBit: true, MsgType: secscodec.MsgTypeDataMsg})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if raw[0] != 0x8F {
-		t.Fatalf("W-bit stream byte = %#x, want 0x8F", raw[0])
+	if raw[6] != 0x8F {
+		t.Fatalf("W-bit stream byte = %#x, want 0x8F", raw[6])
 	}
-	if raw[0]&0x7f != 15 {
-		t.Fatalf("Stream 解码回 %d, want 15", raw[0]&0x7f)
+	if raw[6]&0x7f != 15 {
+		t.Fatalf("Stream 解码回 %d, want 15", raw[6]&0x7f)
 	}
 }
 
@@ -102,9 +132,9 @@ func TestHSMSByteOrderGuard(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	raw[11] = 2
+	raw[8] = 2 // PType：本包只支持 SECS-II(0)
 	if _, err := secscodec.Decode(raw); err == nil {
-		t.Fatal("字节顺序 2 必须失败")
+		t.Fatal("PType 2 必须失败")
 	}
 }
 
@@ -114,7 +144,7 @@ func TestHSMSLengthMismatch(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	raw[9] = 0x09
+	raw[0] = 0x09 // 篡改长度前缀首字节
 	if _, err := secscodec.Decode(raw); err == nil {
 		t.Fatal("长度字段与实际数据不一致必须失败")
 	}

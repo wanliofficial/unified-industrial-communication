@@ -19,10 +19,11 @@ func mustHex(t *testing.T, s string) []byte {
 }
 
 // COTP 连接请求必须与现场抓包逐字节一致。这里的值不是随便写的：
-// TPDU 256、TSAP 0x0100/0x0102 是 S7-300/400/1200/1500 都接受的最小集合。
+// 源 TSAP 0x0100、目标 TSAP 0x0102、TPDU size 1024（编码值 0x0A、长度恒
+// 1 字节）是 snap7 的 CliConnect 与 S7-300/400/1200/1500 都接受的最小集合。
 func TestCOTPConnectGolden(t *testing.T) {
 	got := COTPConnect()
-	want := mustHex(t, "0300001711e00000000100c1020100c2020100c0020102")
+	want := mustHex(t, "03000016"+"11e00000000100"+"c1020100"+"c2020102"+"c0010a")
 	if !bytes.Equal(got, want) {
 		t.Fatalf("cotp cr =\n% x\nwant\n% x", got, want)
 	}
@@ -32,19 +33,20 @@ func TestCOTPConnectGolden(t *testing.T) {
 // 写死一个值会让另一半设备连不上。
 func TestCOTPConnectRackSlot(t *testing.T) {
 	got := COTPConnectWith(0, 1)
-	want := mustHex(t, "0300001711e00000000100c1020100c2020100c0020101")
+	want := mustHex(t, "03000016"+"11e00000000100"+"c1020100"+"c2020101"+"c0010a")
 	if !bytes.Equal(got, want) {
 		t.Fatalf("frame =\n% x\nwant\n% x", got, want)
 	}
-	// rack 1 slot 4 → 0x0100 + 0x20 + 4 = 0x0124
+	// rack 1 slot 4 → 0x0100 + 0x20 + 4 = 0x0124（位于 0xC2 参数的值字节）
 	got = COTPConnectWith(1, 4)
-	if tail := got[len(got)-2:]; !bytes.Equal(tail, []byte{0x01, 0x24}) {
-		t.Fatalf("dst tsap = % x, want 01 24", tail)
+	if tsap := got[17:19]; !bytes.Equal(tsap, []byte{0x01, 0x24}) {
+		t.Fatalf("dst tsap = % x, want 01 24", tsap)
 	}
 }
 
 func TestParseCOTPConnect(t *testing.T) {
-	cc := mustHex(t, "0300001711d00001000100c0020102c1020100c2020100")
+	// CC 与 CR 同构：TSAP 源/目标对调、DST-REF 回填 SRC-REF。
+	cc := mustHex(t, "03000016"+"11d00001000100"+"c2020102"+"c1020100"+"c0010a")
 	if err := ParseCOTPConnect(cc); err != nil {
 		t.Fatalf("cc should parse: %v", err)
 	}

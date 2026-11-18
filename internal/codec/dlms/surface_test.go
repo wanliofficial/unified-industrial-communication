@@ -175,9 +175,9 @@ func TestAttributeDescriptorRoundTrip(t *testing.T) {
 // with-datablock 分支：表在应答超过 max-PDU 时会走这里。驱动虽然不做
 // 拼块，但**必须**能识别出来并报告，否则现场只看到"值读出来是半截"。
 func TestGetResponseDataBlock(t *testing.T) {
-	// C4 = Get-Response 的 [2] with-datablock；invoke 81；last=1；
+	// C4 + 类型 02（with-datablock）+ invoke 81；last=1；
 	// block-number=1；raw-data [0] 长度 3 内容 01 02 03。
-	apdu := []byte{TagGetResponseBlock, 1 + 5 + 2 + 3, InvokeID,
+	apdu := []byte{TagGetResponse, GetKindNext, InvokeID,
 		0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x03, 0x01, 0x02, 0x03}
 	resp, err := ParseGetResponse(apdu)
 	if err != nil {
@@ -202,8 +202,8 @@ func TestGetResponseDataBlock(t *testing.T) {
 
 // 分块里的错误分支：表用 data-access-result 表示"这一块拿不到"。
 func TestGetResponseDataBlockError(t *testing.T) {
-	// body = invoke(1) + last-block(1) + block-number(4) + 标签(1) + 结果码(1) = 8
-	apdu := []byte{TagGetResponseBlock, 8, InvokeID,
+	// C4 + 类型 02 + invoke；last-block(1) + block-number(4) + 标签(1) + 结果码(1)。
+	apdu := []byte{TagGetResponse, GetKindNext, InvokeID,
 		0x01, 0x00, 0x00, 0x00, 0x02, 0x01, byte(DARDataBlockUnavailable)}
 	resp, err := ParseGetResponse(apdu)
 	if err != nil {
@@ -223,21 +223,21 @@ func TestGetResponseDataBlockError(t *testing.T) {
 // with-list 分支（multiple-references）。本驱动不声明这个能力，但表可能
 // 主动这么回，解析必须能识别而不是当成坏帧。
 func TestGetResponseWithList(t *testing.T) {
-	a, err := EncodeGetResponseNormal(U32(1))
+	a, err := EncodeGetResponseNormal(InvokeID, U32(1))
 	if err != nil {
 		t.Fatal(err)
 	}
-	b, err := EncodeGetResponseNormal(U32(2))
+	b, err := EncodeGetResponseNormal(InvokeID, U32(2))
 	if err != nil {
 		t.Fatal(err)
 	}
-	// 取两条 normal 应答的「Get-Data-Result」部分（去掉 C4 与长度、invoke）。
+	// 取两条 normal 应答的「Get-Data-Result」部分（去掉 C4、类型、invoke）。
 	partA := a[3:]
 	partB := b[3:]
 	body := []byte{InvokeID, 0x02}
 	body = append(body, partA...)
 	body = append(body, partB...)
-	apdu := append([]byte{TagGetResponseList, byte(len(body))}, body...)
+	apdu := append([]byte{TagGetResponse, GetKindList}, body...)
 
 	resp, err := ParseGetResponse(apdu)
 	if err != nil {
@@ -279,23 +279,26 @@ func TestParseDataBlockErrors(t *testing.T) {
 
 // Get-Response 的结构错误必须报错：坏标签、长度越界、payload 截断。
 func TestGetResponseErrors(t *testing.T) {
-	if _, err := ParseGetResponse([]byte{TagGetResponseNormal}); !errors.Is(err, ErrIncomplete) {
+	if _, err := ParseGetResponse([]byte{TagGetResponse}); !errors.Is(err, ErrIncomplete) {
 		t.Errorf("单字节应报 ErrIncomplete，得到 %v", err)
 	}
-	// 长度声称 10 但只有 2 字节。
-	if _, err := ParseGetResponse([]byte{TagGetResponseNormal, 10}); !errors.Is(err, ErrIncomplete) {
-		t.Errorf("长度越界应报 ErrIncomplete，得到 %v", err)
+	if _, err := ParseGetResponse([]byte{TagGetResponse, GetKindNormal}); !errors.Is(err, ErrIncomplete) {
+		t.Errorf("缺 invoke 应报 ErrIncomplete，得到 %v", err)
 	}
 	// 不是 Get-Response 的标签。
 	if _, err := ParseGetResponse([]byte{TagAARQ, 0x01, 0x00}); err == nil {
 		t.Error("AARQ 标签不应被当成 Get-Response")
 	}
-	// normal 分支但 payload 为空（缺 invoke-id）。
-	if _, err := ParseGetResponse([]byte{TagGetResponseNormal, 0x00}); !errors.Is(err, ErrIncomplete) {
-		t.Errorf("缺 invoke 应报 ErrIncomplete，得到 %v", err)
+	// Set-Response（0xC5）不能被当成 Get-Response 的变体。
+	if _, err := ParseGetResponse([]byte{TagSetResponse, GetKindNormal, InvokeID, 0x00}); err == nil {
+		t.Error("Set-Response 标签应明确报错")
+	}
+	// normal 分支但正文为空。
+	if _, err := ParseGetResponse([]byte{TagGetResponse, GetKindNormal, InvokeID}); err == nil {
+		t.Error("空正文应报错")
 	}
 	// Get-Data-Result 的标签不认识。
-	bad := []byte{TagGetResponseNormal, 0x02, InvokeID, 0x7F, 0x00}
+	bad := []byte{TagGetResponse, GetKindNormal, InvokeID, 0x7F, 0x00}
 	if _, err := ParseGetResponse(bad); err == nil {
 		t.Error("未知 Get-Data-Result 标签应报错")
 	}

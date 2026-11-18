@@ -32,8 +32,8 @@ func TestReadRetriesAfterDrop(t *testing.T) {
 		}
 		writeMsg(c, secscodec.DataMessage{
 			SystemBytes: req.SystemBytes, Stream: 1, Function: 4,
-			Body: mustEncode(secscodec.EncodeStatusReply([]secscodec.StatusValue{
-				{ID: 1, Value: secscodec.Int(secscodec.FormatU4, 25)},
+			Body: mustEncode(secscodec.EncodeValueReply([]*secscodec.Item{
+				secscodec.Int(secscodec.FormatU4, 25),
 			})),
 		}.ToMessage())
 	})
@@ -146,10 +146,7 @@ func TestProbeRejectsNonLinktest(t *testing.T) {
 		if err != nil {
 			return
 		}
-		writeMsg(c, secscodec.Message{
-			SystemBytes: req.SystemBytes, MsgType: secscodec.MsgTypeRejectReq,
-			Payload: []byte{0x00, 0x02, 0x00, 0x00},
-		})
+		writeMsg(c, secscodec.NewRejectReq(req.SystemBytes, 0x02, 0x05))
 	})
 	c, err := New().Open(context.Background(), dialConfig(addr))
 	if err != nil {

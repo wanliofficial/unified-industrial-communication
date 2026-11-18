@@ -161,14 +161,15 @@ func TestHandleAPDUSegmentedRejected(t *testing.T) {
 	}
 	defer srv.Close()
 
-	// 分段位（首字节 bit3）置位的 ConfirmedRequest 必须回 Reject。
+	// 分段位（首字节 bit3）置位的 ConfirmedRequest 必须回
+	// Abort(segmentation-not-supported)。
 	apdu := []byte{0x08, 0x00, 0x07, bacnetcodec.ServiceReadProperty}
 	resp := srv.handleAPDU(apdu)
-	if len(resp) < 3 || resp[0]&0xF0 != 0x60 {
+	if len(resp) < 3 || resp[0]&0xF0 != 0x70 {
 		t.Fatalf("segmented request -> % X", resp)
 	}
-	if resp[2] != bacnetcodec.RejectReasonSegmentedNotSup {
-		t.Fatalf("reject reason = 0x%02X", resp[2])
+	if resp[2] != bacnetcodec.AbortReasonSegmentationNotSup {
+		t.Fatalf("abort reason = 0x%02X", resp[2])
 	}
 }
 

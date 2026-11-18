@@ -369,12 +369,14 @@ func TestMultipleServicePacketRoundTrip(t *testing.T) {
 	if binary.LittleEndian.Uint16(req.Data) != 2 {
 		t.Fatalf("count = %d", binary.LittleEndian.Uint16(req.Data))
 	}
+	// 偏移相对数据区起点（条数字段在 0），第一条 = 2+2n = 6。
+	// 与 1756-PM020 示例/pycomm3 同一约定。
 	off0 := int(binary.LittleEndian.Uint16(req.Data[2:]))
 	off1 := int(binary.LittleEndian.Uint16(req.Data[4:]))
-	if off0 != 0 || off1 != len(a) {
+	if off0 != 6 || off1 != 6+len(a) {
 		t.Fatalf("offsets = %d/%d", off0, off1)
 	}
-	if !bytes.Equal(req.Data[6:6+len(a)], a) || !bytes.Equal(req.Data[6+len(a):], b) {
+	if !bytes.Equal(req.Data[off0:off0+len(a)], a) || !bytes.Equal(req.Data[off1:], b) {
 		t.Fatalf("embedded mismatch")
 	}
 
@@ -383,8 +385,8 @@ func TestMultipleServicePacketRoundTrip(t *testing.T) {
 	r1, _ := BuildReply(ServiceReadTag, 0x05, nil, nil)
 	body := make([]byte, 6)
 	binary.LittleEndian.PutUint16(body, 2)
-	binary.LittleEndian.PutUint16(body[2:], 0)
-	binary.LittleEndian.PutUint16(body[4:], uint16(len(r0)))
+	binary.LittleEndian.PutUint16(body[2:], 6)
+	binary.LittleEndian.PutUint16(body[4:], uint16(6+len(r0)))
 	body = append(body, r0...)
 	body = append(body, r1...)
 	replies, err := ParseMultipleReply(Reply{Data: body})

@@ -112,16 +112,23 @@ func TestGetRequestGolden(t *testing.T) {
 		InstanceID: [6]byte{0x01, 0x00, 0x01, 0x08, 0x00, 0xFF},
 		Attribute:  2,
 	}}
-	want := mustHex(t, "C00A8100030100010800FF02")
+	// C0 01 81 + 描述符（class 2B + OBIS 6B + attr 1B），无长度字节。
+	want := mustHex(t, "C0018100030100010800FF02")
 	if got := req.Encode(); !bytes.Equal(got, want) {
 		t.Fatalf("Get-Request = % X, want % X", got, want)
 	}
 }
 
-// Get-Response-Normal 成功：`C4 0C 81 00 06 00 00 01 00` 之类的结构。
-// 用 long-unsigned 12345 做值，验证「标签 + 大端」。
+// Get-Response-Normal 成功：`C4 01 81 00 <A-XDR 值>`。
+// 用 long-unsigned 12345 做值，验证「无长度字节 + 大端」。
 func TestGetResponseRoundTrip(t *testing.T) {
-	apdu, err := EncodeGetResponseNormal(U32(123456))
+	apdu, err := EncodeGetResponseNormal(InvokeID, U32(123456))
+	if err == nil {
+		want := mustHex(t, "C40181"+"00"+"060001E240")
+		if !bytes.Equal(apdu, want) {
+			t.Fatalf("Get-Response = % X, want % X", apdu, want)
+		}
+	}
 	if err != nil {
 		t.Fatalf("Encode: %v", err)
 	}
@@ -140,7 +147,10 @@ func TestGetResponseRoundTrip(t *testing.T) {
 
 // Get-Response-Normal 失败：Data-Access-Result = object-undefined(4)。
 func TestGetResponseError(t *testing.T) {
-	apdu := EncodeGetResponseResult(DARObjectUndefined)
+	apdu := EncodeGetResponseResult(InvokeID, DARObjectUndefined)
+	if !bytes.Equal(apdu, mustHex(t, "C4018101"+"04")) {
+		t.Fatalf("Get-Response 错误帧 = % X", apdu)
+	}
 	resp, err := ParseGetResponse(apdu)
 	if err != nil {
 		t.Fatalf("Parse: %v", err)

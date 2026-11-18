@@ -91,9 +91,10 @@ func TestSimSelectAndLinktest(t *testing.T) {
 	if m := cl.roundTrip(secscodec.NewSelectReq(0)); m.Status() != secscodec.StatusOK {
 		t.Fatalf("Select 应成功，status=%d", m.Status())
 	}
-	// Linktest → Linktest.rsp status 0。
-	if m := cl.roundTrip(secscodec.NewLinktestReq(0)); m.Status() != secscodec.StatusOK {
-		t.Fatalf("Linktest 应成功，status=%d", m.Status())
+	// Linktest → Linktest.rsp。E37 里 Linktest.rsp 没有状态字段，
+	// 只验证类型与系统字节回显。
+	if m := cl.roundTrip(secscodec.NewLinktestReq(0)); m.MsgType != secscodec.MsgTypeLinktestRsp {
+		t.Fatalf("Linktest 应回 LinktestRsp，得到 %s", secscodec.TypeName(m.MsgType))
 	}
 	// Deselect → Deselect.rsp status 0。
 	if m := cl.roundTrip(secscodec.NewDeselectReq(0)); m.Status() != secscodec.StatusOK {
@@ -129,14 +130,15 @@ func TestSimDataMessages(t *testing.T) {
 	cl.send(secscodec.DataMessage{Stream: 1, Function: 3, WBit: true, Body: body}.ToMessage())
 	m = cl.recv()
 	d, _ = secscodec.ParseData(m)
-	vals, err := secscodec.DecodeStatusReply(d.Body)
+	// S1F4 = L,n{V}：纯值列表。
+	items, err := secscodec.DecodeValueReply(d.Body)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(vals) != 1 {
-		t.Fatalf("S1F4 应答 %d 项", len(vals))
+	if len(items) != 1 {
+		t.Fatalf("S1F4 应答 %d 项", len(items))
 	}
-	if v, _ := vals[0].Value.U4(); v != 100 {
+	if v, _ := items[0].U4(); v != 100 {
 		t.Fatalf("VID 1 = %d, want 100", v)
 	}
 
