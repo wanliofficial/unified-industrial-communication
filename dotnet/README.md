@@ -235,7 +235,7 @@ dotnet run --project tests/Uic.Tests -- --opcua             # 额外跑 OPC UA �
 dotnet run --project tests/Uic.Tests -- --stop-on-fail
 ```
 
-正常情况下输出 `415 passed, 0 failed, 3 skipped`（跳过的是默认不启用的 OPC UA 用例），共 418 条；
+正常情况下输出 `417 passed, 0 failed, 3 skipped`（跳过的是默认不启用的 OPC UA 用例），共 420 条；
 `-- --opcua` 时那 3 条也会跑。最新一次全量实测与负载说明见 `docs/testing.md`——
 仓库所在的 NTFS 挂载被常驻服务拖慢时，`contract/*` 偶有单条触到 180 s 硬超时，
 单独复跑即过（文档按实测原样记录，不把超时抹成「全绿」）。

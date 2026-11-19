@@ -141,6 +141,15 @@ internal static class OpcUaTests
             t.Ok(stampBack.Value is DateTime back && back.ToUniversalTime() == fixedAt,
                 $"the written datetime is read back (got {stampBack.Value})");
 
+            // 服务端自己数的「接到的写请求」与「失败的写请求」：这两条是
+            // uic_opcua_writes_total / uic_opcua_write_failures_total 的唯一数据源。
+            // 只断言值被写进去还不够——计数器不涨的话，看板上「有人在写」永远是 0。
+            var nodeManager = runtime.OpcUaServer!.NodeManager;
+            t.Equal(2L, nodeManager.Writes,
+                $"both writes reached the server (got {nodeManager.Writes})");
+            t.Equal(0L, nodeManager.WriteFailures,
+                $"no write failed (got {nodeManager.WriteFailures})");
+
             // ---- 订阅 ----
             var subscription = new Subscription(session.DefaultSubscription)
             {

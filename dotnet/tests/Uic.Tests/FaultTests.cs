@@ -29,6 +29,8 @@ internal static class FaultTests
         tests.Add(new TestCase("fault/stall_threshold_follows_the_slowest_point", StallThresholdFollowsSlowestPoint));
         tests.Add(new TestCase("fault/outbox_ttl_ignores_a_clock_jump", OutboxTtlIgnoresClockJump));
         tests.Add(new TestCase("fault/outbox_permission_error_is_counted", OutboxPermissionErrorIsCounted));
+        tests.Add(new TestCase("fault/state_changes_are_counted_only_on_transitions",
+            StateChangesAreCountedOnlyOnTransitions));
     }
 
     /// <summary>
@@ -358,5 +360,180 @@ internal static class FaultTests
             "a permission error is counted, not silently swallowed");
 
         return Task.CompletedTask;
+    }
+
+    /// <summary>
+    /// 状态变化计数（<c>uic_device_state_changes_total</c>）：只在运行态**真的变了**的时候 +1。
+    ///
+    /// 为什么单独立一条：这个计数器此前在实现里有自增点、文档里列着序列名，却没有任何用例
+    /// 断言过它的取值。它是「设备状态曲线」唯一的数据来源，写错的两头都会误导运维——
+    /// 每轮都加（状态没变也算）会让曲线退化成一条斜线，永远不加则像「设备一直很稳」。
+    /// 首次观测也不能计数：那不是变化，是建立基线。
+    ///
+    /// 驱动按脚本逐轮成功/失败，watcher 在每次状态落定后推一轮，因此断言点都是确定事实。
+    /// </summary>
+    private static async Task StateChangesAreCountedOnlyOnTransitions(TestContext t)
+    {
+        var registry = new DriverRegistry();
+        var driver = new ScriptedDriver();
+        registry.Register(driver);
+
+        var clock = new FakeClock();
+        await using var engine = new Scheduler(
+            registry, new PointCache(), NullLoggerFactory.Instance,
+            new SchedulerOptions { Tick = TimeSpan.FromMilliseconds(10) });
+
+        engine.Start(ScriptedConfig());
+
+        var metrics = new MetricsRegistry();
+        await using var watcher = new DeviceStateWatcher(engine, () => null, NullLogger.Instance, metrics)
+        {
+            MinimumStaleAge = TimeSpan.FromSeconds(1),
+            Time = clock,
+        };
+
+        var actor = engine.Find("d1") ?? throw new CheckFailedException("the device actor was not started");
+
+        double Changes(string state)
+            => metrics.CounterValue("uic_device_state_changes_total",
+                new Dictionary<string, string> { ["device"] = "d1", ["state"] = state });
+
+        // 首次观测只建立基线：这时候还没有「变化」可言。
+        await WaitForStateAsync(t, actor, RuntimeState.Collecting);
+        await watcher.TickAsync(t.Ct);
+        t.Equal(0d, Changes("collecting"),
+            "the first observation is a baseline, not a state change");
+
+        // 同一状态再观测一轮：仍然不是变化。这一条是「每轮都 +1」那类缺陷的闸门。
+        await watcher.TickAsync(t.Ct);
+        t.Equal(0d, Changes("collecting"), "re-observing the same state is not a change");
+
+        // 连续失败到熔断：collecting → degraded → faulted，每一步各记一次。
+        driver.FailNext(2);
+        await WaitForStateAsync(t, actor, RuntimeState.Degraded);
+        await watcher.TickAsync(t.Ct);
+        t.Equal(1d, Changes("degraded"), "entering degraded is one state change");
+
+        await WaitForStateAsync(t, actor, RuntimeState.Faulted);
+        await watcher.TickAsync(t.Ct);
+        t.Equal(1d, Changes("faulted"), "entering faulted is one state change");
+
+        // 熔断后会自行重连，恢复采集就是 faulted → collecting，也要记一次。
+        driver.Succeed();
+        await WaitForStateAsync(t, actor, RuntimeState.Collecting);
+        await watcher.TickAsync(t.Ct);
+        t.Equal(1d, Changes("collecting"),
+            "coming back from the breaker is one state change (and the baseline did not count it)");
+
+        // 恢复到采集后再观察几轮，计数不再增长：稳定期的曲线必须是平的。
+        await watcher.TickAsync(t.Ct);
+        await watcher.TickAsync(t.Ct);
+        t.Equal(1d, Changes("collecting"), "a stable device adds nothing to the state-change counter");
+    }
+
+    private static ConfigDocument ScriptedConfig() => new()
+    {
+        SchemaVersion = 1,
+        Site = "fault-site",
+        Channels =
+        {
+            new Channel
+            {
+                Id = "ch",
+                Protocol = "scripted",
+                Transport = "none",
+                MaxConcurrency = 1,
+                Timeout = TimeSpan.FromSeconds(2),
+                ConnectTimeout = TimeSpan.FromSeconds(2),
+            },
+        },
+        Devices =
+        {
+            new Device
+            {
+                Id = "d1",
+                ChannelId = "ch",
+                Interval = TimeSpan.FromMilliseconds(50),
+                Timeout = TimeSpan.FromSeconds(2),
+                Retries = 0,
+                // 重连间隔压到 100ms，熔断恢复不用等太久；用例等的是状态，不是这个数。
+                RecoverInterval = TimeSpan.FromMilliseconds(100),
+                FailureThreshold = 2,
+                Points =
+                {
+                    new Point
+                    {
+                        Id = "p1",
+                        Address = Address.Register("holding", 0),
+                        DataType = DataType.UInt16,
+                        Interval = TimeSpan.FromMilliseconds(50),
+                    },
+                },
+            },
+        },
+    };
+
+    /// <summary>等到设备进入指定运行态；超时即失败，避免用例挂死。</summary>
+    private static async Task WaitForStateAsync(TestContext t, DeviceActor actor, RuntimeState want)
+    {
+        var clock = System.Diagnostics.Stopwatch.StartNew();
+        while (actor.State != want)
+        {
+            if (clock.ElapsedMilliseconds > 10_000)
+                t.Fail($"the device never reached {want} (still {actor.State} after {clock.ElapsedMilliseconds} ms)");
+
+            await Task.Delay(10, t.Ct);
+        }
+    }
+
+    /// <summary>
+    /// 按脚本成功/失败的驱动：<see cref="FailNext"/> 让接下来 N 轮读失败，<see cref="Succeed"/> 恢复正常。
+    ///
+    /// 失败用非临时错误（协议错），连接不会被重连打断，状态因此稳定落在 degraded/faulted，
+    /// 不会混进 connecting——那会让「状态变化次数」变得不可预期。
+    /// </summary>
+    private sealed class ScriptedDriver : IDriver
+    {
+        private int _failuresLeft;
+
+        public DriverMeta Meta { get; } = new()
+        {
+            Id = "scripted",
+            Name = "脚本化驱动",
+            Transports = new[] { "none" },
+        };
+
+        public void FailNext(int rounds) => Interlocked.Exchange(ref _failuresLeft, rounds);
+
+        public void Succeed() => Interlocked.Exchange(ref _failuresLeft, 0);
+
+        public IConn Open(OpenContext context) => new Conn(this);
+
+        private sealed class Conn(ScriptedDriver owner) : IConn
+        {
+            public Task ProbeAsync(CancellationToken ct) => Task.CompletedTask;
+
+            public Task<IReadOnlyList<RawSample>> ReadAsync(
+                IReadOnlyList<ReadSpan> spans, CancellationToken ct)
+            {
+                if (Interlocked.Decrement(ref owner._failuresLeft) >= 0)
+                {
+                    throw new DriverException(
+                        ErrorKind.Protocol, "scripted", "read", "scripted failure",
+                        temporary: false, inner: null);
+                }
+
+                return Task.FromResult<IReadOnlyList<RawSample>>(
+                    spans.SelectMany(s => s.Points)
+                        .Select(p => new RawSample(p.Id, DataValue.Number(p.DataType, 1), Quality.Good, null))
+                        .ToArray());
+            }
+
+            public Task<IReadOnlyList<WriteResult>> WriteAsync(
+                IReadOnlyList<WriteCommand> commands, CancellationToken ct)
+                => Task.FromResult<IReadOnlyList<WriteResult>>(Array.Empty<WriteResult>());
+
+            public ValueTask DisposeAsync() => ValueTask.CompletedTask;
+        }
     }
 }

@@ -13,29 +13,23 @@ dotnet run --project tests/Uic.Tests -- --opcua             # 额外跑 OPC UA �
 dotnet run --project tests/Uic.Tests -- --stop-on-fail      # 首个失败即停
 ```
 
-正常输出（最新一轮，注意 `contract/*` 在重负载下会整体变慢）：
+正常输出（最新一轮，420 条干净全量）：
 
 ```
-411 passed, 4 failed, 3 skipped · 4108.1s
+417 passed, 0 failed, 3 skipped · 291.9s
 ```
 
-加 `--opcua` 跑全量（含 3 条需外部 OPC UA 环境的端到端），全部 418 条都会跑。
+加 `--opcua` 跑全量（含 3 条需外部 OPC UA 环境的端到端），全部 420 条都会跑。
 不带 `--opcua` 时那 3 条显示 `skip`（原因 `requires --opcua`），不计入通过数。
-418 条这一轮在 `load average` 4.5–6.6 时量到 **4108.1 s**，`411 passed, 4 failed, 3 skipped`：
-4 条失败**全是 `contract/*` 触到 180 s 硬超时**（`devices_and_points_are_listed`、
-`disabled_device_shows_both_states`、`drivers_expose_capability_states`、
-`write_returns_per_point_results`），单独复跑分别 23.1 s / 7.1 s / 13.2 s / 6.4 s 全过。
-原因不在代码：这一轮仓库所在的 NTFS 挂载有常驻服务占着（`mount.ntfs` 约 73% CPU），
-整组 `contract/*` 从平时的 2–45 s 涨到 13–176 s（42 条有计时，中位数 82 s；另有 4 条超时未计时），
-最慢 `contract/api_requires_bearer_token` 175.6 s，
-离 180 s 只差 4 s——4 条正好落在闸门之外。**判红口径照旧：先把机器腾空再复跑，
-只有复跑复现的失败才算真失败。**
-新增的两条服务端安全姿态用例都很便宜：`opcua/server_options_are_anonymous_and_none_only` 14 ms
-（全量 6 ms）、`opcua/server_endpoint_advertises_only_none_and_anonymous` 218 ms（全量 185 ms）。
-`--opcua --filter opcua/` 单独跑 `opcua/*` 17 条全绿 · **18.6 s**（3 条端到端占 7.7 / 2.2 / 8.2 s，其余是纯函数）。
-`load average` 5 左右还量过一次 `401 passed, 2 failed`：同样是两条 `contract/*`
-触到 180 s 硬超时，单独复跑分别 119.0 s / 109.6 s 全过——先腾空再判红，
-见下面的耗时记录。
+420 条这一轮在 `load average` 4.8–5.2 时量到 **291.9 s**，`417 passed, 0 failed, 3 skipped`；
+单条最慢 `contract/health_and_version_are_public` 34.7 s，离 180 s 硬超时很远。
+同一台机器此前一轮（418 条）在仓库所在 NTFS 挂载被常驻服务拖慢时量到 4108.1 s 并有 4 条
+`contract/*` 触到 180 s 硬超时，单独复跑 6.4–23.1 s 全过——**差 14 倍只在机器，不在代码**，
+判红口径照旧：先腾空再复跑，只有复现的失败才算真失败。
+本轮新增/改动的三条耗时：`contract/opcua_restart_failure_is_counted` 4.5 s（要起真实 Kestrel
+并占一个端口）、`contract/resource_pressure_degrades_health` 3.7 s、
+`fault/state_changes_are_counted_only_on_transitions` 0.28 s。
+`--opcua --filter opcua/` 单独跑 `opcua/*` 17 条全绿 · 18.6 s（3 条端到端占 7.7 / 2.2 / 8.2 s）。
 
 （这 3 条不联网、只用进程内自签证书，但要绑端口并做真实握手。`--opcua --filter opcua`
 单独跑时 `opcua/*` 17 条全绿、18.6 s——3 条端到端占 7.7 / 2.2 / 8.2 s，其余 14 条
@@ -81,7 +75,12 @@ dotnet run --project tests/Uic.Tests -- --stop-on-fail      # 首个失败即停
 单条最慢 `contract/tls_rest_serves_https` 45.9 s，全部离 180 s 硬超时很远。`StartAndSettleAsync` 改成轮询判据后，
 `engine/transient_failure_is_retried` 从 481 ms 降到 23 ms、`engine/bad_quality_batch_is_retried`
 从 481 ms 降到 14 ms——不再为「等一轮采集走完」而付死等的时间。新增的四条都便宜（见上）。
-418 条（补了 OPC UA 服务端能力边界两条：`opcua/server_options_are_anonymous_and_none_only`、
+420 条 = 418 条 + 后补的两条（`fault/state_changes_are_counted_only_on_transitions`、
+`contract/opcua_restart_failure_is_counted`）；另给两条已有用例补了指标断言
+（`opcua/anonymous_session_read_write_subscribe` 加服务端写计数、
+`contract/resource_pressure_degrades_health` 加降级计数器），不增条数。
+419 条那一轮（只跑过 `fault/*` 组，未记耗时的中间态）跳过；以 420 条这一轮为准（见下一段）。
+418 条那一轮（补了 OPC UA 服务端能力边界两条：`opcua/server_options_are_anonymous_and_none_only`、
 `opcua/server_endpoint_advertises_only_none_and_anonymous`；配置校验矩阵补 `allowAnonymousRead=false`
 一类）在 `load average` 4.5–6.6、仓库所在 NTFS 挂载被常驻服务拖慢时量到 **4108.1 s**，
 `411 passed, 4 failed, 3 skipped`：4 条失败全是 `contract/*` 触到 180 s 硬超时（最慢的同组
@@ -153,7 +152,7 @@ NFR 的门槛是 120 s，压测用例、PBKDF2 派生与 TLS 握手是主要开�
 | `planner/*` | 8 | 窗口合并、切分上限、区分离、非寄存器寻址 |
 | `history/*` | 10 | journal 历史：时间/身份过滤、每桶降采样、重放去重、**序号重启后不吞掉新样本**（序号是内存计数器，重启/热更新后从 1 重来，只按序号去重会把真实数据当重放）、缺失文件、坏行跳过、跨读取缓冲区行、跨缓冲区胜出行回读、转义名回退、非法日历日期跳过 |
 | `outbox/*` | 12 | 位点推进、重启重放、批次、分区隔离、三重上限、**`droppedLastHour` 是单调时钟的一小时滑动窗口**（累计值只会变大，冒充窗口后看板永远显示「正在丢弃」）、半行容错、**压缩后发号不回退**、**磁盘满（`/dev/full` 注入 ENOSPC）时不推进位点且恢复后补投**、**逐条投递的 sink 发到一半失败时，已送达的记录不被整批重发**（`PartialDeliveryException` 携带送达点） |
-| `fault/*` | 5 | 环境级故障注入：**进程假死**（驱动卡在不可取消的 Task 上，看门狗报停滞并做 5 分钟去重）、**时钟跳变**不误判停滞、**停滞阈值跟着最慢点位周期放宽**（10 s 点位 ⇒ 阈值 100 s，60 s 不报、110 s 报——另外两条把 `MinimumStaleAge` 设成 1 s 跑得快，恰好绕开了「10 × 周期」那支）、**时钟跳变**不清空 Outbox 积压（TTL 按单调时长）、数据目录不可写时样本被计数丢弃而不是静默消失 |
+| `fault/*` | 6 | 环境级故障注入：**进程假死**（驱动卡在不可取消的 Task 上，看门狗报停滞并做 5 分钟去重）、**时钟跳变**不误判停滞、**停滞阈值跟着最慢点位周期放宽**（10 s 点位 ⇒ 阈值 100 s，60 s 不报、110 s 报——另外两条把 `MinimumStaleAge` 设成 1 s 跑得快，恰好绕开了「10 × 周期」那支）、**时钟跳变**不清空 Outbox 积压（TTL 按单调时长）、数据目录不可写时样本被计数丢弃而不是静默消失、**状态变化计数只在真迁移时 +1**（首次观测只建基线、同状态重复观测不加、collecting↔degraded↔faulted 每次迁移各加一——每轮都加会让看板曲线退化成斜线，永远不加则像「设备一直很稳」） |
 | `lifecycle/*` | 7 | 设备下线后的状态清理：**被删设备的观测状态一并遗忘**（含停滞去重窗口，删了又加回来能重新报警）、重新加回时重推 `$state`、**读挂死时下线不被阻塞**（`StopAsync` 有等待上限，否则配置应用与关机一起挂住）、**引用未注册驱动的配置整份被拒**（先预检再卸 actor，不留「旧设备已拆、新的建不出」的半应用状态）、**版本写不下盘时把设备退回旧配置**（`config/versions` 只读时 apply 失败必须等于什么都没变）、**MQTT 的 CA 读不出来时在副作用之前失败**（不能先摘掉旧连接、提交版本，再报 422）、**通道并发上限随热更新生效**（`GetOrAdd` 会把旧闸门原样留下，配置写着 1、实际仍按 4 路并发打同一条链路） |
 | `shutdown/*` | 2 | 优雅退出的顺序与副作用（真实进程内 runtime + 可脚本化 sink）：**停机时队列里的待投记录被 flush 干净**（flush 在 `$death` 之前，否则订阅者会以为数据到此为止）、**flush 有 3 秒上限**（sink 一直失败时停机仍有界返回，未投完的记录留在盘上重放） |
 | `config/*` | 20 | 内容寻址、回滚、启动优先级、非法文档、diff、旧配置迁移、复合时长、死区/量程规则、数组维度规则（类型/125 寄存器上限）、仓库示例可校验、**29 类非法配置逐条定位（含通道/设备/点位三类重复 id、非 None 的 OPC UA 策略、`allowAnonymousRead=false`）**、脱敏占位符还原、控制台草稿拼装出的配置能被真的解析器接受、四类寻址各自必填/禁止字段与混填拒绝、**原子写机制本身（连写 20 份后目录里不残留 `.tmp`、指针切过去的版本文件是完整可解析 JSON、`current` 指向最新提交）** |
@@ -171,7 +170,7 @@ NFR 的门槛是 120 s，压测用例、PBKDF2 派生与 TLS 握手是主要开�
 | `mqtt/*` | 34 | 测试内 broker：CONNECT/SUBSCRIBE 字段、QoS0/1、主题渲染、重连补发、**下线设备清 retained `$state`**、**命令去重窗口用单调时钟（校时跳变不会重复执行命令）**、**过期判定用单调「多久没收到报文」（校时跳变不伪造也不放过过期）**、TLS 发布与不可信 CA 拒绝；南向驱动：主题通配匹配、JSON 字段/类型/信封取值、首次读数前 `stale`、QoS0/1 取数、点位字段覆盖、坏载荷与恢复、断线重订阅、订阅被 ACL 拒绝 |
 | `template/*` | 4 | 50 实例批量生成、参数类型/缺失/未知参数拒绝、未声明占位符拒绝；**同一模板产出 Modbus 与 S7 两台设备并同时通过校验**（FR-CFG-01 验收口径） |
 | `csv/*` | 6 | 地址表达式（参考号/区域偏移/分列）、按 id 合并与冲突行号、死区模式与量程列、点位周期列、数组元素个数列 |
-| `contract/*` | 46 | 进程内真实 Kestrel 的 REST 契约（含驱动能力、**Prometheus 抓取端点的真实运行期序列**（HELP/TYPE、设备数与采集中设备数、无 sink 时仍导出 0、逐值可解析）、模板、CSV、导入导出、单点幂等、**幂等窗口用单调时钟**（校时跳变既不重复执行写命令、也不会永不失效）、**同一幂等键配另一份请求体返回 409**、**幂等台账随运行时实例走**（进程级静态字典会让新实例把重投当成重放、返回另一台网关的结果）、资源降级联动、脱敏配置往返、明文凭据被拒、journal 历史查询、审计写入/导出/拒绝留痕、点位有效周期、数组元素个数与值形态、**写入值按 scale/offset 反算成原始值**、**每个凭据字段（含 certificatePassword）在读写两侧都脱敏**、**驱动没注册时 apply 返回 422 并指出通道**（不是 500，也不会把在跑的设备拆掉）、**分页游标不合法时 400 而不是静默重来**、**超配额返回 429 且与登录锁定同 code**、**`uic_sse_connections` 反映真实连接数**（写死成 0 时看板永远显示没人订阅）、**SSE 按 `device/point` 过滤**（分隔符写错只是静默不出样本，所以质量码写错改为 400；未知 `quality` 不再建一条永远空的流）、**SSE 50 路并发上限**（真开满 50 条流 → 第 51 条 429 `request.rate_limited`，全部释放后名额可复用；删掉上限判断则第 51 条会挂死等 hello，用例用 10 s 保护判 FAIL）、**写请求体语法错误归 400 `request.invalid_json` 而不是冒成 500**（`JsonException` 不是 `ApiException`，不就地翻译就会被最外层兜底 catch 当成网关故障返回 500，污染告警与错误看板——配置导入早就归 422/400，写接口必须一致）、**v0 旧字段写成非字符串归 422/`valid:false` 而不是冒成 500**（迁移链 `GetValue<string>()` 遇数字/对象会抛裸 `InvalidOperationException`，REST 只按 `ConfigException` 分类「配置非法」，裸异常会冒成网关故障——和写请求体语法错误同类）、**`outbox.droppedLastHour` 是一小时窗口而不是累计值**、**停用设备仍在列表里但两个 state 分开表达**、HTTPS 监听、控制台新建设备的完整链路、**诊断包六部分齐全且配置脱敏**（manifest 带 gateway/apiVersion/site、脱敏后的配置不含明文 token、metrics 是真 Prometheus 序列、日志段不含明文、health 带聚合状态、devices.json 列出设备）；认证的 5 条见 `contract/auth_*`） |
+| `contract/*` | 47 | 进程内真实 Kestrel 的 REST 契约（含驱动能力、**Prometheus 抓取端点的真实运行期序列**（HELP/TYPE、设备数与采集中设备数、无 sink 时仍导出 0、逐值可解析）、模板、CSV、导入导出、单点幂等、**幂等窗口用单调时钟**（校时跳变既不重复执行写命令、也不会永不失效）、**同一幂等键配另一份请求体返回 409**、**幂等台账随运行时实例走**（进程级静态字典会让新实例把重投当成重放、返回另一台网关的结果）、资源降级联动、脱敏配置往返、明文凭据被拒、journal 历史查询、审计写入/导出/拒绝留痕、点位有效周期、数组元素个数与值形态、**写入值按 scale/offset 反算成原始值**、**每个凭据字段（含 certificatePassword）在读写两侧都脱敏**、**驱动没注册时 apply 返回 422 并指出通道**（不是 500，也不会把在跑的设备拆掉）、**分页游标不合法时 400 而不是静默重来**、**超配额返回 429 且与登录锁定同 code**、**`uic_sse_connections` 反映真实连接数**（写死成 0 时看板永远显示没人订阅）、**SSE 按 `device/point` 过滤**（分隔符写错只是静默不出样本，所以质量码写错改为 400；未知 `quality` 不再建一条永远空的流）、**SSE 50 路并发上限**（真开满 50 条流 → 第 51 条 429 `request.rate_limited`，全部释放后名额可复用；删掉上限判断则第 51 条会挂死等 hello，用例用 10 s 保护判 FAIL）、**写请求体语法错误归 400 `request.invalid_json` 而不是冒成 500**（`JsonException` 不是 `ApiException`，不就地翻译就会被最外层兜底 catch 当成网关故障返回 500，污染告警与错误看板——配置导入早就归 422/400，写接口必须一致）、**v0 旧字段写成非字符串归 422/`valid:false` 而不是冒成 500**（迁移链 `GetValue<string>()` 遇数字/对象会抛裸 `InvalidOperationException`，REST 只按 `ConfigException` 分类「配置非法」，裸异常会冒成网关故障——和写请求体语法错误同类）、**`outbox.droppedLastHour` 是一小时窗口而不是累计值**、**停用设备仍在列表里但两个 state 分开表达**、HTTPS 监听、控制台新建设备的完整链路、**诊断包六部分齐全且配置脱敏**（manifest 带 gateway/apiVersion/site、脱敏后的配置不含明文 token、metrics 是真 Prometheus 序列、日志段不含明文、health 带聚合状态、devices.json 列出设备）；认证的 5 条见 `contract/auth_*`） |
 | `secret/*` | 9 | 凭据引用：环境变量 / 密钥文件解析、缺失变量硬失败（不能静默变成空令牌）、明文被拒、空值合法、`enc:v1` 封解与篡改拒绝、未知方案与版本、摘要不泄露明文 |
 | `tls/*` | 4 | 证书必填且可读、PFX 口令必须是引用、`insecureSkipVerify` 依赖 `tls.enabled`；证书/CA 不接受凭据引用；**CA 文件内容不是 PEM 时拒绝**（`ImportFromPemFile` 对非 PEM 内容不抛异常、只导入 0 张证书，等于静默退回系统信任库），空文件仍是「显式不配 CA」 |
 | `audit/*` | 9 | 审计落盘：按动作/结果/身份查询、重启后序号单调且旧记录可查、按大小轮转与保留只删旧文件、**跨 UTC 日界换新文件**（注入可拨时钟）、**写不进去只降级不抛异常**（目录指向普通文件）、禁用时不写盘、断电半行跳过、按文件名日期跳过无关归档、分页最新在前 |

@@ -92,6 +92,8 @@ internal static class ContractTests
         tests.Add(new TestCase("contract/metrics_export_runtime_series", MetricsExportRuntimeSeries));
         tests.Add(new TestCase("contract/stream_filters_by_point_pattern", StreamFiltersByPointPattern));
         tests.Add(new TestCase("contract/diagnostics_bundle_carries_the_four_parts", DiagnosticsBundleCarriesTheFourParts));
+        tests.Add(new TestCase("contract/opcua_restart_failure_is_counted",
+            OpcUaRestartFailureIsCounted));
     }
 
     // ------------------------------------------------------------------
@@ -479,6 +481,12 @@ internal static class ContractTests
 
             var metrics = await host.Client.GetStringAsync("/api/v1/metrics", t.Ct);
             t.Contains(metrics, "uic_resources_degraded 1", "the gauge reflects the degraded state");
+
+            // 累加计数器与瞬时 gauge 是两件事：gauge 说「现在是否降级」，计数器说
+            // 「一共降级过几次」。看板上的「资源告急次数」只看得到后者，写漏了
+            // 就没有任何历史可查——恢复之后 gauge 归零，事故痕迹也一起消失。
+            t.Contains(metrics, "uic_resource_pressure_total{kind=\"disk\"} 1",
+                "the pressure counter records the disk degradation (and names the kind)");
 
             // 阈值撤回后必须自动恢复：看门狗只在跳变时触发，恢复路径没写对就会
             // 「降级一次、永久停写」，这正是资源降级最容易踩的坑。
@@ -3238,6 +3246,63 @@ internal static class ContractTests
             Stream.Dispose();
             _response.Dispose();
         }
+    }
+
+    /// <summary>
+    /// 热更新时 OPC UA 服务端起不来：apply 仍算成功，但必须留下计数。
+    ///
+    /// 为什么单独钉这一条：<c>uic_opcua_start_failures_total</c> 此前只在实现里有自增点。
+    /// 这里的语义很特别——设备与配置都已经生效，让整个 apply 失败会给出「什么都没变」的
+    /// 错误信号，所以失败只记日志 + 计数。计数一旦写漏，现场表现就是「配置说 OPC UA 开着、
+    /// 客户端连不上、监控上一条错都没有」，这是最难查的一类。
+    ///
+    /// 注入方式是真实的：把端点指向一个已被占用的端口，服务端绑定就会失败。
+    /// </summary>
+    private static Task OpcUaRestartFailureIsCounted(TestContext t)
+    {
+        return RunAsync(async () =>
+        {
+            // 先占住一个端口：真实占用比伪造一个异常更接近现场（端口被别的服务抢走）。
+            var blocker = new System.Net.Sockets.TcpListener(
+                System.Net.IPAddress.Loopback, 0);
+            blocker.Start();
+            var busyPort = ((System.Net.IPEndPoint)blocker.LocalEndpoint).Port;
+
+            try
+            {
+                await using var host = await Host.StartAsync(t);
+
+                var before = host.Runtime.Metrics.CounterValue("uic_opcua_start_failures_total");
+                t.Equal(0d, before, "no startup failure before the endpoint is moved");
+
+                // 打开 OPC UA 并指到被占用的端口：静态校验会过（scheme/端口格式都对），
+                // 失败发生在绑定阶段——正是这条计数要覆盖的路径。
+                var node = JsonNode.Parse(
+                    JsonDefaults.ToJson(host.Runtime.CurrentConfig))!.AsObject();
+                node["northbound"]!["opcUa"] = JsonNode.Parse($$"""
+                    { "enabled": true, "endpoint": "opc.tcp://127.0.0.1:{{busyPort}}" }
+                    """);
+
+                var next = ConfigStore.Parse(node.ToJsonString());
+                var outcome = await host.Runtime.ApplyConfigAsync(next, "opc ua on a busy port", t.Ct);
+
+                // apply 本身必须成功：设备已经在新配置上跑起来了，报失败会让运维以为改动没生效。
+                t.Ok(outcome.Applied, "the apply succeeds even though the OPC UA endpoint failed");
+
+                var failures = host.Runtime.Metrics.CounterValue("uic_opcua_start_failures_total");
+                t.Equal(1d, failures, "the failed restart is counted");
+
+                // 服务端确实没起来，而且这个事实对外可见：设备照常采集，只是没有 UA 端点。
+                t.Ok(host.Runtime.OpcUaServer is null, "no OPC UA server is running after the failure");
+                var point = await WaitForPointAsync(host, "v1", "temp", t);
+                t.Equal("good", point.GetProperty("quality").GetString(),
+                    "collection is unaffected by the northbound failure");
+            }
+            finally
+            {
+                blocker.Stop();
+            }
+        });
     }
 
     private static Task RunAsync(Func<Task> body) => body();

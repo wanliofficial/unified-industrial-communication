@@ -177,6 +177,15 @@ public sealed class GatewayRuntime : IGatewayControl, IAsyncDisposable
     public AuditLog Audit => _audit;
     public AuthService Auth => _auth;
 
+    /// <summary>
+    /// 北向 OPC UA 服务端（未启用时为 null）。
+    ///
+    /// 暴露出来是为了让写入计数（`uic_opcua_writes_total` / `uic_opcua_write_failures_total`）
+    /// 能被断言：只验证「值写进去了」看不出计数器有没有涨，而看板上「有人在写」
+    /// 正是靠这两个数。运维排障时也可以据此判断写入是否真的到达了服务端。
+    /// </summary>
+    public UicOpcUaServer? OpcUaServer => _opcUa;
+
     /// <summary>解析后的凭据。只在装配监听/客户端时读取，不会出现在任何响应里。</summary>
     public ResolvedSecrets SecretValues => _secrets;
 
