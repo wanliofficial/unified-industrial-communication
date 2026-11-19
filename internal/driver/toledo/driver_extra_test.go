@@ -150,42 +150,51 @@ func TestSilentScaleReportsCommError(t *testing.T) {
 	}
 }
 
-// TestBinaryFramesReportProtocolError 收到字节但一帧都解不出 → ErrProtocol。
+// TestBinaryFramesDegradeToCommError 收到字节但一帧都解不出 → Read 不抛顶层错误，
+// 逐点降级为 comm_error，帧格式诊断走 Stats()。
 //
-// 这是规格点名的一条：仪表被设成二进制 TOLEDO（STX 开头 18 字节）时，若报成
-// 超时，现场会先去改波特率而不是查仪表的帧格式设置。这里用一台只吐二进制帧的
-// 假秤把这条判据钉死。
-func TestBinaryFramesReportProtocolError(t *testing.T) {
+// 这是规格点名的一条：仪表被设成二进制 TOLEDO（STX 开头 18 字节）时，现场会先去
+// 改波特率而不是查仪表的帧格式设置。这条判据现在**不**靠 Read 的顶层错误表达——
+// 推送型驱动链路此刻是好的（衡器在持续推字节），把 ErrProtocol 当顶层错误上抛会
+// 触发 collector 拆链重连 + consecutive 熔断（§3.3.1、§3.10.6）。正确做法：Read
+// 逐点给 comm_error 并返回 nil，让运维从 Stats()（BytesSeen>0 && BadFrames>0 &&
+// !HasFrame）+ LastError 里的「ASCII」指引区分「有字节但解不出」与「没收到」。
+func TestBinaryFramesDegradeToCommError(t *testing.T) {
 	addr := startBinaryScale(t)
 	c := openConnAt(t, addr, pt("w", "weight", model.TypeFloat64))
 
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 
-	// Read 本身不做网络交互（推送模型），因此第一轮可能还没读到字节——那时
-	// 报 comm_error 是对的。要断言的是「字节已经进来、却一帧都解不出」之后
-	// 的分类，所以这里等到坏帧计数上来再看。
-	var err error
+	// Read 本身不做网络交互（推送模型），因此第一轮可能还没读到字节。等到坏帧计数
+	// 上来再看——那时衡器确实在推、只是解不出，正是要断言的场景。
 	deadline := time.Now().Add(2 * time.Second)
+	var out []driver.RawSample
 	for time.Now().Before(deadline) {
-		_, err = c.Read(ctx, spans(pt("w", "weight", model.TypeFloat64)))
+		var err error
+		out, err = c.Read(ctx, spans(pt("w", "weight", model.TypeFloat64)))
 		if err != nil {
-			break
+			t.Fatalf("推送型驱动在帧没解出时不应抛顶层错误（会触发重连+熔断）：%v", err)
 		}
 		if c.(*conn).Stats().BadFrames > 0 {
-			_, err = c.Read(ctx, spans(pt("w", "weight", model.TypeFloat64)))
 			break
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	if err == nil {
-		t.Fatal("只收到二进制帧时应报错，而不是把点位当成「还没收到」")
+	s, ok := sampleByID(out, "w")
+	if !ok {
+		t.Fatal("缺少 weight 样本")
 	}
-	if driver.KindOf(err) != driver.ErrProtocol {
-		t.Fatalf("错误分类 = %s，应为 protocol（提示改帧格式而不是改波特率）", driver.KindOf(err))
+	if s.Quality != model.QualityCommError {
+		t.Errorf("只收到二进制帧时质量码 = %s，应为 comm_error", s.Quality)
 	}
-	if msg := err.Error(); !contains(msg, "ASCII") {
-		t.Errorf("错误消息应给出「切到 ASCII 格式」的可执行指引，得到：%s", msg)
+	// 帧格式诊断走 Stats()：BytesSeen>0、BadFrames>0、未成帧、LastError 含「ASCII」指引。
+	st := c.(*conn).Stats()
+	if st.BytesSeen <= 0 || st.BadFrames <= 0 || st.HasFrame {
+		t.Errorf("收帧统计应显示「读到字节、有坏帧、未成帧」，得到 %+v", st)
+	}
+	if !contains(st.LastError, "ASCII") {
+		t.Errorf("Stats.LastError 应给出「切到 ASCII 格式」的可执行指引，得到：%s", st.LastError)
 	}
 }
 

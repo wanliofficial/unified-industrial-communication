@@ -408,14 +408,19 @@ func (c *conn) Read(ctx context.Context, spans []driver.ReadSpan) ([]driver.RawS
 		return nil, nil
 	}
 
-	// 一帧都没收到时，把「链路上没字节」与「有字节但解不出」分开报。
-	// 这是本驱动唯一会在 Read 里返回错误的分支，其余一律按点位降级。
-	if !hasData {
-		if err := c.noFrameError("read"); err != nil {
-			return nil, err
-		}
-	}
-
+	// 一帧都没收到时，Read **不**把「有字节但解不出（ErrProtocol）」或
+	// 「一个字节都没来（ErrTimeout）」当顶层错误上抛，而是逐点降级为 comm_error。
+	//
+	// 为什么：本驱动与 MQTT 同为推送型——衡器主动推帧，驱动没有命令可发，链路此刻
+	// 是好的。collector 对顶层 ErrProtocol/ErrTimeout 会 Close 拆链 + consecutive
+	// 熔断退避（§3.3.1）；把帧格式配错或衡器暂时安静当成这样的链路级失败，会让一台
+	// 正常设备每周期断链重连（§3.10.6 第一行点名），也会让点表里其它点位跟着不再采集。
+	// 这正是 §3.10.6 对订阅型驱动的纪律：一轮 Read 没有好消息就返回整体错误，是 ❌。
+	//
+	// 两种故障的区分不靠顶层错误，而是收帧统计：运维从 Stats()/toledoread -raw 看到
+	// 「读到 0 字节」（查接线/供电/是否开连续输出）还是「读到 N 字节、坏帧 M」（查帧
+	// 格式/波特率），排查方向在输出层面就已分开（§3.10.28.8）。Probe 路径仍保留这两
+	// 类顶层错误——命令行自检本就该在没帧时报错退出（见 probeTimeout）。
 	now := time.Now()
 	stale := hasData && now.Sub(latestAt) > c.staleAfter
 

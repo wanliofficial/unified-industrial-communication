@@ -9127,7 +9127,7 @@ func (c *conn) pump() {
 - `bytesSeen`（= `Reader.BytesRead()`）：从链路读到的原始字节数；
 - `badFrames`：收到成行但 `Parse` 失败的帧数，附最近一次错误。
 
-有了这两条计数，`Read` 在「从未收到帧」时才能把两种故障分开（见 §3.10.28.8）：一个字节都没回来归 `ErrTimeout`（查接线/供电/是否开连续输出），读到了字节却一帧都不成归 `ErrProtocol` 并附最近解析错误（查仪表帧格式、波特率/校验位）。混为一谈时，现场会先去改波特率，而真正要改的是仪表的帧格式设置。
+有了这两条计数，`Probe` 在「从未收到帧」时才能把两种故障分开（见 §3.10.28.8）：一个字节都没回来归 `ErrTimeout`（查接线/供电/是否开连续输出），读到了字节却一帧都不成归 `ErrProtocol` 并附最近解析错误（查仪表帧格式、波特率/校验位）。`Read` 路径不靠顶层错误区分这两者（推送型驱动不触发重连，见 §3.10.28.8），而是逐点降级为 `comm_error`，区分交给 `Stats()`。混为一谈时，现场会先去改波特率，而真正要改的是仪表的帧格式设置。
 
 由此带来一条硬性约束，与 MQTT 驱动同源：**`Read` 里没有任何网络交互**，耗时与
 点位数量无关，链路安静（衡器没推帧）也不会让它超时。真正断链时（读到底层错误）
@@ -9228,9 +9228,19 @@ Toledo 的点位是「当前一帧读数」的**语义字段**，不是某个寄
 
 判据落在 `pump` 维护的两个计数上（`bytesSeen` / `badFrames`，见 §3.10.28.2），
 经驱动导出的 `Stats()` 读出，`toledoread -raw` 会把它们连同最近一帧原文一起打印。
-因此这条分类不是只作用于返回的错误：即使 `Read` 按点位降级成 `comm_error` 而没抛
+因此这条分类**不只**作用于返回的错误——即使 `Read` 按点位降级成 `comm_error` 而没抛
 错，运维也能从 `-raw` 里看到「读到 0 字节」还是「读到 N 字节、坏帧 M」，两种故障的
 排查方向在输出层面就已分开。
+
+**这两类错误只在 `Probe` 路径作为顶层错误返回，`Read` 路径不返回。** `Read` 是
+调度器周期性采集的入口，而本驱动与 MQTT 同为推送型（§3.10.6）：衡器此刻链路是好的，
+它要么在持续推字节（帧格式配错）、要么只是暂时安静（衡器没推帧）。把这两种
+`ErrProtocol`/`ErrTimeout` 当 `Read` 的顶层错误上抛，会被 collector 按 §3.3.1 的硬
+契约 `Close` 拆链 + `consecutive` 熔断退避——一台正常设备就此每周期断链重连、点表里
+其它点位跟着不再采集，正是 §3.10.6 点名禁止的「一轮 Read 没有好消息就返回整体错误」。
+所以 `Read` 在「一帧都没收到」时一律逐点降级为 `comm_error` 并返回 `nil`，两种故障
+的区分交给 `Stats()`；只有 `Probe`（命令行自检 `-probe`、熔断后的探活）才把这两类
+作为顶层错误抛出，让运维在没帧时明确失败退出。
 
 #### 3.10.28.9 配置与承载
 
@@ -9277,7 +9287,7 @@ comm_error」）。衡器写进去的、驱动解出来的共用同一套格式�
 | 层 | 用例 |
 |---|---|
 | `codec/toledo` | D39 金帧 `53542C47532C2B30303134392E306B670D0A` = `ST,GS,+00149.0kg` 逐字节锁死；`Format`→`Parse` 往返一致；`Format` 按 `WEIGHT(7)` 定宽（`00149.0`）；`splitSigned` 字符串拆分不丢精度（含 15 位整数、大值带小数、小数补零/截断）；`splitSigned` 负 `decimals` 不 panic（原实现切片越界）；大值 `Format`→`Parse` 往返（`999999999.5`/`123456789012345`）；负值/无小数点/多位小数变体；`STX` 二进制帧 → 带「ASCII」指引的拒绝，且收帧层把 STX 当合法起点切出（不当噪声丢）；状态 `ST`/`US`/`OL`/`UL`（大小写）；毛净 `GS`/`NT`/`TR`/`GR`（`GR` 是 `GS` 别名）；掩码数值段 → `Masked` 不报错；`lb oz`/`lb:oz` → `lb_oz` + `DualUnit`；段数/状态/模式错误分类；`Reader` 按 CR/LF 分帧、噪声前缀丢弃并计 `Dropped()`、首字母只认大写、半帧多段到达、`MaxFrame` 兜底、EOF 原样返回；`Reader.BytesRead()` 记读入字节数（噪声计入、`Dropped` 计入、尾随 LF 下次才计入） |
-| `driver/toledo` | 真 TCP 回环：`Probe` 等首帧；稳定重量 → `weight` good + 值；运动中 → 重量 uncertain、status 仍 good；超量程/欠量程 → 重量 bad、status 仍 good；`stable`/`motion` 布尔点位；`-points` 走驱动 Read 路径；`Write` **逐项** `ErrUnsupported`（顶层不抛错）；register 地址 Open 拒绝；未知 symbol Open 报 `ErrAddress`；`readTimeout` 一致性校正后严格 `< staleAfter`（`staleAfter` 取 100ms/1s/1.5s/2s/2.5s/10s/30s 逐点钉死）；`parseOptions` 越界/非法/未知键忽略；`WithSilent` → 全点位 `comm_error`；**只吐二进制帧的假秤 → `ErrProtocol` 且错误带「切 ASCII」指引**（等坏帧计数上来再断言，因为首轮 Read 无网络交互）；`Stats()` 报 `BytesSeen`/`Dropped`/`BadFrames`/`HasFrame`/`Raw`/`FrameAge` |
+| `driver/toledo` | 真 TCP 回环：`Probe` 等首帧；稳定重量 → `weight` good + 值；运动中 → 重量 uncertain、status 仍 good；超量程/欠量程 → 重量 bad、status 仍 good；`stable`/`motion` 布尔点位；`-points` 走驱动 Read 路径；`Write` **逐项** `ErrUnsupported`（顶层不抛错）；register 地址 Open 拒绝；未知 symbol Open 报 `ErrAddress`；`readTimeout` 一致性校正后严格 `< staleAfter`（`staleAfter` 取 100ms/1s/1.5s/2s/2.5s/10s/30s 逐点钉死）；`parseOptions` 越界/非法/未知键忽略；`WithSilent` → 全点位 `comm_error`；**只吐二进制帧的假秤 → `Read` 不抛顶层错误（推送型驱动不触发重连），逐点 `comm_error` 且 `Stats()` 显示「读到字节/有坏帧/未成帧」+ `LastError` 含「ASCII」指引**（等坏帧计数上来再断言，因为首轮 Read 无网络交互）；静默衡器 → `Read` 不抛 `ErrTimeout`、逐点 `comm_error`；`Stats()` 报 `BytesSeen`/`Dropped`/`BadFrames`/`HasFrame`/`Raw`/`FrameAge` |
 | `sim/toledo` | 连上按 ~20 帧/秒推帧；`SetStatus`/`SetMode`/`SetWeight`/`SetReading` 后续帧反映新值；`WithSilent` 不推帧；`Close` 幂等 |
 | `pointtable` | `toledo` 走 `WidthNone + AllowSymbol`；字段名 `weight`/`status`/… 解析成 symbol 且 `Canonical` 往返一致；寄存器/对象/文件/计算/selector 地址在导入期拒绝；`length` 列在导入期拒绝；秤的字段名不被 modbus-tcp/s7/dlt645/cjt188/bacnet 收下 |
 | `cmd/uic` | `toledoRefs` 列拆分；`toledoDefaultType` 与驱动一致；`KnownSymbol` 大小写不敏感、非法字段名（中文/寄存器语法）连秤前拒绝；`printToledoFields` 全字段有说明；`hasFreshFrame` 以「至少一个非 comm_error」为判据（不是样本数>0）；`statsOf` 经可选接口取统计、驱动不实现时安全返回 false；`printToledoRaw` 打印收帧统计 + 原文 + 「读到字节但没成帧」提示；sim 起在 `127.0.0.1:4001` 后 `-probe`/默认/`-points`/`-json`/`-raw`/`-list` |
