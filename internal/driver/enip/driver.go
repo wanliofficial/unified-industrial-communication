@@ -21,6 +21,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"math"
 	"strings"
 	"sync"
 	"time"
@@ -227,12 +228,20 @@ func (c *conn) roundTrip(ctx context.Context, wantCmd uint16, wantCtx [8]byte, p
 		return enipcodec.Header{}, nil, driver.E(driver.ErrProtocol, "read", c.cfg.Device.ID, err.Error(), false, err)
 	}
 	if h.Command != wantCmd {
+		// 命令不匹配（设备主动发通知、别的客户端残留报文）时，这条报文的
+		// h.Length 字节体仍然留在 TCP 流里。先把它读掉再报错：否则下一次
+		// roundTrip 会把残留体当头部读，整条流就此错位，而协议错又不是
+		// 链路级失败，上层会继续用错位的流读后面的点位。
+		c.drainBody(int(h.Length))
 		return enipcodec.Header{}, nil, driver.E(driver.ErrProtocol, "read", c.cfg.Device.ID,
 			fmt.Sprintf("unexpected encapsulation command 0x%04X, want 0x%04X", h.Command, wantCmd), false, nil)
 	}
 	// 发送方上下文必须原样回显。全零视为「设备不实现该字段」而放行：
 	// 少数嵌入式协议栈确实如此，为此拒绝会让设备完全不可用。
 	if h.Context != wantCtx && h.Context != [8]byte{} {
+		// 上下文不匹配是「陈旧/交错应答」的典型场景：这条应答属于之前的某次
+		// 请求，它的体同样在流里，必须先排空才能与真正的应答对齐。
+		c.drainBody(int(h.Length))
 		return enipcodec.Header{}, nil, driver.E(driver.ErrProtocol, "read", c.cfg.Device.ID,
 			"sender context mismatch (stale or interleaved response)", false, nil)
 	}
@@ -246,14 +255,27 @@ func (c *conn) roundTrip(ctx context.Context, wantCmd uint16, wantCtx [8]byte, p
 	return h, body, nil
 }
 
+// drainBody 读掉并丢弃 n 字节，把因命令/上下文不匹配而滞留的报文体从流里清走。
+// 读失败就放弃——调用方本来就要报错返回。
+func (c *conn) drainBody(n int) {
+	buf := make([]byte, 512)
+	for n > 0 {
+		m := n
+		if m > len(buf) {
+			m = len(buf)
+		}
+		if _, err := c.stream.ReadFull(m); err != nil {
+			return
+		}
+		n -= m
+	}
+}
+
 func (c *conn) encapStatus(op string, status uint32) error {
 	msg := fmt.Sprintf("encapsulation status 0x%08X (%s)", status, enipcodec.EncapsulationStatusText(status))
 	if status == 0x64 {
 		// 会话失效：重新建链会重新注册，属于可自愈。
 		return driver.E(driver.ErrDisconnected, op, c.cfg.Device.ID, msg, true, nil)
-	}
-	if status == 0x01 || status == 0x03 {
-		return driver.E(driver.ErrProtocol, op, c.cfg.Device.ID, msg, false, nil)
 	}
 	return driver.E(driver.ErrProtocol, op, c.cfg.Device.ID, msg, false, nil)
 }
@@ -348,29 +370,52 @@ func (c *conn) readSpan(ctx context.Context, span driver.ReadSpan) ([]driver.Raw
 		return nil, nil
 	}
 	plans := make([]pointPlan, len(span.Points))
-	reqs := make([][]byte, len(span.Points))
+	// 只发构造成功的请求，并记录每个点位对应哪个发送槽。单个点位配置错误
+	// （标签名/长度/类型配错）只标坏它自己，不连累同 span 的其它好点位——
+	// span 按标签名分组，一个标签名写错若直接 return，会让整组好点位一起变
+	// address_error（§3.3.1 部分失败）。
+	type sendSlot struct{ point int }
+	var sends []sendSlot
+	reqs := make([][]byte, 0, len(span.Points))
+	var firstErr error
 	for i, p := range span.Points {
 		plan, req, err := buildRead(p)
 		if err != nil {
-			return failed(span, err), err
-		}
-		plans[i], reqs[i] = plan, req
-	}
-	replies, err := c.readBatch(ctx, reqs)
-	if err != nil {
-		return failed(span, err), err
-	}
-	out := make([]driver.RawSample, 0, len(plans))
-	var firstErr error
-	for i, plan := range plans {
-		if replies[i].err != nil {
-			out = append(out, errSample(plan.point.ID, replies[i].err))
+			plans[i] = pointPlan{point: p, buildErr: err}
 			if firstErr == nil {
-				firstErr = replies[i].err
+				firstErr = err
 			}
 			continue
 		}
-		s, err := decodeRead(plan, replies[i].reply)
+		plans[i] = plan
+		sends = append(sends, sendSlot{point: i})
+		reqs = append(reqs, req)
+	}
+	replies, batchErr := c.readBatch(ctx, reqs)
+	if batchErr != nil && firstErr == nil {
+		firstErr = batchErr
+	}
+	// readBatch 可能已经拿到前面批次/点位的成功应答，同时又遇到错误（例如
+	// 第二批解析失败）。不能因为后面的失败就把已经读到的好点位一起丢掉——
+	// 那会把「设备正常、只是某一帧坏了」放大成整段数据丢失。
+	sent := make([]batchReply, len(span.Points))
+	for k, s := range sends {
+		sent[s.point] = replies[k]
+	}
+	out := make([]driver.RawSample, 0, len(plans))
+	for i, plan := range plans {
+		if plan.buildErr != nil {
+			out = append(out, errSample(plan.point.ID, plan.buildErr))
+			continue
+		}
+		if sent[i].err != nil {
+			out = append(out, errSample(plan.point.ID, sent[i].err))
+			if firstErr == nil {
+				firstErr = sent[i].err
+			}
+			continue
+		}
+		s, err := decodeRead(plan, sent[i].reply)
 		if nm, ok := err.(*needMore); ok {
 			// bytes 点位的元素宽度只能从应答里学到；学到之后按实际宽度
 			// 重新请求一次，避免把 int32 数组当 SINT 读（那会直接读到
@@ -511,6 +556,9 @@ type pointPlan struct {
 	skip     int // 应答数据里要跳过的字节数（offset × 元素宽度）
 	want     int // 要取用的字节数
 	bit      int
+	// buildErr 记录该点位构造请求时的错误（标签名/长度/类型配错）。读时逐点
+	// 标坏它自己，不影响同 span 的其它点位。
+	buildErr error
 }
 
 type planKind int
@@ -596,6 +644,13 @@ func buildRead(p driver.PointRef) (pointPlan, []byte, error) {
 				fmt.Sprintf("point %q: %d elements exceed the %d-byte read limit; split the point or use a smaller length",
 					p.ID, count, maxReadBytes), false, nil)
 		}
+	}
+	if count < 1 || count > 0xFFFF {
+		// CIP 的 element count 是 16 位。offset 过大时 uint16(count) 会回绕成
+		// 另一个合法值，读到的就是错误的元素区间（随后解码才报错，诊断成
+		// 协议错）。这里提前按地址错拦下。
+		return pointPlan{}, nil, driver.E(driver.ErrAddress, "read", "",
+			fmt.Sprintf("point %q: element offset %d exceeds the 16-bit Read Tag element count", p.ID, p.Address.Offset), false, nil)
 	}
 	req, err := enipcodec.BuildReadTag(tag, uint16(count))
 	if err != nil {
@@ -755,11 +810,32 @@ func (c *conn) Write(ctx context.Context, reqs []driver.WriteRequest) ([]driver.
 
 	results := make([]driver.WriteResult, 0, len(reqs))
 	var firstErr error
-	for _, req := range reqs {
+	for i, req := range reqs {
+		if err := ctx.Err(); err != nil {
+			e := driver.E(driver.ErrTimeout, "write", c.cfg.Device.ID, "context done", true, err)
+			// 剩余条目必须显式标坏，不能让它们从结果里消失。
+			for _, rest := range reqs[i:] {
+				results = append(results, writeFail(rest, e))
+			}
+			if firstErr == nil {
+				firstErr = e
+			}
+			return results, firstErr
+		}
 		res, err := c.writeOne(ctx, req)
 		results = append(results, res)
-		if err != nil && firstErr == nil {
-			firstErr = err
+		if err != nil {
+			// 链路级失败：后续每一条都只会等满一次超时，必须短路并把剩余
+			// 条目显式标坏（对比 bacnet 的「标失败并 break」）。
+			if driver.IsLinkFailure(err) {
+				for _, rest := range reqs[i+1:] {
+					results = append(results, writeFail(rest, err))
+				}
+				return results, err
+			}
+			if firstErr == nil {
+				firstErr = err
+			}
 		}
 	}
 	// 逐项返回（docs §3.4）：成功的条目**不能**因为同批另一条失败而被回填
@@ -801,6 +877,11 @@ func (c *conn) writeOne(ctx context.Context, req driver.WriteRequest) (driver.Wr
 	if req.Address.Length > 1 {
 		err := driver.E(driver.ErrAddress, "write", c.cfg.Device.ID,
 			fmt.Sprintf("point %q: numeric points support one element; use bytes for arrays", req.PointID), false, nil)
+		return writeFail(req, err), err
+	}
+	if err := checkRange(req.DataType, req.Value.Num); err != nil {
+		err = driver.E(driver.ErrAddress, "write", c.cfg.Device.ID,
+			fmt.Sprintf("point %q: %v", req.PointID, err), false, err)
 		return writeFail(req, err), err
 	}
 	raw, err := value.Encode(req.Value, req.DataType, model.OrderABCD)
@@ -898,7 +979,11 @@ func (c *conn) writeBytes(ctx context.Context, req driver.WriteRequest) (driver.
 	}
 	raw := []byte(req.Value.Text)
 	if len(raw) > n {
-		raw = raw[:n]
+		// 超长字节值不能静默截断：调用方以为整段都写下去了，设备上却只到
+		// 前 n 个字节。与字符串写入一致，直接拒绝并提示缩小值或加大 length。
+		err := driver.E(driver.ErrAddress, "write", c.cfg.Device.ID,
+			fmt.Sprintf("point %q: value is %d bytes but address.length is %d", req.PointID, len(raw), n), false, nil)
+		return writeFail(req, err), err
 	}
 	payload := append([]byte(nil), data...)
 	copy(payload[skip:skip+len(raw)], raw)
@@ -1111,6 +1196,57 @@ func failed(span driver.ReadSpan, err error) []driver.RawSample {
 
 func errSample(id string, err error) driver.RawSample {
 	return driver.RawSample{PointID: id, Quality: qualityOf(err), Err: err}
+}
+
+// checkRange 拒绝越界与带小数的整数写入，以及 float32 溢出成 ±Inf / 下溢成 0。
+//
+// codec/value 的 Encode 用强制转换落地：70000 写进 INT16 会静默变成 4464，
+// 1e300 写进 REAL 会静默变成 +Inf，1e-50 会静默变成 0。写入「成功」了，但
+// 设备上的值已经不是调用方给的值。这和 ADS/DNP3 的既有处理一致，必须在
+// 发报文之前拦下（§3.4 规则 3「写入失败不得静默」）。
+func checkRange(dt model.DataType, v float64) error {
+	switch dt {
+	case model.TypeInt16:
+		if v != math.Trunc(v) || v < math.MinInt16 || v > math.MaxInt16 {
+			return fmt.Errorf("%v 超出 int16 范围或不是整数", v)
+		}
+	case model.TypeUint16:
+		if v != math.Trunc(v) || v < 0 || v > math.MaxUint16 {
+			return fmt.Errorf("%v 超出 uint16 范围或不是整数", v)
+		}
+	case model.TypeInt32:
+		if v != math.Trunc(v) || v < math.MinInt32 || v > math.MaxInt32 {
+			return fmt.Errorf("%v 超出 int32 范围或不是整数", v)
+		}
+	case model.TypeUint32:
+		if v != math.Trunc(v) || v < 0 || v > math.MaxUint32 {
+			return fmt.Errorf("%v 超出 uint32 范围或不是整数", v)
+		}
+	case model.TypeInt64:
+		if v != math.Trunc(v) || v < math.MinInt64 || v >= 9223372036854775808.0 {
+			return fmt.Errorf("%v 超出 int64 范围或不是整数", v)
+		}
+	case model.TypeUint64:
+		if v != math.Trunc(v) || v < 0 || v >= 18446744073709551616.0 {
+			return fmt.Errorf("%v 超出 uint64 范围或不是整数", v)
+		}
+	case model.TypeFloat32:
+		// 强制转换会溢出成 ±Inf 或下溢成 0；两者都让设备上的值与调用方给的值不同。
+		if math.IsNaN(v) || math.IsInf(v, 0) {
+			return fmt.Errorf("%v 不是合法的 float32 值", v)
+		}
+		if v != 0 {
+			f := float32(v)
+			if math.IsInf(float64(f), 0) || f == 0 {
+				return fmt.Errorf("%v 超出 float32 可表示范围", v)
+			}
+		}
+	case model.TypeFloat64:
+		if math.IsNaN(v) || math.IsInf(v, 0) {
+			return fmt.Errorf("%v 不是合法的 float64 值", v)
+		}
+	}
+	return nil
 }
 
 func qualityOf(err error) model.Quality {

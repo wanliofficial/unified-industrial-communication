@@ -401,9 +401,12 @@ func (e *StatusError) Kind() driver.ErrorKind { return statusKind(e.Code) }
 // statusKind 把 CIP 通用状态码映射到平台错误分类。
 func statusKind(code byte) driver.ErrorKind {
 	switch code {
-	case 0x04, 0x05, 0x13, 0x15, 0x16:
-		// 路径段错误 / 目标不存在 / 数据不够 / 数据过多 / 对象不存在：
-		// 都是配置问题，重试不会变好。
+	case 0x03, 0x04, 0x05, 0x06, 0x11, 0x13, 0x15, 0x16:
+		// 路径段错误 / 目标不存在 / 数据不够 / 数据过多 / 对象不存在：配置问题。
+		// 0x03 参数值非法、0x06 partial transfer（读太多）、0x11 应答过大
+		// 都是**点级**问题：缩小 length / 改点表就能好，重试同一请求不会变好。
+		// 归为 ErrProtocol 会让 CountsTowardBreaker 为 true，把这类配置错
+		// 当成「链路坏了」去熔断整台设备。
 		return driver.ErrAddress
 	case 0x08, 0x14:
 		return driver.ErrUnsupported
@@ -805,18 +808,22 @@ func ParseTypeName(s string) (byte, bool) {
 //
 // capacity 是字符容量（不含 4 字节长度）。常见实现的默认容量是 82 字符，
 // 总长 86 字节；调用方必须显式给出容量，不猜。
+// EncodeString 生成 STRING 的线上表示：4 字节小端长度 + 字符 + 补零。
+//
+// 超长（字符数超过容量）直接报错而不是静默截断：截断后长度字段跟着缩水，
+// 调用方以为整个值都写下去了，设备上的值却不是它给的值（§3.4 规则 3
+// 「写入失败不得静默」）。STRING 的每个字符占 1 字节，capacity 就是字符上限。
 func EncodeString(s string, capacity int) ([]byte, error) {
 	if capacity < 1 {
 		return nil, fmt.Errorf("enip: string capacity must be >= 1, got %d", capacity)
 	}
 	raw := []byte(s)
-	n := len(raw)
-	if n > capacity {
-		n = capacity
+	if len(raw) > capacity {
+		return nil, fmt.Errorf("enip: string value %d chars exceeds capacity %d", len(raw), capacity)
 	}
 	out := make([]byte, 4+capacity)
-	binary.LittleEndian.PutUint32(out, uint32(n))
-	copy(out[4:], raw[:n])
+	binary.LittleEndian.PutUint32(out, uint32(len(raw)))
+	copy(out[4:], raw)
 	return out, nil
 }
 

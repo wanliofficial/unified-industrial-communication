@@ -188,11 +188,13 @@ func TestStatusKindAndText(t *testing.T) {
 		{0x05, driver.ErrAddress},
 		{0x15, driver.ErrAddress},
 		{0x16, driver.ErrAddress},
+		{0x03, driver.ErrAddress},
+		{0x06, driver.ErrAddress},
+		{0x11, driver.ErrAddress},
 		{0x08, driver.ErrUnsupported},
 		{0x0E, driver.ErrPermission},
 		{0x01, driver.ErrDisconnected},
 		{0x07, driver.ErrDisconnected},
-		{0x03, driver.ErrProtocol},
 		{0x1F, driver.ErrProtocol},
 	}
 	for _, c := range cases {
@@ -459,13 +461,11 @@ func TestStringEncodeDecode(t *testing.T) {
 	if err != nil || got != "PUMP-01" {
 		t.Fatalf("decoded = %q err=%v", got, err)
 	}
-	// 超长按容量截断，长度字段跟着截断。
-	b, _ = EncodeString("ABCDEFGH", 4)
-	got, _ = DecodeString(b)
-	if got != "ABCD" {
-		t.Fatalf("truncated = %q", got)
+	// 超长按容量拒绝，而不是静默截断：截断会让调用方以为整个值都写下去了。
+	if _, err := EncodeString("ABCDEFGH", 4); err == nil {
+		t.Fatal("overlong string accepted (should be rejected)")
 	}
-	// 长度字段大于实际数据时按实际长度截断，不越界。
+	// 长度字段大于实际数据时按实际长度截断，不越界（这是设备侧的坏长度，防御性兜底）。
 	b = append([]byte{0x09, 0, 0, 0}, []byte("AB")...)
 	got, _ = DecodeString(b)
 	if got != "AB" {
