@@ -1385,7 +1385,24 @@ FINS 的多字数值是「每个字大端、**低字在前**」：
 | `float64`/`int64` | 整体按字倒序 | `DCBA`（默认） |
 
 用户显式配置 `byteOrder` 时以配置为准（有些设备做了字交换）。字符串/字节不做字内
-交换：`"AB"` 在 DM 里就是 `0x4142`，按地址宽度补零或截断。
+交换：`"AB"` 在 DM 里就是 `0x4142`，按地址宽度补零；**超长则拒绝**（按地址宽度报
+`address_error`），不静默截断——截断会让调用方以为整个值都写下去了（§3.4 规则 3）。
+数值写入同理：越界整数、带小数的整数、float32 溢出成 ±Inf 或下溢成 0，都在发报文
+之前拒绝，而不是靠强制转换静默落地（`70000` 写 int16 不能变成 `4464`）。
+
+#### 3.10.6.5.1 写路径与读路径的三条共同约束
+
+`driver/finscore` 同时被 FINS/TCP 与 Host Link 复用，以下约束对两个驱动一并生效：
+
+- **逐块读的结果不得因后一块失败被整段丢弃**。一个 span 可能跨多块（受
+  `WordsPerRead`/`BitsPerRead` 限制），前几块已经解出好值、后一块报地址错或超时时，
+  失败只作用于还没拿到值的点位；已解出的好样本原样保留（§3.3.1，与 SNMP/ENIP 的
+  既有处理一致）。把整个 span 回填成同一条错误，会把「设备正常、只是某一块坏了」
+  放大成整段数据丢失。
+- **链路级失败立即收尾**。`IsLinkFailure(err)` 为真时不再继续后续 span/条目，剩余
+  点位显式标坏并上抛——一轮采集被周期超时打断本身就是「设备太慢」的信号。
+- **写路径遇链路级失败短路**。否则链路已死时一轮写入会被拖成 N 倍超时；剩余条目
+  显式标坏，已成功的条目保持成功（§3.4 规则 4）。
 
 #### 3.10.6.6 结束码与质量映射
 
@@ -1447,6 +1464,7 @@ curl -H 'Authorization: Bearer dev-token-0123456789' \
 | 层 | 用例 |
 |---|---|
 | `codec/fins` | 节点请求/响应金帧、字/位读命令金帧、响应解析、结束码分类、区表与码反查、位=0 的写、TCP 封装、边界与上限 |
+| `driver/finscore` | 跨块读的部分失败（前块好样本保留、失败块只标坏自己，字读/位读/链路失败三种场景）、读链路失败短路、ctx 到期标坏剩余 span、写路径数值越界/带小数/float32 溢出拒绝、STRING/bytes 超长拒绝而非截断、正好填满容量的反向用例、写路径链路失败短路且保留前序成功、字符串跨帧拆分、EM 区位写 RMW 保邻位 |
 | `driver/fins` | 握手、字读、float32 低字在前、位读、位写、`em` RMW、结束码→质量、SID 不匹配、非 TCP 拒绝、能力声明 |
 | `sim/fins` | 真实 TCP 回环：字读写、float32、位读写共享字内存、字/位混合 span、字符串、越界地址、`unitId` 覆盖 |
 
@@ -6264,6 +6282,11 @@ Read(spans)
 寄存器的一处结构性优势。写受命令帧约束（267 字），所以写入 span 的切块
 比读取更保守，这一条由同一个 `Limits` 天然保证，不需要在驱动里再写一遍。
 
+写路径的其余约束（数值越界/带小数/float32 溢出在发报文前拒绝、STRING/bytes
+超长拒绝而非静默截断、链路级失败短路且保留前序成功、已读到的好样本不因后续
+块失败被丢弃）全在 `finscore`，FINS/TCP 与 Host Link 共用同一份实现，详见
+§3.10.6.5.1。
+
 #### 3.10.19.7 事务纪律：静默、排空、单元号、SID
 
 半双工 RS-485 上来的正确性几乎全落在「两次事务之间」：
@@ -6396,8 +6419,8 @@ DM、当前 EM 区 `em`、以及 13 个 bank（`em0`..`em12`）。写错的区�
 | 层 | 用例 |
 |---|---|
 | `codec/hostlink` | `Build`/`ParseRequest`/`ParseResponse` 的黄金字节逐字节钉住；FCS 覆盖 `@` 且不含 `*`/CR；收发两条独立布局（请求无结束码、应答有结束码）；等待时间一位十六进制（0..F 越界拒绝）；单元号两位十进制（0..31）；`FromFINS` 丢弃六个路由字段且 ICF 显式 0x00；`Response.FINS()` 还原标准 FINS 帧；`FrameLen`/`Reader` 的分帧、噪声丢弃与 `*`+CR 定界；结束码 `0x13/0x14/0x15/0x18` 标 `Format()`、`0x03/0x23` 归 permission；`FCSMismatch`/`UnitMismatch` 的 `Comm()` 标记 |
-| `driver/hostlink` | 纯函数：`hostLinkLimits()` 四个上限（269/267/538/534）、`serialDefaults`（仅全空时补 9600-7-E-2，部分配置保留通用缺省 8/N/1）、`unitOf`（0..31、负数与越界拒绝）、`parseOptions`（`gap`/`wait` 边界）、`classifyRead`（超时文案带排查顺序、结束码分层、断链）；`RoundTrip` 对 FINS 结束码按语义分类（地址类 `0x1101..0x1104` → `ErrAddress`/不重试/不计熔断，链路类 `0x0202`/`0x0302` → 可重试，帧长错 `0x18` → 不重试） |
-| `driver/finscore` | `QualityOf`/`endCodeError` 的结束码→质量映射（地址类 `address_error`、链路类 `comm_error`、其余 `bad`）；`*TCPError` 的 `Comm()` 让封装层错误码得 `comm_error`；**部分失败语义（docs §3.3.1）**：成功点数按**样本**计数（span 成功但全员解码失败——如 EM 当前区 bool 缺位号——必须上抛错误，不能按 span 当成成功）、链路级失败（超时/断连）短路剩余 span 并把它们显式标坏、`ctx` 到期标坏剩余 span 后立即返回；**写入逐项返回（docs §3.4）**：同批后一条失败不得回填成功项的 `Err`（回归用例 `TestWriteFailureKeepsEarlierSuccessesIntact`，把回填加回去必须变红） |
+| `driver/hostlink` | 纯函数：`hostLinkLimits()` 四个上限（269/267/538/534）、`serialDefaults`（仅全空时补 9600-7-E-2，部分配置保留通用缺省 8/N/1）、`unitOf`（0..31、负数与越界拒绝）、`parseOptions`（`gap`/`wait` 边界）、`classifyRead`（超时文案带排查顺序、结束码分层、断链）；`RoundTrip` 对 FINS 结束码按语义分类（地址类 `0x1101..0x1104` → `ErrAddress`/不重试/不计熔断，链路类 `0x0202`/`0x0302` → 可重试，帧长错 `0x18` → 不重试）；共用 `finscore` 的写路径约束（越界/超长/短路由 `driver/finscore` 用例覆盖，同一份实现） |
+| `driver/finscore` | `QualityOf`/`endCodeError` 的结束码→质量映射（地址类 `address_error`、链路类 `comm_error`、其余 `bad`）；`*TCPError` 的 `Comm()` 让封装层错误码得 `comm_error`；**部分失败语义（docs §3.3.1）**：成功点数按**样本**计数（span 成功但全员解码失败——如 EM 当前区 bool 缺位号——必须上抛错误，不能按 span 当成成功）、链路级失败（超时/断连）短路剩余 span 并把它们显式标坏、`ctx` 到期标坏剩余 span 后立即返回；**跨块读的部分失败**：前几块已解出好值时后一块失败（地址错或链路失败），只把没拿到值的点位标坏、好样本保留（字读/位读两条路径各有用例）；**写入逐项返回（docs §3.4）**：同批后一条失败不得回填成功项的 `Err`（回归用例 `TestWriteFailureKeepsEarlierSuccessesIntact`，把回填加回去必须变红）、写路径链路失败短路且保留前序成功；**写路径数值范围校验**：越界整数/带小数整数/float32 溢出在发报文前拒绝（70000→int16 不能变 4464）；**STRING/bytes 超长拒绝**而非静默截断，含「正好填满容量」的反向用例 |
 | `sim/hostlink` | 真实 TCP 回环：16 位字往返（写 DM0 再读回）、位读写 + 邻位不变、float32 低字在前往返（DM2/DM3）、**EM 当前区位写走读改写往返（0xFFF7→0xFFFF→0xFFF7、只动 bit3）**、单元号不匹配完全沉默、FCS 错回 0x13、头码不对回 0x16、格式错回 0x14、读超 269 字由 finscore 切块 |
 | `cmd/uic` | `hostLinkWriteRequest` 的写路径判定：给了 `-bit` 一律按位写（**不判区有无原生位码**，EM 区也走位写）、`-qty != 1` 的字写直接拒（避免补零清邻字 + 宽度变化切 DCBA 字节序）、字写 `Length=1`/`Bit=-1`、非法布尔量与非数字拒绝 |
 | `pointtable` | `PolicyFor("hostlink")` == `PolicyFor("fins")`（`WidthRegisters` + `finsAreas`）；正向（字区/float32/位点/EM 当前区/EM bank/别名/大写区名）× 往返（`Canonical()` 能重新解析成同一地址）；反向（未知区名 `dmm`、`em13` 越界、bool 缺位号、位号 16、非 bool 带位号）；Modbus/S7/Mewtocol 拒绝 FINS 区名 |

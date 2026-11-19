@@ -25,6 +25,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"math"
 	"strings"
 	"sync"
 	"time"
@@ -157,7 +158,10 @@ func (c *Conn) Read(ctx context.Context, spans []driver.ReadSpan) ([]driver.RawS
 			// 链路级失败：立即返回，不由下面的闸门吞掉——一轮采集被周期
 			// 超时打断本身就是「设备太慢」的信号，需要让调度器看到。
 			if driver.IsLinkFailure(err) {
-				out = append(out, c.failed(span, err)...)
+				// 前面几块已经读回来的好点位必须保留（§3.3.1；与 SNMP/ENIP
+				// 的既有处理一致）。整 span 回填成同一条错误会把「设备正常、
+				// 只是某一块坏了」放大成整段数据丢失。
+				out = append(out, c.withPendingFailed(span, samples, err)...)
 				for _, rest := range spans[si+1:] {
 					out = append(out, c.failed(rest, err)...)
 				}
@@ -166,7 +170,8 @@ func (c *Conn) Read(ctx context.Context, spans []driver.ReadSpan) ([]driver.RawS
 			if firstErr == nil {
 				firstErr = err
 			}
-			out = append(out, c.failed(span, err)...)
+			// 同理：只把没拿到值的点位标坏，已解出的好样本保留。
+			out = append(out, c.withPendingFailed(span, samples, err)...)
 			continue
 		}
 		// span 成功不等于「有成功的点位」：解码阶段的错误（EM 当前区的 bool
@@ -246,12 +251,12 @@ func (c *Conn) readSpan(ctx context.Context, span driver.ReadSpan) ([]driver.Raw
 
 	if len(wordIdx) > 0 {
 		if err := c.readWordPoints(ctx, span, area, wordIdx, out); err != nil {
-			return nil, err
+			return out, err
 		}
 	}
 	if len(bitIdx) > 0 {
 		if err := c.readBitPoints(ctx, span, area, bitAccess, bitIdx, out); err != nil {
-			return nil, err
+			return out, err
 		}
 	}
 	return out, nil
@@ -510,11 +515,30 @@ func (c *Conn) Write(ctx context.Context, reqs []driver.WriteRequest) ([]driver.
 
 	results := make([]driver.WriteResult, 0, len(reqs))
 	var firstErr error
-	for _, req := range reqs {
+	for i, req := range reqs {
+		if err := ctx.Err(); err != nil {
+			e := driver.E(driver.ErrTimeout, "write", c.devID, "context done", true, err)
+			// 剩余条目必须显式标坏，不能让它们从结果里消失。
+			for _, rest := range reqs[i:] {
+				results = append(results, c.writeFail(rest, e))
+			}
+			return results, e
+		}
 		res, err := c.writeOne(ctx, req)
 		results = append(results, res)
-		if err != nil && firstErr == nil {
-			firstErr = err
+		if err != nil {
+			// 链路级失败：后续每条都只会等满一次超时，必须短路并把剩余条目
+			// 显式标坏（对比 ENIP/其它驱动「标失败并 break」）。地址/权限/不支持
+			// 是点级问题，继续写下一条。
+			if driver.IsLinkFailure(err) {
+				for _, rest := range reqs[i+1:] {
+					results = append(results, c.writeFail(rest, err))
+				}
+				return results, err
+			}
+			if firstErr == nil {
+				firstErr = err
+			}
 		}
 	}
 	return results, firstErr
@@ -580,10 +604,25 @@ func (c *Conn) writeWords(ctx context.Context, req driver.WriteRequest, area fin
 	if req.DataType == model.TypeString || req.DataType == model.TypeBytes {
 		// 字符串/字节：按地址宽度补零或截断。FINS 每个字存两个字符，字内是
 		// 大端（"AB" → 0x4142），不需要额外交换。
+		//
+		// 超长**拒绝**而不是静默截断：copy 会在超出 words*2 时悄悄丢字符，
+		// 调用方以为整个值都写下去了（§3.4 规则 3「写入失败不得静默」）。与
+		// 下面数值分支的越界检查一致。
+		if len(req.Value.Text) > words*2 {
+			err := driver.E(driver.ErrAddress, "write", c.devID,
+				fmt.Sprintf("point %q: value is %d bytes but address.length is %d words (%d bytes)",
+					req.PointID, len(req.Value.Text), words, words*2), false, nil)
+			return c.writeFail(req, err), err
+		}
 		raw := make([]byte, words*2)
 		copy(raw, []byte(req.Value.Text))
 		payload = raw
 	} else {
+		if err := checkRange(req.DataType, req.Value.Num); err != nil {
+			err = driver.E(driver.ErrAddress, "write", c.devID,
+				fmt.Sprintf("point %q: %v", req.PointID, err), false, err)
+			return c.writeFail(req, err), err
+		}
 		raw, err := value.Encode(req.Value, req.DataType, OrderFor(words*2, req.ByteOrder))
 		if err != nil {
 			err = driver.E(driver.ErrProtocol, "write", c.devID, err.Error(), false, err)
@@ -645,6 +684,56 @@ func reqWords(req driver.WriteRequest) int {
 	return 1
 }
 
+// checkRange 拒绝越界与带小数的整数写入，以及 float32 溢出成 ±Inf / 下溢成 0。
+//
+// codec/value 的 Encode 用强制转换落地：70000 写进 INT16 会静默变成 4464，
+// 1e300 写进 REAL 会静默变成 +Inf，1e-50 会静默变成 0。写入「成功」了，但
+// 设备上的值已经不是调用方给的值。这与 ADS/DNP3/ENIP 的既有处理一致，必须在
+// 发报文之前拦下（§3.4 规则 3「写入失败不得静默」）。
+func checkRange(dt model.DataType, v float64) error {
+	switch dt {
+	case model.TypeInt16:
+		if v != math.Trunc(v) || v < math.MinInt16 || v > math.MaxInt16 {
+			return fmt.Errorf("%v 超出 int16 范围或不是整数", v)
+		}
+	case model.TypeUint16:
+		if v != math.Trunc(v) || v < 0 || v > math.MaxUint16 {
+			return fmt.Errorf("%v 超出 uint16 范围或不是整数", v)
+		}
+	case model.TypeInt32:
+		if v != math.Trunc(v) || v < math.MinInt32 || v > math.MaxInt32 {
+			return fmt.Errorf("%v 超出 int32 范围或不是整数", v)
+		}
+	case model.TypeUint32:
+		if v != math.Trunc(v) || v < 0 || v > math.MaxUint32 {
+			return fmt.Errorf("%v 超出 uint32 范围或不是整数", v)
+		}
+	case model.TypeInt64:
+		if v != math.Trunc(v) || v < math.MinInt64 || v >= 9223372036854775808.0 {
+			return fmt.Errorf("%v 超出 int64 范围或不是整数", v)
+		}
+	case model.TypeUint64:
+		if v != math.Trunc(v) || v < 0 || v >= 18446744073709551616.0 {
+			return fmt.Errorf("%v 超出 uint64 范围或不是整数", v)
+		}
+	case model.TypeFloat32:
+		if math.IsNaN(v) || math.IsInf(v, 0) {
+			return fmt.Errorf("%v 不是合法的 float32 值", v)
+		}
+		if v != 0 {
+			f := float32(v)
+			if math.IsInf(float64(f), 0) || f == 0 {
+				return fmt.Errorf("%v 超出 float32 可表示范围", v)
+			}
+		}
+	case model.TypeFloat64:
+		if math.IsNaN(v) || math.IsInf(v, 0) {
+			return fmt.Errorf("%v 不是合法的 float64 值", v)
+		}
+	}
+	return nil
+}
+
 // ---------------------------------------------------------------------------
 // 错误与工具
 // ---------------------------------------------------------------------------
@@ -686,6 +775,33 @@ func (c *Conn) failed(span driver.ReadSpan, err error) []driver.RawSample {
 	q := QualityOf(err)
 	out := make([]driver.RawSample, 0, len(span.Points))
 	for _, p := range span.Points {
+		out = append(out, driver.RawSample{PointID: p.ID, Quality: q, Err: err})
+	}
+	return out
+}
+
+// withPendingFailed 把「还没拿到值」的点位按 err 标坏，已解出的好样本原样保留。
+//
+// readSpan 是逐块读、逐点解的：前面的块已经解出好值，后面的块失败时返回
+// (部分结果, err)。这里只补坏那些 Err 仍为空的槽位——把成功点也回填成错误
+// 会让调用方把一条已读到的点当成失败去重试，且违反 §3.3.1「有成功点不代表
+// 整批失败」的语义。
+func (c *Conn) withPendingFailed(span driver.ReadSpan, samples []driver.RawSample, err error) []driver.RawSample {
+	q := QualityOf(err)
+	if len(samples) == 0 {
+		return c.failed(span, err)
+	}
+	out := make([]driver.RawSample, 0, len(span.Points))
+	for i, p := range span.Points {
+		if i < len(samples) && samples[i].Err != nil {
+			// 已经逐点标坏（解码期错误），保留它自己的错误，诊断更准。
+			out = append(out, samples[i])
+			continue
+		}
+		if i < len(samples) && samples[i].Quality == model.QualityGood {
+			out = append(out, samples[i])
+			continue
+		}
 		out = append(out, driver.RawSample{PointID: p.ID, Quality: q, Err: err})
 	}
 	return out
