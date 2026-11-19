@@ -236,6 +236,11 @@ internal static class ConfigStoreTests
                 n["northbound"]!["opcUa"]!["enabled"] = true;
                 n["northbound"]!["opcUa"]!["securityPolicy"] = "Basic256Sha256";
             }, "northbound.opcUa.securityPolicy"),
+            ("opc ua anonymous read disabled", n =>
+            {
+                n["northbound"]!["opcUa"]!["enabled"] = true;
+                n["northbound"]!["opcUa"]!["allowAnonymousRead"] = false;
+            }, "northbound.opcUa.allowAnonymousRead"),
             ("negative memory watermark", n => n["storage"]!["maxMemoryBytes"] = -1,
                 "storage.maxMemoryBytes"),
 

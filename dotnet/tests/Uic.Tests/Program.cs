@@ -56,6 +56,7 @@ SecretTests.Register(tests);
 TlsTests.Register(tests);
 ContractTests.Register(tests);
 OpcUaClientTests.Register(tests);
+OpcUaServerOptionsTests.Register(tests);
 OpcUaClientLoopbackTests.Register(tests);
 OpcUaTests.Register(tests);
 

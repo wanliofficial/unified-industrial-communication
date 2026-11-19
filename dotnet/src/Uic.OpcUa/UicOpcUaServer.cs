@@ -130,7 +130,14 @@ public sealed class UicOpcUaServer : IAsyncDisposable
     /// <summary>热更新地址空间。失败不会停止服务，只是新配置的点位不可见，调用方已记录日志。</summary>
     public void UpdateConfig(ConfigDocument config) => _server.NodeManager?.UpdateConfig(config);
 
-    private static ApplicationConfiguration BuildApplicationConfiguration(OpcUaServerOptions options)
+    /// <summary>
+    /// 从选项构造协议栈的 ApplicationConfiguration。
+    ///
+    /// internal 是为了让安全姿态（只声明 SecurityPolicy.None + 匿名令牌）能被用例钉住：
+    /// 端到端用例用匿名会话连上就通过，往端点集合里再塞一个 Basic256Sha256 它照样绿，
+    /// 于是「只支持 None」这件事会悄悄破。不绑端口也能断言这条，所以放这里。
+    /// </summary>
+    internal static ApplicationConfiguration BuildApplicationConfiguration(OpcUaServerOptions options)
     {
         var pki = options.PkiDir;
         Directory.CreateDirectory(pki);

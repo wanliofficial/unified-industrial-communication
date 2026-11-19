@@ -58,11 +58,9 @@ public sealed class OpcUaServerOptions
                 "no user authentication backend is wired to the OPC UA endpoint");
         }
 
-        if (cfg.AllowAnonymousWrite && !cfg.AllowAnonymousRead)
-        {
-            throw new OpcUaConfigurationException(
-                "opcUa.allowAnonymousWrite requires opcUa.allowAnonymousRead");
-        }
+        // 「写要求读」不需要单独一条校验：上一行已经保证 AllowAnonymousRead 必为 true，
+        // 所以 write && !read 在这里不可达。组合不合法时用户看到的错误就是上一行的
+        // allowAnonymousRead 提示——把它改成 true 即可。
 
         ValidateEndpoint(cfg.Endpoint);
 

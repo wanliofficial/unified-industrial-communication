@@ -13,28 +13,33 @@ dotnet run --project tests/Uic.Tests -- --opcua             # 额外跑 OPC UA �
 dotnet run --project tests/Uic.Tests -- --stop-on-fail      # 首个失败即停
 ```
 
-正常输出：
+正常输出（最新一轮，注意 `contract/*` 在重负载下会整体变慢）：
 
 ```
-413 passed, 0 failed, 3 skipped · 1106.1s
+411 passed, 4 failed, 3 skipped · 4108.1s
 ```
-加 `--opcua` 跑全量（含 3 条需外部 OPC UA 环境的端到端），全部 416 条都会跑。
+
+加 `--opcua` 跑全量（含 3 条需外部 OPC UA 环境的端到端），全部 418 条都会跑。
 不带 `--opcua` 时那 3 条显示 `skip`（原因 `requires --opcua`），不计入通过数。
-416 条这一轮在 `load average` 5.2–7.9 时量到 **1106.1 s**，`413 passed, 0 failed, 3 skipped`。
-新增的四条都便宜：`schedule/backoff_grows_then_caps` 全量 0 ms（纯函数，176 ms 时是冷启动）、
-`engine/devices_collect_in_parallel` 全量 57 ms（1.4 s 时是冷启动）、
-`engine/failure_threshold_trips_the_breaker` 1063 ms、`fault/stall_threshold_follows_the_slowest_point` 15 ms。
-`config/rejects_twenty_invalid_shapes` 因并入三类重复 id 断言，全量 114 ms。
-`contract/diagnostics_bundle_carries_the_four_parts` 全量 40.2 s（要在进程内起真实 Kestrel
-并等设备进 collecting，与其它 `contract/*` 同量级）。
-`load average` 5 左右那次实测 `401 passed, 2 failed`：两条失败都是 `contract/*`
+418 条这一轮在 `load average` 4.5–6.6 时量到 **4108.1 s**，`411 passed, 4 failed, 3 skipped`：
+4 条失败**全是 `contract/*` 触到 180 s 硬超时**（`devices_and_points_are_listed`、
+`disabled_device_shows_both_states`、`drivers_expose_capability_states`、
+`write_returns_per_point_results`），单独复跑分别 23.1 s / 7.1 s / 13.2 s / 6.4 s 全过。
+原因不在代码：这一轮仓库所在的 NTFS 挂载有常驻服务占着（`mount.ntfs` 约 73% CPU），
+整组 `contract/*` 从平时的 2–45 s 涨到 13–176 s（42 条有计时，中位数 82 s；另有 4 条超时未计时），
+最慢 `contract/api_requires_bearer_token` 175.6 s，
+离 180 s 只差 4 s——4 条正好落在闸门之外。**判红口径照旧：先把机器腾空再复跑，
+只有复跑复现的失败才算真失败。**
+新增的两条服务端安全姿态用例都很便宜：`opcua/server_options_are_anonymous_and_none_only` 14 ms
+（全量 6 ms）、`opcua/server_endpoint_advertises_only_none_and_anonymous` 218 ms（全量 185 ms）。
+`--opcua --filter opcua/` 单独跑 `opcua/*` 17 条全绿 · **18.6 s**（3 条端到端占 7.7 / 2.2 / 8.2 s，其余是纯函数）。
+`load average` 5 左右还量过一次 `401 passed, 2 failed`：同样是两条 `contract/*`
 触到 180 s 硬超时，单独复跑分别 119.0 s / 109.6 s 全过——先腾空再判红，
 见下面的耗时记录。
 
 （这 3 条不联网、只用进程内自签证书，但要绑端口并做真实握手。`--opcua --filter opcua`
-单独跑时 `opcua/*` 那组全绿、23.7 s——那是 14 条时的数；后来补的
-`opcua/batch_size_never_zero_and_follows_operation_limit` 是纯函数（全量里 1 ms），
-没有为它单独重跑 `--opcua`，所以这里的「全绿」不含它。）
+单独跑时 `opcua/*` 17 条全绿、18.6 s——3 条端到端占 7.7 / 2.2 / 8.2 s，其余 14 条
+纯函数都 ≤ 278 ms。这 17 条里含 2 条服务端能力边界用例，见 `opcua/*` 分组表。）
 
 耗时随机器负载波动较大：219 条时在同一台机器上空载量到 65.5 s，233 条在同时跑着
 发布/容器时量到 114.2 s；239 条时空载量到 112.7 s，而机器有 20+ 后台负载时量到 1471 s；
@@ -76,6 +81,12 @@ dotnet run --project tests/Uic.Tests -- --stop-on-fail      # 首个失败即停
 单条最慢 `contract/tls_rest_serves_https` 45.9 s，全部离 180 s 硬超时很远。`StartAndSettleAsync` 改成轮询判据后，
 `engine/transient_failure_is_retried` 从 481 ms 降到 23 ms、`engine/bad_quality_batch_is_retried`
 从 481 ms 降到 14 ms——不再为「等一轮采集走完」而付死等的时间。新增的四条都便宜（见上）。
+418 条（补了 OPC UA 服务端能力边界两条：`opcua/server_options_are_anonymous_and_none_only`、
+`opcua/server_endpoint_advertises_only_none_and_anonymous`；配置校验矩阵补 `allowAnonymousRead=false`
+一类）在 `load average` 4.5–6.6、仓库所在 NTFS 挂载被常驻服务拖慢时量到 **4108.1 s**，
+`411 passed, 4 failed, 3 skipped`：4 条失败全是 `contract/*` 触到 180 s 硬超时（最慢的同组
+`contract/api_requires_bearer_token` 175.6 s），单独复跑 23.1 / 7.1 / 13.2 / 6.4 s 全过。
+`--opcua --filter opcua/` 单独跑 17 条全绿 · 18.6 s。这一轮再次印证「别拿单次绝对秒数当基线」。
 406 条（补了 `engine/channel_gate_lets_queued_writes_go_first`）在 `load average` 10–14
 时量到 1280.4 s，`403 passed, 0 failed, 3 skipped`：同一份 `contract/*` 这一轮单条
 3–39 s（最慢 `contract/idempotency_key_rejects_a_different_body` 39.1 s），又回到「有别的
@@ -145,7 +156,7 @@ NFR 的门槛是 120 s，压测用例、PBKDF2 派生与 TLS 握手是主要开�
 | `fault/*` | 5 | 环境级故障注入：**进程假死**（驱动卡在不可取消的 Task 上，看门狗报停滞并做 5 分钟去重）、**时钟跳变**不误判停滞、**停滞阈值跟着最慢点位周期放宽**（10 s 点位 ⇒ 阈值 100 s，60 s 不报、110 s 报——另外两条把 `MinimumStaleAge` 设成 1 s 跑得快，恰好绕开了「10 × 周期」那支）、**时钟跳变**不清空 Outbox 积压（TTL 按单调时长）、数据目录不可写时样本被计数丢弃而不是静默消失 |
 | `lifecycle/*` | 7 | 设备下线后的状态清理：**被删设备的观测状态一并遗忘**（含停滞去重窗口，删了又加回来能重新报警）、重新加回时重推 `$state`、**读挂死时下线不被阻塞**（`StopAsync` 有等待上限，否则配置应用与关机一起挂住）、**引用未注册驱动的配置整份被拒**（先预检再卸 actor，不留「旧设备已拆、新的建不出」的半应用状态）、**版本写不下盘时把设备退回旧配置**（`config/versions` 只读时 apply 失败必须等于什么都没变）、**MQTT 的 CA 读不出来时在副作用之前失败**（不能先摘掉旧连接、提交版本，再报 422）、**通道并发上限随热更新生效**（`GetOrAdd` 会把旧闸门原样留下，配置写着 1、实际仍按 4 路并发打同一条链路） |
 | `shutdown/*` | 2 | 优雅退出的顺序与副作用（真实进程内 runtime + 可脚本化 sink）：**停机时队列里的待投记录被 flush 干净**（flush 在 `$death` 之前，否则订阅者会以为数据到此为止）、**flush 有 3 秒上限**（sink 一直失败时停机仍有界返回，未投完的记录留在盘上重放） |
-| `config/*` | 20 | 内容寻址、回滚、启动优先级、非法文档、diff、旧配置迁移、复合时长、死区/量程规则、数组维度规则（类型/125 寄存器上限）、仓库示例可校验、**27 类非法配置逐条定位（含通道/设备/点位三类重复 id）**、脱敏占位符还原、控制台草稿拼装出的配置能被真的解析器接受、四类寻址各自必填/禁止字段与混填拒绝、**原子写机制本身（连写 20 份后目录里不残留 `.tmp`、指针切过去的版本文件是完整可解析 JSON、`current` 指向最新提交）** |
+| `config/*` | 20 | 内容寻址、回滚、启动优先级、非法文档、diff、旧配置迁移、复合时长、死区/量程规则、数组维度规则（类型/125 寄存器上限）、仓库示例可校验、**29 类非法配置逐条定位（含通道/设备/点位三类重复 id、非 None 的 OPC UA 策略、`allowAnonymousRead=false`）**、脱敏占位符还原、控制台草稿拼装出的配置能被真的解析器接受、四类寻址各自必填/禁止字段与混填拒绝、**原子写机制本身（连写 20 份后目录里不残留 `.tmp`、指针切过去的版本文件是完整可解析 JSON、`current` 指向最新提交）** |
 | `json/*` | 11 | 时长、枚举、值形状、数组值形状、`count` 往返、UTC、往返稳定、前向兼容 |
 | `logs/*` | 7 | JSON 行字段、轮转不丢行、归档裁剪、默认关闭、热更新开关、非法配置拒绝、环形缓冲顺序与过滤 |
 | `resources/*` | 5 | 磁盘/内存进入与恢复回差、探针不可读不误报、降级时文件日志暂停、非法水位配置拒绝 |
@@ -166,7 +177,7 @@ NFR 的门槛是 120 s，压测用例、PBKDF2 派生与 TLS 握手是主要开�
 | `audit/*` | 9 | 审计落盘：按动作/结果/身份查询、重启后序号单调且旧记录可查、按大小轮转与保留只删旧文件、**跨 UTC 日界换新文件**（注入可拨时钟）、**写不进去只降级不抛异常**（目录指向普通文件）、禁用时不写盘、断电半行跳过、按文件名日期跳过无关归档、分页最新在前 |
 | `auth/*` | 10 | 本地账号：PBKDF2 加盐且文件无明文、首次启动只建一次 admin、改密清除强制标记并删初始口令文件、会话 12 小时过期、5 次失败/分钟锁定与按 IP 隔离、锁定窗口不受系统校时跳变影响、角色权限矩阵、停用账号立即失效、最后一个管理员不可停用/降级、口令策略 |
 | `limits/*` | 6 | 令牌桶限流：突发上限与连续补充、**墙钟跳变不回满配额**、**空闲桶按时间清扫**（按 IP 建桶不能无上限增长）、清扫不误杀活跃桶、空闲窗口不得短于「空桶回满」（否则等于替对方刷新配额）、429 只有一个线上 code |
-| `opcua/*` | 15 | 北向服务端：标准 OPC UA 客户端浏览/读/写/订阅（`--opcua`）；南向客户端：NodeId 解析与拒绝形态、StatusCode→质量表、Variant 标量/数组/形状与范围校验、写入编码、时标、端点/策略/PKI 参数推导、端点精确匹配不降级、单次服务的节点批量（12 条纯函数），以及客户端↔内置服务端回环：批量读（坏地址单独失败）、写与回读、越界拒绝、订阅推送、要求 Basic256Sha256 而服务端只有 None 时显式失败（2 条 `--opcua`）；北向服务端本身由 `opcua/anonymous_session_read_write_subscribe` 端到端覆盖（1 条 `--opcua`，见 `FR-NOR-05`） |
+| `opcua/*` | 17 | 北向服务端：标准 OPC UA 客户端浏览/读/写/订阅（`--opcua`）；服务端能力边界：`FromConfig` 只接受匿名读 + None、拒绝非 None 策略/禁匿名读/坏端点，且协议栈配置只声明一条 None 与一个匿名令牌（2 条纯函数，`OpcUaServerOptionsTests`）；南向客户端：NodeId 解析与拒绝形态、StatusCode→质量表、Variant 标量/数组/形状与范围校验、写入编码、时标、端点/策略/PKI 参数推导、端点精确匹配不降级、单次服务的节点批量（12 条纯函数），以及客户端↔内置服务端回环：批量读（坏地址单独失败）、写与回读、越界拒绝、订阅推送、要求 Basic256Sha256 而服务端只有 None 时显式失败（2 条 `--opcua`）；北向服务端本身由 `opcua/anonymous_session_read_write_subscribe` 端到端覆盖（1 条 `--opcua`，见 `FR-NOR-05`） |
 
 ## 故障注入矩阵 12 类
 

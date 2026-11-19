@@ -763,6 +763,8 @@ Broker 侧已经做了网络隔离或 ACL。即便打开，`config.rollback` 与
 
 > 这两条不是「暂时没做」，而是**显式的能力边界**：配成签名/加密或关闭匿名读会在校验阶段被拒绝，
 > 而不是等到客户端握手失败。证书生命周期是独立的运维负担，不该被悄悄降级成明文。
+> 证据：`config/rejects_twenty_invalid_shapes`（非 None 策略、`allowAnonymousRead=false` 各一条）、
+> `opcua/server_options_are_anonymous_and_none_only`、`opcua/server_endpoint_advertises_only_none_and_anonymous`。
 
 ## `storage`
 

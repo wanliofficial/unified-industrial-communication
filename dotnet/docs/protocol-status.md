@@ -24,7 +24,7 @@
 | Modbus TCP | 从站 | 已实现（仅仿真） | `Uic.Sim.Modbus` | FR-COL-03 |
 | Modbus RTU/ASCII | 从站 | 未实现 | — | FR-COL-03 的延伸 |
 | 虚拟设备 | 主站侧 | 已实现 | `Uic.Driver.Virtual` | FR-COL-07 |
-| OPC UA | 服务端 | 已实现（匿名 + None） | `Uic.OpcUa` | 北向 FR-NOR |
+| OPC UA | 服务端 | 已实现（匿名 + None） | `Uic.OpcUa` | 北向 FR-NOR（姿态由 `opcua/server_options_are_anonymous_and_none_only`、`opcua/server_endpoint_advertises_only_none_and_anonymous` 钉住） |
 | OPC UA | 客户端 | 已实现（None / Basic256Sha256） | `Uic.Driver.OpcUa` | FR-COL-05 |
 | MQTT | 北向发布 | 已实现（3.1.1） | `Uic.Northbound` | FR-NOR-04 |
 | MQTT | 北向下行命令 | 已实现（白名单） | `Uic.Northbound/MqttCommandSink.cs` | FR-OPS 远程命令 |
@@ -228,7 +228,7 @@ MQTT 3.1.1 的报文实现放在协议层 `Uic.Codec.Mqtt`：北向发布与南�
 |---|---|
 | 角色 | 服务端（地址空间提供者） |
 | 传输 | `opc.tcp://`，UA TCP |
-| 安全 | 仅匿名 + `SecurityPolicy.None`；配置成其它策略直接拒绝启动 |
+| 安全 | 仅匿名 + `SecurityPolicy.None`；配置成其它策略、关闭匿名读、或端点不是 `opc.tcp://host:port` 都直接拒绝启动（`OpcUaServerOptions.FromConfig`）。端点集合也只声明一条 None + 一个匿名令牌——由 `opcua/server_options_are_anonymous_and_none_only` 与 `opcua/server_endpoint_advertises_only_none_and_anonymous` 断言，而不是靠「匿名客户端连得上」间接推断 |
 | 地址空间 | `UIC/<site>/<device>/<point>`，设备节点带类型定义，点位是 `BaseDataVariableState` |
 | 读 | 标准浏览 + 读；值来自 `PointCache` |
 | 写 | 点位可写时开放 `CurrentWrite`；写入走 `Scheduler.WriteAsync`，与 REST 写入同一条路径 |
