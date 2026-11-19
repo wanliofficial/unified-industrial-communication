@@ -522,6 +522,11 @@ func payloadBytes(ts byte, length int) int {
 }
 
 // ParseWriteAck 解析写响应，返回每项的错误（nil 表示成功）。
+//
+// 数据区必须为**每一项**都给出一个返回码。少于项数的响应不能被当成
+// 「剩下的都成功」：一个被截断的响应（链路抖动、对端实现不全）会让
+// 一半写请求显示成功，而 PLC 其实根本没收到——计数/累计类点位就是
+// 重复累加，脉冲类点位就是少动一次。宁可整块判坏，也不猜。
 func ParseWriteAck(pdu PDU, count int) ([]error, error) {
 	if pdu.ROSCTR != ROSCTRAckData && pdu.ROSCTR != ROSCTRJobAck {
 		return nil, fmt.Errorf("s7: write ack rosctr %#02x", pdu.ROSCTR)
@@ -532,8 +537,12 @@ func ParseWriteAck(pdu PDU, count int) ([]error, error) {
 	if int(pdu.Param[1]) != count {
 		return nil, fmt.Errorf("s7: write ack count %d, requested %d", pdu.Param[1], count)
 	}
+	if len(pdu.Data) < count {
+		return nil, fmt.Errorf("s7: write ack data truncated: %d return codes for %d items",
+			len(pdu.Data), count)
+	}
 	errs := make([]error, count)
-	for i := 0; i < count && i < len(pdu.Data); i++ {
+	for i := 0; i < count; i++ {
 		if pdu.Data[i] != CodeOK {
 			errs[i] = ItemError{Code: pdu.Data[i]}
 		}

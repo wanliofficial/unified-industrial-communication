@@ -180,9 +180,6 @@ func (s *Session) UploadBlock(ctx context.Context, blockType byte, num int) (dat
 	if err != nil {
 		return nil, s.protocol("upload", err)
 	}
-	if start.Length > maxUploadBytes {
-		return nil, s.protocol("upload", fmt.Errorf("block length %d exceeds limit %d", start.Length, maxUploadBytes))
-	}
 
 	defer func() {
 		// 用独立的短超时收尾：调用方的 ctx 可能已经超时/取消，但 PLC 侧的
@@ -200,6 +197,13 @@ func (s *Session) UploadBlock(ctx context.Context, blockType byte, num int) (dat
 			err = s.protocol("end-upload", e)
 		}
 	}()
+	// 长度上限的检查必须在 defer 之后：Start 已经成功，PLC 侧的上传会话
+	// 已经建立。此处直接 return 会跳过上面的 defer，把会话一直留在 PLC 上
+	// （反复重试若干次就耗尽上传会话），而注释里说的正是「即使中途失败也
+	// 尽力补一条 End」。
+	if start.Length > maxUploadBytes {
+		return nil, s.protocol("upload", fmt.Errorf("block length %d exceeds limit %d", start.Length, maxUploadBytes))
+	}
 
 	buf := make([]byte, 0, start.Length)
 	for i := 0; i < maxUploadChunks; i++ {

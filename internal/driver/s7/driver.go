@@ -10,6 +10,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -294,6 +295,14 @@ func (c *conn) Read(ctx context.Context, spans []driver.ReadSpan) ([]driver.RawS
 				badPre = append(badPre, errSample(p.ID, err))
 				continue
 			}
+			// 单项都装不进协商 PDU 的，切块再怎么切也装不下：对端要么直接
+			// 不回（表现为超时），要么把响应截断。这是**地址配置错**
+			// （address.length 大于 PDU 能承载的上限），发出去只会把问题
+			// 伪装成链路故障，必须在本地判坏。
+			if ok, need := fitsPDU(it, c.pduLen, false); !ok {
+				badPre = append(badPre, errSample(p.ID, pduBudgetErr("read", c.deviceID, need, c.pduLen)))
+				continue
+			}
 			refs = append(refs, readRef{point: p, item: it})
 		}
 	}
@@ -338,15 +347,17 @@ func (c *conn) Read(ctx context.Context, spans []driver.ReadSpan) ([]driver.RawS
 			// 链路级错误：本块与后续所有块都不必再试。把剩余点位显式标坏，
 			// 而不是让它们「消失」——上层看到缺失点会二次判坏，但错误文案
 			// 会变成「point missing」，掩盖真正的断链原因。
-			if firstErr == nil {
-				firstErr = err
-			}
+			//
+			// 上抛的必须是**链路错误本身**：不能被本块之前某个点级错误
+			// （如「对象不存在」→ address）顶掉。collector 按 kind 决定是否
+			// 重连，拿到 address 就不会重连，设备会一直卡在「点配错」的假象
+			// 里而真正断掉的链路永不重建（§3.3.1：链路级失败立即返回该错误）。
 			for _, rest := range chunks[ci:] {
 				for _, k := range rest {
 					out = append(out, errSample(refs[k].point.ID, err))
 				}
 			}
-			return out, firstErr
+			return out, err
 		}
 		values, errs, perr := s7.ParseReadAck(resp, itemsOf(refs, chunk))
 		if perr != nil {
@@ -368,7 +379,7 @@ func (c *conn) Read(ctx context.Context, spans []driver.ReadSpan) ([]driver.RawS
 				}
 				continue
 			}
-			sample := decodeSample(p, refs[k].item, values[j])
+			sample := decodeSample(c.deviceID, p, refs[k].item, values[j])
 			if sample.Quality == model.QualityGood {
 				okSamples++
 			}
@@ -384,29 +395,75 @@ func (c *conn) Read(ctx context.Context, spans []driver.ReadSpan) ([]driver.RawS
 }
 
 // Write 逐项编码、按 PDU 预算成组发送。
+//
+// 逐项返回是硬契约（§3.4 规则 1）：**每个请求恰好一个结果**，不重复、不消失。
+// 因此这里按请求下标预分配槽位，每个失败分支只填「还没报告过」的槽位，
+// 最后按请求顺序收拢——链路在第 N 块断掉时，后续条目的结果仍然是显式的
+// 失败项，而不是从切片里凭空少掉（上层会把缺失项兜底成「driver returned
+// no result」，真正的原因就此丢失）。
 func (c *conn) Write(ctx context.Context, reqs []driver.WriteRequest) ([]driver.WriteResult, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	results := make([]driver.WriteResult, 0, len(reqs))
 	type pending struct {
 		req   driver.WriteRequest
 		item  s7.Item
 		value []byte
+		idx   int // 在 reqs 中的下标
 	}
+	slots := make([]driver.WriteResult, len(reqs))
+	reported := make([]bool, len(reqs))
 	var valid []pending
-	for _, req := range reqs {
+	report := func(idx int, r driver.WriteResult) {
+		if reported[idx] {
+			return
+		}
+		r.PointID = reqs[idx].PointID
+		slots[idx] = r
+		reported[idx] = true
+	}
+	fail := func(idx int, quality model.Quality, err error) {
+		report(idx, driver.WriteResult{OK: false, Quality: quality, Err: err})
+	}
+	failSpan := func(from int, quality model.Quality, err error) {
+		for i := from; i < len(valid); i++ {
+			fail(valid[i].idx, quality, err)
+		}
+	}
+	collect := func() []driver.WriteResult {
+		out := make([]driver.WriteResult, 0, len(reqs))
+		for i := range reqs {
+			if !reported[i] {
+				// 理论上不可达（每个分支都填了槽位）。留一个显式诊断而不是
+				// 零值 WriteResult，避免「静默成功」这种最坏的兜底。
+				out = append(out, driver.WriteResult{
+					PointID: reqs[i].PointID, Quality: model.QualityBad,
+					Err: driver.E(driver.ErrInternal, "write", c.deviceID,
+						"internal: no result recorded for this request", false, nil),
+				})
+				continue
+			}
+			out = append(out, slots[i])
+		}
+		return out
+	}
+
+	for i, req := range reqs {
 		it, v, err := encodeWrite(req)
 		if err != nil {
-			results = append(results, driver.WriteResult{
-				PointID: req.PointID, Quality: model.QualityBad, Err: err,
-			})
+			fail(i, qualityOf(err), err)
 			continue
 		}
-		valid = append(valid, pending{req: req, item: it, value: v})
+		// 单项写请求本身超过协商 PDU：切块装不下，对端只会断连或超时。
+		// 地址配置错（address.length 太大），本地判坏。
+		if ok, need := fitsPDU(it, c.pduLen, true); !ok {
+			fail(i, model.QualityAddressError, pduBudgetErr("write", c.deviceID, need, c.pduLen))
+			continue
+		}
+		valid = append(valid, pending{req: req, item: it, value: v, idx: i})
 	}
 	if len(valid) == 0 {
-		return results, nil
+		return collect(), nil
 	}
 
 	all := make([]s7.Item, len(valid))
@@ -417,6 +474,18 @@ func (c *conn) Write(ctx context.Context, reqs []driver.WriteRequest) ([]driver.
 
 	var firstErr error
 	for _, chunk := range chunks {
+		if err := ctx.Err(); err != nil {
+			e := driver.E(driver.ErrTimeout, "write", c.deviceID, "context done", true, err)
+			for _, k := range chunk {
+				fail(valid[k].idx, model.QualityTimeout, e)
+			}
+			// 链路/上下文已失效：剩下的块不必再逐个等超时。
+			failSpan(chunk[len(chunk)-1]+1, model.QualityTimeout, e)
+			if firstErr == nil {
+				firstErr = e
+			}
+			return collect(), firstErr
+		}
 		witems := make([]s7.Item, 0, len(chunk))
 		wvals := make([][]byte, 0, len(chunk))
 		for _, k := range chunk {
@@ -430,23 +499,16 @@ func (c *conn) Write(ctx context.Context, reqs []driver.WriteRequest) ([]driver.
 				firstErr = e
 			}
 			for _, k := range chunk {
-				results = append(results, driver.WriteResult{
-					PointID: valid[k].req.PointID, Quality: model.QualityBad, Err: e,
-				})
+				fail(valid[k].idx, model.QualityBad, e)
 			}
 			continue
 		}
 		resp, err := c.roundTrip(ctx, pdu)
 		if err != nil {
-			if firstErr == nil {
-				firstErr = err
-			}
-			for _, k := range chunk {
-				results = append(results, driver.WriteResult{
-					PointID: valid[k].req.PointID, Quality: model.QualityCommError, Err: err,
-				})
-			}
-			return results, firstErr
+			// 链路级失败：本块与后续块无法再试。已成功的块保持成功
+			// （§3.4 规则 4），剩余条目显式标坏并从结果里返回。
+			failSpan(chunk[0], model.QualityCommError, err)
+			return collect(), err
 		}
 		errs, perr := s7.ParseWriteAck(resp, len(chunk))
 		if perr != nil {
@@ -455,26 +517,22 @@ func (c *conn) Write(ctx context.Context, reqs []driver.WriteRequest) ([]driver.
 				firstErr = e
 			}
 			for _, k := range chunk {
-				results = append(results, driver.WriteResult{
-					PointID: valid[k].req.PointID, Quality: model.QualityBad, Err: e,
-				})
+				fail(valid[k].idx, model.QualityBad, e)
 			}
 			continue
 		}
 		for j, k := range chunk {
-			r := driver.WriteResult{PointID: valid[k].req.PointID, OK: true, Quality: model.QualityGood}
 			if errs[j] != nil {
-				r.OK = false
-				r.Quality = qualityOf(errs[j])
-				r.Err = errs[j]
+				fail(valid[k].idx, qualityOf(errs[j]), errs[j])
 				if firstErr == nil {
 					firstErr = errs[j]
 				}
+				continue
 			}
-			results = append(results, r)
+			report(valid[k].idx, driver.WriteResult{OK: true, Quality: model.QualityGood})
 		}
 	}
-	return results, firstErr
+	return collect(), firstErr
 }
 
 func (c *conn) Close() error {
@@ -501,52 +559,93 @@ func itemsOf(refs []readRef, idx []int) []s7.Item {
 	return out
 }
 
+// PDU 预算里各部分的固定开销。请求侧：S7 头 10 + 参数头 2；每一项还要
+// 12 字节的变量说明（参数区）；写请求的数据区每项多一个 4 字节数据头。
+// 响应侧：读响应每项是 4 字节的返回码+传输尺寸+长度，再加数据本身（按偶数
+// 对齐）；写响应每项只有 1 字节返回码。
+const (
+	pduHeader    = 10
+	pduParamHead = 2
+	pduItemSpec  = 12
+	pduItemHdr   = 4
+	pduMaxItems  = 20
+)
+
+// itemBudget 返回单项在请求区与响应区各占用多少字节。
+func itemBudget(it s7.Item, write bool) (req, resp int) {
+	width := it.Bytes
+	if it.BitAccess {
+		width = 1
+	}
+	if width < 0 {
+		width = 0
+	}
+	// 数据区按偶数字节对齐。
+	dataWidth := width + (width % 2)
+	req = pduItemSpec
+	resp = pduItemHdr + dataWidth
+	if write {
+		req += pduItemHdr + dataWidth
+		resp += 1
+	}
+	return req, resp
+}
+
+// fitsPDU 判断单项（单独成块、独占一帧时）能否装进协商的 PDU。
+// need 是该项所需的最大字节数，用于诊断文案。
+func fitsPDU(it s7.Item, pduLen int, write bool) (ok bool, need int) {
+	if pduLen <= 0 {
+		pduLen = 480
+	}
+	req, resp := itemBudget(it, write)
+	need = pduHeader + pduParamHead + req
+	if r := pduHeader + pduParamHead + resp; r > need {
+		need = r
+	}
+	return need <= pduLen, need
+}
+
+// pduBudgetErr 是「单项超过协商 PDU」的诊断。
+//
+// 这是**地址配置错**而不是链路故障：`address.length` 要求的字节数超过了
+// 对端能承载的帧长。发出去的对端行为不可预期（S7 常见的表现是干脆不回，
+// 于是从超时反推原因非常困难），因此本地判坏，归 ErrAddress：不重试、
+// 不熔断整台设备。
+func pduBudgetErr(op, deviceID string, need, pduLen int) error {
+	return driver.E(driver.ErrAddress, op, deviceID,
+		fmt.Sprintf("item needs %d bytes of PDU budget, negotiated PDU is %d (address.length too large)", need, pduLen),
+		false, nil)
+}
+
 // planChunks 按「项数 ≤ 20」与「请求/响应不超过协商 PDU」两个约束切块。
 //
 // 预算按最坏情况估算而不是发送后看错误：S7 的 PDU 超限通常表现为对端
 // 直接不响应（而不是返回一个明确的「太长」错误码），从超时反推原因
 // 非常困难。宁可多发一帧，也不要赌对面会不会接受。
+//
+// 单项本身就超预算的情况由调用方先用 fitsPDU 拦下（见 Read/Write）；
+// 本函数不负责拒绝，只负责在「装得下」的项之间切分。
 func planChunks(items []s7.Item, pduLen int, write bool) [][]int {
 	if pduLen <= 0 {
 		pduLen = 480
 	}
-	const (
-		header     = 10
-		paramHead  = 2
-		itemSpec   = 12
-		maxItems   = 20
-		itemHdrRes = 4
-	)
 	var (
 		chunks [][]int
 		cur    []int
-		req    = header + paramHead
-		resp   = header + paramHead
+		req    = pduHeader + pduParamHead
+		resp   = pduHeader + pduParamHead
 	)
 	flush := func() {
 		if len(cur) > 0 {
 			chunks = append(chunks, cur)
 			cur = nil
-			req = header + paramHead
-			resp = header + paramHead
+			req = pduHeader + pduParamHead
+			resp = pduHeader + pduParamHead
 		}
 	}
 	for i, it := range items {
-		width := it.Bytes
-		if it.BitAccess {
-			width = 1
-		}
-		if width < 0 {
-			width = 0
-		}
-		// 数据区按偶数字节对齐。
-		dataWidth := width + (width % 2)
-		addReq, addResp := itemSpec, itemHdrRes+dataWidth
-		if write {
-			addReq += itemHdrRes + dataWidth
-			addResp += 1
-		}
-		if len(cur) >= maxItems || (len(cur) > 0 && (req+addReq > pduLen || resp+addResp > pduLen)) {
+		addReq, addResp := itemBudget(it, write)
+		if len(cur) >= pduMaxItems || (len(cur) > 0 && (req+addReq > pduLen || resp+addResp > pduLen)) {
 			flush()
 		}
 		cur = append(cur, i)
@@ -557,7 +656,12 @@ func planChunks(items []s7.Item, pduLen int, write bool) [][]int {
 	return chunks
 }
 
-func decodeSample(p driver.PointRef, it s7.Item, raw []byte) driver.RawSample {
+// decodeSample 把响应里的原始字节解成平台值。
+//
+// 解码失败归 ErrAddress 而不是 ErrProtocol：响应长度与点位声明的类型/
+// 宽度不符，绝大多数是**点位配置错**（类型写错、address.length 与类型
+// 不匹配），换一个点照样能读。归 ErrProtocol 会熔断整台设备。
+func decodeSample(deviceID string, p driver.PointRef, it s7.Item, raw []byte) driver.RawSample {
 	if it.BitAccess {
 		// 位访问返回 1 字节，最低位即值；有的 CPU 会把整个字节的其它位
 		// 也带上来，所以只取 bit0。
@@ -569,7 +673,7 @@ func decodeSample(p driver.PointRef, it s7.Item, raw []byte) driver.RawSample {
 	}
 	v, err := value.Decode(raw, p.DataType, p.ByteOrder)
 	if err != nil {
-		return errSample(p.ID, driver.E(driver.ErrProtocol, "decode", "", err.Error(), false, err))
+		return errSample(p.ID, driver.E(driver.ErrAddress, "decode", deviceID, err.Error(), false, err))
 	}
 	return driver.RawSample{PointID: p.ID, Value: v, Quality: model.QualityGood}
 }
@@ -641,21 +745,82 @@ func encodeWrite(req driver.WriteRequest) (s7.Item, []byte, error) {
 			return s7.Item{}, nil, driver.E(driver.ErrAddress, "encode", "",
 				fmt.Sprintf("point %q needs explicit address.length for %s", req.PointID, req.DataType), false, nil)
 		}
+		// 超长必须拒绝，不能截断：把 10 个字符写进 4 字节地址只发出 "ABCD"，
+		// 调用方却收到成功——设备上的值已经不是调用方给的值，而且现场看到
+		// 的是「写成功了、值不对」，排查成本极高（§3.4 规则 3）。
+		// 与 FINS 的 STRING/bytes 处理一致：恰好填满照常写（按宽度补零）。
 		raw := []byte(req.Value.Text)
 		if len(raw) > it.Bytes {
-			raw = raw[:it.Bytes]
+			return s7.Item{}, nil, driver.E(driver.ErrAddress, "encode", "",
+				fmt.Sprintf("point %q value is %d bytes, address.length gives only %d bytes",
+					req.PointID, len(raw), it.Bytes), false, nil)
 		}
 		out := make([]byte, it.Bytes)
 		copy(out, raw)
 		return it, out, nil
 	}
+	// 数值范围校验必须在编码之前：value.Encode 用强制转换落地，70000 写
+	// int16 会静默变成 4464，1e300 写 float32 会变成 +Inf（§3.4 规则 3）。
+	if err := checkRange(req.DataType, req.Value.Num); err != nil {
+		return s7.Item{}, nil, driver.E(driver.ErrAddress, "encode", "", err.Error(), false, err)
+	}
 	raw, err := value.Encode(req.Value, req.DataType, req.ByteOrder)
 	if err != nil {
-		return s7.Item{}, nil, driver.E(driver.ErrUnsupported, "encode", "", err.Error(), false, err)
+		// 编码失败是值/类型配置错（类型不支持、值形状不对），与越界同类：
+		// 归 ErrAddress，不熔断、不重试。
+		return s7.Item{}, nil, driver.E(driver.ErrAddress, "encode", "", err.Error(), false, err)
 	}
 	if len(raw) != it.Bytes {
 		return s7.Item{}, nil, driver.E(driver.ErrInternal, "encode", "",
 			fmt.Sprintf("encoded %d bytes for %s, address expects %d", len(raw), req.DataType, it.Bytes), false, nil)
 	}
 	return it, raw, nil
+}
+
+// checkRange 拒绝越界与带小数的整数写入，以及 float32 溢出成 ±Inf / 下溢成 0。
+//
+// 与 finscore/mc 的 checkRange 同构：codec/value.Encode 无范围校验，越界值
+// 会被强制转换悄悄改成另一个合法值（70000 → 4464），调用方却收到成功。
+func checkRange(dt model.DataType, v float64) error {
+	switch dt {
+	case model.TypeInt16:
+		if v != math.Trunc(v) || v < math.MinInt16 || v > math.MaxInt16 {
+			return fmt.Errorf("%v 超出 int16 范围或不是整数", v)
+		}
+	case model.TypeUint16:
+		if v != math.Trunc(v) || v < 0 || v > math.MaxUint16 {
+			return fmt.Errorf("%v 超出 uint16 范围或不是整数", v)
+		}
+	case model.TypeInt32:
+		if v != math.Trunc(v) || v < math.MinInt32 || v > math.MaxInt32 {
+			return fmt.Errorf("%v 超出 int32 范围或不是整数", v)
+		}
+	case model.TypeUint32:
+		if v != math.Trunc(v) || v < 0 || v > math.MaxUint32 {
+			return fmt.Errorf("%v 超出 uint32 范围或不是整数", v)
+		}
+	case model.TypeInt64:
+		if v != math.Trunc(v) || v < math.MinInt64 || v >= 9223372036854775808.0 {
+			return fmt.Errorf("%v 超出 int64 范围或不是整数", v)
+		}
+	case model.TypeUint64:
+		if v != math.Trunc(v) || v < 0 || v >= 18446744073709551616.0 {
+			return fmt.Errorf("%v 超出 uint64 范围或不是整数", v)
+		}
+	case model.TypeFloat32:
+		if math.IsNaN(v) || math.IsInf(v, 0) {
+			return fmt.Errorf("%v 不是合法的 float32 值", v)
+		}
+		if v != 0 {
+			f := float32(v)
+			if math.IsInf(float64(f), 0) || f == 0 {
+				return fmt.Errorf("%v 超出 float32 可表示范围", v)
+			}
+		}
+	case model.TypeFloat64:
+		if math.IsNaN(v) || math.IsInf(v, 0) {
+			return fmt.Errorf("%v 不是合法的 float64 值", v)
+		}
+	}
+	return nil
 }

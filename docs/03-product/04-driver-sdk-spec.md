@@ -539,6 +539,11 @@ type Kinded interface{ Kind() ErrorKind }
 未发送的点位显式标坏——让它们「消失」会诱导上层报「point missing」，把真正的
 断链原因盖掉。S7 的「链路级」判据直接用 `driver.IsLinkFailure`（超时/断连）。
 
+**链路级错误必须作为顶层错误上抛，不被前一块的点级错误顶掉**：分块读时前一块
+里某个点返回「对象不存在」（点级 `ErrAddress`）、随后一块链路断掉，顶层错误
+**必须是链路错误本身**。否则 collector 拿到 `address` 就不会重连，链路永远不
+重建（§3.3.1）。已读到的好样本原样保留。
+
 #### 3.7.5 切块策略
 
 两个约束同时生效，取更严的一个：
@@ -550,11 +555,41 @@ type Kinded interface{ Kind() ErrorKind }
 预算按最坏情况算而不是「发出去看错误」：S7 超限通常表现为对端不响应，而不是
 返回一个明确的「太长」错误码；从超时反推原因的成本远高于多发一帧。
 
+**单项自己就超过协商 PDU 时，切块救不了**：一个字符串点声明 `length=400`、而
+CPU 只协商了 240，那么无论怎么切、单项独占一帧也要 416 字节。继续发出去，对
+端要么直接不回（表现为超时）、要么把响应截断。这是**地址配置错**
+（`address.length` 太大），必须在成帧之前用 `fitsPDU` 拦下，报 `ErrAddress`
+（不重试、不熔断整台设备），并保留诊断「item needs N bytes of PDU budget,
+negotiated PDU is M」。读、写两侧共用同一套预算（`itemBudget`），避免只防一
+边。
+
 #### 3.7.6 探活
 
 `Probe` 读 `M0.0` 一个字节。**单项返回「地址不存在」也算链路可达**：探活要回答的
 是「CPU 还应答吗」，不是「探活点配得对吗」。把地址错误当断链，会让一个配错的
 探活地址把整台设备永久判死——而现场往往先怀疑网络，最后才发现是自己写错了地址。
+
+#### 3.7.6.1 写路径的部分失败与本地校验
+
+写（§3.4 规则 1「逐项返回」）同样逐项成帧。本实现按**请求下标预分配结果槽位**，
+每个失败分支只填「还没报告过」的槽位，最后按请求顺序收拢——保证每个请求恰好
+一个结果、不重复、不消失。链路在第 N 块断掉时，前块已成功的条目保持成功
+（规则 4），剩余条目显式标坏并从结果里返回，绝不出现「结果条数 < 请求条数」
+（上层会把缺失项兜底成「driver returned no result」，丢掉真正的链路原因）。
+
+发报文之前必须拦下三类「看起来写成功了、实际值变了」的请求（规则 3）：
+
+| 情况 | 判据 | 归类 |
+|---|---|---|
+| 带小数的值写整数（`1.5`→int16） | `v != math.Trunc(v)` | `ErrAddress` |
+| 整数越界（`70000`→int16 静默回绕成 `4464`） | `< Min / >= Max+1` | `ErrAddress` |
+| float32 溢出成 `+Inf` / 下溢成 `0` | 转 float32 后 `IsInf` 或变 `0` | `ErrAddress` |
+| STRING/bytes 超长（`"ABCDEFGHIJ"` 写进 4 字节地址只发 `"ABCD"`） | `len(value) > address.length` | `ErrAddress` |
+| 单项超过协商 PDU（`address.length` 太大） | `!fitsPDU(...)` | `ErrAddress` |
+
+这些一律归 `ErrAddress`：越界/带小数/超长/超限都是**配置错**，换一个值或改一行
+配置就好，不该重试、不该熔断整台设备。`checkRange` 与 MC / FINS / ADS 的同名
+函数同构。字符串/bytes **恰好填满**宽度仍照常写入（按宽度补零语义不变）。
 
 #### 3.7.7 块服务（目录 / 属性 / 上传）
 
@@ -579,9 +614,18 @@ type Kinded interface{ Kind() ErrorKind }
 
 上传是**有状态的三段式**：Start 之后 PLC 保留一个上传会话，必须用 End 释放。
 因此 `UploadBlock` 即使在分片阶段失败，也会用独立的短超时补一条 End；不清理
-会让反复重试逐渐耗尽 PLC 的上传会话，而错误信息只会显示「start failed」。
+会让反复重试逐渐耗尽 PLC 的上传会话，而错误信息只会显示「start failed」。长度
+上限的**早退检查必须排在注册 End 的 defer 之后**——Start 已经成功、PLC 侧会话
+已建立，此处直接 return 会跳过收尾、把会话留在 PLC 上（当前 Start 的长度字段
+是 5 位十进制 ASCII，上限 99999，使这条早退路径实际不可达；但顺序本身是错的，
+一旦字段格式变化就会泄漏会话，故按注释修正为「先注册收尾、再判长度」）。
 分片是否结束只看 `param[1]`：`0` 是最后一片，`1` 表示后面还有——把 1 当成
 最后一片不会报错，只会让备份**静默少半截**。
+
+**写响应的数据区必须逐项给满返回码**。`ParseWriteAck` 拒绝参数区项数与请求数
+不一致、以及数据区返回码数量少于项数的响应：一个被截断的响应若被当成
+「剩下的都成功」，一半的写请求会显示成功、实际没落到 PLC——计数类点位重复
+累加，脉冲类点位少动一次，而且现场完全看不出问题。宁可整块判坏，也不猜。
 
 返回的是 PLC 的原始字节流，包含块头（真实 CPU 的第一片前有 36 字节紧凑块头）。
 不替调用方剥掉，是因为剥掉后这份数据就不能再用于下载；需要裸内容时由调用方
@@ -614,6 +658,26 @@ uic s7upload ... -out -                                  # 输出到标准输出
 属性与块上传，用于自测与演示。它与主站共用 `codec/s7`，所以「长度单位」「头
 长度」这类语义不会在主从之间分叉——这是本项目对「自测有效性」的最低要求：
 测试夹具不能是另一套实现。
+
+#### 3.7.9 回归测试矩阵
+
+`internal/codec/s7/regress_test.go` 与 `internal/driver/s7/regress_test.go` 钉住
+本轮修复。每个用例都做了变异验证（改坏实现→用例变红→还原转绿）。
+
+| 用例 | 钉住的契约 | 变异 |
+|---|---|---|
+| `TestWriteAckTruncatedDataIsBad` | 写响应数据区截断判坏（不当成「剩下都成功」） | 去掉 `len(pdu.Data) < count` 检查 |
+| `TestWriteAckCountMismatchIsBad` / `WrongFunc` / `WrongRosctr` | 参数区项数/功能码/帧类型不符判坏 | — |
+| `TestReadLinkFailureNotMaskedByPointError` | 链路失败不被前块点级错误顶掉 | `return out, firstErr` 还原成顶掉 |
+| `TestReadOversizedItemRejectedLocally` | 单项超 PDU 本地判坏（不发出请求） | 去掉读侧 `fitsPDU` 守卫 |
+| `TestWritePartialFailureKeepsEveryResult` | 写分块后块失败：每个请求一个结果，链路错误显式标坏 | 早退不填后续槽位 |
+| `TestWriteStringTooLongIsRejected` | STRING 超长判坏（不静默截断） | 去掉超长拒绝 |
+| `TestWriteStringExactWidthStillWorks` | 恰好填满仍照常写（不误杀） | — |
+| `TestWriteOutOfRangeIsAddress` | 整数越界/带小数/float32 溢出下溢判坏，归 address | 去掉 `checkRange` |
+| `TestWriteOversizedItemRejectedLocally` | 写单项超 PDU 本地判坏 | 去掉写侧 `fitsPDU` 守卫 |
+| `TestDecodeShortPayloadIsAddressNotBreaker` | 解码失败归 address，不熔断 | 还原成 `ErrProtocol` |
+| `TestDecodeSampleSucceeds` | 正常值解出来（分类改动不误杀） | — |
+| `TestFitsPDBudget` | PDU 预算公式读写/位访问一致 | — |
 
 ### 3.8 Modbus 从站（TCP / RTU / ASCII）
 
