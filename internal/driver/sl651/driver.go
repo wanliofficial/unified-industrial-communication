@@ -458,8 +458,17 @@ func (c *conn) transact(ctx context.Context, op string, req []byte,
 			return f, nil
 		}
 		lastErr = err
-		// 断链与参数错误重发没有意义。
-		if driver.KindOf(err) == driver.ErrDisconnected || driver.KindOf(err) == driver.ErrUnsupported {
+		// 断链（写失败/读失败）与不支持是配置/物理层硬失败：重发没有意义，立即
+		// 返回。但**断链必须缓存进 linkErr**——否则同一连接的后续 Read 每周期
+		// 都会 Drain + 写一次坏链路。超时类失败在循环耗尽后已缓存（见下方），
+		// 断连这条早退路径原先漏了：它与 cjt188 等串口驱动不一致，也让
+		// 「后续 Read 直接复用缓存错误、不再重试」的契约在断连时不成立。不支持
+		// （配置错）不缓存：换一条链路/改一行配置就好，不该让整轮采集短路。
+		if driver.KindOf(err) == driver.ErrDisconnected {
+			c.linkErr = err
+			return nil, err
+		}
+		if driver.KindOf(err) == driver.ErrUnsupported {
 			return nil, err
 		}
 		// 尊重 exchange 已经分好的「可重发」标记。CRC 错是瞬态干扰（可重发），
@@ -473,7 +482,7 @@ func (c *conn) transact(ctx context.Context, op string, req []byte,
 			return nil, driver.E(driver.ErrTimeout, op, c.devID, "context done", true, ctxErr)
 		}
 	}
-	if isLinkFailure(lastErr) {
+	if driver.IsLinkFailure(lastErr) {
 		c.linkErr = lastErr
 	}
 	return nil, lastErr
@@ -728,14 +737,6 @@ func qualityOf(err error) model.Quality {
 		return model.QualityBad
 	}
 	return model.QualityCommError
-}
-
-func isLinkFailure(err error) bool {
-	switch driver.KindOf(err) {
-	case driver.ErrTimeout, driver.ErrDisconnected:
-		return true
-	}
-	return false
 }
 
 func isTimeout(err error) bool {

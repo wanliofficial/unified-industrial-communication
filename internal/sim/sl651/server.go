@@ -64,6 +64,11 @@ type Server struct {
 	truncate int
 	// delay 是应答前的人为延迟（验证超时分类）。
 	delay time.Duration
+	// dropOnQuery 为真时收到下行查询后立即断开、不回应（模拟终端掉线/停电）。
+	// 与 silent 的区别：silent 是「收到了但不理」（中心站表现为超时），drop 是
+	// 「连接直接断了」（中心站的写已发出、紧接的读拿到 EOF，归断连）。用它验证
+	// 断连错误的缓存与后续 Read 的短路。
+	dropOnQuery bool
 
 	// 统计
 	requests int64
@@ -293,6 +298,13 @@ func (s *Server) SetTruncate(n int) {
 	s.mu.Unlock()
 }
 
+// SetDropOnQuery 让从站收到下行查询后立即断开、不回应（模拟终端掉线）。
+func (s *Server) SetDropOnQuery(on bool) {
+	s.mu.Lock()
+	s.dropOnQuery = on
+	s.mu.Unlock()
+}
+
 // SetDelay 让从站在应答前等待（验证超时分类）。
 func (s *Server) SetDelay(d time.Duration) {
 	s.mu.Lock()
@@ -386,6 +398,14 @@ func (s *Server) ServeStream(st transport.Stream) error {
 				return nil
 			}
 			return err
+		}
+		s.mu.RLock()
+		drop := s.dropOnQuery
+		s.mu.RUnlock()
+		if drop && f.Dir == sl651codec.DirDown {
+			// 终端掉线：收到查询即断开、不回应。中心站已把查询写进总线，紧接
+			// 的读会拿到 EOF（干净关闭）或 connection reset，归断连。
+			return st.Close()
 		}
 		resp, send, err := s.handle(f)
 		if err != nil || !send {

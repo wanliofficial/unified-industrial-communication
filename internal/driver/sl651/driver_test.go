@@ -416,6 +416,42 @@ func TestLinkErrCached(t *testing.T) {
 	}
 }
 
+// TestDisconnectCachedShortCircuitsNextRead 断连（终端掉线）错误必须缓存进
+// linkErr，与静默超时的 TestLinkErrCached 对称。
+//
+// 断连与超时的差别在物理层：静默是「终端收到了但不理」，中心站的读一直等到
+// 超时；掉线是「连接直接断了」，中心站的查询已写进总线、紧接的读立刻拿到 EOF，
+// 归 ErrDisconnected。两者都是链路级失败，都该让同一连接的后续 Read 直接复用
+// 缓存、不再往坏链路上 Drain + 写一遍。断连这条早退路径原先漏了缓存：修复前
+// conn.linkErr 仍为 nil，第二次读会再发一次 37H 然后再次 EOF。
+func TestDisconnectCachedShortCircuitsNextRead(t *testing.T) {
+	srv := startSim(t)
+	srv.SetDropOnQuery(true) // 收到查询即断开，不回应
+	c := openConn(t, srv, "retries=0")
+
+	conn := c.(*conn)
+	out, err := c.Read(context.Background(), spans(pt("z", "Z")))
+	if err == nil {
+		t.Fatal("终端掉线时读应失败")
+	}
+	if driver.KindOf(err) != driver.ErrDisconnected {
+		t.Fatalf("错误分类 = %v，应为 disconnected（读到 EOF，不是超时）", driver.KindOf(err))
+	}
+	if len(out) != 1 || out[0].Quality != model.QualityCommError {
+		t.Fatalf("样本 = %+v，应为一条 comm_error", out)
+	}
+	if conn.linkErr == nil {
+		t.Fatal("断连错误应被缓存进 linkErr，否则后续 Read 会反复写坏链路")
+	}
+	before := srv.Requests()
+	if _, err := c.Read(context.Background(), spans(pt("z", "Z"))); err == nil {
+		t.Fatal("第二次读应直接返回缓存的断连错误")
+	}
+	if got := srv.Requests() - before; got != 0 {
+		t.Fatalf("第二次读不应再发请求（缓存短路），实际发了 %d 次", got)
+	}
+}
+
 // TestWriteUnsupported 写方向明确不支持。
 func TestWriteUnsupported(t *testing.T) {
 	srv := startSim(t)
