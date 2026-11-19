@@ -296,6 +296,16 @@ func (c *conn) write(ctx context.Context, frame []byte) error {
 	if c.stream == nil {
 		return driver.E(driver.ErrDisconnected, "write", c.deviceID, "connection closed", true, nil)
 	}
+	// 本驱动在握手里声明的发送缓冲区是 bufferSize，且**不支持分块**（收到
+	// Chunk!='F' 的响应会直接报错）。于是一个超过 bufferSize 的帧既不符合我们
+	// 自己报给服务端的限制、又没法被拆分——发出去只会让对端按规范断开连接，
+	// 把「这一条值太大」变成一串看不懂的后续读失败。在这里 fail-closed 给出
+	// 明确诊断，比让连接悄悄断掉强。
+	if len(frame) > bufferSize {
+		return driver.E(driver.ErrProtocol, "write", c.deviceID,
+			fmt.Sprintf("message size %d exceeds negotiated buffer %d (this driver does not chunk)",
+				len(frame), bufferSize), false, nil)
+	}
 	c.setDeadline(ctx)
 	if err := c.stream.Write(frame); err != nil {
 		return c.netErr("write", err)
@@ -797,10 +807,8 @@ func (c *conn) Read(ctx context.Context, spans []driver.ReadSpan) ([]driver.RawS
 			for _, it := range items[start:] {
 				out[it.idx] = errSample(it.point.ID, e)
 			}
-			if firstErr == nil {
-				firstErr = e
-			}
-			return out, firstErr
+			// ctx 取消是链路级超时：同样必须上抛 e，不被前一块点级错误顶掉。
+			return out, e
 		}
 
 		values, err := c.readNodes(ctx, nodes)
@@ -808,13 +816,15 @@ func (c *conn) Read(ctx context.Context, spans []driver.ReadSpan) ([]driver.RawS
 			// 链路/会话级错误：本块与后续块都不必再试，但剩余点位必须
 			// 显式标记，否则上层只会看到「点位缺失」，把真正的原因
 			// （会话失效）掩盖成配置问题。
-			if firstErr == nil {
-				firstErr = err
-			}
+			//
+			// 上抛的必须是**链路错误本身**，不能被前一块的点级错误顶掉：
+			// collector 按错误的 kind 决定重连，拿到 address/permission 就不会
+			// 重连，设备会一直卡在「点配错」的假象里，而真正断掉的链路永远
+			// 不重建（§3.3.1：链路级失败立即返回该错误）。已读到的好样本保留。
 			for _, rest := range items[start:] {
 				out[rest.idx] = errSample(rest.point.ID, err)
 			}
-			return out, firstErr
+			return out, err
 		}
 
 		for i, it := range chunk {
@@ -893,9 +903,11 @@ func (c *conn) Write(ctx context.Context, reqs []driver.WriteRequest) ([]driver.
 			continue
 		}
 		if _, err := ua.EncodeValue(req.DataType, req.Value); err != nil {
+			// 编码失败是值/类型配置错（越界、带小数、类型不符）：归 ErrAddress，
+			// 与 MC / FINS 的 checkRange 一致——不熔断、不重试、质量 address_error。
 			results = append(results, driver.WriteResult{
-				PointID: req.PointID, Quality: model.QualityBad,
-				Err: driver.E(driver.ErrUnsupported, "encode", c.deviceID, err.Error(), false, err),
+				PointID: req.PointID, Quality: model.QualityAddressError,
+				Err: driver.E(driver.ErrAddress, "encode", c.deviceID, err.Error(), false, err),
 			})
 			continue
 		}
@@ -905,92 +917,115 @@ func (c *conn) Write(ctx context.Context, reqs []driver.WriteRequest) ([]driver.
 		return results, nil
 	}
 
+	// 每个 valid 条目一个结果槽位：posResults[i] 对应 valid[i]。分块失败时
+	// 只填还没填的槽位，保证「每个请求恰好一个结果、不重复、不消失」（§3.4 规则
+	// 1/4）。invalid 条目已在上面直接追加。
+	posResults := make([]*driver.WriteResult, len(valid))
+	for i := range posResults {
+		i := i
+		posResults[i] = &driver.WriteResult{PointID: valid[i].req.PointID}
+	}
+	fill := func(lo, hi int, err error) {
+		q := qualityFor(err)
+		for j := lo; j < hi; j++ {
+			if posResults[j].OK || posResults[j].Err != nil {
+				continue // 已经报告过（编码失败或前一块成功），不覆盖
+			}
+			posResults[j].Quality = q
+			posResults[j].Err = err
+		}
+	}
+
 	for start := 0; start < len(valid); start += maxNodesPerRead {
+		if err := ctx.Err(); err != nil {
+			e := driver.E(driver.ErrTimeout, "write", c.deviceID, "context done", true, err)
+			fill(start, len(valid), e)
+			return c.collectWrite(results, posResults), e
+		}
 		end := start + maxNodesPerRead
 		if end > len(valid) {
 			end = len(valid)
 		}
 		chunk := valid[start:end]
 
-		nodes := make([]ua.WriteValue, len(chunk))
+		// nodes 与 chunk 对齐：编码失败的条目不进 nodes，改用并行的 idx 记回它的
+		// 位置——否则零值 WriteValue（空 NodeID）会被发去服务端。
+		nodes := make([]ua.WriteValue, 0, len(chunk))
+		idx := make([]int, 0, len(chunk))
 		for i, p := range chunk {
 			variant, err := ua.EncodeValue(p.req.DataType, p.req.Value)
 			if err != nil {
 				// 前面已校验过，这里只可能是并发修改；保守处理为失败。
-				results = append(results, driver.WriteResult{
-					PointID: p.req.PointID, Quality: model.QualityBad,
-					Err: driver.E(driver.ErrInternal, "encode", c.deviceID, err.Error(), false, err),
-				})
+				e := driver.E(driver.ErrInternal, "encode", c.deviceID, err.Error(), false, err)
+				posResults[start+i].Quality = model.QualityBad
+				posResults[start+i].Err = e
 				continue
 			}
-			nodes[i] = ua.WriteValue{
+			nodes = append(nodes, ua.WriteValue{
 				NodeID:      p.node,
 				AttributeID: ua.AttrValue,
 				Value:       ua.DataValue{Value: &variant, SourceTimestamp: time.Now()},
-			}
+			})
+			idx = append(idx, i)
+		}
+		if len(nodes) == 0 {
+			continue
 		}
 		req := ua.WriteRequest{Header: c.newHeader(), Nodes: nodes}
 		m, err := c.exchange(ctx, ua.SvcWriteRequest, req.Encode())
 		if err != nil {
-			for _, p := range chunk {
-				results = append(results, driver.WriteResult{
-					PointID: p.req.PointID, Quality: model.QualityCommError, Err: err,
-				})
-			}
-			return results, err
+			// 本块与后续块都不必再试；已成功的块保持成功（§3.4 规则 4），
+			// 剩余条目必须显式标坏，不能从结果里消失（collector 会把缺失项
+			// 兜底成「driver returned no result」，丢掉真正的链路原因）。
+			fill(start, len(valid), err)
+			return c.collectWrite(results, posResults), err
 		}
 		if m.ServiceID == ua.SvcServiceFaultResponse {
 			ferr := c.faultErr("write", m.Body)
-			for _, p := range chunk {
-				results = append(results, driver.WriteResult{
-					PointID: p.req.PointID, Quality: model.QualityBad, Err: ferr,
-				})
-			}
-			return results, ferr
+			fill(start, len(valid), ferr)
+			return c.collectWrite(results, posResults), ferr
 		}
 		resp, derr := ua.DecodeWriteResponse(m.Body)
 		if derr != nil {
 			e := driver.E(driver.ErrProtocol, "write", c.deviceID, derr.Error(), true, derr)
-			for _, p := range chunk {
-				results = append(results, driver.WriteResult{
-					PointID: p.req.PointID, Quality: model.QualityBad, Err: e,
-				})
-			}
-			return results, e
+			fill(start, len(valid), e)
+			return c.collectWrite(results, posResults), e
 		}
 		if resp.Header.ServiceResult.IsBad() {
 			e := driver.E(statusKind(resp.Header.ServiceResult), "write", c.deviceID,
 				resp.Header.ServiceResult.Text(), false, resp.Header.ServiceResult)
-			for _, p := range chunk {
-				results = append(results, driver.WriteResult{
-					PointID: p.req.PointID, Quality: model.QualityBad, Err: e,
-				})
-			}
-			return results, e
+			fill(start, len(valid), e)
+			return c.collectWrite(results, posResults), e
 		}
-		for i, p := range chunk {
-			if i >= len(resp.Results) {
-				results = append(results, driver.WriteResult{
-					PointID: p.req.PointID, Quality: model.QualityBad,
-					Err: driver.E(driver.ErrProtocol, "write", c.deviceID,
-						"missing write result", true, nil),
-				})
+		// resp.Results 与 nodes（即 idx）一一对应，而不是与 chunk 一一对应。
+		for k, i := range idx {
+			if k >= len(resp.Results) {
+				e := driver.E(driver.ErrProtocol, "write", c.deviceID,
+					"missing write result", true, nil)
+				posResults[start+i].Quality = model.QualityBad
+				posResults[start+i].Err = e
 				continue
 			}
-			s := resp.Results[i]
+			s := resp.Results[k]
 			if s.IsBad() {
-				results = append(results, driver.WriteResult{
-					PointID: p.req.PointID, Quality: ua.QualityOf(s),
-					Err: driver.E(statusKind(s), "write", c.deviceID, s.Text(), false, s),
-				})
+				posResults[start+i].Quality = ua.QualityOf(s)
+				posResults[start+i].Err = driver.E(statusKind(s), "write", c.deviceID, s.Text(), false, s)
 				continue
 			}
-			results = append(results, driver.WriteResult{
-				PointID: p.req.PointID, OK: true, Quality: model.QualityGood,
-			})
+			posResults[start+i].OK = true
+			posResults[start+i].Quality = model.QualityGood
 		}
 	}
-	return results, nil
+	return c.collectWrite(results, posResults), nil
+}
+
+// collectWrite 把按位置对齐的结果拼成一个切片。invalid 条目已在 results 里，
+// valid 条目按序从 posResults 取（每个恰好一个）。
+func (c *conn) collectWrite(results []driver.WriteResult, posResults []*driver.WriteResult) []driver.WriteResult {
+	for _, r := range posResults {
+		results = append(results, *r)
+	}
+	return results
 }
 
 // Close 依次关闭会话、安全通道、TCP 连接。每一步都可能失败，但都必须
@@ -1077,8 +1112,15 @@ func statusKind(s ua.StatusCode) driver.ErrorKind {
 	switch s {
 	case ua.StatusBadNodeIDUnknown, ua.StatusBadNodeIDInvalid, ua.StatusBadAttributeInvalid:
 		return driver.ErrAddress
-	case ua.StatusBadUserAccessDenied, ua.StatusBadSecurityChecks, ua.StatusBadNotWritable:
+	// BadNotReadable：服务端拒绝读这个点（权限/策略）。它是**点级**配置问题，
+	// 换一个点位照样能读，绝不能算进熔断——否则一个没权限的点会把整台设备拖下水。
+	case ua.StatusBadNotReadable, ua.StatusBadUserAccessDenied, ua.StatusBadSecurityChecks,
+		ua.StatusBadNotWritable:
 		return driver.ErrPermission
+	// BadTypeMismatch：点位声明的类型与服务端变量的类型不符，是配置错。
+	// 同 MC 的 0xC052、S7 的地址不存在——归 ErrAddress，不熔断。
+	case ua.StatusBadTypeMismatch:
+		return driver.ErrAddress
 	case ua.StatusBadServiceUnsupported:
 		return driver.ErrUnsupported
 	case ua.StatusBadTimeout, ua.StatusBadWaitingForData:
@@ -1105,8 +1147,10 @@ func qualityFor(err error) model.Quality {
 		return model.QualityTimeout
 	case driver.ErrDisconnected:
 		return model.QualityCommError
+	// ErrUnsupported 不是「点位被关掉」：服务端不支持该服务是设备能力问题，
+	// 与其它驱动一致报 bad。QualityDisabled 只用于「配置里显式禁用」。
 	case driver.ErrUnsupported:
-		return model.QualityDisabled
+		return model.QualityBad
 	}
 	return model.QualityBad
 }

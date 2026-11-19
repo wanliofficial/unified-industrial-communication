@@ -158,9 +158,30 @@ func variantNumber(v Variant) (float64, error) {
 }
 
 // checkRange 校验数值是否能被目标类型无损承载。
+//
+// 三类会被 here 拦下的「看起来写成功了、实际值变了」的情况：
+//  1. 带小数的值写进整数类型：1.5 写 int16 会被强制转换截成 1，调用方却
+//     收到成功（§3.4 规则 3「写入失败不得静默」）；
+//  2. float32 溢出成 ±Inf 或下溢成 0：1e300 在 float32 里是 +Inf，1e-300
+//     是 0，两者都不是调用方给的值；
+//  3. int64/uint64 的上界不能写成 float 常量：float64(2^63-1) 舍入成 2^63，
+//     `<= 9.22e18` 会让 2^63 通过校验再溢出成负数。
+//
+// NaN/Inf 在两类检查里都要拒：它们既不是「整数」也不是可表示范围。
 func checkRange(t model.DataType, n float64) error {
 	if math.IsNaN(n) || math.IsInf(n, 0) {
 		return fmt.Errorf("opcua: non-finite value for %s", t)
+	}
+	// 整数类型额外要求是整数值。float 类型不做这条检查——1.5 写 float32
+	// 本来就是合法的。
+	integral := func(lo, hi float64) error {
+		if n != math.Trunc(n) {
+			return fmt.Errorf("opcua: value %g is not an integer, cannot store in %s", n, t)
+		}
+		if n < lo || n > hi {
+			return fmt.Errorf("opcua: value %g out of range for %s", n, t)
+		}
+		return nil
 	}
 	bad := func(lo, hi float64) error {
 		if n < lo || n > hi {
@@ -170,17 +191,49 @@ func checkRange(t model.DataType, n float64) error {
 	}
 	switch t {
 	case model.TypeInt16:
-		return bad(math.MinInt16, math.MaxInt16)
+		return integral(math.MinInt16, math.MaxInt16)
 	case model.TypeUint16, model.TypeBCD16:
-		return bad(0, math.MaxUint16)
+		return integral(0, math.MaxUint16)
 	case model.TypeInt32:
-		return bad(math.MinInt32, math.MaxInt32)
+		return integral(math.MinInt32, math.MaxInt32)
 	case model.TypeUint32, model.TypeBCD32:
-		return bad(0, math.MaxUint32)
+		return integral(0, math.MaxUint32)
 	case model.TypeInt64:
-		return bad(-9.223372036854776e18, 9.223372036854776e18)
+		// 上界必须写成 **严格小于 2^63**：9223372036854775807.0 这个字面量在
+		// float64 里会被舍入成 2^63，于是 2^63 本身也能通过（随后 int64(n)
+		// 溢出成负数）。下界 -2^63 可精确表示，用 <=。
+		if n != math.Trunc(n) {
+			return fmt.Errorf("opcua: value %g is not an integer, cannot store in %s", n, t)
+		}
+		if n < -9223372036854775808.0 || n >= 9223372036854775808.0 {
+			return fmt.Errorf("opcua: value %g out of range for %s", n, t)
+		}
+		return nil
 	case model.TypeUint64:
-		return bad(0, 1.8446744073709552e19)
+		// 同理：2^64-1 在 float64 里舍入成 2^64，必须用严格小于。
+		if n != math.Trunc(n) {
+			return fmt.Errorf("opcua: value %g is not an integer, cannot store in %s", n, t)
+		}
+		if n < 0 || n >= 18446744073709551616.0 {
+			return fmt.Errorf("opcua: value %g out of range for %s", n, t)
+		}
+		return nil
+	case model.TypeFloat32:
+		if err := bad(-math.MaxFloat32, math.MaxFloat32); err != nil {
+			return err
+		}
+		// 非零值不能下溢成 0：1e-300 转 float32 是 0，不是调用方给的值。
+		// 溢出端由 bad() 的 ±MaxFloat32 已经拦住，这里补下溢端（结果变 0）。
+		if n != 0 {
+			f := float32(n)
+			if math.IsInf(float64(f), 0) || f == 0 {
+				return fmt.Errorf("opcua: value %g cannot be represented as float32", n)
+			}
+		}
+		return nil
+	case model.TypeFloat64:
+		// NaN/Inf 已在上面拒掉；其余 float64 都是可表示的。
+		return nil
 	}
 	return nil
 }
@@ -257,6 +310,10 @@ func QualityOf(s StatusCode) model.Quality {
 	case StatusBadNoCommunication, StatusBadNotConnected, StatusBadCommunicationError:
 		return model.QualityCommError
 	case StatusBadNodeIDUnknown, StatusBadNodeIDInvalid, StatusBadAttributeInvalid:
+		return model.QualityAddressError
+	// 与驱动侧 statusKind 保持一致：类型不匹配归 address_error（配置错），
+	// 让读路径与写路径对同一状态码报出同一质量码。
+	case StatusBadTypeMismatch:
 		return model.QualityAddressError
 	}
 	return model.QualityBad

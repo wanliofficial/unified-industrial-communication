@@ -990,6 +990,16 @@ OPC UA 的寻址单位是**节点标识**，不是地址。因此：
 越界必须判坏而不是截断：一个把 70000 截成 4464 的温度点，会让操作员按错误的
 数字做决策，而且不会有任何告警。判坏至少会亮出来。
 
+范围校验（`codec/opcua/checkRange`）覆盖四类「看起来成功了、实际值变了」：
+
+1. **带小数的值写进整数类型**：`1.5` 写 int16 判坏，不截成 `1`；
+2. **float32 溢出/下溢**：`1e300` 在 float32 里是 `+Inf`、`1e-300` 是 `0`，两者都不是
+   调用方给的值，判坏；
+3. **int64/uint64 的上界**：`2^63-1` 在 float64 里会舍入成 `2^63`，用 `>= 2^63` 严格判上界，
+   否则 `2^63` 通过校验再 `int64(n)` 溢出成负数；
+4. **编解码两侧都查**：`EncodeValue`（写）与 `DecodeValue`（读）都过同一道 `checkRange`——
+   服务端把一个 double `1.5` 发来、而点位是 int16，同样判坏而不是静默截断。
+
 #### 3.9.5 部分失败语义
 
 OPC UA 的 `Read` 是**逐项**返回 `DataValue.Status` 的：一个节点不存在，不影响
@@ -1005,17 +1015,43 @@ OPC UA 的 `Read` 是**逐项**返回 `DataValue.Status` 的：一个节点不�
 「全部失败必须返回 error」这一条容易被漏掉：如果只在 `DataValue.Status` 上标坏，
 上层的熔断器与告警都看不到异常，设备会一直「在采但全坏」。
 
+**分块读时链路失败必须立即上抛**：`Read` 按 `maxNodesPerRead`（100）切块。若前一块
+成功、后一块链路断掉，顶层错误**必须是链路错误本身**（`ErrDisconnected`/`ErrTimeout`），
+不能被前一块里某个点级错误（如 `BadNodeIdUnknown`→`ErrAddress`）顶掉——否则 collector
+拿到 address 就不会重连，链路永远不重建。已读到的好样本保留，剩余点位显式标坏（§3.3.1）。
+
+#### 3.9.5.1 写路径的部分失败与本地校验
+
+写（§3.4）同样按块切，且必须逐项返回：
+
+| 情况 | 驱动行为 |
+|---|---|
+| 分块写，前块成功、后块链路失败 | 前块结果保持成功，剩余条目**显式标坏**并从结果里返回，顶层错误上抛链路错误。绝不出现「结果条数 < 请求条数」——collector 会把缺失项兜底成「driver returned no result」，丢掉真正的链路原因 |
+| 编码失败（越界/带小数/类型不符） | 发请求前本地拒绝，归 `ErrAddress`，质量码 `address_error`；与 MC/FINS 的 `checkRange` 一致，不熔断 |
+| 单帧超过协商缓冲区（65535） | 本驱动不支持分块，本地 `fail-closed` 报 `ErrProtocol`（非临时、不熔断、不触发重连），明确诊断「message size exceeds negotiated buffer」；发出去只会让对端按规范断连 |
+| 服务端逐项拒绝 | 每个节点按自己的状态码分类回传（`BadNotWritable`→permission、`BadTypeMismatch`→address 等） |
+
+**编码失败为什么归 `ErrAddress` 而不是 `ErrUnsupported`**：越界/带小数/类型不符都是
+「这个点的值或类型配错了」，`ErrUnsupported` 会让指标把它记成「能力不支持」并（旧行为）
+报成 `disabled`。归 `ErrAddress` 既表达了配置错的语义，又同样不熔断。
+
 #### 3.9.6 状态码 → 错误分类
 
 | 状态码 | 分类 | 理由 |
 |---|---|---|
 | `BadNodeIdUnknown` / `BadNodeIdInvalid` / `BadAttributeIdInvalid` | `ErrAddress` | 点位配错了，不是设备坏了；不该熔断整台设备 |
-| `BadUserAccessDenied` / `BadSecurityChecks` / `BadNotWritable` | `ErrPermission` | 权限问题，重试无用，需要改配置 |
-| `BadServiceUnsupported` | `ErrUnsupported` | 对端不支持该服务 |
+| `BadTypeMismatch` | `ErrAddress` | 点位声明的类型与服务端变量的类型不符，是配置错；归 address，不熔断 |
+| `BadUserAccessDenied` / `BadSecurityChecks` / `BadNotWritable` / `BadNotReadable` | `ErrPermission` | 服务端拒绝读/写这个点（权限/策略），换一个点位照样能读，不该熔断 |
+| `BadServiceUnsupported` | `ErrUnsupported` | 对端不支持该服务（能力问题，质量码报 `bad`，不报 `disabled`） |
 | `BadTimeout` / `BadWaitingForInitialData` | `ErrTimeout` | 可重试 |
 | `BadSessionIdInvalid` / `BadSessionClosed` / `BadSecureChannelIdInvalid` / `BadNoCommunication` / `BadNotConnected` / `BadCommunicationError` | `ErrDisconnected` | 需要重建会话或通道 |
 
-其余未列出的 `Bad*` 归 `ErrProtocol`。
+其余未列出的 `Bad*` 归 `ErrProtocol`（会熔断）。
+
+**为什么这里必须细分**：熔断器按连续失败次数触发（默认 5）。把「这个点没权限」「这个
+点类型配错」这类**点级配置错**算成 `ErrProtocol`，会让一个写错的点位在 5 个采集周期后
+把整台设备拖成 `Faulted`——设备其实是好的，只是这一个点配错了，却连累所有点一起停摆。
+这与 MC 的结束码分类（§3.10.5）、FINS 的结束码分类（§3.10.6）是同一条纪律。
 
 #### 3.9.7 明确的能力边界
 
@@ -1078,6 +1114,29 @@ OPC UA 的 `Read` 是**逐项**返回 `DataValue.Status` 的：一个节点不�
 调用回调，最后 `Lock` 写回并通知。北向模式下回调会走到真实设备，耗时以秒计；持锁
 调用会让这期间所有 Read/Browse 一起堵死。回调返回非 Good 时节点值保持不变——
 「写入被接受」与「值已经改了」是两件事。
+
+#### 3.9.9 回归测试矩阵
+
+`internal/codec/opcua/regress_test.go`（编解码范围校验）与
+`internal/driver/opcua/regress_test.go`（读写分块、分类、质量码、帧长）钉住本轮修复。
+每个用例都做了变异验证（改坏实现→用例变红→还原转绿）。
+
+| 用例 | 钉住的契约 | 变异 |
+|---|---|---|
+| `TestEncodeValueRejectsFractionalIntoInteger` | 带小数写整数判坏（不截断） | 去掉 `integral` 的小数检查 |
+| `TestEncodeValueRejectsFloat32Overflow` / `Underflow` | float32 溢出成 Inf、下溢成 0 判坏 | 去掉 `f==0` / `IsInf` 检查 |
+| `TestEncodeValueRejectsNonFiniteFloat64` | NaN/±Inf 判坏 | 已正确，作对照 |
+| `TestEncodeValueInt64BoundaryIsExact` / `Uint64` | 上界严格 `< 2^63` / `< 2^64` | 把 `>=` 改成 `>`（2^63 通过再溢出） |
+| `TestDecodeValueRejectsFractional/Float32Overflow/Underflow` | 解码侧同样过 `checkRange` | 同上（DecodeValue 复用 checkRange） |
+| `TestEncodeDecodeRoundTrip` | 合法值往返不变（不误杀） | — |
+| `TestReadLinkFailureReportsAndKeepsGoodSamples` | 分块读后块链路失败：上抛链路错误 + 保留前块好样本 | — |
+| `TestReadLinkFailureNotMaskedByPointError` | 链路失败不被前块点级错误顶掉 | `return out, firstErr` 还原成顶掉 |
+| `TestReadBadNotReadableIsPermissionNotBreaker` | `BadNotReadable`→permission，不熔断 | 还原成 `ErrProtocol` |
+| `TestReadBadTypeMismatchIsAddressNotBreaker` | `BadTypeMismatch`→address，不熔断 | 还原成 `ErrProtocol` |
+| `TestWritePartialFailureKeepsEveryResult` | 写分块后块失败：每条请求一个结果，不消失 | 丢弃后续块结果 |
+| `TestWriteOutOfRangeIsAddress` | 越界/带小数写本地拒绝，归 address | 还原成 `ErrUnsupported` |
+| `TestWriteOversizedFrameRejectedLocally` | 超缓冲区帧本地 fail-closed | 去掉帧长守卫 |
+| `TestQualityForUnsupportedIsNotDisabled` | `ErrUnsupported`→bad，不报 disabled | 还原成 `QualityDisabled` |
 
 ---
 
