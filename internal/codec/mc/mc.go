@@ -22,6 +22,8 @@ import (
 	"encoding/binary"
 	"fmt"
 	"strings"
+
+	"uic/internal/driver"
 )
 
 // 帧常量。
@@ -214,6 +216,40 @@ type EndCodeError struct {
 
 func (e *EndCodeError) Error() string {
 	return fmt.Sprintf("mc: end code %#04x: %s", e.Code, e.CodeText())
+}
+
+// Kind 把结束码映射成驱动错误种类。
+//
+// 没有这一层，`driver.KindOf` 会落到兜底的 ErrInternal，于是：
+//   - `CountsTowardBreaker` 为 true —— 一个点位名写错（0xC052/0xC056）会让
+//     整台设备被熔断；
+//   - `IsLinkFailure` 为 false 但质量码只能靠驱动自己再查一遍结束码表，
+//     API 层与采集层对同一条错误给出不同结论。
+//
+// 分类依据是「重发一次结果会不会变」：
+//   - 地址类（软元件不存在、起始/点数越界、数据长度不符）→ ErrAddress；
+//   - 命令/子命令不支持 → ErrUnsupported（配置错，不是链路问题）；
+//   - 写保护 → ErrPermission；
+//   - 其余（网络号/PC 号/站号/监视定时器错、请求无法处理）→ ErrProtocol。
+//
+// 这些码都不带 Temporary：MC 结束码是设备对「这条请求」的确定答复，
+// 重发同样的请求只会得到同样的码。
+func (e *EndCodeError) Kind() driver.ErrorKind {
+	switch e.Code {
+	case 0xC052, // head device invalid
+		0xC053, // points invalid
+		0xC054, // head device + points out of range
+		0xC056, // device not supported
+		0xC058, // data length mismatch
+		0xC05B: // write data invalid
+		return driver.ErrAddress
+	case 0xC050, // command not supported
+		0xC051: // subcommand not supported
+		return driver.ErrUnsupported
+	case 0xC06F: // device memory write protected
+		return driver.ErrPermission
+	}
+	return driver.ErrProtocol
 }
 
 // CodeText 给出结束代码的人话说明。未收录的代码保留编号，不猜。

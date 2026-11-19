@@ -15,6 +15,7 @@ import (
 	"context"
 	"encoding/binary"
 	"fmt"
+	"math"
 	"strings"
 	"sync"
 	"time"
@@ -131,26 +132,94 @@ func (c *conn) Read(ctx context.Context, spans []driver.ReadSpan) ([]driver.RawS
 	}
 	var out []driver.RawSample
 	var firstErr error
-	ok := 0
-	for _, span := range spans {
+	good := 0
+	for si, span := range spans {
 		if err := ctx.Err(); err != nil {
-			return out, driver.E(driver.ErrTimeout, "read", c.cfg.Device.ID, "context done", true, err)
+			e := driver.E(driver.ErrTimeout, "read", c.cfg.Device.ID, "context done", true, err)
+			// 剩余 span 的点位必须显式标坏，不能让它们从结果里消失——消失
+			// 的点位在采集层表现为「没有新样本」，会被当成设备安静。
+			for _, rest := range spans[si:] {
+				out = append(out, failed(rest, e)...)
+			}
+			return out, e
 		}
 		samples, err := c.readSpan(ctx, span)
 		if err != nil {
+			// 链路级失败：立即返回，不由下面的闸门吞掉——一轮采集被周期超时
+			// 打断本身就是「设备太慢」的信号。已读回的好样本必须保留（§3.3.1）。
+			if driver.IsLinkFailure(err) {
+				out = append(out, withPendingFailed(span, samples, err)...)
+				for _, rest := range spans[si+1:] {
+					out = append(out, failed(rest, err)...)
+				}
+				return out, err
+			}
 			if firstErr == nil {
 				firstErr = err
 			}
-			out = append(out, failed(span, err)...)
+			// 只把没拿到值的点位标坏；前几块已解出的好样本保留。
+			out = append(out, withPendingFailed(span, samples, err)...)
 			continue
 		}
-		ok++
+		// span 成功不等于「有成功的点位」：解码阶段的错误（位软元件配成数值、
+		// 宽度超出应答）是逐点记在样本上的，readSpan 仍返回 nil error。按 span
+		// 计数会把这批「全员失败」当成成功、`Read` 返回 nil error——正是 §3.3.1
+		// 点名禁止的那种静默。
+		if n := goodSamples(samples); n > 0 {
+			good += n
+		} else if e := firstSampleErr(samples); e != nil && firstErr == nil {
+			firstErr = e
+		}
 		out = append(out, samples...)
 	}
-	if ok == 0 && firstErr != nil {
-		return out, firstErr
+	// 部分失败语义（docs §3.3.1）：有成功点就不向上返回错误。
+	return out, driver.PartialReadError(good, firstErr)
+}
+
+// goodSamples 数一段结果里真正带值的点位（失败样本一律带 Err）。
+func goodSamples(samples []driver.RawSample) int {
+	n := 0
+	for _, s := range samples {
+		if s.Err == nil {
+			n++
+		}
 	}
-	return out, nil
+	return n
+}
+
+// firstSampleErr 返回一段结果里的第一个点位级错误，供「整段全失败但 span
+// 本身没报错」时喂给部分失败闸门。
+func firstSampleErr(samples []driver.RawSample) error {
+	for _, s := range samples {
+		if s.Err != nil {
+			return s.Err
+		}
+	}
+	return nil
+}
+
+// withPendingFailed 把「还没拿到值」的点位按 err 标坏，已解出的好样本原样保留。
+//
+// readSpan 逐块读、逐点解：前面的块已解出好值，后面的块失败时返回 (部分结果,
+// err)。把成功点也回填成错误会让调用方把一条已读到的点当成失败去重试，且违反
+// §3.3.1 的语义。
+func withPendingFailed(span driver.ReadSpan, samples []driver.RawSample, err error) []driver.RawSample {
+	q := qualityOf(err)
+	if len(samples) == 0 {
+		return failed(span, err)
+	}
+	out := make([]driver.RawSample, 0, len(span.Points))
+	for i, p := range span.Points {
+		if i < len(samples) {
+			// 已经逐点标坏（解码期错误）时保留它自己的错误，诊断更准。
+			if samples[i].Err != nil || samples[i].Quality == model.QualityGood {
+				out = append(out, samples[i])
+				continue
+			}
+		}
+		out = append(out, driver.RawSample{PointID: p.ID, Quality: q, Err: err})
+	}
+	return out
 }
 
 func (c *conn) readSpan(ctx context.Context, span driver.ReadSpan) ([]driver.RawSample, error) {
@@ -191,7 +260,11 @@ func (c *conn) readSpan(ctx context.Context, span driver.ReadSpan) ([]driver.Raw
 }
 
 func (c *conn) readChunked(ctx context.Context, span driver.ReadSpan, dev mccodec.Device, min, max, limit int) ([]driver.RawSample, error) {
-	var out []driver.RawSample
+	// 逐块读、逐块解。out 的槽位与 span.Points 一一对应（未读到的留零值），
+	// 失败时把已解出的部分连同错误一起返回——调用方据此只标坏还没拿到值的
+	// 点位，而不是把前几块的好值一起丢掉。
+	out := make([]driver.RawSample, len(span.Points))
+	done := make([]bool, len(span.Points))
 	for start := min; start < max; start += limit {
 		end := start + limit
 		if end > max {
@@ -199,21 +272,40 @@ func (c *conn) readChunked(ctx context.Context, span driver.ReadSpan, dev mccode
 		}
 		data, err := c.read(ctx, strings.ToLower(span.Points[0].Address.Area), start, end-start, dev.Bit)
 		if err != nil {
-			return out, err
+			return compactSamples(out, done, span), err
 		}
-		part := driver.ReadSpan{ID: span.ID}
-		for _, p := range span.Points {
+		var part driver.ReadSpan
+		part = driver.ReadSpan{ID: span.ID}
+		pos := make([]int, 0, len(span.Points))
+		for i, p := range span.Points {
 			if p.Address.Offset >= start && p.Address.Offset < end {
 				part.Points = append(part.Points, p)
+				pos = append(pos, i)
 			}
 		}
 		samples, err := decodeSpan(part, dev, start, data)
 		if err != nil {
-			return out, err
+			return compactSamples(out, done, span), err
 		}
-		out = append(out, samples...)
+		for k, s := range samples {
+			out[pos[k]] = s
+			done[pos[k]] = true
+		}
 	}
-	return out, nil
+	return compactSamples(out, done, span), nil
+}
+
+// compactSamples 按 span.Points 的顺序输出「已解出的样本」，未解出的点位不出现
+// （由调用方按 err 补坏）。withPendingFailed 依赖这个顺序：它按下标与
+// span.Points 对齐。
+func compactSamples(out []driver.RawSample, done []bool, span driver.ReadSpan) []driver.RawSample {
+	samples := make([]driver.RawSample, 0, len(span.Points))
+	for i := range span.Points {
+		if done[i] {
+			samples = append(samples, out[i])
+		}
+	}
+	return samples
 }
 
 func (c *conn) read(ctx context.Context, area string, head, points int, bit bool) ([]byte, error) {
@@ -362,11 +454,29 @@ func (c *conn) Write(ctx context.Context, reqs []driver.WriteRequest) ([]driver.
 
 	results := make([]driver.WriteResult, 0, len(reqs))
 	var firstErr error
-	for _, req := range reqs {
+	for i, req := range reqs {
+		if err := ctx.Err(); err != nil {
+			e := driver.E(driver.ErrTimeout, "write", c.cfg.Device.ID, "context done", true, err)
+			// 剩余条目必须显式标坏，不能让它们从结果里消失。
+			for _, rest := range reqs[i:] {
+				results = append(results, writeFail(rest, e))
+			}
+			return results, e
+		}
 		res, err := c.writeOne(ctx, req)
 		results = append(results, res)
-		if err != nil && firstErr == nil {
-			firstErr = err
+		if err != nil {
+			// 链路级失败：后续每条都只会等满一次超时，必须短路并把剩余条目
+			// 显式标坏。地址/权限/不支持是点级问题，继续写下一条。
+			if driver.IsLinkFailure(err) {
+				for _, rest := range reqs[i+1:] {
+					results = append(results, writeFail(rest, err))
+				}
+				return results, err
+			}
+			if firstErr == nil {
+				firstErr = err
+			}
 		}
 	}
 	// 逐项返回（docs §3.4）：成功的条目**不能**因为同批另一条失败而被回填
@@ -437,17 +547,29 @@ func (c *conn) writeWords(ctx context.Context, req driver.WriteRequest, dev mcco
 	}
 	var payload []byte
 	if req.DataType == model.TypeString || req.DataType == model.TypeBytes {
-		// 字符串/字节：按地址宽度补零或截断，再转成线上字内小端。
-		raw := make([]byte, words*2)
-		if req.DataType == model.TypeString {
-			copy(raw, req.Value.Text)
-		} else {
-			// Bytes 类型在 model.Value 里是 []byte 的 Text 承载（见 Value.Bytes 注释），
-			// 这里直接用原始字节；若 Text 为空则写一个零字。
-			copy(raw, []byte(req.Value.Text))
+		// 字符串/字节：按地址宽度补零，再转成线上字内小端。
+		//
+		// 超长**拒绝**而不是静默截断：`copy` 在超出 words*2 时悄悄丢尾部，
+		// 调用方收到 OK 却只有前半段写进了 PLC（§3.4 规则 3「写入失败不得
+		// 静默」）。与数值分支的越界检查一致。
+		if len(req.Value.Text) > words*2 {
+			err := driver.E(driver.ErrAddress, "write", c.cfg.Device.ID,
+				fmt.Sprintf("point %q: value is %d bytes but address.length is %d words (%d bytes)",
+					req.PointID, len(req.Value.Text), words, words*2), false, nil)
+			return writeFail(req, err), err
 		}
+		raw := make([]byte, words*2)
+		copy(raw, req.Value.Text)
 		payload = swapWords(raw)
 	} else {
+		// 数值范围校验必须在编码/发报文之前：value.Encode 用强制转换落地，
+		// 70000 写 int16 会静默变成 4464，1e300 写 float32 会静默变成 +Inf。
+		// 写入「成功」了，设备上的值却不是调用方给的值（§3.4 规则 3）。
+		if err := checkRange(req.DataType, req.Value.Num); err != nil {
+			err = driver.E(driver.ErrAddress, "write", c.cfg.Device.ID,
+				fmt.Sprintf("point %q: %v", req.PointID, err), false, err)
+			return writeFail(req, err), err
+		}
 		raw, err := value.Encode(req.Value, req.DataType, mcOrder(req.ByteOrder))
 		if err != nil {
 			err = driver.E(driver.ErrProtocol, "write", c.cfg.Device.ID, err.Error(), false, err)
@@ -462,6 +584,52 @@ func (c *conn) writeWords(ctx context.Context, req driver.WriteRequest, dev mcco
 		payload = swapWords(raw)
 	}
 	return c.write(ctx, dev, req.Address.Offset, words, false, payload, req)
+}
+
+// checkRange 拒绝越界与带小数的整数写入，以及 float32 溢出成 ±Inf / 下溢成 0。
+// 与 ADS/DNP3/ENIP/FINS 的既有处理一致。
+func checkRange(dt model.DataType, v float64) error {
+	switch dt {
+	case model.TypeInt16:
+		if v != math.Trunc(v) || v < math.MinInt16 || v > math.MaxInt16 {
+			return fmt.Errorf("%v 超出 int16 范围或不是整数", v)
+		}
+	case model.TypeUint16:
+		if v != math.Trunc(v) || v < 0 || v > math.MaxUint16 {
+			return fmt.Errorf("%v 超出 uint16 范围或不是整数", v)
+		}
+	case model.TypeInt32:
+		if v != math.Trunc(v) || v < math.MinInt32 || v > math.MaxInt32 {
+			return fmt.Errorf("%v 超出 int32 范围或不是整数", v)
+		}
+	case model.TypeUint32:
+		if v != math.Trunc(v) || v < 0 || v > math.MaxUint32 {
+			return fmt.Errorf("%v 超出 uint32 范围或不是整数", v)
+		}
+	case model.TypeInt64:
+		if v != math.Trunc(v) || v < math.MinInt64 || v >= 9223372036854775808.0 {
+			return fmt.Errorf("%v 超出 int64 范围或不是整数", v)
+		}
+	case model.TypeUint64:
+		if v != math.Trunc(v) || v < 0 || v >= 18446744073709551616.0 {
+			return fmt.Errorf("%v 超出 uint64 范围或不是整数", v)
+		}
+	case model.TypeFloat32:
+		if math.IsNaN(v) || math.IsInf(v, 0) {
+			return fmt.Errorf("%v 不是合法的 float32 值", v)
+		}
+		if v != 0 {
+			f := float32(v)
+			if math.IsInf(float64(f), 0) || f == 0 {
+				return fmt.Errorf("%v 超出 float32 可表示范围", v)
+			}
+		}
+	case model.TypeFloat64:
+		if math.IsNaN(v) || math.IsInf(v, 0) {
+			return fmt.Errorf("%v 不是合法的 float64 值", v)
+		}
+	}
+	return nil
 }
 
 func (c *conn) write(ctx context.Context, dev mccodec.Device, head, points int, bit bool, data []byte, req driver.WriteRequest) (driver.WriteResult, error) {
@@ -566,6 +734,11 @@ func (f *framing) RoundTrip(ctx context.Context, req []byte) ([]byte, error) {
 		return nil, classifyNetErr("read-header", err)
 	}
 	if binary.LittleEndian.Uint16(head[0:]) != mccodec.SubheaderResponse {
+		// 副头部不对说明这条不是本次事务的应答（上一个请求的迟到应答、别的主站
+		// 的报文、或流已经错位）。必须按长度把它的体读掉再报错，否则残留体会
+		// 留在 TCP 流里，下一次请求把体当头部读，整条流从此错位——而协议错
+		// 不是链路级失败，上层不会重连，于是后续每个点位都莫名其妙地协议错。
+		f.drainBody(int(binary.LittleEndian.Uint16(head[7:])))
 		return nil, driver.E(driver.ErrProtocol, "read", "",
 			fmt.Sprintf("bad MC subheader % x", head[0:2]), false, nil)
 	}
@@ -582,6 +755,15 @@ func (f *framing) RoundTrip(ctx context.Context, req []byte) ([]byte, error) {
 }
 
 func (f *framing) Close() error { return f.stream.Close() }
+
+// drainBody 尽力读掉一条滞留报文的体。读失败时链路本身已经不可用——由随后的
+// 协议错返回让上层决定重连，这里不覆盖错误。
+func (f *framing) drainBody(n int) {
+	if n <= 0 || n > 4096 {
+		return
+	}
+	_, _ = f.stream.ReadFull(n)
+}
 
 func classifyNetErr(op string, err error) error {
 	if err == nil {
