@@ -604,9 +604,12 @@ func TestMetaContract(t *testing.T) {
 // TestParseOptions 配置解析。
 func TestParseOptions(t *testing.T) {
 	dev := model.Device{Labels: map[string]string{
-		"options": "retries=3,gap=50ms,center=5,password=ABCD",
+		"options": "retries=3,gap=50ms,center=5,password=ABCD,query=elem",
 	}}
-	opt := parseOptions(dev)
+	opt, err := parseOptions(dev)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
 	if opt.Retries != 3 {
 		t.Errorf("Retries = %d", opt.Retries)
 	}
@@ -619,14 +622,25 @@ func TestParseOptions(t *testing.T) {
 	if opt.Password != [2]byte{0xAB, 0xCD} {
 		t.Errorf("Password = % x", opt.Password)
 	}
-
-	// 非法值被忽略，保留默认。
-	def := parseOptions(model.Device{})
-	if def.Retries != defaultRetries || def.Gap != defaultGap {
-		t.Errorf("默认值 = %+v", def)
+	if opt.Query != QueryElem {
+		t.Errorf("Query = %q", opt.Query)
 	}
-	if got := parseOptions(model.Device{Labels: map[string]string{"options": "retries=99,gap=9s"}}); got.Retries != defaultRetries || got.Gap != defaultGap {
-		t.Errorf("越界值应被忽略，得到 %+v", got)
+
+	// 非法值被忽略，保留默认（query 除外：模式选错会整批读错数据语义，
+	// 必须报错而不是悄悄回 all）。
+	def, err := parseOptions(model.Device{})
+	if err != nil || def.Retries != defaultRetries || def.Gap != defaultGap || def.Query != QueryAll {
+		t.Errorf("默认值 = %+v err = %v", def, err)
+	}
+	got, err := parseOptions(model.Device{Labels: map[string]string{"options": "retries=99,gap=9s"}})
+	if err != nil || got.Retries != defaultRetries || got.Gap != defaultGap {
+		t.Errorf("越界值应被忽略，得到 %+v err %v", got, err)
+	}
+	if _, err := parseOptions(model.Device{Labels: map[string]string{"options": "query=hourly"}}); err == nil {
+		t.Errorf("query 非法值应报错")
+	}
+	if _, err := parseOptions(model.Device{Labels: map[string]string{"options": "query"}}); err == nil {
+		t.Errorf("query 缺值应报错")
 	}
 }
 
@@ -731,5 +745,66 @@ func TestGuideOf(t *testing.T) {
 	}
 	if _, _, err := guideOfWithSlot(model.Address{Kind: model.AddressRegister, Path: "Z"}); err == nil {
 		t.Error("非符号地址应失败")
+	}
+}
+
+// query=elem：Read 发 3AH（正文带点表引导符），终端只回点名的要素，
+// 值照常解码。QueryCount 精确锁定发出的查询功能码。
+func TestReadElemQuery(t *testing.T) {
+	srv := startSim(t)
+	c := openConn(t, srv, "query=elem")
+	got := readOne(t, c, "Z")
+	if got != 0.127 {
+		t.Fatalf("Z = %v", got)
+	}
+	if n := srv.QueryCount(sl651codec.FuncQueryElem); n != 1 {
+		t.Fatalf("3AH 次数 = %d, want 1", n)
+	}
+	if n := srv.QueryCount(sl651codec.FuncQueryAll); n != 0 {
+		t.Fatalf("37H 不应出现，实际 %d", n)
+	}
+	// 同一点表随后的读取（Z 去重 + PT）各发一条 3AH，共 3 条。
+	readOne(t, c, "Z")
+	readOne(t, c, "PT")
+	if n := srv.QueryCount(sl651codec.FuncQueryElem); n != 3 {
+		t.Fatalf("3AH 次数 = %d, want 3（三次读取各一条）", n)
+	}
+}
+
+// query=per：Read 发 38H 时段查询，应答与标准报文同形、照常解析。
+func TestReadPerQuery(t *testing.T) {
+	srv := startSim(t)
+	c := openConn(t, srv, "query=per")
+	got := readOne(t, c, "Z")
+	if got != 0.127 {
+		t.Fatalf("Z = %v", got)
+	}
+	if n := srv.QueryCount(sl651codec.FuncQueryPer); n != 1 {
+		t.Fatalf("38H 次数 = %d, want 1", n)
+	}
+}
+
+// query 非法值在 Open 阶段就拒绝，不能悄悄退回 37H。
+func TestOpenRejectsBadQueryMode(t *testing.T) {
+	srv := startSim(t)
+	dev := model.Device{
+		ID: "station", ChannelID: "ch", Enabled: true,
+		Interval: model.Duration(time.Second),
+		Timeout:  model.Duration(time.Second),
+		Labels: map[string]string{
+			"address": stationLabel(srv.Station()),
+			"options": "query=hourly",
+		},
+	}
+	_, err := New().Open(context.Background(), driver.OpenConfig{
+		Channel: model.Channel{
+			ID: "ch", Protocol: "sl651",
+			Transport: model.Transport{Kind: "tcp", Address: srv.Addr()},
+			Timeout:   model.Duration(800 * time.Millisecond),
+		},
+		Device: dev,
+	})
+	if err == nil || driver.KindOf(err) != driver.ErrUnsupported {
+		t.Fatalf("err = %v, want unsupported", err)
 	}
 }

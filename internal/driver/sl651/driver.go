@@ -81,6 +81,13 @@ const (
 	defaultTimeout = 3 * time.Second
 )
 
+// 查询模式：Read 用哪一类查询帧取数。
+const (
+	QueryAll  = "all"  // 37H 实时数据（全要素，默认）
+	QueryPer  = "per"  // 38H 时段数据
+	QueryElem = "elem" // 3AH 指定要素（正文带点表的引导符列表）
+)
+
 // Options 是设备级配置开关（来自 labels.options）。
 type Options struct {
 	// Retries 是同一请求的重发次数（不含首次）。
@@ -91,6 +98,9 @@ type Options struct {
 	CenterAddr int
 	// Password 是 2 字节密码（十六进制，如 "1234"）。
 	Password [2]byte
+	// Query 是查询模式：all=37H（全要素）、per=38H（时段）、elem=3AH（指定
+	// 要素，只回点表里出现过的引导符——终端要素多、点表少时省带宽）。
+	Query string
 }
 
 // Driver 是 SL 651 中心站驱动。
@@ -138,7 +148,7 @@ func (d *Driver) Meta() driver.Meta {
 			{Name: "concurrency", Label: "并发上限", Type: "int", Default: 1, Scope: "channel",
 				Help: "半双工总线必须串行；同一物理串口由多个通道共享时按总线锁排队"},
 			{Name: "labels.options", Label: "通信开关", Type: "string", Default: "", Scope: "device",
-				Help: "retries=2,gap=30ms,center=1,password=1234"},
+				Help: "retries=2,gap=30ms,center=1,password=1234,query=all|per|elem（Read 用 37H/38H/3AH 查询）"},
 		},
 		PointFields: []driver.ConfigField{
 			{Name: "labels.address", Label: "要素地址", Type: "string", Required: true, Scope: "point",
@@ -155,7 +165,10 @@ func (d *Driver) Open(ctx context.Context, cfg driver.OpenConfig) (driver.Conn, 
 	if err != nil {
 		return nil, err
 	}
-	opt := parseOptions(cfg.Device)
+	opt, err := parseOptions(cfg.Device)
+	if err != nil {
+		return nil, err
+	}
 
 	l, err := link.Open(ctx, link.Options{
 		Proto:       "sl651",
@@ -226,9 +239,10 @@ func toBCD(n int) int {
 }
 
 // parseOptions 解析 labels.options。
-func parseOptions(dev model.Device) Options {
-	opt := Options{Retries: defaultRetries, Gap: defaultGap}
+func parseOptions(dev model.Device) (Options, error) {
+	opt := Options{Retries: defaultRetries, Gap: defaultGap, Query: QueryAll}
 	raw := dev.Labels["options"]
+	var queryErr error
 	for _, part := range strings.Split(raw, ",") {
 		part = strings.TrimSpace(part)
 		if part == "" {
@@ -265,12 +279,22 @@ func parseOptions(dev model.Device) Options {
 					}
 				}
 			}
+		case "query":
+			// 查询模式选错会整批读错数据语义（37H 实时 vs 38H 时段），必须
+			// 报错而不是悄悄回 all。既有键的「越界忽略」是文档化的既定行为
+			// （见 SDK 矩阵），不在本次一并改动。
+			if !hasVal || (val != QueryAll && val != QueryPer && val != QueryElem) {
+				queryErr = driver.E(driver.ErrUnsupported, "open", dev.ID,
+					fmt.Sprintf("options.query %q 必须是 all | per | elem", val), false, nil)
+				continue
+			}
+			opt.Query = val
 		}
 	}
 	if opt.Gap < 0 {
 		opt.Gap = 0
 	}
-	return opt
+	return opt, queryErr
 }
 
 // ---------------------------------------------------------------------------
@@ -357,13 +381,28 @@ func (c *conn) Read(ctx context.Context, spans []driver.ReadSpan) ([]driver.RawS
 		return allFailed(refs, c.linkErr), c.linkErr
 	}
 
-	// 发 37H 查询全部。
+	// 按配置选查询帧：37H 全要素（默认）/ 38H 时段 / 3AH 指定要素。
+	// 3AH 的正文带点表的引导符列表——终端要素多而点表少时，一条 3AH 只把
+	// 需要的要素取回来，而不是整帧全量。
 	b := sl651codec.Builder{
 		Center:   c.opt.CenterAddr,
 		Station:  c.addr,
 		Password: c.opt.Password,
 	}
-	req, err := b.BuildQuery(sl651codec.FuncQueryAll, 1, time.Now())
+	var req []byte
+	var err error
+	switch c.opt.Query {
+	case QueryElem:
+		guides, gerr := guidesOf(refs)
+		if gerr != nil {
+			return allFailed(refs, gerr), gerr
+		}
+		req, err = b.BuildQueryElem(1, time.Now(), guides)
+	case QueryPer:
+		req, err = b.BuildQuery(sl651codec.FuncQueryPer, 1, time.Now())
+	default: // QueryAll
+		req, err = b.BuildQuery(sl651codec.FuncQueryAll, 1, time.Now())
+	}
 	if err != nil {
 		return allFailed(refs, err), err
 	}
@@ -646,6 +685,29 @@ func decodeRef(rep *sl651codec.Report, ref driver.PointRef) (driver.RawSample, e
 func guideOf(a model.Address) (byte, error) {
 	g, _, err := guideOfWithSlot(a)
 	return g, err
+}
+
+// guidesOf 收集一次读取涉及的要素引导符（去重、保序）。
+//
+// 3AH 的正文只写「引导符 + 数据定义字节」，不写段号——应答携带该要素的
+// 全部段，段筛选发生在解码侧。个别地址非法时不阻塞整批：那些点在解码
+// 阶段自然会得到 address_error；全部非法才是致命的（3AH 至少一个引导符）。
+func guidesOf(refs []driver.PointRef) ([]byte, error) {
+	seen := map[byte]bool{}
+	out := make([]byte, 0, len(refs))
+	for _, ref := range refs {
+		g, err := guideOf(ref.Address)
+		if err != nil || seen[g] {
+			continue
+		}
+		seen[g] = true
+		out = append(out, g)
+	}
+	if len(out) == 0 {
+		return nil, driver.E(driver.ErrAddress, "read", "",
+			"query=elem 需要点表里至少一个合法要素地址", false, nil)
+	}
+	return out, nil
 }
 
 // guideOfWithSlot 解析 `<要素>` 或 `<要素>[<段号>]`。

@@ -187,8 +187,15 @@ func IsUplinkReport(f byte) bool {
 // 只看功能码无法区分「下行查询」和「上行应答」，必须配合帧的 Dir 字段。
 // 漏掉这一条的症状很隐蔽：自报能解析、查询应答全被当成「不是上行报」丢掉，
 // 而 total 上 BCD 与 CRC 都正确。
+//
+// 39H 不在列：本实现不解析人工置数数据（ParseReport 的分派表没有它），
+// 把它算进「可解析」只会让调用方先过 IsResponse、再在 ParseReport 里撞
+// ErrUnsupported——两条口径必须一致。
 func IsResponse(f byte) bool {
-	return IsUplinkReport(f) || IsQuery(f)
+	if IsUplinkReport(f) {
+		return true
+	}
+	return f == FuncQueryAll || f == FuncQueryPer || f == FuncQueryElem
 }
 
 // IsQuery 判断功能码是否为「中心站查询」下行帧。
