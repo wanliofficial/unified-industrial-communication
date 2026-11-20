@@ -990,6 +990,33 @@ internal static class ContractTests
                  byId.ContainsKey("mqtt"),
                 "the built-in drivers are present");
 
+            // modbus-rtu / modbus-ascii 与 modbus-tcp 同源（能力/寻址一致），但走串口：传输是 serial、
+            // 名字各异、配置字段是「串口 + 波特率」而非「主机 + 端口」。这三点此前只断言了「在场」，
+            // 可控制台「驱动」页正是按它们生成表单——传输或字段名漏一项，用户就填不对、点表里选了
+            // modbus-rtu 却拿到 TCP 的 host/port 表单。这里把差异点钉住。
+            foreach (var (id, name) in new[] { ("modbus-rtu", "Modbus RTU"), ("modbus-ascii", "Modbus ASCII") })
+            {
+                var variant = byId[id];
+                t.Equal(name, variant.GetProperty("name").GetString(), $"{id} name is exposed");
+                t.Equal("serial", variant.GetProperty("transports")[0].GetString(),
+                    $"{id} runs over a serial line, not tcp");
+                t.Equal("master", variant.GetProperty("roles")[0].GetString(), $"{id} is a master");
+                t.Equal("register", variant.GetProperty("addressKinds")[0].GetString(),
+                    $"{id} uses register addressing");
+
+                var fields = variant.GetProperty("configFields").EnumerateArray()
+                    .ToDictionary(f => f.GetProperty("key").GetString()!, f => f.Clone(), StringComparer.Ordinal);
+                t.Equal(2, fields.Count, $"{id} declares a serial port and a baud rate");
+                t.Equal("串口", fields["transport.port"].GetProperty("label").GetString(),
+                    $"{id} names the port field after a serial port");
+                t.Equal("string", fields["transport.port"].GetProperty("type").GetString(),
+                    $"{id} serial port is a device path, not a number");
+                t.Equal("int", fields["transport.baud"].GetProperty("type").GetString(),
+                    $"{id} declares the baud rate");
+                t.Ok(fields.ContainsKey("transport.host") is false,
+                    $"{id} has no tcp host field");
+            }
+
             var modbus = byId["modbus-tcp"];
             t.Equal("1.0", modbus.GetProperty("sdkVersion").GetString(), "sdk version is exposed");
             t.Equal("supported", Cap(modbus, "read"), "modbus can read");
