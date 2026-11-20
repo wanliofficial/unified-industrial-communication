@@ -31,6 +31,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"net"
 	"os"
 	"strconv"
@@ -144,6 +145,8 @@ func (d *Driver) Meta() driver.Meta {
 				Help:        "present-value / object-name / units / priority-array 等，也可写属性编号"},
 			{Name: "address.propIndex", Label: "数组下标", Type: "int", Default: 0, Scope: "point",
 				Help: "读取数组属性时的下标；0 表示不带下标（读整个属性）"},
+			{Name: "address.priority", Label: "写优先级", Type: "int", Default: 0, Scope: "point",
+				Help: "写命令的优先级 1..16（0=不携带）；binary-output / analog-output 等可命令对象使用"},
 		},
 		Description: "BACnet MS/TP 主站：串行总线单主站轮询从站对象（ReadProperty / WriteProperty）",
 	}
@@ -678,6 +681,7 @@ type pointPlan struct {
 	instance int
 	property int
 	index    int
+	priority int
 }
 
 func planPoint(p driver.PointRef) (pointPlan, error) {
@@ -705,9 +709,13 @@ func planPoint(p driver.PointRef) (pointPlan, error) {
 		return pointPlan{}, driver.E(driver.ErrAddress, "read", "",
 			fmt.Sprintf("point %q: propIndex must be >= 0", p.ID), false, nil)
 	}
+	if p.Address.Priority < 0 || p.Address.Priority > 16 {
+		return pointPlan{}, driver.E(driver.ErrAddress, "read", "",
+			fmt.Sprintf("point %q: priority %d out of range 0..16", p.ID, p.Address.Priority), false, nil)
+	}
 	return pointPlan{
 		ref: p, objType: objType, instance: p.Address.Instance,
-		property: property, index: p.Address.PropIndex,
+		property: property, index: p.Address.PropIndex, priority: p.Address.Priority,
 	}, nil
 }
 
@@ -889,7 +897,7 @@ func (c *connState) writeOne(ctx context.Context, req driver.WriteRequest) (driv
 	}
 	invoke := c.nextInvoke()
 	apdu, err := bacnetcodec.WritePropertyRequest(invoke, plan.objType, plan.instance,
-		plan.property, plan.index, 0, appValue)
+		plan.property, plan.index, plan.priority, appValue)
 	if err != nil {
 		e := driver.E(driver.ErrInternal, "write", c.cfg.Device.ID, err.Error(), false, err)
 		return writeFail(req, e), e
@@ -945,6 +953,12 @@ func encodeWriteValue(plan pointPlan, req driver.WriteRequest) ([]byte, error) {
 		}
 	}
 
+	// NULL 写（平台文本值 "null"，大小写不敏感）：BACnet 的释放语义靠它，
+	// 与 BACnet/IP 驱动的 NULL 路径保持同一入口（见那边详注）。
+	if req.Value.Type == model.TypeString && strings.EqualFold(strings.TrimSpace(req.Value.Text), "null") {
+		return bacnetcodec.EncodeApplicationValue(bacnetcodec.AppNull, 0, 0, nil, false)
+	}
+
 	var (
 		u   uint64
 		f   float64
@@ -970,7 +984,11 @@ func encodeWriteValue(plan pointPlan, req driver.WriteRequest) ([]byte, error) {
 		b = []byte(req.Value.Text)
 	case bacnetcodec.AppEnumerated, bacnetcodec.AppUnsigned:
 		n, ok := req.Value.AsFloat()
-		if !ok || n < 0 || n > float64(^uint32(0)) {
+		// ENUMERATED / UNSIGNED 在 BACnet 里是整数值：带小数的 1.5 强转成
+		// uint64 会被静默截成 1，设备收到并接受了另一个值。和 BACnet/IP
+		// 驱动（以及 mc/s7/enip 的 checkRange）一样，非整数在写报文前判错
+		// 而不是悄悄改掉。
+		if !ok || n != math.Trunc(n) || n < 0 || n > float64(^uint32(0)) {
 			err = fmt.Errorf("point %q: enumerated property requires a non-negative integer, got %s", req.PointID, req.Value.String())
 		} else {
 			u = uint64(n)
@@ -984,8 +1002,13 @@ func encodeWriteValue(plan pointPlan, req driver.WriteRequest) ([]byte, error) {
 		}
 	default: // AppReal
 		n, ok := req.Value.AsFloat()
-		if !ok {
-			err = fmt.Errorf("point %q: numeric property requires a number, got %s", req.PointID, req.Value.String())
+		// REAL 在 BACnet 里是 4 字节 float32。一个合法的 float64 可能超出
+		// float32 范围，强转后变 +Inf / 下溢成 0——设备会原样接受，写下去
+		// 的是另一个值。与 BACnet/IP 驱动的同款防护保持一致。
+		if !ok || math.IsNaN(n) || math.IsInf(n, 0) {
+			err = fmt.Errorf("point %q: numeric property requires a finite number, got %s", req.PointID, req.Value.String())
+		} else if f32 := float32(n); math.IsInf(float64(f32), 0) || f32 == 0 && n != 0 {
+			err = fmt.Errorf("point %q: value %s out of range for REAL (float32)", req.PointID, req.Value.String())
 		} else {
 			f = n
 		}
