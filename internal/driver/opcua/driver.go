@@ -69,11 +69,16 @@ func (d *Driver) Meta() driver.Meta {
 		// 与字符串标识，现场那 90% 的 `ns=2;s=...` 点位就写不出来。
 		AddressKinds: []model.AddressKind{model.AddressSymbol},
 		Capabilities: driver.Capabilities{
-			Read:        driver.CapSupported,
-			Write:       driver.CapSupported,
-			Subscribe:   driver.CapSupported,
-			Browse:      driver.CapUnsupported,
-			Discovery:   driver.CapExperimental,
+			Read:      driver.CapSupported,
+			Write:     driver.CapSupported,
+			Subscribe: driver.CapSupported,
+			Browse:    driver.CapUnsupported,
+			// Discovery 如实声明 unsupported：驱动没有 GetEndpoints/
+			// FindServers 客户端（端点信息只在 CreateSession 响应里捎带
+			// 解析 PolicyID）。曾虚标 experimental 且 Description 宣传
+			// 「端点发现」，而运行时与 API 都没有发现入口——虚标只会让
+			// 配置界面出现一个永远点不动的按钮。
+			Discovery:   driver.CapUnsupported,
 			MultiRead:   driver.CapSupported,
 			BitAccess:   driver.CapUnsupported,
 			StructTypes: driver.CapUnsupported,
@@ -100,7 +105,7 @@ func (d *Driver) Meta() driver.Meta {
 					"float32", "float64", "string", "bytes"}, Scope: "point",
 				Help: "写入时按此类型编码；读取时超出范围会判坏而不是截断"},
 		},
-		Description: "OPC UA 二进制客户端（SecurityPolicy None，匿名），支持批量读、写、订阅推送与端点发现",
+		Description: "OPC UA 二进制客户端（SecurityPolicy None，匿名），支持批量读、写、订阅推送",
 	}
 }
 
