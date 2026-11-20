@@ -288,6 +288,11 @@ internal static class LifecycleTests
     /// </summary>
     private static async Task UnpersistedApplyRollsTheDevicesBack(TestContext t)
     {
+        // 用 IsWindows 而不是「非 Linux/非 macOS」：分析器只认这种形状的守卫，
+        // 换成反向判断就退化成 CA1416 警告（与 FaultTests 的 chmod 注入保持一致）。
+        if (OperatingSystem.IsWindows())
+            throw new SkipException("chmod-based permission injection needs a POSIX filesystem");
+
         using var logs = LoggerFactory.Create(b => { b.ClearProviders(); });
         var ring = new RingBufferLogProvider(128);
 
