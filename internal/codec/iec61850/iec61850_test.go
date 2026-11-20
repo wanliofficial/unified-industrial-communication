@@ -642,7 +642,7 @@ func TestInitiateShape(t *testing.T) {
 		{0x83, 0x01, 0x0A},             // nesting level = 10
 		{0xA4},                         // initRequestDetail
 		{0x81, 0x03, 0x05, 0xF1, 0x00}, // parameterCBB
-		{0x82, 0x0C, 0x03},             // servicesSupported，3 个填充位
+		{0x82, 0x0B, 0x03},             // servicesSupported，3 个填充位（位图收窄到实际实现的服务）
 	} {
 		if !bytes.Contains(pdu, marker) {
 			t.Errorf("initiate is missing %x: %x", marker, pdu)

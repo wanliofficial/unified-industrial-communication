@@ -69,15 +69,15 @@ var parameterCBB = []byte{0xF1, 0x00}
 // servicesSupported 是本端支持的服务位图（85 位，11 字节）。
 //
 // 位序与服务标签无关，是标准里一张固定的表。这里声明的集合与驱动实际实现
-// 的服务一致：读、写、模型浏览、状态、标识、命名变量表。声明一个不实现的
-// 服务，对端可能会用它来回应，然后我们只能报「不支持」。
+// 的服务一致：getNameList（模型浏览）、read、write、getVarAccessAttrs（单点
+// 描述）。位图曾经超卖 readJournal、informationReport、named-variable-list
+// 三族与 status/identify——会自发 InformationReport 的真实 IED 正是看着
+// 位图决定要不要发的，声明了却没有任何处理路径，那条报文只会把当前请求
+// 顶成空转到超时。宁可少声明，也不声明做不到的服务。
 var servicesSupported = []byte{
-	0xEE, // status | getNameList | identify | read | write | getVarAccessAttrs
-	0x1C, // defineNamedVariableList | getNamedVariableListAttrs | deleteNamedVariableList
+	0x3A, // getNameList | read | write | getVarAccessAttrs
 	0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-	0x40, // readJournal
-	0x01, // informationReport
-	0x10, // conclude
+	0x00, 0x00, 0x00,
 }
 
 // ---------------------------------------------------------------------------
