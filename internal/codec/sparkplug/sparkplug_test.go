@@ -464,3 +464,107 @@ func TestDecodeMetricRejectsMissingValueField(t *testing.T) {
 		t.Fatalf("metrics = %+v", p.Metrics)
 	}
 }
+
+// Int8/16/32、UInt8/16/32 在线上走 int_value（uint32 承载），编码时按补码
+// 静默截断：Int8 收 300 发出 44、Int32 收 2^40 发出 0。截断后的值是「看起来
+// 合法的另一个值」，消费方无从察觉，比直接报错危险得多。编码侧必须像解码侧
+// 的 declaresInt32 一样在越界时拒绝，而不是回绕。
+func TestEncodeRejectsIntValueOverflow(t *testing.T) {
+	cases := []struct {
+		dt   DataType
+		bad  int64
+		lo   int64
+		hi   int64
+		badU uint64
+	}{
+		{TypeInt8, 300, math.MinInt8, math.MaxInt8, 0},
+		{TypeInt16, 100000, math.MinInt16, math.MaxInt16, 0},
+		{TypeInt32, 1 << 40, math.MinInt32, math.MaxInt32, 0},
+		{TypeUInt8, 0, 0, math.MaxUint8, 256},
+		{TypeUInt16, 0, 0, math.MaxUint16, 1 << 16},
+		{TypeUInt32, 0, 0, math.MaxUint32, 1 << 32},
+	}
+	for _, c := range cases {
+		// 越界的 int64 值必须被拒绝。
+		if c.bad > c.hi || c.bad < c.lo {
+			m := Metric{Name: "x", DataType: c.dt, Value: c.bad}
+			raw, err := Payload{Metrics: []Metric{m}}.Encode()
+			if err == nil {
+				t.Fatalf("%v: value %d overflowed but Encode accepted it (bytes %x)", c.dt, c.bad, raw)
+			}
+		}
+		// 越界的 uint64 值必须被拒绝。
+		if c.badU > uint64(c.hi) {
+			m := Metric{Name: "x", DataType: c.dt, Value: c.badU}
+			raw, err := Payload{Metrics: []Metric{m}}.Encode()
+			if err == nil {
+				t.Fatalf("%v: value %d overflowed but Encode accepted it (bytes %x)", c.dt, c.badU, raw)
+			}
+		}
+	}
+}
+
+// 边界值（恰好等于 Min/Max）与 Int64/DateTime（走 long_value，不做位宽收敛）
+// 必须能正常编码并往返，证明收敛检查没有误伤合法值。
+func TestEncodeAcceptsIntBoundariesAndWideTypes(t *testing.T) {
+	cases := []struct {
+		dt   DataType
+		val  int64
+		want int64
+	}{
+		{TypeInt8, math.MinInt8, math.MinInt8},
+		{TypeInt8, math.MaxInt8, math.MaxInt8},
+		{TypeInt16, math.MinInt16, math.MinInt16},
+		{TypeInt16, math.MaxInt16, math.MaxInt16},
+		{TypeInt32, math.MinInt32, math.MinInt32},
+		{TypeInt32, math.MaxInt32, math.MaxInt32},
+		// Int64/DateTime 走 long_value，全域可表达，不做截断。
+		{TypeInt64, 1 << 40, 1 << 40},
+		{TypeDateTime, 1 << 40, 1 << 40},
+	}
+	for _, c := range cases {
+		raw, err := Payload{Metrics: []Metric{{Name: "x", DataType: c.dt, Value: c.val}}}.Encode()
+		if err != nil {
+			t.Fatalf("%v: %v", c.dt, err)
+		}
+		p, err := Decode(raw)
+		if err != nil {
+			t.Fatalf("decode %v: %v", c.dt, err)
+		}
+		got, ok := p.Metrics[0].Value.(int64)
+		if !ok || got != c.want {
+			t.Fatalf("%v: decoded %v(%T), want %d", c.dt, p.Metrics[0].Value, p.Metrics[0].Value, c.want)
+		}
+	}
+}
+
+// PropertySet 是 keys/values 平行数组。空键会被 str() 当缺省字段丢掉、其值却
+// 照写，导致 keys 比 values 短一格、后续键值整体错位。空键在 Sparkplug 里没有
+// 意义，编码侧必须在 validate 阶段拒绝，而不是发出静默错位的集合。
+func TestEncodeRejectsEmptyPropertyKey(t *testing.T) {
+	m := Metric{Name: "x", DataType: TypeString, Value: "v",
+		Properties: map[string]string{"": "blank", "engUnit": "V"}}
+	raw, err := Payload{Metrics: []Metric{m}}.Encode()
+	if err == nil {
+		t.Fatalf("empty property key accepted; Encode must reject it (bytes %x)", raw)
+	}
+}
+
+// 正常的多属性必须按键排序后对齐编解码，证明拒绝空键的同时没有破坏合法的
+// PropertySet 对齐。
+func TestEncodePropertySetRoundTrip(t *testing.T) {
+	m := Metric{Name: "x", DataType: TypeString, Value: "v",
+		Properties: map[string]string{"engUnit": "V", "quality": "good"}}
+	raw, err := Payload{Metrics: []Metric{m}}.Encode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	p, err := Decode(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := p.Metrics[0].Properties
+	if got["engUnit"] != "V" || got["quality"] != "good" || len(got) != 2 {
+		t.Fatalf("properties misaligned: %+v", got)
+	}
+}

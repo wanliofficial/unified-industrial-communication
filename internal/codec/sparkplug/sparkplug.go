@@ -262,12 +262,27 @@ func (m Metric) validate() error {
 	}
 	switch m.DataType {
 	case TypeInt8, TypeInt16, TypeInt32, TypeInt64, TypeDateTime:
-		if _, ok := m.Value.(int64); !ok {
+		v, ok := m.Value.(int64)
+		if !ok {
 			return fmt.Errorf("sparkplug: metric %q datatype %v needs int64, got %T", m.Name, m.DataType, m.Value)
 		}
+		// 取值范围必须在这里收敛。Int8/16/32 在线上走 int_value（uint32 承载），
+		// 编码时按补码静默截断——Int8 收 300 会发出 44，Int32 收 2^40 会发出 0。
+		// 截断后是一个「看起来合法的另一个值」，消费方无从察觉，属于比报错严重
+		// 得多的静默数据损坏，因此越界一律拒绝而不是回绕。Int64/DateTime 走
+		// long_value（uint64），int64 全域可表达，无需检查。
+		if !inIntRange(m.DataType, v) {
+			return fmt.Errorf("sparkplug: metric %q value %d out of range for datatype %v", m.Name, v, m.DataType)
+		}
 	case TypeUInt8, TypeUInt16, TypeUInt32, TypeUInt64:
-		if _, ok := m.Value.(uint64); !ok {
+		v, ok := m.Value.(uint64)
+		if !ok {
 			return fmt.Errorf("sparkplug: metric %q datatype %v needs uint64, got %T", m.Name, m.DataType, m.Value)
+		}
+		// 同 int 侧：UInt8/16/32 在线上走 int_value，超过位宽的高位会被丢弃，
+		// 静默变成一个更小的合法值。只有 UInt64 走 long_value 可全域承载。
+		if !inUIntRange(m.DataType, v) {
+			return fmt.Errorf("sparkplug: metric %q value %d out of range for datatype %v", m.Name, v, m.DataType)
 		}
 	case TypeFloat:
 		if _, ok := m.Value.(float32); !ok {
@@ -296,7 +311,46 @@ func (m Metric) validate() error {
 			return fmt.Errorf("sparkplug: metric %q has unsupported value type %T", m.Name, m.Value)
 		}
 	}
+	// PropertySet 是 keys/values 两条平行数组，解码按下标一一配对。编码侧
+	// 用 str() 写键，而 str 把空串当「缺省字段」省略——若某个键是空串，它会被
+	// 丢掉、它对应的值却照样写进 values，于是 keys 比 values 短一格，后面所有
+	// 键值全部错位一格（实测 {"":"blank","engUnit":"V"} 解出
+	// {"engUnit":"blank"}）。空键在 Sparkplug 里本就没有意义（键用来标识属性），
+	// 所以这里直接拒绝，而不是发出一个静默错位的 PropertySet。
+	for k := range m.Properties {
+		if k == "" {
+			return fmt.Errorf("sparkplug: metric %q has an empty property key", m.Name)
+		}
+	}
 	return nil
+}
+
+// inIntRange 报告 int64 值 v 能否无损装进 dt 声明的位宽。
+func inIntRange(dt DataType, v int64) bool {
+	switch dt {
+	case TypeInt8:
+		return v >= math.MinInt8 && v <= math.MaxInt8
+	case TypeInt16:
+		return v >= math.MinInt16 && v <= math.MaxInt16
+	case TypeInt32:
+		return v >= math.MinInt32 && v <= math.MaxInt32
+	default: // TypeInt64, TypeDateTime
+		return true
+	}
+}
+
+// inUIntRange 报告 uint64 值 v 能否无损装进 dt 声明的位宽。
+func inUIntRange(dt DataType, v uint64) bool {
+	switch dt {
+	case TypeUInt8:
+		return v <= math.MaxUint8
+	case TypeUInt16:
+		return v <= math.MaxUint16
+	case TypeUInt32:
+		return v <= math.MaxUint32
+	default: // TypeUInt64
+		return true
+	}
 }
 
 func boolBit(v bool) uint64 {

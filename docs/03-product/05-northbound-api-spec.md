@@ -1548,6 +1548,23 @@ NCMD 重生、断线后重发 BIRTH、停机 NDEATH 与 DISCONNECT、异常断�
 是 int32 语义、`long_value` 是 int64 语义）。编码侧 `validate` 已经拒绝非法
 组合，解码侧不校验就成了「自己发不出去，别人发过来照收」。
 
+编码侧还要在发出前拦住两类**静默数据损坏**：
+
+- **整型越界截断。** `Int8/16/32`、`UInt8/16/32` 在线上走 `int_value`（uint32
+  承载），编码时按补码截断——声明 `Int8` 收 300 会发出 44、声明 `Int32` 收
+  `2^40` 会发出 0。截断后的值是一个「看起来合法的另一个值」，消费方无从
+  察觉，比直接报错危险得多，因此 `validate` 按位宽收敛、越界一律拒绝；只有
+  `Int64`/`DateTime`（走 `long_value`）不做位宽检查。
+- **空 PropertySet 键导致键值错位。** PropertySet 是 `keys`/`values` 两条平行
+  数组，解码按下标一一配对。编码用 `str()` 写键，而 `str()` 把空串当「缺省
+  字段」省略——某个键是空串时它会被丢掉、它对应的值却照样写进 `values`，
+  于是 `keys` 比 `values` 短一格，后面所有键值整体错位（`{"":"blank",
+  "engUnit":"V"}` 会解出 `{"engUnit":"blank"}`）。空键在 Sparkplug 里没有意义
+  （键用来标识属性），`validate` 因此直接拒绝。
+
+两者都是 fail-closed：宁可让这一条消息编码失败（sink 计为失败、记录保留待
+重试），也不把错位的值或回绕的数发上总线让下游 SCADA 当成真值。
+
 #### 6.6.7 点位缓存不随配置删除收缩
 
 `internal/cache` 只提供 `Set`/`Get`/`List`/`Count`/`Subscribe`，**没有 `Delete`**。
