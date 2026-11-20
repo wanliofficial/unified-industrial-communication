@@ -39,6 +39,16 @@ func (d DI) Block() bool {
 	return d.DI3 == 0xFF || d.DI2 == 0xFF || d.DI1 == 0xFF || d.DI0 == 0xFF
 }
 
+// IsCommAddress 判断该 DI 是否是「通信地址」本身。
+//
+// 写这类 DI 成功后，表的寻址就变了，主站必须跟着改用新地址——否则这条
+// 连接从下一帧起全部超时。表号 04000103H 虽然同为 KindAddr，但它只是表
+// 的序列号，写它不改变寻址，不在此列。
+func (d DI) IsCommAddress() bool {
+	return d == DI{DI3: 0x04, DI2: 0x00, DI1: 0x01, DI0: 0x02} ||
+		d == DI{DI3: 0x04, DI2: 0x00, DI1: 0x04, DI0: 0x01}
+}
+
 // ParseDI 解析 8 位十六进制数据标识（DI3DI2DI1DI0 顺序）。
 func ParseDI(s string) (DI, error) {
 	s = strings.TrimSpace(s)

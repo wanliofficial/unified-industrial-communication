@@ -663,15 +663,29 @@ func (c *conn) writeOne(ctx context.Context, req driver.WriteRequest) driver.Wri
 		res.Quality = qualityOf(res.Err)
 		return res
 	}
-	if err := c.checkAddr(fr, "write"); err != nil {
+	// 写通信地址时表内部可能先改名再回执：回执带的是**新**地址。
+	// 回执地址与新旧任一匹配都算对——表确实应答了，把「地址已改」误判成
+	// 「总线上有另一台表在应答」会把成功的写报成协议错。
+	addrChanged := item.Kind == dlt645.KindAddr && di.IsCommAddress() && len(payload) == dlt645.AddrLen
+	var newAddr [dlt645.AddrLen]byte
+	if addrChanged {
+		copy(newAddr[:], payload)
+	}
+	if err := c.checkAddr(fr, "write"); err != nil && !(addrChanged && dlt645.MatchAddr(fr.Addr, newAddr)) {
 		res.Err = err
-		res.Quality = qualityOf(err)
+		res.Quality = qualityOf(res.Err)
 		return res
 	}
 	if err := dlt645.WriteAck(fr); err != nil {
 		res.Err = c.classify(di, "write", err)
 		res.Quality = qualityOf(res.Err)
 		return res
+	}
+	if addrChanged {
+		// 表已经改名：后续事务必须用新地址，否则这条连接从下一帧开始就
+		// 全部超时。调用方（配置）仍需自行更新，重连后以配置为准。
+		// （与 cjt188 写地址的处理保持一致。）
+		copy(c.addr[:], payload)
 	}
 	res.OK = true
 	res.Quality = model.QualityGood

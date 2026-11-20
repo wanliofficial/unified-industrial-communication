@@ -485,6 +485,7 @@ func (s *Server) handleWrite(fr dlt.Frame) ([]byte, bool) {
 		s.mu.Unlock()
 		return s.exception(fr, dlt.CtrlWrite, dlt.ErrOther), false
 	}
+	replyAddr := fr.Addr
 	if len(payload) > 0 {
 		v.Raw = append([]byte(nil), payload...)
 		// 写时钟同时推进内部时钟：读路径是从 s.clock 生成时间的，
@@ -494,11 +495,18 @@ func (s *Server) handleWrite(fr dlt.Frame) ([]byte, bool) {
 				s.clock = t
 			}
 		}
+		// 写通信地址立刻改变表的寻址：后续帧必须用新地址才命中本从站。
+		// 回执按「先改名再应答」的表建模——回执带的是新地址；真实设备
+		// 也可能带旧地址应答，主站对两种都必须接受。
+		if di.IsCommAddress() && len(payload) == dlt.AddrLen {
+			copy(s.addr[:], payload)
+			copy(replyAddr[:], payload)
+		}
 	}
 	s.values[di] = v
 	s.writes++
 	s.mu.Unlock()
-	return s.build(fr.Addr, dlt.CtrlWrite|dlt.BitReply, nil)
+	return s.build(replyAddr, dlt.CtrlWrite|dlt.BitReply, nil)
 }
 
 func (s *Server) handleBroadcastTime(fr dlt.Frame) {

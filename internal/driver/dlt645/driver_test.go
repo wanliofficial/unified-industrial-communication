@@ -1021,3 +1021,66 @@ func TestWriteTimeoutCarriesQuality(t *testing.T) {
 		t.Fatalf("kind = %v", driver.KindOf(res[0].Err))
 	}
 }
+
+// 写通信地址成功后必须回填连接内的地址：表已经改名，后续事务还发旧地址
+// 会整连接超时（回归：曾表现为「写成功、下一轮读全超时」）。回执带新地址
+// （表先改名再应答）也要接受，不能误判成「总线上有另一台表」。
+func TestWriteCommAddressBackfillsConnAddr(t *testing.T) {
+	srv := startSim(t)
+	dev := model.Device{
+		ID: "meter", ChannelID: "ch", Enabled: true,
+		Interval: model.Duration(time.Second),
+		Timeout:  model.Duration(2 * time.Second),
+		Labels:   map[string]string{"address": "000000000042", "options": "allow-write"},
+	}
+	c, err := New().Open(context.Background(), driver.OpenConfig{
+		Channel: model.Channel{ID: "ch", Protocol: "dlt645",
+			Transport: model.Transport{Kind: "tcp", Address: srv.Addr()},
+			Timeout:   model.Duration(2 * time.Second)},
+		Device: dev,
+	})
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer func() { _ = c.Close() }()
+
+	res, err := c.Write(context.Background(), []driver.WriteRequest{{
+		PointID: "addr",
+		Address: model.Address{Kind: model.AddressRegister, Area: "04000401", Bit: -1, Length: 6},
+		Value:   model.TextValue(model.TypeString, "000000000099"),
+	}})
+	if err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if !res[0].OK {
+		t.Fatalf("write failed: %v", res[0].Err)
+	}
+	// 连接内地址必须跟着表走（线上序：低字节在前）。
+	mc, ok := c.(*conn)
+	if !ok {
+		t.Fatalf("conn 类型 = %T", c)
+	}
+	want, aerr := dlt645codec.ParseAddr("000000000099")
+	if aerr != nil {
+		t.Fatalf("ParseAddr: %v", aerr)
+	}
+	if mc.addr != want {
+		t.Fatalf("回填地址 = %s, want %s",
+			dlt645codec.FormatAddr(mc.addr), dlt645codec.FormatAddr(want))
+	}
+	// 后续事务用新地址：读通信地址应该命中从站（旧地址会让从站静默超时）。
+	samples, rerr := c.Read(context.Background(), []driver.ReadSpan{{
+		ID: "s",
+		Points: []driver.PointRef{{
+			ID:       "addr",
+			Address:  model.Address{Kind: model.AddressRegister, Area: "04000401", Bit: -1, Length: 6},
+			DataType: model.TypeFloat64,
+		}},
+	}})
+	if rerr != nil {
+		t.Fatalf("read after rename: %v", rerr)
+	}
+	if samples[0].Quality != model.QualityGood {
+		t.Fatalf("read quality = %s, err = %v", samples[0].Quality, samples[0].Err)
+	}
+}
