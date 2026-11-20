@@ -185,8 +185,10 @@ func TestFaultInjection(t *testing.T) {
 	}
 }
 
+// disconnect 故障同样遵守 faultAt 门限：faultAt=1 时 Probe（第 1 次请求）
+// 与随后的 Write 命中注入点。
 func TestDisconnectAffectsProbeAndWrite(t *testing.T) {
-	c := open(t, map[string]string{"fault": "disconnect"})
+	c := open(t, map[string]string{"fault": "disconnect", "faultAt": "1"})
 	if err := c.Probe(context.Background()); driver.KindOf(err) != driver.ErrDisconnected {
 		t.Fatalf("probe err = %v", err)
 	}

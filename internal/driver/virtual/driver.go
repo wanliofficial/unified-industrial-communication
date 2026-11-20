@@ -75,16 +75,29 @@ type conn struct {
 	fault   string
 	faultAt int
 	started time.Time
+	probes  int
 	reads   int
+	writes  int
 	written map[string]model.Value
 	rand    *rand.Rand
 }
 
 func (c *conn) Probe(context.Context) error {
-	if c.fault == "disconnect" {
+	c.mu.Lock()
+	c.probes++
+	n := c.probes
+	c.mu.Unlock()
+	if c.hit(n) {
 		return driver.E(driver.ErrDisconnected, "probe", c.dev.ID, "injected disconnect", true, nil)
 	}
 	return nil
+}
+
+// hit 报告「第 n 次请求是否命中注入点」。所有请求计数共享同一序列
+// （probe/read/write 都从它取号），因此「第 n 次请求注入」对三个入口
+// 含义一致：到点就断，与请求来自哪个方法无关。
+func (c *conn) hit(n int) bool {
+	return c.fault != "none" && c.faultAt > 0 && n == c.faultAt
 }
 
 func (c *conn) Read(ctx context.Context, spans []driver.ReadSpan) ([]driver.RawSample, error) {
@@ -93,8 +106,10 @@ func (c *conn) Read(ctx context.Context, spans []driver.ReadSpan) ([]driver.RawS
 	n := c.reads
 	c.mu.Unlock()
 
-	if err := c.inject(n); err != nil {
-		return nil, err
+	if c.hit(n) {
+		if err := c.injectFault(); err != nil {
+			return nil, err
+		}
 	}
 	select {
 	case <-ctx.Done():
@@ -114,9 +129,13 @@ func (c *conn) Read(ctx context.Context, spans []driver.ReadSpan) ([]driver.RawS
 
 func (c *conn) Write(_ context.Context, reqs []driver.WriteRequest) ([]driver.WriteResult, error) {
 	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.fault == "disconnect" {
-		return nil, driver.E(driver.ErrDisconnected, "write", c.dev.ID, "injected disconnect", true, nil)
+	c.writes++
+	n := c.writes
+	c.mu.Unlock()
+	if c.hit(n) {
+		if err := c.injectFault(); err != nil {
+			return nil, err
+		}
 	}
 	out := make([]driver.WriteResult, 0, len(reqs))
 	for _, r := range reqs {
@@ -128,10 +147,9 @@ func (c *conn) Write(_ context.Context, reqs []driver.WriteRequest) ([]driver.Wr
 
 func (c *conn) Close() error { return nil }
 
-func (c *conn) inject(n int) error {
-	if c.fault == "none" || c.faultAt <= 0 || n != c.faultAt {
-		return nil
-	}
+// injectFault 返回当前故障对应的错误（调用方已确认命中注入点）。
+// 门限判定（faultAt）由 hit 负责，这里只负责「命中之后错成什么样」。
+func (c *conn) injectFault() error {
 	switch c.fault {
 	case "drop":
 		return driver.E(driver.ErrTimeout, "read", c.dev.ID, "injected packet drop", true, nil)
@@ -142,6 +160,7 @@ func (c *conn) inject(n int) error {
 	case "address":
 		return driver.E(driver.ErrAddress, "read", c.dev.ID, "injected address error", false, nil)
 	case "disconnect":
+		// 断连是临时性故障：collector 会重连后重试，不应因此熔断整台设备。
 		return driver.E(driver.ErrDisconnected, "read", c.dev.ID, "injected disconnect", true, nil)
 	}
 	return nil

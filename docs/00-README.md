@@ -1551,7 +1551,7 @@ obs  ← 所有包（不依赖任何内部包）
 | `internal/driver/opcua` | OPC UA 二进制主站（None/None + 匿名）；可选订阅推送 | 三层状态（TCP/通道/会话）分开判断；按 RequestId 过滤迟到响应；节点越界判坏不截断；订阅走独立第二条连接，Read 优先本地表、失效即回退真读 | 76% |
 | `internal/driver/mqtt` | MQTT 南向（订阅取数）：把推送型协议适配成拉取契约 | `Read` 无网络交互，只读本地最新值表；质量码只反映新鲜度（good/stale/bad 三档）；一条消息都没有不算断链，安静到一个窗口且 PING 失败才判链 | 77.4% |
 | `internal/driver/computed` | 计算点：表达式驱动，无物理链路 | 同设备依赖在一次 `Read` 内按拓扑序闭合；输入不可用则不计算、质量取最差并指名输入；整数越界判坏不截断；窗口聚合的数据来自只读 `OpenConfig.History`，缺失时显式失败；求值失败的错误归 `ErrProtocol` 而非 `ErrInternal`（计算点无物理链路，bad 永远来自表达式/输入，不是内部 bug） | 92.7% |
-| `internal/driver/virtual` | 虚拟设备（波形 + 故障注入） | 故障按「第 n 次请求」精确注入一次 | 98.6% |
+| `internal/driver/virtual` | 虚拟设备（波形 + 故障注入） | 故障按「第 n 次请求」精确注入一次；Probe/Read/Write 三个入口共享同一请求序列，`disconnect` 也遵守 `faultAt`（`faultAt<=0` 时从不断连，`>0` 时第 n 次请求起断），避免 `disconnect+faultAt>0` 成为永远建不起链、跑不到恢复的死配置 | 98.6% |
 | `internal/sim/modbus` | 内置 Modbus TCP 从站 | 复用同一份 codec，避免主从语义漂移 | 87.2% |
 | `internal/sim/s7` | 内置 S7 从站（内存 DB/M/I/Q 区；块目录/属性/上传） | 与主站共用 codec/s7；输入区只读；位写保邻位；DB 块内容直接从内存区域反向暴露，与读点位看到同一份数据；上传会话按连接隔离，End 后立即失效 | 80% |
 | `internal/opcuaserver` | 可复用的 OPC UA 服务端内核（地址空间、订阅/发布、标准节点） | 与主站共用 codec/opcua；未激活会话拒绝读写；Variant 类型必须与节点 DataType 一致；Publish 在独立 goroutine，响应按 RequestId 乱序返回；`NewSimulator` 提供演示地址空间 | 82.2% |
