@@ -326,9 +326,8 @@ public static class BacnetApdu
         // 正确做法是先解出应用标签拿到确切长度，再往后跳过恰好这么多字节，
         // 关闭标签只出现在值之后——它只可能有一个。
         var valueStart = i;
-        var (_, valueLen) = OpaqueTaggedLength(apdu, i, out var lengthError);
-        if (lengthError is not null)
-            return AckResult.Failure(lengthError);
+        if (!BacnetTags.TryMeasureApplicationValue(apdu, i, out _, out var valueLen, out var lengthError))
+            return AckResult.Failure(lengthError ?? "complex-ack property value is malformed");
         i += valueLen;
 
         if (i >= apdu.Length || !BacnetConstants.IsContextClosing(apdu[i]))
@@ -344,90 +343,6 @@ public static class BacnetApdu
             return AckResult.Failure("complex-ack property value is empty");
 
         return AckResult.Success(apdu.Slice(valueStart, valueLen).ToArray());
-    }
-
-    /// <summary>
-    /// 量出「应用标签 + 载荷」占用的总字节数，不解读值本身。
-    ///
-    /// ReadProperty 的 ACK 里属性值是一段不透明的应用标签字节：标签头给出长度，
-    /// 据此跳过恰好这么多字节就是关闭标签的位置。绝不能在值里逐字节找关闭标签——
-    /// 载荷可能撞上任意字节序列。
-    /// </summary>
-    private static (int Tag, int Length) OpaqueTaggedLength(
-        ReadOnlySpan<byte> apdu, int offset, out string? error)
-    {
-        error = null;
-        if (offset >= apdu.Length)
-        {
-            error = "complex-ack property value is empty";
-            return (0, 0);
-        }
-
-        var header = apdu[offset];
-        if ((header & BacnetConstants.ContextTagClassBit) != 0)
-        {
-            error = "complex-ack property value is a context tag, not an application value";
-            return (0, 0);
-        }
-
-        var tag = header >> 4;
-        var lvt = header & 0x07;
-        var cursor = offset + 1;
-
-        // boolean 与 null 的值就在标签头里：lvt 是 0/1（boolean）或 0（null），
-        // 后面没有载荷字节。按「1 + lvt」算会把后面的关闭标签当成载荷吞掉。
-        if (tag is BacnetConstants.TagNull or BacnetConstants.TagBoolean)
-            return (tag, 1);
-
-        if (lvt < 5)
-            return (tag, 1 + lvt); // 头 1 字节 + 短载荷
-
-        // LVT=5：后面跟扩展长度（1/254/255 字节，见 BacnetTags）。
-        if (cursor >= apdu.Length)
-        {
-            error = "complex-ack value declares an extended length but it is missing";
-            return (0, 0);
-        }
-
-        var first = apdu[cursor++];
-        int length;
-        int consumed;
-
-        if (first <= 253)
-        {
-            length = first;
-            consumed = 0;
-        }
-        else if (first == 254)
-        {
-            if (cursor + 2 > apdu.Length)
-            {
-                error = "complex-ack value declares a 2-byte extended length but it is truncated";
-                return (0, 0);
-            }
-            length = System.Buffers.Binary.BinaryPrimitives.ReadUInt16BigEndian(apdu.Slice(cursor, 2));
-            consumed = 2;
-        }
-        else
-        {
-            if (cursor + 4 > apdu.Length)
-            {
-                error = "complex-ack value declares a 4-byte extended length but it is truncated";
-                return (0, 0);
-            }
-            length = (int)System.Buffers.Binary.BinaryPrimitives.ReadUInt32BigEndian(apdu.Slice(cursor, 4));
-            consumed = 4;
-        }
-
-        cursor += consumed;
-
-        if (cursor + length > apdu.Length)
-        {
-            error = $"complex-ack value declares {length} payload byte(s) but only {apdu.Length - cursor} remain";
-            return (0, 0);
-        }
-
-        return (tag, cursor - offset + length);
     }
 
     private static AckResult ParseError(ReadOnlySpan<byte> apdu, byte expectedInvokeId)

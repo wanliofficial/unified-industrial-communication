@@ -186,8 +186,7 @@ public static class BacnetSlaveHandler
         // 值是不透明的应用标签字节：按标签头给出的确切长度跳过，不逐字节找关闭标签。
         // 否则写进像 real 1.25（44 3F A0 00 00）这种载荷里带 0x3F 的值会被从中间截断。
         var start = i;
-        var (_, valueLen) = TaggedSpanLength(apdu, i, out var lengthError);
-        if (lengthError is not null)
+        if (!BacnetTags.TryMeasureApplicationValue(apdu, i, out _, out var valueLen, out var lengthError))
         {
             trace = $"write-property {lengthError}";
             return BacnetApdu.BuildError(invokeId, BacnetConstants.ServiceWriteProperty, 2, 9);

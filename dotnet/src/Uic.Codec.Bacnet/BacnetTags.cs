@@ -346,6 +346,104 @@ public static class BacnetTags
         };
     }
 
+    /// <summary>
+    /// 量出 <paramref name="buffer"/> 里从 <paramref name="offset"/> 开始的「应用标签 + 载荷」
+    /// 占用多少字节，不解读值本身。
+    ///
+    /// 这是 ReadProperty-ACK、WriteProperty 请求与 ReadPropertyMultiple 三处共用的唯一实现：
+    /// 值是一段不透明的应用标签字节，必须先按标签头给出的确切长度跳过，才能找到其后的
+    /// 关闭标签。逐字节扫描找关闭标签是错的——载荷是任意字节，完全可能撞上一个合法的
+    /// 关闭标签（real 1.25 = 44 3F A0 00 00，第二个字节 0x3F 就是「上下文标签 3 的关闭」）。
+    ///
+    /// boolean 与 null 的值就在标签头里（LVT 即值），没有载荷字节，按「1 + lvt」算会把
+    /// 后面的关闭标签当成载荷吞掉。
+    /// </summary>
+    public static bool TryMeasureApplicationValue(
+        ReadOnlySpan<byte> buffer, int offset, out int tag, out int length, out string? error)
+    {
+        tag = 0;
+        length = 0;
+        error = null;
+
+        if (offset >= buffer.Length)
+        {
+            error = "value is empty";
+            return false;
+        }
+
+        var header = buffer[offset];
+        if ((header & BacnetConstants.ContextTagClassBit) != 0)
+        {
+            error = "value is a context tag, not an application value";
+            return false;
+        }
+
+        tag = header >> 4;
+        var lvt = header & 0x07;
+        var cursor = offset + 1;
+
+        if (tag is BacnetConstants.TagNull or BacnetConstants.TagBoolean)
+        {
+            length = 1;
+            return true;
+        }
+
+        if (lvt < 5)
+        {
+            length = 1 + lvt; // 头 1 字节 + 短载荷
+            return true;
+        }
+
+        if (cursor >= buffer.Length)
+        {
+            error = "value declares an extended length but it is missing";
+            return false;
+        }
+
+        var first = buffer[cursor++];
+        int payload;
+
+        if (first <= 253)
+        {
+            payload = first;
+        }
+        else if (first == 254)
+        {
+            if (cursor + 2 > buffer.Length)
+            {
+                error = "value declares a 2-byte extended length but it is truncated";
+                return false;
+            }
+            payload = BinaryPrimitives.ReadUInt16BigEndian(buffer.Slice(cursor, 2));
+            cursor += 2;
+        }
+        else
+        {
+            if (cursor + 4 > buffer.Length)
+            {
+                error = "value declares a 4-byte extended length but it is truncated";
+                return false;
+            }
+            var wide = BinaryPrimitives.ReadUInt32BigEndian(buffer.Slice(cursor, 4));
+            if (wide > int.MaxValue)
+            {
+                error = $"extended length {wide} exceeds what this build can buffer";
+                return false;
+            }
+            payload = (int)wide;
+            cursor += 4;
+        }
+
+        if (cursor + payload > buffer.Length)
+        {
+            error = $"value declares {payload} payload byte(s) but only {buffer.Length - cursor} remain";
+            return false;
+        }
+
+        length = cursor - offset + payload;
+        return true;
+    }
+
     // ---- 极小编码：线上整数不带前导零（BACnet 允许任意长度，最短是惯例）----
 
     private static byte[] MinimalUnsigned(ulong number)
