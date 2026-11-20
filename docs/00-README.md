@@ -1549,7 +1549,7 @@ obs  ← 所有包（不依赖任何内部包）
 | `internal/driver/modbus` | Modbus TCP + RTU + ASCII 主站 | 事务号递增；异常码分类（05 Acknowledge / 06 Busy 归可重试的临时故障，与 04 设备故障同档；01/02/03/08 不可重试）；部分失败不吞好样本；同串口事务串行；分帧类型参与端口冲突判定 | 82.7% |
 | `internal/driver/s7` | S7（S7comm）主站；块服务走独立一次性 `Session` | COTP/Setup 握手不可省；按协商 PDU 与 20 项上限切块；逐项返回码映射质量码；顶层 ACK 错误直接判协议错；块上传以 `param[1]` 判最后一片，失败也补 End 释放 PLC 会话 | 78.1% |
 | `internal/driver/opcua` | OPC UA 二进制主站（None/None + 匿名）；可选订阅推送 | 三层状态（TCP/通道/会话）分开判断；按 RequestId 过滤迟到响应；节点越界判坏不截断；订阅走独立第二条连接，Read 优先本地表、失效即回退真读 | 76% |
-| `internal/driver/mqtt` | MQTT 南向（订阅取数）：把推送型协议适配成拉取契约 | `Read` 无网络交互，只读本地最新值表；质量码只反映新鲜度（good/stale/bad 三档）；一条消息都没有不算断链，安静到一个窗口且 PING 失败才判链 | 77.4% |
+| `internal/driver/mqtt` | MQTT 南向（订阅取数）：把推送型协议适配成拉取契约 | `Read` 无网络交互，只读本地最新值表；质量码只反映新鲜度（good/stale/bad 三档）；一条消息都没有不算断链，安静到一个窗口且 PING 失败才判链；客户端 `Ping` 的等待者用 `chan error` 携带结论——链路在 PINGREQ 在飞期间断开时，并发的 Ping 也必须报失败而非误报成功 | 77.4% |
 | `internal/driver/computed` | 计算点：表达式驱动，无物理链路 | 同设备依赖在一次 `Read` 内按拓扑序闭合；输入不可用则不计算、质量取最差并指名输入；整数越界判坏不截断；窗口聚合的数据来自只读 `OpenConfig.History`，缺失时显式失败；求值失败的错误归 `ErrProtocol` 而非 `ErrInternal`（计算点无物理链路，bad 永远来自表达式/输入，不是内部 bug） | 92.7% |
 | `internal/driver/virtual` | 虚拟设备（波形 + 故障注入） | 故障按「第 n 次请求」精确注入一次；Probe/Read/Write 三个入口共享同一请求序列，`disconnect` 也遵守 `faultAt`（`faultAt<=0` 时从不断连，`>0` 时第 n 次请求起断），避免 `disconnect+faultAt>0` 成为永远建不起链、跑不到恢复的死配置 | 98.6% |
 | `internal/sim/modbus` | 内置 Modbus TCP 从站 | 复用同一份 codec，避免主从语义漂移 | 87.2% |

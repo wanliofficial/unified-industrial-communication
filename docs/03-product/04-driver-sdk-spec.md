@@ -1301,6 +1301,11 @@ QoS 取 1：控制命令不能是 fire-and-forget。
    `PINGREQ → PINGRESP` 往返；往返失败才返回 `ErrDisconnected`，让上层重建连接。
 3. `Ping` **必须等 PINGRESP**。写成功不算活着——这是上面第二行的直接推论。
    PINGRESP 报文里没有 packet id，因此同一时刻只能有一次在飞的 PINGREQ（单飞）。
+   单飞意味着后来的 `Ping` 会等前一次的结果——这个「结果」必须能区分**成功**
+   （收到 PINGRESP）与**失败**（链路在 PINGREQ 在飞期间断开）。若等待信号被
+   `close(chan struct{})` 一关了之，后到的 `Ping` 无法区分这两种情况，会在
+   死链路上误报成功。本实现用 `chan error`：PINGRESP 送 `nil`、链路断开送
+   「connection lost before PINGRESP」。
 
 `Probe`（手工探活 / 熔断后的探测）走同一条路径。keepalive 循环也等 PINGRESP，
 所以半死链路在后台就会被打断，不必等到某个点位彻底 stale 才暴露。

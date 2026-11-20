@@ -34,8 +34,13 @@ type Client struct {
 
 	// pingWait 是「等 PINGRESP」的等待者。PINGRESP 报文里没有 packet id，
 	// 所以不能复用 pending：同时只能有一个在飞的 PINGREQ。
+	//
+	// 用 chan error 而不是 chan struct{}：channel 会被三方关闭——PINGRESP
+	//（成功）、dropConn（链路已死）。若只传 struct{}，后到的 Ping 无法区分
+	// 「链路还活着」与「链路刚断」，会在死链路上误报成功（nil）。带上 error
+	// 后，关闭方显式给出结论：PINGRESP 送 nil，dropConn 送连接已断。
 	pingMu   sync.Mutex
-	pingWait chan struct{}
+	pingWait chan error
 
 	done     chan struct{}
 	doneOnce sync.Once
@@ -393,6 +398,11 @@ func (c *Client) Publish(ctx context.Context, m Message) error {
 	}
 }
 
+// errPingConnLost 是链路在 PINGREQ 在飞期间断开时，发给所有等 PINGRESP
+// 等待者的错误。用它而不是裸 errors.New 是为了让等待者能识别「这不是超时、
+// 是连接已断」。
+var errPingConnLost = errors.New("mqtt: connection lost before PINGRESP")
+
 // Ping 做一次真正的往返探测：发 PINGREQ 并等 PINGRESP。
 //
 // 只「写成功」不算活着——写进内核缓冲就返回成功，对端早就没了也看不出来。
@@ -402,15 +412,16 @@ func (c *Client) Ping(ctx context.Context) error {
 	if err := c.Connect(ctx); err != nil {
 		return err
 	}
-	wait := make(chan struct{})
 	c.pingMu.Lock()
 	if c.pingWait != nil {
 		// 已有一次在飞的 PINGREQ：等它就行，不必叠加。
 		prev := c.pingWait
 		c.pingMu.Unlock()
 		select {
-		case <-prev:
-			return nil
+		case err := <-prev:
+			// prev 被 PINGRESP 关闭时是 nil，被 dropConn 关闭时是连接已断；
+			// 不能把后者当成成功返回。
+			return err
 		case <-time.After(c.opt.AckTimeout):
 			return fmt.Errorf("mqtt: no PINGRESP within %s", c.opt.AckTimeout)
 		case <-ctx.Done():
@@ -419,6 +430,7 @@ func (c *Client) Ping(ctx context.Context) error {
 			return errors.New("mqtt: client closed")
 		}
 	}
+	wait := make(chan error, 1)
 	c.pingWait = wait
 	c.pingMu.Unlock()
 	defer func() {
@@ -446,8 +458,8 @@ func (c *Client) Ping(ctx context.Context) error {
 	timer := time.NewTimer(c.opt.AckTimeout)
 	defer timer.Stop()
 	select {
-	case <-wait:
-		return nil
+	case err := <-wait:
+		return err
 	case <-timer.C:
 		c.dropConn(conn)
 		return fmt.Errorf("mqtt: no PINGRESP within %s", c.opt.AckTimeout)
@@ -534,10 +546,15 @@ func (c *Client) dropConn(conn net.Conn) {
 	// 唤醒所有等待 PUBACK 的发布者：连接已经没了，继续等只是白白拖长
 	// Outbox 的失败判定。
 	c.failPending(errors.New("mqtt: connection lost before PUBACK"))
-	// 唤醒等 PINGRESP 的等待者，避免保活循环白等满 AckTimeout。
+	// 唤醒等 PINGRESP 的等待者，避免保活循环白等满 AckTimeout。链路已经
+	// 断了，必须显式告知「失败」而不是只关闭 channel——否则并发的 Ping
+	// 会把这次关闭误当成 PINGRESP 成功。
 	c.pingMu.Lock()
 	if c.pingWait != nil {
-		close(c.pingWait)
+		select {
+		case c.pingWait <- errPingConnLost:
+		default:
+		}
 		c.pingWait = nil
 	}
 	c.pingMu.Unlock()
@@ -597,7 +614,10 @@ func (c *Client) readLoop(conn net.Conn) {
 			// 保活得到回应，说明链路仍然活着（不只是「写成功」）。
 			c.pingMu.Lock()
 			if c.pingWait != nil {
-				close(c.pingWait)
+				select {
+				case c.pingWait <- nil:
+				default:
+				}
 				c.pingWait = nil
 			}
 			c.pingMu.Unlock()
@@ -632,7 +652,7 @@ func (c *Client) keepaliveLoop(conn net.Conn) {
 				return
 			}
 
-			wait := make(chan struct{})
+			wait := make(chan error, 1)
 			c.pingMu.Lock()
 			if c.pingWait != nil {
 				// 已经有一次 PINGREQ 在飞（比如 Probe 刚发过）。不要在飞
@@ -654,8 +674,13 @@ func (c *Client) keepaliveLoop(conn net.Conn) {
 
 			timer := time.NewTimer(c.opt.AckTimeout)
 			select {
-			case <-wait:
+			case perr := <-wait:
+				// nil = PINGRESP 到达（链路活）；非 nil = 链路已断，退出保活。
 				timer.Stop()
+				if perr != nil {
+					c.setErr(perr)
+					return
+				}
 			case <-timer.C:
 				c.setErr(errors.New("mqtt: keepalive timeout (no PINGRESP)"))
 				c.dropConn(conn)
