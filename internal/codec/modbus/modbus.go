@@ -499,6 +499,11 @@ func exceptionError(device string, resp []byte) *driver.OpError {
 		return driver.E(driver.ErrProtocol, "decode", device, "illegal data value (03)", false, nil)
 	case 4:
 		return driver.E(driver.ErrProtocol, "decode", device, "server device failure (04)", true, nil)
+	case 5:
+		// 5 = Acknowledge：从站已接受请求但需要长时间处理，客户端应稍后
+		// 轮询。它和 6（Busy）一样是「临时、可重试」状态——漏判成不可重试
+		// 会让一次慢操作（如延时命令）把该点位永久钉死为坏值。
+		return driver.E(driver.ErrProtocol, "decode", device, "acknowledge (05), poll later", true, nil)
 	case 6:
 		return driver.E(driver.ErrProtocol, "decode", device, "server device busy (06)", true, nil)
 	}

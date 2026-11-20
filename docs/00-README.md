@@ -1546,7 +1546,7 @@ obs  ← 所有包（不依赖任何内部包）
 | `internal/codec/s7` | S7 纯函数编解码（TPKT/COTP/S7 PDU、块目录/属性/上传、长度单位换算） | 请求按字节、响应按位/字节的差异收敛在一处；ACK/ACK_DATA 为 12 字节头、Job/UserData 为 10 字节；ListAll 的数据区是 `0A 00 0000`；块长度是 5 位十进制 ASCII | 85.4% |
 | `internal/codec/opcua` | OPC UA 纯函数编解码（UACP HEL/ACK、安全报文、NodeId、Variant、读/写/浏览 + 订阅/发布/确认） | 分块响应显式报错；数组长度上界必查；BCD 等无对应类型显式报错；未知通知类型跳过而不是判故障 | 86.1%（含 driver/opcua 与 opcuaserver 交叉覆盖） |
 | `internal/transport` | 字节流抽象 + TCP + 串口（termios） | 写满、读满或超时、关闭幂等；协议层 deadline 不得被兜底值覆盖 | 80.3% |
-| `internal/driver/modbus` | Modbus TCP + RTU + ASCII 主站 | 事务号递增；异常码分类；部分失败不吞好样本；同串口事务串行；分帧类型参与端口冲突判定 | 82.7% |
+| `internal/driver/modbus` | Modbus TCP + RTU + ASCII 主站 | 事务号递增；异常码分类（05 Acknowledge / 06 Busy 归可重试的临时故障，与 04 设备故障同档；01/02/03/08 不可重试）；部分失败不吞好样本；同串口事务串行；分帧类型参与端口冲突判定 | 82.7% |
 | `internal/driver/s7` | S7（S7comm）主站；块服务走独立一次性 `Session` | COTP/Setup 握手不可省；按协商 PDU 与 20 项上限切块；逐项返回码映射质量码；顶层 ACK 错误直接判协议错；块上传以 `param[1]` 判最后一片，失败也补 End 释放 PLC 会话 | 78.1% |
 | `internal/driver/opcua` | OPC UA 二进制主站（None/None + 匿名）；可选订阅推送 | 三层状态（TCP/通道/会话）分开判断；按 RequestId 过滤迟到响应；节点越界判坏不截断；订阅走独立第二条连接，Read 优先本地表、失效即回退真读 | 76% |
 | `internal/driver/mqtt` | MQTT 南向（订阅取数）：把推送型协议适配成拉取契约 | `Read` 无网络交互，只读本地最新值表；质量码只反映新鲜度（good/stale/bad 三档）；一条消息都没有不算断链，安静到一个窗口且 PING 失败才判链 | 77.4% |
