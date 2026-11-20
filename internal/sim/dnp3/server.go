@@ -97,6 +97,14 @@ type Server struct {
 	appReads   uint64
 	appControl uint64
 	confirms   uint64
+	// appEnables 是收到 Enable/Disable Unsolicited 请求的次数。
+	appEnables uint64
+	// class0Reads 是请求类 0（静态全量）的读次数——只有完整性轮询会带类 0，
+	// 事件轮询（类 1/2/3）不计数，用来区分两类轮询。
+	class0Reads uint64
+	// extraIIN 被按位或进每条响应的 IIN（注入 DeviceRestart/EventOverflow
+	// 等位，验证主站的处理路径）。
+	extraIIN uint16
 }
 
 // NewServer 启动从站。addr 为空时监听 127.0.0.1:0。
@@ -161,12 +169,28 @@ type Stats struct {
 	Reads    uint64
 	Controls uint64
 	Confirms uint64
+	// Enables 是主站发 Enable/Disable Unsolicited 的次数（0 = 从未激活
+	// 非请求响应）。
+	Enables uint64
+	// Class0Reads 是带类 0 的读次数——只有完整性轮询会请求类 0，用来
+	// 区分事件轮询与完整性重召（含 IIN 触发的立即重召）。
+	Class0Reads uint64
 }
 
 func (s *Server) Stats() Stats {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return Stats{Reads: s.appReads, Controls: s.appControl, Confirms: s.confirms}
+	return Stats{
+		Reads: s.appReads, Controls: s.appControl, Confirms: s.confirms,
+		Enables: s.appEnables, Class0Reads: s.class0Reads,
+	}
+}
+
+// SetIIN 把指定的 IIN 位按位或进每条响应（注入用）。传 0 清除注入。
+func (s *Server) SetIIN(bits uint16) {
+	s.mu.Lock()
+	s.extraIIN = bits
+	s.mu.Unlock()
 }
 
 // Inflight 返回尚未被主站确认的事件条数。
@@ -568,6 +592,11 @@ func (st *station) handleApp(data []byte) {
 		st.srv.confirms++
 		st.srv.inflight = map[byte][]Event{}
 		st.srv.mu.Unlock()
+	case dnp3codec.AppEnableUnsolicited, dnp3codec.AppDisableUnsolicited:
+		st.srv.mu.Lock()
+		st.srv.appEnables++
+		st.srv.mu.Unlock()
+		st.respond(m, 0, nil, false)
 	default:
 		st.respond(m, dnp3codec.IINFuncNotSupport, nil, false)
 	}
@@ -586,6 +615,9 @@ func (st *station) handleRead(m dnp3codec.AppMessage) {
 }
 
 func (st *station) respond(req dnp3codec.AppMessage, iin uint16, objects []byte, con bool) {
+	st.srv.mu.Lock()
+	iin |= st.srv.extraIIN
+	st.srv.mu.Unlock()
 	ctrl := dnp3codec.AppControl{FIR: true, FIN: true, CON: con, Seq: req.Control.Seq}
 	st.sendApp(dnp3codec.EncodeResponse(ctrl, dnp3codec.AppResponse, iin, objects))
 }
@@ -600,6 +632,7 @@ func (s *Server) buildRead(headers []dnp3codec.Header) ([]byte, bool) {
 			// 类对象的变体 = 类号 + 1（类 0 是变体 1）。
 			class := h.Variation
 			if class == 1 {
+				s.class0Reads++
 				out = append(out, s.encodeStaticAll()...)
 				continue
 			}

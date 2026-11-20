@@ -108,7 +108,8 @@ func (d *Driver) Meta() driver.Meta {
 			Read: driver.CapSupported,
 			// 直接控制（CROB / 模拟量输出）等到从站的响应才返回成功。
 			Write: driver.CapSupported,
-			// 从站事件与总召唤共同填充本地表，上层仍是拉取契约。
+			// 连接时激活非请求响应（类 1/2/3）+ 事件轮询 + 总召唤共同填充
+			// 本地表；从站不支持非请求响应时自动退回纯轮询。上层仍是拉取契约。
 			Subscribe:   driver.CapSupported,
 			Browse:      driver.CapUnsupported,
 			Discovery:   driver.CapUnsupported,
@@ -145,7 +146,7 @@ func (d *Driver) Meta() driver.Meta {
 				Enum: []string{"bool", "int16", "uint16", "int32", "uint32", "int64", "uint64",
 					"float32", "float64"}, Scope: "point"},
 		},
-		Description: "DNP3 主站：总召唤 + 事件轮询 + CROB/模拟量直接控制",
+		Description: "DNP3 主站：总召唤 + 事件轮询 + 非请求响应（类 1/2/3）+ CROB/模拟量直接控制；IIN 报重启/溢出立即重召",
 	}
 }
 
@@ -448,6 +449,26 @@ func (c *conn) connect(ctx context.Context) error {
 		_ = nc.Close()
 		return err
 	}
+	// 启动完整性轮询后激活非请求响应（类 1/2/3）。声明里写的「非请求响应
+	// 的接收与确认」要靠这一条才成立：不激活，readLoop 里的 AppUnsolicited
+	// 分支就永远不可达，所谓订阅退化成纯 1 秒事件轮询。
+	// 从站不支持时（IIN 报 FuncNotSupport）退回纯轮询——Enable 失败不该让
+	// 连接失败，只是推送变成轮询。
+	enable, err := dnp3codec.ClassObjects(1, 2, 3)
+	if err != nil {
+		return driver.E(driver.ErrInternal, "open", c.devID, err.Error(), false, err)
+	}
+	resp, err := c.request(ctx, dnp3codec.AppEnableUnsolicited, enable)
+	if err != nil {
+		if c.log != nil {
+			c.log.Warn("dnp3_enable_unsolicited_failed", "device", c.devID, "error", err.Error())
+		}
+	} else if resp.IIN&dnp3codec.IINFuncNotSupport != 0 {
+		if c.log != nil {
+			c.log.Warn("dnp3_enable_unsolicited_rejected", "device", c.devID,
+				"hint", "从站不支持非请求响应，保持事件轮询")
+		}
+	}
 	return nil
 }
 
@@ -592,7 +613,20 @@ func (c *conn) applyObjects(raw []byte, iin uint16) {
 	now := time.Now().UTC()
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	old := c.lastIIN
 	c.lastIIN = iin
+	// DeviceRestart(0x0080) / EventOverflow(0x0800) 要立即补一次完整性重召：
+	// 重启意味着类 0 快照全变，等周期到达最坏 5 分钟旧数据；溢出意味着
+	// 中间丢过事件，同样只有类 0 能补救。位转换守卫防止连环重召（重启位
+	// 在从站被读过之后自清；溢出位在事件重新入队后自清）。轮询在后台做，
+	// 不阻塞当前响应的落表。
+	if newly := iin & ^old & (dnp3codec.IINDeviceRestart | dnp3codec.IINEventOverflow); newly != 0 {
+		if c.log != nil {
+			c.log.Warn("dnp3_iin_integrity_poll", "device", c.devID,
+				"hint", "从站报重启/事件溢出，立即完整性重召")
+		}
+		go c.integrityPollNow()
+	}
 	for _, o := range objs {
 		area, ok := areaOfGroup(o.Group)
 		if !ok {
@@ -826,6 +860,18 @@ func (c *conn) poll(classes []byte) error {
 	defer cancel()
 	_, err = c.request(ctx, dnp3codec.AppRead, objects)
 	return err
+}
+
+// integrityPollNow 在 IIN 报出从站重启/事件溢出时立即补一次类 0 完整性
+// 轮询，不等 integrityPoll 周期。失败不重试：下一轮周期轮询兜底。
+func (c *conn) integrityPollNow() {
+	objects, err := dnp3codec.ClassObjects(0)
+	if err != nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), c.timeout)
+	defer cancel()
+	_, _ = c.request(ctx, dnp3codec.AppRead, objects)
 }
 
 // recover 在主站侧断链后循环重连，直到成功或进程关闭。

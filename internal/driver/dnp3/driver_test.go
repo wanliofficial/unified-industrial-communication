@@ -797,3 +797,48 @@ func TestConcurrentReadAndPolling(t *testing.T) {
 	}
 	wg.Wait()
 }
+
+// 连接成功后必须发一次 Enable Unsolicited（类 1/2/3）：声明里写的
+// 「非请求响应的接收与确认」要靠它激活，否则 AppUnsolicited 分支不可达。
+func TestEnableUnsolicitedOnConnect(t *testing.T) {
+	h := newHarness(t)
+	h.cfg.Device.Labels["integrityPoll"] = "30s" // 隔离周期性完整性轮询
+	h.open()
+	st := h.srv.Stats()
+	if st.Enables != 1 {
+		t.Fatalf("Enable Unsolicited 次数 = %d, want 1", st.Enables)
+	}
+}
+
+// IIN 报 DeviceRestart 必须触发立即完整性重召（类 0 读），不能等
+// integrityPoll 周期——从站重启后旧快照可能要等 5 分钟才刷新。位保持
+// 期间不得连环重召（转换守卫）。
+func TestIINRestartTriggersIntegrityPoll(t *testing.T) {
+	h := newHarness(t)
+	h.cfg.Device.Labels["integrityPoll"] = "30s"
+	c := h.open()
+
+	// 连接时的启动总召唤 = 1 次类 0 读。
+	if got := h.srv.Stats().Class0Reads; got != 1 {
+		t.Fatalf("启动后类 0 读 = %d, want 1", got)
+	}
+	h.srv.SetIIN(dnp3codec.IINDeviceRestart)
+	// 下一次事件轮询（150ms）带回重启位 → 立即重召。
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		if h.srv.Stats().Class0Reads >= 2 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("重启位未触发完整性重召")
+		}
+		time.Sleep(30 * time.Millisecond)
+	}
+	// 位仍保持：转换守卫必须防止连环重召（否则 IIN 常驻时每次响应都重召）。
+	time.Sleep(600 * time.Millisecond)
+	if got := h.srv.Stats().Class0Reads; got != 2 {
+		t.Fatalf("守卫后类 0 读 = %d, want 2", got)
+	}
+	h.srv.SetIIN(0)
+	_ = c
+}
