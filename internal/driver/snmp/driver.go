@@ -1459,10 +1459,19 @@ func (c *connState) getRawBatch(ctx context.Context, oids []snmpcodec.OID) ([]Ge
 	return out, nil
 }
 
+// bulkMaxRepetitions 是 Walk 一次 GetBulk 取的后继条数。
+// 25 是保守值：足够把一张 200 行表的往返数从 200 降到 8，又不至于让
+// 小内存代理回包过大（agent 可以直接回 tooBig，那 Walk 就退化了）。
+const bulkMaxRepetitions = 25
+
 // Walk 从 prefix 的后继开始按字典序遍历，直到离开该子树或达到 max。
 //
 // 只给自检用：生产点表必须是明确的 OID，Walk 出来的名字没有 MIB 也
 // 无法赋予业务含义。
+//
+// v2c/v3 走 GetBulk（一次往返批量取后继）；v1 没有 GetBulk，保持
+// GETNEXT 逐条。codec 的 GetBulkRequest 与内置从站的 GETBULK 应答
+// 早已就位，此前主站一直没接——大表遍历退化成 N 次往返。
 func (c *connState) Walk(ctx context.Context, prefix snmpcodec.OID, max int) ([]GetResult, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -1475,7 +1484,69 @@ func (c *connState) Walk(ctx context.Context, prefix snmpcodec.OID, max int) ([]
 	if max > 1024 {
 		max = 1024
 	}
+	if c.version >= snmpcodec.V2c {
+		return c.walkBulk(ctx, prefix, max)
+	}
+	return c.walkNext(ctx, prefix, max)
+}
 
+// walkBulk 用 GetBulk 遍历：一次往返取 max-repetitions 条后继。
+//
+// 应答里的 EndOfMibView 与离开子树的 OID 都按「遍历结束」处理（GetBulk
+// 会越过子树边界继续取后继，越界项不能进结果）；代理不前进是协议错。
+func (c *connState) walkBulk(ctx context.Context, prefix snmpcodec.OID, max int) ([]GetResult, error) {
+	var out []GetResult
+	cur := prefix
+	for len(out) < max {
+		if err := ctx.Err(); err != nil {
+			return out, driver.E(driver.ErrTimeout, "walk", c.cfg.Device.ID, "context done", true, err)
+		}
+		id := c.nextID()
+		reps := bulkMaxRepetitions
+		if n := max - len(out); n < reps {
+			reps = n
+		}
+		pdu := snmpcodec.PDU{
+			Type:           snmpcodec.PDUGetBulk,
+			RequestID:      id,
+			MaxRepetitions: reps,
+			Varbinds:       []snmpcodec.Varbind{{OID: cur, Value: snmpcodec.Null()}},
+		}
+		resp, err := c.do(ctx, pdu, "walk")
+		if err != nil {
+			return out, err
+		}
+		if st := snmpcodec.ErrorStatus(resp.ErrorStatus); st != snmpcodec.ErrNoError {
+			return out, c.statusError("walk", st, cur, resp.ErrorIndex)
+		}
+		if len(resp.Varbinds) == 0 {
+			return out, driver.E(driver.ErrProtocol, "walk", c.cfg.Device.ID,
+				"GETBULK returned no varbinds", false, nil)
+		}
+		for _, vb := range resp.Varbinds {
+			if vb.Value.Type == snmpcodec.TypeEndOfMibView {
+				return out, nil
+			}
+			if v := vb.OID.Compare(cur); v <= 0 {
+				// 代理返回了一个不前进的 OID：继续循环只会挂死。
+				return out, driver.E(driver.ErrProtocol, "walk", c.cfg.Device.ID,
+					fmt.Sprintf("GETBULK did not advance past %s (returned %s)", cur, vb.OID), false, nil)
+			}
+			if !prefix.HasPrefix(vb.OID) {
+				return out, nil
+			}
+			out = append(out, GetResult{OID: vb.OID, Value: vb.Value})
+			cur = vb.OID
+			if len(out) >= max {
+				break
+			}
+		}
+	}
+	return out, nil
+}
+
+// walkNext 用 GETNEXT 逐条遍历（v1 没有 GetBulk，表尾就是 noSuchName）。
+func (c *connState) walkNext(ctx context.Context, prefix snmpcodec.OID, max int) ([]GetResult, error) {
 	var out []GetResult
 	cur := prefix
 	for len(out) < max {

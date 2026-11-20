@@ -1097,3 +1097,84 @@ func TestReadAllFailedStillReturnsError(t *testing.T) {
 		t.Fatalf("samples = %d, want 2", len(out))
 	}
 }
+
+// bulkAgent 实现 GetBulk 语义：每个 varbind 最多回 max-repetitions 条后继，
+// 表尾补 EndOfMibView。walkAgent 只会逐条回——真 bulk 应答（一次多条、
+// 条目中途越界/表尾）只有这里能覆盖。
+func bulkAgent(t *testing.T, table map[string]snmpcodec.Value) func(snmpcodec.Message) [][]byte {
+	t.Helper()
+	keys := make([]snmpcodec.OID, 0, len(table))
+	for k := range table {
+		keys = append(keys, snmpcodec.MustParseOID(k))
+	}
+	sort.Slice(keys, func(i, j int) bool { return keys[i].Compare(keys[j]) < 0 })
+	return func(req snmpcodec.Message) [][]byte {
+		vbs := make([]snmpcodec.Varbind, 0, req.PDU.MaxRepetitions)
+		cur := req.PDU.Varbinds[0].OID
+		for i := 0; i < req.PDU.MaxRepetitions; i++ {
+			next := -1
+			for j, k := range keys {
+				if k.Compare(cur) > 0 {
+					next = j
+					break
+				}
+			}
+			if next < 0 {
+				vbs = append(vbs, snmpcodec.Varbind{OID: cur, Value: snmpcodec.Exception(snmpcodec.TypeEndOfMibView)})
+				continue
+			}
+			vbs = append(vbs, snmpcodec.Varbind{OID: keys[next], Value: table[keys[next].String()]})
+			cur = keys[next]
+		}
+		return [][]byte{reply(t, req, vbs, 0, 0)}
+	}
+}
+
+// v2c Walk 必须走 GetBulk：一次往返取回多条后继，往返次数从表行数降为
+// 表行数/max-repetitions。7 条表目 + max-repetitions=25 → 一次往返收齐。
+func TestWalkV2UsesGetBulk(t *testing.T) {
+	table := map[string]snmpcodec.Value{
+		"1.3.6.1.2.1.1.1.0": snmpcodec.String("a"),
+		"1.3.6.1.2.1.1.2.0": snmpcodec.String("b"),
+		"1.3.6.1.2.1.1.3.0": snmpcodec.String("c"),
+		"1.3.6.1.2.1.1.4.0": snmpcodec.String("d"),
+		"1.3.6.1.2.1.1.5.0": snmpcodec.String("e"),
+		"1.3.6.1.2.1.1.6.0": snmpcodec.String("f"),
+		"1.3.6.1.2.1.1.7.0": snmpcodec.String("g"),
+		"1.3.6.1.2.1.2.1.0": snmpcodec.Integer(2), // 子树外：应终止遍历
+	}
+	f := &fakeDatagram{handler: bulkAgent(t, table)}
+	c := openTest(t, f, testConfig(nil))
+
+	out, err := c.Walk(context.Background(), snmpcodec.MustParseOID("1.3.6.1.2.1.1"), 100)
+	if err != nil {
+		t.Fatalf("walk: %v", err)
+	}
+	if len(out) != 7 {
+		t.Fatalf("walked %d OIDs, want 7", len(out))
+	}
+	if got := out[6].OID.String(); got != "1.3.6.1.2.1.1.7.0" {
+		t.Fatalf("last = %s", got)
+	}
+	// 一次往返就收齐（连接探活还有自己的请求，这里只看 bulk 请求）。
+	bulk := 0
+	for _, m := range f.requests {
+		if m.PDU.Type == snmpcodec.PDUGetBulk {
+			bulk++
+			if m.PDU.MaxRepetitions <= 0 {
+				t.Fatal("GetBulk 请求缺 max-repetitions")
+			}
+		}
+	}
+	if bulk != 1 {
+		t.Fatalf("GetBulk 请求次数 = %d, want 1", bulk)
+	}
+
+	// max 截断同样一条往返内完成（reps 收缩到剩余额度）。
+	f2 := &fakeDatagram{handler: bulkAgent(t, table)}
+	c2 := openTest(t, f2, testConfig(nil))
+	out2, err := c2.Walk(context.Background(), snmpcodec.MustParseOID("1.3.6.1.2.1.1"), 5)
+	if err != nil || len(out2) != 5 {
+		t.Fatalf("max walk = %d, %v", len(out2), err)
+	}
+}
