@@ -39,6 +39,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -158,7 +159,10 @@ func (d *Driver) Open(ctx context.Context, cfg driver.OpenConfig) (driver.Conn, 
 	if err != nil {
 		return nil, err
 	}
-	opt := parseOptions(cfg.Device)
+	opt, err := parseOptions(cfg.Device)
+	if err != nil {
+		return nil, err
+	}
 
 	l, err := link.Open(ctx, link.Options{
 		Proto:       "hostlink",
@@ -236,28 +240,50 @@ func unitOf(dev model.Device) (byte, error) {
 	return byte(n), nil
 }
 
-func parseOptions(dev model.Device) Options {
+// parseOptions 解析 device.labels["options"]。
+//
+// 配置写错必须报错而不是悄悄回默认值：`gap=abc` 被静默忽略后，症状是
+// 「帧间静默/等待时间悄悄变成默认值」，从超时或偶发冲突的角度几乎查不到
+// 这里来。与 ads 驱动的 options 处理保持同一纪律：逐项校验、未知项报错。
+func parseOptions(dev model.Device) (Options, error) {
 	opt := Options{Gap: defaultGap, Wait: defaultWait}
 	for _, part := range strings.Split(dev.Labels["options"], ",") {
-		key, val, hasVal := strings.Cut(strings.TrimSpace(part), "=")
-		key = strings.ToLower(strings.TrimSpace(key))
-		val = strings.TrimSpace(val)
-		if !hasVal {
+		part = strings.TrimSpace(part)
+		if part == "" {
 			continue
 		}
+		key, val, hasVal := strings.Cut(part, "=")
+		key = strings.ToLower(strings.TrimSpace(key))
+		val = strings.TrimSpace(val)
 		switch key {
 		case "gap":
-			if d, err := time.ParseDuration(val); err == nil && d >= 0 && d <= time.Second {
-				opt.Gap = d
+			if !hasVal {
+				return opt, driver.E(driver.ErrUnsupported, "open", dev.ID,
+					"options.gap 需要 =时长（如 10ms）", false, nil)
 			}
+			d, err := time.ParseDuration(val)
+			if err != nil || d < 0 || d > time.Second {
+				return opt, driver.E(driver.ErrUnsupported, "open", dev.ID,
+					fmt.Sprintf("options.gap %q 必须是 0..1s 的时长", val), false, nil)
+			}
+			opt.Gap = d
 		case "wait":
-			var n int
-			if _, err := fmt.Sscanf(val, "%d", &n); err == nil && n >= 0 && n <= hlcodec.MaxWait {
-				opt.Wait = byte(n)
+			if !hasVal {
+				return opt, driver.E(driver.ErrUnsupported, "open", dev.ID,
+					"options.wait 需要 =N", false, nil)
 			}
+			n, err := strconv.Atoi(val)
+			if err != nil || n < 0 || n > hlcodec.MaxWait {
+				return opt, driver.E(driver.ErrUnsupported, "open", dev.ID,
+					fmt.Sprintf("options.wait %q 必须是 0..%d", val, hlcodec.MaxWait), false, nil)
+			}
+			opt.Wait = byte(n)
+		default:
+			return opt, driver.E(driver.ErrUnsupported, "open", dev.ID,
+				fmt.Sprintf("未知的 options 项 %q（支持 gap / wait）", key), false, nil)
 		}
 	}
-	return opt
+	return opt, nil
 }
 
 // ---------------------------------------------------------------------------

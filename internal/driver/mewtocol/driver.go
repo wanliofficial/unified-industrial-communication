@@ -138,6 +138,10 @@ func (d *Driver) Open(ctx context.Context, cfg driver.OpenConfig) (driver.Conn, 
 	if err != nil {
 		return nil, err
 	}
+	opt, err := parseOptions(cfg.Device)
+	if err != nil {
+		return nil, err
+	}
 	l, err := link.Open(ctx, link.Options{
 		Proto:       "mewtocol",
 		DefaultPort: defaultTCPPort,
@@ -150,7 +154,7 @@ func (d *Driver) Open(ctx context.Context, cfg driver.OpenConfig) (driver.Conn, 
 		cfg:     cfg,
 		link:    l,
 		station: st,
-		opt:     parseOptions(cfg.Device),
+		opt:     opt,
 		devID:   devID,
 		timeout: cfg.Device.Timeout.Duration(),
 	}, nil
@@ -172,23 +176,39 @@ func stationOf(dev model.Device) (mewtocol.Station, error) {
 	return st, nil
 }
 
-func parseOptions(dev model.Device) Options {
+// parseOptions 解析 device.labels["options"]。
+//
+// 与 hostlink/ads 同一纪律：非法值、缺值、未知项都报错，绝不悄悄回默认值
+// ——「帧间静默变成默认 10ms」这类症状在链路层根本看不出配置错了。
+func parseOptions(dev model.Device) (Options, error) {
 	opt := Options{Gap: defaultGap}
 	raw := dev.Labels["options"]
 	for _, part := range strings.Split(raw, ",") {
-		key, val, hasVal := strings.Cut(strings.TrimSpace(part), "=")
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		key, val, hasVal := strings.Cut(part, "=")
 		key = strings.ToLower(strings.TrimSpace(key))
 		val = strings.TrimSpace(val)
 		switch key {
 		case "gap":
-			if hasVal {
-				if d, err := time.ParseDuration(val); err == nil && d >= 0 && d <= time.Second {
-					opt.Gap = d
-				}
+			if !hasVal {
+				return opt, driver.E(driver.ErrUnsupported, "open", dev.ID,
+					"options.gap 需要 =时长（如 10ms）", false, nil)
 			}
+			d, err := time.ParseDuration(val)
+			if err != nil || d < 0 || d > time.Second {
+				return opt, driver.E(driver.ErrUnsupported, "open", dev.ID,
+					fmt.Sprintf("options.gap %q 必须是 0..1s 的时长", val), false, nil)
+			}
+			opt.Gap = d
+		default:
+			return opt, driver.E(driver.ErrUnsupported, "open", dev.ID,
+				fmt.Sprintf("未知的 options 项 %q（支持 gap）", key), false, nil)
 		}
 	}
-	return opt
+	return opt, nil
 }
 
 // ---------------------------------------------------------------------------

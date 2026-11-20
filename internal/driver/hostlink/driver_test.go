@@ -450,18 +450,30 @@ func TestUnitOf(t *testing.T) {
 }
 
 func TestParseOptions(t *testing.T) {
-	opt := parseOptions(model.Device{Labels: map[string]string{"options": "gap=20ms,wait=5"}})
+	opt, err := parseOptions(model.Device{Labels: map[string]string{"options": "gap=20ms,wait=5"}})
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
 	if opt.Gap != 20*time.Millisecond || opt.Wait != 5 {
 		t.Fatalf("opt = %+v", opt)
 	}
-	// 非法的值必须静默忽略并保留缺省：这是可选项，不该让设备起不来。
-	opt = parseOptions(model.Device{Labels: map[string]string{"options": "gap=99s,wait=99,junk"}})
-	if opt.Gap != defaultGap || opt.Wait != defaultWait {
-		t.Fatalf("opt = %+v", opt)
+	// 非法值 / 未知项必须报错而不是悄悄回默认：配置写错的症状是「帧间
+	// 静默变成默认值」，从链路层几乎查不出来。与 ads 驱动同一纪律。
+	// （旧行为是静默忽略——恰是缺口审计点名要修的静默降级。）
+	for _, tc := range []struct{ name, options string }{
+		{"gap 非法", "gap=99s"},
+		{"gap 缺值", "gap"},
+		{"wait 越界", "wait=99"},
+		{"未知项", "junk=1"},
+	} {
+		if _, err := parseOptions(model.Device{ID: "d", Labels: map[string]string{"options": tc.options}}); err == nil {
+			t.Fatalf("%s: 应报错", tc.name)
+		}
 	}
-	opt = parseOptions(model.Device{})
-	if opt.Gap != defaultGap || opt.Wait != defaultWait {
-		t.Fatalf("opt = %+v", opt)
+	// 空配置用默认值。
+	opt, err = parseOptions(model.Device{})
+	if err != nil || opt.Gap != defaultGap || opt.Wait != defaultWait {
+		t.Fatalf("opt = %+v err = %v", opt, err)
 	}
 }
 

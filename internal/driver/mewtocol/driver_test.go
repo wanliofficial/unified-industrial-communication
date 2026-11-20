@@ -516,3 +516,28 @@ func TestWriteIndexWidthCheckedLocally(t *testing.T) {
 		}
 	}
 }
+
+// options 解析与 hostlink/ads 同一纪律：非法值、缺值、未知项报错，
+// 不悄悄回默认值（旧行为是静默忽略，是缺口审计点名的静默降级）。
+func TestParseOptions(t *testing.T) {
+	opt, err := parseOptions(model.Device{Labels: map[string]string{"options": "gap=20ms"}})
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if opt.Gap != 20*time.Millisecond {
+		t.Fatalf("opt = %+v", opt)
+	}
+	for _, tc := range []struct{ name, options string }{
+		{"gap 非法", "gap=99s"},
+		{"gap 缺值", "gap"},
+		{"未知项", "junk=1"},
+	} {
+		if _, err := parseOptions(model.Device{ID: "d", Labels: map[string]string{"options": tc.options}}); err == nil {
+			t.Fatalf("%s: 应报错", tc.name)
+		}
+	}
+	opt, err = parseOptions(model.Device{})
+	if err != nil || opt.Gap != defaultGap {
+		t.Fatalf("opt = %+v err = %v", opt, err)
+	}
+}
