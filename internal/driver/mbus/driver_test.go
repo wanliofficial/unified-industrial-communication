@@ -686,3 +686,38 @@ func itoa(v int) string {
 	}
 	return string(b)
 }
+
+// CI=70h 通用错误应答必须作为协议错上抛，而不是降级成逐点 address_error：
+// 错误码说明的是从站整体状态（CI 不支持、缓冲溢出…），拿「报文里没有
+// 记录」去查点表会把人引向完全错误的方向。
+func TestErrorResponseSurfacesAsProtocolError(t *testing.T) {
+	srv := startSim(t)
+	srv.SetErrorResponse(0x01) // 从站不支持该 CI
+	c := openConn(t, srv, "")
+	out, err := c.Read(context.Background(), spans(q("e", "energy")))
+	if err == nil {
+		t.Fatal("CI=70h 错误应答应报错")
+	}
+	if driver.KindOf(err) != driver.ErrProtocol {
+		t.Fatalf("错误分类 = %v，应为 ErrProtocol", driver.KindOf(err))
+	}
+	if !strings.Contains(err.Error(), "不支持该 CI") {
+		t.Fatalf("错误信息应带从站错误码解释：%v", err)
+	}
+	// 整批点位标坏（bad），错误说明指向从站而不是点表。
+	if len(out) != 1 {
+		t.Fatalf("样本数 = %d", len(out))
+	}
+	if out[0].Quality != model.QualityBad {
+		t.Fatalf("质量 = %s，应为 bad", out[0].Quality)
+	}
+	// 注入解除后同一连接应恢复正常（错误在应答内容，链路是好的）。
+	srv.SetErrorResponse(0)
+	out, err = c.Read(context.Background(), spans(q("e", "energy")))
+	if err != nil {
+		t.Fatalf("解除注入后应恢复正常：%v", err)
+	}
+	if out[0].Quality != model.QualityGood {
+		t.Fatalf("质量 = %s，应为 good", out[0].Quality)
+	}
+}

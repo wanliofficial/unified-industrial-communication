@@ -401,6 +401,15 @@ func (c *conn) readTable(ctx context.Context, op string) (mbuscodec.Response, er
 			return mbuscodec.Response{}, err
 		}
 	}
+	// CI=70h（通用错误）/ 71h（告警状态）应答没有记录：错误码说明的是从站
+	// 的整体状态（CI 不支持、缓冲溢出…），不是哪个点配错了。在这里上抛，
+	// 让整批点位拿到协议错——把它降级成逐点 address_error，用户会拿着一堆
+	// "报文里没有记录"去查点表，而真正的问题是表在报错。codec 已把错误码
+	// 翻译进 ErrorText；「有头无记录」的应答（76h/空表）不算错误。
+	if resp.Kind == mbuscodec.DataNone {
+		return resp, driver.E(driver.ErrProtocol, op, c.devID,
+			fmt.Sprintf("从站报错误应答：%s", resp.ErrorText), false, nil)
+	}
 	c.inited = true
 	c.linkErr = nil
 

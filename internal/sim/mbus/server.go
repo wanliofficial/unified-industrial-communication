@@ -61,6 +61,8 @@ type Server struct {
 	silent bool
 	// statusError 为真时状态字报应用错误（bit0-1 非零）。
 	statusError bool
+	// errorCode 非零时对 REQ_UD2 回 CI=70h 通用错误应答（注入用）。
+	errorCode byte
 
 	requests int64
 	nkeCount int64
@@ -306,6 +308,15 @@ func (s *Server) SetStatusError(on bool) {
 	s.statusError = on
 }
 
+// SetErrorResponse 让从站对后续 REQ_UD2 回 CI=70h 通用错误应答（code 为
+// EN 13757-3 的应用错误码）。非零 code 结束注入，恢复数据应答。用于验证
+// 主站把「表在报错」如实上抛，而不是降级成逐点 address_error。
+func (s *Server) SetErrorResponse(code byte) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.errorCode = code
+}
+
 // SetAccessNo 直接设置访问号（用于构造特定向量）。
 func (s *Server) SetAccessNo(n byte) {
 	s.mu.Lock()
@@ -469,6 +480,15 @@ func (s *Server) handleREQ(fr mb.Frame) ([]byte, bool) {
 	}
 	s.fcbSeen = true
 	s.fcbValue = fr.FCB()
+
+	// 错误应答注入：CI=70h 通用错误（带 EN 13757-3 应用错误码）。
+	// 同样纳入 FCB 回放与访问号自增，与正常应答的语义保持一致。
+	if s.errorCode != 0 {
+		frame := mb.BuildLong(mb.CtrlRSPUD, s.addr, mb.CIGeneralError, []byte{s.errorCode})
+		s.lastReply = append([]byte(nil), frame...)
+		s.header.AccessNo++
+		return frame, false
+	}
 
 	data, err := s.buildData()
 	if err != nil {
