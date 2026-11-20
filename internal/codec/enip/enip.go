@@ -828,13 +828,17 @@ func EncodeString(s string, capacity int) ([]byte, error) {
 }
 
 // DecodeString 解析 STRING：4 字节小端长度 + 字符。
+//
+// n 小于缓冲容量是常态（CIP STRING 元素按类型宽度对齐，尾部是填充字节）。
+// n **大于**实际数据则是设备侧的坏长度：照单全收会把截断值当好值上报
+// （「看起来成功、其实丢了一半」），必须报错让点标坏，而不是钳制。
 func DecodeString(b []byte) (string, error) {
 	if len(b) < 4 {
 		return "", errors.New("enip: STRING shorter than length header")
 	}
 	n := int(binary.LittleEndian.Uint32(b))
 	if n < 0 || n > len(b)-4 {
-		n = len(b) - 4
+		return "", fmt.Errorf("enip: STRING length %d exceeds reply data %d bytes", n, max(len(b)-4, 0))
 	}
 	return strings.TrimRight(string(b[4:4+n]), "\x00"), nil
 }

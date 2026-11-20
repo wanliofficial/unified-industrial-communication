@@ -465,11 +465,11 @@ func TestStringEncodeDecode(t *testing.T) {
 	if _, err := EncodeString("ABCDEFGH", 4); err == nil {
 		t.Fatal("overlong string accepted (should be rejected)")
 	}
-	// 长度字段大于实际数据时按实际长度截断，不越界（这是设备侧的坏长度，防御性兜底）。
+	// 长度字段大于实际数据必须报错而不是截断：截断值会被当好值上报，
+	// 「看起来成功、其实丢了一半」。尾部填充（n < 容量）是常态，不受影响。
 	b = append([]byte{0x09, 0, 0, 0}, []byte("AB")...)
-	got, _ = DecodeString(b)
-	if got != "AB" {
-		t.Fatalf("clamped = %q", got)
+	if _, err := DecodeString(b); err == nil {
+		t.Fatal("bad length must be rejected")
 	}
 	if _, err := EncodeString("x", 0); err == nil {
 		t.Fatal("zero capacity accepted")
