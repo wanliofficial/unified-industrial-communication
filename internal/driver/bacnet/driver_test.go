@@ -758,3 +758,47 @@ func TestReadAllFailedStillReturnsError(t *testing.T) {
 		t.Fatalf("samples = %d, want 2", len(samples))
 	}
 }
+
+// 写优先级透传与 NULL 释放：priority 走点位地址字段进写报文；文本值
+// "null" 编码成 AppNull——priority-array 槽位的释放（relinquish）此前
+// 只有「改槽位」没有「释放」，是 codec 有、驱动没入口的能力。
+func TestWritePriorityAndNullRelinquish(t *testing.T) {
+	srv := newSim(t)
+	c := openSim(t, srv)
+	p := objRef("setpoint", "analog-value", 2, "priority-array", model.TypeFloat32)
+	p.Address.PropIndex = 1
+	p.Address.Priority = 8
+	res, err := c.Write(context.Background(), []driver.WriteRequest{{
+		PointID: "setpoint", Address: p.Address, DataType: model.TypeFloat32,
+		Value: model.NumValue(model.TypeFloat64, 7.5),
+	}})
+	if err != nil || !res[0].OK {
+		t.Fatalf("write: %v %+v", err, res)
+	}
+	if got := srv.LastWritePriority(); got != 8 {
+		t.Fatalf("从站收到的 priority = %d, want 8", got)
+	}
+
+	// 释放该优先级：写 NULL（不带优先级）。
+	pnull := p
+	pnull.Address.Priority = 0
+	res, err = c.Write(context.Background(), []driver.WriteRequest{{
+		PointID: "setpoint", Address: pnull.Address, DataType: model.TypeFloat32,
+		Value: model.TextValue(model.TypeString, "null"),
+	}})
+	if err != nil || !res[0].OK {
+		t.Fatalf("null write: %v %+v", err, res)
+	}
+	// NULL 已落槽位：读回得到「元素是 NULL」的地址错误（与既有读语义一致）。
+	s := readOne(t, c, pnull)
+	if s.Err == nil {
+		t.Fatalf("null element read should fail, got %+v", s.Value)
+	}
+
+	// 越界优先级在本地拒绝，不发报文。
+	bad := p
+	bad.Address.Priority = 17
+	if _, err := planPoint(bad); err == nil {
+		t.Fatal("priority 17 应拒绝")
+	}
+}

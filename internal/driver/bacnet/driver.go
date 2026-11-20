@@ -102,6 +102,8 @@ func (d *Driver) Meta() driver.Meta {
 				Help:        "present-value / object-name / units / priority-array 等，也可写属性编号"},
 			{Name: "address.propIndex", Label: "数组下标", Type: "int", Default: 0, Scope: "point",
 				Help: "读取数组属性时的下标；0 表示不带下标（读整个属性）"},
+			{Name: "address.priority", Label: "写优先级", Type: "int", Default: 0, Scope: "point",
+				Help: "写命令的优先级 1..16（0=不携带）；binary-output / analog-output 等可命令对象使用"},
 		},
 		Description: "BACnet/IP 主站：对象属性读写（ReadProperty / WriteProperty，UDP 47808）",
 	}
@@ -280,6 +282,7 @@ type pointPlan struct {
 	instance int
 	property int
 	index    int
+	priority int
 }
 
 func planPoint(p driver.PointRef) (pointPlan, error) {
@@ -307,9 +310,13 @@ func planPoint(p driver.PointRef) (pointPlan, error) {
 		return pointPlan{}, driver.E(driver.ErrAddress, "read", "",
 			fmt.Sprintf("point %q: propIndex must be >= 0", p.ID), false, nil)
 	}
+	if p.Address.Priority < 0 || p.Address.Priority > 16 {
+		return pointPlan{}, driver.E(driver.ErrAddress, "read", "",
+			fmt.Sprintf("point %q: priority %d out of range 0..16", p.ID, p.Address.Priority), false, nil)
+	}
 	return pointPlan{
 		ref: p, objType: objType, instance: p.Address.Instance,
-		property: property, index: p.Address.PropIndex,
+		property: property, index: p.Address.PropIndex, priority: p.Address.Priority,
 	}, nil
 }
 
@@ -493,7 +500,7 @@ func (c *connState) writeOne(ctx context.Context, req driver.WriteRequest) (driv
 	}
 	invoke := c.nextInvoke()
 	apdu, err := bacnetcodec.WritePropertyRequest(invoke, plan.objType, plan.instance,
-		plan.property, plan.index, 0, appValue)
+		plan.property, plan.index, plan.priority, appValue)
 	if err != nil {
 		e := driver.E(driver.ErrInternal, "write", c.cfg.Device.ID, err.Error(), false, err)
 		return writeFail(req, e), e
@@ -550,6 +557,15 @@ func encodeWriteValue(plan pointPlan, req driver.WriteRequest) ([]byte, error) {
 		case model.TypeFloat64:
 			tag = bacnetcodec.AppDouble
 		}
+	}
+
+	// NULL 写（平台文本值 "null"，大小写不敏感）：BACnet 的释放语义靠它。
+	// 写 NULL 到 priority-array 的某个槽位 = 释放该优先级，设备回落到下一
+	// 个有效优先级；写 NULL 到可命令对象的 present-value 同理。这是 codec
+	// 早已支持、驱动一直没有入口的能力（此前无法 relinquish，只能改槽位
+	// 却不能释放）。
+	if req.Value.Type == model.TypeString && strings.EqualFold(strings.TrimSpace(req.Value.Text), "null") {
+		return bacnetcodec.EncodeApplicationValue(bacnetcodec.AppNull, 0, 0, nil, false)
 	}
 
 	var (

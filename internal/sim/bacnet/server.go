@@ -91,6 +91,9 @@ type Server struct {
 	closed  chan struct{}
 	// autoIncrement 让 analog-value:3 每秒自增，便于观察 SSE 与死区。
 	autoIncrement bool
+	// lastWritePriority 是最近一次收到的写命令 priority（0 = 未携带），
+	// 供测试断言主站的 priority 透传。
+	lastWritePriority int
 }
 
 // NewServer 启动从站。addr 为空时监听 127.0.0.1:0。
@@ -290,7 +293,7 @@ func (s *Server) lookup(objType, instance, property, index int) (*prop, byte, by
 }
 
 func (s *Server) writeProperty(req bacnetcodec.ConfirmedRequest) []byte {
-	objType, instance, property, _, value, err := bacnetcodec.WritePropertyRequestParams(req.Params)
+	objType, instance, property, priority, value, err := bacnetcodec.WritePropertyRequestParams(req.Params)
 	if err != nil {
 		return bacnetcodec.BuildReject(req.InvokeID, bacnetcodec.RejectReasonInvalidTag)
 	}
@@ -308,6 +311,8 @@ func (s *Server) writeProperty(req bacnetcodec.ConfirmedRequest) []byte {
 	}
 
 	s.mu.Lock()
+	// 记录写优先级供测试断言主站的 priority 透传；0 表示请求未携带。
+	s.lastWritePriority = priority
 	p, ec, ecode := s.lookup(objType, instance, property, index)
 	if p == nil {
 		s.mu.Unlock()
@@ -356,6 +361,12 @@ func decodeIndex(b []byte) uint64 {
 // 「把字符串写进模拟量」这类错误回 invalid-data-type，而不是默默存下
 // 一个无法再读回来的值。
 func coerce(target *prop, tag byte, u uint64, f float64, b []byte, bl bool) (*prop, error) {
+	// NULL 写入 = 释放（relinquish）：不管目标槽位当前是什么类型，写完
+	// 槽位回到 NULL。真实设备对已占用槽位的释放正是这么做的——NULL 只
+	// 对「空槽位」有效的话，释放就永远做不到。
+	if tag == bacnetcodec.AppNull {
+		return &prop{tag: bacnetcodec.AppNull}, nil
+	}
 	out := target.clone()
 	switch target.tag {
 	case bacnetcodec.AppReal, bacnetcodec.AppDouble:
@@ -406,9 +417,14 @@ func coerce(target *prop, tag byte, u uint64, f float64, b []byte, bl bool) (*pr
 			return nil, fmt.Errorf("cannot write application tag %d to an octet-string property", tag)
 		}
 	case bacnetcodec.AppNull:
-		// 写 NULL 到优先级数组的元素表示「释放该优先级」，存储就是一个 NULL。
+		// priority-array 的空槽位存储上是 NULL。真实设备允许把任意与对象
+		// 匹配的值写进空槽位（写完槽位 tag 就变成值的类型），只回绝 NULL
+		// 才是错的——那会让「写 7.5 到 priority-array[1]」这条标准操作
+		// 失败。NULL 写入表示「释放该优先级」，存储保持 NULL。
 		if tag != bacnetcodec.AppNull {
-			return nil, fmt.Errorf("null property only accepts a null value")
+			// 写入值的类型成为槽位的新 tag。
+			out.tag = tag
+			out.u, out.f, out.text, out.bytes, out.boolean = u, f, string(b), append([]byte(nil), b...), bl
 		}
 	default:
 		return nil, fmt.Errorf("unsupported property tag %d", target.tag)
@@ -576,6 +592,14 @@ func (s *Server) Value(objectType string, instance int, property string) (any, b
 		return nil, true
 	}
 	return p.u, true
+}
+
+// LastWritePriority 返回最近一次写命令的 priority（0 = 未携带），供测试
+// 断言主站把点表里的优先级透传到了写报文。
+func (s *Server) LastWritePriority() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.lastWritePriority
 }
 
 // Objects 返回对象表的可读摘要（"analog-input:1" 列表），供自检命令打印。

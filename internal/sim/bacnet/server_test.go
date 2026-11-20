@@ -391,13 +391,19 @@ func TestObjectsLists(t *testing.T) {
 
 func TestPropEncodeErrors(t *testing.T) {
 	s := newServer(t)
-	// NULL 属性只能接受 NULL 值；其它类型返回错误而不是静默接受。
+	// NULL 槽位（priority-array 的空位）接受任意值写入——写完后槽位 tag
+	// 变成值的类型，这正是「写 7.5 到 priority-array[1]」的标准形态；
+	// NULL 写入保持 NULL（释放语义）。
 	if err := s.setProp(0, 0, 0, &prop{tag: bacnetcodec.AppNull}); err != nil {
 		t.Fatalf("set null: %v", err)
 	}
 	p := &prop{tag: bacnetcodec.AppNull}
-	if _, err := coerce(p, bacnetcodec.AppReal, 0, 1, nil, false); err == nil {
-		t.Fatal("real value accepted by null property")
+	out, err := coerce(p, bacnetcodec.AppReal, 0, 1, nil, false)
+	if err != nil {
+		t.Fatalf("real value into empty (null) slot must be accepted: %v", err)
+	}
+	if out.tag != bacnetcodec.AppReal {
+		t.Fatalf("slot tag = %d, want real after numeric write", out.tag)
 	}
 	if _, err := coerce(&prop{tag: 0x0F}, bacnetcodec.AppReal, 0, 1, nil, false); err == nil {
 		t.Fatal("unknown property tag accepted")

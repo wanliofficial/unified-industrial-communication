@@ -204,6 +204,11 @@ type Address struct {
 	Instance   int    `json:"instance,omitempty"`
 	Property   string `json:"property,omitempty"`
 	PropIndex  int    `json:"propIndex,omitempty"`
+	// Priority 是 BACnet 写命令的优先级（1..16，0 = 不携带，设备按默认
+	// 处理）。binary-output / analog-output 这类可命令对象靠它决定谁说了
+	// 算；单开一个字段而不是塞进 Property 字符串，与 DPT 同理——「写哪个
+	// 属性」和「以什么优先级写」是两件独立的事。
+	Priority int `json:"priority,omitempty"`
 
 	// file
 	FileID   int `json:"fileId,omitempty"`
@@ -287,6 +292,10 @@ func (a Address) Validate() error {
 		}
 		if a.Instance < 0 {
 			return errors.New("address.instance: must be >= 0")
+		}
+		// Priority 是 BACnet 写优先级：0（不携带）或 1..16。
+		if a.Priority < 0 || a.Priority > 16 {
+			return errors.New("address.priority: must be 0..16")
 		}
 		if a.Area != "" || a.Path != "" || a.FileID != 0 || a.Selector != "" ||
 			a.Expr != "" || a.DPT != "" {
