@@ -1229,7 +1229,11 @@ type ConfirmedRequest struct {
 
 // ParseConfirmedRequest 解析 ConfirmedRequest 的公共头。
 func ParseConfirmedRequest(apdu []byte) (ConfirmedRequest, error) {
-	if len(apdu) < 3 {
+	// 头固定 4 字节：pdu-type/flags、max-segs|seg|win、invokeID、service-choice；
+	// params（apdu[4:]）可以为空。守卫必须是 < 4 而不是 < 3——少一字节时
+	// apdu[3] 与 apdu[4:] 都会越界 panic。畸形报文必须回错误而不是 panic：
+	// 调用方（从站 serve 循环）没有 recover，一个截断的确认请求会崩掉整个进程。
+	if len(apdu) < 4 {
 		return ConfirmedRequest{}, ErrTruncated
 	}
 	if ClassifyAPDU(apdu[0]) != APDUKindConfirmedRequest {

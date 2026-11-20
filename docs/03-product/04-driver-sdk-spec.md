@@ -2057,6 +2057,23 @@ BACnet 的类型编码是最容易写错的一处：**同一个 LVT 数值，在
 直接把应用值塞在原始负载里。`ReadPropertyACK` 两种都接受——宽容读、严格写，
 是现场兼容性的基本取舍。
 
+##### 写值的数值边界：越界/非整数在写报文前拒绝
+
+选标签只解决「发什么类型」，不解决「发的值能不能装进那个类型」。两个静默
+截断/溢出都违背「写入失败不得静默」——调用方拿到成功，设备实际收到的是
+另一个值：
+
+| 标签 | BACnet 类型 | 越界/非规范值 | 不拦截会怎样 |
+|---|---|---|---|
+| REAL | 4 字节 float32 | 合法 float64 超出 float32 范围（如 `1e300`）、NaN、±Inf、下溢成 0 | 设备收到 `+Inf`/0，写下去的数与请求不同 |
+| UNSIGNED / ENUMERATED | 整数 | 带小数的 `1.5` | 强转 uint64 静默变 `1` |
+
+`dataType=float64` 的点写模拟量 `present-value`（走 REAL）是最隐蔽的一条：
+该值在 `textval.CheckRange` 里是合法 float64，能一路通过上游校验，却在编码
+成 REAL 时溢出。因此 `encodeWriteValue` 在写报文前对 REAL 做 float32 收敛检查、
+对 UNSIGNED/ENUMERATED 做整数检查，越界一律回 `ErrAddress`（本地拒绝、不熔断
+不重试、质量 `address_error`），与 S7/ENIP/MC/ADS 的 `checkRange` 纪律一致。
+
 #### 3.10.8.6 错误类 / 错误码 → 质量映射
 
 设备的 Error APDU 带 `class` 与 `code` 两个字节。映射不是「一律 bad」，
@@ -2156,8 +2173,8 @@ UNSIGNED（老设备或网关转换过）。把配置类型当成「怎么解释
 
 | 层 | 用例 |
 |---|---|
-| `codec/bacnet` | BVLC/NPDU 长度语义、Forwarded-NPDU、标签头六种 LVT、application/context 差异、BOOLEAN 内联、最短字节数、REAL/DOUBLE 金帧、Read/Write 请求金帧、ComplexACK 两种形态、Error/Reject/Abort 解析、参数往返、别名与编号解析 |
-| `driver/bacnet` | 元数据与能力声明、模拟量/字符串/枚举读、类型宽松与严格、未知对象/属性、数组下标与越界、写 REAL/字符串/枚举/布尔、写只读对象、类型不匹配本地拒绝、超时、迟到应答丢弃、重发、ctx 取消、invoke 环绕、错误类映射；**部分失败语义（有成功点则 `err==nil`、全失败才返回整体错误、链路级失败立即返回并把剩余点标坏）** |
+| `codec/bacnet` | BVLC/NPDU 长度语义、Forwarded-NPDU、标签头六种 LVT、application/context 差异、BOOLEAN 内联、最短字节数、REAL/DOUBLE 金帧、Read/Write 请求金帧、ComplexACK 两种形态、Error/Reject/Abort 解析、参数往返、别名与编号解析、**`ParseConfirmedRequest` 截断头回错误而非 panic（畸形 3 字节确认请求不崩进程）** |
+| `driver/bacnet` | 元数据与能力声明、模拟量/字符串/枚举读、类型宽松与严格、未知对象/属性、数组下标与越界、写 REAL/字符串/枚举/布尔、写只读对象、类型不匹配本地拒绝、**写 REAL 的 float32 溢出/NaN/Inf/下溢拒绝、写 UNSIGNED/ENUMERATED 的非整数拒绝（静默截断/溢出在写报文前拦下，端到端设备值不变）**、超时、迟到应答丢弃、重发、ctx 取消、invoke 环绕、错误类映射；**部分失败语义（有成功点则 `err==nil`、全失败才返回整体错误、链路级失败立即返回并把剩余点标坏）** |
 | `sim/bacnet` | 真实 UDP 回环：默认对象表、数组下标、未知对象/属性、写权限、写类型收敛、分段拒绝、未知服务、垃圾报文静默丢弃、自增与停止、对象表排序 |
 
 > 跨驱动的读回确认：`runtime` 的 `confirm` 用**补齐类型后的请求值**与读回值比较

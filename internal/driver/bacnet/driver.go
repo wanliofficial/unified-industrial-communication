@@ -22,6 +22,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"net"
 	"os"
 	"strings"
@@ -576,7 +577,10 @@ func encodeWriteValue(plan pointPlan, req driver.WriteRequest) ([]byte, error) {
 		b = []byte(req.Value.Text)
 	case bacnetcodec.AppEnumerated, bacnetcodec.AppUnsigned:
 		n, ok := req.Value.AsFloat()
-		if !ok || n < 0 || n > float64(^uint32(0)) {
+		// ENUMERATED / UNSIGNED 在 BACnet 里是整数值：带小数的 1.5 强转成
+		// uint64 会被静默截成 1，设备收到并接受了另一个值。和 mc/s7/enip 的
+		// checkRange 一样，非整数在写报文前判错而不是悄悄改掉。
+		if !ok || n != math.Trunc(n) || n < 0 || n > float64(^uint32(0)) {
 			err = fmt.Errorf("point %q: enumerated property requires a non-negative integer, got %s", req.PointID, req.Value.String())
 		} else {
 			u = uint64(n)
@@ -590,8 +594,14 @@ func encodeWriteValue(plan pointPlan, req driver.WriteRequest) ([]byte, error) {
 		}
 	default: // AppReal
 		n, ok := req.Value.AsFloat()
-		if !ok {
-			err = fmt.Errorf("point %q: numeric property requires a number, got %s", req.PointID, req.Value.String())
+		// REAL 在 BACnet 里是 4 字节 float32。一个合法的 float64（例如点表配
+		// dataType=float64、写 analog 的 present-value）可能超出 float32 范围，
+		// 强转后变 +Inf / 下溢成 0——设备会原样接受，写下去的是另一个值。
+		// 与 s7/enip/mc/ads 的 checkRange 纪律一致：越界/非有限在写报文前拒绝。
+		if !ok || math.IsNaN(n) || math.IsInf(n, 0) {
+			err = fmt.Errorf("point %q: numeric property requires a finite number, got %s", req.PointID, req.Value.String())
+		} else if f32 := float32(n); math.IsInf(float64(f32), 0) || f32 == 0 && n != 0 {
+			err = fmt.Errorf("point %q: value %s out of range for REAL (float32)", req.PointID, req.Value.String())
 		} else {
 			f = n
 		}
