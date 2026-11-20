@@ -1302,13 +1302,44 @@ QoS 取 1：控制命令不能是 fire-and-forget。
 3. `Ping` **必须等 PINGRESP**。写成功不算活着——这是上面第二行的直接推论。
    PINGRESP 报文里没有 packet id，因此同一时刻只能有一次在飞的 PINGREQ（单飞）。
    单飞意味着后来的 `Ping` 会等前一次的结果——这个「结果」必须能区分**成功**
-   （收到 PINGRESP）与**失败**（链路在 PINGREQ 在飞期间断开）。若等待信号被
-   `close(chan struct{})` 一关了之，后到的 `Ping` 无法区分这两种情况，会在
-   死链路上误报成功。本实现用 `chan error`：PINGRESP 送 `nil`、链路断开送
-   「connection lost before PINGRESP」。
+   （收到 PINGRESP）与**失败**（链路在 PINGREQ 在飞期间断开），并且必须能
+   **广播给所有等待者**：`Read` 的静默自检与 `Probe` 会同时探测，而一次 PINGREQ
+   只产生一条 PINGRESP。用 `chan error` 是错的——塞值只能唤醒一个接收者，另一个
+   会在健康链路上白等满 `AckTimeout` 并误报断链，触发一次不必要的重连。本实现用
+   `pingFlight{done chan struct{}; err error}`：结束方写 `err` 后 `close(done)`，
+   PINGRESP 是 `nil`、链路断开是「connection lost before PINGRESP」，所有等待者
+   读到同一个结论。
 
 `Probe`（手工探活 / 熔断后的探测）走同一条路径。keepalive 循环也等 PINGRESP，
 所以半死链路在后台就会被打断，不必等到某个点位彻底 stale 才暴露。
+
+#### 3.10.6.1 客户端状态机的三条不变量
+
+这三处都不是「风格问题」，违反任何一条都能编译、也能在实验室跑通，但在现场会
+分别表现为永久卡死、周期性掉线和误判断链：
+
+| 不变量 | 违反后的现场表现 | 做法 |
+|---|---|---|
+| 订阅窗口里分发 PUBLISH **不得再取连接锁** | `Connect` 永久卡死（`Close`/下一次 `Publish` 也一起卡在同一把锁上）；只能在「Broker 在 SUBACK 之前发了一条 QoS1 保留消息」时触发，实验室几乎撞不到 | `dispatchPublish(conn, pkt)` 由调用方把连接传进来。`Connect` 在订阅期间持有连接锁，读循环本来就知道自己读的是哪条连接，再加锁只会引入自锁。规范允许 Broker 在 SUBACK 前后任一顺序发保留消息，其他发布者也随时可能推来消息 |
+| 每条报文写**自带写超时，写完清除** | ① 不清除：`net.Conn` 的写超时是粘性的，`Publish` 设的 `now + AckTimeout` 过期后，保活 PINGREQ、入站 QoS1 的 PUBACK、DISCONNECT 全部立刻 `i/o timeout`——发布间隔大于 `AckTimeout` 的连接会被自己判死、周期性重连；② 不设置：对端停止读取时 `Write` 永久阻塞，`Ping`/保活走不到自己的超时判断，链路状态被冻结 | 所有写走 `writePacket`：在 `writeMu` 内置 `SetWriteDeadline`、写、清成零值。设置与清除都在锁内，并发写各自设自己的上界，不会把对方的截止时间清掉 |
+| 入站 PUBLISH 的协议违约**必须断开** | QoS=3、空主题、主题带 `+`/`#` 的消息被当成普通消息投给点位：QoS3 不回 PUBACK（Broker 无限重投），空主题无处可投，带通配符的主题在消费方看来像一个订阅——错误被藏进「收到了但语义不对」 | `ParsePublish` 按 §3.3.1.2 / §3.3.2 / §4.7.3 拒绝；`readLoop` 与订阅窗口都把它当建链/链路失败处理（规范要求关闭网络连接）。载荷解不出（`OnMessage` 内部）仍是「保留旧值 + 计数」，两者不是一回事 |
+
+#### 3.10.6.2 回归测试矩阵（客户端状态机）
+
+`internal/mqtt/regress_test.go` 每条用例都对应一次**实际发生过的缺陷**，且做过变异
+验证（把修复改回缺陷形态，用例必须转红）：
+
+| 用例 | 钉住的缺陷 | 变异方式 |
+|---|---|---|
+| `TestConnectDoesNotDeadlockOnQoS1PublishDuringSubscribe` | 订阅窗口内 QoS1 保留消息让 `Connect` 自锁 | `dispatchPublish` 恢复二次 `c.mu.Lock()` |
+| `TestPublishDoesNotLeaveStickyWriteDeadline` | `Publish` 的写超时残留成粘性 deadline，空闲后保活把自己判死 | 去掉写完的 `SetWriteDeadline(零值)`，并把 `Ping` 的写改回不设上界 |
+| `TestConcurrentPingBothWakeOnOnePingresp` | 一次 PINGRESP 只唤醒一个等待者，另一个健康链路上误报超时 | `pingFlight.done` 改成容量 1 的 channel（单播语义） |
+| `TestConcurrentPingDuringDeadLinkBothFail` | 死链路上并发 Ping 误报成功（历史 `299f82d`） | `pingFlight` 退回 `close()`-only 语义 |
+| `TestParsePublishRejectsProtocolViolations` | QoS=3 / 空主题 / 主题含通配符被当成普通消息 | 三处守卫前置 `false &&` |
+
+测试用两种对端：`internal/sim/mqtt`（行为完整的 Broker）与 `scriptedBroker`（按
+规范允许、但内置 Broker 不刻意构造的顺序发报文，例如 SUBACK 之前先发保留消息）。
+后者是必须的——「本仓库 Broker 恰好这么发」不能当成协议约束来测。
 
 #### 3.10.7 能力边界与内置 Broker
 

@@ -15,6 +15,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strings"
 )
 
 // 报文类型（MQTT 3.1.1 §2.2.1）。
@@ -416,6 +417,18 @@ func ParsePublish(pkt Packet) (Publish, error) {
 		QoS:       (pkt.Flags >> 1) & 0x03,
 		Retain:    pkt.Flags&0x01 != 0,
 		Duplicate: pkt.Flags&0x08 != 0,
+	}
+	// 三项都是规范的 MUST，而且都会让「这条消息该投给谁、怎么确认」失去
+	// 定义。宽容地接受它们不是健壮性：主题带通配符的消息在本地看起来是
+	// 一条普通消息，在消费方看来却是「一个订阅」，只会把错误藏起来。
+	if p.QoS == 3 {
+		return Publish{}, errors.New("mqtt: publish qos 3 is a protocol violation (§3.3.1.2)")
+	}
+	if p.Topic == "" {
+		return Publish{}, errors.New("mqtt: publish with empty topic (§4.7.3)")
+	}
+	if strings.ContainsAny(p.Topic, "+#") {
+		return Publish{}, fmt.Errorf("mqtt: publish topic %q contains wildcard (§3.3.2)", p.Topic)
 	}
 	rest := body[2+tl:]
 	if p.QoS > 0 {
