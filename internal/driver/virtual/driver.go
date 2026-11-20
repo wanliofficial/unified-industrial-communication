@@ -24,7 +24,12 @@ type Driver struct{}
 // New 返回虚拟驱动。
 func New() *Driver { return &Driver{} }
 
-// Meta 声明虚拟驱动能力：全部 supported，便于测试覆盖所有代码路径。
+// Meta 声明虚拟驱动能力。
+//
+// 能力位是「实际存在的行为」的声明，不是配置意图：Conn 契约只有
+// Probe/Read/Write/Close，本驱动没有任何订阅/浏览代码路径，Subscribe 与
+// Browse 如实声明 unsupported——虚标 supported 会经 driver.List() 暴露给
+// API/UI，让配置界面出现两个永远点不动的按钮。
 func (d *Driver) Meta() driver.Meta {
 	return driver.Meta{
 		ID:           "virtual",
@@ -36,7 +41,7 @@ func (d *Driver) Meta() driver.Meta {
 		AddressKinds: []model.AddressKind{model.AddressRegister, model.AddressSymbol},
 		Capabilities: driver.Capabilities{
 			Read: driver.CapSupported, Write: driver.CapSupported,
-			Subscribe: driver.CapSupported, Browse: driver.CapSupported,
+			Subscribe: driver.CapUnsupported, Browse: driver.CapUnsupported,
 			Discovery: driver.CapUnsupported, MultiRead: driver.CapSupported,
 			BitAccess: driver.CapSupported, StructTypes: driver.CapUnsupported,
 		},
