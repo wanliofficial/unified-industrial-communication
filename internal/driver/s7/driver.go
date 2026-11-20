@@ -82,8 +82,10 @@ func (d *Driver) Meta() driver.Meta {
 			{Name: "address.offset", Label: "字节偏移", Type: "int", Required: true, Scope: "point"},
 			{Name: "address.bit", Label: "位号", Type: "int", Default: -1, Scope: "point",
 				Help: "仅 bool 点位使用，0..7；其余类型留空"},
+			{Name: "address.length", Label: "字节宽度", Type: "int", Scope: "point",
+				Help: "string/bytes 必填。string 的宽度含 2 字节头（DB STRING[n] = 2+n），写入自动带 [max,cur] 头、读取剥头；bytes 是裸字节，不含头"},
 		},
-		Description: "S7comm 主站（TCP 102），支持 DB/I/Q/M/C/T 区读写与位访问",
+		Description: "S7comm 主站（TCP 102），支持 DB/I/Q/M/C/T 区读写与位访问（DB STRING 带 2 字节长度头）",
 	}
 }
 
@@ -671,11 +673,40 @@ func decodeSample(deviceID string, p driver.PointRef, it s7.Item, raw []byte) dr
 			Quality: model.QualityGood,
 		}
 	}
+	if p.DataType == model.TypeString {
+		return decodeS7String(deviceID, p, raw)
+	}
 	v, err := value.Decode(raw, p.DataType, p.ByteOrder)
 	if err != nil {
 		return errSample(p.ID, driver.E(driver.ErrAddress, "decode", deviceID, err.Error(), false, err))
 	}
 	return driver.RawSample{PointID: p.ID, Value: v, Quality: model.QualityGood}
+}
+
+// decodeS7String 解 DB STRING：byte[0]=声明的最大长度，byte[1]=当前实际
+// 长度，其后是字符。
+//
+// 西门子 DB 里的 STRING[n] 占 2+n 字节，头两字节就是这两个长度。早先把
+// 整段按裸字节转文本——头两字节（0x07 0x07 这样的控制字符）被并进文本，
+// 接真实 CPU 时读出来的是乱码；内置从站存裸字节，回环测不出这个错。
+// cur 超出地址宽度是设备侧的坏数据：报地址错而不是按声明截断——截断值
+// 会被当好值上报。
+func decodeS7String(deviceID string, p driver.PointRef, raw []byte) driver.RawSample {
+	if len(raw) < 2 {
+		return errSample(p.ID, driver.E(driver.ErrAddress, "decode", deviceID,
+			fmt.Sprintf("string needs address.length >= 2 (max+cur header), got %d", len(raw)), false, nil))
+	}
+	cur := int(raw[1])
+	if cur > len(raw)-2 {
+		return errSample(p.ID, driver.E(driver.ErrAddress, "decode", deviceID,
+			fmt.Sprintf("string current length %d exceeds area width %d (max declared %d)",
+				cur, len(raw), raw[0]), false, nil))
+	}
+	return driver.RawSample{
+		PointID: p.ID,
+		Value:   model.TextValue(model.TypeString, string(raw[2:2+cur])),
+		Quality: model.QualityGood,
+	}
 }
 
 func errSample(pointID string, err error) driver.RawSample {
@@ -740,7 +771,7 @@ func encodeWrite(req driver.WriteRequest) (s7.Item, []byte, error) {
 		return it, []byte{b}, nil
 	}
 	switch req.DataType {
-	case model.TypeString, model.TypeBytes:
+	case model.TypeBytes:
 		if it.Bytes <= 0 {
 			return s7.Item{}, nil, driver.E(driver.ErrAddress, "encode", "",
 				fmt.Sprintf("point %q needs explicit address.length for %s", req.PointID, req.DataType), false, nil)
@@ -757,6 +788,27 @@ func encodeWrite(req driver.WriteRequest) (s7.Item, []byte, error) {
 		}
 		out := make([]byte, it.Bytes)
 		copy(out, raw)
+		return it, out, nil
+	case model.TypeString:
+		// DB STRING 带 2 字节头（max + cur）：address.length 是含头的总宽，
+		// 与 TIA Portal 的 STRING[n] = 2+n 字节一致。写 [max, cur, 字符...]：
+		// 清空 max/cur 的裸字节写会让 CPU 把字符串长度当 0——「写成功、
+		// 读回全空」。裸字节语义走 bytes 类型（不含头，原样写）。
+		if it.Bytes < 2 {
+			return s7.Item{}, nil, driver.E(driver.ErrAddress, "encode", "",
+				fmt.Sprintf("point %q: string needs address.length >= 2 (max+cur header), got %d",
+					req.PointID, it.Bytes), false, nil)
+		}
+		raw := []byte(req.Value.Text)
+		if len(raw) > it.Bytes-2 {
+			return s7.Item{}, nil, driver.E(driver.ErrAddress, "encode", "",
+				fmt.Sprintf("point %q value is %d chars, address.length %d leaves only %d after the 2-byte header",
+					req.PointID, len(raw), it.Bytes, it.Bytes-2), false, nil)
+		}
+		out := make([]byte, it.Bytes)
+		out[0] = byte(it.Bytes - 2)
+		out[1] = byte(len(raw))
+		copy(out[2:], raw)
 		return it, out, nil
 	}
 	// 数值范围校验必须在编码之前：value.Encode 用强制转换落地，70000 写

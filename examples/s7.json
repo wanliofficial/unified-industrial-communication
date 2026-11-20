@@ -69,7 +69,7 @@
         {
           "id": "label",
           "name": "设备标识",
-          "address": { "kind": "register", "area": "db", "db": 1, "offset": 10, "length": 7, "bit": -1 },
+          "address": { "kind": "register", "area": "db", "db": 1, "offset": 10, "length": 9, "bit": -1 },
           "dataType": "string",
           "enabled": true
         },

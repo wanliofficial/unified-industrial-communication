@@ -113,11 +113,13 @@ func TestOpenRejectsNonTCP(t *testing.T) {
 func TestReadAcrossAreasAndTypes(t *testing.T) {
 	srv := newSim(t, 480)
 	// DB1: REAL 12.5 @0, INT16 -3 @4, DINT 100000 @6, STRING "PUMP-01" @10
-	db1 := make([]byte, 18)
+	// （STRING 带 2 字节头：max=7, cur=7，总宽 9）
+	db1 := make([]byte, 19)
 	binary.BigEndian.PutUint32(db1[0:], math.Float32bits(12.5))
 	binary.BigEndian.PutUint16(db1[4:], uint16(0xFFFD))
 	binary.BigEndian.PutUint32(db1[6:], uint32(100000))
-	copy(db1[10:], "PUMP-01")
+	db1[10], db1[11] = 7, 7
+	copy(db1[12:], "PUMP-01")
 	srv.SetBytes(s7codec.AreaDB, 1, 0, db1)
 	// DB2: WORD 0xBEEF @0
 	srv.SetBytes(s7codec.AreaDB, 2, 0, []byte{0xBE, 0xEF})
@@ -130,7 +132,7 @@ func TestReadAcrossAreasAndTypes(t *testing.T) {
 			pt("count", "db", 1, 4, model.TypeInt16),
 			pt("big", "db", 1, 6, model.TypeInt32),
 			driver.PointRef{ID: "label", DataType: model.TypeString,
-				Address: model.Address{Kind: model.AddressRegister, Area: "db", DB: 1, Offset: 10, Bit: -1}, Length: 7}),
+				Address: model.Address{Kind: model.AddressRegister, Area: "db", DB: 1, Offset: 10, Bit: -1}, Length: 9}),
 		span("db2", pt("word", "db", 2, 0, model.TypeUint16)),
 		span("io", pt("input", "input", 0, 0, model.TypeUint16), bitPt("flag", "merker", 0, 0, 3)),
 	})

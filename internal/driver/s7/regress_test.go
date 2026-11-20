@@ -279,8 +279,9 @@ func TestWriteStringTooLongIsRejected(t *testing.T) {
 	}
 }
 
-// 恰好填满地址宽度仍要照常写（补零语义不变）。
-func TestWriteStringExactWidthStillWorks(t *testing.T) {
+// DB STRING 的 2 字节头语义：写 [max, cur, 字符...]，字符数按 length-2
+// 校验；读回剥掉头。bytes 类型保持裸字节（逃生口，不含头）。
+func TestStringHeaderRoundTrip(t *testing.T) {
 	srv, err := s7sim.NewServer("127.0.0.1:0", 480)
 	if err != nil {
 		t.Fatal(err)
@@ -289,16 +290,95 @@ func TestWriteStringExactWidthStillWorks(t *testing.T) {
 	srv.Ensure(s7codec.AreaDB, 1, 4096)
 	c := openWith(t, srv, &failCounter{})
 
+	// 写 "LINE-2"（6 字符）→ length 8 = 2 头 + 6 字符。
 	results, err := c.Write(context.Background(), []driver.WriteRequest{{
 		PointID: "s", DataType: model.TypeString,
-		Address: model.Address{Kind: model.AddressRegister, Area: "db", DB: 1, Offset: 0, Bit: -1, Length: 4},
-		Value:   model.TextValue(model.TypeString, "ABCD"),
+		Address: model.Address{Kind: model.AddressRegister, Area: "db", DB: 1, Offset: 0, Bit: -1, Length: 8},
+		Value:   model.TextValue(model.TypeString, "LINE-2"),
+	}})
+	if err != nil || len(results) != 1 || !results[0].OK {
+		t.Fatalf("write: %v %+v", err, results)
+	}
+	// 落到 sim 的字节必须是 [max=6, cur=6, LINE-2, 0]：用 bytes 类型
+	// 裸读回验证（bytes 不剥头）。
+	raws, err := c.Read(context.Background(), []driver.ReadSpan{{
+		ID: "db1", Points: []driver.PointRef{{
+			ID: "sraw", DataType: model.TypeBytes,
+			Address: model.Address{Kind: model.AddressRegister, Area: "db", DB: 1, Offset: 0, Bit: -1}, Length: 8,
+		}},
 	}})
 	if err != nil {
-		t.Fatalf("err: %v", err)
+		t.Fatalf("read raw: %v", err)
 	}
-	if len(results) != 1 || !results[0].OK {
-		t.Fatalf("exact-width write must succeed: %+v", results)
+	if got := raws[0].Value.Text; got != "\x06\x06LINE-2" {
+		t.Fatalf("raw = % X, want 06 06 'LINE-2'（length 8 恰好填满，无填充位）", got)
+	}
+	// 读回剥头：文本恰为 LINE-2，尾部填充不进文本。
+	raws, err = c.Read(context.Background(), []driver.ReadSpan{{
+		ID: "db1", Points: []driver.PointRef{{
+			ID: "s", DataType: model.TypeString,
+			Address: model.Address{Kind: model.AddressRegister, Area: "db", DB: 1, Offset: 0, Bit: -1}, Length: 8,
+		}},
+	}})
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if raws[0].Value.Text != "LINE-2" {
+		t.Fatalf("text = %q, want LINE-2", raws[0].Value.Text)
+	}
+
+	// 裸字节（bytes 类型）不带头：原样写原样读。
+	results, err = c.Write(context.Background(), []driver.WriteRequest{{
+		PointID: "b", DataType: model.TypeBytes,
+		Address: model.Address{Kind: model.AddressRegister, Area: "db", DB: 1, Offset: 20, Bit: -1, Length: 4},
+		Value:   model.TextValue(model.TypeBytes, "ABCD"),
+	}})
+	if err != nil || len(results) != 1 || !results[0].OK {
+		t.Fatalf("bytes write: %v %+v", err, results)
+	}
+	raws, err = c.Read(context.Background(), []driver.ReadSpan{{
+		ID: "db1", Points: []driver.PointRef{{
+			ID: "b", DataType: model.TypeBytes,
+			Address: model.Address{Kind: model.AddressRegister, Area: "db", DB: 1, Offset: 20, Bit: -1}, Length: 4,
+		}},
+	}})
+	if err != nil {
+		t.Fatalf("bytes read: %v", err)
+	}
+	if raws[0].Value.Text != "ABCD" {
+		t.Fatalf("bytes text = %q, want ABCD（裸字节不带头）", raws[0].Value.Text)
+	}
+}
+
+// 字符数超出 length-2 在写报文前拒绝（头占 2 字节）；length<2 直接拒绝。
+func TestWriteStringHeaderLimits(t *testing.T) {
+	cases := []struct {
+		length int
+		text   string
+		wantOK bool
+	}{
+		{8, "LINE-2", true},   // 2 头 + 6 字符，恰好填满
+		{8, "LINE-23", false}, // 7 字符 > 6
+		{2, "", true},         // 空 STRING：max=0
+		{1, "", false},        // 头都不够
+	}
+	for _, tc := range cases {
+		srv, err := s7sim.NewServer("127.0.0.1:0", 480)
+		if err != nil {
+			t.Fatal(err)
+		}
+		srv.Ensure(s7codec.AreaDB, 1, 4096)
+		c := openWith(t, srv, &failCounter{})
+		results, err := c.Write(context.Background(), []driver.WriteRequest{{
+			PointID: "s", DataType: model.TypeString,
+			Address: model.Address{Kind: model.AddressRegister, Area: "db", DB: 1, Offset: 0, Bit: -1, Length: tc.length},
+			Value:   model.TextValue(model.TypeString, tc.text),
+		}})
+		ok := err == nil && len(results) == 1 && results[0].OK
+		if ok != tc.wantOK {
+			t.Fatalf("length=%d text=%q: ok=%v (%v), want %v", tc.length, tc.text, ok, err, tc.wantOK)
+		}
+		srv.Close()
 	}
 }
 

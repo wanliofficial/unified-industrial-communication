@@ -57,6 +57,12 @@ curl -s localhost:8085/api/v1/points
 ASCII**，分片以 `param[1]` 判断是否最后一片（0 才是最后一片）。上传失败也会补一条
 End：不释放 PLC 侧会话，反复重试就可能把上传会话耗尽。
 
+DB STRING 的 2 字节长度头：西门子 DB 里的 `STRING[n]` 占 `2+n` 字节（头两字节是
+声明的最大长度与当前实际长度）。驱动 `string` 类型按这个语义读写：`address.length`
+是**含头**的总宽，写入自动带 `[max, cur]` 头，读取剥头后按 `cur` 取字符——裸字节
+读写（不带头）用 `bytes` 类型。内置从站的 DB 是裸内存，用 `bytes` 点位即可自检
+任意字节布局。
+
 OPC UA（二进制，SecurityPolicy None / 匿名）：
 
 ```bash
