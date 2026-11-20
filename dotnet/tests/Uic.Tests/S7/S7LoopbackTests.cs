@@ -35,6 +35,7 @@ internal static class S7LoopbackTests
         tests.Add(new TestCase("s7/unsplittable_point_is_reported", OversizedSinglePointIsReported));
         tests.Add(new TestCase("s7/silent_plc_times_out", SilentPlcTimesOut));
         tests.Add(new TestCase("s7/reconnect_after_peer_closes", ReconnectAfterPeerCloses));
+        tests.Add(new TestCase("s7/metadata_declares_capabilities", MetadataDeclaresCapabilities));
     }
 
     private static (Channel Channel, Device Device) Setup(int port, Dictionary<string, string>? labels = null) => (
@@ -487,4 +488,52 @@ internal static class S7LoopbackTests
     }
 
     private static Task RunAsync(Func<Task> body) => body();
+
+    // ------------------------------------------------------------------
+    // 驱动元数据
+    // ------------------------------------------------------------------
+
+    /// <summary>
+    /// S7 的能力声明此前只活在实现里：protocol-status.md 有记载、<c>GET /api/v1/drivers</c>
+    /// 会把它发给控制台前端生成表单，但没有任何用例守着它别漂移。这里把 Id / 角色 /
+    /// 传输 / 寻址种类 / 能力四态逐一钉住——和 <c>bacnet/*</c> 的 MetadataDeclaresObjectAddressing 同范式。
+    /// 重点钉住「位访问 Supported、订阅 Unsupported」：前者是 S7 区别于 Modbus 的点，
+    /// 后者是「订阅只走 OPC UA / MQTT」边界的落实处，悄悄改成 Supported 会被当成已支持的功能。
+    /// </summary>
+    private static Task MetadataDeclaresCapabilities(TestContext t)
+    {
+        var meta = new S7MasterDriver().Meta;
+
+        t.Equal("s7", meta.Id, "驱动 id");
+        t.Equal("S7comm 主站", meta.Name, "驱动名");
+        t.Ok(meta.Roles.Count == 1 && meta.Roles[0] == DriverRole.Master, "S7 只做主站");
+        t.Ok(meta.Transports.Count == 1 && meta.Transports[0] == "tcp", "S7 走 TCP");
+        t.Ok(meta.Accepts(AddressKind.Register), "S7 用 register 寻址（区域 + 字节偏移）");
+        t.Ok(!meta.Accepts(AddressKind.Symbol) && !meta.Accepts(AddressKind.Object),
+            "S7 不接受符号/对象寻址——符号寻址是 0xB2，明确没做");
+        t.Ok(!meta.Accepts(AddressKind.File), "S7 不走文件记录寻址");
+
+        t.Equal((int)CapState.Supported, (int)meta.Capabilities.Read, "读支持");
+        t.Equal((int)CapState.Supported, (int)meta.Capabilities.Write, "写支持");
+        t.Equal((int)CapState.Supported, (int)meta.Capabilities.MultiRead, "多节点批量读支持");
+        t.Equal((int)CapState.Supported, (int)meta.Capabilities.BitAccess,
+            "位访问是 S7 的招牌能力，必须 Supported");
+        t.Equal((int)CapState.Unsupported, (int)meta.Capabilities.Subscribe, "S7 没有订阅，轮询采集");
+        t.Equal((int)CapState.Unsupported, (int)meta.Capabilities.Browse, "不支持节点浏览");
+        t.Equal((int)CapState.Unsupported, (int)meta.Capabilities.StructTypes, "不支持结构化类型");
+
+        // 控制台表单按这些字段生成输入项；缺一个，用户就填不了对应的配置。
+        var channelFields = meta.ConfigFields.Where(f => f.Scope == "channel").Select(f => f.Name).ToArray();
+        t.Ok(channelFields.Contains("transport.host") && channelFields.Contains("transport.port"),
+            "通道级字段 host/port 必须声明");
+        var deviceFields = meta.ConfigFields.Where(f => f.Scope == "device").Select(f => f.Name).ToArray();
+        foreach (var required in new[] { "labels.rack", "labels.slot", "labels.pduSize" })
+            t.Ok(deviceFields.Contains(required), $"设备级字段 {required} 必须声明");
+
+        var pointFields = meta.PointFields.Select(f => f.Name).ToArray();
+        foreach (var required in new[] { "address.area", "address.offset" })
+            t.Ok(pointFields.Contains(required), $"点位字段 {required} 必须声明");
+
+        return Task.CompletedTask;
+    }
 }

@@ -31,6 +31,7 @@ internal static class OpcUaClientTests
         tests.Add(new TestCase("opcua/options_reject_bad_config", OptionsRejectsBadConfig));
         tests.Add(new TestCase("opcua/endpoint_selection_never_downgrades", EndpointSelectionNeverDowngrades));
         tests.Add(new TestCase("opcua/batch_size_never_zero_and_follows_operation_limit", BatchSizeNeverZeroAndFollowsOperationLimit));
+        tests.Add(new TestCase("opcua/metadata_declares_capabilities", MetadataDeclaresCapabilities));
     }
 
     // ------------------------------------------------------------------
@@ -585,6 +586,67 @@ internal static class OpcUaClientTests
         foreach (var limit in new uint?[] { null, 0, 1, 5, 499, 500, 501, uint.MaxValue })
             t.Ok(OpcUaClientDriver.MaxNodes(limit) >= 1,
                 $"batch is never zero (limit {limit?.ToString() ?? "null"})");
+
+        return Task.CompletedTask;
+    }
+
+    // ------------------------------------------------------------------
+    // 驱动元数据
+    // ------------------------------------------------------------------
+
+    /// <summary>
+    /// OPC UA 客户端的能力声明此前只活在实现里：protocol-status.md §3.3 有记载、
+    /// <c>GET /api/v1/drivers</c> 会把它发给控制台前端生成表单，但没有任何用例守着它别漂移。
+    /// 这里把 Id / 角色 / 传输 / 寻址种类 / 能力四态 / 端点字段逐一钉住。
+    /// 重点钉住「订阅 Supported、位访问 Unsupported」：订阅是 OPC UA 区别于 Modbus/S7 的能力，
+    /// 位访问 unsupported 是因为 NodeId 映射不区分字节内位（位寻址留给 S7/Modbus）——
+    /// 这两个值悄悄改向，会被当成「已支持 / 已支持」的假功能。
+    /// </summary>
+    private static Task MetadataDeclaresCapabilities(TestContext t)
+    {
+        var meta = new OpcUaClientDriver().Meta;
+
+        t.Equal("opcua", meta.Id, "驱动 id");
+        t.Equal("OPC UA 客户端", meta.Name, "驱动名");
+        t.Ok(meta.Roles.Count == 1 && meta.Roles[0] == DriverRole.Master, "客户端只做主站");
+        t.Ok(meta.Transports.Count == 1 && meta.Transports[0] == "tcp", "OPC UA 走 TCP");
+        t.Ok(meta.Accepts(AddressKind.Symbol), "OPC UA 用符号寻址（NodeId 文本）");
+        t.Ok(!meta.Accepts(AddressKind.Register) && !meta.Accepts(AddressKind.Object),
+            "OPC UA 不接受 register/object 寻址");
+        t.Ok(!meta.Accepts(AddressKind.File), "OPC UA 不走文件记录寻址");
+
+        t.Equal((int)CapState.Supported, (int)meta.Capabilities.Read, "读支持");
+        t.Equal((int)CapState.Supported, (int)meta.Capabilities.Write, "写支持");
+        t.Equal((int)CapState.Supported, (int)meta.Capabilities.Subscribe,
+            "订阅（MonitoredItem）是 OPC UA 的核心能力");
+        t.Equal((int)CapState.Supported, (int)meta.Capabilities.MultiRead,
+            "多节点批量 Read 支持（按 MaxNodesPerRead 分片）");
+        t.Equal((int)CapState.Unsupported, (int)meta.Capabilities.BitAccess,
+            "OPC UA 不按字节内位寻址，位访问 unsupported");
+        t.Equal((int)CapState.Unsupported, (int)meta.Capabilities.Browse, "不支持节点浏览");
+
+        // 控制台表单按这些字段生成输入项；缺一个，用户就填不了对应的配置。
+        var configFieldNames = meta.ConfigFields.Select(f => f.Name).ToArray();
+        foreach (var required in new[]
+                 {
+                     "transport.host", "transport.port", "labels.endpointPath",
+                     "labels.securityPolicy", "labels.securityMode",
+                     "labels.acceptUntrustedCertificates", "labels.pkiDir",
+                     "labels.sessionTimeout", "labels.publishingInterval",
+                 })
+            t.Ok(configFieldNames.Contains(required), $"配置字段 {required} 必须声明");
+
+        // 安全策略的枚举白名单必须与 SelectEndpoint / FromContext 认的值一致，
+        // 否则表单能填一个驱动根本不认的档位（OptionsRejectsBadConfig 已钉住运行期）。
+        var policyField = meta.ConfigFields.First(f => f.Name == "labels.securityPolicy");
+        t.Ok(policyField.Enum is not null && policyField.Enum.Contains("None")
+            && policyField.Enum.Contains("Basic256Sha256"),
+            "安全策略枚举只暴露 None / Basic256Sha256");
+        t.Equal("None", policyField.Default, "默认安全策略是 None（未配置时不强制加密）");
+
+        var pointFieldNames = meta.PointFields.Select(f => f.Name).ToArray();
+        foreach (var required in new[] { "address.path", "address.index" })
+            t.Ok(pointFieldNames.Contains(required), $"点位字段 {required} 必须声明");
 
         return Task.CompletedTask;
     }
