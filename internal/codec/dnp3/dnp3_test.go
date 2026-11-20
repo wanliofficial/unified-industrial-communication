@@ -465,3 +465,52 @@ func TestParseTruncated(t *testing.T) {
 		}
 	}
 }
+
+// 索引 >0xFFFF 必须用 QualIndex32 前缀：点表允许 24 位索引，早先把
+// uint16(index) 静默截断——index=0x12345 的控制命令会下发到 0x2345 上。
+// 读路径本就解析 32 位前缀，写路径对齐。
+func TestControlObjects32BitIndex(t *testing.T) {
+	const big = uint32(0x12345)
+
+	raw, err := CROBObjects(big, CROBLatchOn, 1, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if raw[2] != QualIndex32 {
+		t.Fatalf("crob qualifier = 0x%02X, want 0x%02X", raw[2], QualIndex32)
+	}
+	objs, err := ParseObjects(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(objs) != 1 || objs[0].Index != big {
+		t.Fatalf("crob = %+v", objs)
+	}
+	c, ok := objs[0].Value.(CROB)
+	if !ok || c.Code != CROBLatchOn || c.Count != 1 || !c.Success() {
+		t.Fatalf("crob value = %#v", objs[0].Value)
+	}
+
+	raw, err = AnalogOutputObjects(big, 3, 12.5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if raw[2] != QualIndex32 {
+		t.Fatalf("analog qualifier = 0x%02X, want 0x%02X", raw[2], QualIndex32)
+	}
+	objs, err = ParseObjects(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(objs) != 1 || objs[0].Index != big || objs[0].Value != 12.5 {
+		t.Fatalf("analog output = %+v", objs)
+	}
+
+	// 8/16 位分支不回归。
+	if raw, err = CROBObjects(300, CROBLatchOn, 1, 0, 0); err != nil || raw[2] != QualIndex16 {
+		t.Fatalf("16-bit qualifier = 0x%02X err %v", raw[2], err)
+	}
+	if raw, err = CROBObjects(7, CROBLatchOn, 1, 0, 0); err != nil || raw[2] != QualIndex8 {
+		t.Fatalf("8-bit qualifier = 0x%02X err %v", raw[2], err)
+	}
+}

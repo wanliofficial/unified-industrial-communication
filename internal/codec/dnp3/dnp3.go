@@ -1129,20 +1129,16 @@ func ClassObjects(classes ...byte) ([]byte, error) {
 }
 
 // CROBObjects 生成一个直接控制（组 12 变体 1）的对象区。
+//
+// 索引前缀按数值大小选 8/16/32 位：点表允许 24 位索引，>0xFFFF 时用
+// QualIndex32——把 uint16 静默截断会把控制命令下发到错误的点上。
 func CROBObjects(index uint32, code, count byte, onTime, offTime uint32) ([]byte, error) {
-	q := QualIndex8
-	if index > 0xFF {
-		q = QualIndex16
-	}
+	q := indexQualifier(index)
 	out, err := EncodeHeader(GroupCROB, 1, q, 0, 1)
 	if err != nil {
 		return nil, err
 	}
-	if q == QualIndex8 {
-		out = append(out, byte(index))
-	} else {
-		out = binary.LittleEndian.AppendUint16(out, uint16(index))
-	}
+	out = appendIndexPrefix(out, q, index)
 	out = append(out, code, count)
 	out = binary.LittleEndian.AppendUint32(out, onTime)
 	out = binary.LittleEndian.AppendUint32(out, offTime)
@@ -1157,19 +1153,12 @@ func AnalogOutputObjects(index uint32, variation byte, value float64) ([]byte, e
 	if variation < 1 || variation > 4 {
 		return nil, fmt.Errorf("dnp3: analog output variation %d out of range", variation)
 	}
-	q := QualIndex8
-	if index > 0xFF {
-		q = QualIndex16
-	}
+	q := indexQualifier(index)
 	out, err := EncodeHeader(GroupAnalogOutputBlock, variation, q, 0, 1)
 	if err != nil {
 		return nil, err
 	}
-	if q == QualIndex8 {
-		out = append(out, byte(index))
-	} else {
-		out = binary.LittleEndian.AppendUint16(out, uint16(index))
-	}
+	out = appendIndexPrefix(out, q, index)
 	switch variation {
 	case 1:
 		out = binary.LittleEndian.AppendUint32(out, uint32(int32(value)))
@@ -1181,4 +1170,26 @@ func AnalogOutputObjects(index uint32, variation byte, value float64) ([]byte, e
 		out = binary.LittleEndian.AppendUint64(out, math.Float64bits(value))
 	}
 	return out, nil
+}
+
+// indexQualifier 按索引大小选带索引前缀的限定词（8/16/32 位）。
+func indexQualifier(index uint32) byte {
+	switch {
+	case index > 0xFFFF:
+		return QualIndex32
+	case index > 0xFF:
+		return QualIndex16
+	}
+	return QualIndex8
+}
+
+// appendIndexPrefix 按限定词把索引前缀写进对象区。
+func appendIndexPrefix(out []byte, q byte, index uint32) []byte {
+	switch q {
+	case QualIndex8:
+		return append(out, byte(index))
+	case QualIndex16:
+		return binary.LittleEndian.AppendUint16(out, uint16(index))
+	}
+	return binary.LittleEndian.AppendUint32(out, index)
 }
