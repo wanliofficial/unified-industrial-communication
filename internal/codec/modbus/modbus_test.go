@@ -2,6 +2,7 @@ package modbus
 
 import (
 	"bytes"
+	"encoding/binary"
 	"testing"
 
 	"uic/internal/driver"
@@ -277,5 +278,47 @@ func TestByteOrder(t *testing.T) {
 		if back := Reorder(got, tc.order); !bytes.Equal(back, raw) {
 			t.Fatalf("%s not symmetric: % x", tc.order, back)
 		}
+	}
+}
+
+// FC15 编解码：LSB-first 位序、数量/范围上限、回显校验。
+func TestWriteMultipleCoils(t *testing.T) {
+	c := NewCodec("dev1")
+	pdu, err := c.EncodeWriteMultipleCoils(10, []bool{true, false, true, true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pdu[0] != FCWriteMultipleCoils {
+		t.Fatalf("fc = %#x", pdu[0])
+	}
+	if binary.BigEndian.Uint16(pdu[1:3]) != 10 || binary.BigEndian.Uint16(pdu[3:5]) != 4 {
+		t.Fatalf("header = % X", pdu[:5])
+	}
+	if pdu[5] != 1 || pdu[6] != 0b00001101 {
+		t.Fatalf("data = byteCount %d bits %08b, want 1 / 00001101 (LSB-first)", pdu[5], pdu[6])
+	}
+	// 从站侧解析共享同一语义（slave/sim 的 FC15 处理会再钉一遍）。
+
+	// 回显：地址与数量一致才算成功。
+	echo := append([]byte{FCWriteMultipleCoils}, pdu[1:5]...)
+	if err := c.DecodeWriteMultipleCoils(10, 4, echo); err != nil {
+		t.Fatalf("echo: %v", err)
+	}
+	if err := c.DecodeWriteMultipleCoils(11, 4, echo); err == nil {
+		t.Fatal("地址不一致应报错")
+	}
+	if err := c.DecodeWriteMultipleCoils(10, 5, echo); err == nil {
+		t.Fatal("数量不一致应报错")
+	}
+
+	// 越界 / 超限 / 空。
+	if _, err := c.EncodeWriteMultipleCoils(0xFFFF, []bool{true, false}); err == nil {
+		t.Fatal("越出 0x10000 应报错")
+	}
+	if _, err := c.EncodeWriteMultipleCoils(0, make([]bool, MaxWriteCoils+1)); err == nil {
+		t.Fatal("超过 MaxWriteCoils 应报错")
+	}
+	if _, err := c.EncodeWriteMultipleCoils(0, nil); err == nil {
+		t.Fatal("空批次应报错")
 	}
 }

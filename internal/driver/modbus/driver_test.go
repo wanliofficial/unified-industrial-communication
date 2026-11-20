@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
 	"sync"
 	"testing"
@@ -649,5 +650,86 @@ func TestCloseIsIdempotent(t *testing.T) {
 	}
 	if err := c.Close(); err != nil {
 		t.Fatalf("second close: %v", err)
+	}
+}
+
+// coilRun 的边界：只有「线圈区 + 整点 bool + 偏移严格连续」的相邻请求才
+// 能合并成 FC15。重复偏移、间隔偏移、寄存器写都要终止串。
+func TestCoilRun(t *testing.T) {
+	coil := func(offset int) driver.WriteRequest {
+		return driver.WriteRequest{
+			PointID: fmt.Sprintf("c%d", offset), DataType: model.TypeBool,
+			Value:   model.BoolValue(true),
+			Address: model.Address{Kind: model.AddressRegister, Area: "coil", Offset: offset, Bit: -1},
+		}
+	}
+	reqs := []driver.WriteRequest{
+		coil(0), coil(1), coil(2),
+		{PointID: "h", DataType: model.TypeBool, Value: model.BoolValue(true),
+			Address: model.Address{Kind: model.AddressRegister, Area: "holding", Offset: 3, Bit: -1}},
+		coil(4), coil(6), coil(7),
+	}
+	// 0..2 连续；第 4 个是 holding，终止；随后 4 断开（4 之后是 6）。
+	if n := coilRun(reqs, 0); n != 3 {
+		t.Fatalf("run(0) = %d, want 3", n)
+	}
+	if n := coilRun(reqs, 3); n != 0 {
+		t.Fatalf("run(3) = %d, want 0", n)
+	}
+	if n := coilRun(reqs, 4); n != 1 {
+		t.Fatalf("run(4) = %d, want 1", n)
+	}
+	// 重复偏移不算连续。
+	if n := coilRun([]driver.WriteRequest{coil(9), coil(9)}, 0); n != 1 {
+		t.Fatalf("dup offset run = %d, want 1", n)
+	}
+}
+
+// 端到端：一批相邻线圈写走 FC15 合并，值全部落对（位序 LSB-first）。
+func TestWriteCoilBatchFC15(t *testing.T) {
+	s := newSim(t)
+	c := openConn(t, s, 1)
+	mk := func(offset int, v bool) driver.WriteRequest {
+		return driver.WriteRequest{
+			PointID: fmt.Sprintf("c%d", offset), DataType: model.TypeBool,
+			Value:   model.BoolValue(v),
+			Address: model.Address{Kind: model.AddressRegister, Area: "coil", Offset: offset, Bit: -1},
+		}
+	}
+	want := []bool{true, false, true, true, false, false, true, false, true}
+	reqs := make([]driver.WriteRequest, len(want))
+	for i, v := range want {
+		reqs[i] = mk(10+i, v)
+	}
+	res, err := c.Write(context.Background(), reqs)
+	if err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	for i, r := range res {
+		if !r.OK || r.Quality != model.QualityGood {
+			t.Fatalf("res[%d] = %+v", i, r)
+		}
+	}
+	// 回读逐位核对。
+	spans := []driver.ReadSpan{{
+		ID: "s",
+		Points: func() (ps []driver.PointRef) {
+			for i := range want {
+				ps = append(ps, driver.PointRef{
+					ID: fmt.Sprintf("c%d", 10+i), DataType: model.TypeBool, Length: 1,
+					Address: model.Address{Kind: model.AddressRegister, Area: "coil", Offset: 10 + i, Bit: -1},
+				})
+			}
+			return ps
+		}(),
+	}}
+	got, err := c.Read(context.Background(), spans)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, g := range got {
+		if g.Value.Bool != want[i] {
+			t.Fatalf("coil %d = %v, want %v", 10+i, g.Value.Bool, want[i])
+		}
 	}
 }

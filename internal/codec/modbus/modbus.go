@@ -368,6 +368,72 @@ func isHoldingArea(area string) bool {
 // IsHoldingArea 供驱动判断某个区是否可写（FC6/FC16 只能写保持寄存器）。
 func IsHoldingArea(area string) bool { return isHoldingArea(strings.ToLower(area)) }
 
+// IsCoilArea 供驱动判断某个区是否走线圈写（FC5/FC15）。
+func IsCoilArea(area string) bool { return isCoilArea(strings.ToLower(area)) }
+
+// MaxWriteCoils 是 FC15 一次能写的线圈数上限（MODBUS 应用协议规定 0x7B0）。
+const MaxWriteCoils = 0x7B0
+
+// EncodeWriteMultipleCoils 生成 FC15 写多线圈 PDU。
+//
+// 位序按规范 LSB-first：第一个线圈占第一个数据字节的最低位。Meta 声明了
+// FC15，而主站此前只发 FC5——批量线圈写被逐点拆成单写，对串口总线是
+// 实打实的帧数开销。
+func (c *Codec) EncodeWriteMultipleCoils(offset int, bits []bool) ([]byte, error) {
+	if offset < 0 || offset > 0xFFFF {
+		return nil, driver.E(driver.ErrAddress, "encode", c.DeviceID,
+			fmt.Sprintf("coil offset %d out of range 0..65535", offset), false, nil)
+	}
+	if len(bits) == 0 || offset+len(bits) > 0x10000 {
+		return nil, driver.E(driver.ErrAddress, "encode", c.DeviceID,
+			fmt.Sprintf("coil range %d..%d out of 0..65535", offset, offset+len(bits)-1), false, nil)
+	}
+	if len(bits) > MaxWriteCoils {
+		return nil, driver.E(driver.ErrAddress, "encode", c.DeviceID,
+			fmt.Sprintf("%d coils exceeds limit %d", len(bits), MaxWriteCoils), false, nil)
+	}
+	n := (len(bits) + 7) / 8
+	pdu := make([]byte, 6+n)
+	pdu[0] = FCWriteMultipleCoils
+	binary.BigEndian.PutUint16(pdu[1:3], uint16(offset))
+	binary.BigEndian.PutUint16(pdu[3:5], uint16(len(bits)))
+	pdu[5] = byte(n)
+	for i, b := range bits {
+		if b {
+			pdu[6+i/8] |= 1 << uint(i%8)
+		}
+	}
+	return pdu, nil
+}
+
+// DecodeWriteMultipleCoils 校验 FC15 回显（功能码 + 起始地址 + 数量）。
+func (c *Codec) DecodeWriteMultipleCoils(start, count int, resp []byte) error {
+	if len(resp) == 0 {
+		return driver.E(driver.ErrProtocol, "decode", c.DeviceID, "empty response", true, nil)
+	}
+	if resp[0]&0x80 != 0 {
+		return exceptionError(c.DeviceID, resp)
+	}
+	if resp[0] != FCWriteMultipleCoils {
+		return driver.E(driver.ErrProtocol, "decode", c.DeviceID,
+			fmt.Sprintf("unexpected write echo %#x, want %#x", resp[0], FCWriteMultipleCoils), true, nil)
+	}
+	if len(resp) < 5 {
+		return driver.E(driver.ErrProtocol, "decode", c.DeviceID, "short write response", true, nil)
+	}
+	// 与单点写同一纪律：回显地址/数量必须与请求一致，不回读确认的写入
+	// 不能「成功」得毫无声息。
+	if got, want := int(binary.BigEndian.Uint16(resp[1:3])), start; got != want {
+		return driver.E(driver.ErrProtocol, "decode", c.DeviceID,
+			fmt.Sprintf("write echo address %d, want %d", got, want), true, nil)
+	}
+	if got, want := int(binary.BigEndian.Uint16(resp[3:5])), count; got != want {
+		return driver.E(driver.ErrProtocol, "decode", c.DeviceID,
+			fmt.Sprintf("write echo quantity %d, want %d", got, want), true, nil)
+	}
+	return nil
+}
+
 // DecodeWrite 校验写响应。
 func (c *Codec) DecodeWrite(req driver.WriteRequest, resp []byte) (driver.WriteResult, error) {
 	if len(resp) == 0 {

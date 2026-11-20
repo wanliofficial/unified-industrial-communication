@@ -202,13 +202,29 @@ func (c *conn) Write(ctx context.Context, reqs []driver.WriteRequest) ([]driver.
 
 	results := make([]driver.WriteResult, 0, len(reqs))
 	var firstErr error
-	for _, req := range reqs {
+	for i := 0; i < len(reqs); {
+		req := reqs[i]
 		if needsBitRMW(req) {
 			res, err := c.writeBitRMW(ctx, req)
 			results = append(results, res)
 			if err != nil && firstErr == nil {
 				firstErr = err
 			}
+			i++
+			continue
+		}
+		// 相邻的线圈整点写合并成一个 FC15 事务（Meta 声明的 FC15 落地处）：
+		// 一批 N 个点从 N 帧变 1 帧，串口总线上是实打实的开销。寄存器写
+		// 不合并——FC16 已承载单点多寄存器值，且合并会打乱逐点回显校验。
+		if n := coilRun(reqs, i); n >= 2 {
+			batch := c.writeCoilBatch(ctx, reqs[i:i+n])
+			for _, res := range batch {
+				if res.Err != nil && firstErr == nil {
+					firstErr = res.Err
+				}
+			}
+			results = append(results, batch...)
+			i += n
 			continue
 		}
 		pdu, err := c.codec.EncodeWrite(req)
@@ -217,6 +233,7 @@ func (c *conn) Write(ctx context.Context, reqs []driver.WriteRequest) ([]driver.
 			if firstErr == nil {
 				firstErr = err
 			}
+			i++
 			continue
 		}
 		resp, err := c.tr.RoundTrip(ctx, pdu)
@@ -225,6 +242,7 @@ func (c *conn) Write(ctx context.Context, reqs []driver.WriteRequest) ([]driver.
 			if firstErr == nil {
 				firstErr = err
 			}
+			i++
 			continue
 		}
 		res, err := c.codec.DecodeWrite(req, resp)
@@ -236,8 +254,69 @@ func (c *conn) Write(ctx context.Context, reqs []driver.WriteRequest) ([]driver.
 			}
 		}
 		results = append(results, res)
+		i++
 	}
 	return results, firstErr
+}
+
+// coilRun 计算从 i 开始可以合并成一个 FC15 的请求数：都是线圈区的整点
+// bool 写、偏移严格连续。任何不满足的请求终止该串（包括重复偏移——同一
+// 线圈写两次合并成一次会丢掉其中一次的语义）。
+func coilRun(reqs []driver.WriteRequest, i int) int {
+	first := reqs[i]
+	if first.DataType != model.TypeBool || first.Address.Kind != model.AddressRegister ||
+		!mbcodec.IsCoilArea(first.Address.Area) {
+		return 0
+	}
+	n := 1
+	for j := i + 1; j < len(reqs); j++ {
+		next := reqs[j]
+		if next.DataType != model.TypeBool || next.Address.Kind != model.AddressRegister ||
+			!mbcodec.IsCoilArea(next.Address.Area) ||
+			next.Address.Offset != first.Address.Offset+(j-i) {
+			break
+		}
+		n++
+	}
+	return n
+}
+
+// writeCoilBatch 把一段连续线圈写合成为一次 FC15 事务，结果按请求顺序
+// 逐点返回。任何一步失败，整串标同样的错误——FC15 的回显只确认
+// 「起始地址 + 数量」，不确认每个位，无法只标坏其中一部分。
+func (c *conn) writeCoilBatch(ctx context.Context, reqs []driver.WriteRequest) []driver.WriteResult {
+	start := reqs[0].Address.Offset
+	bits := make([]bool, len(reqs))
+	for i, r := range reqs {
+		bits[i] = r.Value.Bool
+	}
+	out := make([]driver.WriteResult, len(reqs))
+	for i := range out {
+		out[i] = driver.WriteResult{PointID: reqs[i].PointID}
+	}
+	fail := func(err error, quality model.Quality) []driver.WriteResult {
+		for i := range out {
+			out[i].Err = err
+			out[i].Quality = quality
+		}
+		return out
+	}
+	pdu, err := c.codec.EncodeWriteMultipleCoils(start, bits)
+	if err != nil {
+		return fail(err, model.QualityBad)
+	}
+	resp, err := c.tr.RoundTrip(ctx, pdu)
+	if err != nil {
+		return fail(err, model.QualityCommError)
+	}
+	if err := c.codec.DecodeWriteMultipleCoils(start, len(reqs), resp); err != nil {
+		return fail(err, model.QualityBad)
+	}
+	for i := range out {
+		out[i].OK = true
+		out[i].Quality = model.QualityGood
+	}
+	return out
 }
 
 // needsBitRMW 判断一次写入是否需要「读-改-写」：布尔点落在保持寄存器里，
