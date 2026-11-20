@@ -610,3 +610,56 @@ func TestIntegratedTotalsInvalidQualityConvertsToBad(t *testing.T) {
 		t.Fatalf("quality = %s, want bad", q)
 	}
 }
+
+// 测量值的 QDS 品质位（[QDS] = OV(bit0)+保留(bit1..3)+BL(bit4)+SB(bit5)+
+// NT(bit6)+IV(bit7)）必须按标准位置逐位解出。旧实现用 `Quality(b & 0x1F)`
+// 读 bit0..4，把 IV 落在 bit7 整个漏掉——一个「无效」的模拟量会被报成
+// good（fail-open），而 BL 落在 bit4 又被误读成 IV。这里用标准位置手拼
+// QDS 字节，钉死每一位的折算结果。
+func TestMeasuredQDSQualityBits(t *testing.T) {
+	cases := []struct {
+		name string
+		qds  byte
+		want model.Quality
+	}{
+		{"OV bit0", 0x01, model.QualityUncertain},
+		{"BL bit4", 0x10, model.QualityUncertain},
+		{"SB bit5", 0x20, model.QualityUncertain},
+		{"NT bit6", 0x40, model.QualityStale},
+		{"IV bit7", 0x80, model.QualityBad},
+		{"IV+NT bit7|bit6", 0xC0, model.QualityBad}, // bad 压过 stale
+	}
+	for _, c := range cases {
+		// M_ME_NA_1 元素：2 字节归一化值 + 1 字节 QDS。
+		elem := []byte{0x00, 0x40, c.qds}
+		o, n, err := decodeElement(TypeMeasuredNormalized, elem)
+		if err != nil || n != 3 {
+			t.Fatalf("%s: decodeElement = %v, %d", c.name, err, n)
+		}
+		if q := QualityOf(o.Quality); q != c.want {
+			t.Fatalf("%s: QDS=0x%02X quality = %s, want %s", c.name, c.qds, q, c.want)
+		}
+	}
+
+	// 编码侧必须把 IV 写回 bit7（不是 bit4）。旧实现 `Quality & 0x1F` 会
+	// 把 QInvalid 写到 0x10（BL 的位置），与真实装置对不上。
+	o := Object{Num: 0.5, Quality: QInvalid}
+	b, err := appendElement(nil, TypeMeasuredNormalized, o)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if b[2]&0x80 == 0 {
+		t.Fatalf("IV must land in bit 7: QDS=0x%02X", b[2])
+	}
+	if b[2]&0x10 != 0 {
+		t.Fatalf("IV must not leak into BL bit 4: QDS=0x%02X", b[2])
+	}
+	// 往返一次，IV 仍是 bad。
+	back, _, err := decodeElement(TypeMeasuredNormalized, b)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if q := QualityOf(back.Quality); q != model.QualityBad {
+		t.Fatalf("round-trip IV quality = %s, want bad", q)
+	}
+}

@@ -175,6 +175,53 @@ func encodeSIQQuality(q Quality) byte {
 	return byte(q&siqQualityMask) << 3
 }
 
+// decodeQDS 把测量值（M_ME_*）的 QDS 字节折品质位集合。
+//
+// QDS = [OV, 保留×3, BL, SB, NT, IV]：OV 在 bit0，bit1..3 是保留位，BL/SB/NT/IV
+// 在 bit4..7（与 SIQ/DIQ 的品质位同位置）。OV 与 BL/SB/NT/IV 之间隔着三个
+// 保留位，不连续，必须逐位映射——既不能整体平移，也不能裸 `Quality(b & 0x1F)`
+// （那会把 IV 落在 bit7 整个漏掉、把 BL 落在 bit4 误读成 IV，并把保留位当品质）。
+func decodeQDS(b byte) Quality {
+	var q Quality
+	if b&0x01 != 0 {
+		q |= QOverflow // OV bit0
+	}
+	if b&(1<<4) != 0 {
+		q |= QBlocked // BL bit4
+	}
+	if b&(1<<5) != 0 {
+		q |= QSubstituted // SB bit5
+	}
+	if b&(1<<6) != 0 {
+		q |= QNotTopical // NT bit6
+	}
+	if b&(1<<7) != 0 {
+		q |= QInvalid // IV bit7
+	}
+	return q
+}
+
+// encodeQDS 是 decodeQDS 的逆运算。
+func encodeQDS(q Quality) byte {
+	var b byte
+	if q.Has(QOverflow) {
+		b |= 0x01 // OV bit0
+	}
+	if q.Has(QBlocked) {
+		b |= 1 << 4 // BL bit4
+	}
+	if q.Has(QSubstituted) {
+		b |= 1 << 5 // SB bit5
+	}
+	if q.Has(QNotTopical) {
+		b |= 1 << 6 // NT bit6
+	}
+	if q.Has(QInvalid) {
+		b |= 1 << 7 // IV bit7
+	}
+	return b
+}
+
 // ---------------------------------------------------------------------------
 // 信息对象与 ASDU
 // ---------------------------------------------------------------------------
@@ -557,24 +604,24 @@ func decodeElement(typeID byte, b []byte) (Object, int, error) {
 			Time: decodeCP56Time2a(b[1:8]),
 		}, size, nil
 	case TypeMeasuredNormalized:
-		return Object{Num: normalized(b[0:2]), Quality: Quality(b[2] & 0x1F)}, size, nil
+		return Object{Num: normalized(b[0:2]), Quality: decodeQDS(b[2])}, size, nil
 	case TypeMeasuredScaled:
-		return Object{Num: float64(int16(binary.LittleEndian.Uint16(b[0:2]))), Quality: Quality(b[2] & 0x1F)}, size, nil
+		return Object{Num: float64(int16(binary.LittleEndian.Uint16(b[0:2]))), Quality: decodeQDS(b[2])}, size, nil
 	case TypeMeasuredFloat:
-		return Object{Num: float64(math.Float32frombits(binary.LittleEndian.Uint32(b[0:4]))), Quality: Quality(b[4] & 0x1F)}, size, nil
+		return Object{Num: float64(math.Float32frombits(binary.LittleEndian.Uint32(b[0:4]))), Quality: decodeQDS(b[4])}, size, nil
 	case TypeMeasuredNormalizedTime:
 		return Object{
-			Num: normalized(b[0:2]), Quality: Quality(b[2] & 0x1F),
+			Num: normalized(b[0:2]), Quality: decodeQDS(b[2]),
 			Time: decodeCP56Time2a(b[3:10]),
 		}, size, nil
 	case TypeMeasuredScaledTime:
 		return Object{
-			Num: float64(int16(binary.LittleEndian.Uint16(b[0:2]))), Quality: Quality(b[2] & 0x1F),
+			Num: float64(int16(binary.LittleEndian.Uint16(b[0:2]))), Quality: decodeQDS(b[2]),
 			Time: decodeCP56Time2a(b[3:10]),
 		}, size, nil
 	case TypeMeasuredFloatTime:
 		return Object{
-			Num: float64(math.Float32frombits(binary.LittleEndian.Uint32(b[0:4]))), Quality: Quality(b[4] & 0x1F),
+			Num: float64(math.Float32frombits(binary.LittleEndian.Uint32(b[0:4]))), Quality: decodeQDS(b[4]),
 			Time: decodeCP56Time2a(b[5:12]),
 		}, size, nil
 	case TypeIntegratedTotals:
@@ -637,7 +684,7 @@ func appendElement(b []byte, typeID byte, o Object) ([]byte, error) {
 		return append(b, encodeCP56Time2a(o.Time)...), nil
 	case TypeMeasuredNormalized, TypeMeasuredNormalizedTime:
 		b = binary.LittleEndian.AppendUint16(b, encodeNormalized(o.Num))
-		b = append(b, byte(o.Quality&0x1F))
+		b = append(b, encodeQDS(o.Quality))
 		if typeID == TypeMeasuredNormalizedTime {
 			b = append(b, encodeCP56Time2a(o.Time)...)
 		}
@@ -647,14 +694,14 @@ func appendElement(b []byte, typeID byte, o Object) ([]byte, error) {
 			return nil, fmt.Errorf("scaled value %v exceeds int16", o.Num)
 		}
 		b = binary.LittleEndian.AppendUint16(b, uint16(int16(math.Round(o.Num))))
-		b = append(b, byte(o.Quality&0x1F))
+		b = append(b, encodeQDS(o.Quality))
 		if typeID == TypeMeasuredScaledTime {
 			b = append(b, encodeCP56Time2a(o.Time)...)
 		}
 		return b, nil
 	case TypeMeasuredFloat, TypeMeasuredFloatTime:
 		b = binary.LittleEndian.AppendUint32(b, math.Float32bits(float32(o.Num)))
-		b = append(b, byte(o.Quality&0x1F))
+		b = append(b, encodeQDS(o.Quality))
 		if typeID == TypeMeasuredFloatTime {
 			b = append(b, encodeCP56Time2a(o.Time)...)
 		}
