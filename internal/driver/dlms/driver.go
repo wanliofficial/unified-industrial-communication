@@ -704,6 +704,11 @@ func (c *conn) getAttribute(ctx context.Context, pointID string, desc dlmscodec.
 //     的原始值看起来已经缩放过了。
 //  3. **octet-string / visible-string**：表号、逻辑设备名是文本；能打印成
 //     可见字符就给原文，否则给十六进制。
+//
+// null-data（含 dontcare）不是 0：它表示表此刻没有可信值（未置值、对象
+// 数据尚未生成）。把 null 解成 good 质量的 0，下游看到的是"读数正常、
+// 恰好为零"——电表上 0 和无值天差地别（负荷曲线空白 vs 停电）。这里按
+// ErrProtocol 标坏，下一轮采集重试，值生成了自然恢复。
 func valueOf(ref driver.PointRef, v dlmscodec.Value) (model.Value, error) {
 	switch v.Kind() {
 	case dlmscodec.KindArray:
@@ -723,7 +728,8 @@ func valueOf(ref driver.PointRef, v dlmscodec.Value) (model.Value, error) {
 	case dlmscodec.KindString:
 		return model.TextValue(model.TypeString, v.Text), nil
 	case dlmscodec.KindNull:
-		return model.NumValue(model.TypeFloat64, 0), nil
+		return model.Value{}, driver.E(driver.ErrProtocol, "decode", ref.ID,
+			"meter returned null-data (no value available)", false, nil)
 	}
 	// 数值 / 布尔
 	if n, ok := v.Number(); ok {

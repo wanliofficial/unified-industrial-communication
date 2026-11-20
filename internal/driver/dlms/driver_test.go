@@ -420,3 +420,17 @@ func mustOBIS(t *testing.T, s string) dl.OBIS {
 	}
 	return o
 }
+
+// null-data 不是 0：表没给值必须标坏（protocol → bad），而不是冒充一个
+// good 质量的 0。负荷曲线空白和真读数 0 在电表上是两回事。
+func TestValueOfNullIsBad(t *testing.T) {
+	for _, tag := range []byte{dl.TagNull, dl.TagDontCare} {
+		v, err := valueOf(driver.PointRef{ID: "x"}, dl.Value{Tag: tag})
+		if err == nil {
+			t.Fatalf("tag %#x: 想要错误，得到值 %v", tag, v)
+		}
+		if k := driver.KindOf(err); k != driver.ErrProtocol {
+			t.Fatalf("tag %#x: 错误分类 = %s, want protocol", tag, k)
+		}
+	}
+}

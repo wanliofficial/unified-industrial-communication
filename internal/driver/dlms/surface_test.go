@@ -158,7 +158,8 @@ func TestAttributeOfErrors(t *testing.T) {
 // valueOf 覆盖 A-XDR 的每个 Kind。关键点：
 //   - octet-string 全可打印时给 ASCII（表号），否则给十六进制（时钟状态）；
 //   - date_time 解不出来时必须给原始字节，不能输出零值时间；
-//   - null 给 0 而不是报"类型不支持"（否则一条 null 会让整批点位变坏）。
+//   - null 必须报错（标坏），见 TestValueOfNullIsBad——null 是"表没给值"，
+//     冒充 good 的 0 比一个坏点难排查得多；单点坏不会拖垮整批读取。
 func TestValueOf(t *testing.T) {
 	ref := driver.PointRef{ID: "p"}
 
@@ -175,7 +176,6 @@ func TestValueOf(t *testing.T) {
 		{"octets-ascii", dl.Octets([]byte("12345678")), model.TypeString, 0, "12345678", false},
 		{"octets-binary", dl.Octets([]byte{0x00, 0x01, 0xFF}), model.TypeString, 0, "00 01 FF", false},
 		{"visible", dl.Text("LD1"), model.TypeString, 0, "LD1", false},
-		{"null", dl.Value{Tag: dl.TagNull}, model.TypeFloat64, 0, "", true},
 		{"uint", dl.U32(4000), model.TypeFloat64, 4000, "", true},
 		{"int", dl.I32(-7), model.TypeFloat64, -7, "", true},
 		{"float", dl.Float64(1.25), model.TypeFloat64, 1.25, "", true},
