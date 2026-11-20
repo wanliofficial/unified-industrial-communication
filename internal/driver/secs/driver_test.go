@@ -303,3 +303,50 @@ func TestReadRangeCheck(t *testing.T) {
 		t.Fatalf("越界应 ErrProtocol: %+v", samples)
 	}
 }
+
+// establishComm=true：Select 之后必须发 S1F13 并接受 S1F14（COMMACK=0）。
+func TestEstablishCommAccepted(t *testing.T) {
+	srv := startSim(t)
+	cfg := testConfig(srv, svidPoint("v1", 1001, model.TypeUint32))
+	cfg.Device.Labels = map[string]string{"establishComm": "true"}
+	before := srv.Requests()
+	c, err := New().Open(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer func() { _ = c.Close() }()
+	// S1F13 是数据消息，计入 Requests；Open 阶段没有其它数据请求。
+	if got := srv.Requests() - before; got != 1 {
+		t.Fatalf("建立通信请求数 = %d, want 1", got)
+	}
+}
+
+// 设备明确拒绝建立通信（COMMACK=1）时 Open 必须失败：硬着头皮发 S1F3
+// 大概率也被拒，把「设备活着但不让建」伪装成读超时最难排查。
+func TestEstablishCommDenied(t *testing.T) {
+	srv := startSim(t)
+	srv.SetCommAck(false)
+	cfg := testConfig(srv, svidPoint("v1", 1001, model.TypeUint32))
+	cfg.Device.Labels = map[string]string{"establishComm": "true"}
+	_, err := New().Open(context.Background(), cfg)
+	if err == nil {
+		t.Fatal("COMMACK=1 应导致 Open 失败")
+	}
+	if k := driver.KindOf(err); k != driver.ErrPermission {
+		t.Fatalf("错误分类 = %v, want permission", k)
+	}
+}
+
+// establishComm 默认关闭：不实现 S1F13 的老机台不受影响（不发建立握手）。
+func TestEstablishCommOffByDefault(t *testing.T) {
+	srv := startSim(t)
+	before := srv.Requests()
+	c, err := New().Open(context.Background(), testConfig(srv, svidPoint("v1", 1001, model.TypeUint32)))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer func() { _ = c.Close() }()
+	if got := srv.Requests() - before; got != 0 {
+		t.Fatalf("默认不应发 S1F13，实际 %d 条", got)
+	}
+}

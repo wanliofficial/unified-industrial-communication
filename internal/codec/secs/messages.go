@@ -288,18 +288,27 @@ func EncodeCommAck(ok bool) ([]byte, error) {
 
 // DecodeCommAck 解析 S1F14，返回 COMMACK 是否为 0（接受）。
 func DecodeCommAck(body []byte) (bool, error) {
+	code, err := DecodeCommAckCode(body)
+	return code == 0, err
+}
+
+// DecodeCommAckCode 解析 S1F14，返回 COMMACK 原始码。
+//
+// 0=接受、1=拒绝、2=CRA 不支持、3=已建立——「已建立」对主站是可接受
+// 的（要建立的事已经建立了），调用方需要区分码值而不是一个 bool。
+func DecodeCommAckCode(body []byte) (byte, error) {
 	it, err := decodeSingle(body)
 	if err != nil {
-		return false, err
+		return 0, err
 	}
 	if it.Format != FormatList || len(it.Children) < 1 {
-		return false, fmt.Errorf("secscodec: S1F14 应答体不是 L,2")
+		return 0, fmt.Errorf("secscodec: S1F14 应答体不是 L,2")
 	}
 	c := it.Children[0]
 	if c.Format != FormatBinary || len(c.Raw) != 1 {
-		return false, fmt.Errorf("secscodec: COMMACK 不是 B,1（%s）", c.Text())
+		return 0, fmt.Errorf("secscodec: COMMACK 不是 B,1（%s）", c.Text())
 	}
-	return c.Raw[0] == 0, nil
+	return c.Raw[0], nil
 }
 
 // ---------------------------------------------------------------------------

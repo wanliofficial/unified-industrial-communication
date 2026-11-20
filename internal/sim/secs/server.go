@@ -1,9 +1,10 @@
 // Package secs 提供一个内置的 HSMS/SECS-II 设备（从站）仿真，供自检与测试使用。
 //
 // 它实现最小采集闭环必需的消息：Select/Deselect/Linktest/Separate 控制消息，
-// S1F1/S1F2（Are You There），S1F3/S1F4（状态变量），S2F13/S2F14（设备常数），
-// S2F15/S2F16（写设备常数）。另外提供主动推送 S6F11（事件报告）与 S5F1（报警）
-// 的能力，用来验证主站在收到异步推送时能正确忽略、继续等自己的应答。
+// S1F1/S1F2（Are You There），S1F13/S1F14（建立通信），S1F3/S1F4（状态变量），
+// S2F13/S2F14（设备常数），S2F15/S2F16（写设备常数）。另外提供主动推送
+// S6F11（事件报告）与 S5F1（报警）的能力，用来验证主站在收到异步推送时
+// 能正确忽略、继续等自己的应答。
 //
 // 为什么需要它：SECS/GEM 的握手与事务语义（系统字节配对、Select 前置、应答
 // W 位清零）只有在真实连线上跑一遍才可靠。纯内存 loopback 无法覆盖 TCP 帧边界
@@ -59,6 +60,7 @@ type Server struct {
 	order        []vkey             // 保持插入顺序，便于自检输出
 	selected     map[net.Conn]bool
 	rejectWrites bool // 写应答照收，但存储层不落值（见 Options）
+	commAck      bool // S1F13 的 COMMACK 注入（默认 true=0 接受）
 	wg           sync.WaitGroup
 	closed       bool
 
@@ -84,6 +86,7 @@ func NewServerWithOptions(addr string, opt Options) (*Server, error) {
 		ln:           ln,
 		name:         name,
 		rejectWrites: opt.RejectWrites,
+		commAck:      true,
 		vars:         map[vkey]*variable{},
 		selected:     map[net.Conn]bool{},
 	}
@@ -305,6 +308,8 @@ func (s *Server) handleData(c net.Conn, m secscodec.Message) {
 	switch {
 	case dm.Stream == 1 && dm.Function == 1 && dm.WBit:
 		s.replyData(c, dm, s.onLineData())
+	case dm.Stream == 1 && dm.Function == 13:
+		s.replyCommAck(c, dm)
 	case dm.Stream == 1 && dm.Function == 3:
 		s.replyStatus(c, dm, secscodec.ObjectSVID)
 	case dm.Stream == 1 && dm.Function == 11:
@@ -314,6 +319,28 @@ func (s *Server) handleData(c net.Conn, m secscodec.Message) {
 	case dm.Stream == 2 && dm.Function == 15:
 		s.replyConstantAck(c, dm)
 	}
+}
+
+// replyCommAck 应答 S1F13 建立通信，COMMACK 默认 0（接受），与 GEM 设备
+// 一致。不少 GEM 设备在通信未建立前直接拒绝 S1F3，所以从站必须支持这一步，
+// 主站的建立握手才能在回环里被真实覆盖。SetCommAck 注入拒绝，验证主站
+// 对 COMMACK=1 的处理路径。
+func (s *Server) replyCommAck(c net.Conn, dm secscodec.DataMessage) {
+	s.mu.Lock()
+	ok := s.commAck
+	s.mu.Unlock()
+	body, err := secscodec.EncodeCommAck(ok)
+	if err != nil {
+		return
+	}
+	s.replyData(c, dm, body, secscodec.SF{Stream: 1, Function: 14})
+}
+
+// SetCommAck 注入 S1F14 的 COMMACK（默认 true=0 接受；false=1 拒绝）。
+func (s *Server) SetCommAck(ok bool) {
+	s.mu.Lock()
+	s.commAck = ok
+	s.mu.Unlock()
 }
 
 func (s *Server) onLineData() []byte {

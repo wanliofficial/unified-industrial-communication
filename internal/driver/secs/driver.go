@@ -26,6 +26,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"os"
 	"strconv"
@@ -91,6 +92,9 @@ func (d *Driver) Meta() driver.Meta {
 			{Name: "labels.retries", Label: "重试次数", Type: "int",
 				Default: defaultRetries, Scope: "device",
 				Help: "事务超时后的额外重发次数；0 表示只发一次"},
+			{Name: "labels.establishComm", Label: "建立通信", Type: "bool",
+				Default: false, Scope: "device",
+				Help: "Select 后发 S1F13/S1F14 建立通信（GEM 要求）；接 GEM 设备开启，老 SECS 机台保持关闭"},
 		},
 		PointFields: []driver.ConfigField{
 			{Name: "address.kind", Label: "寻址方式", Type: "enum", Required: true,
@@ -116,6 +120,12 @@ func (d *Driver) Meta() driver.Meta {
 type settings struct {
 	commTimeout time.Duration
 	retries     int
+	// establishComm 控制 Select 之后是否发 S1F13/S1F14 建立通信。
+	// GEM 设备必须先建立通信才接受 S1F3——接 GEM 设备时配
+	// labels.establishComm=true；默认关闭是因为 S1F13 属于 GEM 状态模型，
+	// 不是 SECS-II 本体必需，老 SECS 机台可能根本不实现它，默认开启会让
+	// 这类设备的 Open 多等一轮超时。
+	establishComm bool
 }
 
 // Open 建立 TCP 链路并完成 HSMS Select 握手。
@@ -172,18 +182,61 @@ func (d *Driver) Open(ctx context.Context, cfg driver.OpenConfig) (driver.Conn, 
 		points:  plans,
 		byID:    byID,
 		sysSeq:  uint32(time.Now().UnixNano()),
+		log:     cfg.Log,
 	}
 	if err := c.selectLink(ctx, st.commTimeout); err != nil {
 		_ = tcpConn.Close()
 		return nil, err
 	}
+	if st.establishComm {
+		if err := c.establish(ctx); err != nil {
+			_ = tcpConn.Close()
+			return nil, err
+		}
+	}
 	return c, nil
+}
+
+// establish 发 S1F13（`L,0`）建立通信并等 S1F14。
+//
+// GEM 规范要求先建立通信再请求数据：不少设备在通信未建立前直接拒绝
+// S1F3，表现为「连上了但读什么都超时」。三种结局：
+//
+//   - COMMACK 0（接受）/ 3（已建立）：通过；
+//   - COMMACK 1（拒绝）/ 2（CRA 不支持）：硬失败——设备明确说了「现在
+//     不能建立」，硬着头皮发数据请求大概率也是被拒；
+//   - 没有应答：**不判死**。S1F13 是 GEM 的要求，不是 SECS-II 本体的，
+//     老机台可能根本不实现它——退回不建立通信继续采集，日志里留下
+//     指引。
+func (c *conn) establish(ctx context.Context) error {
+	body, err := secscodec.EncodeEmptyList()
+	if err != nil {
+		return driver.E(driver.ErrInternal, "establish", c.devID, err.Error(), false, err)
+	}
+	resp, err := c.exchange(ctx, secscodec.SFCommRequest, body, "establish")
+	if err != nil {
+		if driver.KindOf(err) == driver.ErrTimeout && c.log != nil {
+			c.log.Warn("secs_establish_no_reply", "device", c.devID,
+				"hint", "设备未应答 S1F13（可能非 GEM 机台），继续采集")
+		}
+		return nil
+	}
+	code, err := secscodec.DecodeCommAckCode(resp.Body)
+	if err != nil {
+		return driver.E(driver.ErrProtocol, "establish", c.devID, err.Error(), false, err)
+	}
+	if code != 0 && code != 3 {
+		return driver.E(driver.ErrPermission, "establish", c.devID,
+			fmt.Sprintf("建立通信被拒绝（COMMACK=%d: 1=denied, 2=CRA not supported）", code), false, nil)
+	}
+	return nil
 }
 
 func parseSettings(cfg driver.OpenConfig) (settings, error) {
 	st := settings{
-		commTimeout: 5 * time.Second,
-		retries:     defaultRetries,
+		commTimeout:   5 * time.Second,
+		retries:       defaultRetries,
+		establishComm: false,
 	}
 	labels := cfg.Device.Labels
 
@@ -206,6 +259,13 @@ func parseSettings(cfg driver.OpenConfig) (settings, error) {
 			return st, fmt.Errorf("labels.retries %d: must be 0..5", n)
 		}
 		st.retries = n
+	}
+	if v := strings.TrimSpace(labels["establishComm"]); v != "" {
+		b, err := strconv.ParseBool(v)
+		if err != nil {
+			return st, fmt.Errorf("labels.establishComm %q: not a bool", v)
+		}
+		st.establishComm = b
 	}
 	return st, nil
 }
@@ -286,6 +346,7 @@ type conn struct {
 	addr    string
 	timeout time.Duration
 	st      settings
+	log     *slog.Logger
 
 	mu     sync.Mutex
 	closed bool
