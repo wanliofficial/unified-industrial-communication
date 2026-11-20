@@ -9429,6 +9429,16 @@ comm_error」）。衡器写进去的、驱动解出来的共用同一套格式�
 实现顺序上有个细节：先判输入状态，再判求值错误。输入不可用时求值必然报
 「引用没有值」，那是**结果**不是原因；先报它会把一个 timeout 说成 bad。
 
+**错误分类（`errOf`）：bad 归 `ErrProtocol`，不归 `ErrInternal`。** 计算点没有
+物理链路，运行期一个 bad 结果永远来自「表达式或输入」——除零、越界、无输入、
+非数值、引用写错——这是数据/协议语义层失败，与 `ErrProtocol` 同类。`ErrInternal`
+在本仓的语义是「实现 bug / 不可恢复的内部错误」且计入熔断（`CountsTowardBreaker`
+为 true）；把数据层面失败标成内部错误，会让运维看到「内部错误」去查进程，而不是
+查表达式/点表，也违背「结束码必须自带 Kind、不得兜底成 ErrInternal」的纪律。其余
+质量码如实映射：`timeout`→`ErrTimeout`、`comm_error`/`not_connected`→
+`ErrDisconnected`、`address_error`→`ErrAddress`。注意计算点的 `Read` 在顶层始终返回
+`nil`（失败只落在每个样本上），因此这个分类只影响排障展示与告警，不触发调度器熔断。
+
 #### 3.11.7 历史窗口聚合
 
 计算点的表达式可以引用**历史**而不是当前值：

@@ -309,14 +309,19 @@ func (c *conn) evalOne(b *bound, vals map[string]model.Sample) model.Sample {
 
 // errOf 把样本上的原因转成带分类的错误，让上层能给出一致的错误码
 // （例如 bad 与 timeout 在 UI 上的排障提示完全不同）。
+//
+// bad 归 ErrProtocol 而不是 ErrInternal：计算点没有物理链路，运行期一个 bad
+// 结果永远来自「表达式或输入」——除零、越界、无输入、非数值、引用写错——这是
+// 数据/协议语义层的失败，与 ErrProtocol 同类。ErrInternal 在本仓的语义是「实现
+// bug / 不可恢复的内部错误」且 CountsTowardBreaker 为 true；把数据层面的失败标成
+// 内部错误，会让运维看到「内部错误」去查进程，而不是查表达式/点表，也违背「结束码
+// 必须自带 Kind、不得兜底成 ErrInternal」的纪律（与 default 分支一致）。
 func errOf(s model.Sample) error {
 	if s.Error == "" {
 		return nil
 	}
 	kind := driver.ErrProtocol
 	switch s.Quality {
-	case model.QualityBad:
-		kind = driver.ErrInternal
 	case model.QualityTimeout:
 		kind = driver.ErrTimeout
 	case model.QualityCommError, model.QualityNotConnected:
