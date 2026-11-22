@@ -317,45 +317,52 @@ func TestSparkplugReconnectRebirths(t *testing.T) {
 
 	b.DropAll()
 
-	// 这里不能用「第一次 deliver 返回 nil」判定重连完成。DDATA 是 QoS 0，
-	// 没有 PUBACK 兜底：客户端可能把数据成功写进一条**已被对端关闭**的
-	// socket（本端发送缓冲区还没报错），于是 deliver 返回成功而数据已经
-	// 丢了。断言「重连」的唯一可靠信号是 Broker 上真的出现了新的 NBIRTH。
+	// 这里有两个条件要同时满足，且都不能用「deliver 返回成功」判定：
+	//
+	//  1. 重连真的完成了——Broker 上出现了新的 NBIRTH。DDATA 是 QoS 0，没有
+	//     PUBACK 兜底：客户端可能把数据成功写进一条**已被对端关闭**的 socket
+	//     （本端发送缓冲区还没报错），于是 deliver 返回成功而数据已经丢了。所以
+	//     「重连」的唯一可靠信号是 Broker 上真出现了新 NBIRTH。
+	//  2. NBIRTH 之后还有数据。只补 BIRTH 不补 DDATA 的话，消费方会得到一台
+	//     「刚出生但永远没有值」的设备。
+	//
+	// 两个条件之间还有一个时序陷阱：重连后出生有两条路径——同步的 ensureSession
+	// （deliver 内部）与异步的 resync（OnConnect 回调），只靠 epoch 判定谁
+	// 补发。当异步 resync 在全新连接上先发 NBIRTH 时，deliver 那条 DDATA 落到
+	// Broker 的顺序可能**早于** NBIRTH。因此「看到 NBIRTH 就停」会得到一个
+	// 「最后一条 NBIRTH 之后还没有 DDATA」的瞬态快照，而此后不再 deliver、也就
+	// 不再产生新的 DDATA，于是偶发失败。
+	//
+	// 正确做法：在 deadline 内**持续 deliver**，每轮都重新检查「最后一条 NBIRTH
+	// 之后是否已有 dev1 的 DDATA」。重连一旦完成，后续每次 deliver 都会补发一条
+	// DDATA，条件必然收敛；两条路径谁先发 NBIRTH 都不影响结果。
 	deadline := time.Now().Add(15 * time.Second)
 	for {
-		if countTopics(b.Messages(), "spBv1.0/plant-a/NBIRTH/gw-01") > first {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("no NBIRTH after reconnect; topics = %v", topicsOf(b.Messages()))
-		}
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		_, err := s.deliver(ctx, []outbox.Record{recordFor(t, "dev1", "p1", 2)})
 		cancel()
 		// 失败是预期：Outbox 会重试。成功也可能只是写进了已断的 socket，
-		// 所以两种结果都继续下一轮，直到看到新 BIRTH。
+		// 所以两种结果都继续下一轮，直到 Broker 上真的「BIRTH 之后有数据」。
 		_ = err
-		time.Sleep(50 * time.Millisecond)
-	}
 
-	// BIRTH 之后必须还有数据：只补 BIRTH 不补 DDATA 的话，消费方会得到
-	// 一个「刚出生但永远没有值」的设备。
-	msgs := b.Messages()
-	lastBirth := -1
-	for i, m := range msgs {
-		if m.Topic == "spBv1.0/plant-a/NBIRTH/gw-01" {
-			lastBirth = i
+		msgs := b.Messages()
+		lastBirth := -1
+		for i, m := range msgs {
+			if m.Topic == "spBv1.0/plant-a/NBIRTH/gw-01" {
+				lastBirth = i
+			}
 		}
-	}
-	dataAfterBirth := false
-	for _, m := range msgs[lastBirth+1:] {
-		if m.Topic == "spBv1.0/plant-a/DDATA/gw-01/dev1" {
-			dataAfterBirth = true
-			break
+		if lastBirth > first {
+			for _, m := range msgs[lastBirth+1:] {
+				if m.Topic == "spBv1.0/plant-a/DDATA/gw-01/dev1" {
+					return // 重连完成且 BIRTH 之后有数据
+				}
+			}
 		}
-	}
-	if !dataAfterBirth {
-		t.Fatalf("no DDATA after the new NBIRTH; topics = %v", topicsOf(msgs))
+		if time.Now().After(deadline) {
+			t.Fatalf("no DDATA after a post-reconnect NBIRTH; topics = %v", topicsOf(b.Messages()))
+		}
+		time.Sleep(50 * time.Millisecond)
 	}
 }
 
