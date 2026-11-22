@@ -36,6 +36,7 @@ internal static class S7LoopbackTests
         tests.Add(new TestCase("s7/silent_plc_times_out", SilentPlcTimesOut));
         tests.Add(new TestCase("s7/reconnect_after_peer_closes", ReconnectAfterPeerCloses));
         tests.Add(new TestCase("s7/metadata_declares_capabilities", MetadataDeclaresCapabilities));
+        tests.Add(new TestCase("s7/label_out_of_range_is_rejected", LabelOutOfRangeIsRejected));
     }
 
     private static (Channel Channel, Device Device) Setup(int port, Dictionary<string, string>? labels = null) => (
@@ -533,6 +534,53 @@ internal static class S7LoopbackTests
         var pointFields = meta.PointFields.Select(f => f.Name).ToArray();
         foreach (var required in new[] { "address.area", "address.offset" })
             t.Ok(pointFields.Contains(required), $"点位字段 {required} 必须声明");
+
+        return Task.CompletedTask;
+    }
+
+    /// <summary>
+    /// rack / slot / pduSize 是设备级标签，取值越界（现场最常见的就是把 S7-300 的 rack 写成
+    /// 9、或 pduSize 手滑填 1500）必须被驱动明确拒绝，而不是被静默截断成另一个合法值——
+    /// 截断会让设备去连一个根本不存在的机架，现象是「连上了但读不出」，比直接报错难查得多。
+    ///
+    /// 为什么这条没有对应的配置校验器用例：模型校验器不认识驱动私有标签（这是有意为之，
+    /// 见 configuration.md「驱动引用」一节），范围检查只在驱动 Open 时由 ParseInt 做。
+    /// 所以这是那条唯一的守卫，必须有用例钉住。纯构造、不连服务器，便宜。
+    /// </summary>
+    private static Task LabelOutOfRangeIsRejected(TestContext t)
+    {
+        // 每条越界标签都点名是哪个、错在哪；消息带范围，运维一眼能定位。
+        var badRack = new Dictionary<string, string> { ["rack"] = "9" };
+        var rackEx = t.Throws<DriverException>(() => Open(Setup(0, badRack).Channel, Setup(0, badRack).Device),
+            "rack 越界被拒");
+        t.Equal(ErrorKind.Unsupported, rackEx.Kind, "越界标签报 Unsupported，不当成通讯故障");
+        t.Contains(rackEx.Message, "labels.rack", "消息点名是哪个标签");
+        t.Contains(rackEx.Message, "0..7", "消息给出合法范围");
+
+        var badSlot = new Dictionary<string, string> { ["slot"] = "32" };
+        var slotEx = t.Throws<DriverException>(() => Open(Setup(0, badSlot).Channel, Setup(0, badSlot).Device),
+            "slot 越界被拒");
+        t.Contains(slotEx.Message, "labels.slot", "slot 越界也点名");
+        t.Contains(slotEx.Message, "0..31", "slot 合法范围");
+
+        var badPdu = new Dictionary<string, string> { ["pduSize"] = "1500" };
+        var pduEx = t.Throws<DriverException>(() => Open(Setup(0, badPdu).Channel, Setup(0, badPdu).Device),
+            "pduSize 越界被拒");
+        t.Contains(pduEx.Message, "labels.pduSize", "pduSize 越界点名");
+        t.Contains(pduEx.Message, "240..960", "pduSize 合法范围");
+
+        // 边界值本身合法：构造不应抛（Open 是懒连接，构造成功不等于已连上 PLC）。
+        foreach (var (rack, slot, pdu) in new[] { (0, 0, 240), (7, 31, 960), (0, 1, 480) })
+        {
+            var labels = new Dictionary<string, string>
+            {
+                ["rack"] = rack.ToString(),
+                ["slot"] = slot.ToString(),
+                ["pduSize"] = pdu.ToString(),
+            };
+            var (ch, dev) = Setup(0, labels);
+            t.Ok(Open(ch, dev) is not null, $"rack={rack} slot={slot} pduSize={pdu} 边界值应被接受");
+        }
 
         return Task.CompletedTask;
     }

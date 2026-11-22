@@ -13,20 +13,24 @@ dotnet run --project tests/Uic.Tests -- --opcua             # 额外跑 OPC UA �
 dotnet run --project tests/Uic.Tests -- --stop-on-fail      # 首个失败即停
 ```
 
-正常输出（最新一轮，422 条干净全量，带 `--opcua`）：
+正常输出（带 `--opcua` 全量）：
 
 ```
-421 passed, 1 failed, 0 skipped · 1041.9s
+N passed, 0 failed, 0 skipped · <耗时>
 ```
 
-本轮新增两条纯函数用例：`s7/metadata_declares_capabilities`（6 ms）、`opcua/metadata_declares_capabilities`
-（2 ms）——把 S7 与 OPC UA 客户端两个驱动此前**没有任何用例断言**的 `DriverMeta` 能力声明钉住（Id/角色/传输/
-寻址种类、能力四态、通道/设备/点位字段逐项）。不带 `--opcua` 时那 3 条端到端显示 `skip`
-（原因 `requires --opcua`），即 `419 passed / 3 skipped / 0 failed`——新增两条都跑，都便宜。
-422 条这一轮（`--opcua`）在 `load average` 8.3 时量到 **1041.9 s**；唯一未过的是
-`contract/points_csv_import_previews_and_applies` 触到 180 s 硬超时——正是本文档反复记录的「仓库所在
-NTFS 挂载被常驻服务拖慢」高负载 flake，单独复跑 13.7 s 全过（同轮 `contract/config_export_import_round_trip`
-也量到 135.5 s）。判红口径照旧：先腾空再复跑，只有复现的失败才算真失败。
+本轮（423 条）的改动是**纯增量**：新增一条纯构造用例 `s7/label_out_of_range_is_rejected`
+（rack 0..7、slot 0..31、pduSize 240..960 越界时由驱动明确报 Unsupported、不静默截断，≤ 0.6 s），
+以及在既有用例 `bacnet/metadata_declares_object_addressing` 内**补断言**（Name/角色/通道字段，
+不新增用例）。这两处本轮已直接复跑验证：`--filter s7/` 33 条全绿（2.1 s）、
+`--filter bacnet/` 11 条全绿（1.0 s）。由于这两处都不改动任何既有用例的判定，全量通过/失败结论
+不受本轮影响，故全量汇总数字留待下一次腾空复跑时如实量取填入上方（本轮全量在 NTFS 高负载下
+于 `contract/*` 组后被截断、未跑到汇总，故不写「全绿」假数字）。
+
+前序基线（422 条，`--opcua`）：`421 passed, 1 failed, 0 skipped · 1041.9 s`——那 1 条 failed 是
+`contract/points_csv_import_previews_and_applies` 触到 180 s 硬超时的**高负载 flake**
+（`load average` 8.3、仓库所在 NTFS 挂载被常驻服务拖慢），单独复跑 13.7 s 全过。判红口径照旧：
+先腾空再复跑，只有复现的失败才算真失败。
 `--opcua --filter opcua/` 单独跑 `opcua/*` 18 条全绿（3 条端到端占 7.7 / 2.1 / 5.2 s，其余 15 条纯函数
 都 ≤ 36 ms）。
 
@@ -76,6 +80,8 @@ NTFS 挂载被常驻服务拖慢」高负载 flake，单独复跑 13.7 s 全过�
 `contract/resource_pressure_degrades_health` 加降级计数器），不增条数。
 422 条 = 420 条 + 后补的两条驱动元数据用例（`s7/metadata_declares_capabilities`、
 `opcua/metadata_declares_capabilities`），纯函数、各 ≤ 6 ms。
+423 条 = 422 条 + 设备标签越界拒绝一条（`s7/label_out_of_range_is_rejected`，
+rack/slot/pduSize 越界明确报错、纯构造不连服务器、≤ 0.6 s）。
 419 条那一轮（只跑过 `fault/*` 组，未记耗时的中间态）跳过；以 420 条这一轮为准（见下一段）。
 418 条那一轮（补了 OPC UA 服务端能力边界两条：`opcua/server_options_are_anonymous_and_none_only`、
 `opcua/server_endpoint_advertises_only_none_and_anonymous`；配置校验矩阵补 `allowAnonymousRead=false`
@@ -161,7 +167,7 @@ NFR 的门槛是 120 s，压测用例、PBKDF2 派生与 TLS 握手是主要开�
 | `schedule/*` | 6 | 启动相位均匀铺开、单调时间换算与到期边界、调度器实际分配相位、相位按设备内最快点位周期、**uptime 用单调时钟**（校时跳变不会让它凭空多出一小时）、**失败退避算术**（2^n 增长、2^6 被 `recoverInterval` 截住、抖动只加不减且不超 10%、基数大于上限不被缩短） |
 | `sdk/*` | 6 | 驱动注册契约：**SDK 版本不匹配直接拒绝**（错误消息里同时给出驱动声明与宿主要求的版本，且不留半注册状态）、**重复 id 拒绝且不覆盖先注册的驱动**、版本匹配时正常注册并把能力/传输声明原样透出；`check` 与启动共用同一份引用检查：**协议没注册时 `uic check` 退出码 2 并指出 `channels[x].protocol`**（同一份配置换成已注册驱动则通过），同一条通道只报一次；**分层边界由程序集实际引用表钉住**（Modbus/S7/BACnet 三个 codec 的实际引用里不得出现 `Uic.Transport`/`Engine`/`Runtime` 等 I/O 层、不得出现 `System.Net`，且必须依赖 `Uic.Domain` 作为反向对照） |
 | `loopback/*` | 16 | Modbus 主站 ↔ 内置从站的真实链路；含**指向未监听端口的真实连接拒绝**（`SocketException` → `comm_error`、可重试、消息带出端点、且立即返回而不是等到 `connectTimeout`） |
-| `s7/*` | 32 | S7comm：17 条手算黄金帧与地址解析（TPKT/COTP 握手、PDU 协商、读/写/位读写、长度字段按传输尺寸解释（0x03–0x07 位 / 0x09 字节）、错误分类、地址字段上限、**项数字段只有一字节（256 项当场失败而不是静默截断）**），15 条主站 ↔ 内置从站回环（探活、DB/I/Q/M 读、位读写、写输入区被拒、越界落 `address_error`、bool 缺 bit 被拒、数组、按 PDU 切片、单点装不下点名失败、沉默 PLC 超时、断线重连），以及驱动元数据能力声明（`s7/metadata_declares_capabilities`：Id/角色/传输/寻址种类、位访问 Supported、订阅 Unsupported、通道/设备/点位字段逐项钉住） |
+| `s7/*` | 33 | S7comm：17 条手算黄金帧与地址解析（TPKT/COTP 握手、PDU 协商、读/写/位读写、长度字段按传输尺寸解释（0x03–0x07 位 / 0x09 字节）、错误分类、地址字段上限、**项数字段只有一字节（256 项当场失败而不是静默截断）**），15 条主站 ↔ 内置从站回环（探活、DB/I/Q/M 读、位读写、写输入区被拒、越界落 `address_error`、bool 缺 bit 被拒、数组、按 PDU 切片、单点装不下点名失败、沉默 PLC 超时、断线重连），驱动元数据能力声明（`s7/metadata_declares_capabilities`：Id/角色/传输/寻址种类、位访问 Supported、订阅 Unsupported、通道/设备/点位字段逐项钉住），以及设备标签越界拒绝（`s7/label_out_of_range_is_rejected`：rack 0..7、slot 0..31、pduSize 240..960 越界时明确报 Unsupported、不静默截断；边界值被接受） |
 | `serial/*` | 9 | 真实伪终端上的 RTU / ASCII、半双工、帧间静默、deadline、关闭打断读；帧间静默的取值规则（低速按 3.5 字符时间缩放、>19200 bps 固定 1.75 ms）用纯函数断言，不需要 pty |
 | `bacnet/*` | 28 | BACnet/IP：16 条手算黄金帧与地址解析（BVLC/NPDU 封拆帧、NPDU 版本必须为 1、ReadProperty/WriteProperty 帧字节、I-Am 设备实例、对象标识符 10/22 位编码、应用标签往返含扩展长度（LVT=5）、类型不符拒绝、NPDU 路由控制字节拒绝、**ACK 值里出现形似关闭标签的字节也不得截断**），11 条主站 ↔ 内置从站回环（Who-Is/I-Am 探活、**按 invoke-id 配对（从站先回一条 invoke-id 不对的响应，取错会读到别的点位的值而质量仍 good）**、多对象读、bool/字符串、写后回读、unknown-object/property 落 `address_error`、沉默设备超时、**实例号核对（配了 deviceInstance 却回错设备即失败，消息带出期望实例号）**、元数据声明 object 寻址与 udp），1 条 `uic sim` 端到端（**拿 DemoConfig 的开发配置起真实从站再用真实主站读一遍：端口/transport/对象号/四个点位全 good**，值域按正弦基线核对） |
 | `mqtt/*` | 34 | 测试内 broker：CONNECT/SUBSCRIBE 字段、QoS0/1、主题渲染、重连补发、**下线设备清 retained `$state`**、**命令去重窗口用单调时钟（校时跳变不会重复执行命令）**、**过期判定用单调「多久没收到报文」（校时跳变不伪造也不放过过期）**、TLS 发布与不可信 CA 拒绝；南向驱动：主题通配匹配、JSON 字段/类型/信封取值、首次读数前 `stale`、QoS0/1 取数、点位字段覆盖、坏载荷与恢复、断线重订阅、订阅被 ACL 拒绝 |

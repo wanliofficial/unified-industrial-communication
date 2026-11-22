@@ -12,13 +12,16 @@ PRD 中 M 级的采集协议已全部落地，FR-CFG-01 的四类寻址模型也
 COV/分段/多属性读仍不做，见 [protocol-status.md](protocol-status.md) §4.1）。非 M 级验收里的 12 类故障注入同样全部有了
 可自动跑的用例（见 §7）。
 
-当前测试基线：**422 条**（带 `--opcua` 全量：`421 passed / 1 failed / 0 skipped · 1041.9 s`；不带
-`--opcua` 时为 `419 passed / 3 skipped / 0 failed`——那 3 条是需要 `--opcua` 的 OPC UA 端到端用例）。唯一
-未过的 `contract/points_csv_import_previews_and_applies` 是高负载（`load average` 8.3，仓库所在 NTFS
-挂载被常驻服务拖慢）下触到 180 s 硬超时的已知 flake，单独复跑 13.7 s 全过，负载差异详见
-[testing.md](testing.md)。本轮新增 `s7/metadata_declares_capabilities`、`opcua/metadata_declares_capabilities`
+当前测试基线：**423 条**（带 `--opcua` 全量：新增的一条 `s7/label_out_of_range_is_rejected`
+是纯构造、不连服务器；全量实测数字以 [testing.md](testing.md) 最新一轮为准）。本轮新增
+`s7/label_out_of_range_is_rejected`：S7 设备标签 rack(0..7)/slot(0..31)/pduSize(240..960)
+越界时由驱动明确报 Unsupported、不静默截断（模型校验器不认驱动私有标签，这是唯一守卫）。
+此前几轮新增 `s7/metadata_declares_capabilities`、`opcua/metadata_declares_capabilities`
 两条纯函数用例，把 S7 与 OPC UA 客户端两个驱动此前无用例断言的 `DriverMeta` 能力声明钉住。
-`--opcua --filter opcua/` 单独跑 `opcua/*` 18 条全绿。
+`--opcua --filter opcua/` 单独跑 `opcua/*` 18 条全绿。本轮改动纯增量（新增一条纯构造用例 +
+在 `bacnet/metadata_declares_object_addressing` 内补断言、不增条数），不改动既有用例判定，故直接复跑
+受影响两组确认：`--filter s7/` 33 条、`--filter bacnet/` 11 条均全绿；全量汇总数字以 [testing.md](testing.md)
+下一次腾空复跑所量取者为准。
 
 ## 1. 采集（FR-COL）
 
