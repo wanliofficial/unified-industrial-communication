@@ -358,6 +358,18 @@ internal static class BacnetLoopbackTests
         foreach (var required in new[] { "address.objectType", "address.instance", "address.property" })
             t.Ok(fields.Contains(required), $"the point field {required} is declared");
 
+        // 角色与通道字段：控制台「驱动」页按它们生成表单。BACnet/IP 走 UDP、标准端口 47808，
+        // 这些此前没有用例守着，漂移了前端会填错（比如把端口默认值改没，用户连不上 BACnet 设备）。
+        t.Equal("BACnet/IP 主站", meta.Name, "driver name");
+        t.Ok(meta.Roles.Count == 1 && meta.Roles[0] == DriverRole.Master, "BACnet 只做主站");
+        var channelFields = meta.ConfigFields.Where(f => f.Scope == "channel")
+            .ToDictionary(f => f.Name, f => f, StringComparer.Ordinal);
+        t.Ok(channelFields.ContainsKey("transport.host") && channelFields["transport.host"].Required,
+            "the host field is declared and required");
+        t.Ok(channelFields.ContainsKey("transport.port") && channelFields["transport.port"].Required,
+            "the port field is declared and required");
+        t.Equal(47808, channelFields["transport.port"].Default, "the BACnet/IP default port is 47808");
+
         return Task.CompletedTask;
     }
 
