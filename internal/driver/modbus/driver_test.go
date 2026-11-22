@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	mb "uic/internal/codec/modbus"
 	"uic/internal/driver"
 	"uic/internal/model"
 	sim "uic/internal/sim/modbus"
@@ -42,6 +43,24 @@ func openConn(t *testing.T, s *sim.Server, unit int) driver.Conn {
 	}
 	t.Cleanup(func() { _ = c.Close() })
 	return c
+}
+
+// openRawConn 返回 *conn，供需要直接检查 FC22 探测结论的测试使用。
+func openRawConn(t *testing.T, s *sim.Server, unit int, dev model.Device) *conn {
+	t.Helper()
+	c, err := New().Open(context.Background(), driver.OpenConfig{
+		Channel: model.Channel{
+			ID: "ch1", Protocol: "modbus-tcp",
+			Transport: model.Transport{Kind: "tcp", Address: s.Addr()},
+			Timeout:   model.Duration(2 * time.Second),
+		},
+		Device: dev,
+	})
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	t.Cleanup(func() { _ = c.Close() })
+	return c.(*conn)
 }
 
 func regPoint(id, area string, offset int, dt model.DataType, length int) driver.PointRef {
@@ -776,6 +795,195 @@ func TestWriteCoilBatchFC15(t *testing.T) {
 	for i, g := range got {
 		if g.Value.Bool != want[i] {
 			t.Fatalf("coil %d = %v, want %v", 10+i, g.Value.Bool, want[i])
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// FC22 掩码写：优先原子路径，设备拒绝时退回读-改-写
+// ---------------------------------------------------------------------------
+
+// TestRegisterBitWriteUsesMaskWrite 验证默认策略下寄存器位写走 FC22：
+// 内置模拟从站支持 FC22，所以整次写入只有一帧事务。用计数断言，比断言
+// 「结果正确」更强——读-改-写也会得到正确结果，差别只在总线开销与原子性。
+func TestRegisterBitWriteUsesMaskWrite(t *testing.T) {
+	s := newSim(t)
+	s.SetHolding(5, 0xF009) // bit15..bit12=0xF，bit3=1，bit0=1
+	c := openRawConn(t, s, 1, model.Device{ID: "dev1", ChannelID: "ch1", UnitID: 1})
+
+	if _, err := c.Write(context.Background(), []driver.WriteRequest{{
+		PointID: "b3", DataType: model.TypeBool, Value: model.BoolValue(false),
+		Address: model.Address{Kind: model.AddressRegister, Area: "holding", Offset: 5, Length: 1, Bit: 3},
+	}}); err != nil {
+		t.Fatalf("clear bit3: %v", err)
+	}
+	if got := s.Holding(5); got != 0xF001 {
+		t.Fatalf("holding[5] = %#06x, want 0xF001 (bit3 清掉，其余不动)", got)
+	}
+
+	if _, err := c.Write(context.Background(), []driver.WriteRequest{{
+		PointID: "b3", DataType: model.TypeBool, Value: model.BoolValue(true),
+		Address: model.Address{Kind: model.AddressRegister, Area: "holding", Offset: 5, Length: 1, Bit: 3},
+	}}); err != nil {
+		t.Fatalf("set bit3: %v", err)
+	}
+	if got := s.Holding(5); got != 0xF009 {
+		t.Fatalf("holding[5] = %#06x, want 0xF009", got)
+	}
+}
+
+// TestMaskWriteFallbackToRMW 用一段拒绝 FC22 的帧层，验证退回路径仍然
+// 只改目标位。这是自动降级最容易坏的地方：两条路径共享同一个 conn，
+// 若探测结论被错误锁存（例如第一次失败就把 maskUsable 记为 true），
+// 后续写入会一直失败而不是退回。
+func TestMaskWriteFallbackToRMW(t *testing.T) {
+	s := newSim(t)
+	s.SetHolding(5, 0xFFFF)
+	c := openRawConn(t, s, 1, model.Device{ID: "dev1", ChannelID: "ch1", UnitID: 1})
+
+	// 把帧层换成「FC22 一律回非法功能码」的包装。
+	orig := c.tr
+	c.tr = rejectFC22{framed: orig}
+	t.Cleanup(func() { c.tr = orig })
+
+	res, err := c.Write(context.Background(), []driver.WriteRequest{{
+		PointID: "b3", DataType: model.TypeBool, Value: model.BoolValue(false),
+		Address: model.Address{Kind: model.AddressRegister, Area: "holding", Offset: 5, Length: 1, Bit: 3},
+	}})
+	if err != nil {
+		t.Fatalf("write via fallback: %v", err)
+	}
+	if !res[0].OK || res[0].Quality != model.QualityGood {
+		t.Fatalf("result = %+v", res)
+	}
+	if got := s.Holding(5); got != 0xFFF7 {
+		t.Fatalf("holding[5] = %#06x, want 0xFFF7 (只清 bit3)", got)
+	}
+
+	// 结论必须被记住：第二次写入不该再先试 FC22（那会多一帧失败）。
+	calls := 0
+	c.tr = countingFramed{framed: orig, onFC22: func() { calls++ }}
+	if _, err := c.Write(context.Background(), []driver.WriteRequest{{
+		PointID: "b4", DataType: model.TypeBool, Value: model.BoolValue(false),
+		Address: model.Address{Kind: model.AddressRegister, Area: "holding", Offset: 5, Length: 1, Bit: 4},
+	}}); err != nil {
+		t.Fatalf("second write: %v", err)
+	}
+	if calls != 0 {
+		t.Fatalf("probed conn still sent FC22 %d times", calls)
+	}
+}
+
+// rejectFC22 把 FC22 请求改写成非法功能码异常，其余透传。
+//
+// 它同时嵌入 io.Closer 以满足 framed 接口，即使被误用也不会在关闭链路时
+// 关闭底层连接——包装层不该替底层决定生命周期。
+type rejectFC22 struct{ framed }
+
+func (f rejectFC22) RoundTrip(ctx context.Context, pdu []byte) ([]byte, error) {
+	if len(pdu) > 0 && pdu[0] == mb.FCMaskWriteRegister {
+		return mb.ExceptionPDU(mb.FCMaskWriteRegister, 1), nil
+	}
+	return f.framed.RoundTrip(ctx, pdu)
+}
+
+type countingFramed struct {
+	framed
+	onFC22 func()
+}
+
+func (f countingFramed) RoundTrip(ctx context.Context, pdu []byte) ([]byte, error) {
+	if len(pdu) > 0 && pdu[0] == mb.FCMaskWriteRegister {
+		f.onFC22()
+	}
+	return f.framed.RoundTrip(ctx, pdu)
+}
+
+// TestMaskWriteOptionsOverride 验证 maskwrite=on 时设备不支持就直接失败，
+// 而不是悄悄退回读-改-写——静默换路径会把「设备被换掉了」藏起来。
+func TestMaskWriteOptionsOverride(t *testing.T) {
+	s := newSim(t)
+	s.SetHolding(5, 0xFFFF)
+	c := openRawConn(t, s, 1, model.Device{ID: "dev1", ChannelID: "ch1", UnitID: 1,
+		Labels: map[string]string{"options": "maskwrite=on"}})
+	orig := c.tr
+	c.tr = rejectFC22{framed: orig}
+	t.Cleanup(func() { c.tr = orig })
+
+	_, err := c.Write(context.Background(), []driver.WriteRequest{{
+		PointID: "b3", DataType: model.TypeBool, Value: model.BoolValue(false),
+		Address: model.Address{Kind: model.AddressRegister, Area: "holding", Offset: 5, Length: 1, Bit: 3},
+	}})
+	if err == nil {
+		t.Fatal("maskwrite=on must fail when device rejects FC22")
+	}
+	if got := s.Holding(5); got != 0xFFFF {
+		t.Fatalf("failed write must not touch register: %#06x", got)
+	}
+}
+
+// TestMaskWriteOffSkipsFC22 验证 maskwrite=off 连探测都不发。
+func TestMaskWriteOffSkipsFC22(t *testing.T) {
+	s := newSim(t)
+	s.SetHolding(5, 0xFFFF)
+	c := openRawConn(t, s, 1, model.Device{ID: "dev1", ChannelID: "ch1", UnitID: 1})
+	c.maskMode = maskOff
+
+	fc22 := 0
+	orig := c.tr
+	c.tr = countingFramed{framed: orig, onFC22: func() { fc22++ }}
+	t.Cleanup(func() { c.tr = orig })
+
+	if _, err := c.Write(context.Background(), []driver.WriteRequest{{
+		PointID: "b3", DataType: model.TypeBool, Value: model.BoolValue(false),
+		Address: model.Address{Kind: model.AddressRegister, Area: "holding", Offset: 5, Length: 1, Bit: 3},
+	}}); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if fc22 != 0 {
+		t.Fatalf("maskwrite=off still sent FC22 %d times", fc22)
+	}
+	if got := s.Holding(5); got != 0xFFF7 {
+		t.Fatalf("holding[5] = %#06x, want 0xFFF7", got)
+	}
+}
+
+func TestParseMaskWriteOptions(t *testing.T) {
+	dev := func(v string) model.Device {
+		d := model.Device{ID: "d"}
+		if v != "" {
+			d.Labels = map[string]string{"options": v}
+		}
+		return d
+	}
+	cases := []struct {
+		opt  string
+		want maskMode
+		err  bool
+	}{
+		{"", maskAuto, false},
+		{"maskwrite=auto", maskAuto, false},
+		{"maskwrite=on", maskOn, false},
+		{"maskwrite=off", maskOff, false},
+		{"maskwrite", maskAuto, true},           // 缺值
+		{"maskwrite=sometimes", maskAuto, true}, // 拼错的值
+		{"maskwrit=on", maskAuto, true},         // 拼错的键：必须报错，不能静默忽略
+		{"gap=10ms", maskAuto, true},            // 未知项：与其它驱动同一纪律
+	}
+	for _, tc := range cases {
+		got, err := parseOptions(dev(tc.opt))
+		if tc.err {
+			if err == nil {
+				t.Errorf("options %q: want error, got mode %d", tc.opt, got)
+			}
+			continue
+		}
+		if err != nil {
+			t.Errorf("options %q: %v", tc.opt, err)
+			continue
+		}
+		if got != tc.want {
+			t.Errorf("options %q: mode = %d, want %d", tc.opt, got, tc.want)
 		}
 	}
 }

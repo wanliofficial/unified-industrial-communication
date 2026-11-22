@@ -12,6 +12,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -66,7 +67,7 @@ func (d *Driver) Meta() driver.Meta {
 	return driver.Meta{
 		ID:           "modbus-tcp",
 		Name:         "Modbus TCP",
-		Version:      "0.2.0",
+		Version:      "0.3.0",
 		SDKVersion:   driver.SDKVersion,
 		Roles:        []driver.Role{driver.RoleMaster},
 		Transports:   []string{"tcp"},
@@ -86,6 +87,10 @@ func (d *Driver) Meta() driver.Meta {
 				Placeholder: "192.168.1.10:502", Scope: "channel"},
 			{Name: "concurrency", Label: "并发上限", Type: "int", Default: 4, Scope: "channel",
 				Help: "同一通道允许的最大在飞请求数"},
+			{Name: "labels.options", Label: "扩展选项", Type: "string", Scope: "device",
+				Placeholder: "maskwrite=auto",
+				Help: "逗号分隔：maskwrite=auto|on|off 控制寄存器位写是否用 FC22 原子掩码写" +
+					"（auto 先试、设备回 01 则退回读-改-写）"},
 		},
 		PointFields: []driver.ConfigField{
 			{Name: "address.area", Label: "区", Type: "enum", Required: true,
@@ -93,21 +98,82 @@ func (d *Driver) Meta() driver.Meta {
 			{Name: "address.offset", Label: "偏移", Type: "int", Required: true, Scope: "point"},
 			{Name: "address.bit", Label: "位", Type: "int", Default: -1, Scope: "point"},
 		},
-		Description: "Modbus TCP 主站，支持 FC1/2/3/4/5/6/15/16",
+		Description: "Modbus TCP 主站，支持 FC1/2/3/4/5/6/15/16，寄存器位写优先走 FC22 掩码写",
 	}
 }
 
 // Open 建立链路并按传输类型选择分帧方式。
 func (d *Driver) Open(ctx context.Context, cfg driver.OpenConfig) (driver.Conn, error) {
+	mode, err := parseOptions(cfg.Device)
+	if err != nil {
+		return nil, err
+	}
 	tr, err := d.openTransport(ctx, cfg)
 	if err != nil {
 		return nil, err
 	}
 	return &conn{
-		cfg:   cfg,
-		codec: mbcodec.NewCodec(cfg.Device.ID),
-		tr:    tr,
+		cfg:      cfg,
+		codec:    mbcodec.NewCodec(cfg.Device.ID),
+		tr:       tr,
+		maskMode: mode,
 	}, nil
+}
+
+// maskMode 决定寄存器位写走哪条路径。
+type maskMode int
+
+const (
+	// maskAuto：先试 FC22（设备侧原子掩码写），设备回「非法功能码」就退回
+	// 读-改-写，并在本次连接内记住结论。默认值。
+	maskAuto maskMode = iota
+	// maskOn：只用 FC22。设备不支持时写入直接失败——现场若已确认设备支持，
+	// 静默退回读-改-写会掩盖「设备被换成了另一台」。
+	maskOn
+	// maskOff：只用读-改-写。有些设备的协议栈遇到不认识的功能码会**断开
+	// 连接**而不是回 01，自动探测在那类设备上表现为「第一次位写之后整台
+	// 设备离线」，必须能从配置里关掉。
+	maskOff
+)
+
+// parseOptions 解析 device.labels["options"]。
+//
+// 与 hostlink/mewtocol/ads 同一纪律：未知项、缺值都报错，不悄悄回默认值。
+// 「maskwrite 拼错成 maskWrite」如果被忽略，现场看到的是「配置改了没效果」。
+func parseOptions(dev model.Device) (maskMode, error) {
+	mode := maskAuto
+	raw := dev.Labels["options"]
+	for _, part := range strings.Split(raw, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		key, val, hasVal := strings.Cut(part, "=")
+		key = strings.ToLower(strings.TrimSpace(key))
+		val = strings.ToLower(strings.TrimSpace(val))
+		switch key {
+		case "maskwrite":
+			if !hasVal {
+				return mode, driver.E(driver.ErrUnsupported, "open", dev.ID,
+					"options.maskwrite 需要 =auto|on|off", false, nil)
+			}
+			switch val {
+			case "auto":
+				mode = maskAuto
+			case "on", "true", "yes":
+				mode = maskOn
+			case "off", "false", "no":
+				mode = maskOff
+			default:
+				return mode, driver.E(driver.ErrUnsupported, "open", dev.ID,
+					fmt.Sprintf("options.maskwrite %q 必须是 auto|on|off", val), false, nil)
+			}
+		default:
+			return mode, driver.E(driver.ErrUnsupported, "open", dev.ID,
+				fmt.Sprintf("未知的 options 项 %q（支持 maskwrite）", key), false, nil)
+		}
+	}
+	return mode, nil
 }
 
 func (d *Driver) openTransport(ctx context.Context, cfg driver.OpenConfig) (framed, error) {
@@ -147,6 +213,12 @@ type conn struct {
 	cfg   driver.OpenConfig
 	tr    framed
 	codec *mbcodec.Codec
+	// maskMode 是配置里的 FC22 策略；maskUsable 是运行期结论（设备是否真的
+	// 认这个功能码）。两者分开：配置是「用户允许什么」，结论是「设备能什么」，
+	// 混在一个字段里会让「用户改成 off 后仍然走 FC22」这种错难以发现。
+	maskMode   maskMode
+	maskUsable bool
+	maskProbed bool
 }
 
 func (c *conn) Probe(ctx context.Context) error {
@@ -334,11 +406,17 @@ func needsBitRMW(req driver.WriteRequest) bool {
 // 这类错误在调试时表现为「改了 A 点，B 点跟着变了」，而配置与代码都看不出
 // 问题——必须从协议层就避免。
 //
+// 优先走 FC22（设备侧掩码写）：它把「读-改-写」的两帧压成一次原子操作。
+// 两帧版本的空窗期里，PLC 自己的程序或另一个主站改掉同一寄存器的其它位，
+// 会被本驱动带着旧值写回覆盖——这种丢更新在现场表现为「偶尔有个位自己弹回去」，
+// 日志里一切正常。设备不支持 FC22 时退回两帧版本，并在本次连接内记住结论。
+//
 // 原子性边界（诚实说明）：
 //   - 同一驱动的并发写入由 wmu 串行化，两个位写不会互相吞掉；
-//   - 同一串口总线上的其他设备若恰好写同一个 unit 的同一个寄存器，仍可能
-//     插在这两帧之间。那是配置冲突（一个寄存器只能有一个所有者），不是
-//     驱动能替用户解决的；文档里已写明。
+//   - 走 FC22 时设备侧原子，窗口消失；
+//   - 退回读-改-写时，同一串口总线上的其他设备若恰好写同一个 unit 的同一个
+//     寄存器，仍可能插在这两帧之间。那是配置冲突（一个寄存器只能有一个所有者），
+//     不是驱动能替用户解决的；文档里已写明。
 //   - 另一个主站（SCADA 直连同一从站）不受本驱动控制，同样需要现场约束。
 func (c *conn) writeBitRMW(ctx context.Context, req driver.WriteRequest) (driver.WriteResult, error) {
 	bit := req.Address.Bit
@@ -346,6 +424,28 @@ func (c *conn) writeBitRMW(ctx context.Context, req driver.WriteRequest) (driver
 		err := driver.E(driver.ErrAddress, "write", c.cfg.Device.ID,
 			"register bit write requires address.bit 0..15", false, nil)
 		return driver.WriteResult{PointID: req.PointID, Quality: model.QualityAddressError, Err: err}, err
+	}
+
+	if c.wantMaskWrite() {
+		res, err := c.writeBitMask(ctx, req, bit)
+		if err == nil {
+			return res, nil
+		}
+		if !errors.Is(err, mbcodec.ErrIllegalFunction) {
+			return res, err
+		}
+		// 设备不认识 FC22。maskAuto 下永久退回读-改-写；maskOn 下这是配置
+		// 与设备不符，必须让人看见，不能悄悄换条路走。
+		c.maskProbed, c.maskUsable = true, false
+		if c.maskMode == maskOn {
+			err := driver.E(driver.ErrUnsupported, "write", c.cfg.Device.ID,
+				"device rejects FC22 mask write (illegal function) but options.maskwrite=on", false, err)
+			return driver.WriteResult{PointID: req.PointID, Quality: model.QualityBad, Err: err}, err
+		}
+		c.logf("设备不支持 FC22 掩码写，寄存器位写退回读-改-写",
+			"device", c.cfg.Device.ID, "register", req.Address.Offset)
+	} else {
+		c.maskProbed, c.maskUsable = true, false
 	}
 
 	pdu, err := c.codec.EncodeReadRegisters(req.Address.Offset, 1)
@@ -376,6 +476,52 @@ func (c *conn) writeBitRMW(ctx context.Context, req driver.WriteRequest) (driver
 		res.Err = err
 	}
 	return res, err
+}
+
+// wantMaskWrite 决定这次位写是否先试 FC22。已探测出不支持就不再试——
+// 每轮先失败一次再退回会让串口总线上的写慢一倍，而且错误计数里全是噪声。
+func (c *conn) wantMaskWrite() bool {
+	switch c.maskMode {
+	case maskOff:
+		return false
+	case maskOn:
+		return true
+	}
+	return !c.maskProbed || c.maskUsable
+}
+
+// writeBitMask 用 FC22 完成一次原子位写。
+//
+// 成功时锁存 maskUsable=true：这是运行期学会的事实，不需要配置提前声明
+// 「这台设备支持 FC22」——那类开关最终都是「默认值对厂商 A 有效、对厂商 B 报错」。
+func (c *conn) writeBitMask(ctx context.Context, req driver.WriteRequest, bit int) (driver.WriteResult, error) {
+	and, or, err := mbcodec.MaskWriteWord(bit, req.Value.Bool)
+	if err != nil {
+		err = driver.E(driver.ErrAddress, "write", c.cfg.Device.ID, err.Error(), false, err)
+		return driver.WriteResult{PointID: req.PointID, Quality: model.QualityAddressError, Err: err}, err
+	}
+	pdu, err := c.codec.EncodeMaskWriteRegister(req.Address.Offset, and, or)
+	if err != nil {
+		return driver.WriteResult{PointID: req.PointID, Quality: model.QualityAddressError, Err: err}, err
+	}
+	resp, err := c.tr.RoundTrip(ctx, pdu)
+	if err != nil {
+		return driver.WriteResult{PointID: req.PointID, Quality: model.QualityCommError, Err: err}, err
+	}
+	if err := c.codec.DecodeMaskWriteRegister(req.Address.Offset, and, or, resp); err != nil {
+		// 异常码 01（非法功能）已在 codec 层映射成 ErrIllegalFunction，
+		// 这里原样上抛，由 writeBitRMW 决定要不要退回读-改-写。
+		return driver.WriteResult{PointID: req.PointID, Quality: qualityOf(err), Err: err}, err
+	}
+	c.maskProbed, c.maskUsable = true, true
+	return driver.WriteResult{PointID: req.PointID, OK: true, Quality: model.QualityGood}, nil
+}
+
+// logf 是可选日志：驱动在测试里常常没有注入 logger。
+func (c *conn) logf(msg string, args ...any) {
+	if c.cfg.Log != nil {
+		c.cfg.Log.Info(msg, args...)
+	}
 }
 
 func (c *conn) Close() error {

@@ -134,6 +134,14 @@ FC17（服务器 ID）、FC43/MEI 0x0E（读设备标识，支持 basic/regular/
 对象读取，响应超长时自动分页）。`slaves[].identity` 可配置厂商、型号、版本等
 信息；不配时 basic 三件套也有默认值，版本取运行进程的构建版本。
 
+寄存器位写支持 **FC22 掩码写**：Modbus 保持寄存器里「只改一位」如果按
+读-改-写（FC3 + FC6）做，两步之间南向设备自己改过的其它位会被写回旧值覆盖。
+FC22 让设备侧一次算出 `(当前 AND AND_Mask) OR (OR_Mask AND NOT AND_Mask)`，
+不存在这个窗口。主站默认自动探测（设备回 `0x01` 就在本次连接内永久退回
+读-改-写），用 `device.labels.options=maskwrite=on|off|auto` 锁定策略；
+网关从站也实现了 FC22，掩码基于最近一次采样的缓存值计算，只作用于单寄存器
+的可写映射（32 位点位仍拒绝 `0x02`）。
+
 MQTT 北向（需要一个 Broker；`mosquitto` 或任意 MQTT 3.1.1 服务端均可）：
 
 ```bash

@@ -264,3 +264,32 @@ func TestAddrIsUsable(t *testing.T) {
 		t.Fatalf("addr not resolvable: %v", err)
 	}
 }
+
+// TestMaskWriteAtomic 验证 FC22 在内置从站上的语义：只改目标位，
+// 其余 15 位原样保留。这个从站被驱动测试用来证明「寄存器位写真的走了
+// 原子路径」，所以它的行为必须独立验证，而不是靠驱动测试反向保证。
+func TestMaskWriteAtomic(t *testing.T) {
+	s := newTestServer(t, 64)
+	s.SetHolding(5, 0xF001) // bit15..bit12=0xF，bit0=1，bit3=0
+
+	resp := dial(t, s).roundTrip([]byte{0x16, 0x00, 0x05, 0xFF, 0xF7, 0x00, 0x08})
+	if len(resp) != 7 || resp[0] != 0x16 {
+		t.Fatalf("echo = % x", resp)
+	}
+	if got := s.Holding(5); got != 0xF009 {
+		t.Fatalf("holding[5] = %#06x, want 0xF009 (只置 bit3，其余不动)", got)
+	}
+}
+
+// 地址越界回 02、掩码长度不对回 03，与 FC16 的异常码口径一致。
+func TestMaskWriteOutOfRange(t *testing.T) {
+	s := newTestServer(t, 16)
+	if resp := dial(t, s).roundTrip([]byte{0x16, 0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00}); len(resp) != 2 ||
+		resp[0] != 0x96 || resp[1] != 2 {
+		t.Fatalf("out of range resp = % x", resp)
+	}
+	if resp := dial(t, s).roundTrip([]byte{0x16, 0x00, 0x05, 0xFF, 0xFF}); len(resp) != 2 ||
+		resp[0] != 0x96 || resp[1] != 3 {
+		t.Fatalf("short mask resp = % x", resp)
+	}
+}

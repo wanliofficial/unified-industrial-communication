@@ -56,6 +56,10 @@ func (d *ASCII) Meta() driver.Meta {
 
 // Open 打开串口并建立 ASCII 分帧。
 func (d *ASCII) Open(ctx context.Context, cfg driver.OpenConfig) (driver.Conn, error) {
+	mode, err := parseOptions(cfg.Device)
+	if err != nil {
+		return nil, err
+	}
 	t := cfg.Channel.Transport
 	if t.Kind != "serial" {
 		return nil, driver.E(driver.ErrUnsupported, "open", cfg.Device.ID,
@@ -91,9 +95,10 @@ func (d *ASCII) Open(ctx context.Context, cfg driver.OpenConfig) (driver.Conn, e
 		return nil, err
 	}
 	return &conn{
-		cfg:   cfg,
-		codec: mbcodec.NewCodec(cfg.Device.ID),
-		tr:    fr,
+		cfg:      cfg,
+		codec:    mbcodec.NewCodec(cfg.Device.ID),
+		tr:       fr,
+		maskMode: mode,
 	}, nil
 }
 

@@ -25,6 +25,7 @@ const (
 	FCWriteSingleRegister byte = 0x06
 	FCWriteMultipleCoils  byte = 0x0F
 	FCWriteMultipleRegs   byte = 0x10
+	FCMaskWriteRegister   byte = 0x16
 
 	// 诊断与识别类功能码（从站侧）。
 	FC08 byte = 0x08 // Diagnostics（子功能：回显/清计数/各类计数）
@@ -363,6 +364,82 @@ func WordSetBit(word uint16, bit int, v bool) uint16 {
 	return word &^ mask
 }
 
+// 位掩码写（FC22，Mask Write Register）的掩码生成。
+//
+// FC22 的语义是 `结果 = (当前值 AND AND_Mask) OR (OR_Mask AND (NOT AND_Mask))`。
+// 只改一位时，AND_Mask 该位为 0、其余位全 1；OR_Mask 该位为 v、其余位为 0。
+// 这样硬件侧一次完成修改，不需要「先读再写」——读-改-写之间的窗口里，另一个
+// 主站（或 PLC 自身的程序）改了同一寄存器的其它位，会被本驱动写回旧值覆盖。
+//
+// 返回 error 而不是静默钳位：位号越界是配置错误，掩码算错会连带改掉邻位。
+func MaskWriteWord(bit int, v bool) (andMask, orMask uint16, err error) {
+	if bit < 0 || bit > 15 {
+		return 0, 0, fmt.Errorf("modbus: bit %d out of range 0..15", bit)
+	}
+	andMask = ^(uint16(1) << uint(bit))
+	if v {
+		orMask = uint16(1) << uint(bit)
+	}
+	return andMask, orMask, nil
+}
+
+// ApplyMaskWrite 是 FC22 的从站侧公式：`(cur AND AND_Mask) OR (OR_Mask AND NOT AND_Mask)`。
+//
+// 抽出来的理由与 WordSetBit 相同：主站（算掩码）、网关从站（应用掩码）、
+// 内置模拟从站（应用掩码）三处都要这一行。三份实现里只要有一份写成
+// `(cur AND and) OR or`，症状就是「某个位被邻位的掩码顺带置 1」——只在
+// OR_Mask 与 AND_Mask 有重叠位时出现，用单点向量测不出来。
+func ApplyMaskWrite(cur, andMask, orMask uint16) uint16 {
+	return (cur & andMask) | (orMask &^ andMask)
+}
+
+// EncodeMaskWriteRegister 生成 FC22 位掩码写 PDU（6 字节：FC + 地址 + 两掩码）。
+func (c *Codec) EncodeMaskWriteRegister(offset int, andMask, orMask uint16) ([]byte, error) {
+	if offset < 0 || offset > 0xFFFF {
+		return nil, driver.E(driver.ErrAddress, "encode", c.DeviceID,
+			fmt.Sprintf("register offset %d out of range 0..65535", offset), false, nil)
+	}
+	pdu := make([]byte, 7)
+	pdu[0] = FCMaskWriteRegister
+	binary.BigEndian.PutUint16(pdu[1:3], uint16(offset))
+	binary.BigEndian.PutUint16(pdu[3:5], andMask)
+	binary.BigEndian.PutUint16(pdu[5:7], orMask)
+	return pdu, nil
+}
+
+// DecodeMaskWriteRegister 校验 FC22 回显（地址 + 两个掩码）。
+//
+// 三个字段都必须回显，只比地址不够：从站把两个掩码的顺序理解反了时，
+// 地址照样对得上，而结果是把不相关的位改成 1。
+func (c *Codec) DecodeMaskWriteRegister(offset int, andMask, orMask uint16, resp []byte) error {
+	if len(resp) == 0 {
+		return driver.E(driver.ErrProtocol, "decode", c.DeviceID, "empty response", true, nil)
+	}
+	if resp[0]&0x80 != 0 {
+		return exceptionError(c.DeviceID, resp)
+	}
+	if resp[0] != FCMaskWriteRegister {
+		return driver.E(driver.ErrProtocol, "decode", c.DeviceID,
+			fmt.Sprintf("unexpected write echo %#x, want %#x", resp[0], FCMaskWriteRegister), true, nil)
+	}
+	if len(resp) < 7 {
+		return driver.E(driver.ErrProtocol, "decode", c.DeviceID, "short mask write response", true, nil)
+	}
+	if got := int(binary.BigEndian.Uint16(resp[1:3])); got != offset {
+		return driver.E(driver.ErrProtocol, "decode", c.DeviceID,
+			fmt.Sprintf("mask write echo address %d, want %d", got, offset), true, nil)
+	}
+	if got := binary.BigEndian.Uint16(resp[3:5]); got != andMask {
+		return driver.E(driver.ErrProtocol, "decode", c.DeviceID,
+			fmt.Sprintf("mask write echo AND mask %#04x, want %#04x", got, andMask), true, nil)
+	}
+	if got := binary.BigEndian.Uint16(resp[5:7]); got != orMask {
+		return driver.E(driver.ErrProtocol, "decode", c.DeviceID,
+			fmt.Sprintf("mask write echo OR mask %#04x, want %#04x", got, orMask), true, nil)
+	}
+	return nil
+}
+
 func isCoilArea(area string) bool {
 	return area == "coil" || area == "coils"
 }
@@ -527,34 +604,63 @@ func BuildTCP(f Frame) []byte {
 func ExceptionPDU(fc, code byte) []byte { return []byte{fc | 0x80, code} }
 
 // ParseRequestPDU 解析读/写请求，供从站模拟器使用。
+//
+// 返回的 err 区分两类错误，调用方应据此选择异常码：长度不足是**数据格式**
+// 错误（03，Illegal Data Value），未知功能码是**功能选择**错误（01，Illegal
+// 功能）。混用会让主站按错误的语义重试或放弃。
 func ParseRequestPDU(pdu []byte) (fc byte, addr, qty int, values []byte, err error) {
 	if len(pdu) < 1 {
-		return 0, 0, 0, nil, errors.New("modbus: empty pdu")
+		return 0, 0, 0, nil, &PDUError{Code: 1, Msg: "empty pdu"}
 	}
 	fc = pdu[0]
 	switch fc {
 	case FCReadCoils, FCReadDiscreteInputs, FCReadHoldingRegs, FCReadInputRegs:
 		if len(pdu) < 5 {
-			return 0, 0, 0, nil, errors.New("modbus: short read pdu")
+			return fc, 0, 0, nil, &PDUError{FC: fc, Code: 3, Msg: "short read pdu"}
 		}
 		return fc, int(binary.BigEndian.Uint16(pdu[1:3])), int(binary.BigEndian.Uint16(pdu[3:5])), nil, nil
 	case FCWriteSingleCoil, FCWriteSingleRegister:
 		if len(pdu) < 5 {
-			return 0, 0, 0, nil, errors.New("modbus: short write pdu")
+			return fc, 0, 0, nil, &PDUError{FC: fc, Code: 3, Msg: "short write pdu"}
 		}
 		return fc, int(binary.BigEndian.Uint16(pdu[1:3])), 1, pdu[3:5], nil
 	case FCWriteMultipleCoils, FCWriteMultipleRegs:
 		if len(pdu) < 6 {
-			return 0, 0, 0, nil, errors.New("modbus: short multi-write pdu")
+			return fc, 0, 0, nil, &PDUError{FC: fc, Code: 3, Msg: "short multi-write pdu"}
 		}
 		n := int(binary.BigEndian.Uint16(pdu[3:5]))
 		bc := int(pdu[5])
 		if len(pdu) < 6+bc {
-			return 0, 0, 0, nil, errors.New("modbus: truncated multi-write pdu")
+			return fc, 0, 0, nil, &PDUError{FC: fc, Code: 3, Msg: "truncated multi-write pdu"}
 		}
 		return fc, int(binary.BigEndian.Uint16(pdu[1:3])), n, pdu[6 : 6+bc], nil
+	case FCMaskWriteRegister:
+		// FC22 没有数量字段：一个请求只作用于一个寄存器，values 是
+		// [AND hi, AND lo, OR hi, OR lo]。
+		if len(pdu) < 7 {
+			return fc, 0, 0, nil, &PDUError{FC: fc, Code: 3, Msg: "short mask write pdu"}
+		}
+		return fc, int(binary.BigEndian.Uint16(pdu[1:3])), 1, pdu[3:7], nil
 	}
-	return fc, 0, 0, nil, fmt.Errorf("modbus: unsupported function %#x", fc)
+	return fc, 0, 0, nil, &PDUError{FC: fc, Code: 1, Msg: fmt.Sprintf("unsupported function %#x", fc)}
+}
+
+// ErrIllegalFunction 是异常码 01 的哨兵错误，供「设备不认识这个功能码」的
+// 降级路径判断（例如 FC22 掩码写退回读-改-写）。用哨兵而不是比对错误文本：
+// 文案会改，而「不支持」这个语义不能跟着变。
+var ErrIllegalFunction = errors.New("modbus: illegal function (01)")
+
+// PDUError 携带 Modbus 异常码，让从站侧把解析失败映射成正确的异常响应，
+// 而不是所有失败都回 01。Code 取值见 MODBUS 应用协议规范 §6（01 非法功能、
+// 02 非法地址、03 非法数据值）。
+type PDUError struct {
+	FC   byte
+	Code byte
+	Msg  string
+}
+
+func (e *PDUError) Error() string {
+	return fmt.Sprintf("modbus: fc %#x exception %#x: %s", e.FC, e.Code, e.Msg)
 }
 
 func exceptionError(device string, resp []byte) *driver.OpError {
@@ -564,7 +670,7 @@ func exceptionError(device string, resp []byte) *driver.OpError {
 	code := resp[1]
 	switch code {
 	case 1:
-		return driver.E(driver.ErrProtocol, "decode", device, "illegal function (01)", false, nil)
+		return driver.E(driver.ErrProtocol, "decode", device, "illegal function (01)", false, ErrIllegalFunction)
 	case 2:
 		return driver.E(driver.ErrAddress, "decode", device, "illegal data address (02)", false, nil)
 	case 3:
@@ -632,6 +738,9 @@ func RTURequestLen(head []byte) (int, bool) {
 	case FCReadCoils, FCReadDiscreteInputs, FCReadHoldingRegs, FCReadInputRegs,
 		FCWriteSingleCoil, FCWriteSingleRegister, FC08:
 		return 8, true
+	// FC22 掩码写：地址 + FC + 寄存器地址 2 + AND 掩码 2 + OR 掩码 2 + CRC 2。
+	case FCMaskWriteRegister:
+		return 10, true
 	// 没有数据字段的短请求。
 	case FC11, FC17:
 		return 4, true
@@ -686,8 +795,13 @@ func RTUExpectedResponseLen(reqPDU []byte) (int, error) {
 			return 0, fmt.Errorf("modbus: FC%#x quantity %d out of range", fc, qty)
 		}
 		return 5 + qty*2, nil
-	case FCWriteSingleCoil, FCWriteSingleRegister, FCWriteMultipleCoils, FCWriteMultipleRegs:
-		// 写响应是回显：地址 + FC + 2 字节地址 + 2 字节值/数量 + CRC。
+	case FCWriteSingleCoil, FCWriteSingleRegister, FCWriteMultipleCoils, FCWriteMultipleRegs,
+		FCMaskWriteRegister:
+		// 写响应是回显：地址 + FC + 2 字节地址 + 2 字节值/数量（FC22 是 6 字节
+		// 回显：地址 + 两个掩码）+ CRC。
+		if fc == FCMaskWriteRegister {
+			return 10, nil
+		}
 		return 8, nil
 	}
 	return 0, fmt.Errorf("modbus: cannot predict RTU response length for fc %#x", reqPDU[0])

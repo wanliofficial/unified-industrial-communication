@@ -464,7 +464,7 @@ func (s *Server) handle(u *unit, pdu []byte) []byte {
 			switch pdu[0] {
 			case mb.FCReadCoils, mb.FCReadDiscreteInputs, mb.FCReadHoldingRegs,
 				mb.FCReadInputRegs, mb.FCWriteSingleCoil, mb.FCWriteSingleRegister,
-				mb.FCWriteMultipleCoils, mb.FCWriteMultipleRegs:
+				mb.FCWriteMultipleCoils, mb.FCWriteMultipleRegs, mb.FCMaskWriteRegister:
 				code = 0x03 // 功能码认识，但报文长度不对
 			}
 			return mb.ExceptionPDU(pdu[0], code)
@@ -488,6 +488,8 @@ func (s *Server) handle(u *unit, pdu []byte) []byte {
 		return s.writeMultipleCoils(u, fc, addr, qty, values)
 	case mb.FCWriteMultipleRegs:
 		return s.writeMultipleRegs(u, fc, addr, qty, values)
+	case mb.FCMaskWriteRegister:
+		return s.writeMaskRegister(u, fc, addr, values)
 	}
 	return mb.ExceptionPDU(fc, 0x01)
 }
@@ -984,6 +986,62 @@ func (s *Server) writeMultipleRegs(u *unit, fc byte, addr, qty int, raw []byte) 
 		return mb.ExceptionPDU(fc, 0x04)
 	}
 	return []byte{fc, byte(addr >> 8), byte(addr), byte(qty >> 8), byte(qty)}
+}
+
+// writeMaskRegister 处理 FC22（掩码写单寄存器）：`新值 = (当前 AND AND_Mask) OR
+// (OR_Mask AND NOT AND_Mask)`，只改一个寄存器。
+//
+// 与 FC6 的差别不在算术，而在**谁持有「当前值」**：FC6 直接给出整字，FC22 只
+// 给出掩码，所以从站必须先有一个当前值。这里取的是网关缓存里的最近一次采样
+// ——也就是上位机刚才通过 FC3 读到的那个值。由此产生两条必须诚实写明的边界：
+//
+//  1. 只允许落在**单寄存器**点位上。对一个 32 位点位做 FC22 只会改到它的第一个
+//     寄存器，剩下的字节保持旧值，设备收到的就是一个撕裂值——与 FC6 写半宽
+//     点位同一条纪律，直接拒绝（0x02）。
+//  2. 掩码是在网关快照上算的。若南向设备在两次采集之间自己改了这个寄存器，
+//     这次写入会把它带回「网关以为的值」。要真正做到设备侧原子，需要把 FC22
+//     透传到南向驱动（当前驱动契约只有值写入，没有掩码写入），这是已知边界，
+//     不是遗漏。
+func (s *Server) writeMaskRegister(u *unit, fc byte, addr int, raw []byte) []byte {
+	if len(raw) != 4 {
+		return mb.ExceptionPDU(fc, 0x03)
+	}
+	c, ok := u.find(model.MappingHolding, addr)
+	if !ok || !c.writable {
+		return mb.ExceptionPDU(fc, 0x02)
+	}
+	if c.width != 1 {
+		return mb.ExceptionPDU(fc, 0x02)
+	}
+	andMask := binary.BigEndian.Uint16(raw[0:2])
+	orMask := binary.BigEndian.Uint16(raw[2:4])
+	if andMask == 0xFFFF && orMask == 0 {
+		// 两个掩码都是空操作。仍然照常回显：主站可能只是在探活，
+		// 但拒绝它会让「设备支持 FC22 吗」这个问题的答案变成 0x03。
+		return []byte{fc, byte(addr >> 8), byte(addr), raw[0], raw[1], raw[2], raw[3]}
+	}
+
+	cur, good, err := s.encodeReg(u, c)
+	if err != nil {
+		s.log.Warn("slave_mask_write_no_sample", "slave", s.id, "unit", u.id,
+			"point", c.device+"/"+c.point, "error", err.Error())
+		return mb.ExceptionPDU(fc, 0x04)
+	}
+	s.noteDegraded(!good)
+	word := binary.BigEndian.Uint16(cur)
+	next := mb.ApplyMaskWrite(word, andMask, orMask)
+
+	buf := []byte{byte(next >> 8), byte(next)}
+	val, err := decodeCellValue(c, buf, u.order)
+	if err != nil {
+		s.log.Warn("slave_mask_write_decode", "slave", s.id, "unit", u.id,
+			"point", c.device+"/"+c.point, "error", err.Error())
+		return mb.ExceptionPDU(fc, 0x03)
+	}
+	if !s.forward(fc, []WriteRequest{{Device: c.device, Point: c.point, Value: val}}) {
+		return mb.ExceptionPDU(fc, 0x04)
+	}
+	return []byte{fc, byte(addr >> 8), byte(addr), raw[0], raw[1], raw[2], raw[3]}
 }
 
 // forward 把写入转发给南向。全部成功才返回 true：Modbus 的写响应没有

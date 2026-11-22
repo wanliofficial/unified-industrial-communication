@@ -3,6 +3,7 @@ package modbus
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"testing"
 
 	"uic/internal/driver"
@@ -320,5 +321,115 @@ func TestWriteMultipleCoils(t *testing.T) {
 	}
 	if _, err := c.EncodeWriteMultipleCoils(0, nil); err == nil {
 		t.Fatal("空批次应报错")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// FC22 掩码写
+// ---------------------------------------------------------------------------
+
+// TestMaskWriteWordSemantics 直接把 FC22 的公式钉在纯函数上：
+// `结果 = (当前 AND AND_Mask) OR (OR_Mask AND NOT AND_Mask)`。
+//
+// 这里刻意的检查点是 **OR_Mask 里 AND_Mask 为 1 的位会被忽略**。若实现写成
+// `(cur AND and) OR or`（少了 `AND NOT and`），只改一位时结果碰巧相同——
+// 因为 or 只有那一位为 1、and 在那一位为 0——所以只有用「两个掩码都多位」
+// 的向量才能把这个错误暴露出来。
+func TestMaskWriteWordSemantics(t *testing.T) {
+	cases := []struct {
+		name        string
+		bit         int
+		v           bool
+		and, or     uint16
+		cur, expect uint16
+	}{
+		{"set bit0", 0, true, 0xFFFE, 0x0001, 0x0000, 0x0001},
+		{"clear bit0", 0, false, 0xFFFE, 0x0000, 0xFFFF, 0xFFFE},
+		{"set bit15 keeps others", 15, true, 0x7FFF, 0x8000, 0x700F, 0xF00F},
+		{"clear bit15 keeps others", 15, false, 0x7FFF, 0x0000, 0xFFFF, 0x7FFF},
+		// 每个用 MaskWriteWord 得到的掩码都满足 `or & and == 0`，所以
+		// 这一条与「set bit15」覆盖的是不同的位位置，而不是不同公式。
+		{"set bit3 keeps neighbours", 3, true, 0xFFF7, 0x0008, 0xABC5, 0xABCD},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			and, or, err := MaskWriteWord(tc.bit, tc.v)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if and != tc.and || or != tc.or {
+				t.Fatalf("masks = and %#04x or %#04x, want and %#04x or %#04x",
+					and, or, tc.and, tc.or)
+			}
+			got := ApplyMaskWrite(tc.cur, and, or)
+			if got != tc.expect {
+				t.Fatalf("%#04x -> %#04x, want %#04x", tc.cur, got, tc.expect)
+			}
+		})
+	}
+}
+
+func TestMaskWriteWordRejectsBadBit(t *testing.T) {
+	for _, bit := range []int{-1, 16, 99} {
+		if _, _, err := MaskWriteWord(bit, true); err == nil {
+			t.Fatalf("bit %d must be rejected", bit)
+		}
+	}
+}
+
+func TestEncodeMaskWriteRegisterGolden(t *testing.T) {
+	c := NewCodec("dev-1")
+	pdu, err := c.EncodeMaskWriteRegister(0x1234, 0xFFFE, 0x0001)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []byte{0x16, 0x12, 0x34, 0xFF, 0xFE, 0x00, 0x01}
+	if !bytes.Equal(pdu, want) {
+		t.Fatalf("PDU = % x, want % x", pdu, want)
+	}
+	// 回显必须逐字段校验：地址对但掩码顺序反了，写的是别的位。
+	if err := c.DecodeMaskWriteRegister(0x1234, 0xFFFE, 0x0001, want); err != nil {
+		t.Fatalf("decode echo: %v", err)
+	}
+	bad := append([]byte(nil), want...)
+	bad[3], bad[5] = bad[5], bad[3]
+	if err := c.DecodeMaskWriteRegister(0x1234, 0xFFFE, 0x0001, bad); err == nil {
+		t.Fatal("swapped masks must be rejected")
+	}
+	bad = append([]byte(nil), want...)
+	bad[1], bad[2] = 0x00, 0x01
+	if err := c.DecodeMaskWriteRegister(0x1234, 0xFFFE, 0x0001, bad); err == nil {
+		t.Fatal("address mismatch must be rejected")
+	}
+	exc := []byte{0x96, 0x01}
+	err = c.DecodeMaskWriteRegister(0x1234, 0xFFFE, 0x0001, exc)
+	if !errors.Is(err, ErrIllegalFunction) {
+		t.Fatalf("exception 01 must map to ErrIllegalFunction, got %v", err)
+	}
+}
+
+func TestParseRequestPDUMaskWrite(t *testing.T) {
+	fc, addr, qty, vals, err := ParseRequestPDU([]byte{0x16, 0x00, 0x05, 0xFF, 0xF7, 0x00, 0x08})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fc != FCMaskWriteRegister || addr != 5 || qty != 1 {
+		t.Fatalf("fc=%#x addr=%d qty=%d", fc, addr, qty)
+	}
+	if !bytes.Equal(vals, []byte{0xFF, 0xF7, 0x00, 0x08}) {
+		t.Fatalf("values = % x", vals)
+	}
+	if _, _, _, _, err := ParseRequestPDU([]byte{0x16, 0x00, 0x05, 0xFF}); err == nil {
+		t.Fatal("short FC22 pdu must fail")
+	}
+}
+
+func TestRTULengthsForMaskWrite(t *testing.T) {
+	// 请求整帧 = 地址 + PDU(7) + CRC(2) = 10；响应同为 10。
+	if n, ok := RTURequestLen([]byte{0x01, 0x16}); !ok || n != 10 {
+		t.Fatalf("RTURequestLen = %d ok=%v, want 10 true", n, ok)
+	}
+	if n, err := RTUExpectedResponseLen([]byte{0x16, 0x00, 0x05, 0xFF, 0xF7, 0x00, 0x08}); err != nil || n != 10 {
+		t.Fatalf("RTUExpectedResponseLen = %d %v, want 10 nil", n, err)
 	}
 }

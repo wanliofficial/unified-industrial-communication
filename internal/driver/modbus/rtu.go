@@ -56,6 +56,10 @@ func (d *RTU) Meta() driver.Meta {
 // 同一串口上挂多台从站时，每个设备会各自 Open 一次。物理串口由
 // serialport.Acquire 做引用计数复用，事务由 Ref 的总线锁串行化。
 func (d *RTU) Open(ctx context.Context, cfg driver.OpenConfig) (driver.Conn, error) {
+	mode, err := parseOptions(cfg.Device)
+	if err != nil {
+		return nil, err
+	}
 	t := cfg.Channel.Transport
 	if t.Kind != "serial" {
 		return nil, driver.E(driver.ErrUnsupported, "open", cfg.Device.ID,
@@ -90,9 +94,10 @@ func (d *RTU) Open(ctx context.Context, cfg driver.OpenConfig) (driver.Conn, err
 		return nil, err
 	}
 	return &conn{
-		cfg:   cfg,
-		codec: mbcodec.NewCodec(cfg.Device.ID),
-		tr:    fr,
+		cfg:      cfg,
+		codec:    mbcodec.NewCodec(cfg.Device.ID),
+		tr:       fr,
+		maskMode: mode,
 	}, nil
 }
 

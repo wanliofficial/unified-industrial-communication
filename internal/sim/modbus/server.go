@@ -167,6 +167,12 @@ func (s *Server) serve(c net.Conn) {
 func (s *Server) handle(pdu []byte) []byte {
 	fc, addr, qty, values, err := mbcodec.ParseRequestPDU(pdu)
 	if err != nil {
+		// 解析失败已经有明确的异常码（01 非法功能 / 03 非法数据值），
+		// 透传它而不是统一回 01：否则主站会把「字段长度写错」当成
+		// 「设备不认识这个功能码」，两条错误的处置方式完全不同。
+		if pe, ok := err.(*mbcodec.PDUError); ok && pe.Code != 0 {
+			return mbcodec.ExceptionPDU(pe.FC, pe.Code)
+		}
 		if len(pdu) > 0 {
 			return mbcodec.ExceptionPDU(pdu[0], 1)
 		}
@@ -216,6 +222,17 @@ func (s *Server) handle(pdu []byte) []byte {
 			s.coils[addr+i] = values[byteIdx]&(1<<uint(i%8)) != 0
 		}
 		return []byte{fc, pdu[1], pdu[2], pdu[3], pdu[4]}
+	case mbcodec.FCMaskWriteRegister:
+		// FC22 是一个真正的原子操作：从站自己算 `(cur AND and) OR (or AND NOT and)`，
+		// 不存在读-改-写窗口。它要能独立验证，否则「驱动优先走掩码写」这件事
+		// 就只能靠真机确认。
+		if addr < 0 || addr >= len(s.holding) || len(values) < 4 {
+			return mbcodec.ExceptionPDU(fc, 2)
+		}
+		andMask := binary.BigEndian.Uint16(values[0:2])
+		orMask := binary.BigEndian.Uint16(values[2:4])
+		s.holding[addr] = mbcodec.ApplyMaskWrite(s.holding[addr], andMask, orMask)
+		return []byte{fc, pdu[1], pdu[2], pdu[3], pdu[4], pdu[5], pdu[6]}
 	}
 	return mbcodec.ExceptionPDU(fc, 1)
 }
