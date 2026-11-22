@@ -243,6 +243,8 @@ func TestConvert(t *testing.T) {
 		{iec104.Object{Num: 0.25}, iec104.TypeMeasuredNormalizedTime, 0.25},
 		{iec104.Object{Num: 7}, iec104.TypeMeasuredScaledTime, 7},
 		{iec104.Object{Num: 3.5}, iec104.TypeMeasuredFloatTime, 3.5},
+		{iec104.Object{Uint: 5}, iec104.TypeStepPosition, 5},
+		{iec104.Object{Uint: 0x80000001}, iec104.TypeBitstring, 0x80000001},
 	} {
 		v, _, ok := convert(tc.obj, tc.typeID, model.TypeFloat32)
 		if !ok || v.Num != tc.want {
@@ -252,6 +254,35 @@ func TestConvert(t *testing.T) {
 	// 未知的数据类型标识。
 	if _, _, ok := convert(iec104.Object{}, iec104.TypeInterrogation, model.TypeFloat32); ok {
 		t.Fatal("command type must not convert to a value")
+	}
+}
+
+// TestConvertStepPositionTransient 步位置的暂态位 T（VTI bit7，落在 Raw）必须
+// 把质量降为 uncertain——设备明说「调节进行中、还没稳」的值不能静默报成 good，
+// 否则控制逻辑会基于一个还在变化的档位做过冲。
+func TestConvertStepPositionTransient(t *testing.T) {
+	// T=0：稳定档位，good。
+	v, q, ok := convert(iec104.Object{Uint: 5, Raw: 0x05}, iec104.TypeStepPosition, model.TypeUint16)
+	if !ok || v.Num != 5 || q != model.QualityGood {
+		t.Fatalf("settled step = %+v %s %v, want 5/good", v, q, ok)
+	}
+	// T=1：调节进行中，值仍是 5 但质量降为 uncertain。
+	v, q, ok = convert(iec104.Object{Uint: 5, Raw: 0x85}, iec104.TypeStepPosition, model.TypeUint16)
+	if !ok || v.Num != 5 {
+		t.Fatalf("transient step value = %+v %v, want 5", v, ok)
+	}
+	if q != model.QualityUncertain {
+		t.Fatalf("transient step quality = %s, want uncertain", q)
+	}
+	// T=1 叠加 IV（读数无效）：bad 比 uncertain 更严重，取更差的。
+	v, q, ok = convert(iec104.Object{Uint: 5, Raw: 0x85, Quality: iec104.QInvalid},
+		iec104.TypeStepPosition, model.TypeUint16)
+	if !ok || q != model.QualityBad {
+		t.Fatalf("transient+invalid step quality = %s, want bad", q)
+	}
+	// 位串没有暂态概念，质量只来自 QDS。
+	if _, q, ok = convert(iec104.Object{Uint: 0x1}, iec104.TypeBitstring, model.TypeUint32); !ok || q != model.QualityGood {
+		t.Fatalf("bitstring quality = %s, want good", q)
 	}
 }
 

@@ -994,6 +994,8 @@ func TestTypeOf(t *testing.T) {
 		{Info{Kind: KindFloat, Time: &ts}, iec104.TypeMeasuredFloatTime},
 		{Info{Kind: KindCounter}, iec104.TypeIntegratedTotals},
 		{Info{Kind: KindCounter, Time: &ts}, iec104.TypeIntegratedTotalsTime},
+		{Info{Kind: KindStep}, iec104.TypeStepPosition},
+		{Info{Kind: KindBitstring}, iec104.TypeBitstring},
 	}
 	for _, c := range cases {
 		if got := typeOf(c.info); got != c.want {

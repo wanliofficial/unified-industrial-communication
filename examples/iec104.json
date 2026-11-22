@@ -180,6 +180,30 @@
           "enabled": true
         },
         {
+          "id": "tap",
+          "name": "步位置/分接头档位（IOA 1101，M_ST_NA_1，0..127）",
+          "address": {
+            "kind": "register",
+            "area": "ioa",
+            "offset": 1101,
+            "bit": -1
+          },
+          "dataType": "uint16",
+          "enabled": true
+        },
+        {
+          "id": "flags",
+          "name": "32 位位串（IOA 1102，M_BO_NA_1，bit0 在最低字节）",
+          "address": {
+            "kind": "register",
+            "area": "ioa",
+            "offset": 1102,
+            "bit": -1
+          },
+          "dataType": "uint32",
+          "enabled": true
+        },
+        {
           "id": "cmd",
           "name": "单点命令（IOA 4001，只存在于控制方向）",
           "address": {

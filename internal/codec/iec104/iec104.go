@@ -227,6 +227,8 @@ func BuildUFrame(fn byte) ([]byte, error) {
 const (
 	TypeSinglePoint            = iec60870.TypeSinglePoint
 	TypeDoublePoint            = iec60870.TypeDoublePoint
+	TypeStepPosition           = iec60870.TypeStepPosition
+	TypeBitstring              = iec60870.TypeBitstring
 	TypeMeasuredNormalized     = iec60870.TypeMeasuredNormalized
 	TypeMeasuredScaled         = iec60870.TypeMeasuredScaled
 	TypeMeasuredFloat          = iec60870.TypeMeasuredFloat

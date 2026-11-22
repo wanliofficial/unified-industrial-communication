@@ -35,13 +35,15 @@ const MaxASDU = 249
 const (
 	TypeSinglePoint            byte = 1   // M_SP_NA_1
 	TypeDoublePoint            byte = 3   // M_DP_NA_1
+	TypeStepPosition           byte = 5   // M_ST_NA_1（步位置，VTI+QDS）
+	TypeBitstring              byte = 7   // M_BO_NA_1（32 位位串，无品质）
 	TypeMeasuredNormalized     byte = 9   // M_ME_NA_1
 	TypeMeasuredScaled         byte = 11  // M_ME_NB_1
 	TypeMeasuredFloat          byte = 13  // M_ME_NC_1
 	TypeIntegratedTotals       byte = 15  // M_IT_NA_1
 	TypeSinglePointTime        byte = 30  // M_SP_TB_1
 	TypeDoublePointTime        byte = 31  // M_DP_TB_1
-	TypeIntegratedTotalsTime   byte = 32  // M_IT_TB_1（带 CP56Time2a 时标的累计量）
+	TypeIntegratedTotalsTime   byte = 37  // M_IT_TB_1（带 CP56Time2a 时标的累计量）
 	TypeMeasuredNormalizedTime byte = 34  // M_ME_TD_1
 	TypeMeasuredScaledTime     byte = 35  // M_ME_TE_1
 	TypeMeasuredFloatTime      byte = 36  // M_ME_TF_1
@@ -126,6 +128,34 @@ func (q Quality) String() string {
 // decodeSIQQuality 从 SIQ/DIQ 字节里取品质位。
 func decodeSIQQuality(b byte) Quality {
 	return Quality((b >> 3) & byte(siqQualityMask))
+}
+
+// VTI（步位置，M_ST_NA_1）的 bit 定义。
+//
+// VTI = Value with transient state indication：低 7 位是步位置值（0..127），
+// bit7 是暂态位 T。T=1 表示设备正处于「调节进行中」（如变压器有载分接开关正在
+// 换挡），此刻的步位置虽可读但不稳定。T 既不落进 QDS（IV/NT/SB/BL 描述的是
+// 采集有效性，不是机械暂态），也不能凭空塞进某个品质位——因此解码时把整字节
+// 存进 Object.Raw 供无损回写，并在点位映射层（point.go 的 Convert）把 T 折成
+// uncertain（不稳定），与双点 0/3「中间态」、BCR 的 CY/CA「本周期不可比」同一
+// 处理：绝不把一个设备明说「还没稳」的值静默报成 good。
+const (
+	vtiValueMask = 0x7F   // 低 7 位：步位置值
+	vtiTransient = 1 << 7 // T：暂态（调节进行中）
+)
+
+// decodeStepPositionVTI 解出步位置的值与暂态位，并把原始 VTI 字节存进 Raw。
+func decodeStepPositionVTI(b byte) (value byte, transient bool, raw byte) {
+	return b & vtiValueMask, b&vtiTransient != 0, b
+}
+
+// encodeStepPositionVTI 把步位置值写回 VTI 字节；transient 控制暂态位。
+func encodeStepPositionVTI(value byte, transient bool) byte {
+	out := value & vtiValueMask
+	if transient {
+		out |= vtiTransient
+	}
+	return out
 }
 
 // BCR（二进制计数器读数）第 5 字节里的标志位。低 5 位是序号，不是品质。
@@ -231,6 +261,8 @@ func encodeQDS(q Quality) byte {
 //
 //	单点       Bool / Quality / Time
 //	双点       Uint（0..3）/ Quality / Time
+//	步位置     Uint（0..127）/ Raw（原始 VTI 字节）/ Quality / Time
+//	位串       Uint（32 位，bit0 = data[0] 的 LSB）/ Quality（恒 0）/ Time
 //	归一化     Num（-1..1）/ Quality / Time
 //	标度化     Num（int16）/ Quality / Time
 //	短浮点     Num / Quality / Time
@@ -531,6 +563,12 @@ func ElementSize(typeID byte) (int, bool) {
 		TypeSingleCommand, TypeDoubleCommand,
 		TypeInterrogation, TypeCounterInterrogation:
 		return 1, true
+	case TypeStepPosition:
+		// VTI（1 字节）+ QDS（1 字节）。
+		return 2, true
+	case TypeBitstring:
+		// 32 位位串，无品质描述符，正好 4 字节。
+		return 4, true
 	case TypeMeasuredNormalized, TypeMeasuredScaled, TypeSetpointNormalized, TypeSetpointScaled:
 		return 3, true
 	case TypeMeasuredFloat, TypeIntegratedTotals, TypeSetpointFloat:
@@ -564,7 +602,7 @@ func IsCommandType(typeID byte) bool {
 // IsData 表示该 ASDU 携带过程值（从站 → 主站）。
 func IsData(typeID byte) bool {
 	switch typeID {
-	case TypeSinglePoint, TypeDoublePoint,
+	case TypeSinglePoint, TypeDoublePoint, TypeStepPosition, TypeBitstring,
 		TypeMeasuredNormalized, TypeMeasuredScaled, TypeMeasuredFloat,
 		TypeIntegratedTotals, TypeIntegratedTotalsTime,
 		TypeSinglePointTime, TypeDoublePointTime,
@@ -608,6 +646,16 @@ func decodeElement(typeID byte, b []byte) (Object, int, error) {
 			Uint: uint32(b[0] & 0x03), Quality: decodeSIQQuality(b[0]),
 			Time: decodeCP56Time2a(b[1:8]),
 		}, size, nil
+	case TypeStepPosition:
+		// VTI（值 + 暂态位）+ QDS。值落在 Uint（0..127），原始 VTI 字节存进
+		// Raw 以便无损回写；暂态位的「不稳」语义由 point.go 的 Convert 折成
+		// uncertain（与双点中间态、BCR 不可比同一处理），这里只管存取原始字节。
+		value, _, raw := decodeStepPositionVTI(b[0])
+		return Object{Uint: uint32(value), Raw: raw, Quality: decodeQDS(b[1])}, size, nil
+	case TypeBitstring:
+		// 32 位位串，bit0 落在 data[0] 的最低位——按小端读成 uint32。
+		// 没有品质描述符，Quality 恒为 0（good）。
+		return Object{Uint: uint32(binary.LittleEndian.Uint32(b[0:4]))}, size, nil
 	case TypeMeasuredNormalized:
 		return Object{Num: normalized(b[0:2]), Quality: decodeQDS(b[2])}, size, nil
 	case TypeMeasuredScaled:
@@ -696,6 +744,17 @@ func appendElement(b []byte, typeID byte, o Object) ([]byte, error) {
 		}
 		b = append(b, byte(o.Uint)|encodeSIQQuality(o.Quality))
 		return append(b, encodeCP56Time2a(o.Time)...), nil
+	case TypeStepPosition:
+		if o.Uint > 127 {
+			return nil, fmt.Errorf("step position value %d exceeds 7 bits", o.Uint)
+		}
+		// 暂态位从原始 VTI 字节（Object.Raw）取，保证回写与解码前逐字节一致；
+		// 仅当调用方直接构造对象（Raw 为 0）时才退化为「非暂态」。
+		transient := o.Raw&vtiTransient != 0
+		b = append(b, encodeStepPositionVTI(byte(o.Uint), transient))
+		return append(b, encodeQDS(o.Quality)), nil
+	case TypeBitstring:
+		return binary.LittleEndian.AppendUint32(b, o.Uint), nil
 	case TypeMeasuredNormalized, TypeMeasuredNormalizedTime:
 		b = binary.LittleEndian.AppendUint16(b, encodeNormalized(o.Num))
 		b = append(b, encodeQDS(o.Quality))

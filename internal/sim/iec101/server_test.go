@@ -617,6 +617,26 @@ func TestSmallProfile(t *testing.T) {
 	}
 }
 
+// TestTypeOf 钉死 InfoKind → ASDU 类型号的映射，含新加的步位置与位串。
+func TestTypeOf(t *testing.T) {
+	cases := []struct {
+		info Info
+		want byte
+	}{
+		{Info{Kind: KindSingle}, iec60870.TypeSinglePoint},
+		{Info{Kind: KindDouble}, iec60870.TypeDoublePoint},
+		{Info{Kind: KindCounter}, iec60870.TypeIntegratedTotals},
+		{Info{Kind: KindStep}, iec60870.TypeStepPosition},
+		{Info{Kind: KindBitstring}, iec60870.TypeBitstring},
+	}
+	for _, c := range cases {
+		if got := typeOf(c.info); got != c.want {
+			t.Fatalf("typeOf(%+v) = %s, want %s", c.info,
+				iec60870.TypeName(got), iec60870.TypeName(c.want))
+		}
+	}
+}
+
 // TestAddresslessLink 覆盖 linkAddressSize=0：固定帧只有 4 字节，解析也
 // 必须按 0 字节地址去切。
 func TestAddresslessLink(t *testing.T) {

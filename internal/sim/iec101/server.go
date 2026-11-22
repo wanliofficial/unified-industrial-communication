@@ -47,11 +47,13 @@ const (
 type InfoKind int
 
 const (
-	KindSingle  InfoKind = iota // 单点信息（bool）
-	KindDouble                  // 双点信息（0..3）
-	KindFloat                   // 短浮点测量值
-	KindScaled                  // 标度化测量值（int16）
-	KindCounter                 // 累计量（uint32）
+	KindSingle    InfoKind = iota // 单点信息（bool）
+	KindDouble                    // 双点信息（0..3）
+	KindFloat                     // 短浮点测量值
+	KindScaled                    // 标度化测量值（int16）
+	KindCounter                   // 累计量（uint32）
+	KindStep                      // 步位置信息（0..127）
+	KindBitstring                 // 32 位位串
 )
 
 // Info 是一个信息对象。
@@ -783,6 +785,10 @@ func typeOf(i Info) byte {
 			return iec60870.TypeIntegratedTotalsTime
 		}
 		return iec60870.TypeIntegratedTotals
+	case KindStep:
+		return iec60870.TypeStepPosition
+	case KindBitstring:
+		return iec60870.TypeBitstring
 	}
 	if i.Time != nil {
 		return iec60870.TypeMeasuredFloatTime
@@ -799,6 +805,8 @@ func infoObject(i Info) iec60870.Object {
 		o.Uint = uint32(math.Round(i.Num))
 	case KindCounter:
 		o.Uint = i.Counter
+	case KindStep, KindBitstring:
+		o.Uint = uint32(math.Round(i.Num))
 	default:
 		o.Num = i.Num
 	}

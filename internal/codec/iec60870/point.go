@@ -124,6 +124,21 @@ func Convert(o Object, typeID byte, dt model.DataType) (model.Value, model.Quali
 		TypeMeasuredScaled, TypeMeasuredScaledTime,
 		TypeMeasuredFloat, TypeMeasuredFloatTime:
 		return model.NumValue(dt, o.Num), q, true
+	case TypeStepPosition:
+		// 步位置是 0..127 的整数档位（如变压器分接头位置）。暂态位 T（Object.Raw
+		// 的 bit7）表示机械调节进行中——值可读但还没稳，交给控制逻辑会过冲，
+		// 因此折成 uncertain（与双点 0/3 中间态、BCR 的 CY/CA 不可比同一处理），
+		// 不静默报成 good。档位取值本身不受 T 影响。
+		qq := q
+		if o.Raw&vtiTransient != 0 {
+			qq = Worse(q, model.QualityUncertain)
+		}
+		return model.NumValue(dt, float64(o.Uint)), qq, true
+	case TypeBitstring:
+		// 32 位位串按小端折成一个无符号整数；bit0 = 该整数的最低位。
+		// 平台不假设这 32 位的语义（保护状态 / 告警汇总都可能），交给点位
+		// 配置决定怎么解释，这里只保证逐位无损。
+		return model.NumValue(dt, float64(o.Uint)), q, true
 	case TypeIntegratedTotals, TypeIntegratedTotalsTime:
 		return model.NumValue(dt, float64(o.Uint)), q, true
 	case TypeSinglePoint, TypeSinglePointTime:

@@ -20,6 +20,10 @@ func TestBuildParseRoundTripAllTypes(t *testing.T) {
 			Objects: []Object{{IOA: 100, Bool: true, Quality: QSubstituted}}},
 		{TypeID: TypeDoublePoint, Cause: CauseSpontaneous, CommonAddr: 7,
 			Objects: []Object{{IOA: 101, Uint: 2}}},
+		{TypeID: TypeStepPosition, Cause: CauseSpontaneous, CommonAddr: 7,
+			Objects: []Object{{IOA: 102, Uint: 5, Quality: QSubstituted}}},
+		{TypeID: TypeBitstring, Cause: CauseSpontaneous, CommonAddr: 7,
+			Objects: []Object{{IOA: 103, Uint: 0x80000001}}},
 		{TypeID: TypeMeasuredNormalized, Cause: CausePeriodic, CommonAddr: 7,
 			Objects: []Object{{IOA: 200, Num: 0.5, Quality: QBlocked}}},
 		{TypeID: TypeMeasuredScaled, Cause: CausePeriodic, CommonAddr: 7,
@@ -193,8 +197,9 @@ func TestParseASDURejectsMalformed(t *testing.T) {
 
 func TestElementSizeAndClassifiers(t *testing.T) {
 	sizes := map[byte]int{
-		TypeSinglePoint: 1, TypeDoublePoint: 1, TypeMeasuredNormalized: 3,
-		TypeMeasuredScaled: 3, TypeMeasuredFloat: 5, TypeIntegratedTotals: 5,
+		TypeSinglePoint: 1, TypeDoublePoint: 1, TypeStepPosition: 2, TypeBitstring: 4,
+		TypeMeasuredNormalized: 3,
+		TypeMeasuredScaled:     3, TypeMeasuredFloat: 5, TypeIntegratedTotals: 5,
 		TypeIntegratedTotalsTime: 12,
 		TypeSinglePointTime:      8, TypeDoublePointTime: 8, TypeClockSync: 7,
 		TypeMeasuredNormalizedTime: 10, TypeMeasuredScaledTime: 10,

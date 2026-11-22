@@ -35,11 +35,13 @@ const DefaultCommonAddr uint16 = 1
 type InfoKind int
 
 const (
-	KindSingle  InfoKind = iota // 单点信息（bool）
-	KindDouble                  // 双点信息（0..3）
-	KindFloat                   // 短浮点测量值
-	KindScaled                  // 标度化测量值（int16）
-	KindCounter                 // 累计量（uint32）
+	KindSingle    InfoKind = iota // 单点信息（bool）
+	KindDouble                    // 双点信息（0..3）
+	KindFloat                     // 短浮点测量值
+	KindScaled                    // 标度化测量值（int16）
+	KindCounter                   // 累计量（uint32）
+	KindStep                      // 步位置信息（0..127）
+	KindBitstring                 // 32 位位串
 )
 
 // Info 是一个信息对象。
@@ -161,6 +163,8 @@ func (s *Server) installDefaults() {
 		{IOA: 2003, Kind: KindDouble, Num: 2, Writable: true},
 		{IOA: 2004, Kind: KindDouble, Num: 1},
 		{IOA: 3001, Kind: KindCounter, Counter: 1000},
+		{IOA: 1101, Kind: KindStep, Num: 5},
+		{IOA: 1102, Kind: KindBitstring, Num: 0x00000005},
 		{IOA: 4001, Kind: KindSingle, Bool: false, Writable: true, Command: true},
 		{IOA: 4002, Kind: KindFloat, Num: 0, Writable: true, Command: true},
 		{IOA: 4003, Kind: KindScaled, Num: 0, Writable: true, Command: true},
@@ -619,6 +623,13 @@ func typeOf(i Info) byte {
 			return iec104.TypeIntegratedTotalsTime
 		}
 		return iec104.TypeIntegratedTotals
+	case KindStep:
+		// 步位置无带时标变体（M_ST_TA_1 不在实现范围内），恒上送 M_ST_NA_1。
+		return iec104.TypeStepPosition
+	case KindBitstring:
+		// 位串的带时标变体是 CP24Time2a（3 字节），与本平台统一用的
+		// CP56Time2a 不兼容；同样不在范围内，恒上送 M_BO_NA_1。
+		return iec104.TypeBitstring
 	}
 	if i.Time != nil {
 		return iec104.TypeMeasuredFloatTime
@@ -642,6 +653,10 @@ func infoObject(i Info) iec104.Object {
 		o.Uint = uint32(math.Round(i.Num))
 	case KindCounter:
 		o.Uint = i.Counter
+	case KindStep:
+		o.Uint = uint32(math.Round(i.Num))
+	case KindBitstring:
+		o.Uint = uint32(math.Round(i.Num))
 	default:
 		o.Num = i.Num
 	}
