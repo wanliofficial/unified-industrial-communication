@@ -112,7 +112,12 @@ type Address struct {
    （否则「取第 3 位」这种配置会得到一个语义不明的数值）；
 3. `symbol.Path` 非空，不含控制字符与空格；`symbol.Selector`（可空）同样不含控制字符与空格；
 4. `object.Instance >= 0`，`ObjectType` 与 `Property` 非空；
-5. 各类字段不得混填（校验时按 `Kind` 只检查对应字段，其余必须为零值）；
+5. 各类字段不得混填：一条地址只应携带与 `Kind` 对应的字段，其余必须为零值。这张
+   「字段 → 合法 Kind」映射是 `Validate` 与 `Canonical` 的**唯一事实源**（`fieldsByKind`）：
+   `Validate` 用它拒绝任何越界字段，`Canonical` 用同一分类丢弃越界字段。早先五个 `Kind`
+   各写一份内联检查、只有 `computed` 查得全，其余各自漏检（如 register 不查 `instance`/
+   `propIndex`），导致「配置写错却不放行」，且 `Canonical` 把越界字段静默丢弃后两个语义
+   不同的地址坍缩成同一字符串、点表去重时张冠李戴。集中成表后新增字段只需登记一次；
 6. `computed.Expr` 非空、≤1024 字节、不含控制字符；对应点位必须**只读**且
    类型为数值或布尔——允许可写会产生一条永远失败的写入路径，允许字符串
    则得到一个没有任何运算符可消费的值。

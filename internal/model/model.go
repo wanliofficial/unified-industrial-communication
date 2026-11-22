@@ -234,6 +234,63 @@ var selectorRe = regexp.MustCompile(`^[^\x00-\x1f]+$`)
 // 层只需要保证 DPT 字段里不是别的什么东西（例如把 selector 写进来了）。
 var dptRe = regexp.MustCompile(`^[0-9]+(\.[0-9]+)?$`)
 
+// 每个字段对哪些 Kind 合法。这是「一条地址只应填写与 Kind 对应的字段」的
+// 唯一事实源：Validate 用它拒绝任何越界字段，Canonical 用同一分类丢弃越界
+// 字段。历史上五个 Kind 各写一份内联检查，只有 computed 分支检查得全，其余
+// 分支各自漏检了若干字段——一个 register 地址误带 `instance` 能通过校验，而
+// Canonical 又把它静默丢掉，于是两个语义不同的地址坍缩成同一字符串、点表去
+// 重时张冠李戴。集中成一张表后，新增字段只需在此登记一次，不可能再漏。
+//
+// 注意有两类字段对多个 Kind 都合法，不能从任何一侧拒绝：
+//   - Offset：register 与 file 都用；
+//   - Length：register 与 symbol 都用（symbol 用于 ADS STRING/bytes 的宽度）。
+var fieldsByKind = map[AddressKind]map[string]bool{
+	AddressRegister: {"area": true, "offset": true, "length": true, "bit": true, "db": true},
+	AddressSymbol:   {"path": true, "index": true, "length": true, "selector": true, "dpt": true},
+	AddressObject:   {"objecttype": true, "instance": true, "property": true, "propindex": true, "priority": true},
+	AddressFile:     {"fileid": true, "recordid": true, "offset": true},
+	AddressComputed: {"expr": true},
+}
+
+// mixedFieldsForKind 返回 a 中携带的、不属于该 Kind 的字段名列表（已排序，
+// 便于错误信息与测试稳定）。空列表表示没有越界字段。
+func mixedFieldsForKind(a Address) []string {
+	allowed := fieldsByKind[a.Kind]
+	var extra []string
+	for name, present := range addressFieldPresence(a) {
+		if present && !allowed[name] {
+			extra = append(extra, name)
+		}
+	}
+	sort.Strings(extra)
+	return extra
+}
+
+// addressFieldPresence 报告每个字段是否「已被设置」。字符串字段以非空为准，
+// 数值字段以非零为准——这与 Canonical 的丢弃逻辑一致（空串/0 在规范串里不
+// 出现，因此它们被带上与否都不会改变地址身份，不算越界）。
+func addressFieldPresence(a Address) map[string]bool {
+	return map[string]bool{
+		"area":       a.Area != "",
+		"offset":     a.Offset != 0,
+		"length":     a.Length != 0,
+		"bit":        a.Bit != 0, // 注意：register 的 -1（无位）由 range 校验处理，不是越界
+		"db":         a.DB != 0,
+		"path":       a.Path != "",
+		"index":      a.Index != 0,
+		"selector":   a.Selector != "",
+		"dpt":        a.DPT != "",
+		"objecttype": a.ObjectType != "",
+		"instance":   a.Instance != 0,
+		"property":   a.Property != "",
+		"propindex":  a.PropIndex != 0,
+		"priority":   a.Priority != 0,
+		"fileid":     a.FileID != 0,
+		"recordid":   a.RecordID != 0,
+		"expr":       a.Expr != "",
+	}
+}
+
 // Validate 校验地址自身的一致性与范围。
 func (a Address) Validate() error {
 	if !validAddressKinds[a.Kind] {
@@ -253,9 +310,8 @@ func (a Address) Validate() error {
 		if a.Bit < -1 || a.Bit > 15 {
 			return fmt.Errorf("address.bit: must be -1..15, got %d", a.Bit)
 		}
-		if a.Path != "" || a.ObjectType != "" || a.FileID != 0 || a.Selector != "" ||
-			a.Expr != "" || a.DPT != "" {
-			return errors.New("address: mixed fields for register kind")
+		if extra := mixedFieldsForKind(a); len(extra) > 0 {
+			return fmt.Errorf("address: mixed fields for register kind: %s", strings.Join(extra, ", "))
 		}
 		if a.DB < 0 {
 			return errors.New("address.db: must be >= 0")
@@ -283,8 +339,8 @@ func (a Address) Validate() error {
 		if a.DPT != "" && !dptRe.MatchString(a.DPT) {
 			return fmt.Errorf("address.dpt: %q is not a datapoint type (want e.g. 9.001)", a.DPT)
 		}
-		if a.Area != "" || a.ObjectType != "" || a.FileID != 0 || a.Expr != "" {
-			return errors.New("address: mixed fields for symbol kind")
+		if extra := mixedFieldsForKind(a); len(extra) > 0 {
+			return fmt.Errorf("address: mixed fields for symbol kind: %s", strings.Join(extra, ", "))
 		}
 	case AddressObject:
 		if a.ObjectType == "" || a.Property == "" {
@@ -297,17 +353,15 @@ func (a Address) Validate() error {
 		if a.Priority < 0 || a.Priority > 16 {
 			return errors.New("address.priority: must be 0..16")
 		}
-		if a.Area != "" || a.Path != "" || a.FileID != 0 || a.Selector != "" ||
-			a.Expr != "" || a.DPT != "" {
-			return errors.New("address: mixed fields for object kind")
+		if extra := mixedFieldsForKind(a); len(extra) > 0 {
+			return fmt.Errorf("address: mixed fields for object kind: %s", strings.Join(extra, ", "))
 		}
 	case AddressFile:
 		if a.FileID < 0 || a.RecordID < 0 || a.Offset < 0 {
 			return errors.New("address.file: fileId/recordId/offset must be >= 0")
 		}
-		if a.Area != "" || a.Path != "" || a.ObjectType != "" || a.Selector != "" ||
-			a.Expr != "" || a.DPT != "" {
-			return errors.New("address: mixed fields for file kind")
+		if extra := mixedFieldsForKind(a); len(extra) > 0 {
+			return fmt.Errorf("address: mixed fields for file kind: %s", strings.Join(extra, ", "))
 		}
 	case AddressComputed:
 		if strings.TrimSpace(a.Expr) == "" {
@@ -321,11 +375,8 @@ func (a Address) Validate() error {
 		if !selectorRe.MatchString(a.Expr) {
 			return errors.New("address.expr: must not contain control chars")
 		}
-		if a.Area != "" || a.Path != "" || a.ObjectType != "" || a.FileID != 0 ||
-			a.Selector != "" || a.Offset != 0 || a.Length != 0 || a.Bit != 0 || a.DB != 0 ||
-			a.Index != 0 || a.Instance != 0 || a.PropIndex != 0 || a.RecordID != 0 ||
-			a.DPT != "" {
-			return errors.New("address: mixed fields for computed kind")
+		if extra := mixedFieldsForKind(a); len(extra) > 0 {
+			return fmt.Errorf("address: mixed fields for computed kind: %s", strings.Join(extra, ", "))
 		}
 	}
 	return nil

@@ -602,6 +602,77 @@ func TestComputedPointRules(t *testing.T) {
 	}
 }
 
+// Validate 对「这条地址只应填写与 Kind 对应的字段」的检查必须与 Canonical 的
+// 丢弃逻辑对称：过去五个 Kind 各写一份内联检查，只有 computed 查得全，其余
+// 各自漏检了若干字段。register 漏检 instance/propIndex/recordId/index、symbol
+// 漏检 instance/propIndex/recordId/db/bit/offset、object 漏检 index/recordId/
+// db/bit/offset/length、file 漏检 index/instance/propIndex/db/bit/length。
+//
+// 后果是「配置写错却不报错」：register 地址误带 instance 通过校验，而
+// Canonical 又把 instance 静默丢掉，于是本意不同的两个地址坍缩成同一字符串，
+// 点表 CSV 导入用 Canonical 去重时会把两点当成同一个数据项，值张冠李戴。
+func TestValidateRejectsForeignFieldsForEveryKind(t *testing.T) {
+	cases := []struct {
+		name string
+		a    Address
+		// foreign 是任意一个「不该出现在该 Kind 上」的字段及其非零取值，
+		// 用来构造越界地址。
+	}{
+		{"register+instance", Address{Kind: AddressRegister, Area: "holding", Offset: 5, Length: 2, Bit: -1, Instance: 3}},
+		{"register+propIndex", Address{Kind: AddressRegister, Area: "holding", Offset: 5, Length: 2, Bit: -1, PropIndex: 1}},
+		{"register+recordID", Address{Kind: AddressRegister, Area: "holding", Offset: 5, Length: 2, Bit: -1, RecordID: 7}},
+		{"register+index", Address{Kind: AddressRegister, Area: "holding", Offset: 5, Length: 2, Bit: -1, Index: 2}},
+		{"symbol+instance", Address{Kind: AddressSymbol, Path: "DB1.DBW0", Instance: 1}},
+		{"symbol+offset", Address{Kind: AddressSymbol, Path: "DB1.DBW0", Offset: 4}},
+		{"symbol+length", Address{Kind: AddressSymbol, Path: "DB1.DBW0", Length: 0}}, // length=0 合法，跳过
+		{"symbol+db", Address{Kind: AddressSymbol, Path: "DB1.DBW0", DB: 1}},
+		{"symbol+bit", Address{Kind: AddressSymbol, Path: "DB1.DBW0", Bit: 2}},
+		{"object+index", Address{Kind: AddressObject, ObjectType: "binary_input", Property: "present_value", Index: 1}},
+		{"object+recordID", Address{Kind: AddressObject, ObjectType: "binary_input", Property: "present_value", RecordID: 1}},
+		{"object+offset", Address{Kind: AddressObject, ObjectType: "binary_input", Property: "present_value", Offset: 4}},
+		{"object+length", Address{Kind: AddressObject, ObjectType: "binary_input", Property: "present_value", Length: 2}},
+		{"object+db", Address{Kind: AddressObject, ObjectType: "binary_input", Property: "present_value", DB: 1}},
+		{"object+bit", Address{Kind: AddressObject, ObjectType: "binary_input", Property: "present_value", Bit: 3}},
+		{"file+index", Address{Kind: AddressFile, FileID: 1, Offset: 2, Index: 1}},
+		{"file+instance", Address{Kind: AddressFile, FileID: 1, Offset: 2, Instance: 1}},
+		{"file+propIndex", Address{Kind: AddressFile, FileID: 1, Offset: 2, PropIndex: 1}},
+		{"file+db", Address{Kind: AddressFile, FileID: 1, Offset: 2, DB: 1}},
+		{"file+bit", Address{Kind: AddressFile, FileID: 1, Offset: 2, Bit: 3}},
+		{"file+length", Address{Kind: AddressFile, FileID: 1, Offset: 2, Length: 4}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			// symbol+length 是合法组合（ADS STRING/bytes），跳过它，
+			// 仅校验其余越界组合被拒。
+			if tc.name == "symbol+length" {
+				return
+			}
+			if err := tc.a.Validate(); err == nil {
+				t.Fatalf("%s: expected rejection, got nil (Canonical=%q)", tc.name, tc.a.Canonical())
+			}
+		})
+	}
+}
+
+// 同一对「本意不同」的地址，越界字段被 Canonical 静默丢弃后会坍缩成同一字符串。
+// 这是上面缺陷的运行时后果：点表用 Canonical 去重，坍缩即张冠李戴。修复后
+// 这类地址在 Validate 阶段就被拒绝，根本走不到去重。
+func TestCanonicalNoLongerCollidesAfterValidate(t *testing.T) {
+	a := Address{Kind: AddressRegister, Area: "holding", Offset: 5, Length: 2, Instance: 3}
+	b := Address{Kind: AddressRegister, Area: "holding", Offset: 5, Length: 2, Instance: 9}
+	// 二者 Canonical 仍然相同（Canonical 本就不看 instance）——但 Validate
+	// 现在会拒绝它们，使这个坍缩无法进入生产数据。
+	if a.Canonical() != b.Canonical() {
+		t.Skip("Canonical 改变了行为，本用例的前提失效")
+	}
+	if err := a.Validate(); err == nil {
+		t.Fatal("register+instance 必须在 Validate 阶段被拒绝")
+	}
+	if err := b.Validate(); err == nil {
+		t.Fatal("register+instance 必须在 Validate 阶段被拒绝")
+	}
+}
+
 // Canonical 是缓存键与北向节点名的唯一来源，驱动不得自行实现。每种寻址
 // 都必须产出不同且稳定的字符串：两个不同的地址得到同一个键，会导致
 // 读回来的值张冠李戴——这类错误在运行时完全看不出来。

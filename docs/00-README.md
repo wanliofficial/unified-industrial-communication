@@ -1539,7 +1539,7 @@ obs  ← 所有包（不依赖任何内部包）
 
 | 包 | 职责 | 关键不变量 | 覆盖率 |
 |---|---|---|---|
-| `internal/model` | 通道/设备/点位/地址/采样/质量码/从站映射与设备标识/窗口摘要 | 不依赖任何内部包；不变量集中在 `Validate`；DB 号与 area 联动校验；计算点强制只读、4 类地址各有规范形式；订阅周期只在 `subscribe=true` 时允许出现；从站标识限长并禁控制字符；`WindowStats.Avg` 在 `Count=0` 时返回 0 而不是 NaN | 87.1% |
+| `internal/model` | 通道/设备/点位/地址/采样/质量码/从站映射与设备标识/窗口摘要 | 不依赖任何内部包；不变量集中在 `Validate`；DB 号与 area 联动校验；「一条地址只填对应 Kind 字段」的映射是 `Validate` 与 `Canonical` 的共同唯一事实源（`fieldsByKind`），五个 Kind 不再各写一份内联 mixed-fields 检查（早先只有 computed 查得全，其余漏检会让配置写错却被放行、越界字段被 Canonical 丢弃后两个地址坍缩）；计算点强制只读、4 类地址各有规范形式；订阅周期只在 `subscribe=true` 时允许出现；从站标识限长并禁控制字符；`WindowStats.Avg` 在 `Count=0` 时返回 0 而不是 NaN | 88.3% |
 | `internal/driver` | 驱动契约（Codec/Transport/Driver）、错误分类、注册表、只读 `Lookup` 注入、**部分失败契约的两个统一谓词**（`IsLinkFailure`：超时/断连才算链路级；`PartialReadError`：有成功点则吞错、全失败才上抛） | 能力四态；`Conn` 不保证并发安全，由调用方串行；协议错误可用 `Kinded` 自带分类；部分失败规则见 `docs/03-product/04-driver-sdk-spec.md` §3.3.1，禁止各驱动自写闸门（漏一处就会出现「一个坏点让整台设备每周期重连」） | 87% |
 | `internal/codec/modbus` | Modbus 纯函数编解码（TCP/RTU/ASCII，主站与从站共用） | 无 I/O、无时钟、无可变状态 | 88.5% |
 | `internal/codec/value` | 协议无关值编解码（重排、数值/字符串/BCD） | 与协议无关；`Encode` 对 string/bytes 不猜宽度 | 95% |
