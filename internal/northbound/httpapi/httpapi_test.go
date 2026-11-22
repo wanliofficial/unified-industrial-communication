@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -752,12 +753,53 @@ func TestMetricPathNormalization(t *testing.T) {
 		"/api/v1/points/d1/write":            "/api/v1/points/:device/write",
 		"/api/v1/config/versions/sha256:abc": "/api/v1/config/versions/:id",
 		"/api/v1/stream":                     "/api/v1/stream",
+		// 报警单条与确认带动态 id，且查不到会 404：必须归一化，否则任意 id
+		// 都会成为新的指标标签、撑爆基数。
+		"/api/v1/alarms/rule-high-temp":    "/api/v1/alarms/:id",
+		"/api/v1/alarms/rule-low-tank/ack": "/api/v1/alarms/:id/ack",
+		// 不存在（404）的设备/点位子路径同样不能把原始 id 带进标签。
+		"/api/v1/devices/d1/whatever":     "/api/v1/devices/:device",
+		"/api/v1/devices/d1/points/extra": "/api/v1/devices/:device/points",
+		"/api/v1/points/d1/p1/extra":      "/api/v1/points/:device/:point",
 	}
 	for in, want := range cases {
 		if got := metricPath(in); got != want {
 			t.Fatalf("metricPath(%q) = %q, want %q", in, got, want)
 		}
 	}
+}
+
+// TestMetricPathBoundedCardinality 是上面那条的性质化版本：同一类前缀下无论
+// 出现多少个不同的路径参数，归一化后的标签集合都必须有限。这正是 metricPath
+// 存在的理由——Prometheus 风格注册表从不回收标签组合。
+func TestMetricPathBoundedCardinality(t *testing.T) {
+	ids := []string{"AAAA", "BBBB", "rule-x", "0", "../../../etc", "带空格"}
+	templates := []string{
+		"/api/v1/alarms/%s",
+		"/api/v1/alarms/%s/ack",
+		"/api/v1/devices/%s",
+		"/api/v1/devices/%s/points",
+		"/api/v1/devices/%s/points/extra",
+		"/api/v1/devices/%s/whatever",
+		"/api/v1/points/%s/p1",
+		"/api/v1/points/d1/%s",
+		"/api/v1/points/%s/p1/extra",
+	}
+	seen := map[string]bool{}
+	for _, tpl := range templates {
+		for _, id := range ids {
+			got := metricPath(fmt.Sprintf(tpl, id))
+			if strings.Contains(got, id) {
+				t.Fatalf("metricPath(%q) = %q 仍含原始路径参数 %q", tpl, got, id)
+			}
+			seen[got] = true
+		}
+	}
+	// 9 个模板 × 6 个 id，但归一化后远少于 54 个标签，且全部不含原始 id。
+	if len(seen) == 0 {
+		t.Fatal("no labels produced")
+	}
+	t.Logf("归一化后得到 %d 个有限标签", len(seen))
 }
 
 func TestRecordsMetricPath(t *testing.T) {

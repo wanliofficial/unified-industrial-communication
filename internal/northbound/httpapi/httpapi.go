@@ -642,33 +642,51 @@ func (s *Server) record(r *http.Request, code int, start time.Time) {
 }
 
 // metricPath 把路径参数替换为占位符，避免设备/点位 ID 造成指标基数爆炸。
-// 这是指标标签的第一条纪律：标签值必须来自有限集合。
+// 这是指标标签的第一条纪律：标签值必须来自有限集合。Prometheus 风格的注册表
+// 从不回收标签集合，每出现一个新的标签组合就多占一份内存且永不释放——一个
+// 客户端（或误配置的探针）只要反复请求带不同路径参数的 URL，就能把 /metrics
+// 撑爆。因此这里不仅归一化已知路由，还必须把每一类前缀下的**任意**子路径
+// （包括不存在、返回 404 的那一段）都折叠到有限集合，否则 404 就成了绕过
+// 归一化的缺口。
 func metricPath(p string) string {
 	const dev = "/api/v1/devices/"
 	const pts = "/api/v1/points/"
 	const ver = "/api/v1/config/versions/"
+	const alm = "/api/v1/alarms/"
 	switch {
 	case strings.HasPrefix(p, dev):
+		// seg[0] 是设备号，一律归一化为占位符；其后只保留固定的 "points"
+		// 段，其余（如 /{device}/xyz、/{device}/points/{x} 这类并不存在的
+		// 子路径）全部折叠，避免任意路径进入标签。
 		seg := strings.Split(strings.TrimPrefix(p, dev), "/")
-		if len(seg) == 1 {
-			return dev + ":device"
+		out := dev + ":device"
+		if len(seg) >= 2 && seg[1] == "points" {
+			out += "/points"
 		}
-		if len(seg) == 2 && seg[1] == "points" {
-			return dev + ":device/points"
-		}
+		return out
 	case strings.HasPrefix(p, pts):
 		seg := strings.Split(strings.TrimPrefix(p, pts), "/")
-		if len(seg) == 2 {
-			if seg[1] == "write" {
+		if len(seg) >= 2 {
+			switch {
+			case seg[1] == "write":
 				return pts + ":device/write"
+			case len(seg) >= 3 && seg[2] == "write":
+				return pts + ":device/:point/write"
+			default:
+				return pts + ":device/:point"
 			}
-			return pts + ":device/:point"
-		}
-		if len(seg) == 3 && seg[2] == "write" {
-			return pts + ":device/:point/write"
 		}
 	case strings.HasPrefix(p, ver):
 		return ver + ":id"
+	case strings.HasPrefix(p, alm):
+		// /alarms/{id}（查单条）与 /alarms/{id}/ack（确认）带动态 id，
+		// 且查不到会 404——若不归一化，任意 id 都会成为新标签。/alarms
+		// 列表本身是固定路径，走不到这个前缀。
+		seg := strings.Split(strings.TrimPrefix(p, alm), "/")
+		if len(seg) >= 2 && seg[1] == "ack" {
+			return alm + ":id/ack"
+		}
+		return alm + ":id"
 	}
 	return p
 }
