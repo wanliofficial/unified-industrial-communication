@@ -191,6 +191,11 @@ func TestRuntimeEndToEnd(t *testing.T) {
 	// drain 取决于调度。拿到第一个 good 样本的瞬间就断言 Delivered>0，测的
 	// 是 goroutine 的调度时机而不是补发语义——GOMAXPROCS=1 或机器繁忙时
 	// 会稳定失败。所以这里等它收敛。
+	//
+	// 同理，「设备态已 collecting、点位全 good」也不能一次性断言：点位是
+	// 逐点 cache.Set，设备态要到本轮 finish 才转 collecting，中途必然存在
+	// 「读到半个批次」的窗口（Good=6、Bad=1，设备还是 connecting）。健康检查
+	// 本身是瞬时快照，断言它的一瞬间等价于断言调度器的抢占顺序。
 	code, body := h.do(http.MethodGet, "/api/v1/health", "")
 	if code != 200 {
 		t.Fatalf("health = %d %s", code, body)
@@ -199,8 +204,22 @@ func TestRuntimeEndToEnd(t *testing.T) {
 	if err := json.Unmarshal(body, &health); err != nil {
 		t.Fatal(err)
 	}
-	if health.Devices.Collecting != 1 || health.Points.Good == 0 {
-		t.Fatalf("health = %+v", health)
+	healthDeadline := time.Now().Add(10 * time.Second)
+	for {
+		if health.Devices.Collecting == 1 && health.Points.Good > 0 && health.Points.Bad == 0 {
+			break
+		}
+		if time.Now().After(healthDeadline) {
+			t.Fatalf("health never converged: %+v", health)
+		}
+		time.Sleep(10 * time.Millisecond)
+		code, body = h.do(http.MethodGet, "/api/v1/health", "")
+		if code != 200 {
+			t.Fatalf("health = %d %s", code, body)
+		}
+		if err := json.Unmarshal(body, &health); err != nil {
+			t.Fatal(err)
+		}
 	}
 	deliverDeadline := time.Now().Add(10 * time.Second)
 	for health.Outbox.Delivered == 0 {

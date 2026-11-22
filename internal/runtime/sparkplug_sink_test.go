@@ -316,25 +316,47 @@ func TestSparkplugReconnectRebirths(t *testing.T) {
 	first := countTopics(b.Messages(), "spBv1.0/plant-a/NBIRTH/gw-01")
 
 	b.DropAll()
-	// 客户端要一点时间才能从读循环发现断链。失败是预期：Outbox 会重试。
-	deadline := time.Now().Add(8 * time.Second)
-	for time.Now().Before(deadline) {
+
+	// 这里不能用「第一次 deliver 返回 nil」判定重连完成。DDATA 是 QoS 0，
+	// 没有 PUBACK 兜底：客户端可能把数据成功写进一条**已被对端关闭**的
+	// socket（本端发送缓冲区还没报错），于是 deliver 返回成功而数据已经
+	// 丢了。断言「重连」的唯一可靠信号是 Broker 上真的出现了新的 NBIRTH。
+	deadline := time.Now().Add(15 * time.Second)
+	for {
+		if countTopics(b.Messages(), "spBv1.0/plant-a/NBIRTH/gw-01") > first {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("no NBIRTH after reconnect; topics = %v", topicsOf(b.Messages()))
+		}
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		_, err := s.deliver(ctx, []outbox.Record{recordFor(t, "dev1", "p1", 2)})
 		cancel()
-		if err == nil {
-			break
-		}
+		// 失败是预期：Outbox 会重试。成功也可能只是写进了已断的 socket，
+		// 所以两种结果都继续下一轮，直到看到新 BIRTH。
+		_ = err
 		time.Sleep(50 * time.Millisecond)
 	}
-	deadline = time.Now().Add(8 * time.Second)
-	for time.Now().Before(deadline) {
-		if countTopics(b.Messages(), "spBv1.0/plant-a/NBIRTH/gw-01") > first {
-			return
+
+	// BIRTH 之后必须还有数据：只补 BIRTH 不补 DDATA 的话，消费方会得到
+	// 一个「刚出生但永远没有值」的设备。
+	msgs := b.Messages()
+	lastBirth := -1
+	for i, m := range msgs {
+		if m.Topic == "spBv1.0/plant-a/NBIRTH/gw-01" {
+			lastBirth = i
 		}
-		time.Sleep(20 * time.Millisecond)
 	}
-	t.Fatalf("no NBIRTH after reconnect; topics = %v", topicsOf(b.Messages()))
+	dataAfterBirth := false
+	for _, m := range msgs[lastBirth+1:] {
+		if m.Topic == "spBv1.0/plant-a/DDATA/gw-01/dev1" {
+			dataAfterBirth = true
+			break
+		}
+	}
+	if !dataAfterBirth {
+		t.Fatalf("no DDATA after the new NBIRTH; topics = %v", topicsOf(msgs))
+	}
 }
 
 // close 必须先发 NDEATH，再发 DISCONNECT。
