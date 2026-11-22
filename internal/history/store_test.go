@@ -493,3 +493,84 @@ func TestConcurrentWriteAndQuery(t *testing.T) {
 		t.Fatalf("appended = %d", st.Appended)
 	}
 }
+
+// 段内记录时间并不保证单调：多台设备的采集互不相关，写入按事件到达顺序
+// 落盘，后写的记录完全可能早于先写的。段索引的 end 必须是段内**最大**
+// 时间，写成「最后一条」会得到 end < start 的自相矛盾区间，
+// snapshotSegments 判重叠时整段跳过，段内仍落在窗口里的 good 样本全部
+// 漏统计——趋势曲线会凭空少一段，「平均值」也随之偏低。
+func TestSegmentIndexUsesMaxTimeNotLast(t *testing.T) {
+	dir := t.TempDir()
+	base := time.Date(2026, 3, 1, 12, 0, 0, 0, time.UTC)
+	s, _ := openTest(t, dir, Options{SegmentBytes: 1 << 20, MaxBytes: 1 << 20, MaxAge: 24 * time.Hour})
+
+	// 先写较晚的 200s，再写较早的 150s（模拟跨设备交错到达）。
+	if err := s.Write(numRec(base.Add(200*time.Second), "dev", "p", 20)); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Write(numRec(base.Add(150*time.Second), "dev", "p", 15)); err != nil {
+		t.Fatal(err)
+	}
+	// 运行期：内存索引的 end 必须已经取最大值，不能等重启才自愈。
+	if got := s.segs[0].end; got.Before(base.Add(200 * time.Second)) {
+		t.Fatalf("live segment end = %v, want >= %v", got, base.Add(200*time.Second))
+	}
+
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// 重开：scan 从末行恢复时必须得到同一个上界。
+	clock := newClock(base.Add(210 * time.Second))
+	s2, err := Open(Options{Dir: dir, SegmentBytes: 1 << 20, MaxBytes: 1 << 20,
+		MaxAge: 24 * time.Hour, Now: clock.Now, Log: quietLogger()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s2.Close()
+	if got, want := s2.segs[0].end, base.Add(200*time.Second); !got.Equal(want) {
+		t.Fatalf("scanned segment end = %v, want %v", got, want)
+	}
+	st, err := s2.WindowStats("dev", "p", 50*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.Count != 1 || st.Sum != 20 {
+		t.Fatalf("WindowStats = count %d sum %v, want count 1 sum 20 (segment was skipped)", st.Count, st.Sum)
+	}
+}
+
+// 旧版本可能已经把 end 写坏（end < start）。启动扫描必须自愈，否则这段
+// 数据会在每次重启后继续被漏掉，且没有任何错误提示。
+func TestScanRepairsTornSegmentBounds(t *testing.T) {
+	dir := t.TempDir()
+	base := time.Date(2026, 3, 1, 12, 0, 0, 0, time.UTC)
+	s, _ := openTest(t, dir, Options{SegmentBytes: 1 << 20, MaxBytes: 1 << 20, MaxAge: 24 * time.Hour})
+	if err := s.Write(numRec(base.Add(200*time.Second), "dev", "p", 20)); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Write(numRec(base.Add(150*time.Second), "dev", "p", 15)); err != nil {
+		t.Fatal(err)
+	}
+	path := s.segs[0].path
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// 人为把内存索引不存在、但「磁盘上的末行」就是较小时间的旧库形态
+	// 交给 Open：它只能靠 scan 从末行推断，正是旧版本写坏的形态。
+	clock := newClock(base.Add(210 * time.Second))
+	s2, err := Open(Options{Dir: dir, SegmentBytes: 1 << 20, MaxBytes: 1 << 20,
+		MaxAge: 24 * time.Hour, Now: clock.Now, Log: quietLogger()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s2.Close()
+	seg := s2.segs[0]
+	if !seg.end.Equal(base.Add(200 * time.Second)) {
+		t.Fatalf("segment %s end = %v, want %v", path, seg.end, base.Add(200*time.Second))
+	}
+	if seg.end.Before(seg.start) {
+		t.Fatalf("segment bounds still inverted: start %v end %v", seg.start, seg.end)
+	}
+}

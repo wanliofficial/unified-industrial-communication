@@ -215,6 +215,15 @@ func (s *Store) scan() error {
 		} else {
 			seg.end = info.ModTime().UTC()
 		}
+		// 旧版本把 end 写成「最后一条记录」而不是「最大时间」：段内时间
+		// 非单调时 end 会小于 start，成为一个自相矛盾的区间，查询按重叠
+		// 判断就会整段跳过。读到这种段时重扫一遍求真实上界——只在启动
+		// 时发生一次，且只针对被写坏的段（正常段 end >= start 不受影响）。
+		if seg.end.Before(seg.start) || seg.end.Equal(seg.start) && seg.size > 0 {
+			if maxT, ok := maxRecordTime(path, info.Size()); ok && maxT.After(seg.end) {
+				seg.end = maxT
+			}
+		}
 		s.segs = append(s.segs, seg)
 		s.bytes += info.Size()
 	}
@@ -246,6 +255,26 @@ func firstRecordTime(path string) (time.Time, bool) {
 		}
 	}
 	return time.Time{}, false
+}
+
+// maxRecordTime 扫描整个段，返回其中最大的记录时间。
+//
+// 只在 scan() 遇到自相矛盾的段（end < start）时调用：正常段的 end 由
+// Write 用最大值维护，无需全扫。它的存在是为了让被旧版本写坏的段在下次
+// 启动时自愈，而不是永久漏掉一段数据。
+func maxRecordTime(path string, size int64) (time.Time, bool) {
+	var maxT time.Time
+	ok := false
+	if _, _, err := scanSegment(path, func(rec Record) bool {
+		if !ok || rec.Time.After(maxT) {
+			maxT = rec.Time
+			ok = true
+		}
+		return true
+	}); err != nil {
+		return time.Time{}, false
+	}
+	return maxT, ok
 }
 
 // endsWithNewline 检查段文件是否以换行结束（空文件视为安全）。
@@ -380,9 +409,18 @@ func (s *Store) Write(r Record) error {
 		return err
 	}
 	s.active.size += int64(n)
-	s.active.end = r.Time
+	// start/end 必须是段内记录的**最小/最大**时间，而不是「首条/末条」。
+	// 段内记录时间并不保证单调：多个设备的采集互不相关，写入又是按事件
+	// 到达顺序落盘，后写的记录完全可能早于先写的（例如 A 设备 12:03:20
+	// 的样本先到，B 设备 12:02:30 的样本后到）。`scan()` 与查询都假设
+	// 「首行是下界、末行是上界」，若 end 被写成最后一条的较小时间，会出现
+	// end < start 的自相矛盾段；snapshotSegments 按 [start,end] 与查询区间
+	// 判重叠时就会把整个段跳过，段内真正落在窗口里的 good 样本全部漏统计。
 	if s.active.start.IsZero() || r.Time.Before(s.active.start) {
 		s.active.start = r.Time
+	}
+	if s.active.end.IsZero() || r.Time.After(s.active.end) {
+		s.active.end = r.Time
 	}
 	s.bytes += int64(n)
 	s.appended++
