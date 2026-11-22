@@ -274,7 +274,7 @@ func formatObject(typeID byte, o iec104codec.Object) string {
 		return strconv.FormatInt(int64(o.Num), 10)
 	case iec104codec.TypeMeasuredFloat, iec104codec.TypeMeasuredFloatTime:
 		return trimFloat(o.Num)
-	case iec104codec.TypeIntegratedTotals:
+	case iec104codec.TypeIntegratedTotals, iec104codec.TypeIntegratedTotalsTime:
 		return strconv.FormatUint(uint64(o.Uint), 10)
 	case iec104codec.TypeClockSync:
 		return ""

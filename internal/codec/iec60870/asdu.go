@@ -41,6 +41,7 @@ const (
 	TypeIntegratedTotals       byte = 15  // M_IT_NA_1
 	TypeSinglePointTime        byte = 30  // M_SP_TB_1
 	TypeDoublePointTime        byte = 31  // M_DP_TB_1
+	TypeIntegratedTotalsTime   byte = 32  // M_IT_TB_1（带 CP56Time2a 时标的累计量）
 	TypeMeasuredNormalizedTime byte = 34  // M_ME_TD_1
 	TypeMeasuredScaledTime     byte = 35  // M_ME_TE_1
 	TypeMeasuredFloatTime      byte = 36  // M_ME_TF_1
@@ -534,6 +535,9 @@ func ElementSize(typeID byte) (int, bool) {
 		return 3, true
 	case TypeMeasuredFloat, TypeIntegratedTotals, TypeSetpointFloat:
 		return 5, true
+	// M_IT_TB_1：BCR（5 字节）+ CP56Time2a（7 字节）。
+	case TypeIntegratedTotalsTime:
+		return 12, true
 	case TypeSinglePointTime, TypeDoublePointTime:
 		return 8, true
 	case TypeClockSync:
@@ -562,7 +566,7 @@ func IsData(typeID byte) bool {
 	switch typeID {
 	case TypeSinglePoint, TypeDoublePoint,
 		TypeMeasuredNormalized, TypeMeasuredScaled, TypeMeasuredFloat,
-		TypeIntegratedTotals,
+		TypeIntegratedTotals, TypeIntegratedTotalsTime,
 		TypeSinglePointTime, TypeDoublePointTime,
 		TypeMeasuredNormalizedTime, TypeMeasuredScaledTime, TypeMeasuredFloatTime:
 		return true
@@ -574,7 +578,8 @@ func IsData(typeID byte) bool {
 func IsTimeTagged(typeID byte) bool {
 	switch typeID {
 	case TypeSinglePointTime, TypeDoublePointTime,
-		TypeMeasuredNormalizedTime, TypeMeasuredScaledTime, TypeMeasuredFloatTime:
+		TypeMeasuredNormalizedTime, TypeMeasuredScaledTime, TypeMeasuredFloatTime,
+		TypeIntegratedTotalsTime:
 		return true
 	}
 	return false
@@ -633,6 +638,15 @@ func decodeElement(typeID byte, b []byte) (Object, int, error) {
 		return Object{
 			Uint: binary.LittleEndian.Uint32(b[0:4]),
 			Raw:  b[4], Quality: decodeBCRQuality(b[4]),
+		}, size, nil
+	case TypeIntegratedTotalsTime:
+		// 与 M_IT_NA_1 同一个 BCR 读法，只是末尾多 7 字节 CP56Time2a。
+		// 时标对轮询主站不改变取值（值仍是累计量），但必须消费掉——
+		// 否则后续信息对象的地址会偏移，整帧解析错位。
+		return Object{
+			Uint: binary.LittleEndian.Uint32(b[0:4]),
+			Raw:  b[4], Quality: decodeBCRQuality(b[4]),
+			Time: decodeCP56Time2a(b[5:12]),
 		}, size, nil
 	case TypeSingleCommand:
 		return Object{Bool: b[0]&0x01 != 0, Select: b[0]&0x80 != 0, Qualifier: (b[0] >> 2) & 0x1F}, size, nil
@@ -709,6 +723,10 @@ func appendElement(b []byte, typeID byte, o Object) ([]byte, error) {
 	case TypeIntegratedTotals:
 		b = binary.LittleEndian.AppendUint32(b, o.Uint)
 		return append(b, encodeBCRQuality(o.Raw, o.Quality)), nil
+	case TypeIntegratedTotalsTime:
+		b = binary.LittleEndian.AppendUint32(b, o.Uint)
+		b = append(b, encodeBCRQuality(o.Raw, o.Quality))
+		return append(b, encodeCP56Time2a(o.Time)...), nil
 	case TypeSingleCommand:
 		var v byte
 		if o.Bool {

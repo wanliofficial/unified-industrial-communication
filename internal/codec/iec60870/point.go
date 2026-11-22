@@ -124,7 +124,7 @@ func Convert(o Object, typeID byte, dt model.DataType) (model.Value, model.Quali
 		TypeMeasuredScaled, TypeMeasuredScaledTime,
 		TypeMeasuredFloat, TypeMeasuredFloatTime:
 		return model.NumValue(dt, o.Num), q, true
-	case TypeIntegratedTotals:
+	case TypeIntegratedTotals, TypeIntegratedTotalsTime:
 		return model.NumValue(dt, float64(o.Uint)), q, true
 	case TypeSinglePoint, TypeSinglePointTime:
 		if o.Bool {

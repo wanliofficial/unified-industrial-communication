@@ -613,6 +613,11 @@ func typeOf(i Info) byte {
 		}
 		return iec104.TypeMeasuredScaled
 	case KindCounter:
+		// 带 Time 的累计量按 M_IT_TB_1 上送：CRT 的序号位不能替代时标，
+		// 「某个时刻的读数」是电能量结算的必需信息。
+		if i.Time != nil {
+			return iec104.TypeIntegratedTotalsTime
+		}
 		return iec104.TypeIntegratedTotals
 	}
 	if i.Time != nil {

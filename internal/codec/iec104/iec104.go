@@ -231,6 +231,7 @@ const (
 	TypeMeasuredScaled         = iec60870.TypeMeasuredScaled
 	TypeMeasuredFloat          = iec60870.TypeMeasuredFloat
 	TypeIntegratedTotals       = iec60870.TypeIntegratedTotals
+	TypeIntegratedTotalsTime   = iec60870.TypeIntegratedTotalsTime
 	TypeSinglePointTime        = iec60870.TypeSinglePointTime
 	TypeDoublePointTime        = iec60870.TypeDoublePointTime
 	TypeMeasuredNormalizedTime = iec60870.TypeMeasuredNormalizedTime

@@ -779,6 +779,9 @@ func typeOf(i Info) byte {
 		}
 		return iec60870.TypeMeasuredScaled
 	case KindCounter:
+		if i.Time != nil {
+			return iec60870.TypeIntegratedTotalsTime
+		}
 		return iec60870.TypeIntegratedTotals
 	}
 	if i.Time != nil {

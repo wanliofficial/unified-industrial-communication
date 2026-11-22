@@ -993,8 +993,7 @@ func TestTypeOf(t *testing.T) {
 		{Info{Kind: KindFloat}, iec104.TypeMeasuredFloat},
 		{Info{Kind: KindFloat, Time: &ts}, iec104.TypeMeasuredFloatTime},
 		{Info{Kind: KindCounter}, iec104.TypeIntegratedTotals},
-		// 累计量即使带时标也用无时标类型（时标由计数序号表达）。
-		{Info{Kind: KindCounter, Time: &ts}, iec104.TypeIntegratedTotals},
+		{Info{Kind: KindCounter, Time: &ts}, iec104.TypeIntegratedTotalsTime},
 	}
 	for _, c := range cases {
 		if got := typeOf(c.info); got != c.want {

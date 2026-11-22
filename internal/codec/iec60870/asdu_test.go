@@ -28,6 +28,8 @@ func TestBuildParseRoundTripAllTypes(t *testing.T) {
 			Objects: []Object{{IOA: 202, Num: 42.5}}},
 		{TypeID: TypeIntegratedTotals, Cause: CauseSpontaneous, CommonAddr: 7,
 			Objects: []Object{{IOA: 300, Uint: 123456, Raw: 3}}},
+		{TypeID: TypeIntegratedTotalsTime, Cause: CauseSpontaneous, CommonAddr: 7,
+			Objects: []Object{{IOA: 301, Uint: 654321, Raw: 3, Time: &ts}}},
 		{TypeID: TypeSinglePointTime, Cause: CauseSpontaneous, CommonAddr: 7,
 			Objects: []Object{{IOA: 400, Bool: true, Time: &ts}}},
 		{TypeID: TypeDoublePointTime, Cause: CauseSpontaneous, CommonAddr: 7,
@@ -193,7 +195,8 @@ func TestElementSizeAndClassifiers(t *testing.T) {
 	sizes := map[byte]int{
 		TypeSinglePoint: 1, TypeDoublePoint: 1, TypeMeasuredNormalized: 3,
 		TypeMeasuredScaled: 3, TypeMeasuredFloat: 5, TypeIntegratedTotals: 5,
-		TypeSinglePointTime: 8, TypeDoublePointTime: 8, TypeClockSync: 7,
+		TypeIntegratedTotalsTime: 12,
+		TypeSinglePointTime:      8, TypeDoublePointTime: 8, TypeClockSync: 7,
 		TypeMeasuredNormalizedTime: 10, TypeMeasuredScaledTime: 10,
 		TypeMeasuredFloatTime: 12, TypeSingleCommand: 1, TypeDoubleCommand: 1,
 		TypeSetpointNormalized: 3, TypeSetpointScaled: 3, TypeSetpointFloat: 5,
@@ -216,13 +219,16 @@ func TestElementSizeAndClassifiers(t *testing.T) {
 			t.Fatalf("%s must not be data", TypeName(typ))
 		}
 	}
-	for _, typ := range []byte{TypeSinglePoint, TypeMeasuredFloat, TypeIntegratedTotals} {
+	for _, typ := range []byte{TypeSinglePoint, TypeMeasuredFloat, TypeIntegratedTotals, TypeIntegratedTotalsTime} {
 		if !IsData(typ) || IsCommandType(typ) {
 			t.Fatalf("%s classifier wrong", TypeName(typ))
 		}
 	}
 	if !IsTimeTagged(TypeMeasuredFloatTime) || IsTimeTagged(TypeMeasuredFloat) {
 		t.Fatal("IsTimeTagged wrong")
+	}
+	if !IsTimeTagged(TypeIntegratedTotalsTime) || IsTimeTagged(TypeIntegratedTotals) {
+		t.Fatal("IsTimeTagged wrong for integrated totals")
 	}
 	if IsTimeTagged(TypeSingleCommand) {
 		t.Fatal("commands are not time tagged")
@@ -467,6 +473,9 @@ func TestTypeNameAndLookup(t *testing.T) {
 		"setpoint-normalized": TypeSetpointNormalized,
 		"setpoint_normalized": TypeSetpointNormalized,
 		"double-command":      TypeDoubleCommand,
+		"counter-time":        TypeIntegratedTotalsTime,
+		"m_it_tb_1":           TypeIntegratedTotalsTime,
+		"M_IT_TB_1":           TypeIntegratedTotalsTime,
 	}
 	for in, want := range cases {
 		got, ok := TypeFromName(in)
@@ -598,6 +607,58 @@ func TestIntegratedTotalsKeepsBCRFlags(t *testing.T) {
 	}
 }
 
+// 带时标累计量 M_IT_TB_1（类型 32）= BCR（5 字节）+ CP56Time2a（7 字节）。
+// 时标不改变取值，但**必须消费掉**：少读 7 字节会让同一 ASDU 里后续信息
+// 对象的 IOA 整体前移，症状是「第一个电度对上、第二个电度开始串位」。
+func TestIntegratedTotalsTimeKeepsTimeTag(t *testing.T) {
+	ts1 := time.Date(2026, 11, 22, 8, 30, 15, 250*int(time.Millisecond), time.Local)
+	ts2 := ts1.Add(15 * time.Minute)
+	raw, err := BuildASDU(ASDU{TypeID: TypeIntegratedTotalsTime, Cause: CausePeriodic,
+		CommonAddr: 1, Objects: []Object{
+			{IOA: 300, Uint: 1000, Raw: 0x05, Time: &ts1},
+			{IOA: 301, Uint: 0xFFFFFFFF, Raw: 0xE0, Quality: QInvalid | QOverflow | QSubstituted, Time: &ts2},
+		}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// ASDU 头 6 字节 + 每个对象 (3 字节 IOA + 12 字节元素)。
+	if want := 6 + 2*(3+12); len(raw) != want {
+		t.Fatalf("frame = %d bytes, want %d", len(raw), want)
+	}
+	out, err := ParseASDU(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(out.Objects) != 2 {
+		t.Fatalf("objects = %d, want 2", len(out.Objects))
+	}
+	want := []struct {
+		ioa   uint32
+		value uint32
+		raw   byte
+		ts    time.Time
+	}{
+		{300, 1000, 0x05, ts1},
+		{301, 0xFFFFFFFF, 0xE0, ts2},
+	}
+	for i, w := range want {
+		o := out.Objects[i]
+		if o.IOA != w.ioa || o.Uint != w.value {
+			t.Fatalf("object %d = IOA %d value %d, want %d/%d", i, o.IOA, o.Uint, w.ioa, w.value)
+		}
+		if o.Raw != w.raw {
+			t.Fatalf("object %d raw = 0x%02X, want 0x%02X", i, o.Raw, w.raw)
+		}
+		if o.Time == nil || !o.Time.Equal(w.ts) {
+			t.Fatalf("object %d time = %v, want %v", i, o.Time, w.ts)
+		}
+	}
+	// 解码侧也必须报告消费了 12 字节，否则调用方按 5 字节推进会串位。
+	if _, n, err := decodeElement(TypeIntegratedTotalsTime, raw[6:]); err != nil || n != 12 {
+		t.Fatalf("decodeElement = %d, %v; want 12", n, err)
+	}
+}
+
 // IV 的累计量必须折算成 bad，而不是跟着「值不为 0」一起当 good 上报。
 func TestIntegratedTotalsInvalidQualityConvertsToBad(t *testing.T) {
 	o := Object{IOA: 300, Uint: 99, Raw: 0x80}
@@ -608,6 +669,20 @@ func TestIntegratedTotalsInvalidQualityConvertsToBad(t *testing.T) {
 	}
 	if q != model.QualityBad {
 		t.Fatalf("quality = %s, want bad", q)
+	}
+}
+
+// 带时标累计量的取值与无时标版本一致：平台侧仍是一个 uint32 计数，
+// 时标只用于旁路表展示，不能因为「多了时标」就被判成不认识的类型。
+func TestIntegratedTotalsTimeConvertsLikeCounter(t *testing.T) {
+	ts := time.Date(2026, 11, 22, 9, 0, 0, 0, time.Local)
+	o := Object{IOA: 300, Uint: 4321, Raw: 0x01, Time: &ts}
+	v, q, ok := Convert(o, TypeIntegratedTotalsTime, model.TypeUint32)
+	if !ok {
+		t.Fatal("convert failed")
+	}
+	if v.Type != model.TypeUint32 || v.Num != 4321 || q != model.QualityGood {
+		t.Fatalf("value = %+v quality = %s", v, q)
 	}
 }
 
