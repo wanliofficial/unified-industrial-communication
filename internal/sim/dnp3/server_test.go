@@ -41,6 +41,7 @@ func TestStaticRoundTrip(t *testing.T) {
 		"10/0": false,
 		"10/1": false,
 		"20/0": uint64(1000),
+		"21/0": uint64(900),
 		"20/1": uint64(42),
 		"30/0": 42.5,
 		"30/1": 7.25,
@@ -57,5 +58,59 @@ func TestStaticRoundTrip(t *testing.T) {
 	}
 	if t.Failed() {
 		t.Logf("raw = % X", raw)
+	}
+}
+
+// 冻结计数器（组 21/23）必须作为独立 area 编码：同一个 index 与组 20 的
+// 瞬时计数器是两个值，编码器把两者混用会让主站读到「冻结值变成了实时值」。
+func TestFrozenCounterStaticAndEvent(t *testing.T) {
+	s, err := NewServer("127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	s.SetAutoChange(false)
+	s.SetPoint(Point{Area: FrozenCounter, Index: 2, Counter: 500, Flags: dnp3codec.FlagOnline})
+	s.SetPoint(Point{Area: Counter, Index: 2, Counter: 7, Flags: dnp3codec.FlagOnline})
+
+	s.mu.Lock()
+	raw, _ := s.buildRead([]dnp3codec.Header{{Group: dnp3codec.GroupClass, Variation: 1,
+		Qualifier: dnp3codec.QualAllObjects, All: true}})
+	s.mu.Unlock()
+
+	objs, err := dnp3codec.ParseObjects(raw)
+	if err != nil {
+		t.Fatalf("parse: %v\nraw = % X", err, raw)
+	}
+	got := map[string]any{}
+	for _, o := range objs {
+		got[fmt.Sprintf("%d/%d", o.Group, o.Index)] = o.Value
+	}
+	if v := got["21/2"]; v != uint64(500) {
+		t.Fatalf("frozen counter 21/2 = %v, want 500; all = %v", v, got)
+	}
+	if v := got["20/2"]; v != uint64(7) {
+		t.Fatalf("counter 20/2 = %v, want 7", v)
+	}
+
+	// 类 3 事件走组 23。
+	s.SetPoint(Point{Area: FrozenCounter, Index: 2, Counter: 500, Flags: dnp3codec.FlagOnline, Class: 3})
+	if err := s.SetValue(FrozenCounter, 2, 600); err != nil {
+		t.Fatal(err)
+	}
+	s.mu.Lock()
+	raw, hasEvents := s.buildRead([]dnp3codec.Header{{Group: dnp3codec.GroupClass, Variation: 4,
+		Qualifier: dnp3codec.QualAllObjects, All: true}})
+	s.mu.Unlock()
+	if !hasEvents {
+		t.Fatal("frozen counter change did not produce an event")
+	}
+	objs, err = dnp3codec.ParseObjects(raw)
+	if err != nil {
+		t.Fatalf("parse event: %v\nraw = % X", err, raw)
+	}
+	if len(objs) != 1 || objs[0].Group != dnp3codec.GroupFrozenCounterEvent ||
+		objs[0].Index != 2 || objs[0].Value != uint64(600) {
+		t.Fatalf("frozen counter event = %+v", objs)
 	}
 }

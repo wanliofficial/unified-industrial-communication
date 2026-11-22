@@ -109,23 +109,25 @@ const (
 
 // 对象组。本实现认识的组都在这里列出来，README/驱动文档引用同一份常量。
 const (
-	GroupBinaryInput       byte = 1
-	GroupBinaryEvent       byte = 2
-	GroupDoubleBitInput    byte = 3
-	GroupDoubleBitEvent    byte = 4
-	GroupBinaryOutput      byte = 10
-	GroupBinaryOutputEvent byte = 11
-	GroupCROB              byte = 12
-	GroupCounter           byte = 20
-	GroupCounterEvent      byte = 22
-	GroupAnalogInput       byte = 30
-	GroupAnalogEvent       byte = 32
-	GroupAnalogOutput      byte = 40
-	GroupAnalogOutputBlock byte = 41
-	GroupTime              byte = 50
-	GroupTimeCTO           byte = 51
-	GroupTimeDelay         byte = 52
-	GroupClass             byte = 60
+	GroupBinaryInput        byte = 1
+	GroupBinaryEvent        byte = 2
+	GroupDoubleBitInput     byte = 3
+	GroupDoubleBitEvent     byte = 4
+	GroupBinaryOutput       byte = 10
+	GroupBinaryOutputEvent  byte = 11
+	GroupCROB               byte = 12
+	GroupCounter            byte = 20
+	GroupFrozenCounter      byte = 21
+	GroupCounterEvent       byte = 22
+	GroupFrozenCounterEvent byte = 23
+	GroupAnalogInput        byte = 30
+	GroupAnalogEvent        byte = 32
+	GroupAnalogOutput       byte = 40
+	GroupAnalogOutputBlock  byte = 41
+	GroupTime               byte = 50
+	GroupTimeCTO            byte = 51
+	GroupTimeDelay          byte = 52
+	GroupClass              byte = 60
 )
 
 // 限定词的低 4 位（范围码）。高 4 位是前缀码，见 prefixSize。
@@ -868,6 +870,51 @@ func numericSpecOf(g, v byte) (numericSpec, bool) {
 		// 回这两条变体时对象体整体错位——第一个对象就把后续所有对象读歪。
 		// 尺寸与 IEEE 1815 / DNP Users Group AN2013-004b 一致：组 32 带时标
 		// 整型同样是 11/9 字节绝对时标（组 22 没有相对时标变体，只有绝对时标）。
+		case 5:
+			return numericSpec{size: 11, flags: true, kind: 'u', time: true}, true
+		case 6:
+			return numericSpec{size: 9, flags: true, kind: 'U', time: true}, true
+		}
+	// 冻结计数器（组 21）与普通计数器（组 20）是两类不同的对象：同一个
+	// index 在两组里指向不同的值（瞬时累计 / 结算周期冻结累计），不能共用
+	// area。
+	//
+	// 变体编号按 IEEE 1815 对象库（与 opendnp3 生成代码逐字节一致）：
+	//
+	//	1/2   = 32/16 位，带标志（5/3 字节）
+	//	5/6   = 32/16 位，带标志 + 6 字节绝对时标（11/9 字节）
+	//	9/10  = 32/16 位，无标志（4/2 字节）
+	//
+	// 注意 5/6 与 9/10 不是「有/无时标」的相邻编号：真正的无标志变体是
+	// 9/10，而 5/6 才是带时标的。把这两对写反（以为 5/6 无标志、9/10 带
+	// 时标）会让对象体宽度从 11/9 变成 4/2 字节，第一个对象就把后续全部
+	// 读歪，而错位后的数字依然是合法值 —— 与组 22 的坑同源。
+	//
+	// 3/4/7/8/11/12 是「增量（delta）计数器」：线路送的是相对上次冻结的
+	// 差值，不是累计值。把差值当累计量写进点位会让读数在每次冻结后回落到
+	// 一个小数，现场表现为「电度表突然归零」。本实现不做增量语义，这几条
+	// 变体显式报不支持，而不是猜一个近似映射。
+	case GroupFrozenCounter:
+		switch v {
+		case 1:
+			return numericSpec{size: 5, flags: true, kind: 'u'}, true
+		case 2:
+			return numericSpec{size: 3, flags: true, kind: 'U'}, true
+		case 5:
+			return numericSpec{size: 11, flags: true, kind: 'u', time: true}, true
+		case 6:
+			return numericSpec{size: 9, flags: true, kind: 'U', time: true}, true
+		case 9:
+			return numericSpec{size: 4, kind: 'u'}, true
+		case 10:
+			return numericSpec{size: 2, kind: 'U'}, true
+		}
+	case GroupFrozenCounterEvent:
+		switch v {
+		case 1:
+			return numericSpec{size: 5, flags: true, kind: 'u'}, true
+		case 2:
+			return numericSpec{size: 3, flags: true, kind: 'U'}, true
 		case 5:
 			return numericSpec{size: 11, flags: true, kind: 'u', time: true}, true
 		case 6:

@@ -39,11 +39,12 @@ const (
 	DoubleBitInput Area = "double-bit-input"
 	BinaryOutput   Area = "binary-output"
 	Counter        Area = "counter"
+	FrozenCounter  Area = "frozen-counter"
 	AnalogInput    Area = "analog-input"
 	AnalogOutput   Area = "analog-output"
 )
 
-var areaOrder = []Area{BinaryInput, DoubleBitInput, BinaryOutput, Counter, AnalogInput, AnalogOutput}
+var areaOrder = []Area{BinaryInput, DoubleBitInput, BinaryOutput, Counter, FrozenCounter, AnalogInput, AnalogOutput}
 
 // Point 是一个从站数据点。
 //
@@ -223,6 +224,9 @@ func (s *Server) installDefaults() {
 		{Area: BinaryOutput, Index: 1, Bool: false, Flags: dnp3codec.FlagOnline, Class: 1},
 		{Area: Counter, Index: 0, Counter: 1000, Flags: dnp3codec.FlagOnline, Class: 3},
 		{Area: Counter, Index: 1, Counter: 42, Flags: dnp3codec.FlagOnline},
+		// 冻结计数器与普通计数器同索引不同值：结算周期冻结值 900，
+		// 用来验证「两组各自寻址、不互相顶替」。
+		{Area: FrozenCounter, Index: 0, Counter: 900, Flags: dnp3codec.FlagOnline},
 		{Area: AnalogInput, Index: 0, Num: 42.5, Flags: dnp3codec.FlagOnline, Class: 2},
 		{Area: AnalogInput, Index: 1, Num: 7.25, Flags: dnp3codec.FlagOnline, Class: 2},
 		{Area: AnalogInput, Index: 2, Num: -3.5, Flags: dnp3codec.FlagOnline, Class: 2},
@@ -277,7 +281,7 @@ func (s *Server) SetValue(area Area, index uint32, v any) error {
 		d &= 0x03
 		changed = p.Double != d
 		p.Double = d
-	case Counter:
+	case Counter, FrozenCounter:
 		n, ok := numericToUint32(v)
 		if !ok {
 			return fmt.Errorf("dnp3 sim: %s[%d] needs an integer, got %T", area, index, v)
@@ -644,7 +648,8 @@ func (s *Server) buildRead(headers []dnp3codec.Header) ([]byte, bool) {
 				hasEvents = true
 			}
 		case dnp3codec.GroupBinaryInput, dnp3codec.GroupDoubleBitInput, dnp3codec.GroupBinaryOutput,
-			dnp3codec.GroupCounter, dnp3codec.GroupAnalogInput, dnp3codec.GroupAnalogOutput:
+			dnp3codec.GroupCounter, dnp3codec.GroupFrozenCounter,
+			dnp3codec.GroupAnalogInput, dnp3codec.GroupAnalogOutput:
 			out = append(out, s.encodeStaticGroup(h.Group)...)
 		}
 	}
@@ -690,6 +695,8 @@ func (s *Server) encodeStaticGroup(g byte) []byte {
 		return s.encodeArea(BinaryOutput)
 	case dnp3codec.GroupCounter:
 		return s.encodeArea(Counter)
+	case dnp3codec.GroupFrozenCounter:
+		return s.encodeArea(FrozenCounter)
 	case dnp3codec.GroupAnalogInput:
 		return s.encodeArea(AnalogInput)
 	case dnp3codec.GroupAnalogOutput:
@@ -719,6 +726,8 @@ func (s *Server) encodeArea(a Area) []byte {
 		g, v = dnp3codec.GroupBinaryOutput, 2
 	case Counter:
 		g, v = dnp3codec.GroupCounter, 1
+	case FrozenCounter:
+		g, v = dnp3codec.GroupFrozenCounter, 1
 	case AnalogInput:
 		g, v = dnp3codec.GroupAnalogInput, 5
 	case AnalogOutput:
@@ -777,7 +786,7 @@ func (s *Server) encodeArea(a Area) []byte {
 			bits[i/4] |= d << (2 * (i % 4))
 		}
 		out = append(out, bits...)
-	case Counter:
+	case Counter, FrozenCounter:
 		// 计数器与模拟量是「每个对象一个 flags 字节 + 值」，不是先把
 		// 所有 flags 排完再排所有值。两种写法只差一个字节的错位，解析
 		// 出来的数字却仍然「像」合法值，极难靠肉眼发现。
@@ -829,6 +838,8 @@ func (s *Server) encodeEvents(evs []Event) []byte {
 			g, v = dnp3codec.GroupBinaryOutputEvent, 2
 		case Counter:
 			g, v = dnp3codec.GroupCounterEvent, 1
+		case FrozenCounter:
+			g, v = dnp3codec.GroupFrozenCounterEvent, 1
 		case AnalogInput:
 			g, v = dnp3codec.GroupAnalogEvent, 5
 		default:
@@ -842,7 +853,7 @@ func (s *Server) encodeEvents(evs []Event) []byte {
 		for _, e := range list {
 			out = append(out, byte(e.Index), e.Flags)
 			switch a {
-			case Counter:
+			case Counter, FrozenCounter:
 				out = binary.LittleEndian.AppendUint32(out, e.Counter)
 			case AnalogInput:
 				out = binary.LittleEndian.AppendUint32(out, math.Float32bits(float32(e.Num)))

@@ -497,6 +497,57 @@ func TestWriteRejectsReadOnlyArea(t *testing.T) {
 	}
 }
 
+// TestFrozenCounterReadsAsOwnArea：组 21（冻结计数器）与组 20（瞬时计数器）
+// 是两类对象，同一个 index 指向不同的值，不能互相顶替。测试同时挂两个点位，
+// 验证各自拿到自己的值，并且旁路表把组 21 标成 frozen-counter。
+func TestFrozenCounterReadsAsOwnArea(t *testing.T) {
+	h := newHarness(t)
+	h.srv.SetPoint(sim.Point{Area: sim.Counter, Index: 3, Counter: 11, Flags: dnp3codec.FlagOnline})
+	h.srv.SetPoint(sim.Point{Area: sim.FrozenCounter, Index: 3, Counter: 99, Flags: dnp3codec.FlagOnline})
+	h.cfg.Device.Points = append(h.cfg.Device.Points,
+		dp("ctr3", AreaCounter, 3, model.TypeUint32, false),
+		dp("fctr3", AreaFrozenCounter, 3, model.TypeUint32, false))
+	c := h.open()
+	got := h.readAll(c)
+
+	if v := num(t, got["ctr3"]); v != 11 {
+		t.Fatalf("ctr3 = %v, want 11 (group 20)", v)
+	}
+	if v := num(t, got["fctr3"]); v != 99 {
+		t.Fatalf("fctr3 = %v, want 99 (group 21)", v)
+	}
+
+	var saw bool
+	for _, o := range c.Observed() {
+		if o.Area == AreaFrozenCounter && o.Index == 3 {
+			saw = true
+			if o.Group != dnp3codec.GroupFrozenCounter {
+				t.Fatalf("observed group = %d, want %d", o.Group, dnp3codec.GroupFrozenCounter)
+			}
+		}
+	}
+	if !saw {
+		t.Fatalf("Observed missing frozen counter 3: %+v", c.Observed())
+	}
+}
+
+// 冻结计数器是只读对象：写入口必须显式拒绝，而不是把值塞进组 20。
+func TestFrozenCounterIsReadOnly(t *testing.T) {
+	h := newHarness(t)
+	c := h.open()
+	_, err := c.Write(context.Background(), []driver.WriteRequest{{
+		PointID: "fctr3", DataType: model.TypeUint32,
+		Address: model.Address{Kind: model.AddressRegister, Area: AreaFrozenCounter, Offset: 3, Bit: -1},
+		Value:   model.NumValue(model.TypeUint32, 1),
+	}})
+	if err == nil {
+		t.Fatal("write to frozen counter succeeded")
+	}
+	if driver.KindOf(err) != driver.ErrUnsupported {
+		t.Fatalf("kind = %s, want unsupported", driver.KindOf(err))
+	}
+}
+
 // ---------------------------------------------------------------------------
 // 链路与配置
 // ---------------------------------------------------------------------------

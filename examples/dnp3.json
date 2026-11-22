@@ -110,6 +110,19 @@
           "enabled": true
         },
         {
+          "id": "energy_frozen",
+          "name": "冻结计数器 0（组 21，结算周期冻结值）",
+          "address": {
+            "kind": "register",
+            "area": "frozen-counter",
+            "offset": 0,
+            "bit": -1
+          },
+          "dataType": "uint32",
+          "unit": "kWh",
+          "enabled": true
+        },
+        {
           "id": "pulses",
           "name": "计数器 1（静态）",
           "address": {

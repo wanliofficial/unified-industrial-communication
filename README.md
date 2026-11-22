@@ -524,7 +524,8 @@ DNP3（IEEE 1815）调度主站（TCP 20000）：
 ./uic sim -protocol dnp3 -listen 127.0.0.1:20000 &   # 内置 DNP3 从站（链路地址 1）
 ./uic -config examples/dnp3.json
 curl -s -H 'Authorization: Bearer dev-token-0123456789' localhost:8098/api/v1/points
-#   13 点：二进制输入（类 1，每秒翻转）、双点 1/2、计数器（类 3，每秒自增）、
+#   14 点：二进制输入（类 1，每秒翻转）、双点 1/2、计数器（类 3，每秒自增）、
+#          冻结计数器（组 21，只读）、
 #          模拟量 42.5/7.25/-3.5/1234（类 2）、
 #          二进制输出（CROB）+ 模拟量输出（组 41）（可写）
 #   自检（不需要网关）：./uic dnp3read -addr 127.0.0.1:20000
@@ -549,8 +550,10 @@ DNP3 是三层协议：链路层（`05 64` 起始、每 16 字节一块 CRC、�
 品质位**，必须先屏蔽——否则所有处于「合」位的开关都会被判成 uncertain。
 
 点位用 `kind=register` 寻址，`offset` 是对象索引，`area` 取 `binary-input` /
-`double-bit-input` / `binary-output` / `counter` / `analog-input` / `analog-output`
-（也接受 `bi`/`dbi`/`bo`/`ctr`/`ai`/`ao` 短别名）。双点量按 bool 映射时：1（分）→
+`double-bit-input` / `binary-output` / `counter` / `frozen-counter` / `analog-input` /
+`analog-output`（也接受 `bi`/`dbi`/`bo`/`ctr`/`fctr`/`ai`/`ao` 短别名）。**`frozen-counter`
+（组 21/23）与 `counter`（组 20/22）是两个独立的对象组**：同一个索引在两组里分别是
+结算周期冻结值与瞬时值，各自寻址，不能互相顶替；冻结计数器只读。双点量按 bool 映射时：1（分）→
 false、2（合）→ true、0/3（中间态/不确定）→ false + uncertain，绝不把「未知」显示成
 「已关闭」。写二进制输出用 CROB（组 12，锁存开/关），写模拟量输出用组 41；两者都等
 从站的应用响应并检查回显状态，**只写 socket 不检查回显会把拒绝当成成功**。不做选择-
@@ -1424,9 +1427,9 @@ go test -race -count=1 ./...
 | `internal/codec/iec101` | IEC 60870-5-101 纯函数帧层（FT1.2 固定帧 / 可变帧 / 单字节帧、控制域 FCB/FCV/ACD/DFC、校验和、流式收帧 `Reader`） |
 | `internal/driver/iec101` | IEC 101 非平衡轮询主站（复位链路、第 1/2 级轮询、站总召唤 + 电能量召唤、FCB 原帧重传、命令两段确认、双承载、旁路表） |
 | `internal/sim/iec101` | IEC 101 内置从站（FT1.2 over TCP 透传、FCB 去重、ACD、两级队列、召唤快照与终止、命令两段确认） |
-| `internal/codec/dnp3` | DNP3 纯函数编解码（链路帧与 CRC / 流式收帧 / 传输分片重组 / 应用层请求响应 / 对象解析 / 请求头 / CROB 与组 41 构造） |
+| `internal/codec/dnp3` | DNP3 纯函数编解码（链路帧与 CRC / 流式收帧 / 传输分片重组 / 应用层请求响应 / 对象解析（含组 21/23 冻结计数器）/ 请求头 / CROB 与组 41 构造） |
 | `internal/driver/dnp3` | DNP3 主站（复位链路 + TEST_LINK、类 0/1/2/3 轮询、未请求响应、应用层确认、CROB 与模拟量直接控制、旁路表） |
-| `internal/sim/dnp3` | DNP3 内置从站（链路 ACK / 类 0 静态快照 / 三类事件队列与 inflight / CROB 与组 41 直接控制回显） |
+| `internal/sim/dnp3` | DNP3 内置从站（链路 ACK / 类 0 静态快照 / 三类事件队列与 inflight / 冻结计数器组 21/23 / CROB 与组 41 直接控制回显） |
 | `internal/codec/coap` | CoAP 纯函数编解码（4 字节头 / 选项 delta-len 扩展 / uint 与 Block 编解码 / URI 拆分 / link-format 解析） |
 | `internal/codec/textval` | 文本/JSON 标量 → 平台值（MQTT 与 CoAP 共用的类型规则；selector 取字段） |
 | `internal/driver/coap` | CoAP 主站（GET/PUT/POST、Block2 续读与降级、分离响应、指数重传、资源发现、坏包跳过） |

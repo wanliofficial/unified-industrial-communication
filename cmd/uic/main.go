@@ -1192,6 +1192,7 @@ func simDNP3(addr string) {
 	fmt.Println("  double-bit-input:[0]=1(分) [1]=2(合)")
 	fmt.Println("  binary-output:   [0]=off [1]=off（可 CROB 直接控制）")
 	fmt.Println("  counter:         [0]=1000(类3，每秒自增) [1]=42")
+	fmt.Println("  frozen-counter:  [0]=900（组 21，结算周期冻结值，只读）")
 	fmt.Println("  analog-input:    [0]=42.5 [1]=7.25 [2]=-3.5 [3]=1234（类2）")
 	fmt.Println("  analog-output:   [0]=0（可组 41 直接控制）")
 	fmt.Printf("  自检：   uic dnp3read -addr %s\n", srv.Addr())

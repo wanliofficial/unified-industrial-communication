@@ -374,6 +374,148 @@ func TestParseCounterEventTimed(t *testing.T) {
 	}
 }
 
+// TestParseFrozenCounters 钉住组 21/23（冻结计数器）的变体布局。组 21 与
+// 组 20 是不同对象：同一个 index 在两组里指向不同的值（瞬时累计 / 结算周期
+// 冻结累计），不能互相顶替。
+func TestParseFrozenCounters(t *testing.T) {
+	ts := time.UnixMilli(1700000000123).UTC()
+
+	// 21v1：32 位值 + 品质，起止范围编码（5 字节/对象）。
+	var raw []byte
+	raw = append(raw, GroupFrozenCounter, 1, QualStartStop8, 0, 1, FlagOnline)
+	raw = binary.LittleEndian.AppendUint32(raw, 777)
+	raw = append(raw, FlagOnline)
+	raw = binary.LittleEndian.AppendUint32(raw, 888)
+	objs, err := ParseObjects(raw)
+	if err != nil {
+		t.Fatalf("21v1: %v", err)
+	}
+	if len(objs) != 2 || objs[0].Index != 0 || objs[0].Value != uint64(777) ||
+		objs[1].Index != 1 || objs[1].Value != uint64(888) {
+		t.Fatalf("21v1 objects = %+v", objs)
+	}
+	if objs[0].Group != GroupFrozenCounter || !objs[0].HasFlags {
+		t.Fatalf("21v1 metadata = %+v", objs[0])
+	}
+
+	// 21v2：16 位值 + 品质（3 字节/对象）。
+	raw = []byte{GroupFrozenCounter, 2, QualStartStop8, 0, 1, FlagOnline}
+	raw = binary.LittleEndian.AppendUint16(raw, 65535)
+	raw = append(raw, FlagOnline)
+	raw = binary.LittleEndian.AppendUint16(raw, 7)
+	objs, err = ParseObjects(raw)
+	if err != nil {
+		t.Fatalf("21v2: %v", err)
+	}
+	if len(objs) != 2 || objs[0].Value != uint64(65535) || objs[1].Value != uint64(7) {
+		t.Fatalf("21v2 objects = %+v", objs)
+	}
+
+	// 21v5/21v6：32/16 位 + 品质 + 6 字节绝对时标（11/9 字节）。这两个变体
+	// 编号最容易被写成「无品质」——真正的无品质变体是 9/10。写反一个宽度
+	// 就会让第二个对象整体错位，所以这里用两个对象钉死。
+	t2 := ts.Add(time.Minute)
+	raw = []byte{GroupFrozenCounter, 5, QualIndex8, 2}
+	raw = append(raw, 0, FlagOnline)
+	raw = binary.LittleEndian.AppendUint32(raw, 123)
+	raw = append(raw, EncodeTime48(ts)...)
+	raw = append(raw, 1, FlagOnline)
+	raw = binary.LittleEndian.AppendUint32(raw, 456)
+	raw = append(raw, EncodeTime48(t2)...)
+	objs, err = ParseObjects(raw)
+	if err != nil {
+		t.Fatalf("21v5: %v", err)
+	}
+	if len(objs) != 2 {
+		t.Fatalf("21v5 objects = %d, want 2", len(objs))
+	}
+	if objs[0].Index != 0 || objs[0].Value != uint64(123) || !objs[0].HasFlags || !objs[0].When.Equal(ts) {
+		t.Fatalf("21v5 object 0 = %+v", objs[0])
+	}
+	if objs[1].Index != 1 || objs[1].Value != uint64(456) || !objs[1].When.Equal(t2) {
+		t.Fatalf("21v5 object 1 = %+v (misaligned)", objs[1])
+	}
+
+	raw = []byte{GroupFrozenCounter, 6, QualStartStop8, 0, 1, FlagOnline}
+	raw = binary.LittleEndian.AppendUint16(raw, 65535)
+	raw = append(raw, EncodeTime48(ts)...)
+	raw = append(raw, FlagOnline)
+	raw = binary.LittleEndian.AppendUint16(raw, 7)
+	raw = append(raw, EncodeTime48(t2)...)
+	objs, err = ParseObjects(raw)
+	if err != nil {
+		t.Fatalf("21v6: %v", err)
+	}
+	if len(objs) != 2 || objs[0].Value != uint64(65535) || objs[1].Value != uint64(7) ||
+		!objs[1].When.Equal(t2) {
+		t.Fatalf("21v6 objects = %+v", objs)
+	}
+
+	// 21v9/21v10：无品质变体，4/2 字节。
+	raw = append([]byte{GroupFrozenCounter, 9, QualStartStop8, 0, 1}, make([]byte, 8)...)
+	binary.LittleEndian.PutUint32(raw[5:], 4321)
+	binary.LittleEndian.PutUint32(raw[9:], 8765)
+	objs, err = ParseObjects(raw)
+	if err != nil {
+		t.Fatalf("21v9: %v", err)
+	}
+	if len(objs) != 2 || objs[0].Value != uint64(4321) || objs[1].Value != uint64(8765) ||
+		objs[0].HasFlags {
+		t.Fatalf("21v9 objects = %+v", objs)
+	}
+	raw = []byte{GroupFrozenCounter, 10, QualStartStop8, 0, 1, 0x01, 0x00, 0x02, 0x00}
+	objs, err = ParseObjects(raw)
+	if err != nil {
+		t.Fatalf("21v10: %v", err)
+	}
+	if len(objs) != 2 || objs[0].Value != uint64(1) || objs[1].Value != uint64(2) {
+		t.Fatalf("21v10 objects = %+v", objs)
+	}
+
+	// 增量（delta）变体 3/4/7/8/11/12 送的是相对上次冻结的差值，不是累计量。
+	// 当累计量落表会让读数在每次冻结后回落，必须显式拒绝。
+	for _, v := range []byte{3, 4, 7, 8, 11, 12} {
+		_, err = ParseObjects([]byte{GroupFrozenCounter, v, QualIndex8, 1, 0, FlagOnline,
+			0, 0, 0, 0, 0, 0})
+		var de *UnsupportedError
+		if !errors.As(err, &de) || de.Group != GroupFrozenCounter || de.Variation != v {
+			t.Fatalf("21v%d err = %v, want UnsupportedError", v, err)
+		}
+	}
+
+	// 23v5：冻结计数器事件 = 值 + 品质 + 时标，两个对象验证不会错位。
+	raw = []byte{GroupFrozenCounterEvent, 5, QualIndex8, 2}
+	raw = append(raw, 5, FlagOnline)
+	raw = binary.LittleEndian.AppendUint32(raw, 11)
+	raw = append(raw, EncodeTime48(ts)...)
+	raw = append(raw, 6, FlagOnline)
+	raw = binary.LittleEndian.AppendUint32(raw, 22)
+	raw = append(raw, EncodeTime48(t2)...)
+	objs, err = ParseObjects(raw)
+	if err != nil {
+		t.Fatalf("23v5: %v", err)
+	}
+	if len(objs) != 2 {
+		t.Fatalf("23v5 objects = %d, want 2", len(objs))
+	}
+	if objs[0].Index != 5 || objs[0].Value != uint64(11) || !objs[0].When.Equal(ts) {
+		t.Fatalf("23v5 object 0 = %+v", objs[0])
+	}
+	if objs[1].Index != 6 || objs[1].Value != uint64(22) || !objs[1].When.Equal(t2) {
+		t.Fatalf("23v5 object 1 = %+v (misaligned)", objs[1])
+	}
+
+	// 23 也没有增量变体之外的相对时标写法；23v3/4/7/8 同为 delta，显式拒绝。
+	for _, v := range []byte{3, 4, 7, 8} {
+		_, err = ParseObjects([]byte{GroupFrozenCounterEvent, v, QualIndex8, 1, 0, FlagOnline,
+			0, 0, 0, 0, 0, 0})
+		var ee *UnsupportedError
+		if !errors.As(err, &ee) || ee.Group != GroupFrozenCounterEvent || ee.Variation != v {
+			t.Fatalf("23v%d err = %v, want UnsupportedError", v, err)
+		}
+	}
+}
+
 func TestParseRequestHeaders(t *testing.T) {
 	raw, err := ClassObjects(0, 1, 2, 3)
 	if err != nil {

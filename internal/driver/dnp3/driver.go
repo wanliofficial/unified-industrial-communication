@@ -56,6 +56,7 @@ const (
 	AreaDoubleBitInput  = "double-bit-input"
 	AreaBinaryOutput    = "binary-output"
 	AreaCounter         = "counter"
+	AreaFrozenCounter   = "frozen-counter"
 	AreaAnalogInput     = "analog-input"
 	AreaAnalogOutput    = "analog-output"
 	maxObserved         = 4096
@@ -137,9 +138,9 @@ func (d *Driver) Meta() driver.Meta {
 				Enum: []string{"register"}, Scope: "point"},
 			{Name: "address.area", Label: "对象类别", Type: "enum", Required: true,
 				Enum: []string{AreaBinaryInput, AreaDoubleBitInput, AreaBinaryOutput,
-					AreaCounter, AreaAnalogInput, AreaAnalogOutput},
+					AreaCounter, AreaFrozenCounter, AreaAnalogInput, AreaAnalogOutput},
 				Scope: "point",
-				Help:  "binary-input 为组 1；analog-input 为组 30；counter 为组 20；输出类可写"},
+				Help:  "binary-input 为组 1；counter 为组 20；frozen-counter 为组 21；analog-input 为组 30；输出类可写"},
 			{Name: "address.offset", Label: "点索引", Type: "int", Required: true,
 				Scope: "point", Help: "DNP3 对象的 index（通常 0..65535）"},
 			{Name: "dataType", Label: "数据类型", Type: "enum", Required: true,
@@ -343,7 +344,7 @@ func checkDataType(area string, dt model.DataType) error {
 // AreaNames 返回可用的地址区名，错误信息与配置界面共用。
 func AreaNames() []string {
 	return []string{AreaBinaryInput, AreaDoubleBitInput, AreaBinaryOutput,
-		AreaCounter, AreaAnalogInput, AreaAnalogOutput}
+		AreaCounter, AreaFrozenCounter, AreaAnalogInput, AreaAnalogOutput}
 }
 
 func normalizeArea(s string) (string, bool) {
@@ -356,6 +357,8 @@ func normalizeArea(s string) (string, bool) {
 		return AreaBinaryOutput, true
 	case AreaCounter, "ctr", "counters":
 		return AreaCounter, true
+	case AreaFrozenCounter, "fctr", "frozen-counters", "frozencounter":
+		return AreaFrozenCounter, true
 	case AreaAnalogInput, "ai", "analoginput":
 		return AreaAnalogInput, true
 	case AreaAnalogOutput, "ao", "analogoutput":
@@ -374,6 +377,8 @@ func areaOfGroup(g byte) (string, bool) {
 		return AreaBinaryOutput, true
 	case dnp3codec.GroupCounter, dnp3codec.GroupCounterEvent:
 		return AreaCounter, true
+	case dnp3codec.GroupFrozenCounter, dnp3codec.GroupFrozenCounterEvent:
+		return AreaFrozenCounter, true
 	case dnp3codec.GroupAnalogInput, dnp3codec.GroupAnalogEvent:
 		return AreaAnalogInput, true
 	case dnp3codec.GroupAnalogOutput:
