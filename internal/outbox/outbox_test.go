@@ -1,6 +1,7 @@
 package outbox
 
 import (
+	"bytes"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -155,6 +156,78 @@ func TestRepairsTruncatedTail(t *testing.T) {
 	if len(recs) != 3 || string(recs[2].Data) != `{}` {
 		t.Fatalf("tail append broken: %+v", recs)
 	}
+}
+
+// Pending 遇到批次「中段」的损坏记录时，不能连带丢掉它前面那条好且未确认
+// 的记录，更不能在没有任何 Ack 的情况下推进 cursorSeq。
+//
+// 旧实现遇到损坏记录调 dropHead，而 dropHead 只删队头：损坏的在 seq2 时，
+// 被删的是 seq1（好记录），cursorSeq 前进到 1。若此刻崩溃，重启后 scan 会
+// 跳过 seq <= cursorSeq 的记录，seq1 永久丢失——违反 at-least-once。损坏
+// 记录只是「读不出」，不是「已送达」，不应带走别的好记录。
+func TestCorruptMidBatchKeepsGoodRecords(t *testing.T) {
+	s, dir := openTemp(t, Options{Sync: true})
+	defer s.Close()
+	now := time.Now()
+	enqueueN(t, s, 3, now) // seq 1,2,3
+
+	k := s.sinks["s1"]
+	mid := k.entries[1] // seq2，非队头
+	f, err := os.OpenFile(filepath.Join(dir, "s1.wal"), os.O_WRONLY, 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteAt(bytes.Repeat([]byte("x"), int(mid.n)), mid.off); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+
+	recs, err := s.Pending("s1", 10, now)
+	if err != nil {
+		t.Fatalf("pending: %v", err)
+	}
+	if len(recs) != 2 || recs[0].Seq != 1 || recs[1].Seq != 3 {
+		t.Fatalf("pending seqs = %v, want [1 3]", recordSeqs(recs))
+	}
+	st := s.Stats()[0]
+	if st.CursorSeq != 0 {
+		t.Fatalf("cursor advanced without Ack: cursorSeq=%d", st.CursorSeq)
+	}
+	if st.Dropped["corrupt"] != 1 {
+		t.Fatalf("corrupt drop not counted: %+v", st.Dropped)
+	}
+
+	// 好记录 seq1 必须仍在队列，下一次 Pending 仍能取到（未被投递确认）。
+	recs2, err := s.Pending("s1", 10, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, r := range recs2 {
+		if r.Seq == 1 {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("good un-acked seq1 was dropped: second pending = %v", recordSeqs(recs2))
+	}
+
+	// Ack seq1 之后，位点才推进，且只剩 seq3。
+	if err := s.Ack("s1", 1); err != nil {
+		t.Fatal(err)
+	}
+	recs3, _ := s.Pending("s1", 10, now)
+	if len(recs3) != 1 || recs3[0].Seq != 3 {
+		t.Fatalf("after ack: %v, want [3]", recordSeqs(recs3))
+	}
+}
+
+func recordSeqs(recs []Record) []uint64 {
+	out := make([]uint64, len(recs))
+	for i, r := range recs {
+		out[i] = r.Seq
+	}
+	return out
 }
 
 func TestCountCapDropsOldest(t *testing.T) {

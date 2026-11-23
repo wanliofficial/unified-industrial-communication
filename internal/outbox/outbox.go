@@ -386,7 +386,18 @@ func (s *Store) Pending(sinkName string, limit int, now time.Time) ([]Record, er
 	}
 	out := make([]Record, 0, end-k.head)
 	buf := make([]byte, 0, 512)
-	for _, e := range k.entries[k.head:end] {
+	// 逐条读取；损坏记录原地从索引里剔除，绝不推进 head / cursorSeq。
+	//
+	// 旧实现遇到损坏记录调用 dropHead，但 dropHead 只删「队头」——损坏的
+	// 在批次中段时，被删掉的是队头那条**好且未 Ack** 的记录，并且 cursorSeq
+	// 被推进。调用方还没拿到 Ack 确认，位点却已前移；若此刻崩溃，重启后
+	// scan 会跳过 seq <= cursorSeq 的记录，那条好记录就永久丢了。这违反本包
+	// 承诺的 at-least-once。损坏记录只是「读不出」不是「已送达」，它既不该
+	// 带走别的好记录，也不该替调用方确认任何东西——与 scan 的语义一致
+	// （scan 遇到反序列化失败同样不建索引）。
+	i := k.head
+	for i < end {
+		e := k.entries[i]
 		buf = buf[:0]
 		if cap(buf) < int(e.n) {
 			buf = make([]byte, e.n)
@@ -397,11 +408,17 @@ func (s *Store) Pending(sinkName string, limit int, now time.Time) ([]Record, er
 		}
 		var rec Record
 		if err := json.Unmarshal(buf, &rec); err != nil {
-			// 损坏记录：跳过并丢弃，避免整条队列被一条坏数据卡死。
-			k.dropHead("corrupt")
+			// 损坏记录：原地剔除这一条，只扣它自己的字节，记一次 dropped；
+			// head 仍是第一条未确认的好记录，cursorSeq 不动。i 不前进，
+			// 因为 splice 后下标 i 处已是下一条。
+			k.entries = append(k.entries[:i], k.entries[i+1:]...)
+			k.bytes -= int64(e.n)
+			k.dropped["corrupt"]++
+			end--
 			continue
 		}
 		out = append(out, rec)
+		i++
 	}
 	return out, nil
 }
