@@ -1419,7 +1419,12 @@ func (c *conn) writeFragments(ctx context.Context, tag string, typ byte, count u
 		if err != nil {
 			return err
 		}
-		if err := enipcodec.ParseWriteTagReply(reply); err != nil {
+		// 中间片回 0x06（partial transfer）表示「这片收了、继续发」，只有末片
+		// 回 0x00。用逐片严格校验的 ParseWriteTagReply 会把多片写在第一片就
+		// 判失败，标签被部分写入而驱动已报错（真机普遍如此，内置从站恒回 0
+		// 掩盖了它）。真正的错误码（非 0x06/0x00）仍由 ParseWriteTagFragReply
+		// 返回，写失败并标坏。
+		if _, err := enipcodec.ParseWriteTagFragReply(reply); err != nil {
 			return wrapStatus(err)
 		}
 	}

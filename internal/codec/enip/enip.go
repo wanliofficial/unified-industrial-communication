@@ -682,6 +682,24 @@ func ParseWriteTagReply(reply Reply) error {
 	return nil
 }
 
+// ParseWriteTagFragReply 解析 Write Tag Fragmented（0x53）应答。
+//
+// 与 ParseWriteTagReply 的关键差别：**中间分片**的成功应答回 0x06
+// （partial transfer），只有**最后一片**回 0x00（1756-PM020；pycomm3 的从站
+// 生产代码对写分片同样把 0x06 当「这一片收了、继续发下一片」）。用 ParseWriteTagReply
+// 逐片校验会把多片写在第一片（0x06）就判失败，标签被部分写入而驱动已报错。
+// 返回 more：true 表示还有后续分片（0x06），false 表示已完成（0x00）。
+func ParseWriteTagFragReply(reply Reply) (more bool, err error) {
+	switch reply.Status {
+	case 0:
+		return false, nil
+	case 0x06:
+		return true, nil
+	default:
+		return false, &StatusError{Service: ServiceWriteFrag, Code: reply.Status, Extra: reply.Extra}
+	}
+}
+
 // BuildMultiple 生成 Multiple Service Packet 请求（服务 0x0A）。
 //
 // 路径固定指向 Message Router（class 0x02 / instance 0x01）。请求数据是

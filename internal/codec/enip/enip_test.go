@@ -601,6 +601,24 @@ func TestParseWriteTagReplyShort(t *testing.T) {
 	}
 }
 
+func TestParseWriteTagFragReply(t *testing.T) {
+	// 末片：0x00 表示写完，more=false。
+	if more, err := ParseWriteTagFragReply(Reply{Status: 0}); err != nil || more {
+		t.Fatalf("final fragment: more=%v err=%v", more, err)
+	}
+	// 中间片：0x06 partial transfer 是「这片收了、继续发」，不是错误。
+	if more, err := ParseWriteTagFragReply(Reply{Status: 0x06}); err != nil || !more {
+		t.Fatalf("intermediate fragment: more=%v err=%v", more, err)
+	}
+	// 真正的错误码（非 0x06/0x00）必须报错，不能被当成「继续」吞掉。
+	if _, err := ParseWriteTagFragReply(Reply{Status: 0x13}); err == nil {
+		t.Fatal("mid-stream error status accepted as success")
+	}
+	if _, err := ParseWriteTagFragReply(Reply{Status: 0x01}); err == nil {
+		t.Fatal("connection failure status accepted as success")
+	}
+}
+
 func TestBuildMultipleLimits(t *testing.T) {
 	req := make([][]byte, 33)
 	for i := range req {

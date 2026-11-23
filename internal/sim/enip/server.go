@@ -546,7 +546,14 @@ func (s *Server) writeFrag(req enipcodec.Request) []byte {
 		return mustReply(req.Service, 0x13, nil, nil)
 	}
 	copy(t.data[offset:], payload)
-	return mustReply(req.Service, 0, nil, nil)
+	// 与 readFrag 一致：非最后一片回 0x06（partial transfer），真机只有末片
+	// 回 0x00。这样内置从站也走真实的分片应答路径，不会用「恒回 0」掩盖
+	// 驱动把 0x06 当失败的缺陷。
+	status := byte(0x06)
+	if offset+len(payload) == len(t.data) {
+		status = 0
+	}
+	return mustReply(req.Service, status, nil, nil)
 }
 
 // forwardOpen 处理 Forward Open / Large Forward Open，登记一条 Class 3 连接。

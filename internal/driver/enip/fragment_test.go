@@ -3,6 +3,7 @@ package enip
 import (
 	"context"
 	"encoding/binary"
+	"strings"
 	"testing"
 
 	enipcodec "uic/internal/codec/enip"
@@ -130,6 +131,57 @@ func TestWriteStringFragmented(t *testing.T) {
 	_, _, got, _ := srv.Tag("LONG_STRING")
 	if n := int(binary.LittleEndian.Uint32(got)); n != len(text) || string(got[4:4+n]) != text {
 		t.Fatalf("string length = %d, want %d", n, len(text))
+	}
+}
+
+// TestWriteFragmentedAcceptsPartialTransfer 钉住 Write Tag Fragmented 的
+// 中间分片语义：真实设备对**非最后**的分片回 0x06（partial transfer），只有
+// 最后一片回 0x00。内置从站 writeFrag 恒回 0，掩盖了「驱动把 0x06 当失败、
+// 多片写在第一个中间片就报错并留下半截标签」这个缺陷。这里用人工桩模拟真机
+// 应答（中间片 0x06、末片 0x00），Write 必须整体成功。
+func TestWriteFragmentedAcceptsPartialTransfer(t *testing.T) {
+	// EncodeString(text, 500) = 504 字节 → 400 + 104，恰好两片。
+	text := strings.Repeat("A", 450)
+	s := newScript().add(registerReply(0x11, 0, 1)).
+		// 第一片触发惰性 Forward Open。
+		add(rrReply(0x11, enipcodec.ServiceForwardOpen, 0, nil,
+			forwardOpenReply(0x70000001, 0x70000002, 1, 0x1234, 42))).
+		// 中间片：partial transfer（0x06），必须被接受而不是报错。
+		add(unitReply(0x11, enipcodec.ServiceWriteFrag, 0x06, 0x70000001, 1, nil)).
+		// 最后一片：成功（0x00）。
+		add(unitReply(0x11, enipcodec.ServiceWriteFrag, 0x00, 0x70000001, 2, nil))
+	c, _ := openScript(t, s)
+	res, err := c.Write(context.Background(), []driver.WriteRequest{{
+		PointID:  "name",
+		Address:  model.Address{Kind: model.AddressRegister, Area: "LONG_STRING", Bit: -1, Length: 500},
+		DataType: model.TypeString, Value: model.TextValue(model.TypeString, text),
+	}})
+	if err != nil || !res[0].OK {
+		t.Fatalf("fragmented write with partial-transfer replies failed: %v %+v", err, res)
+	}
+}
+
+// TestWriteFragmentedMidStreamErrorStillFails 反向钉住：中间片回的不是 0x06/0x00
+// 而是真正的错误码（如 0x13 not enough data）时，Write 必须失败并标坏，不能
+// 把设备侧错误吞掉当成功。
+func TestWriteFragmentedMidStreamErrorStillFails(t *testing.T) {
+	text := strings.Repeat("A", 450)
+	s := newScript().add(registerReply(0x11, 0, 1)).
+		add(rrReply(0x11, enipcodec.ServiceForwardOpen, 0, nil,
+			forwardOpenReply(0x70000001, 0x70000002, 1, 0x1234, 42))).
+		// 中间片就报 0x13（not enough data）：必须终止并失败。
+		add(unitReply(0x11, enipcodec.ServiceWriteFrag, 0x13, 0x70000001, 1, nil))
+	c, _ := openScript(t, s)
+	res, err := c.Write(context.Background(), []driver.WriteRequest{{
+		PointID:  "name",
+		Address:  model.Address{Kind: model.AddressRegister, Area: "LONG_STRING", Bit: -1, Length: 500},
+		DataType: model.TypeString, Value: model.TextValue(model.TypeString, text),
+	}})
+	if err == nil {
+		t.Fatal("mid-stream error status must fail the write")
+	}
+	if len(res) == 1 && res[0].OK {
+		t.Fatalf("failed write reported OK: %+v", res[0])
 	}
 }
 

@@ -1815,9 +1815,11 @@ Service Packet 把这些读合成一个报文：路径固定指向 Message Route
 驱动的策略：
 
 - 单次合包的**保守上限是 450 字节**（嵌入区 + 偏移表），超过就拆批；
-- 单帧数据超过连接预算（`fragChunk=400` 字节）时**自动改走分片**：先发普通 Read/Write Tag，
+- 单帧数据超过连接预算（`fragChunk=400` 字节）时**自动改走分片**：读路径先发普通 Read Tag，
   设备回 0x06（partial transfer）即说明放不下，已带回来的那一片不丢，从它的字节偏移继续
-  用 0x52/0x53 收发，直到设备不再回 0x06。整个过程对调用方透明——大数组、长 STRING、字节块
+  用 0x52/0x53 收发；写路径（bytes/STRING 已知长度）直接按 `fragChunk` 切片用 0x53 收发。
+  **读写的中间分片设备都回 0x06、只有末片回 0x00**，驱动据此判断续发/完成，不会因为收到
+  0x06 就把多片写判失败。整个过程对调用方透明——大数组、长 STRING、字节块
   和一个小标签走的是同一条 `Read`/`Write`；
 - 设备回 0x08/0x14（服务不支持 / 属性不支持）时**关掉合包并退回逐条请求**，
   本批立刻重发；一次不支持之后不再尝试，避免每轮采集都先失败一次；
@@ -1902,11 +1904,14 @@ CIP 通用状态在 `codec/enip` 里分类，驱动只做「错误 → 质量码
 | 0x01 / 0x02 / 0x07 / 0x0C / 0x10 | `ErrDisconnected` | `comm_error` | 连接失败/资源不足/连接丢失/状态冲突 |
 | 其它 | `ErrProtocol` | `bad` | 协议错 |
 
-> ¹ 0x06 在**读路径不再是终态**：它表示「这一片成功、还有后续」，驱动改走 Read Tag
-> Fragmented 把剩下的数据读完（§3.10.7.5.1）。只有当分片续读本身失败（设备回 0x05
-> 之类）、或设备拒绝 Forward Open 时，0x06 才作为点级 `address_error` 浮出。归为点级
-> 而非协议错仍是对的：缩小 length 或换点表能好，重试同一请求不会变好；归为 `ErrProtocol`
-> 会让 `CountsTowardBreaker` 为 true，把配置错当「链路坏了」去熔断整台设备。
+> ¹ 0x06 在**读/写分片路径都不是终态**：它表示「这一片成功、还有后续」。读路径改走
+> Read Tag Fragmented 把剩下的数据读完；写路径把剩下的分片发完（§3.10.7.5.1）。两者都
+> 只有**最后一片**回 0x00。若用逐片严格校验（`ParseWriteTagReply` 不容忍非零）处理写分片，
+> 多片写会在第一个中间片（0x06）就判失败、标签被部分写入而驱动已报错——真机普遍如此，
+> 内置从站一度恒回 0x00 掩盖了它（现已在 `writeFrag` 按非末片回 0x06 修正）。只有当分片
+> 本身失败（设备回 0x05/0x13 之类）、或设备拒绝 Forward Open 时，错误才作为点级 `address_error`
+> 浮出。归为点级而非协议错仍是对的：缩小 length 或换点表能好，重试同一请求不会变好；归为
+> `ErrProtocol` 会让 `CountsTowardBreaker` 为 true，把配置错当「链路坏了」去熔断整台设备。
 
 > 0x03 / 0x11 归为点级而不是协议错：它们都是「这一条请求本身有问题」（参数非法、
 > 读太多、应答超出缓冲），缩小 length 或改点表就能好，重试同一请求不会变好。归为
@@ -1978,9 +1983,9 @@ curl -H 'Authorization: Bearer dev-token-0123456789' \
 
 | 层 | 用例 |
 |---|---|
-| `codec/enip` | 封装头/长度语义、CPF 奇数对齐与越界、SendRRData、RegisterSession、CIP 请求/应答、附加状态、符号路径偶对齐、逻辑路径 8/16/32 位、Read/Write Tag 金帧、Read Tag Fragmented 金帧、Forward Open（标准 + Large）/Forward Close/SendUnitData 金帧与 CPF 校验、多服务偏移表、类型表、字符串编解码（**超长拒绝而非截断**）、状态码→分类（0x03/0x11 归点级地址错；0x06 见下） |
-| `driver/enip` | 注册与状态、命令/上下文错位（**滞留帧排空后流重新对齐，下一次读仍命中正确应答**）、原子类型、大小写、STRING、bytes 两阶段读、数组 offset、位读/位写保邻位、offset 写保前缀、多服务合包与拆批、MSP 自动退回、错类型/越界位/未知标签、会话失效可重试、Probe 容忍不支持、能力声明；**部分失败语义（有成功点则 `err==nil`、全失败才返回整体错误、链路级失败立即返回且剩余 span 的点位显式标坏）**；**readBatch 后一批失败时保留前一批已得的好样本**；**单个点位构造失败（标签/类型配错）不连累同 span 其它好点位**；**写路径数值越界/带小数/float32 溢出在写报文前拒绝（70000→INT16、1.5→INT16、1e300→REAL 均判地址错，且设备值不变）**；**STRING/bytes 超长拒绝而非静默截断**；**写路径遇链路级失败短路、剩余条目显式标坏**；**大标签分片读（bytes/数值 offset/STRING 跨多片重组）**；**大标签分片写（bytes/STRING 切片回写，从站校验落值）**；**分片续读途中类型变化判协议错**；**Forward Open 被拒报「不支持」而非假装成功**；**连接被目标释放（0x07）后重开一次续读**；**0x06 触发分片、分片失败只标坏该点且链路不熔断（后续读仍可用）**；**批量写逐项语义（一条成功 + 一条未知标签：成功项不被回填 `Err`、失败项带 `Quality`、且成功项确实落到从站）** |
-| `sim/enip` | 真实 TCP 回环：注册/注销/坏版本/未知命令、Read/Write Tag 与错误码 0x03/0x05/0x13/0x15、STRING 写、多服务与关闭、非符号路径、`SetTag` 校验、默认标签；**Forward Open/Forward Close 登记 Class 3 连接**、**SendUnitData 回 0x07（连接不存在）**、**Read/Write Tag Fragmented（0x52/0x53）按 `SetFragmentSize` 切片回 0x06** |
+| `codec/enip` | 封装头/长度语义、CPF 奇数对齐与越界、SendRRData、RegisterSession、CIP 请求/应答、附加状态、符号路径偶对齐、逻辑路径 8/16/32 位、Read/Write Tag 金帧、Read Tag Fragmented 金帧、Forward Open（标准 + Large）/Forward Close/SendUnitData 金帧与 CPF 校验、多服务偏移表、类型表、字符串编解码（**超长拒绝而非截断**）、状态码→分类（0x03/0x11 归点级地址错；0x06 见下）；**Write Tag Fragmented 应答中间片 0x06=续发/末片 0x00=完成（`ParseWriteTagFragReply`），真错误码仍报错** |
+| `driver/enip` | 注册与状态、命令/上下文错位（**滞留帧排空后流重新对齐，下一次读仍命中正确应答**）、原子类型、大小写、STRING、bytes 两阶段读、数组 offset、位读/位写保邻位、offset 写保前缀、多服务合包与拆批、MSP 自动退回、错类型/越界位/未知标签、会话失效可重试、Probe 容忍不支持、能力声明；**部分失败语义（有成功点则 `err==nil`、全失败才返回整体错误、链路级失败立即返回且剩余 span 的点位显式标坏）**；**readBatch 后一批失败时保留前一批已得的好样本**；**单个点位构造失败（标签/类型配错）不连累同 span 其它好点位**；**写路径数值越界/带小数/float32 溢出在写报文前拒绝（70000→INT16、1.5→INT16、1e300→REAL 均判地址错，且设备值不变）**；**STRING/bytes 超长拒绝而非静默截断**；**写路径遇链路级失败短路、剩余条目显式标坏**；**大标签分片读（bytes/数值 offset/STRING 跨多片重组）**；**大标签分片写（bytes/STRING 切片回写，从站校验落值；中间片回 0x06 partial transfer 续发、末片 0x00 完成，由 `ParseWriteTagFragReply` 区分，真机普遍如此、内置从站亦按非末片回 0x06）**；**分片续读途中类型变化判协议错**；**Forward Open 被拒报「不支持」而非假装成功**；**连接被目标释放（0x07）后重开一次续读**；**0x06 触发分片、分片失败只标坏该点且链路不熔断（后续读仍可用）**；**批量写逐项语义（一条成功 + 一条未知标签：成功项不被回填 `Err`、失败项带 `Quality`、且成功项确实落到从站）** |
+| `sim/enip` | 真实 TCP 回环：注册/注销/坏版本/未知命令、Read/Write Tag 与错误码 0x03/0x05/0x13/0x15、STRING 写、多服务与关闭、非符号路径、`SetTag` 校验、默认标签；**Forward Open/Forward Close 登记 Class 3 连接**、**SendUnitData 回 0x07（连接不存在）**、**Read/Write Tag Fragmented（0x52/0x53）按 `SetFragmentSize` 切片、非末片回 0x06（partial transfer）、末片回 0x00** |
 
 ### 3.10.8 BACnet/IP（对象属性读写，UDP 47808）
 
