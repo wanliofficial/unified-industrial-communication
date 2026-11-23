@@ -444,6 +444,52 @@ func TestWriteOneFailureDoesNotAbortBatch(t *testing.T) {
 	}
 }
 
+// TestWriteRejectsOutOfRangeBeforeWire：越界/带小数的写入必须在**发帧之前**被
+// 拒，归 ErrAddress（点/配置错误，不计熔断），且一个字节都不发——寄存器保持
+// 旧值。旧实现直接走 value.Encode 裸转换，70000 写 uint16 会静默变 4464 且
+// 上报「写成功」（§3.4 规则 3）。
+func TestWriteRejectsOutOfRangeBeforeWire(t *testing.T) {
+	cases := []struct {
+		name string
+		dt   model.DataType
+		num  float64
+		off  int
+	}{
+		{"uint16 上溢", model.TypeUint16, 70000, 0},
+		{"int16 上溢", model.TypeInt16, 40000, 1},
+		{"uint16 负数", model.TypeUint16, -1, 2},
+		{"float32 溢出", model.TypeFloat32, 1e300, 3},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s := newSim(t)
+			c := openConn(t, s, 1)
+			before := s.Holding(tc.off)
+			res, err := c.Write(context.Background(), []driver.WriteRequest{{
+				PointID:  "oor",
+				DataType: tc.dt,
+				Value:    model.NumValue(tc.dt, tc.num),
+				Address:  model.Address{Kind: model.AddressRegister, Area: "holding", Offset: tc.off, Length: 1, Bit: -1},
+			}})
+			if err == nil {
+				t.Fatal("越界写入必须返回错误")
+			}
+			if driver.KindOf(err) != driver.ErrAddress {
+				t.Fatalf("kind = %s, want address", driver.KindOf(err))
+			}
+			if driver.CountsTowardBreaker(err) {
+				t.Fatal("越界写入不应计入熔断")
+			}
+			if len(res) != 1 || res[0].OK || res[0].Err == nil {
+				t.Fatalf("应返回一条带错的失败结果，得到 %+v", res)
+			}
+			if got := s.Holding(tc.off); got != before {
+				t.Fatalf("越界值不应落到寄存器：holding[%d] = %d, want %d（旧值）", tc.off, got, before)
+			}
+		})
+	}
+}
+
 func TestProbe(t *testing.T) {
 	s := newSim(t)
 	c := openConn(t, s, 1)
