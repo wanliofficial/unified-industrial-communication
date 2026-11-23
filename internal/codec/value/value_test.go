@@ -2,6 +2,7 @@ package value
 
 import (
 	"bytes"
+	"errors"
 	"math"
 	"testing"
 
@@ -98,5 +99,87 @@ func TestInvalidBCDIsRejected(t *testing.T) {
 	// 0x1A 的高半字节合法、低半字节非法；不能悄悄当成 10。
 	if _, err := Decode([]byte{0x1A}, model.TypeBCD16, ""); err == nil {
 		t.Fatal("invalid BCD digit must be rejected")
+	}
+}
+
+// Encode 绝不能「静默改变值」：越界/带小数/NaN/Inf/BCD 溢出都必须在编码前
+// 拒绝，而不是用强制转换落地后让设备收到另一个数。这是所有协议共用的
+// 收口点，漏一处就会有一条写入路径静默损坏数据（Modbus 与 Mewtocol 曾
+// 因各自漏掉 checkRange 而中招）。
+func TestEncodeRejectsValuesThatWouldChangeOnTheWire(t *testing.T) {
+	bad := []struct {
+		typ model.DataType
+		val float64
+		why string
+	}{
+		{model.TypeInt16, 40000, "int16 上溢"},
+		{model.TypeInt16, -40000, "int16 下溢"},
+		{model.TypeInt16, 1.5, "int16 带小数"},
+		{model.TypeUint16, 70000, "uint16 上溢"},
+		{model.TypeUint16, -1, "uint16 负数"},
+		{model.TypeUint16, 3.7, "uint16 带小数"},
+		{model.TypeInt32, 3e9, "int32 上溢"},
+		{model.TypeUint32, 5e9, "uint32 上溢"},
+		{model.TypeUint32, -2, "uint32 负数"},
+		{model.TypeInt64, 1e19, "int64 上溢"},
+		{model.TypeUint64, 2e19, "uint64 上溢"},
+		{model.TypeUint64, -1, "uint64 负数"},
+		{model.TypeFloat32, 1e300, "float32 溢出成 +Inf"},
+		{model.TypeFloat32, -1e300, "float32 溢出成 -Inf"},
+		{model.TypeFloat32, 1e-50, "float32 下溢成 0"},
+		{model.TypeFloat32, math.NaN(), "float32 NaN"},
+		{model.TypeFloat32, math.Inf(1), "float32 +Inf"},
+		{model.TypeFloat64, math.NaN(), "float64 NaN"},
+		{model.TypeFloat64, math.Inf(-1), "float64 -Inf"},
+		{model.TypeBCD16, 12345, "BCD16 超过 4 位"},
+		{model.TypeBCD16, -1, "BCD16 负数"},
+		{model.TypeBCD16, 12.5, "BCD16 带小数"},
+		{model.TypeBCD32, 123456789, "BCD32 超过 8 位"},
+		{model.TypeBCD32, -5, "BCD32 负数"},
+	}
+	for _, tc := range bad {
+		_, err := Encode(model.NumValue(tc.typ, tc.val), tc.typ, "")
+		if err == nil {
+			t.Fatalf("%s: Encode(%v) 必须拒绝（会静默改变值）", tc.why, tc.val)
+		}
+		if !errors.Is(err, ErrRange) {
+			t.Fatalf("%s: err = %v, 期望 errors.Is(err, ErrRange)", tc.why, err)
+		}
+	}
+}
+
+// 边界值必须放行且往返一致：拒绝不能「宁枉勿纵」地把合法极值也挡掉。
+func TestEncodeAcceptsBoundaryValues(t *testing.T) {
+	ok := []struct {
+		typ model.DataType
+		val float64
+	}{
+		{model.TypeInt16, math.MinInt16},
+		{model.TypeInt16, math.MaxInt16},
+		{model.TypeUint16, 0},
+		{model.TypeUint16, math.MaxUint16},
+		{model.TypeInt32, math.MinInt32},
+		{model.TypeInt32, math.MaxInt32},
+		{model.TypeUint32, math.MaxUint32},
+		{model.TypeFloat32, 0},
+		{model.TypeFloat32, 3.5},
+		{model.TypeFloat64, 0},
+		{model.TypeBCD16, 0},
+		{model.TypeBCD16, 9999},
+		{model.TypeBCD32, 0},
+		{model.TypeBCD32, 99999999},
+	}
+	for _, tc := range ok {
+		raw, err := Encode(model.NumValue(tc.typ, tc.val), tc.typ, "")
+		if err != nil {
+			t.Fatalf("%s=%v 应放行: %v", tc.typ, tc.val, err)
+		}
+		back, err := Decode(raw, tc.typ, "")
+		if err != nil {
+			t.Fatalf("%s=%v decode: %v", tc.typ, tc.val, err)
+		}
+		if back.Num != tc.val {
+			t.Fatalf("%s 往返 = %v, want %v", tc.typ, back.Num, tc.val)
+		}
 	}
 }

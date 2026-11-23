@@ -325,6 +325,51 @@ func TestEncodeWriteRejectsNonRegisterAndNonNumeric(t *testing.T) {
 	}
 }
 
+// 越界/带小数写入必须在发报文前拒绝，并归为 ErrAddress（点/配置错误，
+// 不计熔断、不重试）。旧实现直接 value.Encode 裸转换：40000 写 int16 会
+// 静默变成 -25536、1e300 写 float32 会变成 +Inf，而调用方收到「写成功」。
+func TestEncodeWriteRejectsOutOfRangeValue(t *testing.T) {
+	c := NewCodec("dev")
+	cases := []struct {
+		name string
+		dt   model.DataType
+		num  float64
+	}{
+		{"int16 上溢", model.TypeInt16, 40000},
+		{"int16 带小数", model.TypeInt16, 1.5},
+		{"uint16 负数", model.TypeUint16, -1},
+		{"float32 溢出", model.TypeFloat32, 1e300},
+		{"float32 下溢", model.TypeFloat32, 1e-50},
+	}
+	for _, tc := range cases {
+		_, err := c.EncodeWrite(driver.WriteRequest{
+			PointID:  "p",
+			Address:  model.Address{Kind: model.AddressRegister, Area: "holding", Offset: 0, Length: 1},
+			DataType: tc.dt,
+			Value:    model.NumValue(tc.dt, tc.num),
+		})
+		if err == nil {
+			t.Fatalf("%s: 越界写入必须被拒绝", tc.name)
+		}
+		if driver.KindOf(err) != driver.ErrAddress {
+			t.Fatalf("%s: kind = %s, want address", tc.name, driver.KindOf(err))
+		}
+		if driver.CountsTowardBreaker(err) {
+			t.Fatalf("%s: 越界写入不应计入熔断", tc.name)
+		}
+	}
+
+	// 边界值仍然放行：拒绝不能误伤合法极值。
+	if _, err := c.EncodeWrite(driver.WriteRequest{
+		PointID:  "p",
+		Address:  model.Address{Kind: model.AddressRegister, Area: "holding", Offset: 0, Length: 1},
+		DataType: model.TypeInt16,
+		Value:    model.NumValue(model.TypeInt16, math.MaxInt16),
+	}); err != nil {
+		t.Fatalf("int16 上界应放行: %v", err)
+	}
+}
+
 func TestDecodeWriteCases(t *testing.T) {
 	c := NewCodec("dev")
 	req := driver.WriteRequest{PointID: "a"}

@@ -260,7 +260,13 @@ func (c *Codec) EncodeWrite(req driver.WriteRequest) ([]byte, error) {
 	}
 	payload, err := encodeValue(req.Value, req.DataType, req.ByteOrder)
 	if err != nil {
-		return nil, driver.E(driver.ErrInternal, "encode", c.DeviceID, err.Error(), false, err)
+		// 越界/带小数等「编码会变值」的输入归 ErrAddress：这是点/配置错误，
+		// 不该重试、也不该熔断整台设备（与 S7/ADS/ENIP 的 checkRange 同义）。
+		kind := driver.ErrInternal
+		if errors.Is(err, value.ErrRange) {
+			kind = driver.ErrAddress
+		}
+		return nil, driver.E(kind, "encode", c.DeviceID, err.Error(), false, err)
 	}
 	regs := len(payload) / 2
 	if regs <= 1 {

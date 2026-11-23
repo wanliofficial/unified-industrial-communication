@@ -291,6 +291,19 @@ type WriteResult struct {
 5. **失败项必须带 `Quality`**，不能留空串：`runtime/collector.go` 对
    `Quality==""` 会兜底成 `bad`，但驱动层留空等于把「为什么坏」这条信息
    丢了（`qualityOf(err)` 本来能给出 `address_error`/`comm_error`/`timeout`）。
+6. **数值越界/带小数/非有限值必须在编码时拒绝，不能静默改变值**。这一步的
+   收口点在 `codec/value` 的 `Encode`：所有写型驱动（Modbus / S7 / ADS /
+   ENIP / MC / FINS / Mewtocol …）都把 `float64 → 字节` 的最终落地交给它，
+   因此 `Encode` 在转换前调用 `checkRange`，拒绝一切「编码后会变值」的输入——
+   整数越界（`40000`→int16 静默回绕）、带小数（`1.5`→int16 丢成 `1`）、
+   float32 溢出成 `±Inf` 或下溢成 `0`、`NaN`、BCD 超位或为负，并返回哨兵错误
+   `value.ErrRange`。把守卫放在 `Encode` 内部而不是各驱动各写一份，是为了
+   防止「某个驱动忘了调自己的 `checkRange` 就静默损坏数据」——历史上
+   Modbus 与 Mewtocol 正是漏掉了这份本该人人都有的检查。驱动侧识别到
+   `errors.Is(err, value.ErrRange)` 后归为 `ErrAddress`（点/配置错误，不计入
+   熔断、不重试，质量 `address_error`），与 S7 / ADS / ENIP / MC / FINS 既有的
+   `checkRange` 同义。各驱动原有的 `checkRange` 副本在编码前再拦一道，属
+   冗余但无害的双保险。
 
 #### 3.4.1 寄存器内的位写（读-改-写）
 
@@ -588,8 +601,11 @@ negotiated PDU is M」。读、写两侧共用同一套预算（`itemBudget`）�
 | 单项超过协商 PDU（`address.length` 太大） | `!fitsPDU(...)` | `ErrAddress` |
 
 这些一律归 `ErrAddress`：越界/带小数/超长/超限都是**配置错**，换一个值或改一行
-配置就好，不该重试、不该熔断整台设备。`checkRange` 与 MC / FINS / ADS 的同名
-函数同构。字符串/bytes **恰好填满**宽度仍照常写入（按宽度补零语义不变）。
+配置就好，不该重试、不该熔断整台设备。底层范围校验集中在 `codec/value` 的
+`Encode`（返回 `value.ErrRange`，见 §3.4 规则 6）；S7 / MC / FINS / ADS / ENIP
+各自仍保留一份 `checkRange` 在编码前再拦一道（冗余双保险，行为同构），Modbus
+与 Mewtocol 原先漏掉了这一步，现已随 `Encode` 的收口一并覆盖。字符串/bytes
+**恰好填满**宽度仍照常写入（按宽度补零语义不变）。
 
 #### 3.7.7 块服务（目录 / 属性 / 上传）
 
@@ -6289,7 +6305,7 @@ Mewtocol 的地址是**寄存器语义**：一个地址 = 一个 16 位字。因
 | 层 | 用例 |
 |---|---|
 | `codec/mewtocol` | 区域表与别名（`d`/`f`/`wx`/`set`/`k`）、站号校验（1..99、`FF`、0 拒绝）；BCC 覆盖 `%` 且不含 CR，手册实例 `%01#RCSX0000` → `1D`；`**` 的方向性（`ParseRequest` 接受、`ParseResponse` 判 `ChecksumError` 且错误文案说明原因）；黄金字节逐字节（RD/RCC/RCS/RCP/WCS/WCC/WD/RS/WS/RK/WK/异常应答/IX/IY/ID 的读写）；接点编号双向（`001F`/`0163`/`0010`/`0999`，非法进制与越界拒绝）；`IndexWords`（IX/IY=1、ID=2）与索引寄存器的「区码 + 9 个 0」，包括 `RDID` 读 0..1、`WDID` 两字、`WDIX` 一字，以及「索引寄存器传了非 0 偏移/错误宽度必须在组帧前拒绝」；`MaxWords=24` 与 `MaxContacts=8` 的边界（24 通过、25 拒绝；8 通过、9 拒绝）；`ParseRequest` 三字符命令优先于两字符前缀；`ParseResponse` 的 BCC 校验与异常应答；`FrameLen`/`Reader` 的分帧、噪声丢弃与半帧等待 |
-| `driver/mewtocol` | 纯函数：`pointWords`（bool 恒 1 字、显式长度优先、类型宽度回退）、`reqWords`、`orderFor`（32 位 CDAB / 64 位 DCBA / 显式覆盖）、`classify`（66H→address、65H→permission、41H/53H→protocol 可重试、60H→address）、`qualityOf`（address/comm/bad/timeout）+ **派生一致性**（遍历整段链路码 `22`..`38` 与可重试协议/处理码断言一律 `comm_error`，钉住「手抄白名单漏码」这类漂移）；**批量写逐项语义**（一条成功 + 一条未知区名：成功项 `OK/Quality=good/Err=nil`、失败项带 `Quality` 与 `Err`、坏条目不上线发帧；把「回填 `firstErr`」加回去必须变红）；**多帧 span**（30 个连续寄存器：切成 24+6 两帧、拼接后 30 个样本不重不漏、值与顺序都对；第二帧超时时前排 24 个保留 good、后排 6 个 timeout 而 `Read` 不报错；第一帧就链路级失败时只发 1 帧、30 个点位全部 timeout、`Read` 报错）；**索引寄存器配置错误**（`ix` 带 offset、`ix` 声明成 uint32、`id` 声明成 uint16：一律 `address` 且**不碰总线**，错误文案指明该改成 `uint16`/`uint32`） |
+| `driver/mewtocol` | 纯函数：`pointWords`（bool 恒 1 字、显式长度优先、类型宽度回退）、`reqWords`、`orderFor`（32 位 CDAB / 64 位 DCBA / 显式覆盖）、`classify`（66H→address、65H→permission、41H/53H→protocol 可重试、60H→address）、`qualityOf`（address/comm/bad/timeout）+ **派生一致性**（遍历整段链路码 `22`..`38` 与可重试协议/处理码断言一律 `comm_error`，钉住「手抄白名单漏码」这类漂移）；**批量写逐项语义**（一条成功 + 一条未知区名：成功项 `OK/Quality=good/Err=nil`、失败项带 `Quality` 与 `Err`、坏条目不上线发帧；把「回填 `firstErr`」加回去必须变红）；**多帧 span**（30 个连续寄存器：切成 24+6 两帧、拼接后 30 个样本不重不漏、值与顺序都对；第二帧超时时前排 24 个保留 good、后排 6 个 timeout 而 `Read` 不报错；第一帧就链路级失败时只发 1 帧、30 个点位全部 timeout、`Read` 报错）；**索引寄存器配置错误**（`ix` 带 offset、`ix` 声明成 uint32、`id` 声明成 uint16：一律 `address` 且**不碰总线**，错误文案指明该改成 `uint16`/`uint32`）；**写路径数值越界/带小数/float32 溢出/NaN 在发报文前拒绝**（`value.Encode` 返回 `ErrRange` → 归 `ErrAddress`，一字节不发；旧实现漏了范围校验，`70000` 写 uint16 会静默变 `4464` 且报「写成功」） |
 | `sim/mewtocol` | 真实 TCP 回环：16 位字往返（写 DT0..2 再读回）、接点按字读 + 位提取、`WCS` 单点写后邻位不变、字区位写拒绝（`ErrUnsupported`）、32 位跨字往返（低字在前）、站号过滤（站号 2 的请求静默、站号 1 有应答）、T/C 按点读（T 与 C 分属两个区，分开读）、T/C 单点写不碰邻号、`WCP` 多接点写（两位同时置 1，同字其余位不变——数据位读反的症状是「写 1 变成写 0」）、**T/C 分组里一个带位号的坏点位不得顶偏后续点位的值**（旧实现按下标遍历含坏点的原组去取 `vals`，坏点会拿到邻点值、真正要读的点反而没样本）、**索引寄存器三种形态往返**（IX/IY 1 字、ID 32 位；读 ID 得到 `I1<<16|I0`，写 ID 同时改掉 I0 与 I1——从站里 ID 不是独立寄存器，而是 IX/IY 这一对的 32 位视图，与真机一致） |
 | `pointtable` | `PolicyFor("mewtocol")` 是 `WidthRegisters` + 十四个区白名单 + `BitlessAreas` 只含 `t`/`c`；正向 14 例（字区、接点区、字区 bool、T/C、索引、SV、大写区名）× 往返（`Canonical()` 能重新解析成同一地址）；反向 5 例（未知区名、接点区缺位号、位号 16、字区 bool 缺位号、非 bool 带位号）；寄存器协议反向拒 `dt:0` |
 

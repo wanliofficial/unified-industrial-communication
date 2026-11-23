@@ -228,6 +228,69 @@ func TestWriteFailureKeepsEarlierSuccessesIntact(t *testing.T) {
 	}
 }
 
+// TestWriteRejectsOutOfRangeValue：越界/带小数的写入必须在**主站侧**被拒绝，
+// 一个字节都不发。value.Encode 用强制转换落地，70000 写 uint16 会静默变成
+// 4464，调用方却收到「写成功」（§3.4 规则 3）。
+func TestWriteRejectsOutOfRangeValue(t *testing.T) {
+	cases := []struct {
+		name string
+		req  driver.WriteRequest
+	}{
+		{
+			name: "uint16 上溢",
+			req: driver.WriteRequest{
+				PointID:  "big",
+				Address:  model.Address{Kind: model.AddressRegister, Area: "dt", Offset: 0, Bit: -1},
+				DataType: model.TypeUint16,
+				Value:    model.NumValue(model.TypeUint16, 70000),
+			},
+		},
+		{
+			name: "uint16 负数",
+			req: driver.WriteRequest{
+				PointID:  "neg",
+				Address:  model.Address{Kind: model.AddressRegister, Area: "dt", Offset: 1, Bit: -1},
+				DataType: model.TypeUint16,
+				Value:    model.NumValue(model.TypeUint16, -1),
+			},
+		},
+		{
+			name: "float32 溢出",
+			req: driver.WriteRequest{
+				PointID:  "ovf",
+				Address:  model.Address{Kind: model.AddressRegister, Area: "fl", Offset: 0, Bit: -1},
+				DataType: model.TypeFloat32,
+				Value:    model.NumValue(model.TypeFloat32, 1e300),
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			l := &scriptLink{}
+			c := &conn{link: l, station: 1, devID: "plc1", timeout: time.Second}
+			res, err := c.Write(context.Background(), []driver.WriteRequest{tc.req})
+			if err == nil {
+				t.Fatal("越界写入必须返回错误")
+			}
+			if driver.KindOf(err) != driver.ErrAddress {
+				t.Fatalf("kind = %v, want address", driver.KindOf(err))
+			}
+			if driver.CountsTowardBreaker(err) {
+				t.Fatal("越界写入不应计入熔断")
+			}
+			if len(res) != 1 || res[0].OK {
+				t.Fatalf("应返回一条失败结果，得到 %+v", res)
+			}
+			if res[0].Err == nil {
+				t.Fatal("失败结果必须带错误")
+			}
+			if len(l.requests) != 0 {
+				t.Fatalf("越界写入不应触网，发了 %d 帧", len(l.requests))
+			}
+		})
+	}
+}
+
 // ---------------------------------------------------------------------------
 // 多帧 span：切帧必须按点位边界、拼接后统一解码
 // ---------------------------------------------------------------------------

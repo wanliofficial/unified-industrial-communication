@@ -806,6 +806,11 @@ func (c *conn) writeWords(ctx context.Context, req driver.WriteRequest, area mew
 
 	data, err := value.Encode(req.Value, req.DataType, orderFor(words*2, req.ByteOrder))
 	if err != nil {
+		if errors.Is(err, value.ErrRange) {
+			// 越界/带小数等「编码会变值」的输入是点/配置错误：不重试、不熔断。
+			err = driver.E(driver.ErrAddress, "write", c.devID, err.Error(), false, err)
+			return writeFail(req, err), err
+		}
 		err = driver.E(driver.ErrUnsupported, "write", c.devID, err.Error(), false, err)
 		return writeFail(req, err), err
 	}
