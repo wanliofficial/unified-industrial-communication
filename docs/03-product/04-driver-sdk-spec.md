@@ -8611,6 +8611,21 @@ A-XDR 标签表（IEC 62056-53 §8.6.4）：
 `07`/`08`/`0B`/`0C`/`0E` 是**空号**——不认识的标签必须报错而不是跳过，否则一个
 标签读错会让后面整段数据结构错位成「合法但错误」的值。
 
+**octet-string / visible-string 的长度是单字节 `0..255`，没有 BER 长形式。**
+A-XDR（IEC 61334-6）里 `Data` CHOICE 的 octet-string 是 `IMPLICIT OCTET STRING`、
+无 SIZE 约束；长度就是后面那一个字节本身。所以 `0x80..0xFF` 是**合法长度
+128..255**，绝不能用「`>=0x80` 就是 BER 长形式前缀」去判——A-XDR 根本没有
+`0x81/0x82` 那种长度编码（与 BER、与 MMS 会话层 LI 都不同，见
+§3.10.x iec61850/61850 段与本文件 BER 对照）。200 字节的字符串长度字节就是
+`0xC8`，必须完整解出。
+
+解码器据此区分两种越界：长度字节**声称**的字节数超过当前缓冲实际剩下的
+（`1+n > len(rest)`）时，顶层完整帧本就是「没收全」返回 `ErrIncomplete`
+让 Reader 续读；但在递归（array/structure 元素、Get-Data 值）里子切片拿不到
+「还会来更多字节」的信息，这个超额主张其实是**帧被串位**（OBIS/类号/编码与
+点表不符，或线路噪声），返回 `ErrAXDR`（而非一律 `ErrIncomplete`）让诊断直接
+指向串位。bit-string（长度以 bit 计）同理。
+
 **`date_time` 的 12 字节布局是最容易错位的一处**（IEC 62056-62 §4.1.6.1）：
 
 ```
@@ -8853,7 +8868,7 @@ octet-string 四种值形态。
 
 | 层 | 用例 |
 |---|---|
-| `codec/dlms` | `SNRM` 金帧 `7E A0 07 03 21 93 0F 01 7E`；`FCS(A0 07 03 21 93) == 0F 01` 与 `GoodFCS` 的固定余数 `0xF0B8`；长度字段跨两字节与 bit11 分段位；info 与 FCS 里出现 `0x7E` 时仍按长度定界（FCS `7E 64` 的回归）；截断 → `ErrIncomplete`、指针前移 1 字节重同步；1/2/4 字节地址域（含 `48 68 FE FF`）；LLC `E6 E6 00` vs `E6 E7 00`；I/RR/RNR/U 帧控制域与 `NS`/`NR` 回绕；AARQ/AARE 逐字节向量与拒绝诊断；conformance 位值与 `5F 1F 04 00` 编码；A-XDR 全标签（含 `0x07`/`0x0E` 空号必须报错）；`date_time` 12 字节布局（星期位置、`0x8000` 时区）与 `date`/`time`；`data-access-result` 只认 2 字节形态（用 `hardware-fault(1)` 锁「前两字节相同」的陷阱）；Get-Response 三分支（normal / datablock / list）；OBIS 十进制六段与 `.`/`-`/`:`/空格分隔；`SplitRef` 对 `1-0:1-8-0-255:3:2` 的切点；`ApplyScaler` 单次乘除（`50.01` 精确）；`UnitName`/`ClassName` 全扫 |
+| `codec/dlms` | `SNRM` 金帧 `7E A0 07 03 21 93 0F 01 7E`；`FCS(A0 07 03 21 93) == 0F 01` 与 `GoodFCS` 的固定余数 `0xF0B8`；长度字段跨两字节与 bit11 分段位；info 与 FCS 里出现 `0x7E` 时仍按长度定界（FCS `7E 64` 的回归）；截断 → `ErrIncomplete`、指针前移 1 字节重同步；1/2/4 字节地址域（含 `48 68 FE FF`）；LLC `E6 E6 00` vs `E6 E7 00`；I/RR/RNR/U 帧控制域与 `NS`/`NR` 回绕；AARQ/AARE 逐字节向量与拒绝诊断；conformance 位值与 `5F 1F 04 00` 编码；A-XDR 全标签（含 `0x07`/`0x0E` 空号必须报错）；**字符串/位串长度语义（`0x80..0xFF` 是合法长度 128..255 不拒绝、超额长度主张在递归里报 `ErrAXDR` 帧串位）**；`date_time` 12 字节布局（星期位置、`0x8000` 时区）与 `date`/`time`；`data-access-result` 只认 2 字节形态（用 `hardware-fault(1)` 锁「前两字节相同」的陷阱）；Get-Response 三分支（normal / datablock / list）；OBIS 十进制六段与 `.`/`-`/`:`/空格分隔；`SplitRef` 对 `1-0:1-8-0-255:3:2` 的切点；`ApplyScaler` 单次乘除（`50.01` 精确）；`UnitName`/`ClassName` 全扫 |
 | `driver/dlms` | 真实 TCP 回环：SNRM→AARQ→逐点 GET→DISC；`Probe` 复用已建关联；拒绝关联 → `ErrProtocol`；静默 → `ErrTimeout`；坏校验 → `ErrProtocol` 且文案含「坏帧」与波特率提示；**DM（断开模式）→ `ErrProtocol` 且 `IsRetryable==false`，`retries=2` 下 Get 只发 1 次**（与坏校验「重发到上限」构成成对断言）；`linkErr` 缓存后第二轮不再发包且立即返回；object-undefined → `ErrAddress`；类号不一致 → `ErrAddress`；分块 → `ErrUnsupported` 且提示调大 `max-pdu`；scaler 五个点逐位精确（`50.01`/`0.985`/`220.1`/`5.12`/`345.6`）；**Register 缺 attribute 3 时该点判坏（不报 raw good 静默回绕），补上后同一连接回到正确缩放（不永久毒化）**；`Scan` 条数等于内置表条数且带 scaler_unit 文本；`Association` 采用服务端较小的 max-PDU；`Write`/`MultiRead`/`Browse` 逐项 `ErrUnsupported`；`parseOptions` 越界全忽略；`addressOf` 的 `labels.address` 优先级与 `addr-size=3` 拒绝；空 span 返回 `(nil, nil)`；关闭后所有入口 → `ErrDisconnected` |
 | `sim/dlms` | 默认对象表覆盖 40+ 项且 `examples/dlms.json` 能全部读到；AARQ 接受/拒绝两分支；未建关联读 → `read-write-denied`；对象未定义 / 类号不一致两种结果码；地址与客户端地址过滤静默；`SetSilent`/`SetBadChecksum`/`SetRejectAssociation`/`SetReplyDM`；`SetReplyDM` 下 Get 计数仍加一（证明请求确实到达，用于断言是否重发）；`SetValue`/`Value` 的坏定位报错；`AddObject` 链路上途补属性（供测试「缺 scaler_unit 判坏→补上后同一连接恢复正确缩放」）；TCP `acceptLoop`→`serveConn`→`tcpStream` 真实 socket 路径；`Close` 幂等且能清理连接；`isClosed` 对 `net.ErrClosed`/`io.EOF`/超时的分类 |
 | `pointtable` | `dlms` 走 `WidthNone + AllowSymbol`；`1.0.1.8.0.255`、`:3`、`:3:2` 与连字符写法 `0-0-42-0-0-255:1:2` 都解析成 symbol 且 `Canonical` 往返一致；寄存器/对象/计算地址在导入期拒绝；`length` 列在导入期拒绝 |

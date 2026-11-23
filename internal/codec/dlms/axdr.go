@@ -427,8 +427,20 @@ func Decode(b []byte) (Value, int, error) {
 			return Value{}, 0, ErrIncomplete
 		}
 		n := int(rest[0])
-		if len(rest) < 1+n {
-			return Value{}, 0, ErrIncomplete
+		// A-XDR 的长度是**单字节 0..255**（IEC 61334-6；octet-string 在 Data
+		// CHOICE 里没有 SIZE 约束，因此 0x80..0xFF 是合法长度 128..255，**不是**
+		// BER 的长形式前缀——A-XDR 根本没有 0x81/0x82 这种长度编码，见
+		// docs/03-product/04-driver-sdk-spec.md §3.10.26.4）。所以这里
+		// 不能对 rest[0]>=0x80 报错：那会把一台真机发来的 200 字节字符串当非法。
+		if 1+n > len(rest) {
+			// 长度字节声称的字节数超过了当前缓冲里实际剩下的。顶层的完整帧里
+			// 这确实是「没收全」，返回 ErrIncomplete 让 Reader 继续等；但在递归
+			// （array/structure 元素、Get-Data 值）里，子切片拿不到「还会来更多
+			// 字节」的信息，这个超额主张其实意味着**帧被串位了**（OBIS/类号/编码
+			// 与点表不符，或线路噪声）。两种成因都该显式失败——绝不把半截串当
+			// 合法值返回——这里用 ErrAXDR 把「长度超过可用字节」与「字节不够读」
+			// 区分开，让现场诊断直接指向串位而不是「等更多字节」。
+			return Value{}, 0, fmt.Errorf("%w: %s 长度 %d 超过可用字节 %d（疑似帧串位）", ErrAXDR, tagName(tag), n, len(rest)-1)
 		}
 		body := rest[1 : 1+n]
 		if tag == TagOctetString {
@@ -443,8 +455,10 @@ func Decode(b []byte) (Value, int, error) {
 		}
 		bits := int(rest[0])
 		n := (bits + 7) / 8
-		if len(rest) < 1+n {
-			return Value{}, 0, ErrIncomplete
+		if 1+n > len(rest) {
+			// 与 octet/visible-string 同理：bit-string 的长度主张超过可用字节时，
+			// 在递归语境下是帧串位而非「没收全」，用 ErrAXDR 显式区分。
+			return Value{}, 0, fmt.Errorf("%w: bit-string 长度 %d 位(%d 字节)超过可用字节 %d（疑似帧串位）", ErrAXDR, bits, n, len(rest)-1)
 		}
 		return Value{Tag: tag, Bytes: append([]byte(nil), rest[1:1+n]...), Int: int64(bits)}, 2 + n, nil
 

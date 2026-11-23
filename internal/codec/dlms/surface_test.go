@@ -440,6 +440,69 @@ func TestAXDRSequenceFormatting(t *testing.T) {
 	}
 }
 
+// A-XDR 字符串/位串长度的两个方向都要钉死：
+//
+//  1. 长度字节 0x80..0xFF 是**合法长度 128..255**，不是 BER 长形式前缀。A-XDR
+//     （IEC 61334-6）根本没有 0x81/0x82 这种长度编码，Data CHOICE 里的
+//     octet-string 也没有 SIZE 约束。所以 200 字节字符串必须能完整解出——
+//     绝不能对 rest[0]>=0x80 报错（那会拒掉一台真机发来的长字符串）。
+//  2. 长度字节**声称**的字节数超过缓冲里实际剩下的，是帧串位（OBIS/类号/
+//     编码与点表不符，或线路噪声），不是「没收全」。顶层的完整帧里它确实
+//     可能只是半截，但返回 ErrAXDR 让所有调用方都显式失败、诊断指向串位，
+//     比一律 ErrIncomplete（「等更多字节」）更准。递归（structure/array 元素）
+//     语境下这个区分尤其重要：子切片永远拿不到「还会来更多字节」。
+func TestAXDRStringLengthSemantics(t *testing.T) {
+	// 1. 200 字节（长度字节 0xC8）必须完整解出，不被当非法。
+	big := bytes.Repeat([]byte{0xAB}, 200)
+	enc, err := Octets(big).Encode()
+	if err != nil {
+		t.Fatalf("200 字节 octet-string 应可编码: %v", err)
+	}
+	if enc[1] != 200 {
+		t.Fatalf("长度字节应为 200(0xC8)，得到 %#x", enc[1])
+	}
+	v, used, err := Decode(enc)
+	if err != nil {
+		t.Fatalf("200 字节 octet-string 应可解码，得到 %v", err)
+	}
+	if used != len(enc) || !bytes.Equal(v.Bytes, big) {
+		t.Fatalf("200 字节往返不符：used=%d len=%d equal=%v", used, len(enc), bytes.Equal(v.Bytes, big))
+	}
+	// visible-string 同理（长度 0x80=128）。
+	vs, _, err := Decode(append([]byte{TagVisibleString, 0x80}, bytes.Repeat([]byte("z"), 128)...))
+	if err != nil {
+		t.Fatalf("128 字节 visible-string 应可解码，得到 %v", err)
+	}
+	if len(vs.Text) != 128 {
+		t.Fatalf("128 字节 visible-string 解出 %d 字节", len(vs.Text))
+	}
+
+	// 2a. 顶层：长度主张超过可用字节 → ErrAXDR（不是 ErrIncomplete）。
+	over := []byte{TagOctetString, 0x80, 0x01, 0x02} // 声称 128 字节，只跟了 2 字节
+	_, _, err = Decode(over)
+	if !errors.Is(err, ErrAXDR) {
+		t.Fatalf("超额长度主张应报 ErrAXDR，得到 %v", err)
+	}
+
+	// 2b. 递归：structure 第一个元素是超额 octet-string，把后面的兄弟吞掉。
+	// 之前会一路返回 ErrIncomplete（「等更多字节」），掩盖了真正的串位；
+	// 现在必须显式报 ErrAXDR，且不静默返回一个缺了兄弟的「成功」结构。
+	corrupt := []byte{
+		TagStructure, 0x02,       // 声称 2 个元素
+		TagOctetString, 0x80, 0x01, 0x02, // 元素 1：声称 128 字节，实际只 2 字节
+		TagInteger, 0x2A,              // 元素 2：本应存在的兄弟，被长度吞掉
+	}
+	_, _, err = Decode(corrupt)
+	if !errors.Is(err, ErrAXDR) {
+		t.Fatalf("递归超额长度应报 ErrAXDR（帧串位），得到 %v", err)
+	}
+
+	// 3. bit-string 超额主张同样报 ErrAXDR。
+	if _, _, err := Decode([]byte{TagBitString, 0x80, 0x01}); !errors.Is(err, ErrAXDR) {
+		t.Fatalf("bit-string 超额长度应报 ErrAXDR，得到 %v", err)
+	}
+}
+
 // 编码侧的边界：octet-string / visible-string 超过 255 字节要报错，
 // 不能静默按 byte 截断长度（那会让接收方少读一半字节）。
 func TestAXDREncodeLimits(t *testing.T) {
