@@ -229,7 +229,7 @@ type Device struct {
     ChannelID  string   `json:"channel"`
     UnitID     int      `json:"unitId,omitempty"`     // 站号/从站地址
     Interval   Duration `json:"interval"`             // 默认采集周期
-    Timeout    Duration `json:"timeout,omitempty"`    // 单次请求超时
+    Timeout    Duration `json:"timeout,omitempty"`    // 单次请求超时；留空时继承所属 channel 的超时（不是第一个 channel）
     ByteOrder  ByteOrder `json:"byteOrder,omitempty"`
     Enabled    bool     `json:"enabled"`
     Points     []Point  `json:"points"`

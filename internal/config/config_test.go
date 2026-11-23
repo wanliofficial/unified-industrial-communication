@@ -113,6 +113,38 @@ func TestValidateEmptyChannelsDoesNotPanic(t *testing.T) {
 	}
 }
 
+// 设备没配 timeout 时必须继承「它自己所属 channel」的超时，而不是 Channels[0]。
+// 多通道、各通道超时不同的配置里，挂在慢通道上的设备若被第一个（可能很快）
+// 通道的超时提前掐断，会表现为「明明配了 30s 却 3s 就超时」，且没有任何报错。
+func TestDeviceTimeoutInheritsOwnChannel(t *testing.T) {
+	registerDrivers(t)
+	f := baseFile()
+	f.Channels = []model.Channel{
+		{ID: "fast", Protocol: "virtual", Transport: model.Transport{Kind: "tcp", Address: "127.0.0.1:1"}, Timeout: model.Duration(3 * time.Second)},
+		{ID: "slow", Protocol: "virtual", Transport: model.Transport{Kind: "tcp", Address: "127.0.0.1:2"}, Timeout: model.Duration(30 * time.Second)},
+	}
+	f.Devices = []model.Device{{
+		ID: "d-on-slow", ChannelID: "slow", Interval: model.Duration(time.Second), Enabled: true,
+		Points: []model.Point{{
+			ID: "p1", DataType: model.TypeFloat32, Enabled: true,
+			Address: model.Address{Kind: model.AddressRegister, Area: "holding", Offset: 0, Length: 2, Bit: -1},
+		}},
+	}}
+	if err := f.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	if got := f.Devices[0].TimeoutOrDefault(); got != 30*time.Second {
+		t.Fatalf("device timeout = %v, want 30s (must inherit its own 'slow' channel, not Channels[0])", got)
+	}
+
+	// 显式配了 timeout 的设备不被 channel 默认值覆盖。
+	f.Devices[0].Timeout = model.Duration(7 * time.Second)
+	f.Normalize()
+	if got := f.Devices[0].TimeoutOrDefault(); got != 7*time.Second {
+		t.Fatalf("explicit device timeout = %v, want 7s", got)
+	}
+}
+
 func openManager(t *testing.T) (*Manager, string) {
 	t.Helper()
 	registerDrivers(t)

@@ -352,16 +352,20 @@ func (f *File) Normalize() {
 			f.Channels[i].Timeout = model.Duration(3 * time.Second)
 		}
 	}
-	chTimeout := model.Duration(3 * time.Second)
-	if len(f.Channels) > 0 && f.Channels[0].Timeout > 0 {
-		chTimeout = f.Channels[0].Timeout
+	// 设备没配 timeout 时继承「它自己所属 channel」的超时——不是 Channels[0]。
+	// 多通道、各通道超时不同的配置里，挂在慢通道上的设备若被第一个（可能
+	// 很快）通道的超时提前掐断，会表现为「明明配了 30s 却 3s 就超时」，且
+	// 没有任何报错。channel 超时已在上面的循环里默认过，这里直接按 id 建表。
+	channelTimeout := make(map[string]model.Duration, len(f.Channels))
+	for _, ch := range f.Channels {
+		channelTimeout[ch.ID] = ch.Timeout
 	}
 	for i := range f.Devices {
 		if f.Devices[i].Interval == 0 {
 			f.Devices[i].Interval = model.Duration(1 * time.Second)
 		}
 		if f.Devices[i].Timeout == 0 {
-			f.Devices[i].Timeout = chTimeout
+			f.Devices[i].Timeout = channelTimeout[f.Devices[i].ChannelID]
 		}
 	}
 }
