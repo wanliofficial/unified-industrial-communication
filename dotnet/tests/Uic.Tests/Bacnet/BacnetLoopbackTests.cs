@@ -25,6 +25,7 @@ internal static class BacnetLoopbackTests
         tests.Add(new TestCase("bacnet/read_multiple_objects", ReadMultipleObjects));
         tests.Add(new TestCase("bacnet/read_bool_and_string", ReadBoolAndString));
         tests.Add(new TestCase("bacnet/write_then_read_back", WriteThenReadBack));
+        tests.Add(new TestCase("bacnet/write_array_point_is_rejected", WriteArrayPointIsRejected));
         tests.Add(new TestCase("bacnet/unknown_object_is_address_error", UnknownObjectIsAddressError));
         tests.Add(new TestCase("bacnet/unknown_property_is_address_error", UnknownPropertyIsAddressError));
         tests.Add(new TestCase("bacnet/silent_device_times_out", SilentDeviceTimesOut));
@@ -205,6 +206,45 @@ internal static class BacnetLoopbackTests
             var samples = await conn.ReadAsync(ReadPlanner.Plan(new[] { point }), t.Ct);
             t.Close(62.5, samples[0].Value!.AsNumber(), 1e-6, "read back");
         });
+    }
+
+    /// <summary>
+    /// BACnet 写数组点位必须被明确拒绝，而不是把数组写到整个属性上。
+    ///
+    /// 数组点位需要「属性标识符 + 数组索引」两个要素，本实现不带索引；若这条守卫被删掉，
+    /// 写下去会落在整个数组属性上，设备要么报错要么只改第一个元素——两种结果都不是调用方
+    /// 想要的，而且「看起来写成功了」会让上层误以为一处故障已修复。所以这里钉住：数组写的
+    /// 结果是「逐点失败、Quality.Bad、消息说明不支持」，而不是抛异常中断整批或静默成功。
+    ///
+    /// 这条检查在建立连接之前就发生（不需要 UDP 服务器），纯构造即可验证。
+    /// </summary>
+    private static async Task WriteArrayPointIsRejected(TestContext t)
+    {
+        var (channel, device) = Setup(0);
+
+        // Count=2 让 PointRef.IsArray 为真（BACnet 对象没声明过数组，但契约层允许，
+        // 驱动必须自己拒绝，不能靠「配置里不会出现」来回避）。
+        var arrayPoint = new PointRef(
+            "av-array",
+            Address.Object(
+                BacnetConstants.ObjectTypeAnalogValue.ToString(), 3,
+                BacnetConstants.PropertyPresentValue.ToString()),
+            DataType.Float32, ByteOrder.ABCD, 1, Count: 2);
+
+        await using var conn = Open(channel, device);
+
+        var writes = await conn.WriteAsync(new[]
+        {
+            new WriteCommand(arrayPoint, DataValue.Numbers(DataType.Float32, new[] { 1d, 2d })),
+        }, t.Ct);
+
+        t.Equal(1, writes.Count, "one result per command");
+        t.Ok(!writes[0].Ok, "the array write is refused");
+        // 「不支持该能力」是 Disabled，不是 Bad：Bad 表示瞬时/质量坏，Disabled 才是「本实现
+        // 压根不做这件事」，上层据此区别于可重试的坏值。
+        t.Equal(Quality.Disabled, writes[0].Quality, "unsupported array write maps to Disabled");
+        t.Contains(writes[0].Error ?? string.Empty, "array",
+            "the reason names the array limitation");
     }
 
     private static Task UnknownObjectIsAddressError(TestContext t)

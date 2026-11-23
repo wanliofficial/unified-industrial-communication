@@ -12,17 +12,18 @@ PRD 中 M 级的采集协议已全部落地，FR-CFG-01 的四类寻址模型也
 COV/分段/多属性读仍不做，见 [protocol-status.md](protocol-status.md) §4.1）。非 M 级验收里的 12 类故障注入同样全部有了
 可自动跑的用例（见 §7）。
 
-当前测试基线：**425 条**（带 `--opcua` 全量：本轮新增的一条 `bacnet/device_instance_out_of_range_is_rejected`
+当前测试基线：**426 条**（带 `--opcua` 全量：本轮新增的一条 `bacnet/write_array_point_is_rejected`
 是纯构造、不启 UDP 服务器；全量实测数字以 [testing.md](testing.md) 最新一轮为准）。本轮新增
-`bacnet/device_instance_out_of_range_is_rejected`：BACnet <MASKED_PERSON_001> deviceInstance 必须是 22 位实例号
-（0..4194303），越界与非数字时由驱动明确报 Unsupported、不静默截断（-1 是「没配、不核对实例号」哨兵、被接受；
-<MASKED_PERSON_001>校验器不认<MASKED_PERSON_001>私有标签，这是唯一守卫），纯构造不启 UDP、≤ 0.1 s。
-此前几轮新增 `mqtt/options_reject_out_of_range_labels`（南向<MASKED_PERSON_001>数值范围与非布尔拒绝）、
+`bacnet/write_array_point_is_rejected`：BACnet 数组点位写入必须被明确拒绝——逐点 `Ok=false`、
+质量映射 Disabled（不支持的能力，区别于可重试的 Bad）、消息点名「不支持数组」，检查在建连前发生。
+若删掉这条守卫，数组会写到整个属性上（设备报错或只改第一个元素），现象比直接报错难查。纯构造不启 UDP、≤ 0.1 s。
+此前几轮新增 `bacnet/device_instance_out_of_range_is_rejected`（deviceInstance 22 位实例号越界）、
+`mqtt/options_reject_out_of_range_labels`（南向<MASKED_PERSON_001>数值范围与非布尔拒绝）、
 `s7/label_out_of_range_is_rejected`（S7 <MASKED_PERSON_001> rack/slot/pduSize 越界）、
 `s7/metadata_declares_capabilities`、`opcua/metadata_declares_capabilities`
 （S7 与 OPC UA 客户端两个驱动此前无用例断言的 `DriverMeta` 能力声明钉住）。
 本轮改动纯增量（新增一条纯构造用例），不改动既有用例判定，故直接复跑受影响一组确认：
-`--filter bacnet/` 29 条全绿；全量汇总数字以 [testing.md](testing.md) 下一次腾空复跑所量取者为准。
+`--filter bacnet/` 30 条全绿；全量汇总数字以 [testing.md](testing.md) 下一次腾空复跑所量取者为准。
 
 ## 1. 采集（FR-COL）
 

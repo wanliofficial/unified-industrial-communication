@@ -19,11 +19,11 @@ dotnet run --project tests/Uic.Tests -- --stop-on-fail      # 首个失败即停
 N passed, 0 failed, 0 skipped · <耗时>
 ```
 
-本轮（425 条）的改动是**纯增量**：新增一条纯构造用例 `bacnet/device_instance_out_of_range_is_rejected`
-（deviceInstance 22 位实例号越界与非数字时由驱动明确报 Unsupported、不静默接受，≤ 0.1 s）。本轮已直接复跑
-验证：`--filter bacnet/` 29 条全绿。由于这条不改动任何既有用例的判定，全量通过/失败结论不受影响，故全量
-汇总数字留待下一次腾空复跑时如实量取填入上方（前一轮全量在 NTFS 高负载下于 `contract/*` 组后被截断、未跑到
-汇总，故不写「全绿」假数字）。
+本轮（426 条）的改动是**纯增量**：新增一条纯构造用例 `bacnet/write_array_point_is_rejected`
+（数组点位写被明确拒绝：逐点失败、`Ok=false`、质量映射 Disabled 而非 Bad、消息点名「不支持数组」，
+检查在建连前发生）。本轮已直接复跑验证：`--filter bacnet/` 30 条全绿。由于这条不改动任何既有用例的
+判定，全量通过/失败结论不受影响，故全量汇总数字留待下一次腾空复跑时如实量取填入上方（前一轮全量在
+NTFS 高负载下于 `contract/*` 组后被截断、未跑到汇总，故不写「全绿」假数字）。
 
 前序基线（422 条，`--opcua`）：`421 passed, 1 failed, 0 skipped · 1041.9 s`——那 1 条 failed 是
 `contract/points_csv_import_previews_and_applies` 触到 180 s 硬超时的**高负载 flake**
@@ -84,6 +84,8 @@ rack/slot/pduSize 越界明确报错、纯构造不连服务器、≤ 0.6 s）�
 qos/keepAlive/reconnect/staleAfter 越界与非布尔 tlsEnabled 明确报错、纯构造不连 Broker、≤ 0.1 s）。
 425 条 = 424 条 + BACnet <MASKED_PERSON_001>越界拒绝一条（`bacnet/device_instance_out_of_range_is_rejected`，
 deviceInstance 22 位实例号越界与非数字明确报错、纯构造不启 UDP、≤ 0.1 s）。
+426 条 = 425 条 + BACnet 数组写拒绝一条（`bacnet/write_array_point_is_rejected`，
+数组点位写逐点失败映射 Disabled、消息点名不支持、检查在建连前、纯构造不启 UDP、≤ 0.1 s）。
 419 条那一轮（只跑过 `fault/*` 组，未记耗时的中间态）跳过；以 420 条这一轮为准（见下一段）。
 418 条那一轮（补了 OPC UA 服务端能力边界两条：`opcua/server_options_are_anonymous_and_none_only`、
 `opcua/server_endpoint_advertises_only_none_and_anonymous`；配置校验矩阵补 `allowAnonymousRead=false`
@@ -171,7 +173,7 @@ NFR 的门槛是 120 s，压测用例、PBKDF2 派生与 TLS 握手是主要开�
 | `loopback/*` | 16 | Modbus 主站 ↔ 内置从站的真实链路；含**指向未监听端口的真实连接拒绝**（`SocketException` → `comm_error`、可重试、消息带出端点、且立即返回而不是等到 `connectTimeout`） |
 | `s7/*` | 33 | S7comm：17 条手算黄金帧与地址解析（TPKT/COTP 握手、PDU 协商、读/写/位读写、长度字段按传输尺寸解释（0x03–0x07 位 / 0x09 字节）、错误分类、地址字段上限、**项数字段只有一字节（256 项当场失败而不是静默截断）**），15 条主站 ↔ 内置从站回环（探活、DB/I/Q/M 读、位读写、写输入区被拒、越界落 `address_error`、bool 缺 bit 被拒、数组、按 PDU 切片、单点装不下点名失败、沉默 PLC 超时、断线重连），驱动元数据能力声明（`s7/metadata_declares_capabilities`：Id/角色/传输/寻址种类、位访问 Supported、订阅 Unsupported、通道/设备/点位字段逐项钉住），以及设备标签越界拒绝（`s7/label_out_of_range_is_rejected`：rack 0..7、slot 0..31、pduSize 240..960 越界时明确报 Unsupported、不静默截断；边界值被接受） |
 | `serial/*` | 9 | 真实伪终端上的 RTU / ASCII、半双工、帧间静默、deadline、关闭打断读；帧间静默的取值规则（低速按 3.5 字符时间缩放、>19200 bps 固定 1.75 ms）用纯函数断言，不需要 pty |
-| `bacnet/*` | 29 | BACnet/IP：16 条手算黄金帧与地址解析（BVLC/NPDU 封拆帧、NPDU 版本必须为 1、ReadProperty/WriteProperty 帧字节、I-Am 设备实例、对象标识符 10/22 位编码、应用标签往返含扩展长度（LVT=5）、类型不符拒绝、NPDU 路由控制字节拒绝、**ACK 值里出现形似关闭标签的字节也不得截断**），12 条主站 ↔ 内置从站回环（Who-Is/I-Am 探活、**按 invoke-id 配对（从站先回一条 invoke-id 不对的响应，取错会读到别的点位的值而质量仍 good）**、多对象读、bool/字符串、写后回读、unknown-object/property 落 `address_error`、沉默设备超时、**实例号核对（配了 deviceInstance 却回错设备即失败，消息带出期望实例号）**、**deviceInstance 越界与非数字拒绝（22 位实例号上限 -1..4194303 越界明确报错，-1 是「没配、不核对」哨兵、纯构造不启 UDP）**、元数据声明 object 寻址与 udp），1 条 `uic sim` 端到端（**拿 DemoConfig 的开发配置起真实从站再用真实主站读一遍：端口/transport/对象号/四个点位全 good**，值域按正弦基线核对） |
+| `bacnet/*` | 30 | BACnet/IP：16 条手算黄金帧与地址解析（BVLC/NPDU 封拆帧、NPDU 版本必须为 1、ReadProperty/WriteProperty 帧字节、I-Am 设备实例、对象标识符 10/22 位编码、应用标签往返含扩展长度（LVT=5）、类型不符拒绝、NPDU 路由控制字节拒绝、**ACK 值里出现形似关闭标签的字节也不得截断**），13 条主站 ↔ 内置从站回环（Who-Is/I-Am 探活、**按 invoke-id 配对（从站先回一条 invoke-id 不对的响应，取错会读到别的点位的值而质量仍 good）**、多对象读、bool/字符串、写后回读、**数组点位写被明确拒绝（逐点失败、映射 Disabled 而非 Bad、消息点名不支持，检查在建连前）**、unknown-object/property 落 `address_error`、沉默设备超时、**实例号核对（配了 deviceInstance 却回错设备即失败，消息带出期望实例号）**、**deviceInstance 越界与非数字拒绝（22 位实例号上限 -1..4194303 越界明确报错，-1 是「没配、不核对」哨兵、纯构造不启 UDP）**、元数据声明 object 寻址与 udp），1 条 `uic sim` 端到端（**拿 DemoConfig 的开发配置起真实从站再用真实主站读一遍：端口/transport/对象号/四个点位全 good**，值域按正弦基线核对） |
 | `mqtt/*` | 35 | 测试内 broker：CONNECT/SUBSCRIBE 字段、QoS0/1、主题渲染、重连补发、**下线设备清 retained `$state`**、**命令去重窗口用单调时钟（校时跳变不会重复执行命令）**、**过期判定用单调「多久没收到报文」（校时跳变不伪造也不放过过期）**、TLS 发布与不可信 CA 拒绝；南向驱动：主题通配匹配、JSON 字段/类型/信封取值、首次读数前 `stale`、QoS0/1 取数、点位字段覆盖、坏载荷与恢复、断线重订阅、<MASKED_PERSON_001>越界与非布尔<MASKED_PERSON_001>拒绝（`mqtt/options_reject_out_of_range_labels`：qos 0..1、keepAlive 5..600、reconnect 500..300000、staleAfter 0..86400 越界明确报错、tlsEnabled 非布尔报错，纯构造不连 Broker）、<MASKED_PERSON_001>凭据与「CA 无 TLS」拒绝、订阅被 ACL 拒绝 |
 | `template/*` | 4 | 50 实例批量生成、参数类型/缺失/未知参数拒绝、未声明占位符拒绝；**同一模板产出 Modbus 与 S7 两台设备并同时通过校验**（FR-CFG-01 验收口径） |
 | `csv/*` | 6 | 地址表达式（参考号/区域偏移/分列）、按 id 合并与冲突行号、死区模式与量程列、点位周期列、数组元素个数列 |
