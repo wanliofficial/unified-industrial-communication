@@ -31,6 +31,7 @@ internal static class BacnetLoopbackTests
         tests.Add(new TestCase("bacnet/stray_response_is_not_taken_as_value", StrayResponseIsNotTaken));
         tests.Add(new TestCase("bacnet/probe_with_wrong_device_instance_times_out", ProbeWithWrongInstance));
         tests.Add(new TestCase("bacnet/metadata_declares_object_addressing", MetadataDeclaresObjectAddressing));
+        tests.Add(new TestCase("bacnet/device_instance_out_of_range_is_rejected", DeviceInstanceOutOfRangeIsRejected));
     }
 
     private static (Channel Channel, Device Device) Setup(int port, Dictionary<string, string>? labels = null) => (
@@ -369,6 +370,54 @@ internal static class BacnetLoopbackTests
         t.Ok(channelFields.ContainsKey("transport.port") && channelFields["transport.port"].Required,
             "the port field is declared and required");
         t.Equal(47808, channelFields["transport.port"].Default, "the BACnet/IP default port is 47808");
+
+        return Task.CompletedTask;
+    }
+
+    /// <summary>
+    /// deviceInstance 是设备级标签，取值必须是 22 位非负整数（0..4194303，BACnet 对象标识符
+    /// 的实例号在报文里只占 22 位）。越界（最常见：把十进制实例号敲成超出 22 位的数）或非数字
+    /// 必须由驱动明确拒绝，而不是被静默截断成另一个实例号——截断会让核对逻辑去对一台根本不存在的
+    /// 设备，现象是「Who-Is 发了但永远等不到我要的那台 I-Am」，比当场报错难查得多。
+    ///
+    /// 为什么此前没有对应用例：模型校验器不认驱动私有标签（见 configuration.md「驱动引用」一节），
+    /// 范围检查只在驱动 Open 时由 ParseInt 做，<MASKED_PERSON_002>。deviceInstance=-1 是「没配、不核对实例号」
+    /// 的哨兵值，必须被接受。纯构造、不启 UDP 服务器，便宜。
+    /// </summary>
+    private static Task DeviceInstanceOutOfRangeIsRejected(TestContext t)
+    {
+        const int maxInstance = 0x3FFFFF; // 与 BacnetObjectId.MaxInstance 一致：22 位
+
+        // 越界：比上限大 1，必须被拒，且消息点名是哪个标签、给出合法范围。
+        var overMax = Setup(0, new Dictionary<string, string>(StringComparer.Ordinal)
+        {
+            ["deviceInstance"] = (maxInstance + 1).ToString(),
+        });
+        var overEx = t.Throws<DriverException>(() => Open(overMax.Channel, overMax.Device),
+            "deviceInstance 越界被拒");
+        t.Equal(ErrorKind.Unsupported, overEx.Kind, "越界标签报 Unsupported，不当成通讯故障");
+        t.Contains(overEx.Message, "labels.deviceInstance", "消息点名是哪个标签");
+        // 下界 -1 是「没配」哨兵，上界是 22 位实例号上限；消息把整个合法区间都给出。
+        t.Contains(overEx.Message, $"-1..{maxInstance}", "消息给出合法范围");
+
+        // 非数字也要明确报错，而不是被当成「没配」静默跳过核对。
+        var notNumber = Setup(0, new Dictionary<string, string>(StringComparer.Ordinal)
+        {
+            ["deviceInstance"] = "abc",
+        });
+        var nnEx = t.Throws<DriverException>(() => Open(notNumber.Channel, notNumber.Device),
+            "非数字 deviceInstance 被拒");
+        t.Contains(nnEx.Message, "labels.deviceInstance", "非数字也点名标签");
+
+        // -1 是「没配、不核对」的哨兵值，必须被接受；上限本身也合法。
+        foreach (var ok in new[] { "-1", maxInstance.ToString(), "0", "2002" })
+        {
+            var (ch, dev) = Setup(0, new Dictionary<string, string>(StringComparer.Ordinal)
+            {
+                ["deviceInstance"] = ok,
+            });
+            t.Ok(Open(ch, dev) is not null, $"deviceInstance={ok} 应被接受");
+        }
 
         return Task.CompletedTask;
     }
