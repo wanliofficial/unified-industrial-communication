@@ -1419,7 +1419,7 @@ func TestMetaPointFieldsCoverAllAreas(t *testing.T) {
 			have[e] = true
 		}
 		for _, want := range []string{
-			AreaIOA, AreaSingleCommand, AreaDoubleCommand,
+			AreaIOA, AreaSingleCommand, AreaDoubleCommand, AreaStepCommand,
 			AreaSetpointFloat, AreaSetpointScaled, AreaSetpointNormalized,
 		} {
 			if !have[want] {

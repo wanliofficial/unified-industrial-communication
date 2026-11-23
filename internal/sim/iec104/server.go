@@ -168,6 +168,7 @@ func (s *Server) installDefaults() {
 		{IOA: 4001, Kind: KindSingle, Bool: false, Writable: true, Command: true},
 		{IOA: 4002, Kind: KindFloat, Num: 0, Writable: true, Command: true},
 		{IOA: 4003, Kind: KindScaled, Num: 0, Writable: true, Command: true},
+		{IOA: 4004, Kind: KindStep, Num: 5, Writable: true, Command: true},
 	} {
 		s.info[i.IOA] = i
 	}
@@ -421,7 +422,7 @@ func (st *station) apply(raw []byte) error {
 		return st.counterInterrogation(a)
 	case iec104.TypeClockSync:
 		return st.confirm(a)
-	case iec104.TypeSingleCommand, iec104.TypeDoubleCommand,
+	case iec104.TypeSingleCommand, iec104.TypeDoubleCommand, iec104.TypeStepCommand,
 		iec104.TypeSetpointNormalized, iec104.TypeSetpointScaled, iec104.TypeSetpointFloat:
 		return st.command(a)
 	}
@@ -522,6 +523,11 @@ func (st *station) command(req iec104.ASDU) error {
 		case iec104.TypeSingleCommand:
 			i.Bool = ioao.Bool
 		case iec104.TypeDoubleCommand:
+			i.Num = float64(ioao.Uint)
+		case iec104.TypeStepCommand:
+			// 调节步命令的方向（1=降档/2=升档）落在 Uint。内置从站没有真实的
+			// 档位机构，这里只把方向记进 Num，便于自检命令读回确认主站发对了
+			// 方向；真实设备的档位变化由它自己的 M_ST_NA_1 上送体现。
 			i.Num = float64(ioao.Uint)
 		default:
 			i.Num = ioao.Num

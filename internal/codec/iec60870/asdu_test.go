@@ -48,6 +48,8 @@ func TestBuildParseRoundTripAllTypes(t *testing.T) {
 			Objects: []Object{{IOA: 500, Bool: true, Select: true}}},
 		{TypeID: TypeDoubleCommand, Cause: CauseActivation, CommonAddr: 7,
 			Objects: []Object{{IOA: 501, Uint: 2}}},
+		{TypeID: TypeStepCommand, Cause: CauseActivation, CommonAddr: 7,
+			Objects: []Object{{IOA: 505, Uint: 2}}},
 		{TypeID: TypeSetpointNormalized, Cause: CauseActivation, CommonAddr: 7,
 			Objects: []Object{{IOA: 502, Num: -0.5}}},
 		{TypeID: TypeSetpointScaled, Cause: CauseActivation, CommonAddr: 7,
@@ -204,6 +206,7 @@ func TestElementSizeAndClassifiers(t *testing.T) {
 		TypeSinglePointTime:      8, TypeDoublePointTime: 8, TypeClockSync: 7,
 		TypeMeasuredNormalizedTime: 10, TypeMeasuredScaledTime: 10,
 		TypeMeasuredFloatTime: 12, TypeSingleCommand: 1, TypeDoubleCommand: 1,
+		TypeStepCommand:        1,
 		TypeSetpointNormalized: 3, TypeSetpointScaled: 3, TypeSetpointFloat: 5,
 		TypeEndOfInit: 1, TypeInterrogation: 1, TypeCounterInterrogation: 1,
 	}
@@ -216,7 +219,7 @@ func TestElementSizeAndClassifiers(t *testing.T) {
 	if _, ok := ElementSize(199); ok {
 		t.Fatal("unknown type must not have a size")
 	}
-	for _, typ := range []byte{TypeInterrogation, TypeSingleCommand, TypeClockSync} {
+	for _, typ := range []byte{TypeInterrogation, TypeSingleCommand, TypeDoubleCommand, TypeStepCommand, TypeClockSync} {
 		if !IsCommandType(typ) {
 			t.Fatalf("%s must be a command", TypeName(typ))
 		}
@@ -432,6 +435,22 @@ func TestBuildCommands(t *testing.T) {
 		t.Fatalf("double command = %+v", a.Objects[0])
 	}
 
+	// 调节步命令：1=降档、2=升档，0/3 拒绝。
+	if _, err := BuildStepCommand(1, 1, 0, false); err == nil {
+		t.Fatal("step command direction 0 must be rejected")
+	}
+	if _, err := BuildStepCommand(1, 1, 3, false); err == nil {
+		t.Fatal("step command direction 3 must be rejected")
+	}
+	raw, err = BuildStepCommand(1, 6, 2, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a, _ = ParseASDU(raw)
+	if a.Objects[0].Uint != 2 || a.TypeID != TypeStepCommand {
+		t.Fatalf("step command = %+v", a.Objects[0])
+	}
+
 	if _, err := BuildSetpointNormalized(1, 1, 2, false); err == nil {
 		t.Fatal("normalized setpoint out of range must be rejected")
 	}
@@ -478,6 +497,8 @@ func TestTypeNameAndLookup(t *testing.T) {
 		"setpoint-normalized": TypeSetpointNormalized,
 		"setpoint_normalized": TypeSetpointNormalized,
 		"double-command":      TypeDoubleCommand,
+		"step-command":        TypeStepCommand,
+		"c_rc_na_1":           TypeStepCommand,
 		"counter-time":        TypeIntegratedTotalsTime,
 		"m_it_tb_1":           TypeIntegratedTotalsTime,
 		"M_IT_TB_1":           TypeIntegratedTotalsTime,

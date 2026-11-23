@@ -74,10 +74,10 @@ func iec101readCmd(args []string) {
 	probe := fs.Bool("probe", false, "只做「复位链路 + 请求链路状态」，不召唤")
 
 	// 命令下发。
-	cmdArea := fs.String("area", "", "下发命令时的对象类别：single-command | double-command | "+
+	cmdArea := fs.String("area", "", "下发命令时的对象类别：single-command | double-command | step-command | "+
 		"setpoint-float | setpoint-scaled | setpoint-normalized")
 	cmdIOA := fs.Int("cmd-ioa", 0, "下发命令的信息对象地址（IOA）")
-	write := fs.String("write", "", "下发命令的值：单/双点写 on|off|1|2；设定值写数字")
+	write := fs.String("write", "", "下发命令的值：单/双点/调节步写 on|off|1|2（调节步 1=降档 2=升档）；设定值写数字")
 	fs.Parse(args)
 
 	// 传输方式的默认值取决于「用户到底给了哪一组参数」。dlt645read 已经
@@ -503,6 +503,19 @@ func buildIEC101Write(area string, ioa int, value string) (driver.WriteRequest, 
 		default:
 			return req, fmt.Errorf("双点命令取值 %q 非法（on|off|1|2）", value)
 		}
+	case iec101drv.AreaStepCommand:
+		// 调节步命令只接受 1（降档）/2（升档）；on/off 是给人用的别名，
+		// on=升档（往大调）。
+		switch strings.ToLower(strings.TrimSpace(value)) {
+		case "on", "2", "升", "higher":
+			req.DataType = model.TypeBool
+			req.Value = model.BoolValue(true)
+		case "off", "1", "降", "lower":
+			req.DataType = model.TypeBool
+			req.Value = model.BoolValue(false)
+		default:
+			return req, fmt.Errorf("调节步命令取值 %q 非法（on|off|1|2，1=降档 2=升档）", value)
+		}
 	case iec101drv.AreaSetpointFloat,
 		iec101drv.AreaSetpointScaled,
 		iec101drv.AreaSetpointNormalized:
@@ -513,7 +526,7 @@ func buildIEC101Write(area string, ioa int, value string) (driver.WriteRequest, 
 		req.DataType = model.TypeFloat32
 		req.Value = model.NumValue(model.TypeFloat32, f)
 	default:
-		return req, fmt.Errorf("-area %q 未知（single-command | double-command | "+
+		return req, fmt.Errorf("-area %q 未知（single-command | double-command | step-command | "+
 			"setpoint-float | setpoint-scaled | setpoint-normalized）", area)
 	}
 	return req, nil

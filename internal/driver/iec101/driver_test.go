@@ -219,6 +219,30 @@ func TestWriteDoubleCommandRejectsInvalidState(t *testing.T) {
 	}
 }
 
+func TestWriteStepCommandRejectsInvalidDirection(t *testing.T) {
+	srv, err := sim.NewServer("")
+	if err != nil {
+		t.Fatalf("sim: %v", err)
+	}
+	defer srv.Close()
+
+	dev := testDevice(1, ioaPoint("step", AreaStepCommand, 4004, model.TypeUint16))
+	c := openTest(t, srv, dev)
+
+	// 0/3 是「不允许」，不是「中间态」。必须在点击那一刻就拒绝，而不是
+	// 发下去让设备静默不动。
+	_, err = c.Write(context.Background(), []driver.WriteRequest{{
+		PointID: "step", DataType: model.TypeUint16,
+		Address: dev.Points[0].Address, Value: model.NumValue(model.TypeUint16, 3),
+	}})
+	if err == nil {
+		t.Fatal("step command direction 3 must be rejected")
+	}
+	if driver.KindOf(err) != driver.ErrAddress {
+		t.Fatalf("kind = %v, want address", driver.KindOf(err))
+	}
+}
+
 func TestWriteUnknownIOAIsAddressError(t *testing.T) {
 	srv, err := sim.NewServer("")
 	if err != nil {

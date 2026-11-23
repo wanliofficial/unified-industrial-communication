@@ -241,6 +241,7 @@ const (
 	TypeMeasuredFloatTime      = iec60870.TypeMeasuredFloatTime
 	TypeSingleCommand          = iec60870.TypeSingleCommand
 	TypeDoubleCommand          = iec60870.TypeDoubleCommand
+	TypeStepCommand            = iec60870.TypeStepCommand
 	TypeSetpointNormalized     = iec60870.TypeSetpointNormalized
 	TypeSetpointScaled         = iec60870.TypeSetpointScaled
 	TypeSetpointFloat          = iec60870.TypeSetpointFloat

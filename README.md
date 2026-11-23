@@ -414,9 +414,9 @@ IEC 60870-5-104 调度主站（TCP 2404）：
 ./uic sim -protocol iec104 -listen 127.0.0.1:2404 &   # 内置 IEC 104 从站
 ./uic -config examples/iec104.json
 curl -s -H 'Authorization: Bearer dev-token-0123456789' localhost:8091/api/v1/points
-#   14 点：短浮点 42.5/7.25、标度化 1234、被取代值（uncertain）、带时标值、
-#         单点 on/off、双点 1/2、累计量每秒自增、
-#         单点命令 + 短浮点/标度化设定值 + 双点遥控（可写）
+#   17 点：短浮点 42.5/7.25、标度化 1234、被取代值（uncertain）、带时标值、
+#         单点 on/off、双点 1/2、累计量每秒自增、步位置/位串、
+#         单点命令 + 短浮点/标度化设定值 + 双点遥控 + 调节步命令（可写）
 #   自检（不需要网关）：./uic iec104read -addr 127.0.0.1:2404 -ca 1
 #   只验链路层：./uic iec104read -addr 127.0.0.1:2404 -probe
 #   下发命令：./uic iec104read -addr 127.0.0.1:2404 -area double-command -cmd-ioa 2003 -write off
@@ -435,10 +435,11 @@ IEC 104 与其它协议的根本差别是**数据由从站推上来**：建链�
 一个温度半小时不变是正常的，按时间降级会让整页看起来都不新鲜。
 
 点位用 `kind=register` 寻址，`offset` 即 IOA（1..16777215），`area` 取 `ioa` /
-`single-command` / `double-command` / `setpoint-float` / `setpoint-scaled` /
-`setpoint-normalized`。命令类型由 `area` 声明，不由 `dataType` 推导：同一个 `float32`
-可能是短浮点设定值，也可能是放大 100 倍的标度化整数。双点命令只接受 1（分）/2（合），
-0 与 3 是标准里的「不允许」，本地即拒。同一 IOA 可挂两个点位（读状态 + 写命令）。
+`single-command` / `double-command` / `step-command` / `setpoint-float` /
+`setpoint-scaled` / `setpoint-normalized`。命令类型由 `area` 声明，不由 `dataType`
+推导：同一个 `float32` 可能是短浮点设定值，也可能是放大 100 倍的标度化整数。双点命令
+只接受 1（分）/2（合），调节步命令只接受 1（降档）/2（升档），0 与 3 是标准里的
+「不允许」，本地即拒。同一 IOA 可挂两个点位（读状态 + 写命令）。
 
 `iec104read` 不依赖点表：驱动旁路表按 IOA 记录设备实际送过的原始对象（类型标识、
 传送原因、时标），初次接陌生设备时先看清「它送什么」再写点表。双点的 0/3 中间态
@@ -450,9 +451,9 @@ IEC 60870-5-101 串行远动主站（FT1.2，串口 / 串口服务器）：
 ./uic sim -protocol iec101 -listen 127.0.0.1:4001 &   # 内置 101 从站（FT1.2 over TCP 透传）
 ./uic -config examples/iec101.json
 curl -s -H 'Authorization: Bearer dev-token-0123456789' localhost:8092/api/v1/points
-#   14 点：短浮点 42.5/7.25、标度化 1234、被取代值（uncertain）、带时标值、
+#   15 点：短浮点 42.5/7.25、标度化 1234、被取代值（uncertain）、带时标值、
 #         单点 on/off、双点 1/2、累计量每秒自增（需电能量召唤）、
-#         单点命令 + 短浮点/标度化设定值 + 双点遥控（可写）
+#         单点命令 + 短浮点/标度化设定值 + 双点遥控 + 调节步命令（可写）
 #   自检（不需要网关）：./uic iec101read -addr 127.0.0.1:4001
 #   只验链路层：./uic iec101read -transport serial -port /dev/ttyUSB0 -baud 9600 -probe
 #   下发命令：./uic iec101read -addr 127.0.0.1:4001 -area double-command -cmd-ioa 2003 -write on

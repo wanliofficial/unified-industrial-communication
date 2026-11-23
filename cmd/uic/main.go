@@ -209,9 +209,11 @@ func usage() {
   uic mstpread -addr 127.0.0.1:4001 -mac 128 -type analog-value -instance 2 -write 55.5
   uic iec104read -addr 127.0.0.1:2404 -ca 1 [-ioa 1001,1002] [-json]
   uic iec104read -addr 127.0.0.1:2404 -area single-command -cmd-ioa 4001 -write on
+  uic iec104read -addr 127.0.0.1:2404 -area step-command -cmd-ioa 4004 -write on
   uic iec101read -addr 127.0.0.1:4001 [-link-addr 1] [-ca 1] [-ioa-size 2] [-json] [-raw]
   uic iec101read -transport serial -port /dev/ttyUSB0 -baud 9600 -link-addr 1 -ca 1 -probe
   uic iec101read -addr 127.0.0.1:4001 -area double-command -cmd-ioa 2003 -write on
+  uic iec101read -addr 127.0.0.1:4001 -area step-command -cmd-ioa 4004 -write off
   uic mewtocolread -addr 127.0.0.1:2000 -station 1 -area dt -offset 0 -qty 3 [-json] [-raw]
   uic mewtocolread -transport serial -port /dev/ttyUSB0 -baud 9600 -parity odd -probe
   uic mewtocolread -addr 127.0.0.1:2000 -area x -offset 1 -bit 15 -write on

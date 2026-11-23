@@ -227,6 +227,19 @@
           "dataType": "int16",
           "writable": true,
           "enabled": true
+        },
+        {
+          "id": "tap-cmd",
+          "name": "调节步命令（IOA 4004，升档=2/降档=1；true→升、false→降）",
+          "address": {
+            "kind": "register",
+            "area": "step-command",
+            "offset": 4004,
+            "bit": -1
+          },
+          "dataType": "bool",
+          "writable": true,
+          "enabled": true
         }
       ]
     }

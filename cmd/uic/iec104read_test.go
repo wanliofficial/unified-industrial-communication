@@ -51,6 +51,8 @@ func TestBuildIEC104WriteRejections(t *testing.T) {
 		{"single garbage", iec104drv.AreaSingleCommand, "maybe"},
 		{"double zero", iec104drv.AreaDoubleCommand, "0"},
 		{"double three", iec104drv.AreaDoubleCommand, "3"},
+		{"step three", iec104drv.AreaStepCommand, "3"},
+		{"step garbage", iec104drv.AreaStepCommand, "maybe"},
 		{"setpoint garbage", iec104drv.AreaSetpointFloat, "abc"},
 		{"scaled garbage", iec104drv.AreaSetpointScaled, ""},
 	}
@@ -80,6 +82,9 @@ func TestFormatObject(t *testing.T) {
 		{"scaled", iec104codec.TypeMeasuredScaled, iec104codec.Object{Num: 1234}, "1234"},
 		{"scaled negative", iec104codec.TypeMeasuredScaledTime, iec104codec.Object{Num: -7}, "-7"},
 		{"counter", iec104codec.TypeIntegratedTotals, iec104codec.Object{Uint: 900}, "900"},
+		{"step lower", iec104codec.TypeStepCommand, iec104codec.Object{Uint: 1}, "降档 (1)"},
+		{"step higher", iec104codec.TypeStepCommand, iec104codec.Object{Uint: 2}, "升档 (2)"},
+		{"step not permitted", iec104codec.TypeStepCommand, iec104codec.Object{Uint: 3}, "不允许 (3)"},
 	}
 	for _, c := range cases {
 		if got := formatObject(c.typeID, c.obj); got != c.want {

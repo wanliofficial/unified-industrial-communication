@@ -49,6 +49,7 @@ const (
 	TypeMeasuredFloatTime      byte = 36  // M_ME_TF_1
 	TypeSingleCommand          byte = 45  // C_SC_NA_1
 	TypeDoubleCommand          byte = 46  // C_DC_NA_1
+	TypeStepCommand            byte = 47  // C_RC_NA_1（调节步命令，升降压）
 	TypeSetpointNormalized     byte = 48  // C_SE_NA_1
 	TypeSetpointScaled         byte = 49  // C_SE_NB_1
 	TypeSetpointFloat          byte = 50  // C_SE_NC_1
@@ -166,6 +167,25 @@ const (
 	bcrInvalid  = 1 << 7 // IV：读数无效
 )
 
+// RCO（Regulating step command，C_RC_NA_1）的位定义。
+//
+// RCO 是调节步命令，用来驱动有载调压分接开关这类「升一档 / 降一档」的执行机构：
+// 主站发一条脉冲让设备自己换档，而不是设定一个目标档位。信息对象只有 1 字节，
+// 布局为 S/E（bit7）| QU（bit2..6）| RCS（bit0..1），没有品质描述符。
+//
+// RCS 是两位状态码：1=降一档（next step lower）、2=升一档（next step higher）。
+// 0 与 3 在标准里都是「不允许（not permitted）」——与双点命令把 0/3 当中态、
+// 设定值的越界值拒绝同理，这里同样拒绝，让误用在点击那一刻就报错，而不是把
+// 一个设备明说「不接受」的方向当合法命令发下去（好设备回否定确认，差设备静默
+// 不动，现场都表现为「按钮点了没反应」）。
+const (
+	rcsMask     = 0x03 // RCO 低 2 位：调节步方向
+	rcsLower    = 0x01 // next step lower：降一档
+	rcsHigher   = 0x02 // next step higher：升一档
+	rcsNotPermA = 0x00 // not permitted（保留值之一）
+	rcsNotPermB = 0x03 // not permitted（保留值之一）
+)
+
 // decodeBCRQuality 把 BCR 的标志位折成本包的品质位集合。
 //
 // IV 是「这个读数不能信」，必须落成 QInvalid（→ bad）。CY/CA 不是坏值，
@@ -267,7 +287,7 @@ func encodeQDS(q Quality) byte {
 //	标度化     Num（int16）/ Quality / Time
 //	短浮点     Num / Quality / Time
 //	累计量     Uint / Raw（BCR 序号，低 5 位）/ Quality（CY/CA/IV）
-//	命令       Bool 或 Uint 或 Num / Select / Qualifier
+//	命令       Bool 或 Uint 或 Num / Select / Qualifier / Uint（调节步方向）
 //	召唤/同步  Qualifier 或 Time
 type Object struct {
 	IOA       uint32
@@ -560,7 +580,7 @@ func HasIOA(typeID byte) bool {
 func ElementSize(typeID byte) (int, bool) {
 	switch typeID {
 	case TypeSinglePoint, TypeDoublePoint, TypeEndOfInit,
-		TypeSingleCommand, TypeDoubleCommand,
+		TypeSingleCommand, TypeDoubleCommand, TypeStepCommand,
 		TypeInterrogation, TypeCounterInterrogation:
 		return 1, true
 	case TypeStepPosition:
@@ -591,7 +611,7 @@ func ElementSize(typeID byte) (int, bool) {
 // IsCommandType 表示该 ASDU 是控制方向（主站 → 从站）。
 func IsCommandType(typeID byte) bool {
 	switch typeID {
-	case TypeSingleCommand, TypeDoubleCommand,
+	case TypeSingleCommand, TypeDoubleCommand, TypeStepCommand,
 		TypeSetpointNormalized, TypeSetpointScaled, TypeSetpointFloat,
 		TypeInterrogation, TypeCounterInterrogation, TypeClockSync:
 		return true
@@ -700,6 +720,13 @@ func decodeElement(typeID byte, b []byte) (Object, int, error) {
 		return Object{Bool: b[0]&0x01 != 0, Select: b[0]&0x80 != 0, Qualifier: (b[0] >> 2) & 0x1F}, size, nil
 	case TypeDoubleCommand:
 		return Object{Uint: uint32(b[0] & 0x03), Select: b[0]&0x80 != 0, Qualifier: (b[0] >> 2) & 0x1F}, size, nil
+	case TypeStepCommand:
+		// RCO：bit0..1 = RCS（调节步方向），bit2..6 = QU，bit7 = S/E。
+		return Object{
+			Uint:      uint32(b[0] & rcsMask),
+			Select:    b[0]&0x80 != 0,
+			Qualifier: (b[0] >> 2) & 0x1F,
+		}, size, nil
 	case TypeSetpointNormalized:
 		return Object{Num: normalized(b[0:2]), Select: b[2]&0x80 != 0, Qualifier: b[2] & 0x7F}, size, nil
 	case TypeSetpointScaled:
@@ -798,6 +825,15 @@ func appendElement(b []byte, typeID byte, o Object) ([]byte, error) {
 	case TypeDoubleCommand:
 		if o.Uint > 3 {
 			return nil, fmt.Errorf("double command value %d exceeds 2 bits", o.Uint)
+		}
+		v := byte(o.Uint) | (o.Qualifier&0x1F)<<2
+		if o.Select {
+			v |= 0x80
+		}
+		return append(b, v), nil
+	case TypeStepCommand:
+		if o.Uint != rcsLower && o.Uint != rcsHigher {
+			return nil, fmt.Errorf("regulating step direction %d not permitted (want 1=lower, 2=higher)", o.Uint)
 		}
 		v := byte(o.Uint) | (o.Qualifier&0x1F)<<2
 		if o.Select {
@@ -1002,6 +1038,20 @@ func BuildDoubleCommand(ca uint16, ioa uint32, state byte, selectFlag bool) ([]b
 	return BuildASDU(ASDU{
 		TypeID: TypeDoubleCommand, Cause: CauseActivation, CommonAddr: ca,
 		Objects: []Object{{IOA: ioa, Uint: uint32(state), Select: selectFlag}},
+	})
+}
+
+// BuildStepCommand 构造调节步命令（C_RC_NA_1）。step 取 1（降一档）或 2（升一档）。
+//
+// 与单点/双点命令一样，0 与 3 是「不允许」：这里直接拒绝，让误用在构造那一刻
+// 就暴露，而不是把一个设备明说「不接受」的方向当合法命令发下去。
+func BuildStepCommand(ca uint16, ioa uint32, step byte, selectFlag bool) ([]byte, error) {
+	if step != rcsLower && step != rcsHigher {
+		return nil, fmt.Errorf("step command direction must be 1 (lower) or 2 (higher), got %d", step)
+	}
+	return BuildASDU(ASDU{
+		TypeID: TypeStepCommand, Cause: CauseActivation, CommonAddr: ca,
+		Objects: []Object{{IOA: ioa, Uint: uint32(step), Select: selectFlag}},
 	})
 }
 

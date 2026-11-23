@@ -54,6 +54,7 @@ func newH(t *testing.T) *h {
 			pt("cmd", AreaSingleCommand, 4001, model.TypeBool, true),
 			pt("sp", AreaSetpointFloat, 4002, model.TypeFloat32, true),
 			pt("sps", AreaSetpointScaled, 4003, model.TypeInt16, true),
+			pt("step", AreaStepCommand, 4004, model.TypeUint16, true),
 		},
 	}
 	hh := &h{t: t, srv: srv, drv: New(),
@@ -335,6 +336,41 @@ func TestWriteScaledSetpoint(t *testing.T) {
 	waitFor(t, "sim to apply the scaled setpoint", func() bool {
 		info, ok := hh.srv.Value(4003)
 		return ok && info.Num == 777
+	})
+}
+
+// TestWriteStepCommand 调节步命令：bool true→升档(2)、false→降档(1)，
+// sim 把方向记进 Num。这是步位置监视（M_ST_NA_1）的控制对偶——能看档位，
+// 也能下升/降命令。
+func TestWriteStepCommand(t *testing.T) {
+	hh := newH(t)
+	c := hh.open()
+	hh.waitRead(c, "temp")
+
+	res, err := c.Write(context.Background(), []driver.WriteRequest{{
+		PointID: "step", DataType: model.TypeUint16,
+		Address: model.Address{Kind: model.AddressRegister, Area: AreaStepCommand, Offset: 4004, Bit: -1},
+		Value:   model.BoolValue(true), // true → 升档
+	}})
+	if err != nil || !res[0].OK {
+		t.Fatalf("write step higher = %+v %v", res, err)
+	}
+	waitFor(t, "sim to record the higher step", func() bool {
+		info, ok := hh.srv.Value(4004)
+		return ok && info.Num == 2
+	})
+
+	res, err = c.Write(context.Background(), []driver.WriteRequest{{
+		PointID: "step", DataType: model.TypeUint16,
+		Address: model.Address{Kind: model.AddressRegister, Area: AreaStepCommand, Offset: 4004, Bit: -1},
+		Value:   model.BoolValue(false), // false → 降档
+	}})
+	if err != nil || !res[0].OK {
+		t.Fatalf("write step lower = %+v %v", res, err)
+	}
+	waitFor(t, "sim to record the lower step", func() bool {
+		info, ok := hh.srv.Value(4004)
+		return ok && info.Num == 1
 	})
 }
 

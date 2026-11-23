@@ -44,9 +44,9 @@ func iec104readCmd(args []string) {
 	raw := fs.Bool("raw", false, "额外显示传送原因、限定词与原始品质位")
 	probe := fs.Bool("probe", false, "只做 STARTDT + TESTFR 往返，不召唤")
 
-	cmdArea := fs.String("area", "", "下发命令时的对象类别：single-command | double-command | setpoint-float | setpoint-scaled | setpoint-normalized")
+	cmdArea := fs.String("area", "", "下发命令时的对象类别：single-command | double-command | step-command | setpoint-float | setpoint-scaled | setpoint-normalized")
 	cmdIOA := fs.Int("cmd-ioa", 0, "下发命令的信息对象地址（IOA）")
-	write := fs.String("write", "", "下发命令的值：单/双点写 on|off|1|2；设定值写数字")
+	write := fs.String("write", "", "下发命令的值：单/双点/调节步写 on|off|1|2（调节步 1=降档 2=升档）；设定值写数字")
 	fs.Parse(args)
 
 	caVal := *ca
@@ -280,6 +280,18 @@ func formatObject(typeID byte, o iec104codec.Object) string {
 		return strconv.FormatUint(uint64(o.Uint), 10)
 	case iec104codec.TypeBitstring:
 		return fmt.Sprintf("0x%08X", o.Uint)
+	case iec104codec.TypeStepCommand:
+		// 调节步命令的方向：1=降档、2=升档、0/3=不允许。诊断原样显示设备发来的
+		// 方向码，不替它翻译成「升/降」——翻译一旦写错（0/3 的中间态）就把一个
+		// 设备明说「不允许」的值显示成某个真实方向。
+		switch o.Uint {
+		case 1:
+			return "降档 (1)"
+		case 2:
+			return "升档 (2)"
+		default:
+			return fmt.Sprintf("不允许 (%d)", o.Uint)
+		}
 	case iec104codec.TypeClockSync:
 		return ""
 	}
@@ -426,6 +438,19 @@ func buildIEC104Write(area string, ioa int, value string) (driver.WriteRequest, 
 		default:
 			return req, fmt.Errorf("双点命令取值 %q 非法（on|off|1|2）", value)
 		}
+	case iec104drv.AreaStepCommand:
+		// 调节步命令只接受 1（降档）/2（升档）；on/off 是给人用的别名，
+		// on=升档（往大调）。
+		switch strings.ToLower(strings.TrimSpace(value)) {
+		case "on", "2", "升", "higher":
+			req.DataType = model.TypeBool
+			req.Value = model.BoolValue(true)
+		case "off", "1", "降", "lower":
+			req.DataType = model.TypeBool
+			req.Value = model.BoolValue(false)
+		default:
+			return req, fmt.Errorf("调节步命令取值 %q 非法（on|off|1|2，1=降档 2=升档）", value)
+		}
 	case iec104drv.AreaSetpointFloat,
 		iec104drv.AreaSetpointScaled,
 		iec104drv.AreaSetpointNormalized:
@@ -436,7 +461,7 @@ func buildIEC104Write(area string, ioa int, value string) (driver.WriteRequest, 
 		req.DataType = model.TypeFloat32
 		req.Value = model.NumValue(model.TypeFloat32, f)
 	default:
-		return req, fmt.Errorf("-area %q 未知（single-command | double-command | "+
+		return req, fmt.Errorf("-area %q 未知（single-command | double-command | step-command | "+
 			"setpoint-float | setpoint-scaled | setpoint-normalized）", area)
 	}
 	return req, nil

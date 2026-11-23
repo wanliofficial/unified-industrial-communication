@@ -75,6 +75,7 @@ const (
 	AreaIOA                = iec60870.AreaIOA
 	AreaSingleCommand      = iec60870.AreaSingleCommand
 	AreaDoubleCommand      = iec60870.AreaDoubleCommand
+	AreaStepCommand        = iec60870.AreaStepCommand
 	AreaSetpointFloat      = iec60870.AreaSetpointFloat
 	AreaSetpointScaled     = iec60870.AreaSetpointScaled
 	AreaSetpointNormalized = iec60870.AreaSetpointNormalized
@@ -168,7 +169,7 @@ func (d *Driver) Meta() driver.Meta {
 			{Name: "address.kind", Label: "寻址方式", Type: "enum", Required: true,
 				Enum: []string{"register"}, Scope: "point"},
 			{Name: "address.area", Label: "对象类别", Type: "enum", Required: true,
-				Enum: []string{AreaIOA, AreaSingleCommand, AreaDoubleCommand,
+				Enum: []string{AreaIOA, AreaSingleCommand, AreaDoubleCommand, AreaStepCommand,
 					AreaSetpointFloat, AreaSetpointScaled, AreaSetpointNormalized},
 				Scope: "point",
 				Help:  "ioa 为监视方向；其余为命令类型，写入时按它下发"},
@@ -178,7 +179,7 @@ func (d *Driver) Meta() driver.Meta {
 				Enum: []string{"bool", "int16", "uint16", "int32", "uint32", "int64", "uint64",
 					"float32", "float64"}, Scope: "point"},
 		},
-		Description: "IEC 60870-5-104 主站：总召唤 + 突发上送 + 单点/双点/设定值命令",
+		Description: "IEC 60870-5-104 主站：总召唤 + 突发上送 + 单点/双点/调节步/设定值命令",
 	}
 }
 

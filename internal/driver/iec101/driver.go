@@ -19,7 +19,7 @@
 //     是这类驱动最常见的一处谎报。
 //
 // 能力边界：只做非平衡式主站、FT1.2 三种帧、总召唤、第 1/2 级轮询、
-// 单点/双点/设定值命令与激活确认；不做平衡式（从站可主动发送）、不做
+// 单点/双点/调节步/设定值命令与激活确认；不做平衡式（从站可主动发送）、不做
 // 文件传输、不做时钟同步的写路径、不做冗余通道切换、不做带时标的命令。
 // 承载既可以是真实串口，也可以是串口服务器的 TCP 透传——两者的分帧完全
 // 相同，内置从站因此可以同时服务自检命令与自动化测试。
@@ -49,6 +49,7 @@ const (
 	AreaIOA                = iec60870.AreaIOA
 	AreaSingleCommand      = iec60870.AreaSingleCommand
 	AreaDoubleCommand      = iec60870.AreaDoubleCommand
+	AreaStepCommand        = iec60870.AreaStepCommand
 	AreaSetpointFloat      = iec60870.AreaSetpointFloat
 	AreaSetpointScaled     = iec60870.AreaSetpointScaled
 	AreaSetpointNormalized = iec60870.AreaSetpointNormalized
@@ -166,7 +167,7 @@ func (d *Driver) Meta() driver.Meta {
 				Enum: []string{"bool", "int16", "uint16", "int32", "uint32", "int64", "uint64",
 					"float32", "float64"}, Scope: "point"},
 		},
-		Description: "IEC 60870-5-101 主站（FT1.2 非平衡轮询）：总召唤 + 事件轮询 + 单点/双点/设定值命令",
+		Description: "IEC 60870-5-101 主站（FT1.2 非平衡轮询）：总召唤 + 事件轮询 + 单点/双点/调节步/设定值命令",
 	}
 }
 

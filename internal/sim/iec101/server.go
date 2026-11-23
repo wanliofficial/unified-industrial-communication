@@ -235,6 +235,7 @@ func (s *Server) installDefaults() {
 		{IOA: 4001, Kind: KindSingle, Bool: false, Writable: true, Command: true},
 		{IOA: 4002, Kind: KindFloat, Num: 0, Writable: true, Command: true},
 		{IOA: 4003, Kind: KindScaled, Num: 0, Writable: true, Command: true},
+		{IOA: 4004, Kind: KindStep, Num: 5, Writable: true, Command: true},
 	} {
 		s.info[i.IOA] = i
 	}
@@ -586,7 +587,7 @@ func (st *station) apply(payload []byte) error {
 		out.Cause = iec60870.CauseActivationCon
 		st.enqueue1(out)
 		return nil
-	case iec60870.TypeSingleCommand, iec60870.TypeDoubleCommand,
+	case iec60870.TypeSingleCommand, iec60870.TypeDoubleCommand, iec60870.TypeStepCommand,
 		iec60870.TypeSetpointNormalized, iec60870.TypeSetpointScaled, iec60870.TypeSetpointFloat:
 		return st.command(a)
 	}
@@ -662,6 +663,11 @@ func (st *station) command(a iec60870.ASDU) error {
 		case iec60870.TypeSingleCommand:
 			i.Bool = o.Bool
 		case iec60870.TypeDoubleCommand:
+			i.Num = float64(o.Uint)
+		case iec60870.TypeStepCommand:
+			// 调节步方向（1=降档/2=升档）落在 Uint；内置从站没有真实档位
+			// 机构，只把方向记进 Num 供自检读回，真实档位变化由设备的
+			// M_ST_NA_1 上送体现。
 			i.Num = float64(o.Uint)
 		default:
 			i.Num = o.Num

@@ -145,3 +145,66 @@ func TestStepPositionBitLayout(t *testing.T) {
 		t.Fatalf("QDS 的 IV 位未置位：0x%02X", elem[1])
 	}
 }
+
+// TestStepCommandTypeID 钉死调节步命令 C_RC_NA_1 的类型号 = 47（0x2F）。
+//
+// 47 是 IEC 60870-5-101/-104 一致规定的：S/E+QU+RCO 的 1 字节调节步命令。
+// 这个号曾与 45/46/48 的命令族相邻，容易在补类型时被记错，所以和步位置的
+// 类型号一样钉死。
+func TestStepCommandTypeID(t *testing.T) {
+	if TypeStepCommand != 47 {
+		t.Fatalf("C_RC_NA_1 类型号 = %d，标准规定 47", TypeStepCommand)
+	}
+	if !IsCommandType(TypeStepCommand) {
+		t.Fatal("调节步命令必须是命令类型（IsCommandType）")
+	}
+	if IsData(TypeStepCommand) {
+		t.Fatal("调节步命令不能同时是数据类型（IsData）")
+	}
+	if size, ok := ElementSize(TypeStepCommand); !ok || size != 1 {
+		t.Fatalf("调节步命令信息对象宽度 = %d/%v，want 1/true", size, ok)
+	}
+}
+
+// TestStepCommandBitLayout 逐字节钉死 RCO 布局：bit7=S/E、bit2..6=QU、bit0..1=RCS。
+func TestStepCommandBitLayout(t *testing.T) {
+	// 升档（RCS=2）、选择位（S/E=1）、QU=0x05。
+	raw := BuildFrame(TypeStepCommand, 1, Object{Uint: 2, Select: true, Qualifier: 0x05})
+	// 信息对象只有 1 字节（RCO），没有 IOA 之外的元素；取 ASDU 最后一字节。
+	rco := raw[len(raw)-1]
+	if rco&rcsMask != rcsHigher {
+		t.Fatalf("RCS = %d，want 2（升档）", rco&rcsMask)
+	}
+	if rco&0x80 == 0 {
+		t.Fatal("S/E（选择位 bit7）未置位")
+	}
+	if (rco>>2)&0x1F != 0x05 {
+		t.Fatalf("QU = %#x，want 0x05", (rco>>2)&0x1F)
+	}
+}
+
+// TestStepCommandDirectionRoundTrip 升/降两档方向必须无损往返，且 0/3 被拒。
+func TestStepCommandDirectionRoundTrip(t *testing.T) {
+	for _, dir := range []byte{rcsLower, rcsHigher} {
+		raw, err := BuildASDU(ASDU{TypeID: TypeStepCommand, Cause: CauseActivation, CommonAddr: 1,
+			Objects: []Object{{IOA: 505, Uint: uint32(dir)}}})
+		if err != nil {
+			t.Fatalf("direction %d: build: %v", dir, err)
+		}
+		out, err := ParseASDU(raw)
+		if err != nil {
+			t.Fatalf("direction %d: parse: %v", dir, err)
+		}
+		if out.Objects[0].Uint != uint32(dir) {
+			t.Fatalf("direction %d round-trip = %d", dir, out.Objects[0].Uint)
+		}
+	}
+	// 0 与 3 是「不允许」：编码必须拒绝，不能把设备明说「不接受」的方向当
+	// 合法命令发下去（双点命令把 0/3 当中态、设定值的越界值拒绝同理）。
+	for _, bad := range []uint32{0, 3, 4, 99} {
+		if _, err := BuildASDU(ASDU{TypeID: TypeStepCommand, Cause: CauseActivation, CommonAddr: 1,
+			Objects: []Object{{IOA: 505, Uint: bad}}}); err == nil {
+			t.Fatalf("direction %d 必须被拒绝（not permitted）", bad)
+		}
+	}
+}

@@ -31,6 +31,7 @@ const (
 	AreaIOA                = "ioa"                 // 监视方向，写入时按 dataType 推导命令类型
 	AreaSingleCommand      = "single-command"      // 单点命令
 	AreaDoubleCommand      = "double-command"      // 双点命令
+	AreaStepCommand        = "step-command"        // 调节步命令（升/降一档）
 	AreaSetpointFloat      = "setpoint-float"      // 短浮点设定值命令
 	AreaSetpointScaled     = "setpoint-scaled"     // 标度化设定值命令
 	AreaSetpointNormalized = "setpoint-normalized" // 归一化设定值命令
@@ -39,7 +40,7 @@ const (
 // Areas 返回全部合法的对象类别，供配置界面枚举。
 func Areas() []string {
 	return []string{AreaIOA, AreaSingleCommand, AreaDoubleCommand,
-		AreaSetpointFloat, AreaSetpointScaled, AreaSetpointNormalized}
+		AreaStepCommand, AreaSetpointFloat, AreaSetpointScaled, AreaSetpointNormalized}
 }
 
 // Plan 是一个点位的应用层规划结果。
@@ -66,7 +67,7 @@ func PlanPoint(p driver.PointRef, proto string, maxIOA uint32) (*Plan, error) {
 	}
 	area := strings.ToLower(strings.TrimSpace(p.Address.Area))
 	switch area {
-	case AreaIOA, AreaSingleCommand, AreaDoubleCommand,
+	case AreaIOA, AreaSingleCommand, AreaDoubleCommand, AreaStepCommand,
 		AreaSetpointFloat, AreaSetpointScaled, AreaSetpointNormalized:
 	default:
 		return nil, driver.E(driver.ErrAddress, "open", "",
@@ -214,6 +215,35 @@ func DoubleState(v model.Value) (byte, bool) {
 	return 0, false
 }
 
+// StepDirection 把平台值映射成调节步命令的 RCS 两位方向码。
+//
+// 调节步命令驱动有载调压分接开关这类「升一档 / 降一档」的执行机构，方向码
+// 只有两个合法值：1=降一档（next step lower）、2=升一档（next step higher）。
+// 0 与 3 在标准里是「不允许（not permitted）」，与双点命令把 0/3 当中态、
+// 设定值的越界值拒绝同理，这里同样拒绝：让误用在点击那一刻就报错，而不是
+// 把设备明说「不接受」的方向当合法命令发下去（好设备回否定确认，差设备静默
+// 不动，现场都表现为「按钮点了没反应」）。
+//
+// 平台映射：布尔 true→升档（higher）、false→降档（lower），与双点命令
+// true=合 的直觉一致（「true 往大调」）；数值则必须是 1 或 2。
+func StepDirection(v model.Value) (byte, bool) {
+	if v.Type == model.TypeBool {
+		if v.Bool {
+			return rcsHigher, true
+		}
+		return rcsLower, true
+	}
+	f, ok := Numeric(v)
+	if !ok || f != float64(int(f)) {
+		return 0, false
+	}
+	switch int(f) {
+	case rcsLower, rcsHigher:
+		return byte(f), true
+	}
+	return 0, false
+}
+
 // BuildCommand 构造一条控制方向的 ASDU（以太网承载的固定剖面）。
 func BuildCommand(area string, ioa uint32, dataType model.DataType,
 	req driver.WriteRequest, ca uint16) ([]byte, model.Value, error) {
@@ -275,6 +305,16 @@ func CommandASDU(area string, ioa uint32, dataType model.DataType,
 		}
 		return ASDU{TypeID: TypeDoubleCommand, Cause: CauseActivation, CommonAddr: ca,
 			Objects: []Object{{IOA: ioa, Uint: uint32(state)}}}, req.Value, nil
+	case AreaStepCommand:
+		dir, ok := StepDirection(req.Value)
+		if !ok {
+			return bad("point %q: step command requires bool or numeric 1 (lower) / 2 (higher), got %+v",
+				req.PointID, req.Value)
+		}
+		// 回填值用方向码本身：设备确认后、突发上送到达前，读回的就是这条
+		// 「升/降一档」命令的方向，与双点/单点命令回填请求值同理。
+		return ASDU{TypeID: TypeStepCommand, Cause: CauseActivation, CommonAddr: ca,
+			Objects: []Object{{IOA: ioa, Uint: uint32(dir)}}}, model.NumValue(dataType, float64(dir)), nil
 	case AreaSetpointFloat:
 		f, ok := Numeric(req.Value)
 		if !ok {

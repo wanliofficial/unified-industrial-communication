@@ -2336,7 +2336,7 @@ ASDU 头 6 字节：
 
 | 类型 | 宽度 | 说明 |
 |---|---|---|
-| 单点 / 双点 / 命令（单点、双点、归一化、标度化、短浮点） | 1 / 1 / 1 / 1 | 状态值 + 品质（命令还带 S/E 选择位） |
+| 单点 / 双点 / 命令（单点、双点、调节步、归一化、标度化、短浮点） | 1 / 1 / 1 / 1 / 1 / 1 | 状态值或方向码 + 品质（命令还带 S/E 选择位） |
 | 步位置（M_ST_NA_1） | 2 | VTI（值 0..127 + 暂态位 T） + 1 字节 QDS |
 | 32 位位串（M_BO_NA_1） | 4 | 32 位，bit0 = data[0] 的 LSB，无品质描述符 |
 | 归一化 / 标度化 | 3 | int16 + 1 字节品质 |
@@ -2485,6 +2485,7 @@ ASDU；把它们全部收完再返回 `Open`，会让每次重连的耗时与设
 | `ioa` | 监视 | 读上送值；若该点可写，按 `dataType` 推导命令类型 |
 | `single-command` | 控制 | 单点命令（`dataType=bool`） |
 | `double-command` | 控制 | 双点命令（`dataType=uint16`，值 1/2） |
+| `step-command` | 控制 | 调节步命令（`C_RC_NA_1`，升/降一档；`dataType=bool` 或 `uint16`） |
 | `setpoint-float` | 控制 | 短浮点设定值 |
 | `setpoint-scaled` | 控制 | 标度化设定值（int16） |
 | `setpoint-normalized` | 控制 | 归一化设定值（-1..1） |
@@ -2523,6 +2524,16 @@ ASDU；把它们全部收完再返回 `Open`，会让每次重连的耗时与设
 把它们当合法值发下去，好设备会回否定确认，差设备会静默不动，两种情况在现场都
 表现为「按钮点了没反应」。驱动因此在本地就拒绝，让错误在点击的那一刻暴露出来。
 `on`/`off` 是给人用的别名，落到线上仍然是 2/1。
+
+**调节步命令（`step-command`，`C_RC_NA_1`）驱动有载调压分接开关这类「升一档 /
+降一档」的执行机构，发的是脉冲而不是目标档位。** 信息对象只有 1 字节 RCO：bit7
+是选择位 S/E、bit2..6 是限定词 QU、bit0..1 是方向码 RCS。方向码只有两个合法值
+1（降一档 next step lower）与 2（升一档 next step higher），0 与 3 同样是标准里
+的「不允许」——和双点命令把 0/3 当中态、设定值的越界值拒绝同理，驱动在本地即拒。
+平台映射：布尔 `true`→升档（2）、`false`→降档（1），与双点命令 `true`=合 的直觉
+一致（「true 往大调」）；数值则必须是 1 或 2。它是步位置监视（`M_ST_NA_1`）的
+控制对偶：监视方向能看分接头在第几档，命令方向能下升/降档脉冲。带时标的命令变体
+（如 `C_RC_TA_1`）与带时标的监视变体一样不在本实现范围，收到显式拒绝。
 
 **写入成功后先填本地缓存，质量标 `uncertain`。** 设备会在几十毫秒后把新状态
 突发上送，但紧接着的读回确认可能在这个窗口里发生。不填缓存的话，读回确认会读到
@@ -2632,7 +2643,7 @@ t2**。只按 t2 判断，密集上送时对端的窗口会被拖住；只按 w 
 | 主站驱动 | `internal/driver/iec104`（`Meta`/`Open`/`Read`/`Write`/`Probe`，内部 `startDataTransfer`/`interrogate`/`counterInterrogate`/`readLoop`/`keeper`/`dispatch`/`buildCommand`/`Observed`） |
 | 内置从站 | `internal/sim/iec104`（`NewServer`/`SetValue`/`Value`/`Objects`/`SetCommonAddr`/`SetAutoIncrement`/`BadFrames`） |
 | CLI | `uic iec104read -addr 127.0.0.1:2404 -ca 1` |
-| 示例 | `examples/iec104.json`（16 点位：短浮点/标度化/取代值/带时标/单点/双点/累计量/步位置/位串 + 单点命令/短浮点设定值/标度化设定值/双点遥控） |
+| 示例 | `examples/iec104.json`（17 点位：短浮点/标度化/取代值/带时标/单点/双点/累计量/步位置/位串 + 单点命令/短浮点设定值/标度化设定值/双点遥控/调节步命令） |
 
 内置从站默认对象表（公共地址 1）：
 
@@ -2705,7 +2716,7 @@ TCP 能连上、STARTDT 能过、TESTFR 能往返，之后才轮到 ASDU 的问�
 
 | 层 | 用例 |
 |---|---|
-| `codec/iec104` | APCI 三种帧型的金帧、长度字段语义、U 帧功能码低两位、I 帧空载荷拒绝、ASDU 头与 SQ、IOA 24 位、全部元素宽度、归一化/标度化/短浮点往返、归一化满量程不回绕且往返不漂移、CP56Time2a 保留位掩码、CP56Time2a 拒绝非法日期（2 月 30 日 / 4 月 31 日 / 非闰年 2 月 29 日 / 日 0 / 时 24）、SIQ/DIQ 品质位移、QDS 品质位按标准位序逐位解出（IV@bit7→bad、NT@bit6→stale、SB/BL@bit4/5→uncertain、OV@bit0→uncertain；旧 `& 0x1F` 裸读会让 IV 漏报成 good）、累计量 BCR 的 IV/CY/CA 标志位（解码 + 重编码 + 折成 bad/uncertain）、带时标累计量 M_IT_TB_1（BCR + CP56Time2a，12 字节，时标必须消费否则后续对象错位）、步位置 M_ST_NA_1（VTI 值 + 暂态位 T 不污染取值/品质、原始字节存 Raw 供无损回写、超 7 位拒绝）、32 位位串 M_BO_NA_1（小端 bit0 在最低字节、无品质）、M_IT_TB_1 类型号钉死为 37（防误标回 32）、命令构造（选择位）、类型/原因名与别名、越界与截断 |
+| `codec/iec104` | APCI 三种帧型的金帧、长度字段语义、U 帧功能码低两位、I 帧空载荷拒绝、ASDU 头与 SQ、IOA 24 位、全部元素宽度、归一化/标度化/短浮点往返、归一化满量程不回绕且往返不漂移、CP56Time2a 保留位掩码、CP56Time2a 拒绝非法日期（2 月 30 日 / 4 月 31 日 / 非闰年 2 月 29 日 / 日 0 / 时 24）、SIQ/DIQ 品质位移、QDS 品质位按标准位序逐位解出（IV@bit7→bad、NT@bit6→stale、SB/BL@bit4/5→uncertain、OV@bit0→uncertain；旧 `& 0x1F` 裸读会让 IV 漏报成 good）、累计量 BCR 的 IV/CY/CA 标志位（解码 + 重编码 + 折成 bad/uncertain）、带时标累计量 M_IT_TB_1（BCR + CP56Time2a，12 字节，时标必须消费否则后续对象错位）、步位置 M_ST_NA_1（VTI 值 + 暂态位 T 不污染取值/品质、原始字节存 Raw 供无损回写、超 7 位拒绝）、32 位位串 M_BO_NA_1（小端 bit0 在最低字节、无品质）、M_IT_TB_1 类型号钉死为 37（防误标回 32）、调节步命令 C_RC_NA_1（类型 47，RCO 方向 1=降/2=升、0 与 3 拒绝、S/E 选择位与 QU 限定词、bool→升档/降档映射）、命令构造（选择位）、类型/原因名与别名、越界与截断 |
 | `driver/iec104` | 元数据与能力声明、地址规划与全部拒绝路径、STARTDT 握手与超时、站召唤与电能量召唤、I 帧乱序断链、S 帧越界确认、U 帧六个功能码、发送窗口打满与确认放行、k 窗口按 N(R) 精确递减（部分确认不放大窗口、迟到的旧确认与越界确认被忽略）、连接关闭中断等待、keeper 空闲探测与判死、确认时机两条判据（达到 w 立即确认 / 单帧等满 t2 再确认）、命令五种类型与三类错误、否定确认分类、缓存填充与不污染、旁路表（含未配置 IOA、一对多、上限、丢弃计数）、纯控制方向点位的说明文字、回填不覆盖更新的突发上送、**部分失败契约**（混合成功返回 nil / 全失败上抛 / 被取消的 ctx 仍补齐逐点样本 / 链路判死全部标 bad 且样本数与 spans 一致）、**写入批次中止**（链路判死与链路级超时都立即收尾并逐项给质量码，不逐条等超时）、**命令等待响应断链**（不挂满设备超时）、发送超时携带 `timeout` 质量码 |
 | `sim/iec104` | 真实 TCP 回环：STARTDT 之前不上送、STARTDT/STOPDT/TESTFR 六个 U 帧、站召唤完整快照（含 SQ=1 分组不截断）、累计量走另一条召唤、命令三段式与否定确认、只读对象拒绝、未知类型/公共地址、乱序断链、S 帧接受、垃圾帧计数、ASDU 解析失败只计数、多连接各自维护序号、突发上送、累计量自增、`Close` 幂等；`-race` 下无数据竞争（`autoIncrement` 与 `station.started` 各自归其锁保护，锁外读会被 race 检测器抓到） |
 
@@ -5828,8 +5839,8 @@ internal/driver/iec104/     平衡式主站
 
 - **ASDU 层**（`asdu.go`、`names.go`）：类型标识、VSQ、传送原因、元素编解码、
   `Profile{OrgSize, CASize, IOASize}`、按剖面构造请求；
-- **点位语义层**（`point.go`）：对象类别（`ioa` 与五种命令）、`PlanPoint`、`Convert`、
-  `QualityOf`、`Worse`、`Numeric`、`DoubleState`、`BuildCommandProfile`。
+- **点位语义层**（`point.go`）：对象类别（`ioa` 与六种命令）、`PlanPoint`、`Convert`、
+  `QualityOf`、`Worse`、`Numeric`、`DoubleState`、`StepDirection`、`BuildCommandProfile`。
 
 为什么点位语义也要共享：「双点 0/3 是非法状态而不是中间态」「归一化设定值必须落在
 -1..1」「未声明命令类型的可写点按平台类型推导命令」——这些判断与承载方式无关，写
@@ -5838,7 +5849,7 @@ internal/driver/iec104/     平衡式主站
 
 两个承载的地址形态完全相同，因此点表层用同一份策略：`PolicyFor("iec101")` 与
 `PolicyFor("iec104")` 都返回 `{Width: WidthNone, AllowRegister: true, RegisterAreas: iecAreas}`，
-白名单是 `ioa` 加五种命令类别。`WidthNone` 不只是「推导长度时返回 0」——它反转了
+白名单是 `ioa` 加六种命令类别。`WidthNone` 不只是「推导长度时返回 0」——它反转了
 两条寄存器协议的习惯（`length` 不该出现、布尔量不该带位号），细节见 §3.10.17.14。
 
 #### 3.10.17.14 点表这一层：`WidthNone` 反转了两条寄存器习惯
