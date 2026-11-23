@@ -488,9 +488,9 @@ func TestAXDRStringLengthSemantics(t *testing.T) {
 	// 之前会一路返回 ErrIncomplete（「等更多字节」），掩盖了真正的串位；
 	// 现在必须显式报 ErrAXDR，且不静默返回一个缺了兄弟的「成功」结构。
 	corrupt := []byte{
-		TagStructure, 0x02,       // 声称 2 个元素
+		TagStructure, 0x02, // 声称 2 个元素
 		TagOctetString, 0x80, 0x01, 0x02, // 元素 1：声称 128 字节，实际只 2 字节
-		TagInteger, 0x2A,              // 元素 2：本应存在的兄弟，被长度吞掉
+		TagInteger, 0x2A, // 元素 2：本应存在的兄弟，被长度吞掉
 	}
 	_, _, err = Decode(corrupt)
 	if !errors.Is(err, ErrAXDR) {
