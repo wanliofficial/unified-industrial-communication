@@ -29,10 +29,16 @@ type Server struct {
 	mu       sync.Mutex
 	tags     map[string]*tag
 	sessions map[uint32]bool
+	// links 记录 Forward Open 建立的 Class 3 连接：连接 ID → 连接序列号。
+	links    map[uint32]uint16
 	nextID   uint32
+	nextConn uint32
 	closed   chan struct{}
 	// msp 允许测试关掉 Multiple Service Packet，验证主站的退回路径。
 	msp bool
+	// fragSize 是单帧能带回的最大数据字节数。真机的连接尺寸有限，超过就回
+	// 0x06（partial transfer）。测试可以把它调小，用很小的标签也能逼出分片。
+	fragSize int
 }
 
 type tag struct {
@@ -55,9 +61,12 @@ func NewServer(addr string) (*Server, error) {
 		log:      slog.Default(),
 		tags:     map[string]*tag{},
 		sessions: map[uint32]bool{},
+		links:    map[uint32]uint16{},
 		nextID:   0x1000,
+		nextConn: 0x20000000,
 		closed:   make(chan struct{}),
 		msp:      true,
+		fragSize: 400,
 	}
 	s.installDefaults()
 	go s.serve()
@@ -74,6 +83,19 @@ func (s *Server) SetMultipleSupported(v bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.msp = v
+}
+
+// SetFragmentSize 设置单帧最大数据字节数（默认 400）。
+//
+// 调小之后，普通的小标签也会触发 0x06（partial transfer），可以在没有大
+// 标签的情况下验证主站的分片路径。
+func (s *Server) SetFragmentSize(n int) {
+	if n < 1 {
+		n = 1
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.fragSize = n
 }
 
 // Close 停止监听与自增计数器。
@@ -281,6 +303,38 @@ func (s *Server) respond(h enipcodec.Header, body []byte) ([]byte, bool) {
 			return mustPacket(enipcodec.CmdSendRRData, h.Session, 0x03, h.Context, nil), true
 		}
 		return mustPacket(enipcodec.CmdSendRRData, h.Session, 0, h.Context, payload), true
+
+	case enipcodec.CmdSendUnitData:
+		s.mu.Lock()
+		valid := s.sessions[h.Session]
+		s.mu.Unlock()
+		if !valid {
+			return mustPacket(enipcodec.CmdSendUnitData, h.Session, 0x64, h.Context, nil), true
+		}
+		connID, seq, cip, err := enipcodec.ParseSendUnitData(body)
+		if err != nil {
+			return mustPacket(enipcodec.CmdSendUnitData, h.Session, 0x03, h.Context, nil), true
+		}
+		s.mu.Lock()
+		_, linked := s.links[connID]
+		s.mu.Unlock()
+		var reply []byte
+		if !linked {
+			// 连接不存在（从未建立或被 Forward Close 关掉）：回 CIP 0x07
+			// （connection lost），让主站知道该重开连接。
+			svc := byte(0)
+			if req, perr := enipcodec.ParseRequest(cip); perr == nil {
+				svc = req.Service
+			}
+			reply = mustReply(svc, 0x07, nil, nil)
+		} else {
+			reply = s.dispatch(cip)
+		}
+		payload, err := enipcodec.BuildSendUnitData(connID, seq, reply)
+		if err != nil {
+			return mustPacket(enipcodec.CmdSendUnitData, h.Session, 0x03, h.Context, nil), true
+		}
+		return mustPacket(enipcodec.CmdSendUnitData, h.Session, 0, h.Context, payload), true
 	}
 	return mustPacket(h.Command, h.Session, 0x01, h.Context, nil), true
 }
@@ -307,6 +361,14 @@ func (s *Server) dispatch(cip []byte) []byte {
 		return s.readTag(req)
 	case enipcodec.ServiceWriteTag:
 		return s.writeTag(req)
+	case enipcodec.ServiceReadFrag:
+		return s.readFrag(req)
+	case enipcodec.ServiceWriteFrag:
+		return s.writeFrag(req)
+	case enipcodec.ServiceForwardOpen, enipcodec.ServiceLargeForwardOpen:
+		return s.forwardOpen(req)
+	case enipcodec.ServiceForwardClose:
+		return s.forwardClose(req)
 	case enipcodec.ServiceMultiple:
 		s.mu.Lock()
 		ok := s.msp
@@ -366,11 +428,177 @@ func (s *Server) readTag(req enipcodec.Request) []byte {
 		data = data[:n*size]
 	}
 
-	body := make([]byte, 4, 4+len(data))
+	// 单帧放不下就只回前 fragSize 字节并置 0x06，与真机的 partial transfer
+	// 行为一致；主站随后会用 0x52 从偏移处继续读。
+	limit := s.fragmentSize()
+	status := byte(0)
+	if len(data) > limit {
+		data = data[:limit]
+		status = 0x06
+	}
+	// 应答体是「类型 + 数据」，没有元素数字段。
+	body := make([]byte, 2, 2+len(data))
 	binary.LittleEndian.PutUint16(body[0:], uint16(typ))
-	binary.LittleEndian.PutUint16(body[2:], uint16(n))
 	body = append(body, data...)
+	return mustReply(req.Service, status, nil, body)
+}
+
+func (s *Server) fragmentSize() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.fragSize
+}
+
+// readFrag 处理 Read Tag Fragmented（0x52）。
+func (s *Server) readFrag(req enipcodec.Request) []byte {
+	name, err := enipcodec.ParseSymbolicPath(req.Path)
+	if err != nil {
+		return mustReply(req.Service, 0x04, nil, nil)
+	}
+	if len(req.Data) < 6 {
+		return mustReply(req.Service, 0x03, nil, nil)
+	}
+	count := int(binary.LittleEndian.Uint16(req.Data[0:]))
+	offset := int(binary.LittleEndian.Uint32(req.Data[2:]))
+	if count < 1 || offset < 0 {
+		return mustReply(req.Service, 0x03, nil, nil)
+	}
+
+	s.mu.Lock()
+	t, ok := s.tags[strings.ToLower(name)]
+	if !ok {
+		s.mu.Unlock()
+		return mustReply(req.Service, 0x05, nil, nil)
+	}
+	typ := t.typ
+	if typ == enipcodec.TypeSTRING {
+		if count != 1 {
+			s.mu.Unlock()
+			return mustReply(req.Service, 0x15, nil, nil)
+		}
+	} else if count > t.count {
+		s.mu.Unlock()
+		return mustReply(req.Service, 0x15, nil, nil)
+	}
+	data := append([]byte(nil), t.data...)
+	if typ != enipcodec.TypeSTRING {
+		size := enipcodec.TypeSize(typ)
+		if size <= 0 {
+			s.mu.Unlock()
+			return mustReply(req.Service, 0x03, nil, nil)
+		}
+		data = data[:count*size]
+	}
+	limit := s.fragSize
+	s.mu.Unlock()
+
+	if offset > len(data) {
+		return mustReply(req.Service, 0x03, nil, nil)
+	}
+	part := data[offset:]
+	status := byte(0)
+	if len(part) > limit {
+		part = part[:limit]
+		status = 0x06
+	}
+	body := make([]byte, 2, 2+len(part))
+	binary.LittleEndian.PutUint16(body[0:], uint16(typ))
+	body = append(body, part...)
+	return mustReply(req.Service, status, nil, body)
+}
+
+// writeFrag 处理 Write Tag Fragmented（0x53）。
+//
+// count 是整个标签的总元素数，data 只带本片字节；写应答没有数据区。
+func (s *Server) writeFrag(req enipcodec.Request) []byte {
+	name, err := enipcodec.ParseSymbolicPath(req.Path)
+	if err != nil {
+		return mustReply(req.Service, 0x04, nil, nil)
+	}
+	if len(req.Data) < 8 {
+		return mustReply(req.Service, 0x03, nil, nil)
+	}
+	typ := byte(binary.LittleEndian.Uint16(req.Data[0:]))
+	count := int(binary.LittleEndian.Uint16(req.Data[2:]))
+	offset := int(binary.LittleEndian.Uint32(req.Data[4:]))
+	payload := req.Data[8:]
+	if count < 1 || offset < 0 || len(payload) == 0 {
+		return mustReply(req.Service, 0x03, nil, nil)
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	t, ok := s.tags[strings.ToLower(name)]
+	if !ok {
+		return mustReply(req.Service, 0x05, nil, nil)
+	}
+	if typ != t.typ {
+		return mustReply(req.Service, 0x03, nil, nil)
+	}
+	if typ == enipcodec.TypeSTRING {
+		if count != 1 {
+			return mustReply(req.Service, 0x15, nil, nil)
+		}
+	} else if count > t.count {
+		return mustReply(req.Service, 0x15, nil, nil)
+	}
+	if offset+len(payload) > len(t.data) {
+		return mustReply(req.Service, 0x13, nil, nil)
+	}
+	copy(t.data[offset:], payload)
+	return mustReply(req.Service, 0, nil, nil)
+}
+
+// forwardOpen 处理 Forward Open / Large Forward Open，登记一条 Class 3 连接。
+func (s *Server) forwardOpen(req enipcodec.Request) []byte {
+	if len(req.Data) < 36 {
+		return mustReply(req.Service, 0x03, nil, nil)
+	}
+	ot := binary.LittleEndian.Uint32(req.Data[2:])
+	to := binary.LittleEndian.Uint32(req.Data[6:])
+	serial := binary.LittleEndian.Uint16(req.Data[10:])
+	vendor := binary.LittleEndian.Uint16(req.Data[12:])
+	orig := binary.LittleEndian.Uint32(req.Data[14:])
+
+	s.mu.Lock()
+	if ot == 0 {
+		ot = s.newConnID()
+	}
+	if to == 0 || to == 0xFFFFFFFF {
+		to = s.newConnID()
+	}
+	s.links[ot] = serial
+	s.mu.Unlock()
+
+	body := make([]byte, 26)
+	binary.LittleEndian.PutUint32(body[0:], ot)
+	binary.LittleEndian.PutUint32(body[4:], to)
+	binary.LittleEndian.PutUint16(body[8:], serial)
+	binary.LittleEndian.PutUint16(body[10:], vendor)
+	binary.LittleEndian.PutUint32(body[12:], orig)
 	return mustReply(req.Service, 0, nil, body)
+}
+
+// forwardClose 处理 Forward Close，按连接序列号释放连接。
+func (s *Server) forwardClose(req enipcodec.Request) []byte {
+	if len(req.Data) < 10 {
+		return mustReply(req.Service, 0x03, nil, nil)
+	}
+	serial := binary.LittleEndian.Uint16(req.Data[2:])
+	s.mu.Lock()
+	for id, sn := range s.links {
+		if sn == serial {
+			delete(s.links, id)
+		}
+	}
+	s.mu.Unlock()
+	return mustReply(req.Service, 0, nil, nil)
+}
+
+// newConnID 分配连接 ID。调用方必须持有 s.mu。
+func (s *Server) newConnID() uint32 {
+	s.nextConn++
+	return s.nextConn
 }
 
 func (s *Server) writeTag(req enipcodec.Request) []byte {
@@ -412,10 +640,8 @@ func (s *Server) writeTag(req enipcodec.Request) []byte {
 		}
 		copy(t.data, data[:count*size])
 	}
-	body := make([]byte, 4)
-	binary.LittleEndian.PutUint16(body[0:], uint16(typ))
-	binary.LittleEndian.PutUint16(body[2:], uint16(count))
-	return mustReply(req.Service, 0, nil, body)
+	// 写应答没有数据区，只有状态。
+	return mustReply(req.Service, 0, nil, nil)
 }
 
 func (s *Server) multiple(req enipcodec.Request) []byte {

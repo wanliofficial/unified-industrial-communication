@@ -24,6 +24,7 @@ import (
 	"math"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	enipcodec "uic/internal/codec/enip"
@@ -132,9 +133,21 @@ type conn struct {
 	// msp 记录设备是否支持 Multiple Service Packet。一次不支持之后不再尝试，
 	// 避免每轮采集都先失败一次再退回。
 	msp bool
+
+	// link 是分片读写需要的 Class 3 显式连接。普通 Read/Write Tag 走
+	// 未连接 SendRRData，不依赖它；只有单帧放不下时才惰性建立。
+	link linkState
 }
 
 func (c *conn) Close() error {
+	c.mu.Lock()
+	if c.link.open {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		c.closeLink(ctx)
+		cancel()
+	}
+	c.mu.Unlock()
+
 	// UnRegisterSession 没有响应，失败也不影响关闭。
 	if c.session != 0 {
 		pkt, err := enipcodec.BuildPacket(enipcodec.CmdUnregister, c.session, 0, c.nextContext(), nil)
@@ -307,13 +320,198 @@ func (c *conn) send(ctx context.Context, cip []byte) (enipcodec.Reply, error) {
 }
 
 // ---------------------------------------------------------------------------
+// Class 3 显式连接（分片读写用）
+// ---------------------------------------------------------------------------
+
+// ensureLink 建立 Forward Open 连接；已经建立时直接返回。
+//
+// Forward Open 本身走未连接 SendRRData（Connection Manager 不接受自己刚
+// 建立的连接来开连接），之后的 0x52/0x53 才走 SendUnitData。
+func (c *conn) ensureLink(ctx context.Context) error {
+	if c.link.open {
+		return nil
+	}
+	path, err := enipcodec.MessageRouterPath()
+	if err != nil {
+		return driver.E(driver.ErrInternal, "forward-open", c.cfg.Device.ID, err.Error(), false, err)
+	}
+	serial := nextLinkSerial()
+	req, err := enipcodec.BuildForwardOpen(enipcodec.ForwardOpen{
+		OTConnectionID:    uint32(serial),
+		TOConnectionID:    0xFFFFFFFF, // 由目标分配；这里只占位
+		SerialNumber:      serial,
+		VendorID:          originatorVendor,
+		OriginatorSerial:  originatorSerial,
+		OTRPI:             linkRPI,
+		TORPI:             linkRPI,
+		ConnectionSize:    connSize,
+		Priority:          linkPriority,
+		TimeoutTicks:      linkTimeoutTicks,
+		TimeoutMultiplier: linkTimeoutMultiplier,
+		ConnectionPath:    path,
+	})
+	if err != nil {
+		return driver.E(driver.ErrInternal, "forward-open", c.cfg.Device.ID, err.Error(), false, err)
+	}
+	reply, err := c.send(ctx, req)
+	if err != nil {
+		return err
+	}
+	res, err := enipcodec.ParseForwardOpenReply(reply)
+	if err != nil {
+		var se *enipcodec.StatusError
+		if errors.As(err, &se) && (se.Code == 0x08 || se.Code == 0x14) {
+			return driver.E(driver.ErrUnsupported, "forward-open", c.cfg.Device.ID,
+				fmt.Sprintf("device rejected Forward Open (status 0x%02X); a Class 3 connection is required for fragmented tag access", se.Code),
+				false, err)
+		}
+		return wrapStatus(err)
+	}
+	ot := res.OTConnectionID
+	if ot == 0 {
+		// 极少数实现把 0 解释成「沿用发起方的建议值」。0 不是可用的连接 ID，
+		// 直接拿去发 SendUnitData 只会收到「连接不存在」。
+		ot = uint32(serial)
+	}
+	c.link = linkState{
+		open:       true,
+		otID:       ot,
+		toID:       res.TOConnectionID,
+		serial:     serial,
+		vendor:     originatorVendor,
+		origSerial: originatorSerial,
+	}
+	return nil
+}
+
+// closeLink 发送 Forward Close 并清空本地连接状态。失败时仍然清空：
+// 调用方要么在关闭链路，要么即将重开连接。
+func (c *conn) closeLink(ctx context.Context) {
+	if !c.link.open {
+		return
+	}
+	st := c.link
+	c.link = linkState{}
+	req, err := enipcodec.BuildForwardClose(linkPriority, linkTimeoutTicks, st.serial, st.vendor, st.origSerial)
+	if err != nil {
+		return
+	}
+	reply, err := c.send(ctx, req)
+	if err != nil {
+		return
+	}
+	_ = enipcodec.ParseForwardCloseReply(reply)
+}
+
+// sendUnit 在已建立的连接上发送一条 CIP 报文。
+func (c *conn) sendUnit(ctx context.Context, cip []byte) (enipcodec.Reply, error) {
+	if !c.link.open {
+		return enipcodec.Reply{}, driver.E(driver.ErrInternal, "send-unit", c.cfg.Device.ID,
+			"connected send without an open connection", false, nil)
+	}
+	c.link.seq++
+	payload, err := enipcodec.BuildSendUnitData(c.link.otID, c.link.seq, cip)
+	if err != nil {
+		return enipcodec.Reply{}, driver.E(driver.ErrInternal, "encode", c.cfg.Device.ID, err.Error(), false, err)
+	}
+	ctxBytes := c.nextContext()
+	pkt, err := enipcodec.BuildPacket(enipcodec.CmdSendUnitData, c.session, 0, ctxBytes, payload)
+	if err != nil {
+		return enipcodec.Reply{}, driver.E(driver.ErrInternal, "encode", c.cfg.Device.ID, err.Error(), false, err)
+	}
+	_, body, err := c.roundTrip(ctx, enipcodec.CmdSendUnitData, ctxBytes, pkt)
+	if err != nil {
+		return enipcodec.Reply{}, err
+	}
+	_, _, raw, err := enipcodec.ParseSendUnitData(body)
+	if err != nil {
+		return enipcodec.Reply{}, driver.E(driver.ErrProtocol, "decode", c.cfg.Device.ID, err.Error(), false, err)
+	}
+	reply, err := enipcodec.ParseReply(raw)
+	if err != nil {
+		return enipcodec.Reply{}, driver.E(driver.ErrProtocol, "decode", c.cfg.Device.ID, err.Error(), false, err)
+	}
+	return reply, nil
+}
+
+// sendConnected 发送一条需要连接的 CIP 报文。设备回 0x07（connection lost）
+// 时重开一次连接再发：连接可能因为空闲超时被目标单方面释放，这属于可自愈
+// 的链路事件，不应该让整轮采集失败。
+func (c *conn) sendConnected(ctx context.Context, cip []byte) (enipcodec.Reply, error) {
+	var last enipcodec.Reply
+	for attempt := 0; attempt < 2; attempt++ {
+		if err := c.ensureLink(ctx); err != nil {
+			return enipcodec.Reply{}, err
+		}
+		reply, err := c.sendUnit(ctx, cip)
+		if err != nil {
+			return enipcodec.Reply{}, err
+		}
+		if reply.Status != 0x07 {
+			return reply, nil
+		}
+		last = reply
+		c.link = linkState{}
+	}
+	return last, nil
+}
+
+// ---------------------------------------------------------------------------
 // 读
 // ---------------------------------------------------------------------------
 
-// maxReadBytes 是一次 Read Tag 的保守上限。CIP 连接的标准报文尺寸通常
-// 是 504 字节；超过后设备会回 0x06（partial transfer）。与其让设备报错，
-// 不如在驱动侧明确拒绝并给出「缩小 length」的提示。
-const maxReadBytes = 400
+// maxReadBytes 已移除：单帧放不下的读改写走 Read Tag Fragmented（0x52），
+// 不再用 400 字节的硬上限把大数组/长字符串拒之门外。
+//
+// 分片路径由 Class 3 显式连接承载。下面这组常量决定连接尺寸与单片预算：
+// 一个连接报文除了数据还要装 CPF/序列号/CIP 应答头，所以连接尺寸要比
+// 单片数据大出一截。
+const (
+	// connSize 是 Forward Open 声明的连接尺寸（字节）。
+	connSize = 500
+	// fragChunk 是单片数据字节数。读请求 400 字节数据 + 类型头/应答头
+	// 约 410 字节，仍小于 connSize；写请求同理。
+	fragChunk = 400
+	// maxTransferBytes 是单个点位允许传输的总量上限。分片理论上能读 4 GiB
+	// （32 位 offset），但没有上限的误配（address.length 写成 1e9）会让一次
+	// 采集占满内存与超时预算。超过就显式拒绝，而不是慢慢读到天荒地老。
+	maxTransferBytes = 1 << 20
+)
+
+// Class 3 显式连接的参数。取值与主流开源实现一致：RPI 2 s、低优先级、
+// 超时乘数 7。厂商号/序列号只用于标识发起方，设备在应答里原样回显。
+const (
+	originatorVendor      = 0x1234
+	originatorSerial      = 0x55494301 // "UIC" + 1
+	linkPriority          = 0x0A
+	linkTimeoutTicks      = 0x0E
+	linkTimeoutMultiplier = 0x07
+	linkRPI               = 2_000_000 // 微秒
+)
+
+// linkSerialSeq 保证同一进程内的连接序列号不重复。Forward Open/Close 靠
+// (序列号, 厂商号, 发起方序列号) 三元组配对，重复会让关闭请求指向别人的连接。
+var linkSerialSeq uint32
+
+func nextLinkSerial() uint16 {
+	for {
+		v := atomic.AddUint32(&linkSerialSeq, 1)
+		if s := uint16(v); s != 0 {
+			return s
+		}
+	}
+}
+
+// linkState 是一条 Class 3 显式连接的本地状态。
+type linkState struct {
+	open       bool
+	otID       uint32 // O→T 连接 ID：SendUnitData 地址条目使用
+	toID       uint32
+	serial     uint16
+	vendor     uint16
+	origSerial uint32
+	seq        uint16 // Connected Data Item 序列号
+}
 
 func (c *conn) Read(ctx context.Context, spans []driver.ReadSpan) ([]driver.RawSample, error) {
 	c.mu.Lock()
@@ -415,20 +613,7 @@ func (c *conn) readSpan(ctx context.Context, span driver.ReadSpan) ([]driver.Raw
 			}
 			continue
 		}
-		s, err := decodeRead(plan, sent[i].reply)
-		if nm, ok := err.(*needMore); ok {
-			// bytes 点位的元素宽度只能从应答里学到；学到之后按实际宽度
-			// 重新请求一次，避免把 int32 数组当 SINT 读（那会直接读到
-			// 类型不匹配，或者更糟：读回半截数据）。
-			req, berr := enipcodec.BuildReadTag(plan.point.Address.Area, uint16(nm.count))
-			if berr != nil {
-				err = driver.E(driver.ErrAddress, "read", c.cfg.Device.ID, berr.Error(), false, berr)
-			} else if reply, rerr := c.send(ctx, req); rerr != nil {
-				err = rerr
-			} else {
-				s, err = decodeRead(plan, reply)
-			}
-		}
+		s, err := c.finishRead(ctx, plan, sent[i].reply)
 		if err != nil {
 			out = append(out, errSample(plan.point.ID, err))
 			if firstErr == nil {
@@ -439,6 +624,46 @@ func (c *conn) readSpan(ctx context.Context, span driver.ReadSpan) ([]driver.Raw
 		out = append(out, s)
 	}
 	return out, firstErr
+}
+
+// finishRead 把一条读应答变成样本。
+//
+// 两个特殊出口：
+//   - 状态 0x06（partial transfer）：单帧放不下，改走 Read Tag Fragmented；
+//   - bytes 点位学到的元素宽度不够覆盖 address.length：按实际宽度重读。
+func (c *conn) finishRead(ctx context.Context, plan pointPlan, reply enipcodec.Reply) (driver.RawSample, error) {
+	var (
+		typ  byte
+		data []byte
+		err  error
+	)
+	if reply.Status == 0x06 {
+		// 0x06（partial transfer）：首帧已带回一小片数据，必须改走 Read Tag
+		// Fragmented 把它读完。此时还不知道元素宽度，先把首片的数据字节数当
+		// offset 续读，最后再交给 decodeData 解释。
+		typ, data, _, perr := enipcodec.ParseReadTagFragReply(reply)
+		if perr != nil {
+			return driver.RawSample{}, wrapStatus(perr)
+		}
+		typ, data, err = c.readFragments(ctx, plan.point.Address.Area, plan.count, typ, data)
+		if err != nil {
+			return driver.RawSample{}, err
+		}
+		return decodeData(plan, typ, data)
+	}
+	typ, data, err = enipcodec.ParseReadTagReply(reply)
+	if err != nil {
+		return driver.RawSample{}, wrapStatus(err)
+	}
+	s, err := decodeData(plan, typ, data)
+	if nm, ok := err.(*needMore); ok {
+		typ, data, err = c.readFragments(ctx, plan.point.Address.Area, nm.count, typ, data)
+		if err != nil {
+			return driver.RawSample{}, err
+		}
+		return decodeData(plan, typ, data)
+	}
+	return s, err
 }
 
 type batchReply struct {
@@ -555,6 +780,7 @@ type pointPlan struct {
 	elemSize int
 	skip     int // 应答数据里要跳过的字节数（offset × 元素宽度）
 	want     int // 要取用的字节数
+	count    int // 请求里的元素数（分片续读时要原样带上）
 	bit      int
 	// buildErr 记录该点位构造请求时的错误（标签名/长度/类型配错）。读时逐点
 	// 标坏它自己，不影响同 span 的其它点位。
@@ -601,6 +827,10 @@ func buildRead(p driver.PointRef) (pointPlan, []byte, error) {
 			return pointPlan{}, nil, driver.E(driver.ErrAddress, "read", "",
 				fmt.Sprintf("point %q: bytes requires address.length (byte count)", p.ID), false, nil)
 		}
+		if n > maxTransferBytes {
+			return pointPlan{}, nil, driver.E(driver.ErrAddress, "read", "",
+				fmt.Sprintf("point %q: %d bytes exceed the %d-byte transfer limit", p.ID, n, maxTransferBytes), false, nil)
+		}
 		plan.kind = planBytes
 		plan.want = n
 	case model.TypeBool:
@@ -638,13 +868,6 @@ func buildRead(p driver.PointRef) (pointPlan, []byte, error) {
 	} else if plan.kind == planBoolTag || plan.kind == planBoolBit {
 		count = p.Address.Offset + 1
 	}
-	if plan.kind == planNumeric {
-		if count*max(1, plan.elemSize) > maxReadBytes {
-			return pointPlan{}, nil, driver.E(driver.ErrAddress, "read", "",
-				fmt.Sprintf("point %q: %d elements exceed the %d-byte read limit; split the point or use a smaller length",
-					p.ID, count, maxReadBytes), false, nil)
-		}
-	}
 	if count < 1 || count > 0xFFFF {
 		// CIP 的 element count 是 16 位。offset 过大时 uint16(count) 会回绕成
 		// 另一个合法值，读到的就是错误的元素区间（随后解码才报错，诊断成
@@ -652,6 +875,7 @@ func buildRead(p driver.PointRef) (pointPlan, []byte, error) {
 		return pointPlan{}, nil, driver.E(driver.ErrAddress, "read", "",
 			fmt.Sprintf("point %q: element offset %d exceeds the 16-bit Read Tag element count", p.ID, p.Address.Offset), false, nil)
 	}
+	plan.count = count
 	req, err := enipcodec.BuildReadTag(tag, uint16(count))
 	if err != nil {
 		return pointPlan{}, nil, driver.E(driver.ErrAddress, "read", "",
@@ -685,15 +909,17 @@ func cipTypeOf(t model.DataType) (byte, bool) {
 }
 
 func decodeRead(plan pointPlan, reply enipcodec.Reply) (driver.RawSample, error) {
-	typ, count, data, err := enipcodec.ParseReadTagReply(reply)
+	typ, data, err := enipcodec.ParseReadTagReply(reply)
 	if err != nil {
 		return driver.RawSample{}, wrapStatus(err)
 	}
+	return decodeData(plan, typ, data)
+}
+
+// decodeData 按点位计划解释「类型 + 数据」。分片续读与普通读共用它，
+// 保证两条路径对同一份字节的理解完全一致。
+func decodeData(plan pointPlan, typ byte, data []byte) (driver.RawSample, error) {
 	p := plan.point
-	if count < 1 {
-		return driver.RawSample{}, driver.E(driver.ErrProtocol, "decode", "",
-			fmt.Sprintf("point %q: device returned 0 elements", p.ID), false, nil)
-	}
 	switch plan.kind {
 	case planBoolTag:
 		if typ != enipcodec.TypeBOOL {
@@ -745,10 +971,9 @@ func decodeRead(plan pointPlan, reply enipcodec.Reply) (driver.RawSample, error)
 			// 学到宽度之后必须再核一次上限：第一次请求只有 1 个元素，
 			// 不可能在 buildRead 阶段就知道实际要读多少字节。
 			need := p.Address.Offset + (plan.want+size-1)/size
-			if need*size > maxReadBytes {
+			if need*size > maxTransferBytes {
 				return driver.RawSample{}, driver.E(driver.ErrAddress, "decode", "",
-					fmt.Sprintf("point %q: %d bytes exceed the %d-byte read limit; split the point or use a smaller length",
-						p.ID, need*size, maxReadBytes), false, nil)
+					fmt.Sprintf("point %q: %d bytes exceed the %d-byte transfer limit", p.ID, need*size, maxTransferBytes), false, nil)
 			}
 			return driver.RawSample{}, &needMore{count: need}
 		}
@@ -934,6 +1159,11 @@ func (c *conn) writeString(ctx context.Context, req driver.WriteRequest) (driver
 	if capacity <= 0 {
 		capacity = 82 // 常见实现的默认 STRING 容量
 	}
+	if capacity > maxTransferBytes {
+		err := driver.E(driver.ErrAddress, "write", c.cfg.Device.ID,
+			fmt.Sprintf("point %q: STRING capacity %d exceeds the %d-byte transfer limit", req.PointID, capacity, maxTransferBytes), false, nil)
+		return writeFail(req, err), err
+	}
 	data, err := enipcodec.EncodeString(req.Value.Text, capacity)
 	if err != nil {
 		err = driver.E(driver.ErrAddress, "write", c.cfg.Device.ID, err.Error(), false, err)
@@ -947,6 +1177,11 @@ func (c *conn) writeBytes(ctx context.Context, req driver.WriteRequest) (driver.
 	if n <= 0 {
 		err := driver.E(driver.ErrAddress, "write", c.cfg.Device.ID,
 			fmt.Sprintf("point %q: bytes requires address.length (byte count)", req.PointID), false, nil)
+		return writeFail(req, err), err
+	}
+	if n > maxTransferBytes {
+		err := driver.E(driver.ErrAddress, "write", c.cfg.Device.ID,
+			fmt.Sprintf("point %q: %d bytes exceed the %d-byte transfer limit", req.PointID, n, maxTransferBytes), false, nil)
 		return writeFail(req, err), err
 	}
 	// 先读一个元素学类型与宽度：标签可能是 SINT、INT 或 DINT 数组，
@@ -1033,51 +1268,162 @@ func (c *conn) writeBit(ctx context.Context, req driver.WriteRequest) (driver.Wr
 	return c.sendWrite(ctx, req, req.Address.Area, actual, req.Address.Offset+1, payload)
 }
 
-func (c *conn) readElements(ctx context.Context, tag string, count int) ([]byte, byte, error) {
+// readAll 读 count 个元素；单帧放不下时自动改走 Read Tag Fragmented。
+//
+// 先发普通 Read Tag：大多数点位一帧就够，不必为它们付 Forward Open 的代价。
+// 设备回 0x06 时已经带回一部分数据，直接从这部分之后继续分片；回 0x11
+// （reply data too large）则一个字节都没给，从偏移 0 开始分片。
+func (c *conn) readAll(ctx context.Context, tag string, count int) (byte, []byte, error) {
+	if count < 1 || count > 0xFFFF {
+		return 0, nil, driver.E(driver.ErrAddress, "read", c.cfg.Device.ID,
+			fmt.Sprintf("tag %q: element count %d outside 1..65535", tag, count), false, nil)
+	}
 	req, err := enipcodec.BuildReadTag(tag, uint16(count))
 	if err != nil {
-		return nil, 0, driver.E(driver.ErrAddress, "read", c.cfg.Device.ID, err.Error(), false, err)
+		return 0, nil, driver.E(driver.ErrAddress, "read", c.cfg.Device.ID, err.Error(), false, err)
 	}
 	reply, err := c.send(ctx, req)
 	if err != nil {
-		return nil, 0, err
+		return 0, nil, err
 	}
-	typ, got, data, err := enipcodec.ParseReadTagReply(reply)
+	switch reply.Status {
+	case 0:
+		typ, data, err := enipcodec.ParseReadTagReply(reply)
+		if err != nil {
+			return 0, nil, wrapStatus(err)
+		}
+		return typ, data, nil
+	case 0x06:
+		typ, data, _, err := enipcodec.ParseReadTagFragReply(reply)
+		if err != nil {
+			return 0, nil, wrapStatus(err)
+		}
+		return c.readFragments(ctx, tag, count, typ, data)
+	case 0x11:
+		return c.readFragments(ctx, tag, count, 0, nil)
+	}
+	return 0, nil, wrapStatus(&enipcodec.StatusError{
+		Service: enipcodec.ServiceReadTag, Code: reply.Status, Extra: reply.Extra})
+}
+
+// readFragments 从 prefix 之后继续分片读取，直到设备不再回 0x06。
+func (c *conn) readFragments(ctx context.Context, tag string, count int, typ byte, prefix []byte) (byte, []byte, error) {
+	data := append([]byte(nil), prefix...)
+	for {
+		if len(data) > maxTransferBytes {
+			return 0, nil, driver.E(driver.ErrAddress, "read", c.cfg.Device.ID,
+				fmt.Sprintf("tag %q: fragmented read exceeds %d bytes", tag, maxTransferBytes), false, nil)
+		}
+		// offset 是「已收到的数据字节数」，不含类型头；count 始终是整个标签
+		// 要读的元素总数，两者单位不同是协议本身的规定。
+		req, err := enipcodec.BuildReadTagFrag(tag, uint16(count), uint32(len(data)))
+		if err != nil {
+			return 0, nil, driver.E(driver.ErrAddress, "read", c.cfg.Device.ID, err.Error(), false, err)
+		}
+		reply, err := c.sendConnected(ctx, req)
+		if err != nil {
+			return 0, nil, err
+		}
+		t, part, more, err := enipcodec.ParseReadTagFragReply(reply)
+		if err != nil {
+			return 0, nil, wrapStatus(err)
+		}
+		if typ == 0 {
+			typ = t
+		} else if t != typ {
+			return 0, nil, driver.E(driver.ErrProtocol, "decode", c.cfg.Device.ID,
+				fmt.Sprintf("tag %q changed type mid-fragment (%s -> %s)",
+					tag, enipcodec.TypeText(typ), enipcodec.TypeText(t)), false, nil)
+		}
+		if more && len(part) == 0 {
+			// 空片 + 0x06 会让续读原地打转，直到超时。设备坏了也不能死循环。
+			return 0, nil, driver.E(driver.ErrProtocol, "decode", c.cfg.Device.ID,
+				fmt.Sprintf("tag %q: device reported more data but returned an empty fragment", tag), false, nil)
+		}
+		data = append(data, part...)
+		if !more {
+			break
+		}
+	}
+	return typ, data, nil
+}
+
+func (c *conn) readElements(ctx context.Context, tag string, count int) ([]byte, byte, error) {
+	typ, data, err := c.readAll(ctx, tag, count)
 	if err != nil {
-		return nil, 0, wrapStatus(err)
+		return nil, 0, err
 	}
 	size := enipcodec.TypeSize(typ)
 	if size <= 0 {
 		return nil, 0, driver.E(driver.ErrAddress, "read", c.cfg.Device.ID,
 			fmt.Sprintf("tag %q returned non-atomic type %s", tag, enipcodec.TypeText(typ)), false, nil)
 	}
-	if int(got) < count || len(data) < count*size {
+	if len(data) < count*size {
 		return nil, 0, driver.E(driver.ErrProtocol, "read", c.cfg.Device.ID,
-			fmt.Sprintf("tag %q returned %d elements, want %d", tag, got, count), false, nil)
+			fmt.Sprintf("tag %q returned %d bytes, want %d elements (%d bytes)",
+				tag, len(data), count, count*size), false, nil)
 	}
 	return data[:count*size], typ, nil
 }
 
 func (c *conn) sendWrite(ctx context.Context, req driver.WriteRequest, tag string, typ byte, count int, data []byte) (driver.WriteResult, error) {
-	if len(data) > maxReadBytes {
+	if count < 1 || count > 0xFFFF {
 		err := driver.E(driver.ErrAddress, "write", c.cfg.Device.ID,
-			fmt.Sprintf("point %q: %d bytes exceed the %d-byte write limit", req.PointID, len(data), maxReadBytes), false, nil)
+			fmt.Sprintf("point %q: element count %d outside 1..65535", req.PointID, count), false, nil)
 		return writeFail(req, err), err
 	}
-	msg, err := enipcodec.BuildWriteTag(tag, typ, uint16(count), data)
-	if err != nil {
-		err = driver.E(driver.ErrAddress, "write", c.cfg.Device.ID, err.Error(), false, err)
+	if len(data) > maxTransferBytes {
+		err := driver.E(driver.ErrAddress, "write", c.cfg.Device.ID,
+			fmt.Sprintf("point %q: %d bytes exceed the %d-byte transfer limit", req.PointID, len(data), maxTransferBytes), false, nil)
 		return writeFail(req, err), err
 	}
-	reply, err := c.send(ctx, msg)
-	if err != nil {
-		return writeFail(req, err), err
-	}
-	if _, _, err := enipcodec.ParseWriteTagReply(reply); err != nil {
-		err = wrapStatus(err)
-		return writeFail(req, err), err
+	var err error
+	if len(data) <= fragChunk {
+		msg, berr := enipcodec.BuildWriteTag(tag, typ, uint16(count), data)
+		if berr != nil {
+			err = driver.E(driver.ErrAddress, "write", c.cfg.Device.ID, berr.Error(), false, berr)
+			return writeFail(req, err), err
+		}
+		var reply enipcodec.Reply
+		reply, err = c.send(ctx, msg)
+		if err != nil {
+			return writeFail(req, err), err
+		}
+		if err = enipcodec.ParseWriteTagReply(reply); err != nil {
+			err = wrapStatus(err)
+			return writeFail(req, err), err
+		}
+	} else {
+		if err = c.writeFragments(ctx, tag, typ, uint16(count), data); err != nil {
+			return writeFail(req, err), err
+		}
 	}
 	return driver.WriteResult{PointID: req.PointID, OK: true, Quality: model.QualityGood}, nil
+}
+
+// writeFragments 按 fragChunk 切片写一个超过单帧预算的值。
+//
+// count 始终是整个标签的总元素数，offset 是本片之前的字节数；数据可以
+// 在任意字节边界切开（offset 本来就是字节单位），不需要按元素对齐。
+func (c *conn) writeFragments(ctx context.Context, tag string, typ byte, count uint16, data []byte) error {
+	for off := 0; off < len(data); off += fragChunk {
+		end := off + fragChunk
+		if end > len(data) {
+			end = len(data)
+		}
+		msg, err := enipcodec.BuildWriteTagFrag(tag, typ, count, uint32(off), data[off:end])
+		if err != nil {
+			return driver.E(driver.ErrAddress, "write", c.cfg.Device.ID, err.Error(), false, err)
+		}
+		reply, err := c.sendConnected(ctx, msg)
+		if err != nil {
+			return err
+		}
+		if err := enipcodec.ParseWriteTagReply(reply); err != nil {
+			return wrapStatus(err)
+		}
+	}
+	return nil
 }
 
 func typeMismatchForWrite(req driver.WriteRequest, want, got byte) error {

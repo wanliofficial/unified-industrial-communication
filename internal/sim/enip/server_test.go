@@ -141,12 +141,12 @@ func TestReadTagOverRaw(t *testing.T) {
 
 	req, _ := enipcodec.BuildReadTag("dint_tag", 1)
 	reply, _ := c.cip(req)
-	typ, count, data, err := enipcodec.ParseReadTagReply(reply)
+	typ, data, err := enipcodec.ParseReadTagReply(reply)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if typ != enipcodec.TypeDINT || count != 1 || binary.LittleEndian.Uint32(data) != 1234 {
-		t.Fatalf("type/count/data = %02X/%d/% x", typ, count, data)
+	if typ != enipcodec.TypeDINT || len(data) != 4 || binary.LittleEndian.Uint32(data) != 1234 {
+		t.Fatalf("type/data = %02X/% x", typ, data)
 	}
 
 	// 超出标签元素数：0x15（too much data），不是静默返回一部分。

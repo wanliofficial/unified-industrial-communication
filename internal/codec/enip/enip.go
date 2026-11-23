@@ -43,7 +43,10 @@ const (
 	CmdRegisterSession uint16 = 0x0065
 	CmdUnregister      uint16 = 0x0066
 	CmdSendRRData      uint16 = 0x006F
-	CmdSendUnitData    uint16 = 0x0072
+	// CmdSendUnitData 是已连接（Class 3）显式报文的封装命令。
+	// 0x0072 是 IndicateStatus，不是 SendUnitData：用错之后设备会把整个
+	// 已连接路径当成未知命令，分片读写完全不可用。
+	CmdSendUnitData uint16 = 0x0070
 )
 
 // CPF 条目类型。
@@ -58,15 +61,20 @@ const (
 
 // CIP 服务码（只列本平台用到的）。
 const (
-	ServiceMultiple   byte = 0x0A
-	ServiceGetAttrAll byte = 0x01
-	ServiceGetAttr    byte = 0x0E
-	ServiceSetAttr    byte = 0x10
-	ServiceReadTag    byte = 0x4C
-	ServiceWriteTag   byte = 0x4D
-	ServiceReadFrag   byte = 0x52
-	ServiceWriteFrag  byte = 0x53
-	ServiceReplyMask  byte = 0x80
+	ServiceMultiple     byte = 0x0A
+	ServiceGetAttrAll   byte = 0x01
+	ServiceGetAttr      byte = 0x0E
+	ServiceSetAttr      byte = 0x10
+	ServiceForwardClose byte = 0x4E
+	ServiceReadTag      byte = 0x4C
+	ServiceWriteTag     byte = 0x4D
+	ServiceReadFrag     byte = 0x52
+	ServiceWriteFrag    byte = 0x53
+	ServiceForwardOpen  byte = 0x54
+	// ServiceLargeForwardOpen 与标准 Forward Open 的差别只在连接尺寸字段的
+	// 宽度（16 位 vs 9 位），用于超过 511 字节的连接。
+	ServiceLargeForwardOpen byte = 0x5B
+	ServiceReplyMask        byte = 0x80
 )
 
 // CIP 数据类型码（标准原子类型）。
@@ -609,28 +617,69 @@ func BuildWriteTag(tag string, dataType byte, count uint16, data []byte) ([]byte
 	return BuildRequest(ServiceWriteTag, path, payload)
 }
 
-// ParseReadTagReply 解析 Read Tag 应答：类型 + 元素数 + 原始数据。
-func ParseReadTagReply(reply Reply) (dataType byte, count uint16, data []byte, err error) {
+// ParseReadTagReply 解析 Read Tag 应答：数据类型 + 原始数据。
+//
+// 应答体**没有元素数字段**：Read Tag 应答是「类型(2) + 数据」，元素数由请求
+// 决定（1756-PM020 的逐字节示例：CC 00 00 00 C4 00 2A 00 00 00；pycomm3、
+// pylogix、cpppo 三份实现一致）。早前按「类型 + 元素数 + 数据」解析，会把
+// 第一个元素的低两字节当成元素数、把数据整体错位两个字节——对 DINT 这类
+// 4 字节类型，读回的值和长度同时是错的。
+//
+// STRUCT（0x02A0）在数据前多一个 2 字节结构句柄，类型头共 4 字节。
+func ParseReadTagReply(reply Reply) (dataType byte, data []byte, err error) {
 	if reply.Status != 0 {
-		return 0, 0, nil, &StatusError{Service: ServiceReadTag, Code: reply.Status, Extra: reply.Extra}
+		return 0, nil, &StatusError{Service: ServiceReadTag, Code: reply.Status, Extra: reply.Extra}
 	}
-	if len(reply.Data) < 4 {
-		return 0, 0, nil, errors.New("enip: Read Tag reply shorter than type/count header")
-	}
-	dataType = reply.Data[0]
-	count = binary.LittleEndian.Uint16(reply.Data[2:])
-	return dataType, count, reply.Data[4:], nil
+	return parseTagData(reply.Data)
 }
 
-// ParseWriteTagReply 解析 Write Tag 应答：类型 + 元素数。
-func ParseWriteTagReply(reply Reply) (dataType byte, count uint16, err error) {
+// ParseReadTagFragReply 解析 Read Tag Fragmented 应答。
+//
+// 与 Read Tag 的区别只有状态 0x06（partial transfer）：它表示「这一片成功、
+// 还有后续数据」。每个分片应答都带完整的类型头，offset 只对数据字节计数。
+func ParseReadTagFragReply(reply Reply) (dataType byte, data []byte, more bool, err error) {
+	switch reply.Status {
+	case 0:
+	case 0x06:
+		more = true
+	default:
+		return 0, nil, false, &StatusError{Service: ServiceReadFrag, Code: reply.Status, Extra: reply.Extra}
+	}
+	dataType, data, err = parseTagData(reply.Data)
+	return dataType, data, more, err
+}
+
+// parseTagData 拆出「类型头 + 数据」，兼容 STRUCT 的 4 字节类型头。
+func parseTagData(b []byte) (dataType byte, data []byte, err error) {
+	if len(b) < 2 {
+		return 0, nil, errors.New("enip: tag reply shorter than data type")
+	}
+	dataType = b[0]
+	off := 2
+	if dataType == TypeStruct && b[1] == 0x02 {
+		// 0x02A0：结构体类型 + 2 字节结构句柄。
+		if len(b) < 4 {
+			return 0, nil, errors.New("enip: STRUCT reply shorter than structure handle")
+		}
+		off = 4
+	}
+	return dataType, b[off:], nil
+}
+
+// ParseWriteTagReply 解析 Write Tag / Write Tag Fragmented 应答。
+//
+// 写应答**没有数据区**，只有「服务 + 保留 + 状态 + 附加状态」（1756-PM020；
+// cpppo 的从站生产代码同样不输出类型/元素数）。按「类型 + 元素数」解析会
+// 把一次成功的写入判成截断失败，调用方随后重发，对计数类点位就是重复累加。
+func ParseWriteTagReply(reply Reply) error {
 	if reply.Status != 0 {
-		return 0, 0, &StatusError{Service: ServiceWriteTag, Code: reply.Status, Extra: reply.Extra}
+		service := ServiceWriteTag
+		if reply.Service&^ServiceReplyMask == ServiceWriteFrag {
+			service = ServiceWriteFrag
+		}
+		return &StatusError{Service: service, Code: reply.Status, Extra: reply.Extra}
 	}
-	if len(reply.Data) < 4 {
-		return 0, 0, errors.New("enip: Write Tag reply shorter than type/count header")
-	}
-	return reply.Data[0], binary.LittleEndian.Uint16(reply.Data[2:]), nil
+	return nil
 }
 
 // BuildMultiple 生成 Multiple Service Packet 请求（服务 0x0A）。

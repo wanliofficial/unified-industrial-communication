@@ -343,12 +343,14 @@ curl -s -H 'Authorization: Bearer dev-token-0123456789' localhost:8089/api/v1/po
 #   位读写：./uic enipread -addr 127.0.0.1:44818 -tag DINT_TAG -type bool -bit 1 -write off
 ```
 
-EtherNet/IP 只做 **CIP 显式报文 + 符号标签**（Read/Write Tag），不做隐式 I/O（UDP 2222）、
+EtherNet/IP 只做 **CIP 显式报文 + 符号标签**（Read/Write Tag + Fragmented），不做隐式 I/O（UDP 2222）、
 不做对象/属性寻址、不做结构体/数组自动展开。`address.area` 是标签名（大小写不敏感）、
 `offset` 是数组起始元素、`length` 是 bytes 字节数/string 字符容量、`bit` 是整数标签内的
 位号（-1 表示标签本身是 BOOL）。数值线上小端；同宽有符号/无符号可互换，类型以应答里的
 实际类型为准；bytes 两阶段读（先学宽度再按区间重读）；一轮多条读走 Multiple Service
-Packet，设备不支持时自动退回逐条请求。
+Packet，设备不支持时自动退回逐条请求。单帧放不下的大标签（长数组、大 STRING、字节块）
+经 Forward Open 建立的 Class 3 连接走 Read/Write Tag Fragmented（0x52/0x53）分片读写，
+对调用方透明；总量上限 1 MiB，超过按地址错拒绝。
 
 BACnet/IP 对象属性（UDP 47808）：
 
@@ -1414,9 +1416,9 @@ go test -race -count=1 ./...
 | `internal/codec/hostlink` | Host Link（上位链接 FINS）纯函数编解码（ASCII 信封 `FA` / FCS 异或含 `@` / 收发两条布局 / 单元号十进制 / 单次上限 269·267 / 结束码分层 / 流式收帧） |
 | `internal/driver/hostlink` | Host Link 主站驱动（`FromFINS` 套信封、单元号·等待时间·ICF 收校验、结束码分层、串口 7-E-2 缺省、超时排查顺序、不自动重试） |
 | `internal/sim/hostlink` | Host Link 内置从站（逐字节扫帧、`*`+CR 定界、单元号过滤沉默、FCS 错 0x13 / 格式错 0x14 / 头码错 0x16） |
-| `internal/codec/enip` | EtherNet/IP 纯函数编解码（封装头 / CPF / SendRRData / CIP 请求应答 / 符号路径 / Read/Write Tag / 多服务合包 / 类型表） |
+| `internal/codec/enip` | EtherNet/IP 纯函数编解码（封装头 / CPF / SendRRData / CIP 请求应答 / 符号路径 / Read/Write Tag / Forward Open·Forward Close / SendUnitData / Read·Write Tag Fragmented / 多服务合包 / 类型表） |
 | `internal/driver/enip` | CIP 显式报文主站（标签读写、数组 offset、STRING、bytes 两阶段读、位 RMW、多服务合包与自动退回） |
-| `internal/sim/enip` | EtherNet/IP 内置从站（RegisterSession / Read/Write Tag / 多服务合包 / 默认标签表） |
+| `internal/sim/enip` | EtherNet/IP 内置从站（RegisterSession / Read/Write Tag / Forward Open·Close / SendUnitData / Read·Write Tag Fragmented / 多服务合包 / 默认标签表） |
 | `internal/codec/bacnet` | BACnet/IP 与 MS/TP 共享纯函数编解码（BVLC / NPDU / APDU / 标签 / 对象属性名表 / Read-WriteProperty；MS/TP 分帧与双 CRC） |
 | `internal/driver/bacnet` | BACnet/IP 主站（对象属性读写、UDP invoke ID 配对、按对象语义选写标签、错误类映射） |
 | `internal/sim/bacnet` | BACnet/IP 内置从站（对象表 / 属性读写 / 数组下标 / 写权限 / 类型收敛） |

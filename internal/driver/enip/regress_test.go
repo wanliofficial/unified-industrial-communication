@@ -28,8 +28,8 @@ func samplesByID(samples []driver.RawSample) map[string]driver.RawSample {
 }
 
 func dintReply(v int32) []byte {
-	// Read Tag 应答数据：[类型, 0, countLo, countHi, v0..v3]（小端）。
-	b := []byte{enipcodec.TypeDINT, 0, 1, 0, byte(v), byte(v >> 8), byte(v >> 16), byte(v >> 24)}
+	// Read Tag 应答数据：[类型, 0, v0..v3]（小端），没有元素数字段。
+	b := []byte{enipcodec.TypeDINT, 0, byte(v), byte(v >> 8), byte(v >> 16), byte(v >> 24)}
 	return rrReply(0x11, enipcodec.ServiceReadTag, 0, nil, b)
 }
 
@@ -218,21 +218,36 @@ func TestWriteShortCircuitsOnLinkFailure(t *testing.T) {
 // 候选 G：partial transfer / 过长应答等点级错误不能计入熔断
 // ---------------------------------------------------------------------------
 
-func TestPartialTransferIsAddressError(t *testing.T) {
-	s := newScript().add(registerReply(0x11, 0, 1))
-	// 设备回 0x06（partial transfer，通常是 length 配太大）：点级错误。
-	s.add(rrReply(0x11, enipcodec.ServiceReadTag, 0x06, nil, nil))
+func TestPartialTransferContinuesViaFragments(t *testing.T) {
+	// 0x06（partial transfer）不再是终态点级错误：它表示「这一片成功、还有后续」，
+	// 驱动应改走 Read Tag Fragmented 把剩下的数据读完。这里让分片续读命中一个
+	// 不存在的标签，验证：点被标坏、整轮仍返回样本、链路不被熔断（后续读仍可用）。
+	s := newScript().add(registerReply(0x11, 0, 1)).
+		// 首帧 Read Tag 回 0x06 + 一片 DINT 数据。
+		add(rrReply(0x11, enipcodec.ServiceReadTag, 0x06, nil,
+			[]byte{enipcodec.TypeDINT, 0, 1, 0, 0, 0})).
+		// Forward Open 成功。
+		add(rrReply(0x11, enipcodec.ServiceForwardOpen, 0, nil, forwardOpenReply(0x70000001, 0x70000002, 1, 0x1234, 42))).
+		// 分片续读回标签不存在（0x05）。
+		add(unitReply(0x11, enipcodec.ServiceReadFrag, 0x05, 0x70000001, 1, nil))
 	c, _ := openScript(t, s)
-	samples, err := c.Read(context.Background(), []driver.ReadSpan{{ID: "s", Points: []driver.PointRef{
+
+	samples, _ := c.Read(context.Background(), []driver.ReadSpan{{ID: "s", Points: []driver.PointRef{
 		ref("a", "DINT_TAG", model.TypeInt32),
 	}}})
-	if err == nil {
-		t.Fatal("expected error")
+	if len(samples) != 1 || samples[0].Quality != model.QualityAddressError {
+		t.Fatalf("samples = %+v", samples)
 	}
-	if samples[0].Quality != model.QualityAddressError {
-		t.Fatalf("quality = %q, want address_error", samples[0].Quality)
+
+	// 链路未熔断：再读一次（单帧即可满足）应当成功。
+	s.add(dintReply(7))
+	samples, err := c.Read(context.Background(), []driver.ReadSpan{{ID: "s", Points: []driver.PointRef{
+		ref("b", "DINT_TAG", model.TypeInt32),
+	}}})
+	if err != nil {
+		t.Fatalf("link should still be usable after a point-level fragment failure: %v", err)
 	}
-	if driver.CountsTowardBreaker(err) {
-		t.Fatalf("0x06 partial transfer counted toward breaker: %v", err)
+	if got, _ := samples[0].Value.AsFloat(); got != 7 {
+		t.Fatalf("recovery read = %v, want 7", samples[0].Value)
 	}
 }

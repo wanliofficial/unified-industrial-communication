@@ -299,21 +299,28 @@ func TestReadTagRequest(t *testing.T) {
 }
 
 func TestParseReadTagReply(t *testing.T) {
-	// 类型 DINT(4) + 元素数 1 + 数据 0x000004D2（线上小端）→ 1234
-	reply := Reply{Service: ServiceReadTag | ServiceReplyMask, Data: []byte{0xC4, 0x00, 0x01, 0x00, 0xD2, 0x04, 0x00, 0x00}}
-	typ, count, data, err := ParseReadTagReply(reply)
+	// 类型 DINT(0x00C4) + 数据 0x000004D2（线上小端）→ 1234。
+	// 应答里没有元素数字段：类型之后直接就是数据。
+	reply := Reply{Service: ServiceReadTag | ServiceReplyMask, Data: []byte{0xC4, 0x00, 0xD2, 0x04, 0x00, 0x00}}
+	typ, data, err := ParseReadTagReply(reply)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if typ != TypeDINT || count != 1 || binary.LittleEndian.Uint32(data) != 1234 {
-		t.Fatalf("type/count/data = %02X/%d/% x", typ, count, data)
+	if typ != TypeDINT || binary.LittleEndian.Uint32(data) != 1234 {
+		t.Fatalf("type/data = %02X/% x", typ, data)
+	}
+	// STRUCT（0x02A0）在数据前多一个 2 字节结构句柄。
+	st := Reply{Data: []byte{0xA0, 0x02, 0x0B, 0x00, 0x01, 0x02}}
+	typ, data, err = ParseReadTagReply(st)
+	if err != nil || typ != TypeStruct || !bytes.Equal(data, []byte{1, 2}) {
+		t.Fatalf("struct = %02X/% x err=%v", typ, data, err)
 	}
 	bad := Reply{Status: 0x05}
-	if _, _, _, err := ParseReadTagReply(bad); err == nil {
+	if _, _, err := ParseReadTagReply(bad); err == nil {
 		t.Fatal("error reply accepted")
 	}
 	short := Reply{}
-	if _, _, _, err := ParseReadTagReply(short); err == nil {
+	if _, _, err := ParseReadTagReply(short); err == nil {
 		t.Fatal("short reply accepted")
 	}
 }
@@ -337,11 +344,11 @@ func TestWriteTagRequestAndReply(t *testing.T) {
 		t.Fatalf("data = % x", req.Data[4:])
 	}
 
-	typ, count, err := ParseWriteTagReply(Reply{Data: []byte{0xC4, 0x00, 0x01, 0x00}})
-	if err != nil || typ != TypeDINT || count != 1 {
-		t.Fatalf("reply = %02X/%d err=%v", typ, count, err)
+	// 写应答没有数据区：只有状态，不能因为「没有类型/元素数」判成截断失败。
+	if err := ParseWriteTagReply(Reply{Data: nil}); err != nil {
+		t.Fatalf("empty write reply: %v", err)
 	}
-	if _, _, err := ParseWriteTagReply(Reply{Status: 0x0E}); err == nil {
+	if err := ParseWriteTagReply(Reply{Status: 0x0E}); err == nil {
 		t.Fatal("error reply accepted")
 	}
 	if _, err := BuildWriteTag("A", TypeDINT, 0, nil); err == nil {
@@ -585,8 +592,12 @@ func TestBuildWriteTagRejectsBadTag(t *testing.T) {
 }
 
 func TestParseWriteTagReplyShort(t *testing.T) {
-	if _, _, err := ParseWriteTagReply(Reply{Data: []byte{0xC4, 0}}); err == nil {
-		t.Fatal("short write reply accepted")
+	// 写应答允许为空（真机就是这样）；状态非 0 仍然要报错。
+	if err := ParseWriteTagReply(Reply{}); err != nil {
+		t.Fatalf("empty write reply rejected: %v", err)
+	}
+	if err := ParseWriteTagReply(Reply{Status: 0x13}); err == nil {
+		t.Fatal("error reply accepted")
 	}
 }
 

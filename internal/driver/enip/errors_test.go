@@ -308,7 +308,7 @@ func TestWriteNetworkFailure(t *testing.T) {
 
 func TestReadBoolTagShortReply(t *testing.T) {
 	s := newScript().add(registerReply(0x11, 0, 1)).
-		add(rrReply(0x11, enipcodec.ServiceReadTag, 0, nil, []byte{enipcodec.TypeBOOL, 0, 1, 0}))
+		add(rrReply(0x11, enipcodec.ServiceReadTag, 0, nil, []byte{enipcodec.TypeBOOL, 0}))
 	c, _ := openScript(t, s)
 	samples, err := c.Read(context.Background(), []driver.ReadSpan{{ID: "s", Points: []driver.PointRef{
 		ref("flag", "BOOL_TAG", model.TypeBool),
@@ -320,7 +320,7 @@ func TestReadBoolTagShortReply(t *testing.T) {
 
 func TestReadStringBrokenPayload(t *testing.T) {
 	s := newScript().add(registerReply(0x11, 0, 1)).
-		add(rrReply(0x11, enipcodec.ServiceReadTag, 0, nil, []byte{enipcodec.TypeSTRING, 0, 1, 0}))
+		add(rrReply(0x11, enipcodec.ServiceReadTag, 0, nil, []byte{enipcodec.TypeSTRING, 0}))
 	c, _ := openScript(t, s)
 	samples, err := c.Read(context.Background(), []driver.ReadSpan{{ID: "s", Points: []driver.PointRef{
 		ref("name", "STRING_TAG", model.TypeString),
@@ -332,7 +332,7 @@ func TestReadStringBrokenPayload(t *testing.T) {
 
 func TestReadNumericShortReply(t *testing.T) {
 	s := newScript().add(registerReply(0x11, 0, 1)).
-		add(rrReply(0x11, enipcodec.ServiceReadTag, 0, nil, []byte{enipcodec.TypeDINT, 0, 1, 0, 1, 2}))
+		add(rrReply(0x11, enipcodec.ServiceReadTag, 0, nil, []byte{enipcodec.TypeDINT, 0, 1, 2}))
 	c, _ := openScript(t, s)
 	samples, err := c.Read(context.Background(), []driver.ReadSpan{{ID: "s", Points: []driver.PointRef{
 		ref("x", "DINT_TAG", model.TypeInt32),
@@ -344,7 +344,7 @@ func TestReadNumericShortReply(t *testing.T) {
 
 func TestReadBytesOnStructTag(t *testing.T) {
 	s := newScript().add(registerReply(0x11, 0, 1)).
-		add(rrReply(0x11, enipcodec.ServiceReadTag, 0, nil, []byte{enipcodec.TypeStruct, 0, 1, 0, 1, 2, 3, 4}))
+		add(rrReply(0x11, enipcodec.ServiceReadTag, 0, nil, []byte{enipcodec.TypeStruct, 0x02, 0, 0, 1, 2, 3, 4}))
 	c, _ := openScript(t, s)
 	p := ref("raw", "STRUCT_TAG", model.TypeBytes)
 	p.Address.Length = 4
@@ -356,7 +356,7 @@ func TestReadBytesOnStructTag(t *testing.T) {
 
 func TestReadZeroElements(t *testing.T) {
 	s := newScript().add(registerReply(0x11, 0, 1)).
-		add(rrReply(0x11, enipcodec.ServiceReadTag, 0, nil, []byte{enipcodec.TypeDINT, 0, 0, 0}))
+		add(rrReply(0x11, enipcodec.ServiceReadTag, 0, nil, []byte{enipcodec.TypeDINT, 0}))
 	c, _ := openScript(t, s)
 	samples, err := c.Read(context.Background(), []driver.ReadSpan{{ID: "s", Points: []driver.PointRef{
 		ref("x", "DINT_TAG", model.TypeInt32),
@@ -409,7 +409,7 @@ func TestWriteRejectsBadAddress(t *testing.T) {
 
 func TestWriteStringDefaultCapacity(t *testing.T) {
 	s := newScript().add(registerReply(0x11, 0, 1)).
-		add(rrReply(0x11, enipcodec.ServiceWriteTag, 0, nil, []byte{enipcodec.TypeSTRING, 0, 1, 0}))
+		add(rrReply(0x11, enipcodec.ServiceWriteTag, 0, nil, nil))
 	c, _ := openScript(t, s)
 	_, err := c.Write(context.Background(), []driver.WriteRequest{{
 		PointID:  "name",
@@ -427,17 +427,14 @@ func TestWriteStringDefaultCapacity(t *testing.T) {
 }
 
 func TestWriteBytesTooLarge(t *testing.T) {
-	big := make([]byte, 4+maxReadBytes+1)
-	big[0] = enipcodec.TypeSINT
-	binary.LittleEndian.PutUint16(big[2:], uint16(maxReadBytes+1))
-	s := newScript().add(registerReply(0x11, 0, 1)).
-		add(rrReply(0x11, enipcodec.ServiceReadTag, 0, nil, []byte{enipcodec.TypeSINT, 0, 1, 0, 0})).
-		add(rrReply(0x11, enipcodec.ServiceReadTag, 0, nil, big))
+	// 超过绝对上限的 address.length 必须在碰设备之前拒绝：没有上限时一次
+	// 误配就能把内存和采集周期一起吃掉。
+	s := newScript().add(registerReply(0x11, 0, 1))
 	c, _ := openScript(t, s)
 	_, err := c.Write(context.Background(), []driver.WriteRequest{{
 		PointID:  "raw",
-		Address:  model.Address{Kind: model.AddressRegister, Area: "SINT_ARRAY", Bit: -1, Length: maxReadBytes + 1},
-		DataType: model.TypeBytes, Value: model.BytesValue(make([]byte, maxReadBytes+1)),
+		Address:  model.Address{Kind: model.AddressRegister, Area: "SINT_ARRAY", Bit: -1, Length: maxTransferBytes + 1},
+		DataType: model.TypeBytes, Value: model.BytesValue([]byte{1}),
 	}})
 	if err == nil || driver.KindOf(err) != driver.ErrAddress {
 		t.Fatalf("err = %v", err)
@@ -446,7 +443,7 @@ func TestWriteBytesTooLarge(t *testing.T) {
 
 func TestWriteBytesOnStructTag(t *testing.T) {
 	s := newScript().add(registerReply(0x11, 0, 1)).
-		add(rrReply(0x11, enipcodec.ServiceReadTag, 0, nil, []byte{enipcodec.TypeStruct, 0, 1, 0, 1, 2, 3, 4}))
+		add(rrReply(0x11, enipcodec.ServiceReadTag, 0, nil, []byte{enipcodec.TypeStruct, 0x02, 0, 0, 1, 2, 3, 4}))
 	c, _ := openScript(t, s)
 	_, err := c.Write(context.Background(), []driver.WriteRequest{{
 		PointID:  "raw",
@@ -460,7 +457,7 @@ func TestWriteBytesOnStructTag(t *testing.T) {
 
 func TestWriteOffsetTypeMismatch(t *testing.T) {
 	s := newScript().add(registerReply(0x11, 0, 1)).
-		add(rrReply(0x11, enipcodec.ServiceReadTag, 0, nil, []byte{enipcodec.TypeINT, 0, 2, 0, 1, 0, 2, 0}))
+		add(rrReply(0x11, enipcodec.ServiceReadTag, 0, nil, []byte{enipcodec.TypeINT, 0, 1, 0, 2, 0}))
 	c, _ := openScript(t, s)
 	_, err := c.Write(context.Background(), []driver.WriteRequest{{
 		PointID:  "x",
@@ -474,7 +471,7 @@ func TestWriteOffsetTypeMismatch(t *testing.T) {
 
 func TestWriteBitOutsideElement(t *testing.T) {
 	s := newScript().add(registerReply(0x11, 0, 1)).
-		add(rrReply(0x11, enipcodec.ServiceReadTag, 0, nil, []byte{enipcodec.TypeINT, 0, 1, 0, 0, 0}))
+		add(rrReply(0x11, enipcodec.ServiceReadTag, 0, nil, []byte{enipcodec.TypeINT, 0, 0, 0}))
 	c, _ := openScript(t, s)
 	_, err := c.Write(context.Background(), []driver.WriteRequest{{
 		PointID:  "bit",
@@ -510,7 +507,7 @@ func TestSendMultipleWrongReplyCount(t *testing.T) {
 	// 两条请求，但设备只回一条：必须报协议错，不能把第一条的结果当成两条。
 	body := make([]byte, 2)
 	binary.LittleEndian.PutUint16(body, 1)
-	r0, _ := enipcodec.BuildReply(enipcodec.ServiceReadTag, 0, nil, []byte{enipcodec.TypeDINT, 0, 1, 0, 1, 0, 0, 0})
+	r0, _ := enipcodec.BuildReply(enipcodec.ServiceReadTag, 0, nil, []byte{enipcodec.TypeDINT, 0, 1, 0, 0, 0})
 	body = append(body, 0, 0)
 	body = append(body, r0...)
 	s.add(rrReply(0x11, enipcodec.ServiceMultiple, 0, nil, body))
@@ -644,11 +641,11 @@ func TestNeedMoreError(t *testing.T) {
 }
 
 func TestReadBytesExceedingLimit(t *testing.T) {
-	// 学到实际宽度后才知道 401 字节超过上限；必须在驱动侧拒绝，
-	// 而不是让设备回 0x06（partial transfer）。
+	// 超过绝对上限的 address.length 在构造请求时就被拒绝；401 字节不再算超限，
+	// 那本来就可以走分片路径读回来。
 	c := openSim(t, newSim(t))
 	p := ref("big", "DINT_ARRAY", model.TypeBytes)
-	p.Address.Length = maxReadBytes + 1
+	p.Address.Length = maxTransferBytes + 1
 	samples, err := c.Read(context.Background(), []driver.ReadSpan{{ID: "s", Points: []driver.PointRef{p}}})
 	if err == nil {
 		t.Fatal("oversized bytes read accepted")

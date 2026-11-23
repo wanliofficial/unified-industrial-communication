@@ -1706,12 +1706,16 @@ EtherNet/IP 是标准组织定义的工业以太网协议族，CIP（Common Indu
 应用层。本驱动只实现 **CIP 显式报文 + TCP 44818 + 符号标签访问**：
 
 - Read Tag（0x4C）/ Write Tag（0x4D）；
+- Read/Write Tag Fragmented（0x52/0x53）：单帧放不下的标签（长数组、大 STRING、字节块）经
+  Forward Open 建立的 Class 3 显式连接分片读写，不再受单帧尺寸限制；
 - Multiple Service Packet（0x0A）把一轮采集里的多条读合并成一个报文；
 - STRING（4 字节长度 + 字符容量）、原子数值类型、BOOL、整数标签里的位；
 - 设备不支持多服务合包时自动退回逐条请求，并记住结论。
 
 **不做**的事情同样重要：不做隐式 I/O（UDP 2222 的 Class 1 连接）、不做对象/属性寻址
 （Identity/Message Router 对象只用于 Probe 与合包路径）、不做结构体/数组的自动展开。
+大标签的分片读写**需要**设备支持 Class 3 显式连接（Forward Open）；被设备拒绝时按
+「不支持」报错，而不是退回单帧——单帧本来就装不下，退回只会换一种方式失败。
 理由见 §3.10.7.8。
 
 #### 3.10.7.1 三层封装，每层的「长度」含义都不同
@@ -1811,12 +1815,45 @@ Service Packet 把这些读合成一个报文：路径固定指向 Message Route
 驱动的策略：
 
 - 单次合包的**保守上限是 450 字节**（嵌入区 + 偏移表），超过就拆批；
-- 单次读/写的数据量**保守上限 400 字节**：CIP 连接的标准报文尺寸通常 504，
-  超过后设备回 0x06（partial transfer）。与其让设备报错，不如在驱动侧明确拒绝
-  并提示「缩小 length」；
+- 单帧数据超过连接预算（`fragChunk=400` 字节）时**自动改走分片**：先发普通 Read/Write Tag，
+  设备回 0x06（partial transfer）即说明放不下，已带回来的那一片不丢，从它的字节偏移继续
+  用 0x52/0x53 收发，直到设备不再回 0x06。整个过程对调用方透明——大数组、长 STRING、字节块
+  和一个小标签走的是同一条 `Read`/`Write`；
 - 设备回 0x08/0x14（服务不支持 / 属性不支持）时**关掉合包并退回逐条请求**，
   本批立刻重发；一次不支持之后不再尝试，避免每轮采集都先失败一次；
 - 嵌入应答按条目解析：某一条错误只让那个点位变 bad，不牵连整批。
+
+#### 3.10.7.5.1 分片读写与 Class 3 显式连接
+
+0x52/0x53 **不是无连接服务**：它们要求先对 Connection Manager（class 0x06 / instance 0x01）
+做 Forward Open（0x54），之后报文用封装命令 SendUnitData（0x0070）发出，CPF 里带连接 ID
+与序列号。pycomm3、pylogix 两家主流客户端都走这条已连接路径，cpppo 在客户端侧虽用未连接
+发送，但显式连接的语义是协议规定的，不是某个厂商的偏好。
+
+`codec/enip/connected.go` 把这一层做成纯函数：`BuildForwardOpen`/`ParseForwardOpenReply`、
+`BuildForwardClose`、`BuildSendUnitData`/`ParseSendUnitData`、`BuildReadTagFrag`/
+`BuildWriteTagFrag`。线格式逐项核实过的三个要点：
+
+| 细节 | 正确做法 | 写错的后果 |
+|---|---|---|
+| SendUnitData 封装命令 | **0x0070**（0x0072 是 IndicateStatus） | 设备把已连接路径当未知命令，分片完全不可用 |
+| SendUnitData CPF 条目 | **2 个**：连接地址（0x00A1, len 4）+ 连接数据（0x00B1, len 2+序列号+CIP） | 用了 0x8002（Sequenced Address）就是 Class 1 隐式 I/O，CIP 服务不会被解析 |
+| SendUnitData 地址条目用的连接 ID | **应答里的 O→T 连接 ID**（不是请求建议的值） | 设备有权改写它，用错就收「连接不存在」 |
+
+两个 0x52/0x53 服务码在不同对象上含义不同：Symbol 对象上是 Read/Write Tag Fragmented，
+Connection Manager 上是 Unconnected Send。驱动只对**标签**发分片，按目标对象区分，不冲突。
+
+读应答的布局是「类型 + 数据」，**没有元素数字段**（与 1756-PM020 的逐字节示例、pycomm3/
+pylogix/cpppo 三份实现一致）。STRUCT（0x02A0）在数据前多一个 2 字节结构句柄，类型头共
+4 字节；其余原子类型 2 字节。写应答**没有任何数据区**，只有服务 + 保留 + 状态。分片续读的
+offset 是**已收到的数据字节数，不含类型头**；而请求里的元素 count 是**整个标签的总元素数**，
+两者单位不同是协议本身的规定。`ParseReadTagReply`/`ParseWriteTagReply` 已按此修正——
+早前按「类型 + 元素数 + 数据」解析会把 DINT 的值和长度同时读错，写应答更是会被判成截断失败。
+
+驱动层的连接生命周期：惰性 Forward Open（只有真的要分片才建），序列号自增，连接被目标
+单方面释放（应答 0x07）时重开一次再发——空闲超时是链路事件，不该让整轮采集失败。单个
+点位的传输总量上限是 `maxTransferBytes=1 MiB`：分片理论上能读 4 GiB，但没有上限的误配
+（`address.length` 写成 1e9）会让一次采集占满内存与超时预算，超过就显式按地址错拒绝。
 
 #### 3.10.7.6 位访问：读元素 → 改一位 → 写回
 
@@ -1858,17 +1895,23 @@ CIP 通用状态在 `codec/enip` 里分类，驱动只做「错误 → 质量码
 
 | CIP 状态 | 分类 | 质量码 | 说明 |
 |---|---|---|---|
-| 0x03 / 0x04 / 0x05 / 0x06 / 0x11 / 0x13 / 0x15 / 0x16 | `ErrAddress` | `address_error` | 参数值非法 / 路径段错 / 目标不存在 / partial transfer（length 配太大）/ 应答过大 / 数据不够 / 数据过多 / 对象不存在 |
+| 0x03 / 0x04 / 0x05 / 0x11 / 0x13 / 0x15 / 0x16 | `ErrAddress` | `address_error` | 参数值非法 / 路径段错 / 目标不存在 / 应答过大 / 数据不够 / 数据过多 / 对象不存在 |
+| 0x06 | `ErrAddress`¹ | `address_error`¹ | partial transfer：见下注 |
 | 0x08 / 0x14 | `ErrUnsupported` | `bad` | 服务/属性不支持 |
 | 0x0E / 0x0F | `ErrPermission` | `bad` | 属性只读 / 权限不足 |
 | 0x01 / 0x02 / 0x07 / 0x0C / 0x10 | `ErrDisconnected` | `comm_error` | 连接失败/资源不足/连接丢失/状态冲突 |
 | 其它 | `ErrProtocol` | `bad` | 协议错 |
 
-> 0x03 / 0x06 / 0x11 归为点级而不是协议错：它们都是「这一条请求本身有问题」（参数非法、
+> ¹ 0x06 在**读路径不再是终态**：它表示「这一片成功、还有后续」，驱动改走 Read Tag
+> Fragmented 把剩下的数据读完（§3.10.7.5.1）。只有当分片续读本身失败（设备回 0x05
+> 之类）、或设备拒绝 Forward Open 时，0x06 才作为点级 `address_error` 浮出。归为点级
+> 而非协议错仍是对的：缩小 length 或换点表能好，重试同一请求不会变好；归为 `ErrProtocol`
+> 会让 `CountsTowardBreaker` 为 true，把配置错当「链路坏了」去熔断整台设备。
+
+> 0x03 / 0x11 归为点级而不是协议错：它们都是「这一条请求本身有问题」（参数非法、
 > 读太多、应答超出缓冲），缩小 length 或改点表就能好，重试同一请求不会变好。归为
 > `ErrProtocol` 会让 `CountsTowardBreaker` 为 true，把这类配置错当成「链路坏了」去熔断
-> 整台设备。0x06（partial transfer）尤其常见：`maxReadBytes=400` 的保守上限就是为避免它，
-> 真收到时说明该点位 length 配得过大。
+> 整台设备。
 
 封装状态里 **0x64（会话句柄无效）单独归为可重试**：会话过期后重新建链会重新注册，
 属于自愈路径；其它状态判协议错，不重试。这条区分很重要——把 0x64 当永久错误会让
@@ -1895,9 +1938,9 @@ CIP 通用状态在 `codec/enip` 里分类，驱动只做「错误 → 质量码
 
 | 内容 | 路径 |
 |---|---|
-| 编解码 | `internal/codec/enip`（`BuildPacket`/`ParseHeader`/`BuildCPF`/`ParseSendRRData`/`BuildRequest`/`BuildReadTag`/`BuildWriteTag`/`BuildMultiple`/`SymbolicPath`/`LogicalPath`/`EncodeString`/`StatusError`） |
-| 主站驱动 | `internal/driver/enip`（`Meta`/`Open`/`Read`/`Write`/`Probe`，内部 `readBatch`/`sendMultiple`/`writeBit`） |
-| 内置从站 | `internal/sim/enip`（`NewServer`/`SetDINT`/`SetINT`/`SetREAL`/`SetBool`/`SetString`/`SetArray`/`SetMultipleSupported`） |
+| 编解码 | `internal/codec/enip`（`BuildPacket`/`ParseHeader`/`BuildCPF`/`ParseSendRRData`/`BuildRequest`/`BuildReadTag`/`BuildWriteTag`/`BuildMultiple`/`SymbolicPath`/`LogicalPath`/`EncodeString`/`ParseReadTagReply`/`ParseWriteTagReply`/`BuildForwardOpen`/`ParseForwardOpenReply`/`BuildForwardClose`/`BuildSendUnitData`/`ParseSendUnitData`/`BuildReadTagFrag`/`BuildWriteTagFrag`/`StatusError`） |
+| 主站驱动 | `internal/driver/enip`（`Meta`/`Open`/`Read`/`Write`/`Probe`，内部 `readBatch`/`sendMultiple`/`finishRead`/`ensureLink`/`sendConnected`/`readFragments`/`writeFragments`） |
+| 内置从站 | `internal/sim/enip`（`NewServer`/`SetDINT`/`SetINT`/`SetREAL`/`SetBool`/`SetString`/`SetArray`/`SetTag`/`SetMultipleSupported`/`SetFragmentSize`） |
 | CLI | `uic enipread -addr 127.0.0.1:44818 -tag DINT_TAG` |
 | 示例 | `examples/enip.json`（DINT/INT/REAL/BOOL/STRING、整数位、自增计数器） |
 
@@ -1935,9 +1978,9 @@ curl -H 'Authorization: Bearer dev-token-0123456789' \
 
 | 层 | 用例 |
 |---|---|
-| `codec/enip` | 封装头/长度语义、CPF 奇数对齐与越界、SendRRData、RegisterSession、CIP 请求/应答、附加状态、符号路径偶对齐、逻辑路径 8/16/32 位、Read/Write Tag 金帧、多服务偏移表、类型表、字符串编解码（**超长拒绝而非截断**）、状态码→分类（0x03/0x06/0x11 归点级地址错） |
-| `driver/enip` | 注册与状态、命令/上下文错位（**滞留帧排空后流重新对齐，下一次读仍命中正确应答**）、原子类型、大小写、STRING、bytes 两阶段读、数组 offset、位读/位写保邻位、offset 写保前缀、多服务合包与拆批、MSP 自动退回、错类型/越界位/未知标签、会话失效可重试、Probe 容忍不支持、能力声明；**部分失败语义（有成功点则 `err==nil`、全失败才返回整体错误、链路级失败立即返回且剩余 span 的点位显式标坏）**；**readBatch 后一批失败时保留前一批已得的好样本**；**单个点位构造失败（标签/类型配错）不连累同 span 其它好点位**；**写路径数值越界/带小数/float32 溢出在写报文前拒绝（70000→INT16、1.5→INT16、1e300→REAL 均判地址错，且设备值不变）**；**STRING/bytes 超长拒绝而非静默截断**；**写路径遇链路级失败短路、剩余条目显式标坏**；**0x06 partial transfer 判点级地址错、不计入熔断**；**批量写逐项语义（一条成功 + 一条未知标签：成功项不被回填 `Err`、失败项带 `Quality`、且成功项确实落到从站）** |
-| `sim/enip` | 真实 TCP 回环：注册/注销/坏版本/未知命令、Read/Write Tag 与错误码 0x03/0x05/0x13/0x15、STRING 写、多服务与关闭、非符号路径、`SetTag` 校验、默认标签 |
+| `codec/enip` | 封装头/长度语义、CPF 奇数对齐与越界、SendRRData、RegisterSession、CIP 请求/应答、附加状态、符号路径偶对齐、逻辑路径 8/16/32 位、Read/Write Tag 金帧、Read Tag Fragmented 金帧、Forward Open（标准 + Large）/Forward Close/SendUnitData 金帧与 CPF 校验、多服务偏移表、类型表、字符串编解码（**超长拒绝而非截断**）、状态码→分类（0x03/0x11 归点级地址错；0x06 见下） |
+| `driver/enip` | 注册与状态、命令/上下文错位（**滞留帧排空后流重新对齐，下一次读仍命中正确应答**）、原子类型、大小写、STRING、bytes 两阶段读、数组 offset、位读/位写保邻位、offset 写保前缀、多服务合包与拆批、MSP 自动退回、错类型/越界位/未知标签、会话失效可重试、Probe 容忍不支持、能力声明；**部分失败语义（有成功点则 `err==nil`、全失败才返回整体错误、链路级失败立即返回且剩余 span 的点位显式标坏）**；**readBatch 后一批失败时保留前一批已得的好样本**；**单个点位构造失败（标签/类型配错）不连累同 span 其它好点位**；**写路径数值越界/带小数/float32 溢出在写报文前拒绝（70000→INT16、1.5→INT16、1e300→REAL 均判地址错，且设备值不变）**；**STRING/bytes 超长拒绝而非静默截断**；**写路径遇链路级失败短路、剩余条目显式标坏**；**大标签分片读（bytes/数值 offset/STRING 跨多片重组）**；**大标签分片写（bytes/STRING 切片回写，从站校验落值）**；**分片续读途中类型变化判协议错**；**Forward Open 被拒报「不支持」而非假装成功**；**连接被目标释放（0x07）后重开一次续读**；**0x06 触发分片、分片失败只标坏该点且链路不熔断（后续读仍可用）**；**批量写逐项语义（一条成功 + 一条未知标签：成功项不被回填 `Err`、失败项带 `Quality`、且成功项确实落到从站）** |
+| `sim/enip` | 真实 TCP 回环：注册/注销/坏版本/未知命令、Read/Write Tag 与错误码 0x03/0x05/0x13/0x15、STRING 写、多服务与关闭、非符号路径、`SetTag` 校验、默认标签；**Forward Open/Forward Close 登记 Class 3 连接**、**SendUnitData 回 0x07（连接不存在）**、**Read/Write Tag Fragmented（0x52/0x53）按 `SetFragmentSize` 切片回 0x06** |
 
 ### 3.10.8 BACnet/IP（对象属性读写，UDP 47808）
 
