@@ -823,7 +823,6 @@ func (r *Runtime) reload(before *config.File) []string {
 	if len(restarted) > 0 {
 		r.log.Info("config_applied", "version", r.cfg.Version(), "restarted", restarted)
 	}
-	_ = before
 	return restarted
 }
 

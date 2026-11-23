@@ -114,86 +114,77 @@ func main() {
 		cmd, args = args[0], args[1:]
 	}
 	switch cmd {
-	case "run":
-		runCmd(args)
-	case "sim":
-		simCmd(args)
-	case "mcread":
-		mcreadCmd(args)
-	case "finsread":
-		finsreadCmd(args)
-	case "enipread":
-		enipreadCmd(args)
-	case "bacread":
-		bacreadCmd(args)
-	case "mstpread":
-		mstpreadCmd(args)
-	case "iec104read":
-		iec104readCmd(args)
-	case "iec101read":
-		iec101readCmd(args)
-	case "mewtocolread":
-		mewtocolreadCmd(args)
-	case "hostlinkread":
-		hostlinkreadCmd(args)
-	case "dnp3read":
-		dnp3readCmd(args)
-	case "coapread":
-		coapreadCmd(args)
-	case "knxread":
-		knxreadCmd(args)
-	case "iec61850read":
-		iec61850readCmd(args)
-	case "dlt645read":
-		dlt645readCmd(args)
-	case "cjt188read":
-		cjt188readCmd(args)
-	case "mbusread":
-		mbusreadCmd(args)
-	case "dlmsread":
-		dlmsreadCmd(args)
-	case "sl651read":
-		sl651readCmd(args)
-	case "toledoread":
-		toledoreadCmd(args)
-	case "snmpread":
-		snmpreadCmd(args)
-	case "mtconnectread":
-		runMTConnectRead(args)
-	case "secsread":
-		secsreadCmd(args)
-	case "adsread":
-		adsreadCmd(args)
-	case "uaread":
-		uareadCmd(args)
-	case "s7blocks":
-		s7blocksCmd(args)
-	case "s7upload":
-		s7uploadCmd(args)
-	case "instantiate":
-		instantiateCmd(args)
-	case "import":
-		importCmd(args)
-	case "token":
-		tokenCmd(args)
 	case "version", "-v", "--version":
 		printVersion()
+		return
 	case "help", "-h", "--help":
 		usage()
-	default:
-		fmt.Fprintf(os.Stderr, "unknown command %q\n\n", cmd)
-		usage()
-		os.Exit(2)
+		return
 	}
+	// 子命令表是「实现了的子命令」的唯一事实源：新增一个 xxxread 时只需在
+	// 这里登记一次，不必再同步维护一段 switch。此前 mbread 的实现与 usage
+	// 都在、唯独 switch 漏了一个 case，`uic mbread` 直接报 unknown command
+	// ——手写 switch 与实现函数两处维护，迟早会漏。TestCommandTableCovers
+	// Usage 会保证 usage 里宣传的每个子命令都在表里。
+	if fn, ok := commands[cmd]; ok {
+		fn(args)
+		return
+	}
+	fmt.Fprintf(os.Stderr, "unknown command %q\n\n", cmd)
+	usage()
+	os.Exit(2)
+}
+
+// commands 把子命令名映射到它的入口函数。所有 handler 的签名都是
+// func([]string)，因此可以直接放进同一张表。
+var commands = map[string]func([]string){
+	"run":           runCmd,
+	"sim":           simCmd,
+	"mbread":        mbreadCmd,
+	"mcread":        mcreadCmd,
+	"finsread":      finsreadCmd,
+	"enipread":      enipreadCmd,
+	"bacread":       bacreadCmd,
+	"mstpread":      mstpreadCmd,
+	"iec104read":    iec104readCmd,
+	"iec101read":    iec101readCmd,
+	"mewtocolread":  mewtocolreadCmd,
+	"hostlinkread":  hostlinkreadCmd,
+	"dnp3read":      dnp3readCmd,
+	"coapread":      coapreadCmd,
+	"knxread":       knxreadCmd,
+	"iec61850read":  iec61850readCmd,
+	"dlt645read":    dlt645readCmd,
+	"cjt188read":    cjt188readCmd,
+	"mbusread":      mbusreadCmd,
+	"dlmsread":      dlmsreadCmd,
+	"sl651read":     sl651readCmd,
+	"toledoread":    toledoreadCmd,
+	"snmpread":      snmpreadCmd,
+	"mtconnectread": runMTConnectRead,
+	"secsread":      secsreadCmd,
+	"adsread":       adsreadCmd,
+	"uaread":        uareadCmd,
+	"s7blocks":      s7blocksCmd,
+	"s7upload":      s7uploadCmd,
+	"instantiate":   instantiateCmd,
+	"import":        importCmd,
+	"token":         tokenCmd,
 }
 
 func usage() {
-	fmt.Fprintf(os.Stderr, `uic — 统一工业通信网关
+	fmt.Fprint(os.Stderr, usageText)
+}
+
+// usageText 是 usage() 打印的正文。抽成常量是为了让测试能直接解析它，
+// 校验「usage 里宣传的每个子命令都在 commands 表里」——mbread 曾经就是
+// usage 写了、实现也有、但 switch 漏了注册，`uic mbread` 报 unknown command。
+const usageText = `uic — 统一工业通信网关
 
 用法:
   uic [run] -config config.json [-listen :8080] [-token TOKEN]
   uic -check -config config.json
-  uic sim [-listen 127.0.0.1:15020] [-protocol modbus|s7|opcua|mqtt|mc|fins|hostlink|enip|bacnet|bacnet-mstp|iec104|iec101|mewtocol|dnp3|coap|knx|dlt645|cjt188|mbus|dlms|sl651|snmp|ads|secs]
+  uic sim [-listen 127.0.0.1:15020] [-protocol modbus|s7|opcua|mqtt|mc|fins|hostlink|enip|bacnet|bacnet-mstp|iec104|iec101|mewtocol|dnp3|coap|knx|iec61850|mtconnect|dlt645|cjt188|mbus|dlms|sl651|snmp|ads|secs|toledo]
   uic mbread -addr 127.0.0.1:1502 -unit 1 -area holding -offset 0 -qty 2
   uic mbread -addr 127.0.0.1:1502 -area holding -offset 5 -write 777
   uic mcread -addr 127.0.0.1:5000 -area d -offset 100 -qty 2
@@ -278,6 +269,8 @@ func usage() {
   uic mtconnectread -addr 127.0.0.1:15000 -id Xabs,exec # 指定数据项
   uic mtconnectread -addr 127.0.0.1:15000 -sample -from 1 -count 20  # 序号窗口
   uic mbread -transport rtu|ascii -port /dev/ttyUSB0 [-baud 19200] [-parity even]
+  uic sim -protocol toledo -listen 127.0.0.1:4001          # 内置 METTLER TOLEDO 衡器（连续输出）
+  uic toledoread -addr 127.0.0.1:4001 [-json]               # Toledo 连续输出只读自检
   uic uaread -addr 127.0.0.1:4840 -nodes ns=2;s=site/dev/point [-type float64]
   uic uaread -addr 127.0.0.1:4840 -nodes ns=2;s=site/dev/setpoint -write 42.5
   uic s7blocks -addr 127.0.0.1:15102 [-type db [-num 1]] [-json]
@@ -299,8 +292,7 @@ func usage() {
 
 uic token 生成的凭据同时给出明文与 tokenSha256：
   明文交给客户端，配置里只放 tokenSha256。明文只打印一次。
-`)
-}
+`
 
 func printVersion() {
 	fmt.Printf("uic %s (commit %s, built %s, %s)\n", version, commit, buildTime, goruntime.Version())
