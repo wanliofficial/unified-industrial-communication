@@ -19,11 +19,11 @@ dotnet run --project tests/Uic.Tests -- --stop-on-fail      # 首个失败即停
 N passed, 0 failed, 0 skipped · <耗时>
 ```
 
-本轮（426 条）的改动是**纯增量**：新增一条纯构造用例 `bacnet/write_array_point_is_rejected`
-（数组点位写被明确拒绝：逐点失败、`Ok=false`、质量映射 Disabled 而非 Bad、消息点名「不支持数组」，
-检查在建连前发生）。本轮已直接复跑验证：`--filter bacnet/` 30 条全绿。由于这条不改动任何既有用例的
-判定，全量通过/失败结论不受影响，故全量汇总数字留待下一次腾空复跑时如实量取填入上方（前一轮全量在
-NTFS 高负载下于 `contract/*` 组后被截断、未跑到汇总，故不写「全绿」假数字）。
+本轮（427 条）的改动是**纯增量**：新增一条纯函数用例 `pipeline/error_kind_maps_to_quality`
+（`QualityMap.From` 全 8 档错误→质量映射逐档点名，外加反向守卫：任何 ErrorKind 不得折成
+Good/Uncertain/Stale）。本轮已直接复跑验证：`--filter error_kind_maps_to_quality` 1 条全绿（18 ms）。
+由于这条不改动任何既有用例的判定，全量通过/失败结论不受影响，故全量汇总数字留待下一次腾空复跑
+时如实量取填入上方（前一轮全量在 NTFS 高负载下于 `contract/*` 组后被截断、未跑到汇总，故不写「全绿」假数字）。
 
 前序基线（422 条，`--opcua`）：`421 passed, 1 failed, 0 skipped · 1041.9 s`——那 1 条 failed 是
 `contract/points_csv_import_previews_and_applies` 触到 180 s 硬超时的**高负载 flake**
@@ -86,6 +86,8 @@ qos/keepAlive/reconnect/staleAfter 越界与非布尔 tlsEnabled 明确报错、
 deviceInstance 22 位实例号越界与非数字明确报错、纯构造不启 UDP、≤ 0.1 s）。
 426 条 = 425 条 + BACnet 数组写拒绝一条（`bacnet/write_array_point_is_rejected`，
 数组点位写逐点失败映射 Disabled、消息点名不支持、检查在建连前、纯构造不启 UDP、≤ 0.1 s）。
+427 条 = 426 条 + 错误→质量映射整表一条（`pipeline/error_kind_maps_to_quality`，
+`QualityMap.From` 全 8 档逐档点名 + 反向守卫、纯函数不连设备、≤ 0.1 s）。
 419 条那一轮（只跑过 `fault/*` 组，未记耗时的中间态）跳过；以 420 条这一轮为准（见下一段）。
 418 条那一轮（补了 OPC UA 服务端能力边界两条：`opcua/server_options_are_anonymous_and_none_only`、
 `opcua/server_endpoint_advertises_only_none_and_anonymous`；配置校验矩阵补 `allowAnonymousRead=false`
@@ -154,7 +156,7 @@ NFR 的门槛是 120 s，压测用例、PBKDF2 派生与 TLS 握手是主要开�
 |---|---|---|
 | `golden/*` | 24 | 字节级：请求与响应完全匹配（T14），含 4 份数组黄金帧（float32 数组、uint16 数组、批量写数组、逐元素字节序）与 4 份文件记录帧（FC20 TCP/RTU/ASCII、FC21 TCP） |
 | `codec/*` | 24 | 校验和、字节序（含「字符串/字节流不参与重排」）、BCD、时间值、窗口、异常码、分帧容错、数组逐元素字节序与元素个数校验、**写入值越界/超长文本直接拒绝**（不静默取模或截断）、写响应回显逐字节校验 |
-| `pipeline/*` | 13 | 缩放/偏移、整数取整、质量传播、三种死区模式、数组逐元素缩放与「取最大变化」死区、**变化率死区的 Δt 用单调时钟**（校时跳变不伪造也不抹平尖峰） |
+| `pipeline/*` | 14 | 缩放/偏移、整数取整、质量传播、三种死区模式、数组逐元素缩放与「取最大变化」死区、**变化率死区的 Δt 用单调时钟**（校时跳变不伪造也不抹平尖峰）、**驱动异常 → 质量码的整张映射**（`QualityMap.From` 全 8 档逐档点名，外加反向守卫：任何 ErrorKind 不得折成 Good/Uncertain/Stale） |
 | `cache/*` | 5 | 序号单调、只在变化时通知、按点位死区判定、移除设备、订阅者故障隔离 |
 | `planner/*` | 8 | 窗口合并、切分上限、区分离、非寄存器寻址 |
 | `history/*` | 10 | journal 历史：时间/身份过滤、每桶降采样、重放去重、**序号重启后不吞掉新样本**（序号是内存计数器，重启/热更新后从 1 重来，只按序号去重会把真实数据当重放）、缺失文件、坏行跳过、跨读取缓冲区行、跨缓冲区胜出行回读、转义名回退、非法日历日期跳过 |

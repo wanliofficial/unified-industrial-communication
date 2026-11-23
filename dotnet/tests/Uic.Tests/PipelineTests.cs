@@ -18,6 +18,7 @@ internal static class PipelineTests
         tests.Add(new TestCase("pipeline/rounding_for_integer_types", RoundingForIntegerTypes));
         tests.Add(new TestCase("pipeline/bad_quality_skips_scaling", BadQualitySkipsScaling));
         tests.Add(new TestCase("pipeline/bad_quality_preserves_reason", BadQualityPreservesReason));
+        tests.Add(new TestCase("pipeline/error_kind_maps_to_quality", ErrorKindMapsToQuality));
         tests.Add(new TestCase("pipeline/deadband_reports_change", DeadbandReportsChange));
         tests.Add(new TestCase("pipeline/deadband_ignores_noise_below_threshold", DeadbandIgnoresNoiseBelowThreshold));
         tests.Add(new TestCase("pipeline/deadband_reports_quality_transitions", DeadbandReportsQualityTransitions));
@@ -124,6 +125,44 @@ internal static class PipelineTests
         t.Ok(sample.Value is not null, "a placeholder value is always present");
         t.Equal(Quality.AddressError, sample.Quality, "quality");
         t.Equal("illegal data address", sample.Error, "error");
+
+        return Task.CompletedTask;
+    }
+
+    /// <summary>
+    /// 驱动异常 → 质量码的统一映射（`QualityMap.From`）：每个 <see cref="ErrorKind"/> 落到哪一档
+    /// 质量是「上层据此决定重试/熔断/立即失败」的唯一依据，所有驱动共用这一份实现。
+    ///
+    /// 此前只有 VirtualDriverTests 顺带钉住了 Address→address_error，其余七档从未被整体断言过：
+    /// 把 Connection 写成 Bad（而不是 comm_error）不会让任何现有用例变红，却会让整网设备的断链
+    /// 在趋势图与告警里看起来像「值不对」而不是「连不上」——两个结论的处理方式完全不同。
+    /// </summary>
+    private static Task ErrorKindMapsToQuality(TestContext t)
+    {
+        // 逐档点名，写清「为什么是这一档」，漂移时一眼看出改坏了哪条语义。
+        var expected = new (ErrorKind Kind, Quality Quality, string Why)[]
+        {
+            (ErrorKind.Timeout, Quality.Timeout, "超时可重试，质量单独成档"),
+            (ErrorKind.Connection, Quality.CommError, "连不上是通信错误，不冒充值坏"),
+            (ErrorKind.Address, Quality.AddressError, "点表/地址错是配置问题"),
+            (ErrorKind.Unsupported, Quality.Disabled, "本实现不做的能力是 disabled"),
+            (ErrorKind.Permission, Quality.Disabled, "权限不足与不支持同归 disabled（写不进去）"),
+            (ErrorKind.Canceled, Quality.NotConnected, "主动取消意味着会话已断"),
+            (ErrorKind.Protocol, Quality.Bad, "协议错是坏值，不归到可重试类"),
+            (ErrorKind.Internal, Quality.Bad, "网关内部错也是坏值"),
+        };
+
+        foreach (var (kind, quality, why) in expected)
+            t.Equal(quality, QualityMap.From(kind), $"{kind} → {quality}：{why}");
+
+        // 反向守卫：Good/Uncertain/Stale 不是由错误折出来的，任何 ErrorKind 都不该映射到它们，
+        // 否则「读成功但标记为 stale」这类合法质量会被错误路径污染。
+        foreach (ErrorKind kind in Enum.GetValues<ErrorKind>())
+        {
+            var q = QualityMap.From(kind);
+            t.Ok(q is not (Quality.Good or Quality.Uncertain or Quality.Stale),
+                $"{kind} 不能折成成功类质量（{q}）");
+        }
 
         return Task.CompletedTask;
     }

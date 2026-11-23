@@ -12,18 +12,23 @@ PRD 中 M 级的采集协议已全部落地，FR-CFG-01 的四类寻址模型也
 COV/分段/多属性读仍不做，见 [protocol-status.md](protocol-status.md) §4.1）。非 M 级验收里的 12 类故障注入同样全部有了
 可自动跑的用例（见 §7）。
 
-当前测试基线：**426 条**（带 `--opcua` 全量：本轮新增的一条 `bacnet/write_array_point_is_rejected`
-是纯构造、不启 UDP 服务器；全量实测数字以 [testing.md](testing.md) 最新一轮为准）。本轮新增
-`bacnet/write_array_point_is_rejected`：BACnet 数组点位写入必须被明确拒绝——逐点 `Ok=false`、
-质量映射 Disabled（不支持的能力，区别于可重试的 Bad）、消息点名「不支持数组」，检查在建连前发生。
-若删掉这条守卫，数组会写到整个属性上（设备报错或只改第一个元素），现象比直接报错难查。纯构造不启 UDP、≤ 0.1 s。
-此前几轮新增 `bacnet/device_instance_out_of_range_is_rejected`（deviceInstance 22 位实例号越界）、
+当前测试基线：**427 条**（带 `--opcua` 全量：本轮新增的一条 `pipeline/error_kind_maps_to_quality`
+是纯函数、不连任何设备；全量实测数字以 [testing.md](testing.md) 最新一轮为准）。本轮新增
+`pipeline/error_kind_maps_to_quality`：把驱动异常 → 质量码的统一映射 `QualityMap.From` 全 8 档逐档
+点名（Timeout→Timeout、Connection→CommError、Address→AddressError、Unsupported/Permission→Disabled、
+Canceled→NotConnected、Protocol/Internal→Bad），再加反向守卫——任何 ErrorKind 不得折成成功类质量
+（Good/Uncertain/Stale）。此前只有 VirtualDriverTests 顺带钉住 Address 一档，其余七档从未被整体断言：
+这是所有驱动 catch 块共用的唯一映射，若 Connection 漂移成 Bad，整网设备的断链会在告警里看起来像
+「值坏」而非「连不上」，不会有任何现有用例变红。纯函数不连设备、≤ 0.1 s。
+此前几轮新增 `bacnet/write_array_point_is_rejected`（数组点位写逐点失败映射 Disabled）、
+`bacnet/device_instance_out_of_range_is_rejected`（deviceInstance 22 位实例号越界）、
 `mqtt/options_reject_out_of_range_labels`（南向<MASKED_PERSON_001>数值范围与非布尔拒绝）、
 `s7/label_out_of_range_is_rejected`（S7 <MASKED_PERSON_001> rack/slot/pduSize 越界）、
 `s7/metadata_declares_capabilities`、`opcua/metadata_declares_capabilities`
 （S7 与 OPC UA 客户端两个驱动此前无用例断言的 `DriverMeta` 能力声明钉住）。
-本轮改动纯增量（新增一条纯构造用例），不改动既有用例判定，故直接复跑受影响一组确认：
-`--filter bacnet/` 30 条全绿；全量汇总数字以 [testing.md](testing.md) 下一次腾空复跑所量取者为准。
+本轮改动纯增量（新增一条纯函数用例），不改动既有用例判定，故直接复跑受影响用例确认：
+`--filter error_kind_maps_to_quality` 1 条全绿（18 ms）；全量汇总数字以 [testing.md](testing.md)
+下一次腾空复跑所量取者为准。
 
 ## 1. 采集（FR-COL）
 
@@ -70,7 +75,7 @@ COV/分段/多属性读仍不做，见 [protocol-status.md](protocol-status.md) 
 | FR-RUN-04 | 指数退避 + 抖动重连 | 已实现 | `DeviceActor.BackoffDelay()` → `ScheduleMath.Backoff`：`interval × 2^n`（n 截断在 6 档）上限为 `RecoverInterval`（基数大于上限时取基数，避免「退避」反而变短），叠加 `[0, 10%)` 正向抖动——只加不减，防止整批同时失败的设备在同一毫秒齐刷刷重连。**退避算术本身有直接断言**：`schedule/backoff_grows_then_caps`（抖动取 0 时逐档核对 1×/2×/4×、2^6 被 `recoverInterval` 截住、抖动上限 10%、基数大于上限不被缩短）。重试语义：`devices[].retries` 只重试临时性失败，重试前先断开避免迟到帧——`engine/transient_failure_is_retried`、`engine/bad_quality_batch_is_retried`、`engine/deadline_is_retried_as_timeout`、`engine/permanent_failure_is_not_retried`、`engine/retries_are_finite` |
 | FR-RUN-05 | 熔断（连续失败降级 + 定期探活） | 已实现 | `DeviceActor` 状态机：连续失败累计到 `devices[].failureThreshold`（默认 3）之前是 `Degraded`，达到即转 `Faulted` 并关掉当前连接（换代次，迟到的结果作废）。**没有独立的探活定时器**：熔断后靠 `BackoffDelay()` 的退避重连继续尝试，间隔从最快周期按 2^n 增长、上限 `recoverInterval`，重连成功才回到 `Collecting`——原先 `SchedulerOptions.ProbeInterval` 只是个从未被读取的旋钮，已删除。`address` 类错误不参与熔断（点表问题不该把设备判离线）。证据：`engine/failure_threshold_trips_the_breaker`（逐轮放行驱动，断言 1/2 次失败为 `Degraded`、第 3 次转 `Faulted`、换代次、失败计数、熔断后仍重连）、`engine/retries_are_finite`（一轮用完重试后降级）、`engine/permanent_failure_is_not_retried`（地址错不降级） |
 | FR-RUN-06 | 代次隔离（旧结果丢弃） | 已实现 | 代次在重连/重启/熔断关连接时递增，`CollectOnceAsync` 逐样本比对代次，不一致就整批丢弃。**断言到的是「代次递增」**：`engine/actor_reports_state_and_generation`（重启换代次）、`engine/failure_threshold_trips_the_breaker`（熔断关连接同样换代次）。「比对代次后真的丢了在途结果」这一动作**无自动化断言**——要构造它得让连接在读取返回的瞬间被替换，现有驱动接口没有可控的插入点，不做假证 |
-| FR-RUN-07 | 质量码 ≥8 态 + 时间戳三分离 | 已实现 | 9 态 `Quality`（`Good`/`Uncertain`/`Stale`/`Bad`/`Timeout`/`CommError`/`AddressError`/`NotConnected`/`Disabled`），驱动异常统一折成质量码见 `QualityMap.From`。**时间戳「三分离」**指 `Sample` 同时带三类时标：`DeviceTime`（对端/设备给的时刻，可空）、`CollectedAt`（采集发生的墙钟时刻）、`MonoAt`（同一采集的单调时刻）。用途有断言：变化率死区的 Δt 取单调而非墙钟，校时跳变既不凭空造尖峰也不抹平真实变化——`pipeline/deadband_rate_ignores_a_clock_jump`。质量码传播（坏值不参与缩放、保留原因、质量跳变必定上报）：`pipeline/bad_quality_skips_scaling`、`pipeline/bad_quality_preserves_reason`、`pipeline/deadband_reports_quality_transitions`。**未断言**：`Sample.DeviceTime`/`CollectedAt`/`MonoAt` 由生产采集路径（`DeviceActor` → `Pipeline.Process`）逐字段真实填对——`pipeline/*` 全是手工构造样本，只验证加工逻辑，不验证采集侧填充；`json/datavalue_wire_shape_is_stable` 只钉 `DataValue` 的 JSON 线格式 |
+| FR-RUN-07 | 质量码 ≥8 态 + 时间戳三分离 | 已实现 | 9 态 `Quality`（`Good`/`Uncertain`/`Stale`/`Bad`/`Timeout`/`CommError`/`AddressError`/`NotConnected`/`Disabled`），驱动异常统一折成质量码见 `QualityMap.From`。**时间戳「三分离」**指 `Sample` 同时带三类时标：`DeviceTime`（对端/设备给的时刻，可空）、`CollectedAt`（采集发生的墙钟时刻）、`MonoAt`（同一采集的单调时刻）。用途有断言：变化率死区的 Δt 取单调而非墙钟，校时跳变既不凭空造尖峰也不抹平真实变化——`pipeline/deadband_rate_ignores_a_clock_jump`。质量码传播（坏值不参与缩放、保留原因、质量跳变必定上报）：`pipeline/bad_quality_skips_scaling`、`pipeline/bad_quality_preserves_reason`、`pipeline/deadband_reports_quality_transitions`。**错误 → 质量码整张映射**逐档钉住：`pipeline/error_kind_maps_to_quality` 把 `QualityMap.From` 全 8 档（Timeout/CommError/AddressError/Disabled×2/NotConnected/Bad×2）逐档点名并加反向守卫（任何 ErrorKind 不得折成 Good/Uncertain/Stale）——这是所有驱动 catch 块共用的唯一映射，漂移会让整网设备的断链在告警里看起来像「值坏」而非「连不上」。**未断言**：`Sample.DeviceTime`/`CollectedAt`/`MonoAt` 由生产采集路径（`DeviceActor` → `Pipeline.Process`）逐字段真实填对——`pipeline/*` 全是手工构造样本，只验证加工逻辑，不验证采集侧填充；`json/datavalue_wire_shape_is_stable` 只钉 `DataValue` 的 JSON 线格式 |
 | FR-RUN-08 | 单调时钟用于调度与超时 | 已实现 | `nextDue` 与等待都基于 `Stopwatch.GetTimestamp()` + `ScheduleMath`；NTP 校时/手工改钟不会推迟或提前采集。样本时间戳仍用墙上时钟：`schedule/monotonic_arithmetic`。同一原则贯彻到「走了多久」的度量：`/health` 的 uptime 用单调时钟，校时跳变不会让它凭空多出一小时：`schedule/uptime_ignores_a_clock_jump`；**写命令的去重窗口**也用单调时钟，否则一次校时前跳会让同一条命令再执行一遍（对一个写点位的命令就是重复物理动作）：`mqtt/command_dedup_ignores_clock_jump`。限流桶的配额恢复与空闲清扫同样按单调时钟（前跳会让攻击者瞬间拿回全额配额，后跳会让正常客户端被永久 429）：`limits/wall_clock_jump_does_not_refill`、`limits/prune_drops_idle_buckets` |
 | FR-RUN-09 | 运行态与配置态分离 | 已实现 | `ConfiguredState` / `RuntimeState` 两套枚举，`GET /api/v1/devices` 同时返回 `configuredState` 与 `runtimeState`。验收用两台设备对照：停用的仍出现在列表里（配置与点表都在）、两个字段都是 `disabled` 且不产生样本；启用的那台 `configuredState` 恒为 `enabled` 而 `runtimeState` 走「configured → collecting」这套词汇表——把任一边抄成另一边会立刻露出来：`contract/disabled_device_shows_both_states` |
 | FR-RUN-10 | 看门狗（采集心跳 + 资源水位降级） | 已实现 | 采集心跳：`DeviceStateWatcher` 检测「超过 max(10 × 设备最慢点位周期, 30 s) 无新样本」并记 `uic_watchdog_stale_total`，阈值按**最慢**周期放宽——只挂慢变量的设备本来两次样本之间就有大空档，按最快周期算会把正常采集误报成停滞；同一条告警 5 分钟内去重；恢复由 `DeviceActor` 的读超时与重连完成，进程级僵死交给外部 supervisor（NFR 故障矩阵）。证据 `fault/collection_stall_is_reported`（假死仍报「采集中」但样本不动 → 记账，去重窗口过后再报一次）、`fault/clock_jump_does_not_fake_a_stall`（只拨墙钟不拨单调时钟 → 不报）、`fault/stall_threshold_follows_the_slowest_point`（10 s 点位周期 ⇒ 阈值 100 s：60 s 不报、110 s 报）。资源水位：`ResourceMonitor` 按 `storage.minFreeBytes/resumeFreeBytes/maxMemoryBytes` 判定，磁盘告急时暂停文件日志与 journal、健康转 `degraded`、`problems` 标 `$resources`，恢复后自动重启；证据 `resources/disk_pressure_has_hysteresis`、`resources/memory_pressure_has_hysteresis`、`resources/unreadable_probe_is_not_pressure`、`resources/file_log_pauses_during_pressure`、`contract/resource_pressure_degrades_health` |
