@@ -24,6 +24,7 @@ internal static class MqttDriverTests
         tests.Add(new TestCase("mqtt/payload_decodes_fields_and_types", PayloadDecodesFieldsAndTypes));
         tests.Add(new TestCase("mqtt/options_from_channel_and_labels", OptionsFromChannelAndLabels));
         tests.Add(new TestCase("mqtt/options_reject_credentials", OptionsRejectCredentials));
+        tests.Add(new TestCase("mqtt/options_reject_out_of_range_labels", OptionsRejectOutOfRangeLabels));
         tests.Add(new TestCase("mqtt/driver_is_stale_before_first_message", DriverIsStaleBeforeFirstMessage));
         tests.Add(new TestCase("mqtt/driver_reads_qos1_message_into_cache", DriverReadsQos1MessageIntoCache));
         tests.Add(new TestCase("mqtt/driver_reads_qos0_message_into_cache", DriverReadsQos0MessageIntoCache));
@@ -184,6 +185,85 @@ internal static class MqttDriverTests
             "a CA without TLS is rejected instead of ignored");
 
         t.Equal(ErrorKind.Unsupported, ca.Kind, "an unused CA file is a configuration error");
+
+        return Task.CompletedTask;
+    }
+
+    /// <summary>
+    /// 设备标签越界（订阅 QoS 填 2、心跳周期填成 4 或 601、重连间隔越界等）必须由驱动明确
+    /// 拒绝，而不是被静默截断成另一个合法值或透传给协议层。比如 qos=2 若被吞掉，南向会按
+    /// 不存在的 QoS 等级订阅，现象是「订阅登记了但 Broker 那边行为怪」，比当场报错难查得多。
+    ///
+    /// 这些范围检查是<MASKED_PERSON_001>ParseInt/ParseBool 在<MASKED_PERSON_001>构造时做的，是南向<MASKED_PERSON_001>唯一
+    /// 的守卫（模型校验器不认<MASKED_PERSON_001>私有标签）。纯构造、不连 Broker，便宜。
+    /// </summary>
+    private static Task OptionsRejectOutOfRangeLabels(TestContext t)
+    {
+        // 每条越界标签都点名是哪个、错在哪；消息带范围，运维一眼能定位。
+        var badQos = Model("broker.local", 1883,
+            new Dictionary<string, string>(StringComparer.Ordinal) { ["qos"] = "2" });
+        var qosEx = t.Throws<DriverException>(() => MqttConnOptions.FromContext(new OpenContext(
+            badQos.Channel, badQos.Device, NullLogger.Instance, new MetricsRegistry(), t.TempDir)),
+            "qos 越界被拒");
+        t.Equal(ErrorKind.Unsupported, qosEx.Kind, "越界标签报 Unsupported，不当成通讯故障");
+        t.Contains(qosEx.Message, "labels.qos", "消息点名是哪个标签");
+        t.Contains(qosEx.Message, "0..1", "消息给出合法范围");
+
+        var badKeep = Model("broker.local", 1883,
+            new Dictionary<string, string>(StringComparer.Ordinal) { ["keepAliveSeconds"] = "4" });
+        var keepEx = t.Throws<DriverException>(() => MqttConnOptions.FromContext(new OpenContext(
+            badKeep.Channel, badKeep.Device, NullLogger.Instance, new MetricsRegistry(), t.TempDir)),
+            "keepAlive 越界被拒");
+        t.Contains(keepEx.Message, "labels.keepAliveSeconds", "keepAlive 越界点名");
+        t.Contains(keepEx.Message, "5..600", "keepAlive 合法范围");
+
+        var badReconnect = Model("broker.local", 1883,
+            new Dictionary<string, string>(StringComparer.Ordinal) { ["reconnectDelayMs"] = "499" });
+        var reconnectEx = t.Throws<DriverException>(() => MqttConnOptions.FromContext(new OpenContext(
+            badReconnect.Channel, badReconnect.Device, NullLogger.Instance, new MetricsRegistry(), t.TempDir)),
+            "reconnect 越界被拒");
+        t.Contains(reconnectEx.Message, "labels.reconnectDelayMs", "reconnect 越界点名");
+        t.Contains(reconnectEx.Message, "500..300000", "reconnect 合法范围");
+
+        var badStale = Model("broker.local", 1883,
+            new Dictionary<string, string>(StringComparer.Ordinal) { ["staleAfterSeconds"] = "-1" });
+        var staleEx = t.Throws<DriverException>(() => MqttConnOptions.FromContext(new OpenContext(
+            badStale.Channel, badStale.Device, NullLogger.Instance, new MetricsRegistry(), t.TempDir)),
+            "staleAfter 越界被拒");
+        t.Contains(staleEx.Message, "labels.staleAfterSeconds", "staleAfter 越界点名");
+        t.Contains(staleEx.Message, "0..86400", "staleAfter 合法范围");
+
+        // 布尔标签不是 true/false 也要明确报错，而不是被当成 false 静默忽略。
+        var badBool = Model("broker.local", 1883,
+            new Dictionary<string, string>(StringComparer.Ordinal) { ["tlsEnabled"] = "maybe" });
+        var boolEx = t.Throws<DriverException>(() => MqttConnOptions.FromContext(new OpenContext(
+            badBool.Channel, badBool.Device, NullLogger.Instance, new MetricsRegistry(), t.TempDir)),
+            "非布尔 tlsEnabled 被拒");
+        t.Contains(boolEx.Message, "labels.tlsEnabled", "非布尔点名");
+        t.Contains(boolEx.Message, "true or false", "消息说明要布尔值");
+
+        // 边界值本身合法：构造不应抛（FromContext 只算参数，不连 Broker）。
+        foreach (var (qos, keep, reconnect, stale) in new[]
+                 {
+                     (0, 5, 500, 0),
+                     (1, 600, 300_000, 86_400),
+                 })
+        {
+            var labels = new Dictionary<string, string>(StringComparer.Ordinal)
+            {
+                ["qos"] = qos.ToString(),
+                ["keepAliveSeconds"] = keep.ToString(),
+                ["reconnectDelayMs"] = reconnect.ToString(),
+                ["staleAfterSeconds"] = stale.ToString(),
+            };
+            var (ch, dev) = Model("broker.local", 1883, labels);
+            var options = MqttConnOptions.FromContext(new OpenContext(
+                ch, dev, NullLogger.Instance, new MetricsRegistry(), t.TempDir));
+            t.Equal(qos, options.Client.Qos, $"qos={qos} 边界值应被接受");
+            t.Equal(keep, options.Client.KeepAliveSeconds, $"keepAlive={keep} 边界值应被接受");
+            t.Equal(reconnect, options.Client.ReconnectDelayMs, $"reconnect={reconnect} 边界值应被接受");
+            t.Equal(stale, options.StaleAfterSeconds, $"staleAfter={stale} 边界值应被接受");
+        }
 
         return Task.CompletedTask;
     }

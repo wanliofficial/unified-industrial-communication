@@ -19,13 +19,11 @@ dotnet run --project tests/Uic.Tests -- --stop-on-fail      # 首个失败即停
 N passed, 0 failed, 0 skipped · <耗时>
 ```
 
-本轮（423 条）的改动是**纯增量**：新增一条纯构造用例 `s7/label_out_of_range_is_rejected`
-（rack 0..7、slot 0..31、pduSize 240..960 越界时由驱动明确报 Unsupported、不静默截断，≤ 0.6 s），
-以及在既有用例 `bacnet/metadata_declares_object_addressing` 内**补断言**（Name/角色/通道字段，
-不新增用例）。这两处本轮已直接复跑验证：`--filter s7/` 33 条全绿（2.1 s）、
-`--filter bacnet/` 11 条全绿（1.0 s）。由于这两处都不改动任何既有用例的判定，全量通过/失败结论
-不受本轮影响，故全量汇总数字留待下一次腾空复跑时如实量取填入上方（本轮全量在 NTFS 高负载下
-于 `contract/*` 组后被截断、未跑到汇总，故不写「全绿」假数字）。
+本轮（424 条）的改动是**纯增量**：新增一条纯构造用例 `mqtt/options_reject_out_of_range_labels`
+（qos 0..1、keepAlive 5..600、reconnect 500..300000、staleAfter 0..86400 越界与非布尔 tlsEnabled 时由驱动
+明确报 Unsupported、不静默接受，≤ 0.1 s）。本轮已直接复跑验证：`--filter mqtt/` 35 条全绿。
+由于这条不改动任何既有用例的判定，全量通过/失败结论不受影响，故全量汇总数字留待下一次腾空复跑时
+如实量取填入上方（前一轮全量在 NTFS 高负载下于 `contract/*` 组后被截断、未跑到汇总，故不写「全绿」假数字）。
 
 前序基线（422 条，`--opcua`）：`421 passed, 1 failed, 0 skipped · 1041.9 s`——那 1 条 failed 是
 `contract/points_csv_import_previews_and_applies` 触到 180 s 硬超时的**高负载 flake**
@@ -82,6 +80,8 @@ N passed, 0 failed, 0 skipped · <耗时>
 `opcua/metadata_declares_capabilities`），纯函数、各 ≤ 6 ms。
 423 条 = 422 条 + 设备标签越界拒绝一条（`s7/label_out_of_range_is_rejected`，
 rack/slot/pduSize 越界明确报错、纯构造不连服务器、≤ 0.6 s）。
+424 条 = 423 条 + <MASKED_PERSON_001>标签越界与非布尔拒绝一条（`mqtt/options_reject_out_of_range_labels`，
+qos/keepAlive/reconnect/staleAfter 越界与非布尔 tlsEnabled 明确报错、纯构造不连 Broker、≤ 0.1 s）。
 419 条那一轮（只跑过 `fault/*` 组，未记耗时的中间态）跳过；以 420 条这一轮为准（见下一段）。
 418 条那一轮（补了 OPC UA 服务端能力边界两条：`opcua/server_options_are_anonymous_and_none_only`、
 `opcua/server_endpoint_advertises_only_none_and_anonymous`；配置校验矩阵补 `allowAnonymousRead=false`
@@ -170,7 +170,7 @@ NFR 的门槛是 120 s，压测用例、PBKDF2 派生与 TLS 握手是主要开�
 | `s7/*` | 33 | S7comm：17 条手算黄金帧与地址解析（TPKT/COTP 握手、PDU 协商、读/写/位读写、长度字段按传输尺寸解释（0x03–0x07 位 / 0x09 字节）、错误分类、地址字段上限、**项数字段只有一字节（256 项当场失败而不是静默截断）**），15 条主站 ↔ 内置从站回环（探活、DB/I/Q/M 读、位读写、写输入区被拒、越界落 `address_error`、bool 缺 bit 被拒、数组、按 PDU 切片、单点装不下点名失败、沉默 PLC 超时、断线重连），驱动元数据能力声明（`s7/metadata_declares_capabilities`：Id/角色/传输/寻址种类、位访问 Supported、订阅 Unsupported、通道/设备/点位字段逐项钉住），以及设备标签越界拒绝（`s7/label_out_of_range_is_rejected`：rack 0..7、slot 0..31、pduSize 240..960 越界时明确报 Unsupported、不静默截断；边界值被接受） |
 | `serial/*` | 9 | 真实伪终端上的 RTU / ASCII、半双工、帧间静默、deadline、关闭打断读；帧间静默的取值规则（低速按 3.5 字符时间缩放、>19200 bps 固定 1.75 ms）用纯函数断言，不需要 pty |
 | `bacnet/*` | 28 | BACnet/IP：16 条手算黄金帧与地址解析（BVLC/NPDU 封拆帧、NPDU 版本必须为 1、ReadProperty/WriteProperty 帧字节、I-Am 设备实例、对象标识符 10/22 位编码、应用标签往返含扩展长度（LVT=5）、类型不符拒绝、NPDU 路由控制字节拒绝、**ACK 值里出现形似关闭标签的字节也不得截断**），11 条主站 ↔ 内置从站回环（Who-Is/I-Am 探活、**按 invoke-id 配对（从站先回一条 invoke-id 不对的响应，取错会读到别的点位的值而质量仍 good）**、多对象读、bool/字符串、写后回读、unknown-object/property 落 `address_error`、沉默设备超时、**实例号核对（配了 deviceInstance 却回错设备即失败，消息带出期望实例号）**、元数据声明 object 寻址与 udp），1 条 `uic sim` 端到端（**拿 DemoConfig 的开发配置起真实从站再用真实主站读一遍：端口/transport/对象号/四个点位全 good**，值域按正弦基线核对） |
-| `mqtt/*` | 34 | 测试内 broker：CONNECT/SUBSCRIBE 字段、QoS0/1、主题渲染、重连补发、**下线设备清 retained `$state`**、**命令去重窗口用单调时钟（校时跳变不会重复执行命令）**、**过期判定用单调「多久没收到报文」（校时跳变不伪造也不放过过期）**、TLS 发布与不可信 CA 拒绝；南向驱动：主题通配匹配、JSON 字段/类型/信封取值、首次读数前 `stale`、QoS0/1 取数、点位字段覆盖、坏载荷与恢复、断线重订阅、订阅被 ACL 拒绝 |
+| `mqtt/*` | 35 | 测试内 broker：CONNECT/SUBSCRIBE 字段、QoS0/1、主题渲染、重连补发、**下线设备清 retained `$state`**、**命令去重窗口用单调时钟（校时跳变不会重复执行命令）**、**过期判定用单调「多久没收到报文」（校时跳变不伪造也不放过过期）**、TLS 发布与不可信 CA 拒绝；南向驱动：主题通配匹配、JSON 字段/类型/信封取值、首次读数前 `stale`、QoS0/1 取数、点位字段覆盖、坏载荷与恢复、断线重订阅、<MASKED_PERSON_001>越界与非布尔<MASKED_PERSON_001>拒绝（`mqtt/options_reject_out_of_range_labels`：qos 0..1、keepAlive 5..600、reconnect 500..300000、staleAfter 0..86400 越界明确报错、tlsEnabled 非布尔报错，纯构造不连 Broker）、<MASKED_PERSON_001>凭据与「CA 无 TLS」拒绝、订阅被 ACL 拒绝 |
 | `template/*` | 4 | 50 实例批量生成、参数类型/缺失/未知参数拒绝、未声明占位符拒绝；**同一模板产出 Modbus 与 S7 两台设备并同时通过校验**（FR-CFG-01 验收口径） |
 | `csv/*` | 6 | 地址表达式（参考号/区域偏移/分列）、按 id 合并与冲突行号、死区模式与量程列、点位周期列、数组元素个数列 |
 | `contract/*` | 47 | 进程内真实 Kestrel 的 REST 契约（含驱动能力、**Prometheus 抓取端点的真实运行期序列**（HELP/TYPE、设备数与采集中设备数、无 sink 时仍导出 0、逐值可解析）、模板、CSV、导入导出、单点幂等、**幂等窗口用单调时钟**（校时跳变既不重复执行写命令、也不会永不失效）、**同一幂等键配另一份请求体返回 409**、**幂等台账随运行时实例走**（进程级静态字典会让新实例把重投当成重放、返回另一台网关的结果）、资源降级联动、脱敏配置往返、明文凭据被拒、journal 历史查询、审计写入/导出/拒绝留痕、点位有效周期、数组元素个数与值形态、**写入值按 scale/offset 反算成原始值**、**每个凭据字段（含 certificatePassword）在读写两侧都脱敏**、**驱动没注册时 apply 返回 422 并指出通道**（不是 500，也不会把在跑的设备拆掉）、**分页游标不合法时 400 而不是静默重来**、**超配额返回 429 且与登录锁定同 code**、**`uic_sse_connections` 反映真实连接数**（写死成 0 时看板永远显示没人订阅）、**SSE 按 `device/point` 过滤**（分隔符写错只是静默不出样本，所以质量码写错改为 400；未知 `quality` 不再建一条永远空的流）、**SSE 50 路并发上限**（真开满 50 条流 → 第 51 条 429 `request.rate_limited`，全部释放后名额可复用；删掉上限判断则第 51 条会挂死等 hello，用例用 10 s 保护判 FAIL）、**写请求体语法错误归 400 `request.invalid_json` 而不是冒成 500**（`JsonException` 不是 `ApiException`，不就地翻译就会被最外层兜底 catch 当成网关故障返回 500，污染告警与错误看板——配置导入早就归 422/400，写接口必须一致）、**v0 旧字段写成非字符串归 422/`valid:false` 而不是冒成 500**（迁移链 `GetValue<string>()` 遇数字/对象会抛裸 `InvalidOperationException`，REST 只按 `ConfigException` 分类「配置非法」，裸异常会冒成网关故障——和写请求体语法错误同类）、**`outbox.droppedLastHour` 是一小时窗口而不是累计值**、**停用设备仍在列表里但两个 state 分开表达**、HTTPS 监听、控制台新建设备的完整链路、**诊断包六部分齐全且配置脱敏**（manifest 带 gateway/apiVersion/site、脱敏后的配置不含明文 token、metrics 是真 Prometheus 序列、日志段不含明文、health 带聚合状态、devices.json 列出设备）；认证的 5 条见 `contract/auth_*`） |

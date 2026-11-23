@@ -12,16 +12,16 @@ PRD 中 M 级的采集协议已全部落地，FR-CFG-01 的四类寻址模型也
 COV/分段/多属性读仍不做，见 [protocol-status.md](protocol-status.md) §4.1）。非 M 级验收里的 12 类故障注入同样全部有了
 可自动跑的用例（见 §7）。
 
-当前测试基线：**423 条**（带 `--opcua` 全量：新增的一条 `s7/label_out_of_range_is_rejected`
-是纯构造、不连服务器；全量实测数字以 [testing.md](testing.md) 最新一轮为准）。本轮新增
-`s7/label_out_of_range_is_rejected`：S7 设备标签 rack(0..7)/slot(0..31)/pduSize(240..960)
-越界时由驱动明确报 Unsupported、不静默截断（模型校验器不认驱动私有标签，这是唯一守卫）。
-此前几轮新增 `s7/metadata_declares_capabilities`、`opcua/metadata_declares_capabilities`
+当前测试基线：**424 条**（带 `--opcua` 全量：本轮新增的一条 `mqtt/options_reject_out_of_range_labels`
+是纯构造、不连 Broker；全量实测数字以 [testing.md](testing.md) 最新一轮为准）。本轮新增
+`mqtt/options_reject_out_of_range_labels`：南向<MASKED_PERSON_001> qos(0..1)/keepAliveSeconds(5..600)/
+reconnectDelayMs(500..300000)/staleAfterSeconds(0..86400) 越界与非布尔 tlsEnabled 时由驱动明确报
+Unsupported、不静默接受（<MASKED_PERSON_001>校验器不认<MASKED_PERSON_001>私有标签，这是唯一守卫），边界值被接受。
+此前几轮新增 `s7/label_out_of_range_is_rejected`（S7 <MASKED_PERSON_001> rack/slot/pduSize 越界明确报错、不静默截断）、
+`s7/metadata_declares_capabilities`、`opcua/metadata_declares_capabilities`
 两条纯函数用例，把 S7 与 OPC UA 客户端两个驱动此前无用例断言的 `DriverMeta` 能力声明钉住。
-`--opcua --filter opcua/` 单独跑 `opcua/*` 18 条全绿。本轮改动纯增量（新增一条纯构造用例 +
-在 `bacnet/metadata_declares_object_addressing` 内补断言、不增条数），不改动既有用例判定，故直接复跑
-受影响两组确认：`--filter s7/` 33 条、`--filter bacnet/` 11 条均全绿；全量汇总数字以 [testing.md](testing.md)
-下一次腾空复跑所量取者为准。
+本轮改动纯增量（新增一条纯构造用例），不改动既有用例判定，故直接复跑受影响一组确认：
+`--filter mqtt/` 35 条全绿；全量汇总数字以 [testing.md](testing.md) 下一次腾空复跑所量取者为准。
 
 ## 1. 采集（FR-COL）
 
