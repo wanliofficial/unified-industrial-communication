@@ -270,13 +270,24 @@ func parseRow(rec []string, cols map[string]int, line int, protocol string) (*mo
 	// length 列要先读出来，再交给地址解析：像 `holding:10` + `length=8`
 	// 这样的字符串点位，地址里本来就不写长度，只有先知道长度才可能成功。
 	// 反过来（先解析再覆盖）会让这类点位永远报「length is required」。
+	//
+	// 上限跟着协议走：寄存器型地址（Modbus/S7…）解析层自己也卡在 125
+	// （address.go parseRegister），这里同口径；但 ADS 这类允许符号长度的
+	// 协议，符号地址长度可达 65535（address.go 的 AllowSymbolLength 分支）。
+	// 若 CSV 层无条件卡 125，长 STRING 变量（如 200 字节）就只能写进地址串
+	// `NAME:200`、走 CSV 却被提前拒——同一份点表两种写法两种结果。让上限
+	// 与解析层一致，按协议取值。
+	maxLen := 125
+	if PolicyFor(protocol).AllowSymbolLength {
+		maxLen = 65535
+	}
 	lengthHint := 0
 	if v := get("length"); v != "" {
 		n, err := strconv.Atoi(v)
 		if err != nil || n <= 0 {
 			fail("length", v, "must be a positive integer")
-		} else if n > 125 {
-			fail("length", v, "must be <= 125")
+		} else if n > maxLen {
+			fail("length", v, "must be <= %d", maxLen)
 		} else {
 			lengthHint = n
 		}

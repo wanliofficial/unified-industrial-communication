@@ -3942,7 +3942,10 @@ MAIN.arrBytes:4               BYTE[4]
 - **string/bytes 的宽度由点表给出**。PLC 变量的宽度是符号的属性，驱动猜不出来：
   STRING(80) 占 81 字节，BYTE[4] 占 4 字节。写法有两种：地址里 `NAME:81`，或
   CSV 的 length 列；两者同时给且不一致时在导入期报错。省略时用
-  `options.strlen`（默认 81）。
+  `options.strlen`（默认 81）。CSV length 列的上限跟着协议走：ADS 这类
+ `AllowSymbolLength` 协议到 65535（与地址串写法同口径），寄存器型协议
+ （Modbus/S7…）仍是 125——否则同一个 200 字节变量写 `NAME:200` 能过、
+ 写 length 列却被「<= 125」拒，同一份点表两种写法两种结果。
 - `selector`（MQTT 的 `#field`）在导入期拒绝：ADS 没有「载荷里的字段」这个概念。
 - 写成 `holding:100` 这类寄存器地址同样在导入期拒绝；绕过导入直接构造
   `AddressRegister` 时，驱动在发报文前报 `address`。

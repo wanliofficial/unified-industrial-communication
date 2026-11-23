@@ -4,6 +4,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"uic/internal/model"
 )
 
 func TestParseCSVValid(t *testing.T) {
@@ -265,5 +267,47 @@ func TestParseCSVIEC101RejectsLengthColumn(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "length is not expressed") {
 		t.Fatalf("error = %v", err)
+	}
+}
+
+// length 列的上限必须跟着协议走，而不是无条件卡 125。
+//
+// ADS 这类允许符号长度的协议，符号地址长度可达 65535（address.go 的
+// AllowSymbolLength 分支）。一份 200 字节的 STRING 变量，写进地址串
+// `NAME:200` 能过，写进 length 列却被 CSV 层以「<= 125」提前拒——同一份
+// 点表两种写法两种结果，是导入期就该消除的口径不一致。寄存器型协议
+// （Modbus/S7…）解析层自己也卡 125，CSV 层同口径保留。
+func TestParseCSVLengthCapFollowsProtocol(t *testing.T) {
+	// ADS：length=200 经 CSV 导入应通过，且与地址串写法等价。
+	ads := "point,address,type,length\n" +
+		"gross,MainPanel.GrossWeight,string,200\n"
+	res, err := ParseCSV(strings.NewReader(ads), "ads")
+	if err != nil {
+		t.Fatalf("ADS length=200 must import via CSV, got %v", err)
+	}
+	if len(res.Points) != 1 || res.Points[0].Address.Length != 200 {
+		t.Fatalf("imported %+v, want one point with Length=200", res.Points)
+	}
+	// 地址串写法产出的地址与 length 列写法一致。
+	addrForm, err := ParseAddress("MainPanel.GrossWeight:200", model.TypeString, "ads")
+	if err != nil {
+		t.Fatalf("address form: %v", err)
+	}
+	if addrForm.Length != res.Points[0].Address.Length {
+		t.Fatalf("length column (%d) and address form (%d) disagree", res.Points[0].Address.Length, addrForm.Length)
+	}
+
+	// ADS：超过符号上限 65535 仍要拒绝。
+	big := "point,address,type,length\ngross,MainPanel.GrossWeight,string,70000\n"
+	if _, err := ParseCSV(strings.NewReader(big), "ads"); err == nil ||
+		!strings.Contains(err.Error(), "65535") {
+		t.Fatalf("length=70000 must be rejected with the 65535 cap, got %v", err)
+	}
+
+	// 寄存器型协议仍卡 125。
+	mb := "point,address,type,length\nv,holding:0,uint16,200\n"
+	if _, err := ParseCSV(strings.NewReader(mb), "modbus-tcp"); err == nil ||
+		!strings.Contains(err.Error(), "125") {
+		t.Fatalf("modbus length=200 must still be rejected with the 125 cap, got %v", err)
 	}
 }
