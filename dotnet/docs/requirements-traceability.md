@@ -12,22 +12,24 @@ PRD 中 M 级的采集协议已全部落地，FR-CFG-01 的四类寻址模型也
 COV/分段/多属性读仍不做，见 [protocol-status.md](protocol-status.md) §4.1）。非 M 级验收里的 12 类故障注入同样全部有了
 可自动跑的用例（见 §7）。
 
-当前测试基线：**427 条**（带 `--opcua` 全量：本轮新增的一条 `pipeline/error_kind_maps_to_quality`
-是纯函数、不连任何设备；全量实测数字以 [testing.md](testing.md) 最新一轮为准）。本轮新增
-`pipeline/error_kind_maps_to_quality`：把驱动异常 → 质量码的统一映射 `QualityMap.From` 全 8 档逐档
-点名（Timeout→Timeout、Connection→CommError、Address→AddressError、Unsupported/Permission→Disabled、
-Canceled→NotConnected、Protocol/Internal→Bad），再加反向守卫——任何 ErrorKind 不得折成成功类质量
-（Good/Uncertain/Stale）。此前只有 VirtualDriverTests 顺带钉住 Address 一档，其余七档从未被整体断言：
-这是所有驱动 catch 块共用的唯一映射，若 Connection 漂移成 Bad，整网设备的断链会在告警里看起来像
-「值坏」而非「连不上」，不会有任何现有用例变红。纯函数不连设备、≤ 0.1 s。
-此前几轮新增 `bacnet/write_array_point_is_rejected`（数组点位写逐点失败映射 Disabled）、
+当前测试基线：**428 条**（带 `--opcua` 全量：本轮新增的一条 `engine/comm_error_batch_is_retried`
+是纯进程内、不连真实设备；全量实测数字以 [testing.md](testing.md) 最新一轮为准）。本轮新增
+`engine/comm_error_batch_is_retried`：驱动「调用成功但整批返回 comm_error」时也必须按临时性失败重试。
+重试与否由 `DeviceActor.IsTemporary`（只认 `Timeout` 或 `CommError`）决定，与失败是「抛异常」还是
+「返回坏质量批」走**不同的代码分支**——前者靠 catch 块把异常折成质量、后者直接读返回样本里的质量字段。
+此前 CommError 的重试只被「抛异常」路径（`retries_are_finite` 抛 `DriverException.Connection`）钉住，
+返回批这一支无人断言：若有人把 `IsTemporary` 里 CommError 那一支删掉，只有「返回 CommError 批」会立刻
+不重试、而抛异常路径仍照常重试，正是「连接偶发抖动被当成永久故障、把正常产线钉进降级」的回归。
+与 `bad_quality_batch_is_retried`（timeout 返回批）对称。纯进程内、≤ 0.2 s。
+此前几轮新增 `pipeline/error_kind_maps_to_quality`（`QualityMap.From` 全 8 档映射逐档点名 + 反向守卫）、
+`bacnet/write_array_point_is_rejected`（数组点位写逐点失败映射 Disabled）、
 `bacnet/device_instance_out_of_range_is_rejected`（deviceInstance 22 位实例号越界）、
 `mqtt/options_reject_out_of_range_labels`（南向<MASKED_PERSON_001>数值范围与非布尔拒绝）、
 `s7/label_out_of_range_is_rejected`（S7 <MASKED_PERSON_001> rack/slot/pduSize 越界）、
 `s7/metadata_declares_capabilities`、`opcua/metadata_declares_capabilities`
 （S7 与 OPC UA 客户端两个驱动此前无用例断言的 `DriverMeta` 能力声明钉住）。
-本轮改动纯增量（新增一条纯函数用例），不改动既有用例判定，故直接复跑受影响用例确认：
-`--filter error_kind_maps_to_quality` 1 条全绿（18 ms）；全量汇总数字以 [testing.md](testing.md)
+本轮改动纯增量（新增一条引擎用例），不改动既有用例判定，故直接复跑受影响用例确认：
+`--filter comm_error_batch_is_retried` 1 条全绿（200 ms）；全量汇总数字以 [testing.md](testing.md)
 下一次腾空复跑所量取者为准。
 
 ## 1. 采集（FR-COL）
@@ -72,7 +74,7 @@ Canceled→NotConnected、Protocol/Internal→Bad），再加反向守卫——�
 | FR-RUN-01 | 时间片调度，避免同周期设备同时打满 | 已实现 | 每设备独立 `nextDue` + 50 ms tick；启动时按「设备序号 / 设备总数」把设备自己的 interval 均分（100 台 1s 设备即每 10 ms 一台），失败退避再叠加抖动：`schedule/phase_spreads_devices`、`schedule/scheduler_assigns_phases` |
 | FR-RUN-02 | 每设备串行、跨设备并行 | 已实现 | **每设备串行**：同一连接上的读/写永不并发，`engine/conn_is_never_called_concurrently`（计数驱动统计重叠次数）。**跨设备并行**：每台设备一个独立采集循环、通道闸门按通道划分，两台设备不会互相等待——`engine/devices_collect_in_parallel`（屏障驱动：两个读必须同时在飞才能放行，串行调度会以「没有并发」明确失败，不靠时序猜）。真实链路上事务按序完成由 `loopback/read_returns_values_in_order`、`loopback/planner_windows_round_trip`、`loopback/fragmented_response_is_reassembled`、`loopback/cancellation_returns_promptly` 覆盖 |
 | FR-RUN-03 | 通道并发上限与写优先 | 已实现 | `ChannelGate`：写等待计数让新读让路；上限支持热更新：`SemaphoreSlim` 容量改不了，上限变化必须换新闸门——原来的 `GetOrAdd` 会让「配置写 1、实际按 4 路并发」一直持续到进程重启：`lifecycle/channel_concurrency_follows_hot_update`。写优先本身此前无断言，补 `engine/channel_gate_lets_queued_writes_go_first`（容量 2 被两个读占满 → 写排队 → 写结束后才来的读仍不得占用第二个空槽位）；「不重叠」由 `engine/conn_is_never_called_concurrently` 验证 |
-| FR-RUN-04 | 指数退避 + 抖动重连 | 已实现 | `DeviceActor.BackoffDelay()` → `ScheduleMath.Backoff`：`interval × 2^n`（n 截断在 6 档）上限为 `RecoverInterval`（基数大于上限时取基数，避免「退避」反而变短），叠加 `[0, 10%)` 正向抖动——只加不减，防止整批同时失败的设备在同一毫秒齐刷刷重连。**退避算术本身有直接断言**：`schedule/backoff_grows_then_caps`（抖动取 0 时逐档核对 1×/2×/4×、2^6 被 `recoverInterval` 截住、抖动上限 10%、基数大于上限不被缩短）。重试语义：`devices[].retries` 只重试临时性失败，重试前先断开避免迟到帧——`engine/transient_failure_is_retried`、`engine/bad_quality_batch_is_retried`、`engine/deadline_is_retried_as_timeout`、`engine/permanent_failure_is_not_retried`、`engine/retries_are_finite` |
+| FR-RUN-04 | 指数退避 + 抖动重连 | 已实现 | `DeviceActor.BackoffDelay()` → `ScheduleMath.Backoff`：`interval × 2^n`（n 截断在 6 档）上限为 `RecoverInterval`（基数大于上限时取基数，避免「退避」反而变短），叠加 `[0, 10%)` 正向抖动——只加不减，防止整批同时失败的设备在同一毫秒齐刷刷重连。**退避算术本身有直接断言**：`schedule/backoff_grows_then_caps`（抖动取 0 时逐档核对 1×/2×/4×、2^6 被 `recoverInterval` 截住、抖动上限 10%、基数大于上限不被缩短）。重试语义：`devices[].retries` 只重试临时性失败，重试前先断开避免迟到帧——`engine/transient_failure_is_retried`、`engine/bad_quality_batch_is_retried`（timeout 返回批）、`engine/comm_error_batch_is_retried`（**comm_error 返回批**：`IsTemporary` 与抛异常路径走不同判定分支，单列一条守住）、`engine/deadline_is_retried_as_timeout`、`engine/permanent_failure_is_not_retried`、`engine/retries_are_finite` |
 | FR-RUN-05 | 熔断（连续失败降级 + 定期探活） | 已实现 | `DeviceActor` 状态机：连续失败累计到 `devices[].failureThreshold`（默认 3）之前是 `Degraded`，达到即转 `Faulted` 并关掉当前连接（换代次，迟到的结果作废）。**没有独立的探活定时器**：熔断后靠 `BackoffDelay()` 的退避重连继续尝试，间隔从最快周期按 2^n 增长、上限 `recoverInterval`，重连成功才回到 `Collecting`——原先 `SchedulerOptions.ProbeInterval` 只是个从未被读取的旋钮，已删除。`address` 类错误不参与熔断（点表问题不该把设备判离线）。证据：`engine/failure_threshold_trips_the_breaker`（逐轮放行驱动，断言 1/2 次失败为 `Degraded`、第 3 次转 `Faulted`、换代次、失败计数、熔断后仍重连）、`engine/retries_are_finite`（一轮用完重试后降级）、`engine/permanent_failure_is_not_retried`（地址错不降级） |
 | FR-RUN-06 | 代次隔离（旧结果丢弃） | 已实现 | 代次在重连/重启/熔断关连接时递增，`CollectOnceAsync` 逐样本比对代次，不一致就整批丢弃。**断言到的是「代次递增」**：`engine/actor_reports_state_and_generation`（重启换代次）、`engine/failure_threshold_trips_the_breaker`（熔断关连接同样换代次）。「比对代次后真的丢了在途结果」这一动作**无自动化断言**——要构造它得让连接在读取返回的瞬间被替换，现有驱动接口没有可控的插入点，不做假证 |
 | FR-RUN-07 | 质量码 ≥8 态 + 时间戳三分离 | 已实现 | 9 态 `Quality`（`Good`/`Uncertain`/`Stale`/`Bad`/`Timeout`/`CommError`/`AddressError`/`NotConnected`/`Disabled`），驱动异常统一折成质量码见 `QualityMap.From`。**时间戳「三分离」**指 `Sample` 同时带三类时标：`DeviceTime`（对端/设备给的时刻，可空）、`CollectedAt`（采集发生的墙钟时刻）、`MonoAt`（同一采集的单调时刻）。用途有断言：变化率死区的 Δt 取单调而非墙钟，校时跳变既不凭空造尖峰也不抹平真实变化——`pipeline/deadband_rate_ignores_a_clock_jump`。质量码传播（坏值不参与缩放、保留原因、质量跳变必定上报）：`pipeline/bad_quality_skips_scaling`、`pipeline/bad_quality_preserves_reason`、`pipeline/deadband_reports_quality_transitions`。**错误 → 质量码整张映射**逐档钉住：`pipeline/error_kind_maps_to_quality` 把 `QualityMap.From` 全 8 档（Timeout/CommError/AddressError/Disabled×2/NotConnected/Bad×2）逐档点名并加反向守卫（任何 ErrorKind 不得折成 Good/Uncertain/Stale）——这是所有驱动 catch 块共用的唯一映射，漂移会让整网设备的断链在告警里看起来像「值坏」而非「连不上」。**未断言**：`Sample.DeviceTime`/`CollectedAt`/`MonoAt` 由生产采集路径（`DeviceActor` → `Pipeline.Process`）逐字段真实填对——`pipeline/*` 全是手工构造样本，只验证加工逻辑，不验证采集侧填充；`json/datavalue_wire_shape_is_stable` 只钉 `DataValue` 的 JSON 线格式 |

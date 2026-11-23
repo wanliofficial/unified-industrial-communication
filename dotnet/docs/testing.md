@@ -19,9 +19,9 @@ dotnet run --project tests/Uic.Tests -- --stop-on-fail      # 首个失败即停
 N passed, 0 failed, 0 skipped · <耗时>
 ```
 
-本轮（427 条）的改动是**纯增量**：新增一条纯函数用例 `pipeline/error_kind_maps_to_quality`
-（`QualityMap.From` 全 8 档错误→质量映射逐档点名，外加反向守卫：任何 ErrorKind 不得折成
-Good/Uncertain/Stale）。本轮已直接复跑验证：`--filter error_kind_maps_to_quality` 1 条全绿（18 ms）。
+本轮（428 条）的改动是**纯增量**：新增一条引擎用例 `engine/comm_error_batch_is_retried`
+（驱动「调用成功但整批返回 comm_error」时也必须重试：与抛异常的 CommError 走不同的判定分支，
+仅靠抛异常路径钉不住这条）。本轮已直接复跑验证：`--filter comm_error_batch_is_retried` 1 条全绿（200 ms）。
 由于这条不改动任何既有用例的判定，全量通过/失败结论不受影响，故全量汇总数字留待下一次腾空复跑
 时如实量取填入上方（前一轮全量在 NTFS 高负载下于 `contract/*` 组后被截断、未跑到汇总，故不写「全绿」假数字）。
 
@@ -88,6 +88,8 @@ deviceInstance 22 位实例号越界与非数字明确报错、纯构造不启 U
 数组点位写逐点失败映射 Disabled、消息点名不支持、检查在建连前、纯构造不启 UDP、≤ 0.1 s）。
 427 条 = 426 条 + 错误→质量映射整表一条（`pipeline/error_kind_maps_to_quality`，
 `QualityMap.From` 全 8 档逐档点名 + 反向守卫、纯函数不连设备、≤ 0.1 s）。
+428 条 = 427 条 + comm_error 返回批重试一条（`engine/comm_error_batch_is_retried`，
+驱动「调用成功但整批返回 comm_error」时按临时性失败重试、与抛异常路径走不同判定分支、≤ 0.2 s）。
 419 条那一轮（只跑过 `fault/*` 组，未记耗时的中间态）跳过；以 420 条这一轮为准（见下一段）。
 418 条那一轮（补了 OPC UA 服务端能力边界两条：`opcua/server_options_are_anonymous_and_none_only`、
 `opcua/server_endpoint_advertises_only_none_and_anonymous`；配置校验矩阵补 `allowAnonymousRead=false`
@@ -168,7 +170,7 @@ NFR 的门槛是 120 s，压测用例、PBKDF2 派生与 TLS 握手是主要开�
 | `json/*` | 11 | 时长、枚举、值形状、数组值形状、`count` 往返、UTC、往返稳定、前向兼容 |
 | `logs/*` | 7 | JSON 行字段、轮转不丢行、归档裁剪、默认关闭、热更新开关、非法配置拒绝、环形缓冲顺序与过滤 |
 | `resources/*` | 5 | 磁盘/内存进入与恢复回差、探针不可读不误报、降级时文件日志暂停、非法水位配置拒绝 |
-| `engine/*` | 16 | 同连接永不并发、**跨设备并行（屏障驱动证明两台设备的读同时在飞；串行调度会明确失败）**、状态机与代次、**熔断阈值（逐轮放行驱动：1/2 次失败为 `Degraded`，第 3 次转 `Faulted`、换代次、之后仍靠重连探活）**、临时失败重试、坏质量整批重试、deadline 超时重试、确定性错误不重试、重试次数有限、写后回读一致/不一致/不开启、数组写入形状校验、点位周期覆盖设备周期、快慢桶失败互不牵连、**通道闸门写优先（排队中的写占住槽位，写结束后才来的读不得抢第二个空槽位——删掉自旋等待即失效）** |
+| `engine/*` | 17 | 同连接永不并发、**跨设备并行（屏障驱动证明两台设备的读同时在飞；串行调度会明确失败）**、状态机与代次、**熔断阈值（逐轮放行驱动：1/2 次失败为 `Degraded`，第 3 次转 `Faulted`、换代次、之后仍靠重连探活）**、临时失败重试、坏质量整批重试（含 **comm_error 返回批** 与 timeout 返回分支）、deadline 超时重试、确定性错误不重试、重试次数有限、写后回读一致/不一致/不开启、数组写入形状校验、点位周期覆盖设备周期、快慢桶失败互不牵连、**通道闸门写优先（排队中的写占住槽位，写结束后才来的读不得抢第二个空槽位——删掉自旋等待即失效）** |
 | `virtual/*` | 8 | 虚拟设备的故障注入（`FR-COL-07`）：`timeout`/`drop` 归为临时性超时、`address` 归为永久性且落 `address_error`、`bad` **不抛异常**（采样保留、值为空、带原因，避免一个坏点让整批重试）、`disconnect` 持续失败（不是抖一次）、`faultAt` 只注入第 N 次而前后两次正常、缺省不注入、常量波形写后回读 |
 | `schedule/*` | 6 | 启动相位均匀铺开、单调时间换算与到期边界、调度器实际分配相位、相位按设备内最快点位周期、**uptime 用单调时钟**（校时跳变不会让它凭空多出一小时）、**失败退避算术**（2^n 增长、2^6 被 `recoverInterval` 截住、抖动只加不减且不超 10%、基数大于上限不被缩短） |
 | `sdk/*` | 6 | 驱动注册契约：**SDK 版本不匹配直接拒绝**（错误消息里同时给出驱动声明与宿主要求的版本，且不留半注册状态）、**重复 id 拒绝且不覆盖先注册的驱动**、版本匹配时正常注册并把能力/传输声明原样透出；`check` 与启动共用同一份引用检查：**协议没注册时 `uic check` 退出码 2 并指出 `channels[x].protocol`**（同一份配置换成已注册驱动则通过），同一条通道只报一次；**分层边界由程序集实际引用表钉住**（Modbus/S7/BACnet 三个 codec 的实际引用里不得出现 `Uic.Transport`/`Engine`/`Runtime` 等 I/O 层、不得出现 `System.Net`，且必须依赖 `Uic.Domain` 作为反向对照） |

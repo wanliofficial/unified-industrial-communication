@@ -25,6 +25,7 @@ internal static class EngineTests
         tests.Add(new TestCase("engine/bad_quality_batch_is_retried", BadQualityBatchIsRetried));
         tests.Add(new TestCase("engine/deadline_is_retried_as_timeout", DeadlineIsRetriedAsTimeout));
         tests.Add(new TestCase("engine/permanent_failure_is_not_retried", PermanentFailureIsNotRetried));
+        tests.Add(new TestCase("engine/comm_error_batch_is_retried", CommErrorBatchIsRetried));
         tests.Add(new TestCase("engine/retries_are_finite", RetriesAreFinite));
         tests.Add(new TestCase("engine/failure_threshold_trips_the_breaker", FailureThresholdTripsTheBreaker));
         tests.Add(new TestCase("engine/write_confirmation_reads_back", WriteConfirmationReadsBack));
@@ -1070,6 +1071,36 @@ internal static class EngineTests
             t.Equal(2, driver.Reads, "a bad-quality batch is retried");
             t.Equal(Quality.Good, cache.Get("dev-1", "a")!.Quality, "the retry replaces the bad batch");
             t.Equal(1UL, cache.Get("dev-1", "a")!.Seq, "the discarded attempt never reached the cache");
+
+            await actor.StopAsync();
+        });
+    }
+
+    /// <summary>
+    /// 临时性失败的判定只看质量码是不是 <c>Timeout</c> 或 <c>CommError</c>（<c>DeviceActor.IsTemporary</c>），
+    /// 与失败是「抛异常」还是「调用成功但返回整批坏值」无关。上一轮已经钉了 Timeout 的返回批重试
+    /// （<c>bad_quality_batch_is_retried</c>）；但 CommError 这一档只被「抛异常」路径钉住
+    /// （<c>retries_are_finite</c> 抛的是 <c>DriverException.Connection</c>）。两者在判定重试时
+    /// 走的是不同的代码分支：前者靠 catch 块把异常折成质量、后者靠读返回样本里的质量字段直接判。
+    /// 若有人把 <c>IsTemporary</c> 里 CommError 那一支删掉，只有「返回 CommError 批」会立刻不重试、
+    /// 而抛异常路径仍照常重试——正是「连接偶发抖动被当成永久故障、把正常产线钉进降级」的那种回归。
+    /// </summary>
+    private static Task CommErrorBatchIsRetried(TestContext t)
+    {
+        return RunAsync(async () =>
+        {
+            var driver = new ScriptedDriver()
+                .BadBatch(Quality.CommError)
+                .ThenSucceed();
+
+            var cache = new PointCache();
+            var actor = BuildActor(driver, retries: 1, cache);
+
+            await StartAndSettleAsync(actor, t);
+
+            t.Equal(2, driver.Reads, "a comm-error batch (returned, not thrown) is retried like a timeout batch");
+            t.Equal(Quality.Good, cache.Get("dev-1", "a")!.Quality, "the retry replaces the comm-error batch");
+            t.Equal(1UL, cache.Get("dev-1", "a")!.Seq, "the discarded comm-error attempt never reached the cache");
 
             await actor.StopAsync();
         });
