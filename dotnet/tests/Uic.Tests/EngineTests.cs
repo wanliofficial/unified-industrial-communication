@@ -26,6 +26,7 @@ internal static class EngineTests
         tests.Add(new TestCase("engine/deadline_is_retried_as_timeout", DeadlineIsRetriedAsTimeout));
         tests.Add(new TestCase("engine/permanent_failure_is_not_retried", PermanentFailureIsNotRetried));
         tests.Add(new TestCase("engine/comm_error_batch_is_retried", CommErrorBatchIsRetried));
+        tests.Add(new TestCase("engine/address_error_batch_does_not_retire_the_device", AddressErrorBatchDoesNotRetireTheDevice));
         tests.Add(new TestCase("engine/retries_are_finite", RetriesAreFinite));
         tests.Add(new TestCase("engine/failure_threshold_trips_the_breaker", FailureThresholdTripsTheBreaker));
         tests.Add(new TestCase("engine/write_confirmation_reads_back", WriteConfirmationReadsBack));
@@ -1101,6 +1102,47 @@ internal static class EngineTests
             t.Equal(2, driver.Reads, "a comm-error batch (returned, not thrown) is retried like a timeout batch");
             t.Equal(Quality.Good, cache.Get("dev-1", "a")!.Quality, "the retry replaces the comm-error batch");
             t.Equal(1UL, cache.Get("dev-1", "a")!.Seq, "the discarded comm-error attempt never reached the cache");
+
+            await actor.StopAsync();
+        });
+    }
+
+    /// <summary>
+    /// 与 <c>comm_error_batch_is_retried</c> 对称的另一半：驱动「调用成功但整批返回
+    /// <c>address_error</c>」时，绝不能重试、也绝不能把设备拖进降级/熔断。
+    ///
+    /// 为什么单独立一条：地址错是点表写错，不是链路故障——重试一万次还是同一个错地址，
+    /// 只会延长故障时间；把它算进熔断计数更糟，那会把一台「链路完好、只是某个点配错」的
+    /// 设备判成离线（FR-RUN-05 明确 <c>address</c> 类错误不参与熔断）。<c>permanent_failure_is_not_retried</c>
+    /// 钉的是「抛异常」那条 catch 分支；这条钉的是「返回坏质量批」那条主循环分支（actor 在
+    /// 读到样本后直接读质量字段判，不走 catch），两条是不同的代码路径，互不覆盖。
+    ///
+    /// 还有一条只有返回批路径才有的语义：返回批里带的坏值会被原样发布到缓存（现场看得到
+    /// 「这个点读到的是 1，但质量是 address_error」），而抛异常路径没有值可发、只能落占位 0。
+    /// 这条用「缓存里的值 == 驱动返回的 1」钉住——它是返回批路径独有的。
+    /// </summary>
+    private static Task AddressErrorBatchDoesNotRetireTheDevice(TestContext t)
+    {
+        return RunAsync(async () =>
+        {
+            var driver = new ScriptedDriver()
+                .BadBatch(Quality.AddressError)
+                .ThenSucceed();
+
+            var cache = new PointCache();
+            var actor = BuildActor(driver, retries: 3, cache);
+
+            await StartAndSettleAsync(actor, t);
+
+            t.Equal(1, driver.Reads, "a deterministic address error is not retried (retries=3, yet one read)");
+            t.Equal(Quality.AddressError, cache.Get("dev-1", "a")!.Quality, "the point carries the address error");
+            // 返回批路径：驱动返回的坏值（1）被原样发布，而不是占位 0——这条是返回批独有。
+            t.Equal(1, cache.Get("dev-1", "a")!.Value.AsNumber(),
+                "the returned bad value is published as-is, not zeroed to a placeholder");
+            t.Equal(RuntimeState.Collecting, actor.State,
+                "an address error keeps the device Collecting: it is a point-table problem, not a link failure");
+            t.Equal(1L, actor.Stats.ReadsFailed,
+                "the failed cycle is counted as a failed read, even though it does not advance the breaker");
 
             await actor.StopAsync();
         });
