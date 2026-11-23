@@ -33,6 +33,8 @@ internal static class EngineTests
         tests.Add(new TestCase("engine/write_confirmation_detects_mismatch", WriteConfirmationDetectsMismatch));
         tests.Add(new TestCase("engine/write_without_confirmation_skips_readback", WriteWithoutConfirmationSkipsReadback));
         tests.Add(new TestCase("engine/write_readback_failure_is_not_a_write_failure", WriteReadbackFailureIsNotAWriteFailure));
+        tests.Add(new TestCase("engine/write_readback_bad_quality_is_unconfirmed", WriteReadbackBadQualityIsUnconfirmed));
+        tests.Add(new TestCase("engine/write_readback_no_value_is_unconfirmed", WriteReadbackNoValueIsUnconfirmed));
         tests.Add(new TestCase("engine/array_write_shape_is_validated_before_the_device", ArrayWriteShapeIsValidated));
         tests.Add(new TestCase("engine/point_interval_overrides_device_period", PointIntervalOverridesDevicePeriod));
         tests.Add(new TestCase("engine/point_interval_failure_is_scoped_to_due_bucket", PointIntervalFailureIsScoped));
@@ -129,6 +131,12 @@ internal static class EngineTests
         /// <summary>回读这一步直接抛异常：写命令已被接受下发，但回读链路读不出来。</summary>
         public bool ThrowOnRead;
 
+        /// <summary>回读把该点以非 Good 质量返回（值仍是对的），用于钉 verify.quality 分支。</summary>
+        public bool BadQualityOnRead;
+
+        /// <summary>回读一个点都不返回，用于钉 verify.no_value 分支。</summary>
+        public bool OmitOnRead;
+
         public DriverMeta Meta { get; } = new()
         {
             Id = "confirm",
@@ -154,11 +162,25 @@ internal static class EngineTests
                 if (_owner.ThrowOnRead)
                     throw DriverException.Connection("confirm", "read", "readback link down");
 
+                // 回读一个点都不返回：验证「回读无值」这一裁决分支。
+                if (_owner.OmitOnRead)
+                    return Task.FromResult<IReadOnlyList<RawSample>>(Array.Empty<RawSample>());
+
                 var samples = spans.SelectMany(s => s.Points).Select(p =>
                 {
                     if (_owner.LieOnRead)
                     {
                         return new RawSample(p.Id, DataValue.Number(p.DataType, 999), Quality.Good, null);
+                    }
+
+                    // 值保持正确，只把质量弄坏：验证「回读质量坏」这一裁决分支
+                    // （质量检查在值比较之前，所以只会走 verify.quality，不会走到 mismatch）。
+                    if (_owner.BadQualityOnRead)
+                    {
+                        var storedBadQ = _owner._stored.TryGetValue(p.Id, out var sBad)
+                            ? sBad
+                            : DataValue.Number(p.DataType, 1);
+                        return new RawSample(p.Id, storedBadQ, Quality.CommError, null, "readback reports link down");
                     }
 
                     var value = _owner._stored.TryGetValue(p.Id, out var stored)
@@ -318,6 +340,86 @@ internal static class EngineTests
             // 错误消息必须明确是回读失败，而不是写成「写入失败」误导排查方向。
             t.Contains(results[0].Error ?? string.Empty, "verify.readback_failed",
                 "the error is labeled as a readback/verification problem, not a write failure");
+
+            await actor.DisposeAsync();
+        });
+    }
+
+    /// <summary>
+    /// 回读「读回来了，但质量不是 Good」：同样不能算写成功，但理由必须与 mismatch 分开。
+    ///
+    /// 为什么单独立一条：代码里质量检查排在值比较之前（sample.Quality != Good 直接走
+    /// verify.quality 分支），所以值对、质量坏时**只会**落 verify.quality，不会落 mismatch。
+    /// 现场含义不同：mismatch 是「值没保持住、要去查写命令/设备是否接受该值」，quality 是
+    /// 「回读链路本身有问题、这次没读到、要去查读侧」，排查方向相反。质量原样透出（这里 comm_error），
+    /// 上层据此区别于笼统的 Uncertain。
+    /// </summary>
+    private static Task WriteReadbackBadQualityIsUnconfirmed(TestContext t)
+    {
+        return RunAsync(async () =>
+        {
+            var driver = new ConfirmDriver { BadQualityOnRead = true };
+            var actor = new DeviceActor(
+                BuildDevice(), BuildChannel(), driver, new PointCache(), new ChannelGate(1),
+                NullLogger.Instance, new SchedulerOptions { Tick = TimeSpan.FromMilliseconds(5) });
+
+            var results = await actor.WriteAsync(
+                new[]
+                {
+                    new WriteCommand(actor.Spans[0].Points[0], DataValue.Number(DataType.UInt16, 7),
+                        Confirm: true),
+                },
+                t.Ct);
+
+            t.Equal(1, results.Count, "one result");
+            t.Equal(1, driver.Writes, "the write command was dispatched to the device");
+            t.Ok(!results[0].Ok, "a bad-quality readback does not confirm the write");
+            t.Equal(false, results[0].Verified, "the write is not marked verified");
+            // 质量原样透出，而不是笼统的 Uncertain——现场据此判断是读侧链路问题。
+            t.Equal(Quality.CommError, results[0].Quality, "the readback quality is surfaced as-is");
+            t.Contains(results[0].Error ?? string.Empty, "verify.quality",
+                "the error is labeled as a readback-quality problem, not a mismatch");
+            t.Ok(!(results[0].Error ?? string.Empty).Contains("mismatch", StringComparison.Ordinal),
+                "a quality failure is not mislabeled as a value mismatch");
+
+            await actor.DisposeAsync();
+        });
+    }
+
+    /// <summary>
+    /// 回读「一个值都没返回」：既不是 mismatch、也不是 quality，而是 verify.no_value，
+    /// 质量固定 Uncertain（网关根本不知道设备那侧现在是什么值）。
+    ///
+    /// 为什么单独立一条：三个 verify.* 分支的语义各异，运维要从错误前缀一眼分清——
+    /// no_value 是「回读根本没拿到这个点」，去查点表/设备是否还存在该点；mismatch 是「拿到了但不对」；
+    /// quality 是「拿到了但质量坏」。把 no_value 混进 mismatch 会让人去比对两个值，而实际上根本没有值可比。
+    /// </summary>
+    private static Task WriteReadbackNoValueIsUnconfirmed(TestContext t)
+    {
+        return RunAsync(async () =>
+        {
+            var driver = new ConfirmDriver { OmitOnRead = true };
+            var actor = new DeviceActor(
+                BuildDevice(), BuildChannel(), driver, new PointCache(), new ChannelGate(1),
+                NullLogger.Instance, new SchedulerOptions { Tick = TimeSpan.FromMilliseconds(5) });
+
+            var results = await actor.WriteAsync(
+                new[]
+                {
+                    new WriteCommand(actor.Spans[0].Points[0], DataValue.Number(DataType.UInt16, 7),
+                        Confirm: true),
+                },
+                t.Ct);
+
+            t.Equal(1, results.Count, "one result");
+            t.Equal(1, driver.Writes, "the write command was dispatched to the device");
+            t.Equal(1, driver.Reads, "the readback read was attempted");
+            t.Ok(!results[0].Ok, "a missing readback value does not confirm the write");
+            t.Equal(false, results[0].Verified, "the write is not marked verified");
+            // 没有值可选：质量是 Uncertain（不确定设备侧当前值），不是 mismatch 的可比较结论。
+            t.Equal(Quality.Uncertain, results[0].Quality, "no readback value maps to uncertain");
+            t.Contains(results[0].Error ?? string.Empty, "verify.no_value",
+                "the error is labeled as a missing readback value");
 
             await actor.DisposeAsync();
         });

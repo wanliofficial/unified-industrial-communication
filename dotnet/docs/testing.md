@@ -19,13 +19,18 @@ dotnet run --project tests/Uic.Tests -- --stop-on-fail      # 首个失败即停
 N passed, 0 failed, 0 skipped · <耗时>
 ```
 
-本轮（430 条）的改动是**纯增量**：新增一条引擎用例 `engine/write_readback_failure_is_not_a_write_failure`
-（写后确认的回读这一步抛异常时，绝不能谎报成「写入失败」：写命令已下发、回读读不出，只能是**不确定**，
-质量折成回读异常本身的 comm_error、错误消息打 `verify.readback_failed` 前缀，与 `verify.mismatch`/
-`verify.quality` 明确区分）。本轮已直接复跑验证：`--filter write_readback_failure_is_not_a_write_failure`
-1 条全绿（1.6 s）。由于这条不改动任何既有用例的判定，全量通过/失败结论不受影响，故全量汇总数字留待
-下一次腾空复跑时如实量取填入上方（前一轮全量在 NTFS 高负载下于 `contract/*` 组后被截断、未跑到汇总，
-故不写「全绿」假数字）。
+本轮（432 条）的改动是**纯增量**：补齐写后确认回读裁决剩下两个此前无用例的分支，
+`engine/write_readback_bad_quality_is_unconfirmed`（回读读回来了、值也对，但**质量不是 Good**：
+只能算「没确认」，质量原样透出、错误打 `verify.quality`，**不得**误报成值不一致 `verify.mismatch`——
+两者现场排查方向相反：mismatch 查写命令/设备是否接受该值，quality 查回读链路）与
+`engine/write_readback_no_value_is_unconfirmed`（回读**一个值都没返回**：质量固定 `Uncertain`、
+错误打 `verify.no_value`——连值都没有，谈不上「比对不对」）。加上上一轮的
+`engine/write_readback_failure_is_not_a_write_failure`（回读这一步抛异常，绝不谎报成写入失败），
+`VerifyWriteAsync` 的 5 个裁决分支（ok / mismatch / quality / no_value / readback_failed）现已全部有用例点名。
+本轮已直接复跑验证：`--filter write_readback_bad_quality_is_unconfirmed`、
+`--filter write_readback_no_value_is_unconfirmed` 各 1 条全绿，整组 `--filter engine/` 全绿（见提交说明）。
+由于这两条不改动任何既有用例的判定，全量通过/失败结论不受影响，故全量汇总数字留待下一次腾空复跑时
+如实量取填入上方（前一轮全量在 NTFS 高负载下于 `contract/*` 组后被截断、未跑到汇总，故不写「全绿」假数字）。
 
 前序基线（422 条，`--opcua`）：`421 passed, 1 failed, 0 skipped · 1041.9 s`——那 1 条 failed 是
 `contract/points_csv_import_previews_and_applies` 触到 180 s 硬超时的**高负载 flake**
@@ -97,6 +102,10 @@ deviceInstance 22 位实例号越界与非数字明确报错、纯构造不启 U
 430 条 = 429 条 + 回读失败不谎报写失败一条（`engine/write_readback_failure_is_not_a_write_failure`，
 写后确认的回读抛异常时按「不确定」处理、质量折成回读异常的 comm_error、错误打 `verify.readback_failed`
 前缀、与 `verify.mismatch`/`verify.quality` 区分、≤ 2.8 s）。
+432 条 = 430 条 + 回读裁决最后两支（`engine/write_readback_bad_quality_is_unconfirmed`：值对但质量坏时
+只能算没确认、质量原样透出、错误打 `verify.quality` 且**不得**误报成 `verify.mismatch`；
+`engine/write_readback_no_value_is_unconfirmed`：回读一个值都没返回时质量固定 `Uncertain`、
+错误打 `verify.no_value`。至此 `VerifyWriteAsync` 五个裁决分支全部被点名，两条都 ≤ 3 s、纯进程内）。
 419 条那一轮（只跑过 `fault/*` 组，未记耗时的中间态）跳过；以 420 条这一轮为准（见下一段）。
 418 条那一轮（补了 OPC UA 服务端能力边界两条：`opcua/server_options_are_anonymous_and_none_only`、
 `opcua/server_endpoint_advertises_only_none_and_anonymous`；配置校验矩阵补 `allowAnonymousRead=false`
@@ -177,7 +186,7 @@ NFR 的门槛是 120 s，压测用例、PBKDF2 派生与 TLS 握手是主要开�
 | `json/*` | 11 | 时长、枚举、值形状、数组值形状、`count` 往返、UTC、往返稳定、前向兼容 |
 | `logs/*` | 7 | JSON 行字段、轮转不丢行、归档裁剪、默认关闭、热更新开关、非法配置拒绝、环形缓冲顺序与过滤 |
 | `resources/*` | 5 | 磁盘/内存进入与恢复回差、探针不可读不误报、降级时文件日志暂停、非法水位配置拒绝 |
-| `engine/*` | 19 | 同连接永不并发、**跨设备并行（屏障驱动证明两台设备的读同时在飞；串行调度会明确失败）**、状态机与代次、**熔断阈值（逐轮放行驱动：1/2 次失败为 `Degraded`，第 3 次转 `Faulted`、换代次、之后仍靠重连探活）**、临时失败重试、坏质量整批重试（含 **comm_error 返回批**、**address_error 返回批不重试不降级**）、deadline 超时重试、确定性错误不重试、重试次数有限、写后回读一致/不一致/不开启/**回读失败不谎报写失败**、数组写入形状校验、点位周期覆盖设备周期、快慢桶失败互不牵连、**通道闸门写优先（排队中的写占住槽位，写结束后才来的读不得抢第二个空槽位——删掉自旋等待即失效）** |
+| `engine/*` | 21 | 同连接永不并发、**跨设备并行（屏障驱动证明两台设备的读同时在飞；串行调度会明确失败）**、状态机与代次、**熔断阈值（逐轮放行驱动：1/2 次失败为 `Degraded`，第 3 次转 `Faulted`、换代次、之后仍靠重连探活）**、临时失败重试、坏质量整批重试（含 **comm_error 返回批**、**address_error 返回批不重试不降级**）、deadline 超时重试、确定性错误不重试、重试次数有限、**写后回读裁决五分支全覆盖**（一致 / 不一致 / 不开启 / **回读质量坏不得误报成不一致** / **回读无值固定 Uncertain** / **回读抛异常不谎报写失败**）、数组写入形状校验、点位周期覆盖设备周期、快慢桶失败互不牵连、**通道闸门写优先（排队中的写占住槽位，写结束后才来的读不得抢第二个空槽位——删掉自旋等待即失效）** |
 | `virtual/*` | 8 | 虚拟设备的故障注入（`FR-COL-07`）：`timeout`/`drop` 归为临时性超时、`address` 归为永久性且落 `address_error`、`bad` **不抛异常**（采样保留、值为空、带原因，避免一个坏点让整批重试）、`disconnect` 持续失败（不是抖一次）、`faultAt` 只注入第 N 次而前后两次正常、缺省不注入、常量波形写后回读 |
 | `schedule/*` | 6 | 启动相位均匀铺开、单调时间换算与到期边界、调度器实际分配相位、相位按设备内最快点位周期、**uptime 用单调时钟**（校时跳变不会让它凭空多出一小时）、**失败退避算术**（2^n 增长、2^6 被 `recoverInterval` 截住、抖动只加不减且不超 10%、基数大于上限不被缩短） |
 | `sdk/*` | 6 | 驱动注册契约：**SDK 版本不匹配直接拒绝**（错误消息里同时给出驱动声明与宿主要求的版本，且不留半注册状态）、**重复 id 拒绝且不覆盖先注册的驱动**、版本匹配时正常注册并把能力/传输声明原样透出；`check` 与启动共用同一份引用检查：**协议没注册时 `uic check` 退出码 2 并指出 `channels[x].protocol`**（同一份配置换成已注册驱动则通过），同一条通道只报一次；**分层边界由程序集实际引用表钉住**（Modbus/S7/BACnet 三个 codec 的实际引用里不得出现 `Uic.Transport`/`Engine`/`Runtime` 等 I/O 层、不得出现 `System.Net`，且必须依赖 `Uic.Domain` 作为反向对照） |

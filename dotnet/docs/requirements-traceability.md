@@ -12,16 +12,19 @@ PRD 中 M 级的采集协议已全部落地，FR-CFG-01 的四类寻址模型也
 COV/分段/多属性读仍不做，见 [protocol-status.md](protocol-status.md) §4.1）。非 M 级验收里的 12 类故障注入同样全部有了
 可自动跑的用例（见 §7）。
 
-当前测试基线：**430 条**（带 `--opcua` 全量：本轮新增的一条 `engine/write_readback_failure_is_not_a_write_failure`
-是纯进程内、不连真实设备；全量实测数字以 [testing.md](testing.md) 最新一轮为准）。本轮新增
-`engine/write_readback_failure_is_not_a_write_failure`：写后确认的回读这一步本身抛异常时，绝不能把它当成
-「写入失败」上报。写命令已经被驱动接受、已下发到设备，回读却读不出来——这只能说明「这次写没能被确认」，
-是**不确定**，不是**写失败**：写失败去查写命令/点表，回读失败去查回读链路，两者现场处置完全相反。
-代码 catch 块因此把质量折成回读异常的语义（Connection→comm_error）、错误消息统一打 `verify.readback_failed`
-前缀，与 `verify.mismatch`（值对不上）/`verify.quality`（回读质量坏）/`verify.no_value`（回读无值）明确区分。
-用例钉住：写确实下发（Writes==1）、回读被尝试（Reads==1）、Ok/Verified 均为 false、质量为 comm_error、
-错误含 `verify.readback_failed`。纯进程内、≤ 2.8 s。
-此前几轮新增 `engine/address_error_batch_does_not_retire_the_device`（address_error 返回批不重试不降级）、
+当前测试基线：**432 条**（带 `--opcua` 全量：本轮新增的两条 `engine/write_readback_bad_quality_is_unconfirmed`
+与 `engine/write_readback_no_value_is_unconfirmed` 是纯进程内、不连真实设备；全量实测数字以 [testing.md](testing.md)
+最新一轮为准）。本轮补齐写后确认回读裁决剩下的两个此前无用例的分支：
+`engine/write_readback_bad_quality_is_unconfirmed`——回读「读回来了、值也对，但质量不是 Good」时，只能算
+「没确认」，质量原样透出（comm_error）、错误打 `verify.quality` 前缀，**不得**误报成值不一致 `verify.mismatch`
+（两者现场排查方向相反：mismatch 查写命令/设备是否接受该值，quality 查回读链路）；以及
+`engine/write_readback_no_value_is_unconfirmed`——回读「一个值都没返回」时，质量固定 `Uncertain`、错误打
+`verify.no_value`（连值都没有，谈不上「比对不对」）。连同上一轮的 `engine/write_readback_failure_is_not_a_write_failure`
+（回读抛异常、绝不谎报写失败），`VerifyWriteAsync` 的 5 个裁决分支（ok / mismatch / quality / no_value /
+readback_failed）现已全部有用例点名。用例均钉住写确实下发（Writes==1）、回读被尝试（Reads==1）、Ok/Verified
+均为 false，以及各自的质量与错误前缀。纯进程内、≤ 2.7 s。
+此前几轮新增 `engine/write_readback_failure_is_not_a_write_failure`（回读失败不谎报写失败）、
+`engine/address_error_batch_does_not_retire_the_device`（address_error 返回批不重试不降级）、
 `engine/comm_error_batch_is_retried`（comm_error 返回批按临时性失败重试）、
 `pipeline/error_kind_maps_to_quality`（`QualityMap.From` 全 8 档映射逐档点名 + 反向守卫）、
 `bacnet/write_array_point_is_rejected`（数组点位写逐点失败映射 Disabled）、
@@ -30,8 +33,9 @@ COV/分段/多属性读仍不做，见 [protocol-status.md](protocol-status.md) 
 `s7/label_out_of_range_is_rejected`（S7 <MASKED_PERSON_001> rack/slot/pduSize 越界）、
 `s7/metadata_declares_capabilities`、`opcua/metadata_declares_capabilities`
 （S7 与 OPC UA 客户端两个驱动此前无用例断言的 `DriverMeta` 能力声明钉住）。
-本轮改动纯增量（新增一条引擎用例），不改动既有用例判定，故直接复跑受影响用例确认：
-`--filter write_readback_failure_is_not_a_write_failure` 1 条全绿（1.6 s）；全量汇总数字以 [testing.md](testing.md)
+本轮改动纯增量（新增两条引擎用例），不改动既有用例判定，故直接复跑受影响用例确认：
+`--filter write_readback_bad_quality_is_unconfirmed`、`--filter write_readback_no_value_is_unconfirmed`
+各 1 条全绿，整组 `--filter engine/` 全绿（见提交说明）；全量汇总数字以 [testing.md](testing.md)
 下一次腾空复跑所量取者为准。
 
 ## 1. 采集（FR-COL）
@@ -48,7 +52,7 @@ COV/分段/多属性读仍不做，见 [protocol-status.md](protocol-status.md) 
 | FR-COL-08 | 驱动能力四态声明 | 已实现 | `GET /api/v1/drivers` 暴露 `Capabilities`（八项能力，每项 `supported`/`unsupported`/`runtimeDependent`/`experimental` 四态）。API 侧逐项有断言：`contract/drivers_expose_capability_states` 锁住四态线上名字，并经 API 投影逐项断言 modbus-tcp、virtual、mqtt 三个驱动的读写/批量/位访问/订阅/浏览/发现取值、`roles`、`addressKinds`、`configFields`/`pointFields`（modbus-rtu/ascii 与 modbus-tcp 同源，另单独钉住其 `name`、`transports=serial`、`roles` 与「串口+波特率」`configFields`、且确认无 `transport.host` 字段）；BACnet 由 `bacnet/metadata_declares_object_addressing`、S7 与 OPC UA 客户端各自由 `s7/metadata_declares_capabilities`、`opcua/metadata_declares_capabilities` 逐字段钉住——八个内置驱动的能力声明现在都有用例守着（后三条是纯函数，不进 contract host 的 5 驱动注册表）。控制台「驱动」页渲染八项四态徽标、设备页显示「读/写/订阅/浏览」四项——**这部分 UI 渲染无自动化断言**（`scripts/wasm-smoke.cjs` 只覆盖登录、强制改密、首屏数据与新建设备，不校验驱动页徽标） |
 | FR-COL-09 | 批量读规划（合并 / 非法跨越拒绝） | 已实现 | 规划器八条用例逐条点名：相邻合并且允许跨空洞时也合并（`planner/merges_adjacent_registers`、`planner/merges_across_a_gap_when_allowed`）、默认不跨空洞（`planner/does_not_merge_across_a_gap`）、按寄存器与位上限切分（`planner/splits_at_register_limit`、`planner/splits_at_bit_limit`）、按区域分离（`planner/separates_areas`）、非寄存器寻址不参与合并（`planner/keeps_non_register_addresses_separate`）、每点恰好覆盖一次（`planner/covers_every_point_exactly_once`） |
 | FR-COL-10 | 每点位独立采集周期 | 已实现 | `Point.interval` 覆盖设备周期（空/0 表示继承，非 0 时 100ms..24h）；`DeviceActor` 按有效周期分桶，每轮只读到期的桶并合并成一次串行读取，快慢变量互不拖累。证据 `engine/point_interval_overrides_device_period`（1s 设备 + 100ms 点位）、`engine/point_interval_failure_is_scoped_to_due_bucket`、`csv/imports_point_interval`、`schedule/phase_follows_fastest_point`、`contract/points_expose_effective_interval`；看门狗阈值取设备内最慢周期，启动相位取最快周期，点位 DTO 暴露 `interval` 与 `effectiveInterval` |
-| FR-COL-11 | 写入（单点/多点），写后校验与超时 | 已实现 | 单点/多点、逐点裁决、超时三态（`ok`/`disabled`/`timeout`）已实现：`contract/write_returns_per_point_results`。`confirm: true` 在同一个通道租约内立即回读并比较，结果带 `verified`；不一致返回 `ok=false` + `uncertain` + `verify.mismatch`：`engine/write_confirmation_reads_back`、`engine/write_confirmation_detects_mismatch`、`engine/write_without_confirmation_skips_readback`。回读这一步本身抛异常时**绝不谎报成「写入失败」**——写已下发、回读读不出只能是「不确定」，质量折成回读异常的 comm_error、错误打 `verify.readback_failed` 前缀（区别于 `verify.mismatch`/`verify.quality`），现场据此查回读链路而非写命令：`engine/write_readback_failure_is_not_a_write_failure`。数组点位的元素个数在**建链前**校验，不符直接拒绝而不是交给驱动：`engine/array_write_shape_is_validated_before_the_device`。值越界（如 70000 写 uint16）与超长文本直接逐点拒绝，不静默取模/截断：`codec/encode_rejects_out_of_range`、`codec/encode_rejects_overlong_text` |
+| FR-COL-11 | 写入（单点/多点），写后校验与超时 | 已实现 | 单点/多点、逐点裁决、超时三态（`ok`/`disabled`/`timeout`）已实现：`contract/write_returns_per_point_results`。`confirm: true` 在同一个通道租约内立即回读并比较，结果带 `verified`；不一致返回 `ok=false` + `uncertain` + `verify.mismatch`：`engine/write_confirmation_reads_back`、`engine/write_confirmation_detects_mismatch`、`engine/write_without_confirmation_skips_readback`。回读这一步本身抛异常时**绝不谎报成「写入失败」**——写已下发、回读读不出只能是「不确定」，质量折成回读异常的 comm_error、错误打 `verify.readback_failed` 前缀（区别于 `verify.mismatch`/`verify.quality`），现场据此查回读链路而非写命令：`engine/write_readback_failure_is_not_a_write_failure`。回读读回来了但**质量坏**（值对、质量不是 Good）只能算没确认、质量原样透出、**不得误报成**值不一致（两者排查方向相反），错误打 `verify.quality`：`engine/write_readback_bad_quality_is_unconfirmed`；回读**一个值都没返回**时质量固定 `Uncertain`、错误打 `verify.no_value`（连值都没有、谈不上比对）：`engine/write_readback_no_value_is_unconfirmed`——至此 `VerifyWriteAsync` 五个回读裁决分支全部有用例点名。数组点位的元素个数在**建链前**校验，不符直接拒绝而不是交给驱动：`engine/array_write_shape_is_validated_before_the_device`。值越界（如 70000 写 uint16）与超长文本直接逐点拒绝，不静默取模/截断：`codec/encode_rejects_out_of_range`、`codec/encode_rejects_overlong_text` |
 | FR-COL-12 | 订阅型协议（COV/事件/通知） | 刻意没做（C） | 路线图 Wave 2。`Capabilities.Subscribe` 是四态声明，OPC UA 客户端已声明 `supported` 并通过 `ISubscriptionConn` 提供真实的 MonitoredItem 订阅（`opcua/client_read_write_subscribe`），但**采集主路径仍是按周期轮询**，与 Modbus/S7 一致：把订阅接到调度器需要另一套「推送驱动的重试/熔断/死区」语义，不在本版范围内。BACnet 的 COV 同样没做：`Capabilities.Subscribe` 声明为 `unsupported`，驱动不会假装订阅成功 |
 
 ## 2. 数据模型与配置（FR-CFG）
