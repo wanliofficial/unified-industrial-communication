@@ -354,6 +354,30 @@ func TestReadBytesOnStructTag(t *testing.T) {
 	}
 }
 
+// TestReadBytesNeedMoreExceedsElementCount 锁定一条 bytes 重读的边界：
+// 学到元素宽度后 need = offset + ceil(want/size) 可能越过 16 位元素数上限，
+// 但仍落在传输字节上限内。必须在重入 readFragments 之前按地址错拦下——
+// 否则 uint16(need) 回绕成另一个合法值，设备会返回一个「看起来成功」的
+// 错误区间。与 buildRead 首次请求的 count 守卫对称。
+func TestReadBytesNeedMoreExceedsElementCount(t *testing.T) {
+	s := newScript().add(registerReply(0x11, 0, 1)).
+		// 应答只带一个 INT(2B) 元素：data 长度 2 < skip+want，触发 needMore。
+		add(rrReply(0x11, enipcodec.ServiceReadTag, 0, nil, []byte{enipcodec.TypeINT, 0, 1, 0}))
+	c, _ := openScript(t, s)
+	p := ref("raw", "T", model.TypeBytes)
+	p.Address.Offset = 0xFFFE // 首个 count = 0xFFFF，恰好通过 buildRead 守卫
+	p.Address.Length = 6      // INT(2B): need = 0xFFFE + 3 = 0x10001，越 16 位
+	samples, err := c.Read(context.Background(), []driver.ReadSpan{{ID: "s", Points: []driver.PointRef{p}}})
+	if err == nil || len(samples) != 1 || samples[0].Quality != model.QualityAddressError {
+		t.Fatalf("samples = %+v err=%v", samples, err)
+	}
+	// 必须在重读之前拦下：除 RegisterSession 与首个 Read Tag 外不应再有任何
+	// 设备往返（修复前会再走 Forward Open + 一次被截断的重读）。
+	if len(s.requests) != 2 {
+		t.Fatalf("sent %d requests, want 2 (register + single read, no re-read)", len(s.requests))
+	}
+}
+
 func TestReadZeroElements(t *testing.T) {
 	s := newScript().add(registerReply(0x11, 0, 1)).
 		add(rrReply(0x11, enipcodec.ServiceReadTag, 0, nil, []byte{enipcodec.TypeDINT, 0}))

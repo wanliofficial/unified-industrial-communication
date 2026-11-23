@@ -971,6 +971,13 @@ func decodeData(plan pointPlan, typ byte, data []byte) (driver.RawSample, error)
 			// 学到宽度之后必须再核一次上限：第一次请求只有 1 个元素，
 			// 不可能在 buildRead 阶段就知道实际要读多少字节。
 			need := p.Address.Offset + (plan.want+size-1)/size
+			if need > 0xFFFF {
+				// 与 buildRead 里首次请求的 count 守卫对称：needMore 重入
+				// readFragments 时同样会把 count 塞进 16 位元素数字段，漏掉
+				// 这条会让 uint16(need) 回绕成另一个合法值，读到错误区间。
+				return driver.RawSample{}, driver.E(driver.ErrAddress, "decode", "",
+					fmt.Sprintf("point %q: element count %d exceeds the 16-bit Read Tag element count", p.ID, need), false, nil)
+			}
 			if need*size > maxTransferBytes {
 				return driver.RawSample{}, driver.E(driver.ErrAddress, "decode", "",
 					fmt.Sprintf("point %q: %d bytes exceed the %d-byte transfer limit", p.ID, need*size, maxTransferBytes), false, nil)
