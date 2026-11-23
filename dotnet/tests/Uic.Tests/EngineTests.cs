@@ -32,6 +32,7 @@ internal static class EngineTests
         tests.Add(new TestCase("engine/write_confirmation_reads_back", WriteConfirmationReadsBack));
         tests.Add(new TestCase("engine/write_confirmation_detects_mismatch", WriteConfirmationDetectsMismatch));
         tests.Add(new TestCase("engine/write_without_confirmation_skips_readback", WriteWithoutConfirmationSkipsReadback));
+        tests.Add(new TestCase("engine/write_readback_failure_is_not_a_write_failure", WriteReadbackFailureIsNotAWriteFailure));
         tests.Add(new TestCase("engine/array_write_shape_is_validated_before_the_device", ArrayWriteShapeIsValidated));
         tests.Add(new TestCase("engine/point_interval_overrides_device_period", PointIntervalOverridesDevicePeriod));
         tests.Add(new TestCase("engine/point_interval_failure_is_scoped_to_due_bucket", PointIntervalFailureIsScoped));
@@ -125,6 +126,9 @@ internal static class EngineTests
         public int Writes;
         public bool LieOnRead;
 
+        /// <summary>回读这一步直接抛异常：写命令已被接受下发，但回读链路读不出来。</summary>
+        public bool ThrowOnRead;
+
         public DriverMeta Meta { get; } = new()
         {
             Id = "confirm",
@@ -146,6 +150,9 @@ internal static class EngineTests
                 IReadOnlyList<ReadSpan> spans, CancellationToken ct)
             {
                 Interlocked.Increment(ref _owner.Reads);
+
+                if (_owner.ThrowOnRead)
+                    throw DriverException.Connection("confirm", "read", "readback link down");
 
                 var samples = spans.SelectMany(s => s.Points).Select(p =>
                 {
@@ -261,6 +268,56 @@ internal static class EngineTests
             t.Ok(results[0].Ok, "the write succeeds");
             t.Equal(null, results[0].Verified, "without confirm there is no verification verdict");
             t.Equal(0, driver.Reads, "the driver is not read back");
+
+            await actor.DisposeAsync();
+        });
+    }
+
+    /// <summary>
+    /// 写后确认的回读这一步本身抛异常时，绝不能把它当成「写入失败」上报。
+    ///
+    /// 为什么单独立一条：写命令已经被驱动接受、已经下发到设备，回读却读不出来——
+    /// 这只能说明「这次写没能被确认」，是**不确定**，不是**写失败**。两者现场处置完全相反：
+    /// 写失败去查写命令/点表，回读失败去查回读链路。把它们混为一谈，运维会在错误的方向上排查。
+    /// 代码里 catch 块因此把质量折成读失败的语义（这里是 Connection→comm_error）、
+    /// 错误消息统一打 verify.readback_failed 前缀，与 verify.mismatch/verify.quality 明确区分开。
+    ///
+    /// 这与 write_confirmation_detects_mismatch（值对不上）是不同分支：那条是
+    /// 「读回来了但值不对」，这条是「读这一步就挂了」。前者质量是 Uncertain、这条质量是
+    /// 回读异常本身折出的 comm_error——把回读异常也塌缩成 Uncertain 会让运维看不出是链路问题。
+    /// </summary>
+    private static Task WriteReadbackFailureIsNotAWriteFailure(TestContext t)
+    {
+        return RunAsync(async () =>
+        {
+            var driver = new ConfirmDriver { ThrowOnRead = true };
+            var actor = new DeviceActor(
+                BuildDevice(), BuildChannel(), driver, new PointCache(), new ChannelGate(1),
+                NullLogger.Instance, new SchedulerOptions { Tick = TimeSpan.FromMilliseconds(5) });
+
+            var results = await actor.WriteAsync(
+                new[]
+                {
+                    new WriteCommand(actor.Spans[0].Points[0], DataValue.Number(DataType.UInt16, 7),
+                        Confirm: true),
+                },
+                t.Ct);
+
+            t.Equal(1, results.Count, "one result");
+            // 关键：写命令确实下发到了设备（驱动收到并接受了写），所以这不是「写没出去」。
+            t.Equal(1, driver.Writes, "the write command was dispatched to the device");
+            t.Equal(1, driver.Reads, "the readback read was attempted (and failed)");
+
+            // 不能确认 = 不算成功：Ok 为 false、Verified 为 false。
+            t.Ok(!results[0].Ok, "an unconfirmed write is not reported as success");
+            t.Equal(false, results[0].Verified, "the write is not marked verified");
+            // 质量是回读异常本身折出的 comm_error，而不是笼统的 Uncertain/Bad——
+            // 现场据此判断「去查回读链路」，而不是「去查写命令」。
+            t.Equal(Quality.CommError, results[0].Quality,
+                "the readback link failure surfaces as comm_error, not a generic uncertain");
+            // 错误消息必须明确是回读失败，而不是写成「写入失败」误导排查方向。
+            t.Contains(results[0].Error ?? string.Empty, "verify.readback_failed",
+                "the error is labeled as a readback/verification problem, not a write failure");
 
             await actor.DisposeAsync();
         });
