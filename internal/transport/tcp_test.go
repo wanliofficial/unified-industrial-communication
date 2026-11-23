@@ -274,3 +274,40 @@ func TestSetDeadlineShorterThanDefaultIsHonoured(t *testing.T) {
 		t.Fatalf("deadline not honoured: %v", elapsed)
 	}
 }
+
+// 协议层显式设的 deadline 必须原样生效，哪怕比 5s 兜底长。
+//
+// config 不限制设备超时上限；串口服务器链路上「设备超时 30s」是合法配置。
+// 旧 effectiveDeadline 把协议层设的值与 now+5s 取更早的一个，于是 TCP 上
+// 配 30s 却被截成 5s——同一台设备在串口上正常、在 TCP 上凭空超时，是只在
+// 一种接法下复现的诡异故障。兜底只在协议层「没设」（零值）时生效，与
+// serialStream 的语义对齐。
+func TestEffectiveDeadlineHonoursExplicitLongDeadline(t *testing.T) {
+	s := &tcpStream{}
+
+	// 零值：协议层没设 → 用 5s 兜底。
+	before := time.Now()
+	got := s.effectiveDeadline()
+	if d := got.Sub(before); d < 4900*time.Millisecond || d > 6*time.Second {
+		t.Fatalf("zero deadline should fall back to ~5s, got in %v", d)
+	}
+
+	// 协议层设了「30s 后」：必须原样返回，不能被截成 5s。
+	want := time.Now().Add(30 * time.Second)
+	s.deadline = want
+	got = s.effectiveDeadline()
+	if got.Sub(want) > time.Second || got.Sub(want) < -time.Second {
+		t.Fatalf("explicit 30s deadline was not honoured: got %v, want ~%v", got, want)
+	}
+	if remaining := time.Until(got); remaining < 25*time.Second {
+		t.Fatalf("explicit 30s deadline truncated to %v remaining (want ~30s)", remaining)
+	}
+
+	// 协议层设了比兜底短的「120ms 后」：原样返回（不被静默延长）。
+	short := time.Now().Add(120 * time.Millisecond)
+	s.deadline = short
+	got = s.effectiveDeadline()
+	if time.Until(got) > 200*time.Millisecond {
+		t.Fatalf("short deadline silently extended: %v remaining", time.Until(got))
+	}
+}

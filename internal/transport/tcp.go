@@ -96,14 +96,20 @@ func (s *tcpStream) SetDeadline(t time.Time) error {
 	return s.conn.SetDeadline(t)
 }
 
-// effectiveDeadline 取「协议层设置值」与「5s 兜底」中更早的一个。
+// effectiveDeadline 返回本次读写应使用的截止时间。
+//
+// 协议层设了 deadline 就原样用它——哪怕比兜底长：config 不限制设备超时
+// 上限，串口服务器链路上「设备超时 30s」是合法配置，截成 5s 会让慢设备在
+// TCP 上凭空超时、在串口上却正常，是只在某一种接法下复现的诡异故障。
+// 兜底只在协议层「没设」（零值）时生效，否则一条没设 deadline 的链路会
+// 永远阻塞。与 serialStream 的语义对齐：只有 IsZero 才用兜底。
+// 已过期的 deadline 原样返回：调用方明确要求「现在就超时」，静默延长会
+// 掩盖上层已经取消的事实。
+//
 // 调用方必须持有 mu。
 func (s *tcpStream) effectiveDeadline() time.Time {
-	fallback := time.Now().Add(5 * time.Second)
-	if s.deadline.IsZero() || s.deadline.After(fallback) {
-		return fallback
+	if s.deadline.IsZero() {
+		return time.Now().Add(5 * time.Second)
 	}
-	// 已过期的 deadline 原样返回：调用方明确要求「现在就超时」，
-	// 静默延长会掩盖上层已经取消的事实。
 	return s.deadline
 }

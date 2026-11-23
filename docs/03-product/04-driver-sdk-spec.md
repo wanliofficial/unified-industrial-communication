@@ -423,7 +423,7 @@ DCB 结构走另一套 API，在没有真实硬件可验证之前，写一个测
 | `Acquire(proto, cfg, opener) (*Ref, error)` | 按设备路径引用计数复用；**同一路径不同参数直接报错**，不静默复用 |
 | `Ref.Lock()` / `Ref.Unlock()` | 整条总线级互斥（不是单设备），覆盖「排空 → 发送 → 收完帧」全过程 |
 | `Ref.Drain()` | `tcflush(TCIFLUSH)`；调用后截止时间会被压到现在，**必须在 `SetDeadline` 之前调用** |
-| `Ref.SetDeadline(t)` | 单次事务的读/写截止时间 |
+| `Ref.SetDeadline(t)` | 单次事务的读/写截止时间。协议层显式给的值原样生效（可大于底层兜底），**只有零值（未设）才用兜底超时**——串口与 TCP 行为一致。TCP 早期实现把协议值兜底取更早者，会静默截断长超时（配 30s 实际 5s 超时、且只在串口服务器链路上复现），已改 |
 | `Ref.ReadFull(n)` / `Write(p)` | 满足 `transport.Stream`，可直接交给编解码层 |
 | `Count()` | 当前注册的物理端口数（诊断/测试用） |
 
