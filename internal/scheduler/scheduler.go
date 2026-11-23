@@ -196,7 +196,6 @@ type device struct {
 	target Target
 	slot   chan struct{}
 	gen    atomic.Uint64
-	wr     atomic.Int32 // 等待中的写请求数（用于让读让行）
 
 	mu          sync.Mutex
 	state       State
@@ -658,10 +657,7 @@ func (s *Scheduler) SubmitWrite(ctx context.Context, id string, fn func(ctx cont
 		return ErrStopped
 	}
 
-	// 先登记「有写等待」，让同通道其他设备的读请求让行。
-	d.wr.Add(1)
-	defer d.wr.Add(-1)
-
+	// 先占住 slot（设备级：同一设备的写与采集绝不并发；写会等而不是被跳过）。
 	select {
 	case d.slot <- struct{}{}:
 	case <-ctx.Done():
