@@ -104,6 +104,8 @@ internal static class ContractTests
             CommandRequiresConfirmForDestructiveActions));
         tests.Add(new TestCase("contract/uncaught_key_not_found_is_a_404",
             UncaughtKeyNotFoundIsA404));
+        tests.Add(new TestCase("contract/diagnostics_network_reports_channel",
+            DiagnosticsNetworkReportsChannel));
     }
 
     // ------------------------------------------------------------------
@@ -3602,6 +3604,48 @@ internal static class ContractTests
                 "the safety-net catch reports resource.not_found");
             t.Contains(error.GetProperty("message").GetString() ?? string.Empty, "no-such-device",
                 "the message still names the offending device");
+        });
+    }
+
+    /// <summary>
+    /// 诊断端点 <c>GET /api/v1/diagnostics/network</c> 此前零测试（文档在 northbound-api.md 诊断表里列了它，
+    /// 但没有一条用例打到它）。它做三件事，各对应一条断言：
+    /// 1）缺 <c>device</c> 参数要归 400 <c>request.missing_parameter</c>——不能把「参数没给」当成
+    ///    「设备不存在」的 404，否则调用方会以为设备名写错了、去翻配置；
+    /// 2）设备不存在归 404 <c>device.not_found</c>（这个端点同样走设备查表）；
+    /// 3）正常路径把设备所属通道解析出来并报出协议/传输——这是端点存在的意义。
+    /// 用默认的 v1（挂在 virtual-bus，protocol=virtual、transport=none）避开 serial 的文件探测与
+    /// tcp 的 DNS/连接探测（那两类结果依赖网络、不稳定），只钉稳定可断言的解析逻辑。
+    /// </summary>
+    private static Task DiagnosticsNetworkReportsChannel(TestContext t)
+    {
+        return RunAsync(async () =>
+        {
+            await using var host = await Host.StartAsync(t);
+
+            var missing = await host.Client.SendAsync(Get("/api/v1/diagnostics/network"), t.Ct);
+            t.Equal(HttpStatusCode.BadRequest, missing.StatusCode, "missing 'device' is a 400");
+            using (var envelope = await ReadJsonAsync(t, missing))
+            {
+                t.Equal("request.missing_parameter",
+                    envelope.RootElement.GetProperty("error").GetProperty("code").GetString(),
+                    "the code names the missing parameter, not a generic bad request");
+            }
+
+            var unknown = await host.Client.SendAsync(
+                Get("/api/v1/diagnostics/network?device=nope"), t.Ct);
+            t.Equal(HttpStatusCode.NotFound, unknown.StatusCode, "an unknown device is a 404");
+
+            using var ok = await ReadJsonAsync(t, await host.Client.SendAsync(
+                Get("/api/v1/diagnostics/network?device=v1"), t.Ct));
+            var root = ok.RootElement;
+            t.Equal("v1", root.GetProperty("device").GetString(), "the device is echoed back");
+            t.Equal("virtual-bus", root.GetProperty("channel").GetString(),
+                "the channel is resolved from the device");
+            t.Equal("virtual", root.GetProperty("protocol").GetString(),
+                "the channel protocol is reported");
+            t.Equal("none", root.GetProperty("transport").GetString(),
+                "the channel transport is reported");
         });
     }
 

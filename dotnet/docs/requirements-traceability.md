@@ -12,9 +12,23 @@ PRD 中 M 级的采集协议已全部落地，FR-CFG-01 的四类寻址模型也
 COV/分段/多属性读仍不做，见 [protocol-status.md](protocol-status.md) §4.1）。非 M 级验收里的 12 类故障注入同样全部有了
 可自动跑的用例（见 §7）。
 
-当前测试基线：**439 条**（带 `--opcua` 全量；本轮**新增 1 条**契约用例。全量实测数字以
-[testing.md](testing.md) 最新一轮为准）。本轮补上北向最基础的一层 404——中间件对未翻译
-`KeyNotFoundException` 的兜底翻译：`contract/uncaught_key_not_found_is_a_404`。错误表的 404 行把
+当前测试基线：**440 条**（带 `--opcua` 全量；本轮**新增 1 条**契约用例。全量实测数字以
+[testing.md](testing.md) 最新一轮为准）。本轮补上诊断端点 `GET /api/v1/diagnostics/network` 的覆盖——
+它在 northbound-api.md 诊断表里列了、但此前**零测试**：`contract/diagnostics_network_reports_channel`
+钉住三件事——（1）缺 `device` 参数归 400 `request.missing_parameter`（不能把「参数没给」当成「设备不存在」
+的 404，否则调用方会去翻配置查设备名）；（2）未知设备归 404 `device.not_found`；（3）正常路径把设备
+所属通道解析出来并报 protocol/transport（用默认 v1 的 virtual-bus，protocol=virtual、transport=none，
+避开 serial 的文件探测与 tcp 的 DNS/连接探测这类依赖网络、不稳定的分支）。非空验证（TUnit 首断言即停，
+两轮独立扰动各自验证）：（1）把缺参抛点的 code 由 `request.missing_parameter` 改成 `request.invalid`
+→ 用例在「the code names the missing parameter, not a generic bad request: expected
+<request.missing_parameter>, got <request.invalid>」精确 FAIL；（2）恢复该码、把 `result["channel"]`
+改成字符串 `"wrong"` → 用例在「the channel is resolved from the device: expected <virtual-bus>,
+got <wrong>」精确 FAIL。恢复后源码与 HEAD 字节一致、用例 PASS（17.1 s）。**附带结论**：该端点里的
+`channel.not_found` 是防御性死码——配置校验（`Validation.cs` 的 orphan-channel 检查）保证运行中配置的
+每台设备通道都可解析，且该校验已被 `ConfigStoreTests`（`devices[virtual-1].channelId`）与
+`config_validate_reports_problems`（orphan channel → invalid）钉住；该 404 不可达、也未写进错误表，
+故不为其编造用例，只在此如实标注。
+上一轮（439 条、新增 1 条）补上北向最基础的一层 404——中间件对未翻译 `KeyNotFoundException` 的兜底翻译：`contract/uncaught_key_not_found_is_a_404`。错误表的 404 行把
 `resource.not_found` 与 `device.not_found` / `point.not_found` 并列，但它并不是某个端点显式抛的，
 而是 REST 中间件 catch 链里 `ApiException` 之后那条 `catch (KeyNotFoundException)`（`RestApi.cs`）。
 驱动层、调度器、outbox 都直接抛裸 `KeyNotFoundException`（例如 `driver.restart` 的 device 不存在时
