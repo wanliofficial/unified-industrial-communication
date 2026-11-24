@@ -16,7 +16,7 @@
 | G2 | 边缘自治三件套（Outbox/配置回滚/远程命令/看门狗） | P0 | Outbox、配置回滚、看门狗（数据 stale 降级，`runtime.watchdog`/`markStale`）已落地；远程命令、进程级自愈看门狗未落地 |
 | G3 | 无真机测试能力 | P0 | 已落地（`internal/sim`、各协议 `*read` 自检） |
 | G4 | 四类寻址统一模型 | P0 | 已落地（`internal/model`、`pointtable`） |
-| G5 | 配置生命周期（版本/回滚/diff/灰度） | P0 | 版本/回滚已落地；**diff、灰度未落地** |
+| G5 | 配置生命周期（版本/回滚/diff/灰度） | P0 | 已落地：版本/回滚（`config.Manager`）、diff（`Manager.Diff` + `GET /api/v1/config/diff`）、灰度发布（`config.StagePlan`/`MergeForBatch` + runtime 编排 + `POST /api/v1/config/staged` 逐批下发/`advance`/`abort` 回滚） |
 | G6 | 默认安全基线 | P0 | RBAC/审计/Token 已落地（`auth`/`rbac`/`audit`） |
 | G7 | 扩展契约（语义化版本 + 能力声明） | P2 | 静态注册为主，**进程外 gRPC 驱动未落地** |
 | G8 | 跨平台交付（单二进制/交叉编译） | P1 | 已落地（`Makefile`：`make build/vet/fmt/test/race/check/release/sbom`；交叉编译 linux/amd64·linux/arm64·windows/amd64，单二进制 ≤15MB） |
@@ -35,7 +35,7 @@ Wave 0–2 的协议与核心治理域基本标记为"已落地"。未落地功�
 - **协议**：OPC DA 桥接（独立 Windows 桥接进程，`:152`）
 - **架构**：进程外 gRPC 驱动、驱动市场（签名/版本/兼容性）、多实例协调（`:183`）
 - **集中管理**：中心聚合器——只读镜像、配置下发、批量升级、站点分组（`:184`）
-- **灰度发布**：分批下发、观察窗口、自动暂停（`:185`）
+- **灰度发布**：分批下发与回滚已落地（`POST /api/v1/config/staged` 开始、`/advance` 逐批推进、`/abort` 回滚）；观察窗口与自动暂停（按指标自动中止）未落地（`:185`）
 - **数据契约**：v2 双发过渡、Sparkplug B 的 DataSet/模板（`:186`，README 也声明 DataSet/模板不做）
 - **运维**：看门狗数据 stale 降级自愈已落地（`runtime.markStale`）；远程日志拉取、离线升级包、进程级自愈看门狗、Wave 2 的网络诊断与远程配置下发（`:155`/`:187`）未落地
 - **国际化**：中/英双语、时区、单位制（`:188`，无 `i18n` 目录）
