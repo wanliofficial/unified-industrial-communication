@@ -1395,7 +1395,14 @@ go build ./... && go vet ./... && gofmt -l internal cmd
 go test -race -count=1 ./...
 ```
 
-零第三方依赖、零 CGO，仅标准库。
+零第三方依赖、零 CGO，仅标准库。构建 / 发布 / 供应链验收已固化进 `Makefile`（平台无关，CI 入口是 `make check`）：
+
+```bash
+make check    # build + vet + gofmt + go test -race
+make load     # 负载测试：1000 点 / 50 设备，报告吞吐/常驻内存/协程（ADR C4/C5）
+make release  # 交叉编译 linux/amd64·arm64·windows/amd64 单二进制到 dist/
+make sbom     # 从产物内嵌 buildinfo 生成 CycloneDX SBOM（零第三方工具）
+```
 
 ## 目录
 
