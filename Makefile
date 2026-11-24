@@ -28,7 +28,7 @@ RELEASES := linux/amd64 linux/arm64 windows/amd64
 
 .DEFAULT_GOAL := help
 
-.PHONY: help build vet fmt test race check release sbom clean
+.PHONY: help build vet fmt test race check release sbom load clean
 
 help: ## 列出可用目标
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) \
@@ -74,6 +74,9 @@ $(LINUX_AMD64): ## 编译 linux/amd64 主二进制（release/sbom 的依赖）
 sbom: $(LINUX_AMD64) ## 从产物提取依赖清单，生成 CycloneDX SBOM（零第三方工具）
 	@$(GO) run ./tools/sbomgen -binary $(DIST)/$(BIN)-linux-amd64 -output $(DIST)/sbom.cdx.json
 	@echo "SBOM: $(DIST)/sbom.cdx.json"
+
+load: ## 负载测试：1000 点 / 50 设备（ADR-0001 C4/C5），报告吞吐/内存/协程
+	@$(GO) run ./cmd/loadgen -devices 50 -points 20 -interval 100ms -duration 10s
 
 clean: ## 删除构建产物
 	rm -rf $(DIST)
