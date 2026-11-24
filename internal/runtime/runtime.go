@@ -164,6 +164,10 @@ type Runtime struct {
 
 	startedAt time.Time
 	version   httpapi.VersionInfo
+
+	// staged 是灰度发布的编排状态（见 staged.go）。用独立锁：灰度会调用
+	// ApplyConfig（内部走 cfg.Apply 与 reload 的锁），塞进同一把锁会成环。
+	staged stagedState
 }
 
 type idemEntry struct {

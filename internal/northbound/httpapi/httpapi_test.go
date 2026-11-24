@@ -41,6 +41,11 @@ type fakeBackend struct {
 	applyRes  config.ApplyResult
 	rollbackR config.ApplyResult
 
+	staged    StagedStatus
+	beginFn   func(ctx context.Context, raw json.RawMessage, source string, batchSize int) (StagedStatus, error)
+	advanceFn func(ctx context.Context, source string) (StagedStatus, error)
+	abortFn   func(ctx context.Context, source string) (config.ApplyResult, error)
+
 	commandFn func(ctx context.Context, action string, params map[string]any) (any, error)
 
 	streamFn func(filter func(model.Sample) bool, buffer int) (<-chan cache.Event, func())
@@ -142,6 +147,29 @@ func (f *fakeBackend) ConfigDiff(from, to string) (config.Diff, error) { return 
 func (f *fakeBackend) Rollback(_ context.Context, version string) (config.ApplyResult, error) {
 	return f.rollbackR, nil
 }
+
+func (f *fakeBackend) BeginStaged(ctx context.Context, raw json.RawMessage, source string, batchSize int) (StagedStatus, error) {
+	if f.beginFn != nil {
+		return f.beginFn(ctx, raw, source, batchSize)
+	}
+	return f.staged, nil
+}
+
+func (f *fakeBackend) AdvanceStaged(ctx context.Context, source string) (StagedStatus, error) {
+	if f.advanceFn != nil {
+		return f.advanceFn(ctx, source)
+	}
+	return f.staged, nil
+}
+
+func (f *fakeBackend) AbortStaged(ctx context.Context, source string) (config.ApplyResult, error) {
+	if f.abortFn != nil {
+		return f.abortFn(ctx, source)
+	}
+	return f.rollbackR, nil
+}
+
+func (f *fakeBackend) StagedStatusOf() StagedStatus { return f.staged }
 
 func (f *fakeBackend) Command(ctx context.Context, action string, params map[string]any) (any, error) {
 	if f.commandFn != nil {

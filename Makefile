@@ -41,10 +41,10 @@ build: ## 构建全部包（CGO_ENABLED=0）
 vet: ## go vet 全仓
 	$(GO) vet ./...
 
-fmt: ## 检查 gofmt 格式（gofmt -l internal cmd；有输出即需 gofmt -w）
-	@out=$$(gofmt -l internal cmd); \
+fmt: ## 检查 gofmt 格式（gofmt -l internal cmd tools；有输出即需 gofmt -w）
+	@out=$$(gofmt -l internal cmd tools); \
 	  if [ -n "$$out" ]; then \
-	    echo "以下文件未格式化，运行 gofmt -w internal cmd："; echo "$$out"; exit 1; \
+	    echo "以下文件未格式化，运行 gofmt -w internal cmd tools："; echo "$$out"; exit 1; \
 	  else echo "gofmt clean"; fi
 
 test: ## 单元测试

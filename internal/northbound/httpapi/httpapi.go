@@ -256,6 +256,26 @@ func Errf(status int, code, format string, args ...any) *APIError {
 	return &APIError{Status: status, Code: code, Message: fmt.Sprintf(format, args...)}
 }
 
+// StagedStatus 是灰度发布（staged rollout）的对外视图。
+//
+// 灰度把一次全量配置变更切成若干批设备逐批下发：每批只改动该批设备，其余
+// 设备保持当前生效配置。Active=false 且 Completed=true 表示已全部下发；
+// Abort 会把配置回滚到 BaseVersion。
+type StagedStatus struct {
+	Active        bool   `json:"active"`
+	TargetVersion string `json:"targetVersion"`
+	BaseVersion   string `json:"baseVersion"`
+	TotalBatches  int    `json:"totalBatches"`
+	// NextBatch 是下一批的序号；等于 TotalBatches 表示已下发完。
+	NextBatch int  `json:"nextBatch"`
+	Completed bool `json:"completed"`
+	// Batches 是每批的设备 ID。Devices 是它的拍平结果（便于看整体影响面）。
+	Batches   [][]string `json:"batches"`
+	Devices   []string   `json:"devices"`
+	StartedAt time.Time  `json:"startedAt"`
+	UpdatedAt time.Time  `json:"updatedAt"`
+}
+
 // Backend 是 runtime 需要实现的全部业务能力。
 type Backend interface {
 	Health() Health
@@ -277,6 +297,10 @@ type Backend interface {
 	ConfigVersion(id string) (json.RawMessage, error)
 	ConfigDiff(from, to string) (config.Diff, error)
 	Rollback(ctx context.Context, version string) (config.ApplyResult, error)
+	BeginStaged(ctx context.Context, raw json.RawMessage, source string, batchSize int) (StagedStatus, error)
+	AdvanceStaged(ctx context.Context, source string) (StagedStatus, error)
+	AbortStaged(ctx context.Context, source string) (config.ApplyResult, error)
+	StagedStatusOf() StagedStatus
 
 	Command(ctx context.Context, action string, params map[string]any) (any, error)
 
@@ -557,6 +581,10 @@ func (s *Server) routes() {
 	route("GET /api/v1/config/versions/{id}", rbac.PermConfigRead, s.configVersion)
 	route("GET /api/v1/config/diff", rbac.PermConfigRead, s.configDiff)
 	route("POST /api/v1/config/rollback", rbac.PermConfigWrite, s.configRollback)
+	route("GET /api/v1/config/staged", rbac.PermConfigRead, s.configStagedStatus)
+	route("POST /api/v1/config/staged", rbac.PermConfigWrite, s.configStagedBegin)
+	route("POST /api/v1/config/staged/advance", rbac.PermConfigWrite, s.configStagedAdvance)
+	route("POST /api/v1/config/staged/abort", rbac.PermConfigWrite, s.configStagedAbort)
 
 	// 命令的路由级权限只到 PermCommand；具体动作是高危还是普通，要解析
 	// 请求体才知道，因此在 handler 里再判一次（见 command）。
@@ -1275,6 +1303,61 @@ func (s *Server) configRollback(w http.ResponseWriter, r *http.Request) error {
 		return Errf(http.StatusBadRequest, "request.invalid", "version is required")
 	}
 	res, err := s.be.Rollback(r.Context(), body.Version)
+	if err != nil {
+		return err
+	}
+	writeOK(w, res)
+	return nil
+}
+
+// ---------------------------------------------------------------------------
+// 灰度发布（staged rollout）
+// ---------------------------------------------------------------------------
+
+// configStagedStatus 返回当前灰度进度。无灰度时返回 active=false。
+func (s *Server) configStagedStatus(w http.ResponseWriter, _ *http.Request) error {
+	writeOK(w, s.be.StagedStatusOf())
+	return nil
+}
+
+// configStagedBegin 开始一次灰度发布：请求体是完整的目标配置，外加 batchSize。
+//
+// 目标配置放在 `config` 字段下，避免与 batchSize 等控制字段混在同一层导致
+// 「配置里恰好有叫 batchSize 的键」时歧义。
+//
+//	{"batchSize": 10, "config": { ... 完整配置 ... }}
+func (s *Server) configStagedBegin(w http.ResponseWriter, r *http.Request) error {
+	var body struct {
+		BatchSize int             `json:"batchSize"`
+		Config    json.RawMessage `json:"config"`
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, s.opt.MaxBodyBytes)
+	dec := json.NewDecoder(r.Body)
+	if err := dec.Decode(&body); err != nil {
+		return Errf(http.StatusBadRequest, "request.bad_json", "decode body: %v", err)
+	}
+	if len(body.Config) == 0 {
+		return Errf(http.StatusBadRequest, "request.invalid", "config is required")
+	}
+	st, err := s.be.BeginStaged(r.Context(), body.Config, "api", body.BatchSize)
+	if err != nil {
+		return err
+	}
+	writeOK(w, st)
+	return nil
+}
+
+func (s *Server) configStagedAdvance(w http.ResponseWriter, r *http.Request) error {
+	st, err := s.be.AdvanceStaged(r.Context(), "api")
+	if err != nil {
+		return err
+	}
+	writeOK(w, st)
+	return nil
+}
+
+func (s *Server) configStagedAbort(w http.ResponseWriter, r *http.Request) error {
+	res, err := s.be.AbortStaged(r.Context(), "api")
 	if err != nil {
 		return err
 	}
