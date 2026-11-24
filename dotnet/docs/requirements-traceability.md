@@ -12,8 +12,20 @@ PRD 中 M 级的采集协议已全部落地，FR-CFG-01 的四类寻址模型也
 COV/分段/多属性读仍不做，见 [protocol-status.md](protocol-status.md) §4.1）。非 M 级验收里的 12 类故障注入同样全部有了
 可自动跑的用例（见 §7）。
 
-当前测试基线：**438 条**（带 `--opcua` 全量；本轮**新增 1 条**契约用例。全量实测数字以
-[testing.md](testing.md) 最新一轮为准）。本轮补上北向「取/删不存在的模板」的 404 错误分类：
+当前测试基线：**439 条**（带 `--opcua` 全量；本轮**新增 1 条**契约用例。全量实测数字以
+[testing.md](testing.md) 最新一轮为准）。本轮补上北向最基础的一层 404——中间件对未翻译
+`KeyNotFoundException` 的兜底翻译：`contract/uncaught_key_not_found_is_a_404`。错误表的 404 行把
+`resource.not_found` 与 `device.not_found` / `point.not_found` 并列，但它并不是某个端点显式抛的，
+而是 REST 中间件 catch 链里 `ApiException` 之后那条 `catch (KeyNotFoundException)`（`RestApi.cs`）。
+驱动层、调度器、outbox 都直接抛裸 `KeyNotFoundException`（例如 `driver.restart` 的 device 不存在时
+`GatewayRuntime.RestartDeviceAsync` 走 `_engine.Find` 抛裸异常），它们没有、也不该为每个调用点手写
+`ApiException`。这道兜底若被删或排在通用 catch 之后，一个「设备名写错」就会变成 500 internal.error，
+告警误报成网关故障、把真正的 5xx 淹没。用例用真可达路径钉住：`driver.restart` 带一个不存在的 device
+（Admin 静态令牌具备 DeviceControl），期望 404 + `resource.not_found`、message 仍点名设备。非空验证：
+把中间件里 `catch (KeyNotFoundException ...)` 整块删掉 → 重建后该用例在「an untranslated
+KeyNotFoundException is a 404, not a 500 server fault: expected <NotFound>, got <InternalServerError>」
+精确 FAIL；恢复后源码与 HEAD 字节一致、用例 PASS（43.0 s）。
+上一轮（438 条、新增 1 条）补上北向「取/删不存在的模板」的 404 错误分类：
 `contract/unknown_template_returns_not_found`——`GET /api/v1/templates/{id}`（`store.Get` 返回 null）
 与 `DELETE /api/v1/templates/{id}`（`DeleteAsync` 返回 false）在模板不存在时返回 404 + `template.not_found`。
 这个码在错误表（northbound-api.md「端点专属」段落）明列，但既有模板用例只测过创建 + 用**真实** id

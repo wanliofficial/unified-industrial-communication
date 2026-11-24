@@ -102,6 +102,8 @@ internal static class ContractTests
             CommandRejectsMissingParameter));
         tests.Add(new TestCase("contract/command_requires_confirm_for_destructive_actions",
             CommandRequiresConfirmForDestructiveActions));
+        tests.Add(new TestCase("contract/uncaught_key_not_found_is_a_404",
+            UncaughtKeyNotFoundIsA404));
     }
 
     // ------------------------------------------------------------------
@@ -3563,6 +3565,43 @@ internal static class ContractTests
                 "the rejected rollback left the live configuration untouched");
 
             await host.DisposeAsync();
+        });
+    }
+
+    /// <summary>
+    /// 未经翻译的 <see cref="KeyNotFoundException"/> 必须由 REST 中间件兜底归成 404
+    /// `resource.not_found`，而不是冒成 500 internal.error。
+    ///
+    /// 为什么单独立一条：错误表的 404 行里 `resource.not_found` 与 `device.not_found` / `point.not_found`
+    /// 并列，但它不是某个端点显式抛的——它是中间件对 KeyNotFoundException 的**兜底翻译**
+    /// （RestApi 的 catch 链里 ApiException 之后就是它）。驱动层、调度器、outbox 都直接抛
+    /// KeyNotFoundException（例如 driver.restart 的 device 不存在时 GatewayRuntime 走 _engine.Find
+    /// 抛裸异常），它们没有、也不该为每个调用点手写 ApiException。这道兜底若被删或排在通用
+    /// catch 之后，一个「设备名写错」就会变成 500 internal.error，告警误报成网关故障、把真正的
+    /// 5xx 淹没。用例用真可达的路径钉住它：driver.restart 带一个不存在的 device。
+    /// </summary>
+    private static Task UncaughtKeyNotFoundIsA404(TestContext t)
+    {
+        return RunAsync(async () =>
+        {
+            await using var host = await Host.StartAsync(t);
+
+            // driver.restart 需要 DeviceControl（Admin 静态令牌具备）；device 传一个不存在的名字，
+            // Param 校验先通过，随后 GatewayRuntime._engine.Find 返回 null 抛 KeyNotFoundException，
+            // 落到中间件兜底——这里要的是 404 resource.not_found，不是 500。
+            var response = await host.Client.SendAsync(
+                Post("/api/v1/commands",
+                    """{"action":"driver.restart","params":{"device":"no-such-device"}}"""), t.Ct);
+
+            t.Equal(HttpStatusCode.NotFound, response.StatusCode,
+                "an untranslated KeyNotFoundException is a 404, not a 500 server fault");
+
+            using var body = await ReadJsonAsync(t, response);
+            var error = body.RootElement.GetProperty("error");
+            t.Equal("resource.not_found", error.GetProperty("code").GetString(),
+                "the safety-net catch reports resource.not_found");
+            t.Contains(error.GetProperty("message").GetString() ?? string.Empty, "no-such-device",
+                "the message still names the offending device");
         });
     }
 
