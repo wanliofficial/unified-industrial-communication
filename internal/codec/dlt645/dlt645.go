@@ -74,7 +74,7 @@ const (
 	CtrlDemandReset   = 0x19 // 最大需量清零
 	CtrlMeterReset    = 0x1A // 电表清零
 	CtrlEventReset    = 0x1B // 事件清零
-	CtrlRelay         = 0x1C // 拉闸/合闸（��案扩展）
+	CtrlRelay         = 0x1C // 拉闸/合闸（备案扩展）
 	CtrlTerminal      = 0x1D // 多功能端子输出控制（备案扩展）
 )
 
