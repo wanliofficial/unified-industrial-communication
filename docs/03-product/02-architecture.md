@@ -456,6 +456,7 @@ Close 会漏——每加一个子系统就多一条 return 路径，而「进程
 | `0001-language-selection.md` | 语言选型（Go + C# 辅助） | Accepted |
 | `0002-history-storage.md` | 历史存储（自建有界采样日志） | Accepted |
 | `0003-auth-rbac-audit.md` | 认证 / 授权 / 审计 | Accepted |
+| `0004-toolchain-dependency-security.md` | 工具链与依赖安全（零第三方依赖 + 暂不升级堵不可达 advisory） | Accepted |
 | —（本文档承担） | 四类寻址统一模型 | 见 `03-domain-model.md` |
 | —（本文档承担） | 驱动三层分离 | 见 `04-driver-sdk-spec.md` |
 | —（本文档承担） | 北向四通道 | 见 `05-northbound-api-spec.md` |
