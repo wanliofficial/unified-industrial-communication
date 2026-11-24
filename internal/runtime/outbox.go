@@ -51,11 +51,30 @@ func (r *Runtime) openSinks(f *config.File) error {
 	if f.Northbound.MQTT.Enabled {
 		var sink northboundSink
 		var err error
-		switch f.Northbound.MQTT.Format {
+		// 默认 clientID/nodeId 带上实例身份：同站点多实例部署时，若都退回
+		// 「uic-<site>」会连同一 Broker 会话互相顶掉（静默断流）。用户显式
+		// 配了 clientID/nodeId 时以其为准，只有默认值才派生自实例身份。
+		mq := f.Northbound.MQTT
+		switch mq.Format {
 		case config.MQTTFormatSparkplugB:
-			sink, err = newSparkplugSink(f.Northbound.MQTT)
+			// nodeId 的默认值在 config.Normalize 里已补成「uic-<site>」。这里
+			// 识别这个裸默认并追加实例短码：nodeId 是 Sparkplug 的节点身份，
+			// 同站点多实例用同一 nodeId 会既撞节点身份又撞 Broker 会话。
+			// 用户显式配了别的 nodeId 时（不等于裸默认）保持原样不动。
+			//
+			// clientId 不在这里补：Sparkplug sink 的契约是「clientId 缺省取
+			// nodeId」。提前把 clientId 填成站点派生值会让它丢掉 nodeId 语义，
+			// 并覆盖用户显式配的 nodeId 派生结果。只有用户显式配了 clientId
+			// 才保留，否则留空交给 sink。
+			if mq.NodeID == "uic-"+f.Site {
+				mq.NodeID = r.defaultNodeID(f.Site)
+			}
+			sink, err = newSparkplugSink(mq)
 		default:
-			sink, err = newMQTTSink(f.Northbound.MQTT, f.Site, "uic-"+f.Site)
+			if mq.ClientID == "" {
+				mq.ClientID = r.defaultClientID(f.Site)
+			}
+			sink, err = newMQTTSink(mq, f.Site, mq.ClientID)
 		}
 		if err != nil {
 			return fmt.Errorf("runtime: mqtt: %w", err)
@@ -92,6 +111,33 @@ func (r *Runtime) openSinks(f *config.File) error {
 	r.sinkNames = sortedSinks(sinks)
 	r.log.Info("outbox_enabled", "sinks", r.sinkNames, "dir", box.Dir())
 	return nil
+}
+
+// defaultClientID 返回 JSON 格式 MQTT sink 的默认 clientID。
+//
+// 带上实例身份短码：同站点多实例若都用「uic-<site>」会连同一 Broker 会话
+// 互相顶掉（后到的把前一个踢下线，静默断流）。用户显式配了 ClientID 时不会
+// 走到这里（openSinks 只在 mq.ClientID=="" 时调用）。
+func (r *Runtime) defaultClientID(site string) string {
+	return "uic-" + site + "-" + r.instanceShort()
+}
+
+// defaultNodeID 返回 Sparkplug 的默认 nodeId，同样带上实例身份短码。
+func (r *Runtime) defaultNodeID(site string) string {
+	return "uic-" + site + "-" + r.instanceShort()
+}
+
+// instanceShort 返回实例身份的短码，用于拼进 clientID/nodeId。
+//
+// 实例身份形如「inst-<12 hex>」，这里取「inst-」后的 hex 段全量（12 字符，
+// 48 bit，碰撞概率可忽略）作为短码；身份缺失时返回空串，退化回旧的
+// 「uic-<site>」默认（不阻断启动，只失去多实例默认不冲突这层兜底）。
+func (r *Runtime) instanceShort() string {
+	const prefix = "inst-"
+	if len(r.instanceID) > len(prefix) && r.instanceID[:len(prefix)] == prefix {
+		return r.instanceID[len(prefix):]
+	}
+	return ""
 }
 
 // publish 把一次变化事件写入所有已启用的 sink。

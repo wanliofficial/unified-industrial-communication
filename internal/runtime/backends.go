@@ -494,6 +494,9 @@ func (r *Runtime) DiagnosticsBundle(_ context.Context) ([]byte, error) {
 		"uptimeSeconds": int64(time.Since(r.startedAt).Seconds()),
 		"apiVersion":    1,
 		"schemaVersion": config.SchemaVersion,
+		// instanceId 让运维把一份诊断包对应到具体实例：同站点多实例部署时，
+		// 仅凭 site 无法区分，而它与 MQTT clientID/Sparkplug nodeId 同源。
+		"instanceId": r.instanceID,
 	}
 	mb, _ := json.MarshalIndent(manifest, "", "  ")
 	if err := add("manifest.json", mb); err != nil {

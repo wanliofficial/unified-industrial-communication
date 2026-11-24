@@ -179,6 +179,11 @@ func TestConfigAndDiagnosticsEndpoints(t *testing.T) {
 	if manifest["version"] == "" {
 		t.Fatalf("manifest = %+v", manifest)
 	}
+	// 诊断包必须带上实例身份：同站点多实例部署时，仅凭 site 无法区分一份
+	// 诊断包来自哪台实例，而它与 MQTT clientID/Sparkplug nodeId 同源。
+	if manifest["instanceId"] == "" || manifest["instanceId"] == nil {
+		t.Fatalf("manifest 缺 instanceId: %+v", manifest)
+	}
 
 	// 命令形式只给提示，不返回 payload。
 	code, body = h.do(http.MethodPost, "/api/v1/commands", `{"action":"diag.bundle"}`)

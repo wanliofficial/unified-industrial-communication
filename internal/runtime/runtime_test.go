@@ -31,6 +31,12 @@ type harness struct {
 }
 
 func newHarness(t *testing.T, mutate func(cfg map[string]any)) *harness {
+	return newHarnessAt(t, t.TempDir(), mutate)
+}
+
+// newHarnessAt 与 newHarness 相同，但用调用方指定的数据目录。用于「同站点
+// 多实例」（同一 site、不同数据目录）与「同数据目录重启」两类场景的测试。
+func newHarnessAt(t *testing.T, dir string, mutate func(cfg map[string]any)) *harness {
 	t.Helper()
 
 	srv, err := sim.NewServer("127.0.0.1:0", 256)
@@ -42,7 +48,6 @@ func newHarness(t *testing.T, mutate func(cfg map[string]any)) *harness {
 	srv.SetHolding(20, 0x0008)
 	srv.SetCoil(0, true)
 
-	dir := t.TempDir()
 	cfg := map[string]any{
 		"schemaVersion": 1,
 		"site":          "test-site",

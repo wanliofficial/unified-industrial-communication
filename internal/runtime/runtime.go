@@ -64,6 +64,7 @@ import (
 	toledodrv "uic/internal/driver/toledo"
 	"uic/internal/driver/virtual"
 	"uic/internal/history"
+	"uic/internal/instanceid"
 	"uic/internal/model"
 	"uic/internal/northbound/httpapi"
 	"uic/internal/obs"
@@ -119,6 +120,9 @@ type Runtime struct {
 	level   *obs.LevelVar
 	log     *slog.Logger
 	api     *httpapi.Server
+	// instanceID 是本实例的稳定身份（持久化在 dataDir）。用于派生 MQTT
+	// clientID/Sparkplug nodeId 的默认值（同站点多实例默认不冲突）与运维识别。
+	instanceID string
 
 	logFile     io.Closer
 	journal     *os.File
@@ -276,9 +280,18 @@ func New(opt Options) (*Runtime, error) {
 	// 版本信息必须早于任何子系统：从站（FC43）、MQTT 的 $birth、OPC UA 的
 	// BuildInfo 都会在启动阶段就把版本报给外部。晚一步赋值，这些对外声明
 	// 就会永久停留在空值上——配置热更新也不会纠正它们。
+	// 实例身份：先于 openSinks 就位，因为 sink 的 clientID/nodeId 默认值要
+	// 派生自它。加载失败不致命——记日志后继续，缺身份只影响「多实例默认不冲突」
+	// 这层兜底，不该让整个进程起不来。
+	if id, err := instanceid.Load(dataDir); err != nil {
+		logger.Warn("instance_id_load_failed", "error", errText(err))
+	} else {
+		r.instanceID = id
+	}
 	r.version = httpapi.VersionInfo{
 		Version: opt.Version, Commit: opt.Commit, BuildTime: opt.BuildTime,
 		GoVersion: runtime.Version(), Schema: config.SchemaVersion, APIVer: 1,
+		InstanceID: r.instanceID,
 	}
 	r.sched = scheduler.New(scheduler.Options{
 		// 设备运行态变化同时投递到 MQTT（retained）。scheduler 用独立

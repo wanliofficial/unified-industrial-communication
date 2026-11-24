@@ -214,6 +214,10 @@ type VersionInfo struct {
 	GoVersion string `json:"goVersion,omitempty"`
 	Schema    int    `json:"schemaVersion"`
 	APIVer    int    `json:"apiVersion"`
+	// InstanceID 是本实例的稳定身份（持久化在 dataDir）。同站点多实例部署时
+	// 用它区分「这是哪台」，并与 MQTT clientID/Sparkplug nodeId 的默认值共享
+	// 同一来源，使默认不冲突。空表示加载失败（见 runtime 启动日志）。
+	InstanceID string `json:"instanceId,omitempty"`
 }
 
 // PointFilter 是点位查询条件。
