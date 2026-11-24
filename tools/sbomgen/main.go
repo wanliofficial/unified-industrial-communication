@@ -25,9 +25,9 @@ import (
 // buildInfo 是 `go version -m -json <产物>` 输出的子集。go 在编译时把模块图
 // 内嵌进二进制（path: "debug/buildinfo"），这里只取 SBOM 关心的字段。
 type buildInfo struct {
-	GoVersion string `json:"GoVersion"`
-	Path      string `json:"Path"`
-	Main      module `json:"Main"`
+	GoVersion string   `json:"GoVersion"`
+	Path      string   `json:"Path"`
+	Main      module   `json:"Main"`
 	Deps      []module `json:"Deps,omitempty"`
 }
 
@@ -41,16 +41,16 @@ type module struct {
 // 零依赖项目里 components 为空，dependencies 为空——这正是「依赖面按构造
 // 为零」的可机读表达。
 type sbomDoc struct {
-	BOMFormat   string       `json:"bomFormat"`
-	SpecVersion string       `json:"specVersion"`
-	Version     int          `json:"version"`
-	Metadata    sbomMetadata `json:"metadata"`
+	BOMFormat   string          `json:"bomFormat"`
+	SpecVersion string          `json:"specVersion"`
+	Version     int             `json:"version"`
+	Metadata    sbomMetadata    `json:"metadata"`
 	Components  []sbomComponent `json:"components,omitempty"`
 }
 
 type sbomMetadata struct {
-	Timestamp string       `json:"timestamp"`
-	Tools     sbomTools    `json:"tools"`
+	Timestamp string        `json:"timestamp"`
+	Tools     sbomTools     `json:"tools"`
 	Component sbomComponent `json:"component"`
 }
 
