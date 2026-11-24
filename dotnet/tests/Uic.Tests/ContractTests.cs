@@ -1087,7 +1087,18 @@ internal static class ContractTests
             var mqttPointFields = mqtt.GetProperty("pointFields").EnumerateArray()
                 .ToDictionary(f => f.GetProperty("key").GetString()!, f => f.Clone(), StringComparer.Ordinal);
             t.Ok(mqttPointFields["address.path"].GetProperty("required").GetBoolean(),
-                "point fields carry their own required flag");
+                "the topic filter is a required point field");
+            // address.property（取值字段）此前只有行为用例证明它生效（DriverUsesPointFieldOverride），
+            // 但「声明本身存在且标成可选」从未被钉住——它和 address.path 一样由前端按这份元数据生成输入项，
+            // 一旦这条声明被删或误标成 required，控制台表单就少填/多填一个框，没有用例会发现。
+            // 它必须保持 optional：留空时回退到设备级 payloadField，强制必填会把合法的「用默认字段」写法挡掉。
+            t.Ok(mqttPointFields.ContainsKey("address.property"),
+                "the value-field point is declared so the form renders an input for it");
+            t.Ok(!mqttPointFields["address.property"].TryGetProperty("required", out var propRequired)
+                     || !propRequired.GetBoolean(),
+                "the value field stays optional: blank falls back to the device payloadField");
+            t.Equal("point", mqttPointFields["address.property"].GetProperty("scope").GetString(),
+                "the value field is scoped to the point, not the device");
 
             static string? Cap(JsonElement driver, string name)
                 => driver.GetProperty("capabilities").GetProperty(name).GetString();

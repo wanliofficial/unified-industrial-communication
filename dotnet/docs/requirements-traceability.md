@@ -13,7 +13,16 @@ COV/分段/多属性读仍不做，见 [protocol-status.md](protocol-status.md) 
 可自动跑的用例（见 §7）。
 
 当前测试基线：**434 条**（带 `--opcua` 全量；本轮是**加强既有用例**、不新增用例，条数不变。全量实测数字以
-[testing.md](testing.md) 最新一轮为准）。本轮把南向驱动能力声明的覆盖补全：`drivers_expose_capability_states` 此前
+[testing.md](testing.md) 最新一轮为准）。本轮把南向驱动点位字段（`PointFields`）声明的覆盖补全：
+`drivers_expose_capability_states` 此前只钉住 MQTT 的 `address.path`（required），而 `address.property`
+（取值字段）的**声明本身**从未被断言——它的**行为**由 `mqtt/DriverUsesPointFieldOverride` 证明（点级覆盖
+设备级 `payloadField` 生效），但「声明存在、且标成可选」没人钉。这条声明与 `address.path` 一样由前端按
+元数据生成表单输入项，一旦它被删或误标成 required，控制台表单就少填/多填一个框，没有用例会发现。本轮把它
+钉成三点：`address.property` 必须存在、必须保持 optional（留空时回退到设备级 `payloadField`，强制必填会把
+合法的「用默认字段」写法挡掉）、`scope` 必须是 `point`。非空验证：把 `MqttClientDriver.Meta` 里的
+`address.property` 声明整条删掉 → 重建后该用例在「the value-field point is declared so the form renders an
+input for it」断言精确 FAIL；恢复后源码与 HEAD 字节一致、用例 PASS（55.0 s）。条数仍为 434 条。
+上一轮把南向驱动能力声明的覆盖补全：`drivers_expose_capability_states` 此前
 只点名了 modbus-tcp 的能力四态、virtual 的订阅/浏览/发现、mqtt 的读/写/订阅，而 **modbus-rtu/ascii 两个串口变体的
 能力四态**（该用例自己的注释声称与 tcp「能力一致」，却只断言了名称/传输/寻址/配置字段、没断言能力）与 **virtual 的
 读/写/批量/位访问**从未被任何用例钉住。能力是纯声明元数据——经 `/api/v1/drivers` 透给控制台「驱动」页渲染、
