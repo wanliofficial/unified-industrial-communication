@@ -88,6 +88,7 @@ internal static class ContractTests
         tests.Add(new TestCase("contract/auth_login_forces_password_change", AuthLoginForcesPasswordChange));
         tests.Add(new TestCase("contract/auth_roles_are_enforced", AuthRolesAreEnforced));
         tests.Add(new TestCase("contract/auth_users_require_manage", AuthUsersRequireManage));
+        tests.Add(new TestCase("contract/user_last_admin_is_protected", UserLastAdminIsProtected));
         tests.Add(new TestCase("contract/auth_login_is_rate_limited", AuthLoginIsRateLimited));
         tests.Add(new TestCase("contract/auth_logout_revokes_session", AuthLogoutRevokesSession));
         tests.Add(new TestCase("contract/rate_limit_returns_429_with_the_shared_code", RateLimitReturns429));
@@ -2869,6 +2870,62 @@ internal static class ContractTests
             var remove = await host.Client.SendAsync(
                 DeleteWith("/api/v1/users/operator1", Token), t.Ct);
             t.Equal(HttpStatusCode.NoContent, remove.StatusCode, "an admin can delete an account");
+        });
+    }
+
+    /// <summary>
+    /// 不允许把**最后一个启用的管理员**降级、停用或删除：一旦这么做，下一次改配置就没人有权限，
+    /// 只能停机改文件。这条约束在服务端强制（<c>UserStore</c> 的 <c>CountEnabledAdmins() &lt;= 1</c>），
+    /// 不能指望 UI 记得隐藏按钮——API 直连一样会被它挡住。
+    ///
+    /// 此前零测试：<c>auth_users_require_manage</c> 只测了创建/更新/删除「存在且不是最后管理员」的账号，
+    /// 三条 user.last_admin 抛点（Update 的降级、Update 的停用、Delete）无人断言。
+    ///
+    /// 默认种子只有 admin 一个启用管理员；静态 API Token 的身份是 api-token（不是任何用户），
+    /// 所以拿它删 admin 不会撞上 cannot_delete_self，正好落到 last_admin 这条。
+    /// </summary>
+    private static Task UserLastAdminIsProtected(TestContext t)
+    {
+        return RunAsync(async () =>
+        {
+            await using var host = await Host.StartAsync(t);
+
+            // 停用最后一个管理员。
+            var disable = await host.Client.SendAsync(
+                PutWith("/api/v1/users/admin", """{"enabled":false}""", Token), t.Ct);
+            t.Equal(HttpStatusCode.Conflict, disable.StatusCode,
+                "disabling the last enabled admin is a 409, not a silent success");
+            using (var envelope = await ReadJsonAsync(t, disable))
+                t.Equal("user.last_admin",
+                    envelope.RootElement.GetProperty("error").GetProperty("code").GetString(),
+                    "the code names the last-admin rule");
+
+            // 降级最后一个管理员。
+            var demote = await host.Client.SendAsync(
+                PutWith("/api/v1/users/admin", """{"role":"operator"}""", Token), t.Ct);
+            t.Equal(HttpStatusCode.Conflict, demote.StatusCode,
+                "demoting the last enabled admin is rejected the same way");
+            using (var envelope = await ReadJsonAsync(t, demote))
+                t.Equal("user.last_admin",
+                    envelope.RootElement.GetProperty("error").GetProperty("code").GetString(),
+                    "demote reports the same last-admin code");
+
+            // 删除最后一个管理员（静态令牌身份不是 admin，故不是 cannot_delete_self，而是 last_admin）。
+            var delete = await host.Client.SendAsync(DeleteWith("/api/v1/users/admin", Token), t.Ct);
+            t.Equal(HttpStatusCode.Conflict, delete.StatusCode,
+                "deleting the last enabled admin is a 409 too");
+            using (var envelope = await ReadJsonAsync(t, delete))
+                t.Equal("user.last_admin",
+                    envelope.RootElement.GetProperty("error").GetProperty("code").GetString(),
+                    "delete reports the same last-admin code");
+
+            // 三条都被挡下：admin 仍在、仍启用、仍是管理员——约束不是「拒绝后又偷偷移除」。
+            using var list = await ReadJsonAsync(t,
+                await host.Client.SendAsync(GetWith("/api/v1/users", Token), t.Ct));
+            var admin = list.RootElement.GetProperty("items").EnumerateArray()
+                .Single(u => u.GetProperty("id").GetString() == "admin");
+            t.Equal(true, admin.GetProperty("enabled").GetBoolean(), "admin is still enabled");
+            t.Equal("admin", admin.GetProperty("role").GetString(), "admin is still an administrator");
         });
     }
 

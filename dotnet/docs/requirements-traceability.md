@@ -12,8 +12,22 @@ PRD 中 M 级的采集协议已全部落地，FR-CFG-01 的四类寻址模型也
 COV/分段/多属性读仍不做，见 [protocol-status.md](protocol-status.md) §4.1）。非 M 级验收里的 12 类故障注入同样全部有了
 可自动跑的用例（见 §7）。
 
-当前测试基线：**440 条**（带 `--opcua` 全量；本轮**新增 1 条**契约用例。全量实测数字以
-[testing.md](testing.md) 最新一轮为准）。本轮补上诊断端点 `GET /api/v1/diagnostics/network` 的覆盖——
+当前测试基线：**441 条**（带 `--opcua` 全量；本轮**新增 1 条**契约用例。全量实测数字以
+[testing.md](testing.md) 最新一轮为准）。本轮补上错误表 409 行里此前零断言的 `user.last_admin` ——
+不允许把**最后一个启用的管理员**降级、停用或删除：`contract/user_last_admin_is_protected` 钉住
+`UserStore` 的三条抛点（`PUT {enabled:false}` 停用、`PUT {role:operator}` 降级、`DELETE` 删除），
+必须是 409 + `user.last_admin`，并断言事后 admin 仍启用、仍是管理员（证明约束不是「拒绝后又偷偷移除」）。
+默认种子只有 admin 一个启用管理员；静态 API Token 的身份是 `api-token`（不是任何用户），故拿它删
+admin 不会撞上 `user.cannot_delete_self`，正好落到 last_admin 这条。这条约束必须在服务端强制——
+不能指望 UI 记得隐藏按钮，API 直连一样要被挡住，否则下一次改配置就没人有权限、只能停机改文件。
+非空验证（TUnit 首断言即停，故三条断言分三轮独立扰动，各自精确命中）：（1）`Update` 守卫
+`CountEnabledAdmins() <= 1` 改 `<= 0` →「disabling the last enabled admin is a 409, not a silent
+success: expected <Conflict>, got <OK>」FAIL；（2）恢复后把 `Delete` 守卫同样改 `<= 0` →
+「deleting the last enabled admin is a 409 too: expected <Conflict>, got <NoContent>」FAIL；
+（3）恢复后只把 `losingAdmin` 的降级条件 `role != Roles.Admin` 改成恒假 →「demoting the last enabled
+admin is rejected the same way: expected <Conflict>, got <OK>」FAIL。三轮各自恢复后源码与 HEAD
+字节一致，用例 PASS（14.5 s）。
+上一轮（440 条、新增 1 条）补上诊断端点 `GET /api/v1/diagnostics/network` 的覆盖——
 它在 northbound-api.md 诊断表里列了、但此前**零测试**：`contract/diagnostics_network_reports_channel`
 钉住三件事——（1）缺 `device` 参数归 400 `request.missing_parameter`（不能把「参数没给」当成「设备不存在」
 的 404，否则调用方会去翻配置查设备名）；（2）未知设备归 404 `device.not_found`；（3）正常路径把设备
