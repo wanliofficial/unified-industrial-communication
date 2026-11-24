@@ -427,25 +427,37 @@ func TestSparkplugBdSeqIncrementsPerConnect(t *testing.T) {
 
 	deliverSample(t, s, "dev1", "p1", 1)
 	b.WaitConnections(t, 1)
+	// 第一条 NBIRTH（会话 0）由 deliverSample 同步发出，但 Broker 落账有轻微
+	// 滞后；先等它落账，后面以「条数相对基线增加」为收敛信号才有意义。
+	waitTopic(t, b, "spBv1.0/plant-a/NBIRTH/gw-01")
 
+	// 每次 DropAll 后，必须等 Broker 上**本会话的 NBIRTH 真的落账**了，才允许
+	// 下一次 DropAll。不能把两次 DropAll 连发：NBIRTH 是 QoS0，一次恰好落在
+	// 死链上的发布会被静默丢掉（本文件其它用例已承认这一点），连着掐断会让
+	// 「上一会话刚发出、还没被记录就被下一刀关掉」的 NBIRTH 永久丢失——那时
+	// 再断言 births[0]==0 就是在赌运气。
+	//
+	// 收敛信号用「NBIRTH 条数相对 drop 前严格增加」而不是固定阈值：NBIRTH 由
+	// 异步 resync（OnConnect 回调）发出，Broker 落账又有轻微滞后，数到固定
+	// 数字会抢在它前面返回。等条数涨过基线，就说明这一会话的出生已被观测。
 	for i := 0; i < 2; i++ {
-		want := i + 2
+		before := countTopics(b.Messages(), "spBv1.0/plant-a/NBIRTH/gw-01")
 		b.DropAll()
-		// 等客户端发现断链：QoS0 的 Publish 写进一个已经死掉的 socket 也可
-		// 能先成功（内核缓冲区），所以必须以「Broker 收到新的 CONNECT」为
-		// 准，而不是以 deliver 不报错为准。
 		deadline := time.Now().Add(8 * time.Second)
 		for time.Now().Before(deadline) {
 			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-			_, err := s.deliver(ctx, []outbox.Record{recordFor(t, "dev1", "p1", float64(want))})
+			_, err := s.deliver(ctx, []outbox.Record{recordFor(t, "dev1", "p1", float64(i+2))})
 			cancel()
-			if err == nil && b.Connects() >= want {
+			// 失败是预期：Outbox 会重试。成功也可能只是写进了已断的 socket。
+			// 两种结果都继续下一轮，直到 Broker 上真出现比基线更多的 NBIRTH。
+			_ = err
+			if countTopics(b.Messages(), "spBv1.0/plant-a/NBIRTH/gw-01") > before {
 				break
 			}
 			time.Sleep(50 * time.Millisecond)
 		}
-		if got := b.Connects(); got < want {
-			t.Fatalf("after drop %d: connects = %d, want >= %d", i, got, want)
+		if got := countTopics(b.Messages(), "spBv1.0/plant-a/NBIRTH/gw-01"); got <= before {
+			t.Fatalf("after drop %d: NBIRTH count = %d, did not grow past %d", i, got, before)
 		}
 	}
 
