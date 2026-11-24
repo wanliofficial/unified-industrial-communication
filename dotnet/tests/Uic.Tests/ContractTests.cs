@@ -94,6 +94,10 @@ internal static class ContractTests
         tests.Add(new TestCase("contract/diagnostics_bundle_carries_the_four_parts", DiagnosticsBundleCarriesTheFourParts));
         tests.Add(new TestCase("contract/opcua_restart_failure_is_counted",
             OpcUaRestartFailureIsCounted));
+        tests.Add(new TestCase("contract/command_rejects_missing_parameter",
+            CommandRejectsMissingParameter));
+        tests.Add(new TestCase("contract/command_requires_confirm_for_destructive_actions",
+            CommandRequiresConfirmForDestructiveActions));
     }
 
     // ------------------------------------------------------------------
@@ -3329,6 +3333,89 @@ internal static class ContractTests
             {
                 blocker.Stop();
             }
+        });
+    }
+
+    /// <summary>
+    /// 命令缺必填参数必须是 400 + request.missing_parameter，不能是「权限」问题，也不能静默成功。
+    ///
+    /// 为什么单独立一条：命令执行器在参数缺失时抛 BadRequest("request.missing_parameter")，
+    /// 这是 northbound-api.md 错误表里明列的 400 码。它与「没权限」(403 auth.forbidden)、
+    /// 「命令不存在」(400 request.unknown_action) 是三件不同的事，运维要从 code 一眼分清是
+    /// 哪类问题：缺参去补全请求体，越权去申请权限，动作拼错去改配置。三者若被塌缩成同一个
+    /// 笼统 400，现场会朝错误方向排查。这里用静态 API Token（Admin、全权限）发命令，正是要
+    /// 把「权限」这条岔路排除掉，确认落到的是参数校验本身。
+    /// </summary>
+    private static Task CommandRejectsMissingParameter(TestContext t)
+    {
+        return RunAsync(async () =>
+        {
+            await using var host = await Host.StartAsync(t);
+
+            // driver.restart 需要 device；params 留空，执行器应先在 Param("device") 上抛错。
+            var missing = await host.Client.SendAsync(
+                Post("/api/v1/commands",
+                    """{"action":"driver.restart","params":{}}"""), t.Ct);
+
+            t.Equal(HttpStatusCode.BadRequest, missing.StatusCode,
+                "a command missing a required parameter is a 400, not a permission problem");
+            using var body = await ReadJsonAsync(t, missing);
+            var error = body.RootElement.GetProperty("error");
+            t.Equal("request.missing_parameter", error.GetProperty("code").GetString(),
+                "the code names the missing parameter, not a generic bad request");
+            t.Ok(error.GetProperty("message").GetString()!.Contains("device"),
+                "the message points at the missing parameter name");
+
+            await host.DisposeAsync();
+        });
+    }
+
+    /// <summary>
+    /// 破坏性命令（config.rollback / outbox.drop）忘带 confirm:true 必须被 400 + request.confirm_required
+    /// 拦下，而且拦在执行之前——一条手滑的回滚绝不能就此生效。
+    ///
+    /// 为什么单独立一条：这两条命令会切整份配置、丢待投递数据，属于「需要操作员二次确认」的动作。
+    /// 执行器里 Require(scope) 通过之后，下一步就是 if (!request.Confirm) throw confirm_required，
+    /// 顺序很关键：确认这道闸门在真正动配置/丢数据之前。REST 允许这两个动作（CommandScope.All），
+    /// 所以这里不是 403 forbidden（那是 MQTT 通道才有的），而是「忘了带确认」的 400。若有人把那个
+    /// if 删掉或挪到执行之后，回滚就会在没确认的情况下直接生效——把「手滑一次覆盖整张点表」从
+    /// 失误放大成事故。用例钉住两条动作都返回同一码，且状态没被改动。
+    /// </summary>
+    private static Task CommandRequiresConfirmForDestructiveActions(TestContext t)
+    {
+        return RunAsync(async () =>
+        {
+            await using var host = await Host.StartAsync(t);
+
+            var configBefore = host.Runtime.ConfigVersion;
+
+            var rollback = await host.Client.SendAsync(
+                Post("/api/v1/commands",
+                    """{"action":"config.rollback","params":{"version":"v1"},"confirm":false}"""),
+                t.Ct);
+            t.Equal(HttpStatusCode.BadRequest, rollback.StatusCode,
+                "a destructive command without confirm is rejected before it runs");
+            using var rollbackBody = await ReadJsonAsync(t, rollback);
+            t.Equal("request.confirm_required",
+                rollbackBody.RootElement.GetProperty("error").GetProperty("code").GetString(),
+                "the code names the missing confirmation");
+
+            var drop = await host.Client.SendAsync(
+                Post("/api/v1/commands",
+                    """{"action":"outbox.drop","params":{},"confirm":false}"""),
+                t.Ct);
+            t.Equal(HttpStatusCode.BadRequest, drop.StatusCode,
+                "outbox.drop is gated by the same confirmation");
+            using var dropBody = await ReadJsonAsync(t, drop);
+            t.Equal("request.confirm_required",
+                dropBody.RootElement.GetProperty("error").GetProperty("code").GetString(),
+                "outbox.drop reports the same missing-confirmation code");
+
+            // 两道闸门都在执行前拦下：配置版本没被改动，确认这道确认确实挡在回滚之前。
+            t.Equal(configBefore, host.Runtime.ConfigVersion,
+                "the rejected rollback left the live configuration untouched");
+
+            await host.DisposeAsync();
         });
     }
 

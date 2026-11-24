@@ -12,20 +12,22 @@ PRD 中 M 级的采集协议已全部落地，FR-CFG-01 的四类寻址模型也
 COV/分段/多属性读仍不做，见 [protocol-status.md](protocol-status.md) §4.1）。非 M 级验收里的 12 类故障注入同样全部有了
 可自动跑的用例（见 §7）。
 
-当前测试基线：**432 条**（带 `--opcua` 全量：本轮新增的两条 `engine/write_readback_bad_quality_is_unconfirmed`
-与 `engine/write_readback_no_value_is_unconfirmed` 是纯进程内、不连真实设备；全量实测数字以 [testing.md](testing.md)
-最新一轮为准）。本轮补齐写后确认回读裁决剩下的两个此前无用例的分支：
-`engine/write_readback_bad_quality_is_unconfirmed`——回读「读回来了、值也对，但质量不是 Good」时，只能算
-「没确认」，质量原样透出（comm_error）、错误打 `verify.quality` 前缀，**不得**误报成值不一致 `verify.mismatch`
-（两者现场排查方向相反：mismatch 查写命令/设备是否接受该值，quality 查回读链路）；以及
-`engine/write_readback_no_value_is_unconfirmed`——回读「一个值都没返回」时，质量固定 `Uncertain`、错误打
-`verify.no_value`（连值都没有，谈不上「比对不对」）。连同上一轮的 `engine/write_readback_failure_is_not_a_write_failure`
-（回读抛异常、绝不谎报写失败），`VerifyWriteAsync` 的 5 个裁决分支（ok / mismatch / quality / no_value /
-readback_failed）现已全部有用例点名。用例均钉住写确实下发（Writes==1）、回读被尝试（Reads==1）、Ok/Verified
-均为 false，以及各自的质量与错误前缀。纯进程内、≤ 2.7 s。
+当前测试基线：**434 条**（带 `--opcua` 全量：本轮新增的两条 `contract/command_rejects_missing_parameter`
+与 `contract/command_requires_confirm_for_destructive_actions` 是连真实 Kestrel 的契约用例；全量实测数字以
+[testing.md](testing.md) 最新一轮为准）。本轮补齐北向 `/api/v1/commands` 的两条此前无断言的错误分类——
+它们都是 northbound-api.md 错误表里明列的 400 码，但全测试套件只有 `AuthRolesAreEnforced` 测过
+「viewer 越权被 403 拦」，Admin 级（静态 API Token，全权限）走到命令执行器的请求校验这条路从未被断言：
+`contract/command_rejects_missing_parameter`——命令缺必填参数（如 `driver.restart` 不带 `device`）
+返回 400 + `request.missing_parameter`、消息点名缺失的参数名（与「没权限」403 auth.forbidden、「命令不存在」
+`request.unknown_action` 是三件不同的事，运维要从 code 一眼分清该去补请求、申请权限还是改配置）；
+`contract/command_requires_confirm_for_destructive_actions`——`config.rollback`/`outbox.drop` 这类会切整份
+配置、丢待投递数据的破坏性命令忘带 `confirm:true` 时，被 400 + `request.confirm_required` 拦在执行之前
+（用例同时钉住配置版本未被改动），确认这道闸门若被删或挪到执行之后，回滚就会在没确认的情况下直接生效。
+两条都用静态 Admin Token 发命令，正是要把「权限」这条岔路排除掉、确认落到的是请求校验本身。
 此前几轮新增 `engine/write_readback_failure_is_not_a_write_failure`（回读失败不谎报写失败）、
-`engine/address_error_batch_does_not_retire_the_device`（address_error 返回批不重试不降级）、
-`engine/comm_error_batch_is_retried`（comm_error 返回批按临时性失败重试）、
+`engine/write_readback_bad_quality_is_unconfirmed`、`engine/write_readback_no_value_is_unconfirmed`
+（写后确认回读裁决的 quality/no_value 两支，`VerifyWriteAsync` 五个分支至此全部点名）、
+`engine/address_error_batch_does_not_retire_the_device`、`engine/comm_error_batch_is_retried`、
 `pipeline/error_kind_maps_to_quality`（`QualityMap.From` 全 8 档映射逐档点名 + 反向守卫）、
 `bacnet/write_array_point_is_rejected`（数组点位写逐点失败映射 Disabled）、
 `bacnet/device_instance_out_of_range_is_rejected`（deviceInstance 22 位实例号越界）、
@@ -33,10 +35,10 @@ readback_failed）现已全部有用例点名。用例均钉住写确实下发�
 `s7/label_out_of_range_is_rejected`（S7 <MASKED_PERSON_001> rack/slot/pduSize 越界）、
 `s7/metadata_declares_capabilities`、`opcua/metadata_declares_capabilities`
 （S7 与 OPC UA 客户端两个驱动此前无用例断言的 `DriverMeta` 能力声明钉住）。
-本轮改动纯增量（新增两条引擎用例），不改动既有用例判定，故直接复跑受影响用例确认：
-`--filter write_readback_bad_quality_is_unconfirmed`、`--filter write_readback_no_value_is_unconfirmed`
-各 1 条全绿，整组 `--filter engine/` 全绿（见提交说明）；全量汇总数字以 [testing.md](testing.md)
-下一次腾空复跑所量取者为准。
+本轮改动纯增量（新增两条契约用例），不改动既有用例判定，故直接复跑受影响用例确认：两条各 1 条全绿、
+源码与 HEAD 字节一致（非空验证：把错误码从 `request.missing_parameter`/`request.confirm_required` 改成
+`request.invalid` 后重建，两条用例均在「code 命名」断言上精确 FAIL，恢复后 PASS）；全量汇总数字以
+[testing.md](testing.md) 下一次腾空复跑所量取者为准。
 
 ## 1. 采集（FR-COL）
 

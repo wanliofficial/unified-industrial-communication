@@ -19,18 +19,18 @@ dotnet run --project tests/Uic.Tests -- --stop-on-fail      # 首个失败即停
 N passed, 0 failed, 0 skipped · <耗时>
 ```
 
-本轮（432 条）的改动是**纯增量**：补齐写后确认回读裁决剩下两个此前无用例的分支，
-`engine/write_readback_bad_quality_is_unconfirmed`（回读读回来了、值也对，但**质量不是 Good**：
-只能算「没确认」，质量原样透出、错误打 `verify.quality`，**不得**误报成值不一致 `verify.mismatch`——
-两者现场排查方向相反：mismatch 查写命令/设备是否接受该值，quality 查回读链路）与
-`engine/write_readback_no_value_is_unconfirmed`（回读**一个值都没返回**：质量固定 `Uncertain`、
-错误打 `verify.no_value`——连值都没有，谈不上「比对不对」）。加上上一轮的
-`engine/write_readback_failure_is_not_a_write_failure`（回读这一步抛异常，绝不谎报成写入失败），
-`VerifyWriteAsync` 的 5 个裁决分支（ok / mismatch / quality / no_value / readback_failed）现已全部有用例点名。
-本轮已直接复跑验证：`--filter write_readback_bad_quality_is_unconfirmed`、
-`--filter write_readback_no_value_is_unconfirmed` 各 1 条全绿，整组 `--filter engine/` 全绿（见提交说明）。
-由于这两条不改动任何既有用例的判定，全量通过/失败结论不受影响，故全量汇总数字留待下一次腾空复跑时
-如实量取填入上方（前一轮全量在 NTFS 高负载下于 `contract/*` 组后被截断、未跑到汇总，故不写「全绿」假数字）。
+本轮（434 条）的改动是**纯增量**：补齐北向 `/api/v1/commands` 两条此前无断言的错误分类——
+`contract/command_rejects_missing_parameter`（命令缺必填参数，如 `driver.restart` 不带 `device`：400 +
+`request.missing_parameter`、消息点名缺失的参数名；用静态 Admin Token 发命令，正是要把「权限」这条岔路排除掉，
+确认落到的是参数校验本身，与 403 auth.forbidden、`request.unknown_action` 是三件不同的事）与
+`contract/command_requires_confirm_for_destructive_actions`（`config.rollback`/`outbox.drop` 这类会切整份配置、
+丢待投递数据的破坏性命令忘带 `confirm:true` 时被 400 + `request.confirm_required` 拦在执行之前，用例同时钉住配置
+版本未被改动）。这两条都是 northbound-api.md 错误表里明列的 400 码，但全测试套件此前只有
+`AuthRolesAreEnforced` 测过 viewer 越权被 403 拦，Admin 级走到命令执行器的请求校验这条路从未被断言。
+本轮已直接复跑验证：两条各 1 条全绿（恢复后 3.9 s），非空验证见提交说明（把错误码改成 `request.invalid` 后
+两条用例均在「code 命名」断言上精确 FAIL）。整组 `--filter contract/` 全绿（见提交说明）。由于这两条不改动
+任何既有用例的判定，全量通过/失败结论不受影响，故全量汇总数字留待下一次腾空复跑时如实量取填入上方
+（前一轮全量在 NTFS 高负载下于 `contract/*` 组后被截断、未跑到汇总，故不写「全绿」假数字）。
 
 前序基线（422 条，`--opcua`）：`421 passed, 1 failed, 0 skipped · 1041.9 s`——那 1 条 failed 是
 `contract/points_csv_import_previews_and_applies` 触到 180 s 硬超时的**高负载 flake**
@@ -106,6 +106,7 @@ deviceInstance 22 位实例号越界与非数字明确报错、纯构造不启 U
 只能算没确认、质量原样透出、错误打 `verify.quality` 且**不得**误报成 `verify.mismatch`；
 `engine/write_readback_no_value_is_unconfirmed`：回读一个值都没返回时质量固定 `Uncertain`、
 错误打 `verify.no_value`。至此 `VerifyWriteAsync` 五个裁决分支全部被点名，两条都 ≤ 3 s、纯进程内）。
+434 条 = 432 条 + 北向命令请求校验两支（`contract/command_rejects_missing_parameter`：缺参 400 + `request.missing_parameter`；`contract/command_requires_confirm_for_destructive_actions`：破坏性命令缺 confirm 400 + `request.confirm_required`、拦在执行前。两条都是 northbound-api.md 错误表明列的 400 码，此前无断言，≤ 4 s）。
 419 条那一轮（只跑过 `fault/*` 组，未记耗时的中间态）跳过；以 420 条这一轮为准（见下一段）。
 418 条那一轮（补了 OPC UA 服务端能力边界两条：`opcua/server_options_are_anonymous_and_none_only`、
 `opcua/server_endpoint_advertises_only_none_and_anonymous`；配置校验矩阵补 `allowAnonymousRead=false`
@@ -197,7 +198,7 @@ NFR 的门槛是 120 s，压测用例、PBKDF2 派生与 TLS 握手是主要开�
 | `mqtt/*` | 35 | 测试内 broker：CONNECT/SUBSCRIBE 字段、QoS0/1、主题渲染、重连补发、**下线设备清 retained `$state`**、**命令去重窗口用单调时钟（校时跳变不会重复执行命令）**、**过期判定用单调「多久没收到报文」（校时跳变不伪造也不放过过期）**、TLS 发布与不可信 CA 拒绝；南向驱动：主题通配匹配、JSON 字段/类型/信封取值、首次读数前 `stale`、QoS0/1 取数、点位字段覆盖、坏载荷与恢复、断线重订阅、<MASKED_PERSON_001>越界与非布尔<MASKED_PERSON_001>拒绝（`mqtt/options_reject_out_of_range_labels`：qos 0..1、keepAlive 5..600、reconnect 500..300000、staleAfter 0..86400 越界明确报错、tlsEnabled 非布尔报错，纯构造不连 Broker）、<MASKED_PERSON_001>凭据与「CA 无 TLS」拒绝、订阅被 ACL 拒绝 |
 | `template/*` | 4 | 50 实例批量生成、参数类型/缺失/未知参数拒绝、未声明占位符拒绝；**同一模板产出 Modbus 与 S7 两台设备并同时通过校验**（FR-CFG-01 验收口径） |
 | `csv/*` | 6 | 地址表达式（参考号/区域偏移/分列）、按 id 合并与冲突行号、死区模式与量程列、点位周期列、数组元素个数列 |
-| `contract/*` | 47 | 进程内真实 Kestrel 的 REST 契约（含驱动能力、**Prometheus 抓取端点的真实运行期序列**（HELP/TYPE、设备数与采集中设备数、无 sink 时仍导出 0、逐值可解析）、模板、CSV、导入导出、单点幂等、**幂等窗口用单调时钟**（校时跳变既不重复执行写命令、也不会永不失效）、**同一幂等键配另一份请求体返回 409**、**幂等台账随运行时实例走**（进程级静态字典会让新实例把重投当成重放、返回另一台网关的结果）、资源降级联动、脱敏配置往返、明文凭据被拒、journal 历史查询、审计写入/导出/拒绝留痕、点位有效周期、数组元素个数与值形态、**写入值按 scale/offset 反算成原始值**、**每个凭据字段（含 certificatePassword）在读写两侧都脱敏**、**驱动没注册时 apply 返回 422 并指出通道**（不是 500，也不会把在跑的设备拆掉）、**分页游标不合法时 400 而不是静默重来**、**超配额返回 429 且与登录锁定同 code**、**`uic_sse_connections` 反映真实连接数**（写死成 0 时看板永远显示没人订阅）、**SSE 按 `device/point` 过滤**（分隔符写错只是静默不出样本，所以质量码写错改为 400；未知 `quality` 不再建一条永远空的流）、**SSE 50 路并发上限**（真开满 50 条流 → 第 51 条 429 `request.rate_limited`，全部释放后名额可复用；删掉上限判断则第 51 条会挂死等 hello，用例用 10 s 保护判 FAIL）、**写请求体语法错误归 400 `request.invalid_json` 而不是冒成 500**（`JsonException` 不是 `ApiException`，不就地翻译就会被最外层兜底 catch 当成网关故障返回 500，污染告警与错误看板——配置导入早就归 422/400，写接口必须一致）、**v0 旧字段写成非字符串归 422/`valid:false` 而不是冒成 500**（迁移链 `GetValue<string>()` 遇数字/对象会抛裸 `InvalidOperationException`，REST 只按 `ConfigException` 分类「配置非法」，裸异常会冒成网关故障——和写请求体语法错误同类）、**`outbox.droppedLastHour` 是一小时窗口而不是累计值**、**停用设备仍在列表里但两个 state 分开表达**、HTTPS 监听、控制台新建设备的完整链路、**诊断包六部分齐全且配置脱敏**（manifest 带 gateway/apiVersion/site、脱敏后的配置不含明文 token、metrics 是真 Prometheus 序列、日志段不含明文、health 带聚合状态、devices.json 列出设备）；认证的 5 条见 `contract/auth_*`） |
+| `contract/*` | 49 | 进程内真实 Kestrel 的 REST 契约（含驱动能力、**Prometheus 抓取端点的真实运行期序列**（HELP/TYPE、设备数与采集中设备数、无 sink 时仍导出 0、逐值可解析）、模板、CSV、导入导出、单点幂等、**幂等窗口用单调时钟**（校时跳变既不重复执行写命令、也不会永不失效）、**同一幂等键配另一份请求体返回 409**、**幂等台账随运行时实例走**（进程级静态字典会让新实例把重投当成重放、返回另一台网关的结果）、资源降级联动、脱敏配置往返、明文凭据被拒、journal 历史查询、审计写入/导出/拒绝留痕、点位有效周期、数组元素个数与值形态、**写入值按 scale/offset 反算成原始值**、**每个凭据字段（含 certificatePassword）在读写两侧都脱敏**、**驱动没注册时 apply 返回 422 并指出通道**（不是 500，也不会把在跑的设备拆掉）、**分页游标不合法时 400 而不是静默重来**、**超配额返回 429 且与登录锁定同 code**、**`uic_sse_connections` 反映真实连接数**（写死成 0 时看板永远显示没人订阅）、**SSE 按 `device/point` 过滤**（分隔符写错只是静默不出样本，所以质量码写错改为 400；未知 `quality` 不再建一条永远空的流）、**SSE 50 路并发上限**（真开满 50 条流 → 第 51 条 429 `request.rate_limited`，全部释放后名额可复用；删掉上限判断则第 51 条会挂死等 hello，用例用 10 s 保护判 FAIL）、**写请求体语法错误归 400 `request.invalid_json` 而不是冒成 500**（`JsonException` 不是 `ApiException`，不就地翻译就会被最外层兜底 catch 当成网关故障返回 500，污染告警与错误看板——配置导入早就归 422/400，写接口必须一致）、**v0 旧字段写成非字符串归 422/`valid:false` 而不是冒成 500**（迁移链 `GetValue<string>()` 遇数字/对象会抛裸 `InvalidOperationException`，REST 只按 `ConfigException` 分类「配置非法」，裸异常会冒成网关故障——和写请求体语法错误同类）、**`outbox.droppedLastHour` 是一小时窗口而不是累计值**、**停用设备仍在列表里但两个 state 分开表达**、HTTPS 监听、控制台新建设备的完整链路、**诊断包六部分齐全且配置脱敏**（manifest 带 gateway/apiVersion/site、脱敏后的配置不含明文 token、metrics 是真 Prometheus 序列、日志段不含明文、health 带聚合状态、devices.json 列出设备）；**北向命令的请求校验错误分类**（缺参 400 `request.missing_parameter`、破坏性命令缺 `confirm:true` 400 `request.confirm_required` 且拦在执行前——两条都是错误表明列的码，此前只有越权 403 被测）；认证的 5 条见 `contract/auth_*`） |
 | `secret/*` | 9 | 凭据引用：环境变量 / 密钥文件解析、缺失变量硬失败（不能静默变成空令牌）、明文被拒、空值合法、`enc:v1` 封解与篡改拒绝、未知方案与版本、摘要不泄露明文 |
 | `tls/*` | 4 | 证书必填且可读、PFX 口令必须是引用、`insecureSkipVerify` 依赖 `tls.enabled`；证书/CA 不接受凭据引用；**CA 文件内容不是 PEM 时拒绝**（`ImportFromPemFile` 对非 PEM 内容不抛异常、只导入 0 张证书，等于静默退回系统信任库），空文件仍是「显式不配 CA」 |
 | `audit/*` | 9 | 审计落盘：按动作/结果/身份查询、重启后序号单调且旧记录可查、按大小轮转与保留只删旧文件、**跨 UTC 日界换新文件**（注入可拨时钟）、**写不进去只降级不抛异常**（目录指向普通文件）、禁用时不写盘、断电半行跳过、按文件名日期跳过无关归档、分页最新在前 |
