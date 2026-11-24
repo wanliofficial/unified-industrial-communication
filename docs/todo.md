@@ -37,7 +37,7 @@ Wave 0–2 的协议与核心治理域基本标记为"已落地"。未落地功�
 - **集中管理**：中心聚合器——只读镜像、配置下发、批量升级、站点分组（`:184`）
 - **灰度发布**：分批下发、观察窗口、失败率超阈值自动回滚已落地（`POST /api/v1/config/staged` + `/advance` + `/abort`，看门狗兜底自动回滚）；「暂停但不回滚」的形态刻意不做（坏配置继续跑不如直接回滚）（`:185`）
 - **数据契约**：v2 双发过渡、Sparkplug B 的 DataSet/模板（`:186`，README 也声明 DataSet/模板不做）
-- **运维**：看门狗数据 stale 降级自愈已落地（`runtime.markStale`）；远程日志拉取、离线升级包、进程级自愈看门狗、Wave 2 的网络诊断与远程配置下发（`:155`/`:187`）未落地
+- **运维**：看门狗数据 stale 降级自愈已落地（`runtime.markStale`）；远程日志拉取已落地（`GET /api/v1/logs`，按 device/level/limit 过滤，此前是假阴性）、诊断包已落地（`GET /api/v1/diagnostics/bundle`）；离线升级包、进程级自愈看门狗、Wave 2 的网络诊断与远程配置下发（`:155`/`:187`）未落地
 - **国际化**：中/英双语、时区、单位制（`:188`，无 `i18n` 目录）
 - **合规交付**：SBOM 已落地（`make sbom`，CycloneDX，零依赖如实表达）、`make release` 三平台交叉编译验收已可执行（`Makefile`）；签名发布、等保对照表、CI 流水线待落地
-- **测试**：1000 设备负载测试已落地（`make load` / `cmd/loadgen`，真实 runtime 端到端，ADR C4/C5 NFR 断言见 `internal/loadtest`）；驱动一致性扩展未落地（`:158`）
+- **测试**：1000 设备负载测试已落地（`make load` / `cmd/loadgen`，真实 runtime 端到端，ADR C4/C5 NFR 断言见 `internal/loadtest`）；驱动一致性扩展已落地（`internal/driver/conformance` 共享套件 `Check`/`CheckRegistry`，`internal/runtime/conformance_test.go` 遍历注册表全量驱动）；凭据声明收敛到单一事实源（`driver.ConfigField.Secret` + `driver.LooksSecret` 名字兜底，脱敏与一致性套件同源；顺带修掉 SNMP 团体名明文回显）

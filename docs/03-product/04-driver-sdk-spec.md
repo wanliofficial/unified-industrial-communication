@@ -111,6 +111,21 @@ type ConfigField struct {
 }
 ```
 
+**凭据字段的契约**：`Secret` 是「这个字段是凭据」的**权威声明**，它不是 UI 偏好，
+而是全链路脱敏的事实源：
+
+- `GET /api/v1/config` 与 `GET /api/v1/config/versions/{id}` 把 `Secret: true` 的字段
+  值替换为 `***`；`POST /config/apply` 接受 `***` 表示「保持当前值」（见
+  `runtime.fillRedacted`）。
+- 名字启发式 `driver.LooksSecret(name)` 是兜底：字段名含 `password/passwd/pwd/token/
+  secret/apikey/api_key/credential/community/privatekey` 任一片段即视为凭据。驱动若
+  声明了这类名字却漏标 `Secret`，一致性套件会报错——避免「驱动以为写了口令、脱敏
+  却没认出」的静默泄漏（SNMP 团体名 `community` 就是这类：名字里没有 password，
+  却是实打实的只读口令）。
+- `Type` 只允许 `string/int/float/bool/enum/duration`。凭据用 `type: "string"` +
+  `secret: true`，**不要**引入 `password` 之类的自定义类型（配置表单渲染不出来）。
+```
+
 ### 3.2 驱动与连接
 
 ```go
@@ -3600,10 +3615,13 @@ v3 的外层报文与 v1/v2c 完全不同（`HeaderData` + `msgSecurityParameter
 **不退回 v2c 碰运气**——用 v2c 的报文去连一个只开 v3 的代理，得到的是超时；现场会
 把它误判成「网络不通」，而真正的原因是版本配错。
 
-团体名按凭据对待：`labels.community` 在配置表单里是 `password` 类型（界面掩码），
-默认值 `public` 只是「第一次接通最少配置」，不是安全默认。文档与失败提示都要求
-现场显式确认它。v3 的用户名/认证口令/加密口令同样按凭据处理，且口令只从环境变量
-或配置的 Secret 字段读，不落日志（见 §3.10.22）。
+团体名按凭据对待：`labels.community` 在配置表单里声明 `secret: true`（界面掩码、
+`GET /config` 脱敏），`type` 仍为 `string`——字段类型集合只有
+string/int/float/bool/enum/duration 六种，"password" 不是合法类型，写了会让配置
+表单渲染不出来。默认值 `public` 只是「第一次接通最少配置」，不是安全默认。文档与
+失败提示都要求现场显式确认它。v3 的用户名/认证口令/加密口令同样按凭据处理（口令
+字段声明 `secret: true`），且口令只从环境变量或配置的 Secret 字段读，不落日志
+（见 §3.10.22）。
 
 #### 3.10.12.2 报文结构：三层 TLV
 
