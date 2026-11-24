@@ -12,8 +12,20 @@ PRD 中 M 级的采集协议已全部落地，FR-CFG-01 的四类寻址模型也
 COV/分段/多属性读仍不做，见 [protocol-status.md](protocol-status.md) §4.1）。非 M 级验收里的 12 类故障注入同样全部有了
 可自动跑的用例（见 §7）。
 
-当前测试基线：**437 条**（带 `--opcua` 全量；本轮**新增 1 条**契约用例。全量实测数字以
-[testing.md](testing.md) 最新一轮为准）。本轮补上北向「加载不存在的配置版本」的 404 错误分类：
+当前测试基线：**438 条**（带 `--opcua` 全量；本轮**新增 1 条**契约用例。全量实测数字以
+[testing.md](testing.md) 最新一轮为准）。本轮补上北向「取/删不存在的模板」的 404 错误分类：
+`contract/unknown_template_returns_not_found`——`GET /api/v1/templates/{id}`（`store.Get` 返回 null）
+与 `DELETE /api/v1/templates/{id}`（`DeleteAsync` 返回 false）在模板不存在时返回 404 + `template.not_found`。
+这个码在错误表（northbound-api.md「端点专属」段落）明列，但既有模板用例只测过创建 + 用**真实** id
+实例化（`template_instantiates_and_applies`），未知 id 的两条抛点无人断言。缺模板时要能一眼分清
+「模板名打错」404 与「模板内容非法」422，否则运维会去改一个根本不存在的模板。用例同时钉住两条独立
+路径（GET 的 Get-null、DELETE 的 DeleteAsync-false），删掉任一处抛点或改码都会露出来。非空验证：
+（1）把 GET 路径的 `template.not_found` 改成 `resource.not_found` → 用例在「stable error code:
+expected <template.not_found>, got <resource.not_found>」精确 FAIL；（2）恢复 GET、只把 DELETE 路径
+改成 `resource.not_found` → 用例在「delete surfaces the same code: expected <template.not_found>,
+got <resource.not_found>」精确 FAIL。TUnit 首断言即停，故两轮独立扰动各自验证；恢复后源码与 HEAD
+字节一致、用例 PASS（7.4 s）。
+上一轮（437 条、新增 1 条）补上北向「加载不存在的配置版本」的 404 错误分类：
 `contract/unknown_config_version_returns_not_found`——`GET /api/v1/config/versions/{id}` 与
 `GET /api/v1/config/diff?from=` 在版本不存在时返回 404 + `config.version_not_found`。这个码在错误表
 （northbound-api.md「端点专属」段落）明列，但既有用例只拿**真实**版本 id 走 diff/回滚

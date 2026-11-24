@@ -61,6 +61,7 @@ internal static class ContractTests
         tests.Add(new TestCase("contract/unknown_point_returns_error_envelope", UnknownPointReturnsErrorEnvelope));
         tests.Add(new TestCase("contract/unknown_user_returns_error_envelope", UnknownUserReturnsErrorEnvelope));
         tests.Add(new TestCase("contract/unknown_config_version_returns_not_found", UnknownConfigVersionReturnsNotFound));
+        tests.Add(new TestCase("contract/unknown_template_returns_not_found", UnknownTemplateReturnsNotFound));
         tests.Add(new TestCase("contract/config_is_redacted", ConfigIsRedacted));
         tests.Add(new TestCase("contract/config_validate_reports_problems", ConfigValidateReportsProblems));
         tests.Add(new TestCase("contract/malformed_legacy_field_is_not_a_server_fault", MalformedLegacyFieldIsNotAServerFault));
@@ -1225,6 +1226,41 @@ internal static class ContractTests
                 t.Equal("config.version_not_found",
                     envelope.RootElement.GetProperty("error").GetProperty("code").GetString(),
                     "diff surfaces the same code");
+            }
+        });
+    }
+
+    private static Task UnknownTemplateReturnsNotFound(TestContext t)
+    {
+        return RunAsync(async () =>
+        {
+            await using var host = await Host.StartAsync(t);
+
+            // 取/删一个不存在的模板：错误表「端点专属」段落明列 template.not_found，但既有模板
+            // 用例只测过创建 + 用真实 id 实例化（template_instantiates_and_applies），未知 id 的
+            // 抛点无人断言。模板缺失时要能一眼分清「模板名打错」404 与「模板内容非法」422——
+            // 否则运维会去改一个根本不存在的模板、或以为实例化参数写错了。
+            var get = await host.Client.SendAsync(Get("/api/v1/templates/nope"), t.Ct);
+            t.Equal(HttpStatusCode.NotFound, get.StatusCode, "unknown template is a 404");
+
+            using (var envelope = await ReadJsonAsync(t, get))
+            {
+                var error = envelope.RootElement.GetProperty("error");
+                t.Equal("template.not_found", error.GetProperty("code").GetString(), "stable error code");
+                t.Contains(error.GetProperty("message").GetString() ?? string.Empty, "nope",
+                    "message names the template");
+            }
+
+            // 删除走的是另一条路径（DeleteAsync 返回 false，而不是 store.Get 返回 null），
+            // 同一个码必须也在这里现身——两处抛点各自独立，删掉任一处这条会露出来。
+            var delete = await host.Client.SendAsync(DeleteWith("/api/v1/templates/nope", Token), t.Ct);
+            t.Equal(HttpStatusCode.NotFound, delete.StatusCode, "deleting an unknown template is a 404");
+
+            using (var envelope = await ReadJsonAsync(t, delete))
+            {
+                t.Equal("template.not_found",
+                    envelope.RootElement.GetProperty("error").GetProperty("code").GetString(),
+                    "delete surfaces the same code");
             }
         });
     }
