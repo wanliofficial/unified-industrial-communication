@@ -12,8 +12,19 @@ PRD 中 M 级的采集协议已全部落地，FR-CFG-01 的四类寻址模型也
 COV/分段/多属性读仍不做，见 [protocol-status.md](protocol-status.md) §4.1）。非 M 级验收里的 12 类故障注入同样全部有了
 可自动跑的用例（见 §7）。
 
-当前测试基线：**436 条**（带 `--opcua` 全量；本轮**新增 1 条**契约用例。全量实测数字以
-[testing.md](testing.md) 最新一轮为准）。本轮补上北向「改不存在的账号」的 404 错误分类：
+当前测试基线：**437 条**（带 `--opcua` 全量；本轮**新增 1 条**契约用例。全量实测数字以
+[testing.md](testing.md) 最新一轮为准）。本轮补上北向「加载不存在的配置版本」的 404 错误分类：
+`contract/unknown_config_version_returns_not_found`——`GET /api/v1/config/versions/{id}` 与
+`GET /api/v1/config/diff?from=` 在版本不存在时返回 404 + `config.version_not_found`。这个码在错误表
+（northbound-api.md「端点专属」段落）明列，但既有用例只拿**真实**版本 id 走 diff/回滚
+（version 来自 `/api/v1/config`），未知 id 的抛点无人断言。配置版本是回滚的锚点——回滚前必须能一眼
+分清「这个版本号打错了」（404 `config.version_not_found`）还是「配置非法」（422 `config.invalid`），
+否则运维会去查一个根本不存在的版本。用例同时钉住两条 LoadVersion 路径（`versions/{id}` 单版加载、
+`diff` 的 from 加载），删掉任一处抛点或改码都会露出来。非空验证：把 `versions/{id}` 里
+`config.version_not_found` 的抛点临时改成 `config.invalid` → 重建后该用例在「stable error code:
+expected <config.version_not_found>, got <config.invalid>」精确 FAIL；恢复后源码与 HEAD 字节一致、
+用例 PASS（35.6 s）。
+上一轮（436 条、新增 1 条）补上北向「改不存在的账号」的 404 错误分类：
 `contract/unknown_user_returns_error_envelope`——`PUT /api/v1/users/{id}` 在账号不存在时返回
 404 + `user.not_found`。这个码在错误表（northbound-api.md 404 行）明列，但用户端点此前只测过
 创建/更新/删除「存在」的账号（`auth_users_require_manage`），`Find(id)` 返回 null 的抛点无人断言。

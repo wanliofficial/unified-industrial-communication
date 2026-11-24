@@ -60,6 +60,7 @@ internal static class ContractTests
         tests.Add(new TestCase("contract/unknown_device_returns_error_envelope", UnknownDeviceReturnsEnvelope));
         tests.Add(new TestCase("contract/unknown_point_returns_error_envelope", UnknownPointReturnsErrorEnvelope));
         tests.Add(new TestCase("contract/unknown_user_returns_error_envelope", UnknownUserReturnsErrorEnvelope));
+        tests.Add(new TestCase("contract/unknown_config_version_returns_not_found", UnknownConfigVersionReturnsNotFound));
         tests.Add(new TestCase("contract/config_is_redacted", ConfigIsRedacted));
         tests.Add(new TestCase("contract/config_validate_reports_problems", ConfigValidateReportsProblems));
         tests.Add(new TestCase("contract/malformed_legacy_field_is_not_a_server_fault", MalformedLegacyFieldIsNotAServerFault));
@@ -1189,6 +1190,42 @@ internal static class ContractTests
 
             t.Equal("user.not_found", error.GetProperty("code").GetString(), "stable error code");
             t.Contains(error.GetProperty("message").GetString() ?? string.Empty, "nope", "message names the user");
+        });
+    }
+
+    private static Task UnknownConfigVersionReturnsNotFound(TestContext t)
+    {
+        return RunAsync(async () =>
+        {
+            await using var host = await Host.StartAsync(t);
+
+            // 加载一个不存在的配置版本：错误表「端点专属」段落明列 config.version_not_found，
+            // 但既有用例只测过拿真实版本 id 走 diff/回滚（version 来自 /api/v1/config），未知 id
+            // 的抛点无人断言。配置版本是回滚的锚点——回滚前必须能一眼分清「这个版本号打错了」
+            // （404 config.version_not_found）还是「配置非法」（422 config.invalid），否则运维会
+            // 去查一个根本不存在的版本。
+            var single = await host.Client.SendAsync(Get("/api/v1/config/versions/nope"), t.Ct);
+            t.Equal(HttpStatusCode.NotFound, single.StatusCode, "unknown config version is a 404");
+
+            using (var envelope = await ReadJsonAsync(t, single))
+            {
+                var error = envelope.RootElement.GetProperty("error");
+                t.Equal("config.version_not_found", error.GetProperty("code").GetString(), "stable error code");
+                t.Contains(error.GetProperty("message").GetString() ?? string.Empty, "nope",
+                    "message names the version");
+            }
+
+            // diff 的 from 走另一条 LoadVersion 调用，同一码必须也在这里现身——
+            // 删掉任一处抛点或改码，这条会露出来。
+            var diff = await host.Client.SendAsync(Get("/api/v1/config/diff?from=nope"), t.Ct);
+            t.Equal(HttpStatusCode.NotFound, diff.StatusCode, "diff with unknown 'from' is a 404");
+
+            using (var envelope = await ReadJsonAsync(t, diff))
+            {
+                t.Equal("config.version_not_found",
+                    envelope.RootElement.GetProperty("error").GetProperty("code").GetString(),
+                    "diff surfaces the same code");
+            }
         });
     }
 
