@@ -79,6 +79,50 @@ func TestNodeIDEncodingWidths(t *testing.T) {
 	}
 }
 
+// TestNodeIDGUIDWireEncoding 锁定 GUID NodeId 的线序：Data1/Data2/Data3 在
+// 线上是小端、Data4 原样（OPC UA Part 6 §5.1.4）。
+//
+// 这条之前没有锚点：Encode/Decode 的 GUID 分支互逆，自洽的 round-trip 测不出
+// 端序——把 Encode 退化成「直接 append 原字节」（大端）后，本包全部用例仍绿，
+// 但与任何标准 OPC UA 服务端交换出的 GUID 都对不上（症状是「节点不存在」且
+// 指不回配置）。GUID 在浏览结果里会出现，必须能原样透传。
+//
+// 取 GUID 00112233-4455-6677-8899-aabbccddeeff、ns=2：struct 按文本序（大端）
+// 存 [00 11 22 33 44 55 66 77 88 99 aa bb cc dd ee ff]，线上应是
+//
+//	04 | 02 00 | 33 22 11 00 | 55 44 | 77 66 | 88 99 aa bb cc dd ee ff
+//	编码  ns    Data1(LE)     D2(LE)  D3(LE)   Data4(原样)
+func TestNodeIDGUIDWireEncoding(t *testing.T) {
+	n := NodeID{
+		Kind:      NodeIDGUID,
+		Namespace: 2,
+		GUID: [16]byte{
+			0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77,
+			0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff,
+		},
+	}
+	want := []byte{
+		0x04, 0x02, 0x00,
+		0x33, 0x22, 0x11, 0x00, // Data1 小端
+		0x55, 0x44, // Data2 小端
+		0x77, 0x66, // Data3 小端
+		0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, // Data4 原样
+	}
+	e := &encoder{}
+	n.Encode(e)
+	if got := e.Bytes(); !bytes.Equal(got, want) {
+		t.Fatalf("GUID encode = % x, want % x", got, want)
+	}
+	d := newDecoder(want)
+	got := d.NodeID()
+	if err := d.Err(); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if got != n {
+		t.Fatalf("GUID round trip got %s (% x), want %s", got, got.GUID, n)
+	}
+}
+
 // Null 字符串必须写成 -1（0xFFFFFFFF）而不是长度 0。两者语义上都表示
 // 空，但长度 0 会让部分实现把「空 LocalizedText」与「有 Locale 无 Text」
 // 混为一谈。
