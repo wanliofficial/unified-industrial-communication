@@ -12,9 +12,18 @@ PRD 中 M 级的采集协议已全部落地，FR-CFG-01 的四类寻址模型也
 COV/分段/多属性读仍不做，见 [protocol-status.md](protocol-status.md) §4.1）。非 M 级验收里的 12 类故障注入同样全部有了
 可自动跑的用例（见 §7）。
 
-当前测试基线：**434 条**（带 `--opcua` 全量：本轮新增的两条 `contract/command_rejects_missing_parameter`
-与 `contract/command_requires_confirm_for_destructive_actions` 是连真实 Kestrel 的契约用例；全量实测数字以
-[testing.md](testing.md) 最新一轮为准）。本轮补齐北向 `/api/v1/commands` 的两条此前无断言的错误分类——
+当前测试基线：**434 条**（带 `--opcua` 全量；本轮是**加强既有用例**、不新增用例，条数不变。全量实测数字以
+[testing.md](testing.md) 最新一轮为准）。本轮把南向驱动能力声明的覆盖补全：`drivers_expose_capability_states` 此前
+只点名了 modbus-tcp 的能力四态、virtual 的订阅/浏览/发现、mqtt 的读/写/订阅，而 **modbus-rtu/ascii 两个串口变体的
+能力四态**（该用例自己的注释声称与 tcp「能力一致」，却只断言了名称/传输/寻址/配置字段、没断言能力）与 **virtual 的
+读/写/批量/位访问**从未被任何用例钉住。能力是纯声明元数据——经 `/api/v1/drivers` 透给控制台「驱动」页渲染、
+运行期不据此 gate（实际行为如 MQTT 只读、S7 拒绝符号寻址各由行为用例覆盖），所以声明一旦漂移（如误把位访问标成
+Unsupported、误把 virtual 写能力去掉）没有任何用例会发现。本轮把 8 个内置驱动的 `Capabilities` 四态
+（Read/Write/Subscribe/Browse/Discovery/MultiRead/BitAccess/StructTypes）连同 Roles/Transports/AddressKinds 全部点名。
+非空验证：把 modbus-rtu 的 BitAccess 改成 Unsupported → 重建后该用例在「modbus-rtu supports bit access」断言精确
+FAIL；把 virtual 的 Write 改成 Unsupported → 在「the virtual device accepts writes」断言精确 FAIL（TUnit 首断言即停，
+两条扰动各自独立验证）；恢复后源码与 HEAD 字节一致、用例 PASS（10.0 s）。条数仍为 434 条。
+上一轮补齐北向 `/api/v1/commands` 的两条此前无断言的错误分类——
 它们都是 northbound-api.md 错误表里明列的 400 码，但全测试套件只有 `AuthRolesAreEnforced` 测过
 「viewer 越权被 403 拦」，Admin 级（静态 API Token，全权限）走到命令执行器的请求校验这条路从未被断言：
 `contract/command_rejects_missing_parameter`——命令缺必填参数（如 `driver.restart` 不带 `device`）

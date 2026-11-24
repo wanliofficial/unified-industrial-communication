@@ -1008,6 +1008,18 @@ internal static class ContractTests
                 t.Equal("register", variant.GetProperty("addressKinds")[0].GetString(),
                     $"{id} uses register addressing");
 
+                // 串口变体与 tcp 同源，能力声明也必须逐项一致——上面那段注释声称的「能力/寻址一致」，
+                // 此前只验证了寻址与配置字段，能力四态没有。控制台「驱动」页照这份声明渲染能力，
+                // 若 rtu/ascii 的位访问或写能力悄悄漂移（误标成 Unsupported），没有用例会发现。
+                t.Equal("supported", Cap(variant, "read"), $"{id} can read");
+                t.Equal("supported", Cap(variant, "write"), $"{id} can write");
+                t.Equal("supported", Cap(variant, "multiRead"), $"{id} batches reads");
+                t.Equal("supported", Cap(variant, "bitAccess"), $"{id} supports bit access");
+                t.Equal("unsupported", Cap(variant, "subscribe"), $"{id} master has no subscriptions");
+                t.Equal("unsupported", Cap(variant, "browse"), $"{id} has no address space to browse");
+                t.Equal("unsupported", Cap(variant, "discovery"), $"{id} has no discovery");
+                t.Equal("unsupported", Cap(variant, "structTypes"), $"{id} has no structured types");
+
                 var fields = variant.GetProperty("configFields").EnumerateArray()
                     .ToDictionary(f => f.GetProperty("key").GetString()!, f => f.Clone(), StringComparer.Ordinal);
                 t.Equal(2, fields.Count, $"{id} declares a serial port and a baud rate");
@@ -1037,6 +1049,12 @@ internal static class ContractTests
             t.Equal("supported", Cap(virtualDriver, "subscribe"), "the virtual device can push changes");
             t.Equal("supported", Cap(virtualDriver, "browse"), "the virtual device exposes symbols");
             t.Equal("unsupported", Cap(virtualDriver, "discovery"), "discovery stays unsupported");
+            // virtual 声明的读/写/批量/位访问此前也没有任何用例钉住——它和 tcp 一样是 Supported，
+            // 但 behavioral 用例（写后回读等）不读这份声明，所以声明若漂移到 Unsupported 无人发现。
+            t.Equal("supported", Cap(virtualDriver, "read"), "the virtual device can read");
+            t.Equal("supported", Cap(virtualDriver, "write"), "the virtual device accepts writes");
+            t.Equal("supported", Cap(virtualDriver, "multiRead"), "the virtual device batches reads");
+            t.Equal("supported", Cap(virtualDriver, "bitAccess"), "the virtual device supports bit access");
 
             var mqtt = byId["mqtt"];
             t.Equal("supported", Cap(mqtt, "read"), "mqtt can read from its subscription cache");
