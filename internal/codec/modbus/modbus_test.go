@@ -369,6 +369,43 @@ func TestMaskWriteWordSemantics(t *testing.T) {
 	}
 }
 
+// TestApplyMaskWriteOverlappingMasks 锁定 ApplyMaskWrite 的「规范公式」而非
+// 「朴素公式」。
+//
+// MaskWriteWord 生成的掩码永远满足 or & and == 0（AND_Mask 目标位为 0、OR_Mask
+// 目标位为 1，互不重叠）。在掩码不重叠时，规范公式
+//
+//	(cur AND and) OR (or AND NOT and)
+//
+// 与朴素公式
+//
+//	(cur AND and) OR or
+//
+// 完全等价——这正是 TestMaskWriteWordSemantics 没能区分两者的原因，也是把
+// ApplyMaskWrite「简化」成朴素写法后测试仍全绿的原因。
+//
+// 两者的差别只在 AND_Mask 与 OR_Mask 有重叠位时出现（见 ApplyMaskWrite 注释）。
+// 取 and=0x000F、or=0x0003（位 0/1 同时出现在两个掩码里）、cur=0：
+//
+//	规范: (0 AND 0x000F) | (0x0003 AND NOT 0x000F) = 0 | 0 = 0x0000
+//	朴素: (0 AND 0x000F) | 0x0003                      = 0x0003  ← 错
+//
+// 朴素写法会把位 0/1 错置 1，因为它没有排除 AND_Mask 已经「保留」的位。FC22
+// 允许任意 AND/OR 掩码，规范公式必须在重叠掩码下也正确，这条向量就是为它兜底。
+func TestApplyMaskWriteOverlappingMasks(t *testing.T) {
+	const cur, and, or = 0x0000, 0x000F, 0x0003
+	if got := ApplyMaskWrite(cur, and, or); got != 0x0000 {
+		t.Fatalf("ApplyMaskWrite(%#04x, %#04x, %#04x) = %#04x, want 0x0000 "+
+			"(重叠位应以 AND_Mask 为准，朴素公式会错置成 0x0003)", cur, and, or, got)
+	}
+	// 再给一例 cur 非零，确认「保留当前值」这条也被覆盖。
+	// cur=0x00F0：位 0-3 由 AND_Mask 保留（=0），or 的位 0/1 被 NOT and 排除。
+	// 规范: (0x00F0 AND 0x000F) | (0x0003 AND NOT 0x000F) = 0 | 0 = 0x0000
+	if got := ApplyMaskWrite(0x00F0, and, or); got != 0x0000 {
+		t.Fatalf("ApplyMaskWrite(0x00F0, %#04x, %#04x) = %#04x, want 0x0000", and, or, got)
+	}
+}
+
 func TestMaskWriteWordRejectsBadBit(t *testing.T) {
 	for _, bit := range []int{-1, 16, 99} {
 		if _, _, err := MaskWriteWord(bit, true); err == nil {
