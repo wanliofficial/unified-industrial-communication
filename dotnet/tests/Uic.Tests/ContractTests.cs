@@ -89,6 +89,8 @@ internal static class ContractTests
         tests.Add(new TestCase("contract/auth_roles_are_enforced", AuthRolesAreEnforced));
         tests.Add(new TestCase("contract/auth_users_require_manage", AuthUsersRequireManage));
         tests.Add(new TestCase("contract/user_last_admin_is_protected", UserLastAdminIsProtected));
+        tests.Add(new TestCase("contract/user_cannot_delete_self_is_protected",
+            UserCannotDeleteSelfIsProtected));
         tests.Add(new TestCase("contract/auth_login_is_rate_limited", AuthLoginIsRateLimited));
         tests.Add(new TestCase("contract/auth_logout_revokes_session", AuthLogoutRevokesSession));
         tests.Add(new TestCase("contract/rate_limit_returns_429_with_the_shared_code", RateLimitReturns429));
@@ -2922,6 +2924,61 @@ internal static class ContractTests
             // 三条都被挡下：admin 仍在、仍启用、仍是管理员——约束不是「拒绝后又偷偷移除」。
             using var list = await ReadJsonAsync(t,
                 await host.Client.SendAsync(GetWith("/api/v1/users", Token), t.Ct));
+            var admin = list.RootElement.GetProperty("items").EnumerateArray()
+                .Single(u => u.GetProperty("id").GetString() == "admin");
+            t.Equal(true, admin.GetProperty("enabled").GetBoolean(), "admin is still enabled");
+            t.Equal("admin", admin.GetProperty("role").GetString(), "admin is still an administrator");
+        });
+    }
+
+    /// <summary>
+    /// 不能删除自己的账号：错误表 409 行的 <c>user.cannot_delete_self</c> 此前零断言。
+    ///
+    /// 这条和 <c>user.last_admin</c> 不同：它判的是**身份**（<c>principal.Id == id</c>），不是角色——
+    /// 静态 API Token 的身份是 api-token（不是任何用户），所以上一轮的 last_admin 用例恰好绕开了它。
+    /// 要真正落到这条，必须**以 admin 本人登录**、再拿自己的会话删自己。
+    ///
+    /// 会话登录后带 <c>MustChangePassword=true</c>，除改密/me/logout 外的路径都被
+    /// <c>auth.password_change_required</c> 挡住，所以先按现场首次开机流程改一次密，
+    /// 拿到干净会话再删——这也顺带证明了「改密后才能做管理操作」这条链路。
+    ///
+    /// 光断言「自删被拒」还不够：那可能只是「管理员不能删任何账号」。所以再删一个**别人**的账号，
+    /// 必须是 204——证明这道守卫只针对「删自己」，不是把所有删除都拦死。
+    /// </summary>
+    private static Task UserCannotDeleteSelfIsProtected(TestContext t)
+    {
+        return RunAsync(async () =>
+        {
+            await using var host = await Host.StartAsync(t);
+
+            // 先造一个「别人」的账号，稍后用它证明守卫是身份特定的。
+            var create = JsonSerializer.Serialize(new { id = "operator2", role = "operator" });
+            var created = await host.Client.SendAsync(PostWith("/api/v1/users", create, Token), t.Ct);
+            t.Equal(HttpStatusCode.OK, created.StatusCode, "a second account is created for the control case");
+
+            var initial = AdminInitialPassword(host);
+            var (token, _) = await LoginAsync(t, host, "admin", initial);
+
+            // 首次开机口令是临时口令：先改密，否则用户管理端点是 403 password_change_required。
+            var own = await ChangePasswordAsync(t, host, token, initial, "admin-password-2");
+
+            // 以自己的会话删自己：409 + user.cannot_delete_self（先于 last_admin 命中）。
+            var self = await host.Client.SendAsync(DeleteWith("/api/v1/users/admin", own), t.Ct);
+            t.Equal(HttpStatusCode.Conflict, self.StatusCode,
+                "deleting your own account is a 409, not a silent success");
+            using (var envelope = await ReadJsonAsync(t, self))
+                t.Equal("user.cannot_delete_self",
+                    envelope.RootElement.GetProperty("error").GetProperty("code").GetString(),
+                    "the code names the self-delete rule, not the last-admin rule");
+
+            // 同一个会话删「别人」：204——证明守卫只拦「删自己」。
+            var other = await host.Client.SendAsync(DeleteWith("/api/v1/users/operator2", own), t.Ct);
+            t.Equal(HttpStatusCode.NoContent, other.StatusCode,
+                "deleting a different account still works; the guard is identity-specific");
+
+            // 自删被拒后 admin 仍在、仍启用、仍是管理员。
+            using var list = await ReadJsonAsync(t,
+                await host.Client.SendAsync(GetWith("/api/v1/users", own), t.Ct));
             var admin = list.RootElement.GetProperty("items").EnumerateArray()
                 .Single(u => u.GetProperty("id").GetString() == "admin");
             t.Equal(true, admin.GetProperty("enabled").GetBoolean(), "admin is still enabled");

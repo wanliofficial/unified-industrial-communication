@@ -12,8 +12,22 @@ PRD 中 M 级的采集协议已全部落地，FR-CFG-01 的四类寻址模型也
 COV/分段/多属性读仍不做，见 [protocol-status.md](protocol-status.md) §4.1）。非 M 级验收里的 12 类故障注入同样全部有了
 可自动跑的用例（见 §7）。
 
-当前测试基线：**441 条**（带 `--opcua` 全量；本轮**新增 1 条**契约用例。全量实测数字以
-[testing.md](testing.md) 最新一轮为准）。本轮补上错误表 409 行里此前零断言的 `user.last_admin` ——
+当前测试基线：**442 条**（带 `--opcua` 全量；本轮**新增 1 条**契约用例。全量实测数字以
+[testing.md](testing.md) 最新一轮为准）。本轮补上错误表 409 行里此前零断言的 `user.cannot_delete_self` ——
+不能删除自己的账号。它和上一轮的 `user.last_admin` 不同：判的是**身份**（`principal.Id == id`），
+不是角色。静态 API Token 的身份是 `api-token`（不是任何用户），所以上一轮恰好绕开了它；要真正落到这条，
+`contract/user_cannot_delete_self_is_protected` 必须**以 admin 本人登录**（首次开机口令带
+`MustChangePassword=true`，除改密/me/logout 外的路径都被 `auth.password_change_required` 挡住，
+故先按现场流程改一次密拿到干净会话），再拿自己的会话删自己 → 409 + `user.cannot_delete_self`
+（该检查在 `Delete`/`last_admin` 之前命中）。光断言「自删被拒」不够——那可能只是「管理员不能删任何账号」，
+所以再删一个**别人**的账号（operator2）必须是 204，证明守卫只针对「删自己」；事后 admin 仍在、仍启用、
+仍是管理员。非空验证（TUnit 首断言即停，两轮独立扰动）：（1）把 `string.Equals(principal.Id, id, ...)`
+改成运行时恒假 →「the code names the self-delete rule, not the last-admin rule: expected
+<user.cannot_delete_self>, got <user.last_admin>」FAIL（证明自删检查生效且先于 last_admin）；
+（2）改成恒真（拦所有删除）→ 自删断言通过、正向对照「deleting a different account still works;
+the guard is identity-specific: expected <NoContent>, got <Conflict>」FAIL（证明身份特定性）。
+两轮各自恢复后源码与 HEAD 字节一致，用例 PASS（59.8 s）。
+上一轮（441 条、新增 1 条）补上错误表 409 行里此前零断言的 `user.last_admin` ——
 不允许把**最后一个启用的管理员**降级、停用或删除：`contract/user_last_admin_is_protected` 钉住
 `UserStore` 的三条抛点（`PUT {enabled:false}` 停用、`PUT {role:operator}` 降级、`DELETE` 删除），
 必须是 409 + `user.last_admin`，并断言事后 admin 仍启用、仍是管理员（证明约束不是「拒绝后又偷偷移除」）。
