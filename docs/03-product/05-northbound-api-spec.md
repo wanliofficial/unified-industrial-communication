@@ -356,28 +356,41 @@ X-Idempotency-Key: 0b6f...
 | GET | `/api/v1/config/diff?from=&to=` | 版本差异 |
 | POST | `/api/v1/config/rollback` | 回滚到指定版本 |
 | GET | `/api/v1/config/staged` | 灰度发布进度 |
-| POST | `/api/v1/config/staged` | 开始灰度发布（`{"batchSize":N,"config":{...}}`） |
-| POST | `/api/v1/config/staged/advance` | 下发下一批 |
+| POST | `/api/v1/config/staged` | 开始灰度发布（`{"batchSize":N,"observe":"30s","maxFailureRate":0.2,"config":{...}}`） |
+| POST | `/api/v1/config/staged/advance` | 下发下一批（观察窗口内被拒） |
 | POST | `/api/v1/config/staged/abort` | 终止灰度并回滚到灰度前版本 |
 
-**灰度发布**：`POST /api/v1/config/staged` 接收完整目标配置与每批设备数，按设备分批
+**灰度发布**：`POST /api/v1/config/staged` 接收完整目标配置与推进策略，按设备分批
 下发；每批只改动该批设备，其余设备保持当前生效配置（`reload` 按指纹只重建变化设备）。
-被删除的设备不属于任何批次，在最后一批之后一次性落地。响应体与 `GET /api/v1/config/staged`
-同构：
+被删除的设备不属于任何批次，在最后一批之后一次性落地。
+
+- `batchSize`：每批设备数（`<=0` 归一为 1）。
+- `observe`：每批下发后的观察窗口（如 `"30s"`）。窗口内 `advance` 返回
+  `409 config.staged_observing`，即使健康指标正常也不允许提前推进——观察窗口的意义
+  是「给问题留出暴露时间」，不是「等到不健康才停」。
+- `maxFailureRate`：观察窗口结束时**已下发设备**的采集失败率上限（0~1）。超阈值时
+  `advance` 返回 `409 config.staged_auto_aborted`，并自动回滚到 `baseVersion`。看门狗
+  每秒检查一次，因此即使没有人调用 `advance`，窗口结束时也会自动回滚（自动暂停的
+  强形式：暂停而不回滚会让坏配置继续跑，因此这里直接回滚）。
+
+响应体与 `GET /api/v1/config/staged` 同构：
 
 ```json
 {
-  "active": true, "completed": false,
+  "active": true, "completed": false, "aborted": false,
   "baseVersion": "sha256:...", "targetVersion": "sha256:...",
   "totalBatches": 3, "nextBatch": 1,
   "batches": [["dev-01","dev-02"], ["dev-03"], ["dev-04"]],
   "devices": ["dev-01","dev-02","dev-03","dev-04"],
+  "observing": true, "observe": "30s", "observeUntil": "2026-11-24T10:00:30Z",
+  "failureRate": 0.01, "maxFailureRate": 0.2, "pausedReason": "",
   "startedAt": "...", "updatedAt": "..."
 }
 ```
 
 同一时刻只允许一个灰度（重复开始返回 `config.staged_in_progress`）；`advance` 逐批推进，
 末批后自动收敛到目标并置 `completed=true`；`abort` 回滚到 `baseVersion`。
+自动回滚后 `aborted=true` 且 `pausedReason` 说明原因。
 
 **应用配置的响应**：
 
