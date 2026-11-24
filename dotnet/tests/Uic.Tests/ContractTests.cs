@@ -59,6 +59,7 @@ internal static class ContractTests
         tests.Add(new TestCase("contract/drivers_expose_capability_states", DriversExposeCapabilityStates));
         tests.Add(new TestCase("contract/unknown_device_returns_error_envelope", UnknownDeviceReturnsEnvelope));
         tests.Add(new TestCase("contract/unknown_point_returns_error_envelope", UnknownPointReturnsErrorEnvelope));
+        tests.Add(new TestCase("contract/unknown_user_returns_error_envelope", UnknownUserReturnsErrorEnvelope));
         tests.Add(new TestCase("contract/config_is_redacted", ConfigIsRedacted));
         tests.Add(new TestCase("contract/config_validate_reports_problems", ConfigValidateReportsProblems));
         tests.Add(new TestCase("contract/malformed_legacy_field_is_not_a_server_fault", MalformedLegacyFieldIsNotAServerFault));
@@ -1166,6 +1167,28 @@ internal static class ContractTests
 
             t.Equal("point.not_found", error.GetProperty("code").GetString(), "stable error code");
             t.Contains(error.GetProperty("message").GetString() ?? string.Empty, "nope", "message names the point");
+        });
+    }
+
+    private static Task UnknownUserReturnsErrorEnvelope(TestContext t)
+    {
+        return RunAsync(async () =>
+        {
+            await using var host = await Host.StartAsync(t);
+
+            // 改一个不存在的账号：表里明列 user.not_found 这个 404 码，但此前用户端点只测过
+            // 创建/更新/删除「存在」的账号（auth_users_require_manage），这里 Find(id) 返回 null
+            // 的抛点无人断言。它和「密码错」401、「权限不足」403 是三件不同的事——管理员看到的
+            // code 要能直接告诉他「这个账号根本不存在」，而不是去查权限或重试口令。
+            var response = await host.Client.SendAsync(
+                PutWith("/api/v1/users/nope", """{"enabled":false}""", Token), t.Ct);
+            t.Equal(HttpStatusCode.NotFound, response.StatusCode, "unknown user is a 404");
+
+            using var envelope = await ReadJsonAsync(t, response);
+            var error = envelope.RootElement.GetProperty("error");
+
+            t.Equal("user.not_found", error.GetProperty("code").GetString(), "stable error code");
+            t.Contains(error.GetProperty("message").GetString() ?? string.Empty, "nope", "message names the user");
         });
     }
 
