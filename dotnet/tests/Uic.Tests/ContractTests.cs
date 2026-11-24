@@ -58,6 +58,7 @@ internal static class ContractTests
         tests.Add(new TestCase("contract/disabled_device_shows_both_states", DisabledDeviceShowsBothStates));
         tests.Add(new TestCase("contract/drivers_expose_capability_states", DriversExposeCapabilityStates));
         tests.Add(new TestCase("contract/unknown_device_returns_error_envelope", UnknownDeviceReturnsEnvelope));
+        tests.Add(new TestCase("contract/unknown_point_returns_error_envelope", UnknownPointReturnsErrorEnvelope));
         tests.Add(new TestCase("contract/config_is_redacted", ConfigIsRedacted));
         tests.Add(new TestCase("contract/config_validate_reports_problems", ConfigValidateReportsProblems));
         tests.Add(new TestCase("contract/malformed_legacy_field_is_not_a_server_fault", MalformedLegacyFieldIsNotAServerFault));
@@ -1144,6 +1145,27 @@ internal static class ContractTests
             // 错误信封是跨语言的契约：code 稳定、message 可读、requestId 可追踪。
             t.Equal("device.not_found", error.GetProperty("code").GetString(), "stable error code");
             t.Contains(error.GetProperty("message").GetString() ?? string.Empty, "nope", "message names the device");
+        });
+    }
+
+    private static Task UnknownPointReturnsErrorEnvelope(TestContext t)
+    {
+        return RunAsync(async () =>
+        {
+            await using var host = await Host.StartAsync(t);
+
+            // 设备存在、点位不存在：和「设备本身不存在」是两件事，运维要从 code 一眼分清
+            // 是「点ID 写错了」还是「整台设备没注册」。这条 404（point.not_found）在错误表里有据，
+            // 但此前只有 device.not_found 被测；FindPoint 抛的 point 分支无人断言，删掉它或挪走
+            // 都会让未知点位冒成 500。默认 Host 配置的设备 v1 只有 temp/flag 两个点。
+            var response = await host.Client.SendAsync(Get("/api/v1/points/v1/nope"), t.Ct);
+            t.Equal(HttpStatusCode.NotFound, response.StatusCode, "unknown point is a 404");
+
+            using var envelope = await ReadJsonAsync(t, response);
+            var error = envelope.RootElement.GetProperty("error");
+
+            t.Equal("point.not_found", error.GetProperty("code").GetString(), "stable error code");
+            t.Contains(error.GetProperty("message").GetString() ?? string.Empty, "nope", "message names the point");
         });
     }
 

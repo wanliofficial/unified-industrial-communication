@@ -12,8 +12,15 @@ PRD 中 M 级的采集协议已全部落地，FR-CFG-01 的四类寻址模型也
 COV/分段/多属性读仍不做，见 [protocol-status.md](protocol-status.md) §4.1）。非 M 级验收里的 12 类故障注入同样全部有了
 可自动跑的用例（见 §7）。
 
-当前测试基线：**434 条**（带 `--opcua` 全量；本轮是**加强既有用例**、不新增用例，条数不变。全量实测数字以
-[testing.md](testing.md) 最新一轮为准）。本轮把南向驱动点位字段（`PointFields`）声明的覆盖补全：
+当前测试基线：**435 条**（带 `--opcua` 全量；本轮**新增 1 条**契约用例。全量实测数字以
+[testing.md](testing.md) 最新一轮为准）。本轮补上北向「单点位读不存在的点位」的 404 错误分类：
+`contract/unknown_point_returns_error_envelope`——`GET /api/v1/points/{device}/{point}` 在设备存在、
+点位不存在时返回 404 + `point.not_found`。错误表（northbound-api.md）明列此码，但此前只有设备级的
+`device.not_found` 被测，点位级的 `FindPoint` 抛点分支无人断言。它和「设备本身不存在」是运维必须分清的
+两件事——前者是点ID 写错，后者是整台设备没注册；删掉这个抛点或挪成 500，没有用例会发现。非空验证：把
+`FindPoint` 里 `point.not_found` 的抛点临时改成 `device.not_found` → 重建后该用例在「stable error code:
+expected <point.not_found>, got <device.not_found>」精确 FAIL；恢复后源码与 HEAD 字节一致、用例 PASS（13.5 s）。
+上一轮（434 条、加强既有用例不增条）把南向驱动点位字段（`PointFields`）声明的覆盖补全：
 `drivers_expose_capability_states` 此前只钉住 MQTT 的 `address.path`（required），而 `address.property`
 （取值字段）的**声明本身**从未被断言——它的**行为**由 `mqtt/DriverUsesPointFieldOverride` 证明（点级覆盖
 设备级 `payloadField` 生效），但「声明存在、且标成可选」没人钉。这条声明与 `address.path` 一样由前端按
