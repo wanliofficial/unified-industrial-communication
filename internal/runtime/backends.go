@@ -12,6 +12,7 @@ import (
 
 	"uic/internal/alarm"
 	"uic/internal/config"
+	"uic/internal/driver"
 	"uic/internal/northbound/httpapi"
 )
 
@@ -282,14 +283,11 @@ func pathOrRoot(p string) string {
 	return p
 }
 
+// isSecretKey 判断一个配置字段名是否看起来像凭据。委托给 driver.LooksSecret，
+// 它是脱敏与一致性套件共用的单一事实源（覆盖 community/privatekey 等不
+// 含 password/token 字样的凭据名）。
 func isSecretKey(k string) bool {
-	k = strings.ToLower(k)
-	for _, s := range []string{"password", "token", "secret", "apikey", "api_key", "credential"} {
-		if strings.Contains(k, s) {
-			return true
-		}
-	}
-	return false
+	return driver.LooksSecret(k)
 }
 
 // ---------------------------------------------------------------------------

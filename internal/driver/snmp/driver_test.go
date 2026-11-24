@@ -171,14 +171,19 @@ func TestMeta(t *testing.T) {
 	if m.Capabilities.Discovery != driver.CapUnsupported || m.Capabilities.BitAccess != driver.CapUnsupported {
 		t.Fatalf("discovery/bit access must stay unsupported: %+v", m.Capabilities)
 	}
-	// 社区名必须作为凭据字段暴露给前端（Type=password），否则界面会把
-	// 只读口令当普通文本显示。
+	// 社区名必须作为凭据字段暴露给前端（Secret=true），否则界面会把只读
+	// 口令当普通文本显示、GET /config 也不会遮罩。凭据的权威声明是 Secret
+	// 而不是 Type——Type 只有 string/int/float/bool/enum/duration 六种，
+	// 用 "password" 这种未声明的类型会让配置表单渲染不出来。
 	found := false
 	for _, f := range m.ConfigFields {
 		if f.Name == "labels.community" {
 			found = true
-			if f.Type != "password" {
-				t.Fatalf("community field type = %q, want password", f.Type)
+			if !f.Secret {
+				t.Fatalf("community field Secret = false，want true（团体名是只读口令）")
+			}
+			if f.Type != "string" {
+				t.Fatalf("community field type = %q, want string（类型集合里没有 password）", f.Type)
 			}
 		}
 	}
@@ -220,7 +225,7 @@ func TestMetaExposesV3Config(t *testing.T) {
 	}
 
 	// v3 的五个安全参数（+ 可选 engineID）必须作为 ConfigField 暴露，且
-	// 口令字段必须是 password 类型（否则界面把认证口令当明文显示）。
+	// 口令字段必须标 Secret（否则界面把认证口令当明文显示、GET /config 不遮罩）。
 	required := []string{
 		"labels.username", "labels.authProtocol", "labels.authPassword",
 		"labels.privProtocol", "labels.privPassword", "labels.engineID",
@@ -236,8 +241,8 @@ func TestMetaExposesV3Config(t *testing.T) {
 		}
 	}
 	for _, name := range []string{"labels.authPassword", "labels.privPassword"} {
-		if f := byName[name]; f.Type != "password" {
-			t.Errorf("%s Type = %q，应为 password（凭据不能明文展示）", name, f.Type)
+		if f := byName[name]; !f.Secret {
+			t.Errorf("%s Secret = false，应为 true（凭据不能明文展示）", name)
 		}
 	}
 }

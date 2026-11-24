@@ -94,6 +94,34 @@ func (m Meta) Accepts(k model.AddressKind) bool {
 	return false
 }
 
+// secretNameFragments 是「字段名看起来像凭据」的片段（小写匹配）。这是
+// 名字启发式的单一事实源：驱动元数据 ConfigField.Secret 声明之外，凡是名字
+// 命中这些片段的字段也按凭据对待——脱敏要遮罩它，一致性套件要检查它有没有
+// 声明 Secret。命名惯例不一致的驱动（例如用 "community" 表示 SNMP 团体名）
+// 不需要逐个改代码，只要把片段加进这里即可，一处生效全链路。
+var secretNameFragments = []string{
+	"password", "passwd", "pwd",
+	"token", "secret", "apikey", "api_key",
+	"credential", "community", "privatekey", "private_key",
+}
+
+// LooksSecret 判断一个配置字段名（或其任意路径段）是否从名字上看起来像凭据。
+// 这是脱敏与一致性套件共用的启发式：ConfigField.Secret 是权威声明，本函数
+// 兜住「驱动忘了标 Secret 但名字显然敏感」的情况（SNMP 的 community 就是
+// 这类：驱动没标，名字也看不出密码字样，但它是实打实的只读口令）。
+func LooksSecret(name string) bool {
+	// 字段名是点路径，如 "labels.community"；任一段命中都算。
+	for _, part := range strings.Split(name, ".") {
+		k := strings.ToLower(part)
+		for _, frag := range secretNameFragments {
+			if strings.Contains(k, frag) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // OpenConfig 是驱动实例化所需的全部输入。驱动不得读取全局配置。
 type OpenConfig struct {
 	Channel model.Channel

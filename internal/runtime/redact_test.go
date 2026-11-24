@@ -188,3 +188,80 @@ func TestConfigApplyWithoutPlaceholderStillWorks(t *testing.T) {
 		t.Fatalf("apply = %d %s", code, body)
 	}
 }
+
+// TestRedactJSONMasksSNMPCredentials 钉住「凭据声明的单一事实源」。
+//
+// SNMP 的 labels.community/authPassword/privPassword 都是实打实的口令，但
+// 它们不含 password/token 字样（community 尤其如此）。脱敏若只按字段名子串
+// 猜，团体名会在 GET /api/v1/config 里明文回显——这是真实发生过的泄漏形态。
+// 这里用 redactJSON 直接验证：社区名与两个 v3 口令都必须变成 ***，
+// 而 labels.version / labels.username 这类非凭据字段必须原样保留。
+func TestRedactJSONMasksSNMPCredentials(t *testing.T) {
+	raw := []byte(`{
+	  "channels": [{"id": "ch-snmp", "protocol": "snmp"}],
+	  "devices": [{
+	    "id": "switch01",
+	    "labels": {
+	      "community": "public-secret",
+	      "authPassword": "auth-secret",
+	      "privPassword": "priv-secret",
+	      "version": "3",
+	      "username": "uic-ops"
+	    }
+	  }]
+	}`)
+	out, err := redactJSON(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := string(out)
+	for _, leak := range []string{"public-secret", "auth-secret", "priv-secret"} {
+		if strings.Contains(s, leak) {
+			t.Fatalf("凭据 %q 未脱敏：\n%s", leak, s)
+		}
+	}
+	// 非凭据字段必须保留，否则运维看不清自己配的是什么。
+	for _, keep := range []string{`"community": "***"`, `"authPassword": "***"`, `"privPassword": "***"`,
+		`"username": "uic-ops"`} {
+		if !strings.Contains(s, keep) {
+			t.Fatalf("期望保留 %s，实得：\n%s", keep, s)
+		}
+	}
+}
+
+// TestResolvePlaceholdersRestoresCommunity 验证往返：脱敏后的 *** 在原路径
+// 上被还原成当前值。社区名与 v3 口令都必须能「GET 后原样写回」而不丢。
+func TestResolvePlaceholdersRestoresCommunity(t *testing.T) {
+	cur := map[string]any{
+		"devices": []any{map[string]any{
+			"id": "switch01",
+			"labels": map[string]any{
+				"community":    "public-secret",
+				"authPassword": "auth-secret",
+				"privPassword": "priv-secret",
+			},
+		}},
+	}
+	sub := map[string]any{
+		"devices": []any{map[string]any{
+			"id": "switch01",
+			"labels": map[string]any{
+				"community":    "***",
+				"authPassword": "***",
+				"privPassword": "***",
+			},
+		}},
+	}
+	got, err := resolvePlaceholders(sub, cur, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	g := got.(map[string]any)["devices"].([]any)[0].(map[string]any)["labels"].(map[string]any)
+	for key, want := range map[string]string{
+		"community": "public-secret", "authPassword": "auth-secret", "privPassword": "priv-secret",
+	} {
+		if g[key] != want {
+			t.Fatalf("%s = %v，want %q", key, g[key], want)
+		}
+	}
+}

@@ -245,3 +245,31 @@ func TestPartialReadError(t *testing.T) {
 		t.Fatalf("没有错误时返回 nil，得到 %v", got)
 	}
 }
+
+// TestLooksSecret 钉住「名字看起来像凭据」的启发式。它是脱敏与一致性套件
+// 共用的单一事实源：漏掉一种写法，该字段就会在 GET /config 里明文回显。
+func TestLooksSecret(t *testing.T) {
+	secret := []string{
+		"password", "Password", "db.password", "labels.authPassword",
+		"passwd", "pwd", "token", "accessToken", "secret", "clientSecret",
+		"apikey", "api_key", "credential", "credentialId",
+		// community 是 SNMP 团体名——名字里没有 password/token，但它是
+		// 实打实的只读口令。这条用例防止有人把 community 从片段表里删掉。
+		"community", "labels.community", "snmp.community",
+		"privateKey", "private_key",
+	}
+	for _, name := range secret {
+		if !LooksSecret(name) {
+			t.Errorf("LooksSecret(%q) = false，want true", name)
+		}
+	}
+	plain := []string{
+		"", "timeout", "unitId", "transport.address", "address.offset",
+		"dataType", "interval", "concurrency", "labels.version", "labels.username",
+	}
+	for _, name := range plain {
+		if LooksSecret(name) {
+			t.Errorf("LooksSecret(%q) = true，want false（普通字段被误当凭据会导致无法查看配置）", name)
+		}
+	}
+}
