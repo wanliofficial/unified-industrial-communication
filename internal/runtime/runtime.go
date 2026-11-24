@@ -592,6 +592,8 @@ func (r *Runtime) watchdog(ctx context.Context) {
 			return
 		case now := <-t.C:
 			r.markStale(now)
+			// 灰度观察窗口结束后的健康判定：没人来推进时也要能自动回滚。
+			r.checkStagedHealth(ctx, now)
 		}
 	}
 }

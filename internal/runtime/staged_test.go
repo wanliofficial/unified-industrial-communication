@@ -6,9 +6,12 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"sync"
 	"testing"
+	"time"
 
 	"uic/internal/config"
+	"uic/internal/model"
 	"uic/internal/northbound/httpapi"
 )
 
@@ -122,7 +125,7 @@ func TestStagedRolloutConvergesToTarget(t *testing.T) {
 		"sim03", // 删除项：不属于任何批次，最后一批之后落地
 	)
 
-	st, err := h.rt.BeginStaged(ctx, target, "test", 1)
+	st, err := h.rt.BeginStaged(ctx, target, "test", httpapi.StagedPolicy{BatchSize: 1})
 	if err != nil {
 		t.Fatalf("BeginStaged: %v", err)
 	}
@@ -180,7 +183,7 @@ func TestStagedAbortRollsBackToBase(t *testing.T) {
 		"sim02": "sim02-staged",
 	})
 
-	st, err := h.rt.BeginStaged(ctx, target, "test", 1)
+	st, err := h.rt.BeginStaged(ctx, target, "test", httpapi.StagedPolicy{BatchSize: 1})
 	if err != nil {
 		t.Fatalf("BeginStaged: %v", err)
 	}
@@ -209,7 +212,7 @@ func TestStagedAbortRollsBackToBase(t *testing.T) {
 	}
 
 	// 回滚后必须能开始新的灰度（状态已释放）。
-	if _, err := h.rt.BeginStaged(ctx, target, "test", 1); err != nil {
+	if _, err := h.rt.BeginStaged(ctx, target, "test", httpapi.StagedPolicy{BatchSize: 1}); err != nil {
 		t.Fatalf("回滚后 BeginStaged 失败：%v", err)
 	}
 }
@@ -221,10 +224,10 @@ func TestStagedBeginRejectsConcurrentRollout(t *testing.T) {
 	ctx := context.Background()
 
 	target, _ := targetWithRenames(t, h, map[string]string{"sim01": "a", "sim02": "b"})
-	if _, err := h.rt.BeginStaged(ctx, target, "test", 1); err != nil {
+	if _, err := h.rt.BeginStaged(ctx, target, "test", httpapi.StagedPolicy{BatchSize: 1}); err != nil {
 		t.Fatalf("首次 BeginStaged: %v", err)
 	}
-	_, err := h.rt.BeginStaged(ctx, target, "test", 1)
+	_, err := h.rt.BeginStaged(ctx, target, "test", httpapi.StagedPolicy{BatchSize: 1})
 	if err == nil {
 		t.Fatal("并发 BeginStaged 应被拒绝")
 	}
@@ -241,7 +244,7 @@ func TestStagedNoChangesCompletesImmediately(t *testing.T) {
 	baseVersion := h.rt.cfg.Version()
 
 	raw, _ := h.rt.Config() // 原样回传当前配置
-	st, err := h.rt.BeginStaged(ctx, raw, "test", 5)
+	st, err := h.rt.BeginStaged(ctx, raw, "test", httpapi.StagedPolicy{BatchSize: 5})
 	if err != nil {
 		t.Fatalf("BeginStaged: %v", err)
 	}
@@ -314,5 +317,171 @@ func TestStagedHTTPEndpoints(t *testing.T) {
 	code, _ = h.do(http.MethodPost, "/api/v1/config/staged/abort", "")
 	if code != 404 {
 		t.Fatalf("已完成灰度上 abort = %d，want 404", code)
+	}
+}
+
+// fakeClock 是可手动推进的测试时钟。起点设为「24 小时后」而不是过去：
+// 真实看门狗仍按 time.Now 判断，若假时钟在过去，它会先于测试把窗口判成
+// 已过期，导致用例与后台协程抢跑。
+type fakeClock struct {
+	mu sync.Mutex
+	t  time.Time
+}
+
+func newFakeClock() *fakeClock {
+	return &fakeClock{t: time.Now().Add(24 * time.Hour)}
+}
+
+func (c *fakeClock) Now() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.t
+}
+
+func (c *fakeClock) Advance(d time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.t = c.t.Add(d)
+}
+
+// injectStagedHooks 注入测试时钟与健康统计。走灰度锁是为了与看门狗并发读
+// 不产生数据竞争。
+func injectStagedHooks(h *harness, clock *fakeClock, health func(ids []string) (failed, total uint64)) {
+	h.rt.staged.mu.Lock()
+	defer h.rt.staged.mu.Unlock()
+	h.rt.staged.now = clock.Now
+	h.rt.staged.healthFn = health
+}
+
+// 观察窗口内拒绝推进；窗口结束后才允许下一批。这是「观察窗口」的核心语义。
+func TestStagedObserveWindowBlocksAdvance(t *testing.T) {
+	h := newHarness(t, addDevices(1))
+	ctx := context.Background()
+	clock := newFakeClock()
+	injectStagedHooks(h, clock, nil) // 健康统计用真实调度器；这里只看窗口
+
+	target, _ := targetWithRenames(t, h, map[string]string{"sim01": "a", "sim02": "b"})
+	st, err := h.rt.BeginStaged(ctx, target, "test", httpapi.StagedPolicy{
+		BatchSize: 1,
+		Observe:   model.Duration(30 * time.Second),
+	})
+	if err != nil {
+		t.Fatalf("BeginStaged: %v", err)
+	}
+	if st.ObserveUntil.IsZero() {
+		t.Fatal("首批后 ObserveUntil 不应为零")
+	}
+
+	// 窗口内推进：拒绝。
+	_, err = h.rt.AdvanceStaged(ctx, "test")
+	if err == nil {
+		t.Fatal("观察窗口内应拒绝推进")
+	}
+	var apiErr *httpapi.APIError
+	if !errors.As(err, &apiErr) || apiErr.Code != "config.staged_observing" {
+		t.Fatalf("错误码 = %v，want config.staged_observing", err)
+	}
+	if s := h.rt.StagedStatusOf(); !s.Observing || s.NextBatch != 1 {
+		t.Fatalf("窗口内状态 = %+v，want observing 且 nextBatch=1", s)
+	}
+
+	// 窗口结束：允许推进并完成。
+	clock.Advance(31 * time.Second)
+	st, err = h.rt.AdvanceStaged(ctx, "test")
+	if err != nil {
+		t.Fatalf("窗口结束后 AdvanceStaged: %v", err)
+	}
+	if st.Active || !st.Completed {
+		t.Fatalf("末批后状态 = %+v", st)
+	}
+}
+
+// 窗口结束时失败率超阈值：推进被拒 + 自动回滚到灰度前版本。
+func TestStagedAutoAbortOnUnhealthyBatch(t *testing.T) {
+	h := newHarness(t, addDevices(1))
+	ctx := context.Background()
+	baseVersion := h.rt.cfg.Version()
+	clock := newFakeClock()
+	injectStagedHooks(h, clock, func([]string) (uint64, uint64) { return 9, 10 }) // 90% 失败
+
+	target, _ := targetWithRenames(t, h, map[string]string{"sim01": "a", "sim02": "b"})
+	if _, err := h.rt.BeginStaged(ctx, target, "test", httpapi.StagedPolicy{
+		BatchSize:      1,
+		Observe:        model.Duration(10 * time.Second),
+		MaxFailureRate: 0.2,
+	}); err != nil {
+		t.Fatalf("BeginStaged: %v", err)
+	}
+
+	clock.Advance(11 * time.Second)
+	_, err := h.rt.AdvanceStaged(ctx, "test")
+	if err == nil {
+		t.Fatal("失败率超阈值时应自动回滚并拒绝推进")
+	}
+	var apiErr *httpapi.APIError
+	if !errors.As(err, &apiErr) || apiErr.Code != "config.staged_auto_aborted" {
+		t.Fatalf("错误码 = %v，want config.staged_auto_aborted", err)
+	}
+
+	if got := h.rt.cfg.Version(); got != baseVersion {
+		t.Fatalf("自动回滚后版本 = %s，want %s", got, baseVersion)
+	}
+	s := h.rt.StagedStatusOf()
+	if s.Active || !s.Aborted || s.PausedReason == "" {
+		t.Fatalf("自动回滚后状态 = %+v，want aborted 且有原因", s)
+	}
+	if names := deviceNames(t, h); names["sim01"] != "sim" {
+		t.Fatalf("自动回滚后 sim01 未恢复：%v", names)
+	}
+}
+
+// 健康达标时窗口结束应正常推进，不能误伤。
+func TestStagedHealthyBatchAdvances(t *testing.T) {
+	h := newHarness(t, addDevices(1))
+	ctx := context.Background()
+	clock := newFakeClock()
+	injectStagedHooks(h, clock, func([]string) (uint64, uint64) { return 1, 100 }) // 1% 失败
+
+	target, _ := targetWithRenames(t, h, map[string]string{"sim01": "a", "sim02": "b"})
+	if _, err := h.rt.BeginStaged(ctx, target, "test", httpapi.StagedPolicy{
+		BatchSize: 1, Observe: model.Duration(5 * time.Second), MaxFailureRate: 0.2,
+	}); err != nil {
+		t.Fatalf("BeginStaged: %v", err)
+	}
+	clock.Advance(6 * time.Second)
+	st, err := h.rt.AdvanceStaged(ctx, "test")
+	if err != nil {
+		t.Fatalf("健康批次应允许推进：%v", err)
+	}
+	if st.Active || !st.Completed {
+		t.Fatalf("末批后状态 = %+v", st)
+	}
+}
+
+// 看门狗路径：没人调用 advance 时，观察窗口结束 + 健康不达标也必须自动回滚。
+func TestStagedWatchdogAutoAborts(t *testing.T) {
+	h := newHarness(t, addDevices(1))
+	ctx := context.Background()
+	baseVersion := h.rt.cfg.Version()
+	clock := newFakeClock()
+	injectStagedHooks(h, clock, func([]string) (uint64, uint64) { return 50, 100 }) // 50% 失败
+
+	target, _ := targetWithRenames(t, h, map[string]string{"sim01": "a", "sim02": "b"})
+	if _, err := h.rt.BeginStaged(ctx, target, "test", httpapi.StagedPolicy{
+		BatchSize: 1, Observe: model.Duration(3 * time.Second), MaxFailureRate: 0.1,
+	}); err != nil {
+		t.Fatalf("BeginStaged: %v", err)
+	}
+
+	clock.Advance(4 * time.Second)
+	// 直接驱动看门狗的那一次检查（真实 ticker 用的是 time.Now，假时钟在未来）。
+	h.rt.checkStagedHealth(ctx, clock.Now())
+
+	if got := h.rt.cfg.Version(); got != baseVersion {
+		t.Fatalf("看门狗未回滚：版本 %s，want %s", got, baseVersion)
+	}
+	s := h.rt.StagedStatusOf()
+	if s.Active || !s.Aborted {
+		t.Fatalf("看门狗未标记终止：%+v", s)
 	}
 }

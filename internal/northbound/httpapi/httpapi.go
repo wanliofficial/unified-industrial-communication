@@ -256,11 +256,22 @@ func Errf(status int, code, format string, args ...any) *APIError {
 	return &APIError{Status: status, Code: code, Message: fmt.Sprintf(format, args...)}
 }
 
+// StagedPolicy 是灰度发布的推进策略。
+type StagedPolicy struct {
+	// BatchSize 是每批设备数；<=0 归一为 1。
+	BatchSize int `json:"batchSize,omitempty"`
+	// Observe 是每批下发后的观察窗口：窗口内拒绝推进下一批。
+	Observe model.Duration `json:"observe,omitempty"`
+	// MaxFailureRate 是观察窗口结束时「已下发设备」的采集失败率上限（0~1）。
+	// 超过则以 baseVersion 自动回滚并终止灰度；0 表示不做健康检查。
+	MaxFailureRate float64 `json:"maxFailureRate,omitempty"`
+}
+
 // StagedStatus 是灰度发布（staged rollout）的对外视图。
 //
 // 灰度把一次全量配置变更切成若干批设备逐批下发：每批只改动该批设备，其余
 // 设备保持当前生效配置。Active=false 且 Completed=true 表示已全部下发；
-// Abort 会把配置回滚到 BaseVersion。
+// Aborted=true 表示自动或人工回滚过（PausedReason 说明原因）。
 type StagedStatus struct {
 	Active        bool   `json:"active"`
 	TargetVersion string `json:"targetVersion"`
@@ -269,11 +280,20 @@ type StagedStatus struct {
 	// NextBatch 是下一批的序号；等于 TotalBatches 表示已下发完。
 	NextBatch int  `json:"nextBatch"`
 	Completed bool `json:"completed"`
+	Aborted   bool `json:"aborted"`
 	// Batches 是每批的设备 ID。Devices 是它的拍平结果（便于看整体影响面）。
-	Batches   [][]string `json:"batches"`
-	Devices   []string   `json:"devices"`
-	StartedAt time.Time  `json:"startedAt"`
-	UpdatedAt time.Time  `json:"updatedAt"`
+	Batches [][]string `json:"batches"`
+	Devices []string   `json:"devices"`
+	// Observing/ObserveUntil/FailureRate/MaxFailureRate 构成观察窗口与健康判定。
+	Observing      bool           `json:"observing"`
+	Observe        model.Duration `json:"observe,omitempty"`
+	ObserveUntil   time.Time      `json:"observeUntil,omitempty"`
+	FailureRate    float64        `json:"failureRate"`
+	MaxFailureRate float64        `json:"maxFailureRate,omitempty"`
+	// PausedReason 是自动回滚的原因（人工 abort 为空）。
+	PausedReason string    `json:"pausedReason,omitempty"`
+	StartedAt    time.Time `json:"startedAt"`
+	UpdatedAt    time.Time `json:"updatedAt"`
 }
 
 // Backend 是 runtime 需要实现的全部业务能力。
@@ -297,7 +317,7 @@ type Backend interface {
 	ConfigVersion(id string) (json.RawMessage, error)
 	ConfigDiff(from, to string) (config.Diff, error)
 	Rollback(ctx context.Context, version string) (config.ApplyResult, error)
-	BeginStaged(ctx context.Context, raw json.RawMessage, source string, batchSize int) (StagedStatus, error)
+	BeginStaged(ctx context.Context, raw json.RawMessage, source string, policy StagedPolicy) (StagedStatus, error)
 	AdvanceStaged(ctx context.Context, source string) (StagedStatus, error)
 	AbortStaged(ctx context.Context, source string) (config.ApplyResult, error)
 	StagedStatusOf() StagedStatus
@@ -1320,16 +1340,18 @@ func (s *Server) configStagedStatus(w http.ResponseWriter, _ *http.Request) erro
 	return nil
 }
 
-// configStagedBegin 开始一次灰度发布：请求体是完整的目标配置，外加 batchSize。
+// configStagedBegin 开始一次灰度发布：请求体是完整的目标配置与推进策略。
 //
 // 目标配置放在 `config` 字段下，避免与 batchSize 等控制字段混在同一层导致
 // 「配置里恰好有叫 batchSize 的键」时歧义。
 //
-//	{"batchSize": 10, "config": { ... 完整配置 ... }}
+//	{"batchSize": 10, "observe": "30s", "maxFailureRate": 0.2, "config": { ... }}
 func (s *Server) configStagedBegin(w http.ResponseWriter, r *http.Request) error {
 	var body struct {
-		BatchSize int             `json:"batchSize"`
-		Config    json.RawMessage `json:"config"`
+		BatchSize      int             `json:"batchSize"`
+		Observe        model.Duration  `json:"observe"`
+		MaxFailureRate float64         `json:"maxFailureRate"`
+		Config         json.RawMessage `json:"config"`
 	}
 	r.Body = http.MaxBytesReader(w, r.Body, s.opt.MaxBodyBytes)
 	dec := json.NewDecoder(r.Body)
@@ -1339,7 +1361,12 @@ func (s *Server) configStagedBegin(w http.ResponseWriter, r *http.Request) error
 	if len(body.Config) == 0 {
 		return Errf(http.StatusBadRequest, "request.invalid", "config is required")
 	}
-	st, err := s.be.BeginStaged(r.Context(), body.Config, "api", body.BatchSize)
+	policy := StagedPolicy{
+		BatchSize:      body.BatchSize,
+		Observe:        body.Observe,
+		MaxFailureRate: body.MaxFailureRate,
+	}
+	st, err := s.be.BeginStaged(r.Context(), body.Config, "api", policy)
 	if err != nil {
 		return err
 	}

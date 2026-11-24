@@ -42,7 +42,7 @@ type fakeBackend struct {
 	rollbackR config.ApplyResult
 
 	staged    StagedStatus
-	beginFn   func(ctx context.Context, raw json.RawMessage, source string, batchSize int) (StagedStatus, error)
+	beginFn   func(ctx context.Context, raw json.RawMessage, source string, policy StagedPolicy) (StagedStatus, error)
 	advanceFn func(ctx context.Context, source string) (StagedStatus, error)
 	abortFn   func(ctx context.Context, source string) (config.ApplyResult, error)
 
@@ -148,9 +148,9 @@ func (f *fakeBackend) Rollback(_ context.Context, version string) (config.ApplyR
 	return f.rollbackR, nil
 }
 
-func (f *fakeBackend) BeginStaged(ctx context.Context, raw json.RawMessage, source string, batchSize int) (StagedStatus, error) {
+func (f *fakeBackend) BeginStaged(ctx context.Context, raw json.RawMessage, source string, policy StagedPolicy) (StagedStatus, error) {
 	if f.beginFn != nil {
-		return f.beginFn(ctx, raw, source, batchSize)
+		return f.beginFn(ctx, raw, source, policy)
 	}
 	return f.staged, nil
 }
