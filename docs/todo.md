@@ -33,11 +33,11 @@ Wave 0–2 的协议与核心治理域基本标记为"已落地"。未落地功�
 
 - **前端/组态**：Web 控制台 6 页（代码库无 `web`/`frontend`/`ui` 目录）
 - **协议**：OPC DA 桥接（独立 Windows 桥接进程，`:152`）
-- **架构**：进程外 gRPC 驱动、驱动市场（签名/版本/兼容性）、多实例协调（`:183`）
+- **架构**：进程外 gRPC 驱动、驱动市场（签名/版本/兼容性）、多实例协调（`:183`）。多实例协调中的**实例标识消歧**已落地（`internal/instanceid` 持久化稳定 `instanceId` 到 `<dataDir>/instance.id`；MQTT `clientId` / Sparkplug `nodeId` 默认值派生为 `uic-<site>-<短码>`，消除同站点多实例互相顶掉 Broker 会话的静默失效；暴露到 `GET /api/v1/version` 与诊断包 `manifest.json`）；跨实例 leader 选举/集中协调仍未落地
 - **集中管理**：中心聚合器——只读镜像、配置下发、批量升级、站点分组（`:184`）
 - **灰度发布**：分批下发、观察窗口、失败率超阈值自动回滚已落地（`POST /api/v1/config/staged` + `/advance` + `/abort`，看门狗兜底自动回滚）；「暂停但不回滚」的形态刻意不做（坏配置继续跑不如直接回滚）（`:185`）
 - **数据契约**：v2 双发过渡、Sparkplug B 的 DataSet/模板（`:186`，README 也声明 DataSet/模板不做）
 - **运维**：看门狗数据 stale 降级自愈已落地（`runtime.markStale`）；远程日志拉取已落地（`GET /api/v1/logs`，按 device/level/limit 过滤，此前是假阴性）、诊断包已落地（`GET /api/v1/diagnostics/bundle`）；离线升级包、进程级自愈看门狗、Wave 2 的网络诊断与远程配置下发（`:155`/`:187`）未落地
 - **国际化**：中/英双语、时区、单位制（`:188`，无 `i18n` 目录）
 - **合规交付**：SBOM 已落地（`make sbom`，CycloneDX，零依赖如实表达）、`make release` 三平台交叉编译验收已可执行（`Makefile`）；签名发布、等保对照表、CI 流水线待落地
-- **测试**：1000 设备负载测试已落地（`make load` / `cmd/loadgen`，真实 runtime 端到端，ADR C4/C5 NFR 断言见 `internal/loadtest`）；驱动一致性扩展已落地（`internal/driver/conformance` 共享套件 `Check`/`CheckRegistry`，`internal/runtime/conformance_test.go` 遍历注册表全量驱动）；凭据声明收敛到单一事实源（`driver.ConfigField.Secret` + `driver.LooksSecret` 名字兜底，脱敏与一致性套件同源；顺带修掉 SNMP 团体名明文回显）
+- **测试**：1000 设备负载测试已落地（`make load` / `cmd/loadgen`，真实 runtime 端到端，ADR C4/C5 NFR 断言见 `internal/loadtest`）；驱动一致性扩展已落地（`internal/driver/conformance` 共享套件 `Check`/`CheckRegistry`，`internal/runtime/conformance_test.go` 遍历注册表全量驱动）；凭据声明收敛到单一事实源（`driver.ConfigField.Secret` + `driver.LooksSecret` 名字兜底，脱敏与一致性套件同源；顺带修掉 SNMP 团体名明文回显）；实例标识消歧测试已落地（`internal/instanceid` 首次生成/重启复用/空文件重生/不同目录不同身份；`internal/runtime` 验证 `/version` 暴露、诊断包含 `instanceId`、MQTT clientID 与 Sparkplug nodeID 默认带实例短码且不覆盖用户显式配置，8 个变异体全部变红）

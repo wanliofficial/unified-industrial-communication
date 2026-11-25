@@ -244,6 +244,7 @@ type Gate struct {
 /var/lib/uic/
   ├── config.json           当前生效配置（原子写）
   ├── config.state.json     版本状态（current/desired/backup/rollbackCount）
+  ├── instance.id           本实例稳定身份（首次启动生成，重启复用）
   ├── snapshots/
   │     ├── v-<hash>.json   历史配置快照（保留 N 份）
   │     └── ...
@@ -254,6 +255,13 @@ type Gate struct {
   ├── history.db            SQLite：历史数据（Wave 2）
   └── uic.log               结构化日志（轮转）
 ```
+
+`instance.id` 是运行实例的**稳定身份**（形如 `inst-a1b2c3d4e5f6`），与配置无关：
+它是「部署事实」而不是「业务配置」，因此不进 `config.json`——否则会进入配置的
+规范化内容哈希（`Canonical` 序列化整个 `File`），换机器/换数据目录都会产生一个
+新配置版本，污染版本列表与回滚历史。它的用途见 `05-northbound-api-spec.md` §4.1
+（`/version` 的 `instanceId`）：同站点多实例部署时区分实例，并派生 MQTT `clientId` /
+Sparkplug `nodeId` 的默认值，使同站点多实例默认不会互相顶掉 Broker 会话。
 
 **四个写者分离的理由**：
 

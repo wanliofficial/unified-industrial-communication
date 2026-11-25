@@ -247,6 +247,35 @@ Authorization: Bearer <token>
 理由很直接：健康检查的消费者是告警系统与人。一条「说自己有病但说不出哪里疼」的
 响应，最终一定会变成没人看的一行绿字。
 
+**`/api/v1/version` 响应**：
+
+```json
+{
+  "version": "1.4.0",
+  "commit": "a1b2c3d",
+  "buildTime": "2026-11-20T08:00:00Z",
+  "goVersion": "go1.26.10",
+  "schemaVersion": 1,
+  "apiVersion": 1,
+  "instanceId": "inst-a1b2c3d4e5f6"
+}
+```
+
+`instanceId` 是**本实例的稳定身份**：首次启动时生成、持久化在数据目录
+（`<dataDir>/instance.id`），之后重启复用。它有两个用途：
+
+- **多实例消歧**：同站点跑两个实例（一台主机多容器、双机热备、灰度期新旧并存）
+  时，仅凭 `site` 无法区分「这是哪台」。`instanceId` 与 MQTT `clientId` /
+  Sparkplug `nodeId` 的**默认值同源**——默认派生为 `uic-<site>-<短码>`，使同站点
+  多实例默认不会连到同一 Broker 会话上互相顶掉（后到的把前一个踢下线，表现为
+  「数据莫名断流、日志里却无任何错误」）。
+- **运维识别**：诊断包 `manifest.json` 同样带 `instanceId`，一份诊断包可直接对应
+  到具体实例。
+
+它是「部署事实」而非「业务配置」，因此**不进配置文件**（否则会进入配置内容哈希，
+污染版本列表与回滚历史）。用户显式配置了 `clientId`/`nodeId` 时以其为准，实例
+短码只在默认值这一层兜底。
+
 ### 4.2 设备与点位
 
 | 方法 | 路径 | 说明 |
@@ -1253,10 +1282,10 @@ LWT；而 `$birth` 是 retained 的，不补一条 `online=false` 就会让消�
 |---|---|---|---|
 | `enabled` | 是 | `false` | 关闭时不创建 sink，也不写入 Outbox |
 | `broker` | 启用时必填 | — | `tcp://host:port` 或 `host:port`；`ssl://`/`tls://`/`ws://`/`wss://` 显式拒绝 |
-| `clientId` | 否 | `uic-{site}` | 同一 Broker 上多实例必须显式区分，否则会话互相顶掉 |
+| `clientId` | 否 | json：`uic-{site}-{实例短码}`；sparkplug-b：取 `nodeId` | 缺省带上实例身份短码，同站点多实例默认不冲突；显式配置时以其为准 |
 | `format` | 否 | `json` | `json` 或 `sparkplug-b`；见 §6.6 |
 | `groupId` | 否 | `site` | 仅 `sparkplug-b`；不得含 `/`、`+`、`#` |
-| `nodeId` | 否 | `uic-{site}` | 仅 `sparkplug-b`；规则同上 |
+| `nodeId` | 否 | `uic-{site}-{实例短码}` | 仅 `sparkplug-b`；缺省带上实例短码；规则同上 |
 | `topic` | 否 | `uic/{site}/{device}/{point}/value` | 必须含 `{device}` 与 `{point}`；`sparkplug-b` 下必须留空 |
 | `qos` | 否 | `1` | 仅 0/1；写 2 直接报错；`sparkplug-b` 下必须省略（QoS 由消息类型定死） |
 | `retain` | 否 | `false` | 只作用于 `value`；`$state`/`$birth`/`$death` 恒为 retained；`sparkplug-b` 下必须为 false |
