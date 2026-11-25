@@ -227,11 +227,72 @@ Authorization: Bearer <token>
   "devices": { "total": 18, "collecting": 16, "degraded": 1, "faulted": 1 },
   "points":  { "total": 1200, "good": 1180, "stale": 12, "bad": 8 },
   "outbox":  { "pending": 42, "droppedLastHour": 0 },
+  "scheduler": { "verdict": "healthy", "ageMs": 37, "stallAfterMs": 15000 },
   "problems": [
     { "device": "plc-07", "state": "faulted", "reason": "timeout", "since": "2026-11-04T07:10:00Z" }
   ]
 }
 ```
+
+#### `scheduler` 块：采集中枢活性
+
+`/healthz` 只回答「HTTP 层还在不在」。它无法回答另一个更难、也更致命的问题：
+**进程活着、端口通、`/healthz` 200，但采集调度是不是已经停摆了？**
+
+调度器是单协程 tick 循环（默认 50ms）。一旦它因死锁或长时间阻塞而不再 tick，
+所有设备都不再被调度，但：设备运行态仍是 `collecting`（没有新的失败能触发迁移）、
+点位在 `stale` 判定的 3 个周期内仍显示好值、HTTP 层照常响应。对外表现为「一台
+完全健康的网关，实际上一帧数据都没有」。这是最难被外部 supervisor 发现的静默失效。
+
+因此 `/api/v1/health` 增加 `scheduler` 块，由**最近一次 tick 距今的时间**判定：
+
+| `verdict` | 含义 | 判据 |
+|---|---|---|
+| `healthy` | 中枢在转 | `ageMs <= stallAfterMs` |
+| `stalled` | 中枢停摆 | `ageMs > stallAfterMs`（严格大于） |
+| `unknown` | 无法判定 | 调度器尚未 tick（刚启动） |
+
+- `stallAfterMs` 默认 15000（15s）。调度器每秒 tick 二十次，15s 给了偶发长阻塞
+  （如大配置热更新的短暂停顿）足够余量，又远小于人工巡检周期。
+- `unknown` 不等于 `stalled`：刚启动的一瞬间不能误报卡死。
+- `verdict=stalled` 时 `status` 被置为 `stalled`（**优先级最高**，压过
+  `degraded`/`empty`），并追加一条 `state: "stalled"` 的 `problems` 条目——避免
+  被设备态的「看似正常」掩盖。
+- 该信号同时写入指标 `uic_scheduler_stalled_total`（边沿触发，一次卡死只记一次）、
+  `uic_scheduler_tick_age_seconds`（gauge，可做趋势告警），并写 `scheduler_stalled`
+  / `scheduler_recovered` 日志。
+
+`/healthz` 与 `/readyz` 的既有契约不变：`/healthz` 仍无条件 200（存活探针不应因
+业务卡死而重启进程），`/readyz` 仍只检查配置/存储/驱动。卡死信号只经
+`/api/v1/health`、指标、日志与心跳文件对外。
+
+#### 心跳文件：给不访问 HTTP 的 supervisor
+
+`/healthz` 需要能访问 HTTP 端口。断网现场、老式监控脚本、裸机 cron 往往不能。
+因此运行时把同一份存活性快照原子写入 `<dataDir>/heartbeat.json`（默认每 5s）：
+
+```json
+{
+  "ts": 1793500800,
+  "tsMs": 1793500800123,
+  "tsAt": "2026-11-26T12:00:00.123Z",
+  "pid": 4242,
+  "instanceId": "inst-a1b2c3d4e5f6",
+  "version": "1.4.0",
+  "uptimeSeconds": 86400,
+  "scheduler": { "verdict": "healthy", "ageMs": 37, "stallAfterMs": 15000 },
+  "devices": { "total": 18, "collecting": 16, "degraded": 1, "faulted": 1, "disabled": 0 }
+}
+```
+
+读法：`tsMs` 长时间不前进 ⟹ 进程疑似挂了；`tsMs` 在前进但 `scheduler.verdict`
+为 `stalled` ⟹ 进程活着但采集中枢卡死。两者必须分开判断——这正是单靠「进程在不在」
+无法覆盖的场景。
+
+- 写入是 tmp + rename 的原子替换，读方不会读到写了一半的 JSON。
+- 启动即写首份，不必等一个完整间隔。
+- `ts`（秒）在亚秒级间隔下会重复，故另给 `tsMs`（毫秒）供新鲜度判断。
+- 写入失败只记一次告警、不影响进程寿命：心跳是观测手段，不是业务前提。
 
 **不变量：`status != "ok"` ⟹ `problems` 非空。**
 

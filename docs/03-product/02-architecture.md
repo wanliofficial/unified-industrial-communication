@@ -362,9 +362,27 @@ uic_<subsystem>_<name>{<labels>}
 
 | 端点 | 语义 | 失败含义 |
 |---|---|---|
-| `/healthz` | 进程存活 | 进程应被重启 |
+| `/healthz` | 进程存活（无条件 200，不检查依赖） | 进程应被重启 |
 | `/readyz` | 依赖就绪（配置已加载、存储可写、至少一个驱动可用） | 不应接收流量 |
-| `/api/v1/health` | 业务聚合（每设备状态、成功率、队列水位） | 需要人看 |
+| `/api/v1/health` | 业务聚合（每设备状态、成功率、队列水位、采集中枢活性） | 需要人看 |
+
+**采集中枢活性与进程级看门狗**。上面三个端点回答的都是「进程/依赖/设备」层面的
+状态，缺一条：**进程活着、端口通、设备态还显示 collecting，但调度器 tick 已经
+停摆**——此时一帧数据都不会再产生，而所有被动查询看起来都正常。这是最典型的
+静默失效，必须主动检测：
+
+- `internal/scheduler` 每次 tick 记录时间戳，`LastTick()` 暴露给运行时；
+- `internal/watchdog` 是**纯判定**（无协程、无 I/O）：给定「最近一次 tick」与阈值，
+  返回 `healthy` / `stalled` / `unknown`（尚未 tick）。默认阈值 15s（约 300 个 tick）。
+- 运行时看门狗每秒主动判定一次（不是等别人来查），卡死时置 `status="stalled"`、
+  追加 `state="stalled"` problem、记 `uic_scheduler_stalled_total`（边沿触发，一次
+  故障只记一次）与 `uic_scheduler_tick_age_seconds`，并写日志。
+- 进程还周期性原子写 `<dataDir>/heartbeat.json`（`internal/heartbeat`），让不能访问
+  HTTP 的 supervisor（裸机 cron、断网现场、老式脚本）凭「`tsMs` 是否前进」与
+  「`scheduler.verdict` 是否为 `stalled`」区分「进程死了」与「活着但卡死」。
+- `/healthz` 与 `/readyz` 的契约刻意**不变**：存活探针不应因业务卡死而重启进程
+  （重启会丢缓存与在飞写），就绪探针也不该把「卡死」当「未就绪」——否则 k8s 会把
+  Pod 摘出流量，外部就再也看不到卡死信号。
 
 ---
 

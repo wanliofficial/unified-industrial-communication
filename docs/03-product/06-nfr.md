@@ -154,7 +154,9 @@
 | 日志级别 | `debug/info/warn/error`；可按设备动态调整 |
 | 日志轮转 | 单文件 100 MB，保留 5 份 |
 | 追踪 | Wave 3（OpenTelemetry，可选） |
-| 健康 | 三级（live/ready/business） |
+| 健康 | 三级（live/ready/business）；business 级含采集中枢活性 `scheduler.verdict`（healthy/stalled/unknown）与 `status="stalled"` |
+| 看门狗 | 主动检测调度器 tick 停摆（默认 15s 无 tick 判 stalled），边沿触发记 `uic_scheduler_stalled_total` 并写日志；`/healthz` 与 `/readyz` 契约不变 |
+| 心跳文件 | `<dataDir>/heartbeat.json` 原子写（tmp+rename），含 `tsMs` 与 `scheduler.verdict`，供不访问 HTTP 的 supervisor 区分「进程死」与「活着但卡死」 |
 | 诊断 | 一键诊断包 |
 
 **指标预算**：单实例序列数 ≤ 20,000（1000 设备 × 20 序列），避免 Prometheus 基数爆炸。高基数标签（点位 ID、报警 ID 等**路径参数**）**禁止**作为指标标签，只进日志。HTTP 层在 `metricPath` 把路径归一化成占位符（`/api/v1/points/:device/:point`、`/api/v1/alarms/:id`…）；归一化必须覆盖**每一类前缀下的任意子路径，包括返回 404 的那一段**——否则不存在的 URL 就成了绕过归一化的缺口，反复请求不同 id 即可把序列数撑爆。
