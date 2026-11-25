@@ -52,6 +52,13 @@ type fakeBackend struct {
 
 	bundle []byte
 
+	// probeReport 是 Probe 固定返回的响应（probeErr 非 nil 时返回该错误）。
+	probeReport ProbeReport
+	probeErr    error
+
+	// probeQuery 记录最近一次调用入参，供路由/handler 测试断言。
+	probeQuery ProbeQuery
+
 	auditLog []audit.Record
 	auditOff bool
 
@@ -274,6 +281,14 @@ func (f *fakeBackend) HistoryStats() (history.Stats, bool) {
 
 func (f *fakeBackend) DiagnosticsBundle(ctx context.Context) ([]byte, error) {
 	return f.bundle, nil
+}
+
+func (f *fakeBackend) Probe(ctx context.Context, q ProbeQuery) (ProbeReport, error) {
+	f.probeQuery = q
+	if f.probeErr != nil {
+		return ProbeReport{}, f.probeErr
+	}
+	return f.probeReport, nil
 }
 
 func (f *fakeBackend) AuditQuery(fl audit.Filter) (audit.Result, error) {
@@ -1308,4 +1323,80 @@ func TestHealthSerializesHistory(t *testing.T) {
 	if !strings.Contains(rec.Body.String(), `"history":{"enabled":false}`) {
 		t.Fatalf("body = %s", rec.Body.String())
 	}
+}
+
+// ---------------------------------------------------------------------------
+// 网络探测
+// ---------------------------------------------------------------------------
+
+// TestProbeHandlerChannelParsing：channel/device 参数支持重复与逗号分隔，去空
+// 去重，保持出现顺序；timeout 越界夹取到 [100ms,10s]。通过 fakeBackend 记录的
+// 入参断言解析结果，与 runtime 真实实现解耦。
+func TestProbeHandlerChannelParsing(t *testing.T) {
+	s, be := newServer(t, Options{})
+
+	cases := []struct {
+		name     string
+		target   string
+		wantChan []string
+		wantDev  []string
+		wantTO   time.Duration
+	}{
+		{"省略=全部", "/api/v1/diagnostics/probe", nil, nil, 3 * time.Second},
+		{"重复参数", "/api/v1/diagnostics/probe?channel=a&channel=b", []string{"a", "b"}, nil, 3 * time.Second},
+		{"逗号分隔", "/api/v1/diagnostics/probe?channel=a,b,c", []string{"a", "b", "c"}, nil, 3 * time.Second},
+		{"混合+去重+去空", "/api/v1/diagnostics/probe?channel=a,b&channel=b,,a", []string{"a", "b"}, nil, 3 * time.Second},
+		{"设备参数", "/api/v1/diagnostics/probe?device=d1,d2", nil, []string{"d1", "d2"}, 3 * time.Second},
+		{"通道与设备混合", "/api/v1/diagnostics/probe?channel=c&device=d", []string{"c"}, []string{"d"}, 3 * time.Second},
+		{"超时夹取下界", "/api/v1/diagnostics/probe?timeout=1ms", nil, nil, 100 * time.Millisecond},
+		{"超时夹取上界", "/api/v1/diagnostics/probe?timeout=9999s", nil, nil, 10 * time.Second},
+		{"超时非法回退默认", "/api/v1/diagnostics/probe?timeout=abc", nil, nil, 3 * time.Second},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			be.probeQuery = ProbeQuery{}
+			rec := httptest.NewRecorder()
+			s.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, tc.target, nil))
+			if rec.Code != 200 {
+				t.Fatalf("code = %d body = %s", rec.Code, rec.Body.String())
+			}
+			if !equalStrings(be.probeQuery.Channels, tc.wantChan) {
+				t.Fatalf("channels = %v, want %v", be.probeQuery.Channels, tc.wantChan)
+			}
+			if !equalStrings(be.probeQuery.Devices, tc.wantDev) {
+				t.Fatalf("devices = %v, want %v", be.probeQuery.Devices, tc.wantDev)
+			}
+			if be.probeQuery.Timeout != tc.wantTO {
+				t.Fatalf("timeout = %v, want %v", be.probeQuery.Timeout, tc.wantTO)
+			}
+		})
+	}
+}
+
+// TestProbeHandlerUnknownChannel：Backend 返回的未知 channel 错误必须原样
+// 透出（runtime 在这里返回 400 probe.unknown_channel）。
+func TestProbeHandlerUnknownChannel(t *testing.T) {
+	s, be := newServer(t, Options{})
+	be.probeErr = Errf(http.StatusBadRequest, "probe.unknown_channel", "channel(s) not found: x")
+
+	rec := httptest.NewRecorder()
+	s.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/v1/diagnostics/probe?channel=x", nil))
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("code = %d, want 400", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "probe.unknown_channel") {
+		t.Fatalf("body = %s, want probe.unknown_channel", rec.Body.String())
+	}
+}
+
+func equalStrings(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }

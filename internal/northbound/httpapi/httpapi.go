@@ -220,6 +220,49 @@ type VersionInfo struct {
 	InstanceID string `json:"instanceId,omitempty"`
 }
 
+// ProbeQuery 是网络探测的查询条件。
+type ProbeQuery struct {
+	// Channels 是显式指定的通道 ID 列表；为空表示「全部通道」。
+	Channels []string
+	// Devices 是要解析到通道的设备 ID 列表。网络可达性是**通道**属性：一台
+	// 设备连不上，先看它所在通道通不通。指定 Devices 时，把它们映射到各自的
+	// 通道并去重后探测（同一条线上的多台设备只探一次）。
+	Devices []string
+	// Timeout 是单端点探测超时；<=0 用默认 3s。
+	Timeout time.Duration
+}
+
+// ProbeReport 是网络探测端点的聚合响应。语义与 internal/probe 一致，但在此
+// 重声明以避免 httpapi 反向依赖内部探测包（北向 API 是稳定的对外契约）。
+type ProbeReport struct {
+	GeneratedAt time.Time     `json:"generatedAt"`
+	Total       int           `json:"total"`
+	Results     []ProbeResult `json:"results"`
+	Summary     ProbeSummary  `json:"summary"`
+}
+
+// ProbeResult 是单个网络端点的探测结果。
+type ProbeResult struct {
+	Channel   string `json:"channel"`
+	Protocol  string `json:"protocol,omitempty"`
+	Transport string `json:"transport,omitempty"`
+	Address   string `json:"address,omitempty"`
+	// Status 取值：ok | fail | unverified | unsupported。unverified 表示探测
+	// 手段无法判定可达性（UDP 无连接），此时 reachable 必为 false。
+	Status    string `json:"status"`
+	Reachable bool   `json:"reachable"`
+	RTTMs     int64  `json:"rttMs,omitempty"`
+	Error     string `json:"error,omitempty"`
+}
+
+// ProbeSummary 是各状态计数，让概览告警不必遍历 Results。
+type ProbeSummary struct {
+	OK          int `json:"ok"`
+	Fail        int `json:"fail"`
+	Unverified  int `json:"unverified"`
+	Unsupported int `json:"unsupported"`
+}
+
 // PointFilter 是点位查询条件。
 type PointFilter struct {
 	Device  string
@@ -307,6 +350,8 @@ type Backend interface {
 	Version() VersionInfo
 	Metrics() string
 	Logs(device, level string, limit int) []obs.Entry
+
+	Probe(ctx context.Context, q ProbeQuery) (ProbeReport, error)
 
 	Devices(q string) []DeviceView
 	Device(id string) (DeviceView, bool)
@@ -623,6 +668,7 @@ func (s *Server) routes() {
 	route("POST /api/v1/alarms/{id}/ack", rbac.PermAlarmAck, s.alarmAck)
 	route("GET /api/v1/history", rbac.PermRead, s.history)
 	route("GET /api/v1/diagnostics/bundle", rbac.PermDiagnostics, s.bundle)
+	route("GET /api/v1/diagnostics/probe", rbac.PermDiagnostics, s.probe)
 
 	route("GET /api/v1/audit", rbac.PermAuditRead, s.auditList)
 	route("GET /api/v1/audit/verify", rbac.PermAuditRead, s.auditVerify)
@@ -1556,6 +1602,73 @@ func (s *Server) bundle(w http.ResponseWriter, r *http.Request) error {
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(data)
 	return nil
+}
+
+// probe 对配置内网络端点做连通性探测，回答「为什么连不上」的第一个分叉：
+// TCP 连不上 → 路由/端口/防火墙；TCP 连得上但驱动读不到 → 协议参数或设备应用层。
+//
+// 参数：
+//   - channel：可选，可重复（?channel=a&channel=b）或逗号分隔（?channel=a,b）。
+//     指定时只探测它们，任一 id 不存在返回 400 probe.unknown_channel。
+//   - device：可选，同 channel 的多值/逗号写法。把设备映射到其所在通道后探测
+//     （同一条线上的多台设备只探一次）。这是运维的直觉入口：「这台设备为什么
+//     连不上」——网络可达性属于通道，不属于单个设备。
+//   - channel 与 device 都省略时探测配置里全部通道。
+//   - timeout：可选，单端点超时，默认 3s，限定 [100ms,10s]；越界夹取而非报错，
+//     因为探测是诊断动作，夹取比让调用方反复试错更友好。
+//
+// 安全：只探测配置里已声明的通道，不接受任意主机 → 无 SSRF 面。RBAC 与诊断
+// 包同级（PermDiagnostics）。探测会短暂地多开 TCP 连接（连上立即关闭），等价
+// 于运维手动 telnet，风险有界且由人主动触发。
+func (s *Server) probe(w http.ResponseWriter, r *http.Request) error {
+	q := r.URL.Query()
+	report, err := s.be.Probe(r.Context(), ProbeQuery{
+		Channels: parseProbeIDs(q["channel"]),
+		Devices:  parseProbeIDs(q["device"]),
+		Timeout:  parseProbeTimeout(q.Get("timeout")),
+	})
+	if err != nil {
+		return err
+	}
+	writeOK(w, report)
+	return nil
+}
+
+// parseProbeIDs 把重复参数与逗号分隔值合并、去空、去重、保持出现顺序。
+// 返回空切片表示「未指定」——由调用方解释成「探测全部」。
+func parseProbeIDs(raw []string) []string {
+	seen := make(map[string]bool)
+	var out []string
+	for _, v := range raw {
+		for _, id := range strings.Split(v, ",") {
+			id = strings.TrimSpace(id)
+			if id == "" || seen[id] {
+				continue
+			}
+			seen[id] = true
+			out = append(out, id)
+		}
+	}
+	return out
+}
+
+// parseProbeTimeout 解析单端点超时。默认 3s，夹取到 [100ms,10s]：探测是诊断动
+// 作，越界夹取比报错更友好，也让「写一个超大值想一次等到底」不会拖垮请求处理。
+func parseProbeTimeout(raw string) time.Duration {
+	if raw == "" {
+		return 3 * time.Second
+	}
+	d, err := time.ParseDuration(raw)
+	if err != nil {
+		return 3 * time.Second
+	}
+	switch {
+	case d < 100*time.Millisecond:
+		return 100 * time.Millisecond
+	case d > 10*time.Second:
+		return 10 * time.Second
+	}
+	return d
 }
 
 // ---------------------------------------------------------------------------

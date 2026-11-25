@@ -7,13 +7,16 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"sort"
 	"strings"
 	"time"
 
 	"uic/internal/alarm"
 	"uic/internal/config"
 	"uic/internal/driver"
+	"uic/internal/model"
 	"uic/internal/northbound/httpapi"
+	"uic/internal/probe"
 )
 
 // ---------------------------------------------------------------------------
@@ -557,4 +560,130 @@ func (r *Runtime) DiagnosticsBundle(_ context.Context) ([]byte, error) {
 		return nil, err
 	}
 	return buf.Bytes(), nil
+}
+
+// ---------------------------------------------------------------------------
+// Backend: 网络探测
+// ---------------------------------------------------------------------------
+
+// Probe 对当前配置里的网络端点做连通性探测，回答「为什么连不上」的第一个分叉：
+// TCP 连不上 → 路由/端口/防火墙；TCP 连得上但驱动读不到 → 协议参数或设备应用层。
+//
+// 只接受配置内已声明的通道/设备（r.cfg.Current()），不接受任意主机，因此不存在
+// SSRF 面。q.Channels 与 q.Devices 都为空时探测全部通道；指定时把设备解析到其
+// 通道、与显式通道合并去重后探测，且只要有一个 id 在配置里不存在就整体报 400，
+// 避免调用方以为「探测了」实际漏掉。
+//
+// 返回类型用 httpapi 的 DTO（与 Runtime 其它 Backend 方法一致，北向契约的
+// 对外表示归 httpapi 所有）；内部探测仍走 internal/probe 包。
+//
+// 与驱动层 Conn.Probe 的分工：Conn.Probe 走真实协议，本方法只做 TCP 握手或
+// UDP 地址解析、不发任何协议字节。探测是显式的、由运维触发的诊断动作。
+func (r *Runtime) Probe(ctx context.Context, q httpapi.ProbeQuery) (httpapi.ProbeReport, error) {
+	cfg := r.cfg.Current()
+	selected, err := resolveProbeTargets(cfg.Channels, cfg.Devices, q)
+	if err != nil {
+		return httpapi.ProbeReport{}, err
+	}
+	results := probe.Probe(ctx, selected, probe.Options{Timeout: q.Timeout})
+	return httpapi.ProbeReport{
+		GeneratedAt: time.Now().UTC(),
+		Total:       len(results),
+		Results:     toProbeResults(results),
+		Summary:     summarizeProbe(results),
+	}, nil
+}
+
+// toProbeResults 把内部探测结果映射成 httpapi DTO。映射在这里集中，是为了让
+// 内部 probe 包的演进不泄漏到北向 API。
+func toProbeResults(in []probe.Result) []httpapi.ProbeResult {
+	out := make([]httpapi.ProbeResult, len(in))
+	for i, r := range in {
+		out[i] = httpapi.ProbeResult{
+			Channel:   r.Channel,
+			Protocol:  r.Protocol,
+			Transport: r.Transport,
+			Address:   r.Address,
+			Status:    r.Status,
+			Reachable: r.Reachable,
+			RTTMs:     r.RTTMs,
+			Error:     r.Error,
+		}
+	}
+	return out
+}
+
+// resolveProbeTargets 把探测请求解析成要探测的通道列表。
+//
+//   - q.Channels 与 q.Devices 都为空 → 全部通道。
+//   - q.Devices 中的每个设备映射到它的 ChannelID（网络可达性属于通道）；同一
+//     条线上的多台设备去重后只探一次。
+//   - q.Channels 与解析出的通道合并去重。
+//   - 任何 channel/device id 在配置里不存在 → 400，而不是静默少探：静默漏探
+//     会让「都正常」的假象掩盖真实故障。
+//
+// 返回顺序遵循配置里 channels 的声明顺序，便于调用方对照。
+func resolveProbeTargets(channels []model.Channel, devices []model.Device, q httpapi.ProbeQuery) ([]model.Channel, error) {
+	// 全部通道：两个过滤条件都未指定。
+	if len(q.Channels) == 0 && len(q.Devices) == 0 {
+		return channels, nil
+	}
+
+	channelKnown := make(map[string]bool, len(channels))
+	for _, ch := range channels {
+		channelKnown[ch.ID] = true
+	}
+	deviceChannel := make(map[string]string, len(devices))
+	for _, d := range devices {
+		deviceChannel[d.ID] = d.ChannelID
+	}
+
+	want := make(map[string]bool, len(q.Channels)+len(q.Devices))
+	var missing []string
+	for _, id := range q.Channels {
+		if !channelKnown[id] {
+			missing = append(missing, "channel:"+id)
+			continue
+		}
+		want[id] = true
+	}
+	for _, id := range q.Devices {
+		chID, ok := deviceChannel[id]
+		if !ok {
+			missing = append(missing, "device:"+id)
+			continue
+		}
+		want[chID] = true
+	}
+	if len(missing) > 0 {
+		sort.Strings(missing)
+		return nil, httpapi.Errf(http.StatusBadRequest, "probe.unknown_channel",
+			"not found in current config: %s", strings.Join(missing, ", "))
+	}
+
+	out := make([]model.Channel, 0, len(want))
+	for _, ch := range channels {
+		if want[ch.ID] {
+			out = append(out, ch)
+		}
+	}
+	return out, nil
+}
+
+// summarizeProbe 统计各状态计数，让看板与「概览告警」不必再遍历 Results。
+func summarizeProbe(results []probe.Result) httpapi.ProbeSummary {
+	var s httpapi.ProbeSummary
+	for _, r := range results {
+		switch r.Status {
+		case probe.StatusOK:
+			s.OK++
+		case probe.StatusFail:
+			s.Fail++
+		case probe.StatusUnverified:
+			s.Unverified++
+		case probe.StatusUnsupported:
+			s.Unsupported++
+		}
+	}
+	return s
 }
