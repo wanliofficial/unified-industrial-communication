@@ -482,8 +482,73 @@ POST /api/v1/commands
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | GET | `/api/v1/diagnostics/bundle` | 下载诊断包（zip） |
-| GET | `/api/v1/diagnostics/network?device=` | 连通性诊断（DNS/TCP/延迟） |
+| GET | `/api/v1/diagnostics/probe` | 网络端点连通性探测（TCP 握手 + RTT） |
 | GET | `/api/v1/logs?device=&level=&limit=` | 查询日志（尾部） |
+
+#### 4.6.1 网络探测 `GET /api/v1/diagnostics/probe`
+
+回答「为什么连不上」的**第一个分叉**：设备显示连接失败时，先区分故障层。
+
+- TCP 连不上 → 路由 / 端口 / 防火墙 / DNS 问题；
+- TCP 连得上但驱动读不到 → 协议参数或设备应用层问题。
+
+这一分叉以前只能靠人 `telnet host port` 手工判断；本端点把它变成一次可审计的
+调用。它和驱动层的 `Conn.Probe` 分工明确：`Conn.Probe` 走真实协议（握手、读一个
+点），回答「设备应用层是否正常」；本端点只做 TCP 握手或 UDP 地址解析，**不发送
+任何协议字节**。
+
+**参数**：
+
+| 参数 | 说明 |
+|---|---|
+| `channel` | 可选，可重复（`?channel=a&channel=b`）或逗号分隔（`?channel=a,b`） |
+| `device` | 可选，同 `channel` 的多值/逗号写法；把设备解析到其所在通道后探测 |
+| `timeout` | 可选，单端点超时，默认 `3s`，夹取到 `[100ms,10s]` |
+
+`channel` 与 `device` 都省略时探测配置里全部通道；两者同时给出时合并去重探测。
+网络可达性属于**通道**：同一条线上的多台设备只探一次。任何 `channel`/`device`
+在配置里不存在都返回 `400 probe.unknown_channel`——静默少探会让「都正常」的假象
+掩盖真实故障。
+
+**响应**：
+
+```json
+{
+  "generatedAt": "2026-03-01T12:00:00Z",
+  "total": 1,
+  "results": [
+    {
+      "channel": "line-1",
+      "protocol": "modbus-tcp",
+      "transport": "tcp",
+      "address": "10.0.0.5:502",
+      "status": "ok",
+      "reachable": true,
+      "rttMs": 3
+    }
+  ],
+  "summary": {"ok": 1, "fail": 0, "unverified": 0, "unsupported": 0}
+}
+```
+
+**`status` 语义**（刻意区分「失败」与「无法判定」）：
+
+| status | 含义 | `reachable` |
+|---|---|---|
+| `ok` | TCP 握手成功 | `true` |
+| `fail` | TCP 连接失败（拒绝/超时/不可达） | `false` |
+| `unverified` | 探测手段无法判定（UDP 无连接握手） | `false` |
+| `unsupported` | 传输不是网络端点（串口 / 内存） | `false` |
+
+`unverified` 单列而不并入 `reachable`：UDP connected 拨号成功只说明地址可解析、
+本地套接字可建，并不代表对端在线。把它标成可达会让看板误判。
+
+**安全边界**：只探测**配置内已声明**的通道/设备，不接受任意主机——因此不存在
+SSRF 面。权限与诊断包同级（`diagnostics`，operator/admin 有、viewer 无）。探测会
+短暂地多开一条 TCP 连接（连上立即关闭），等价于运维手动 `telnet host port`：
+对只允许单会话的设备（串口服务器、某些 PLC）有瞬时并发风险，但代价有界且由人
+主动触发，故可接受。地址缺端口直接报错而不猜端口——往错误端口探测会把「配置
+写错」误报成「网络不可达」。
 
 诊断包内容：
 
@@ -1869,6 +1934,7 @@ SCADA 会显示一个从未生效的设定值。
 | 审计（哈希链 + 查询/校验） | 已实现 | 见 §4.10（NDJSON 分段、at-least-once 语义） |
 | `uic token` | 已实现 | 生成 Token + `tokenSha256` + 可粘贴片段 |
 | 诊断包 | 已实现 | 见 §4.6 |
+| 网络探测 | 已实现 | 见 §4.6.1（`/api/v1/diagnostics/probe`，TCP 握手 + RTT，仅探测配置内通道） |
 
 ---
 
