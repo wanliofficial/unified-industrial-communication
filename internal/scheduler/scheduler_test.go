@@ -536,3 +536,63 @@ func TestAddDisabledDevicePublishesDisabled(t *testing.T) {
 		t.Fatal("no initial state event for a disabled device")
 	}
 }
+
+// LastTick 在 Start 之前必须报告 unknown（false）：调用方据此区分「刚启动」
+// 与「真的卡死」，绝不能把「还没开始」误报成停摆。
+func TestLastTickUnknownBeforeStart(t *testing.T) {
+	s := New(Options{Tick: time.Millisecond}, nil, nil)
+	if _, ok := s.LastTick(); ok {
+		t.Fatal("未 Start 就声称有 tick 时刻")
+	}
+}
+
+// Start 之后 tick 时间戳必须持续推进：这是「进程活着但采集中枢卡死」检测
+// 的唯一信号源。若这里不动，运行时看门狗就永远判不了卡死。
+func TestLastTickAdvances(t *testing.T) {
+	s, _ := startSched(t, Options{Tick: 2 * time.Millisecond})
+	first, ok := s.LastTick()
+	if !ok {
+		t.Fatal("Start 后 LastTick 应已知")
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if cur, ok := s.LastTick(); ok && cur.After(first) {
+			return
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	t.Fatal("tick 时间戳从不前进：卡死检测将永远失效")
+}
+
+// 停摆检测测的是「循环活性」而非「有没有设备要采」：没有设备时循环仍在转，
+// 时间戳照常前进，不能被误判成卡死。
+func TestLastTickAdvancesWithNoDevices(t *testing.T) {
+	s, _ := startSched(t, Options{Tick: 2 * time.Millisecond})
+	first, ok := s.LastTick()
+	if !ok {
+		t.Fatal("Start 后 LastTick 应已知")
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if cur, ok := s.LastTick(); ok && cur.After(first) {
+			return
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	t.Fatal("空设备表的调度器不再推进 tick 时间戳")
+}
+
+// Start 必须在启动线程内同步种子 tick 时刻：看门狗若在 Start 之后、首个 tick
+// 之前读 LastTick，必须得到「已知」而不是 unknown。否则刚启动的一小段时间会
+// 落入「无法判定」，并让「启动即卡死」这一场景在头一个 tick 间隔内不可见。
+func TestLastTickKnownImmediatelyAfterStart(t *testing.T) {
+	s := New(Options{Tick: time.Hour}, nil, nil) // 周期极长：loop 不可能已经 tick
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	s.Start(ctx)
+	defer s.Close(time.Second)
+
+	if _, ok := s.LastTick(); !ok {
+		t.Fatal("Start 后、首个 tick 前 LastTick 应已知（Start 必须种子时刻）")
+	}
+}

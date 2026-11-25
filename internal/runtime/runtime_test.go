@@ -38,6 +38,14 @@ func newHarness(t *testing.T, mutate func(cfg map[string]any)) *harness {
 // 多实例」（同一 site、不同数据目录）与「同数据目录重启」两类场景的测试。
 func newHarnessAt(t *testing.T, dir string, mutate func(cfg map[string]any)) *harness {
 	t.Helper()
+	return newHarnessTuned(t, dir, mutate, nil)
+}
+
+// newHarnessTuned 在 newHarnessAt 之上允许调整 runtime.Options（如注入更短的
+// StallAfter / 更快的 HeartbeatInterval）。看门狗类测试需要在不等待 15s 的前提下
+// 观察卡死判定，因此必须能从构造层注入。
+func newHarnessTuned(t *testing.T, dir string, mutate func(cfg map[string]any), tune func(*Options)) *harness {
+	t.Helper()
 
 	srv, err := sim.NewServer("127.0.0.1:0", 256)
 	if err != nil {
@@ -106,9 +114,11 @@ func newHarnessAt(t *testing.T, dir string, mutate func(cfg map[string]any)) *ha
 		t.Fatal(err)
 	}
 
-	rt, err := New(Options{
-		ConfigPath: path, DataDir: dir, Version: "test", MetricsPublic: true,
-	})
+	opt := Options{ConfigPath: path, DataDir: dir, Version: "test", MetricsPublic: true}
+	if tune != nil {
+		tune(&opt)
+	}
+	rt, err := New(opt)
 	if err != nil {
 		t.Fatalf("runtime: %v", err)
 	}

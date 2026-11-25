@@ -187,6 +187,14 @@ type Scheduler struct {
 	cancel  context.CancelFunc
 	wg      sync.WaitGroup // tick 协程 + 状态派发协程
 	work    sync.WaitGroup // 在飞采集
+
+	// lastTickNano 是最近一次 tick 的 UnixNano。
+	//
+	// 用途：把「进程活着但采集中枢卡死」这一静默失效变成可观测事实。tick 协程
+	// 是一个单协程循环，若它因死锁/长时间阻塞而停摆，所有设备都不再被调度，
+	// 但 HTTP 层照常响应、/healthz 照常 200——外部 supervisor 与看门狗都以为
+	// 一切正常。记录 tick 时间戳，让运行时看门狗能检测「多久没 tick」。
+	lastTickNano atomic.Int64
 }
 
 type device struct {
@@ -236,6 +244,9 @@ func (s *Scheduler) Start(ctx context.Context) {
 		return
 	}
 	s.ctx, s.cancel = context.WithCancel(ctx)
+	// 启动即种子一次：让看门狗在首个 tick 之前读到的就是「已知且新鲜」，
+	// 而不是 unknown。否则「启动即卡死」在头一个 tick 间隔内不可见。
+	s.lastTickNano.Store(s.now().UnixNano())
 	s.wg.Add(1)
 	go s.loop()
 	if s.opt.OnState != nil {
@@ -253,9 +264,25 @@ func (s *Scheduler) loop() {
 		case <-s.ctx.Done():
 			return
 		case now := <-t.C:
+			// 先记 tick 时间戳再分发：只要循环还在转，就说明调度器没卡死，
+			// 哪怕本轮没有到期设备（dispatch 什么都不做）。这正是「进程活着
+			// 但采集中枢卡死」检测需要的信号——它测的是循环活性，不是采集
+			// 成功率（后者由各设备自身的熔断/退避表达）。
+			s.lastTickNano.Store(now.UnixNano())
 			s.dispatch(now)
 		}
 	}
+}
+
+// LastTick 返回最近一次 tick 的时刻。第二个返回值为 false 表示调度器尚未
+// 启动（或 Start 从未被调用）——此时无法判断活性，调用方应视为「未知」而不
+// 是「卡死」。看门狗据此区分「刚启动」与「真的停摆」。
+func (s *Scheduler) LastTick() (time.Time, bool) {
+	ns := s.lastTickNano.Load()
+	if ns == 0 {
+		return time.Time{}, false
+	}
+	return time.Unix(0, ns), true
 }
 
 func (s *Scheduler) now() time.Time { return s.opt.Now() }

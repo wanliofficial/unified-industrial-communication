@@ -182,7 +182,7 @@ func usage() {
 const usageText = `uic — 统一工业通信网关
 
 用法:
-  uic [run] -config config.json [-listen :8080] [-token TOKEN]
+  uic [run] -config config.json [-listen :8080] [-token TOKEN] [-stall-after 15s] [-heartbeat-interval 5s]
   uic -check -config config.json
   uic sim [-listen 127.0.0.1:15020] [-protocol modbus|s7|opcua|mqtt|mc|fins|hostlink|enip|bacnet|bacnet-mstp|iec104|iec101|mewtocol|dnp3|coap|knx|iec61850|mtconnect|dlt645|cjt188|mbus|dlms|sl651|snmp|ads|secs|toledo]
   uic mbread -addr 127.0.0.1:1502 -unit 1 -area holding -offset 0 -qty 2
@@ -298,6 +298,30 @@ func printVersion() {
 	fmt.Printf("uic %s (commit %s, built %s, %s)\n", version, commit, buildTime, goruntime.Version())
 }
 
+// validateWatchdogFlags 校验 -stall-after 与 -heartbeat-interval 的组合。
+//
+// 返回第一个发现的配置错误（nil 表示合法）。规则：
+//   - stallAfter < 0：非法（0 表示用默认，负值语义不明）；
+//   - 0 < stallAfter < MinStallAfter：阈值小于若干 tick 周期，必然在噪声下误报；
+//   - heartbeat < 0：显式禁用心跳（合法，表示不写心跳文件）；
+//   - 0 < heartbeat < MinHeartbeatEvery：间隔过小，刷盘成本远超收益；
+//   - 其余合法：heartbeat == 0 走默认，heartbeat >= MinHeartbeatEvery 按其原值。
+//
+// 上下界取自 uicruntime（与运行时同源）。拒绝比「静默回退到默认值」好：运维
+// 以为自己配了 1 秒卡死阈值，实际跑的是 15 秒，这种偏差在事后排查时几乎不可见。
+func validateWatchdogFlags(stallAfter, heartbeat time.Duration) error {
+	switch {
+	case stallAfter < 0:
+		return fmt.Errorf("-stall-after 不能为负（0 表示用默认 %v）", uicruntime.DefaultStallAfter)
+	case stallAfter > 0 && stallAfter < uicruntime.MinStallAfter:
+		return fmt.Errorf("-stall-after 必须 ≥ %v（低于若干 tick 周期必然在噪声下误报）", uicruntime.MinStallAfter)
+	}
+	if heartbeat > 0 && heartbeat < uicruntime.MinHeartbeatEvery {
+		return fmt.Errorf("-heartbeat-interval 必须 ≥ %v（0 用默认 %v，负值禁用）", uicruntime.MinHeartbeatEvery, uicruntime.DefaultHeartbeatInterval)
+	}
+	return nil
+}
+
 // runCmd 启动完整服务。
 func runCmd(args []string) {
 	fs := flag.NewFlagSet("run", flag.ExitOnError)
@@ -306,6 +330,8 @@ func runCmd(args []string) {
 	token := fs.String("token", "", "覆盖 API Token")
 	logLevel := fs.String("log-level", "", "日志级别 debug|info|warn|error")
 	dataDir := fs.String("data", "", "覆盖数据目录")
+	stallAfter := fs.Duration("stall-after", 0, "采集调度卡死阈值（0 用默认 15s；≥500ms）")
+	heartbeat := fs.Duration("heartbeat-interval", 0, "心跳文件写入间隔（0 用默认 5s；≥100ms；负值禁用）")
 	check := fs.Bool("check", false, "只校验配置并退出")
 	showVer := fs.Bool("version", false, "打印版本并退出")
 	_ = fs.Parse(args)
@@ -313,6 +339,12 @@ func runCmd(args []string) {
 	if *showVer {
 		printVersion()
 		return
+	}
+	// 看门狗阈值与心跳间隔：配错只会导致行为悄悄变化，因此这里显式校验，
+	// 非法值直接拒绝启动（退出码 2）。
+	if err := validateWatchdogFlags(*stallAfter, *heartbeat); err != nil {
+		fmt.Fprintf(os.Stderr, "%s\n", err)
+		os.Exit(2)
 	}
 	if *check {
 		os.Exit(checkConfig(*cfgPath))
@@ -327,6 +359,9 @@ func runCmd(args []string) {
 		Version:    version,
 		Commit:     commit,
 		BuildTime:  buildTime,
+
+		StallAfter:        *stallAfter,
+		HeartbeatInterval: *heartbeat,
 	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "启动失败: %v\n", err)

@@ -1400,3 +1400,40 @@ func equalStrings(a, b []string) bool {
 	}
 	return true
 }
+
+// scheduler 块必须始终出现在 /api/v1/health 里（包括 unknown），
+// 否则客户端要写两套分支，且「卡死」与「字段缺失」无法区分。
+func TestHealthSerializesScheduler(t *testing.T) {
+	s, be := newServer(t, Options{})
+	be.health = Health{Status: "stalled", Scheduler: SchedulerHealth{
+		Verdict: "stalled", AgeMs: 32000, StallAfterMs: 15000,
+	}}
+	rec := httptest.NewRecorder()
+	s.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/v1/health", nil))
+	if rec.Code != 200 {
+		t.Fatalf("code = %d", rec.Code)
+	}
+	var body struct {
+		Status    string          `json:"status"`
+		Scheduler SchedulerHealth `json:"scheduler"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if body.Scheduler.Verdict != "stalled" || body.Scheduler.AgeMs != 32000 {
+		t.Fatalf("scheduler = %+v", body.Scheduler)
+	}
+	if body.Scheduler.StallAfterMs != 15000 {
+		t.Fatalf("stallAfterMs = %d, want 15000", body.Scheduler.StallAfterMs)
+	}
+	if body.Status != "stalled" {
+		t.Fatalf("status = %q", body.Status)
+	}
+	// verdict 为空时字段也必须存在（零值序列化为 "verdict":""），不让客户端猜。
+	be.health = Health{Status: "ok"}
+	rec = httptest.NewRecorder()
+	s.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/v1/health", nil))
+	if !strings.Contains(rec.Body.String(), `"scheduler":{"verdict":""`) {
+		t.Fatalf("body = %s", rec.Body.String())
+	}
+}

@@ -3,6 +3,7 @@ package main
 import (
 	"strings"
 	"testing"
+	"time"
 
 	"uic/internal/config"
 	"uic/internal/model"
@@ -131,4 +132,43 @@ func isCommandWord(s string) bool {
 		}
 	}
 	return true
+}
+
+func TestValidateWatchdogFlags(t *testing.T) {
+	valid := []struct {
+		name       string
+		stallAfter time.Duration
+		heartbeat  time.Duration
+	}{
+		{"零值走默认", 0, 0},
+		{"默认阈值显式给出", 15 * time.Second, 5 * time.Second},
+		{"卡死阈值取下限", 500 * time.Millisecond, 100 * time.Millisecond},
+		{"心跳禁用", 10 * time.Second, -1},
+		{"大间隔", time.Minute, time.Hour},
+	}
+	for _, c := range valid {
+		if err := validateWatchdogFlags(c.stallAfter, c.heartbeat); err != nil {
+			t.Fatalf("%s: 期望合法，却报错: %v", c.name, err)
+		}
+	}
+
+	invalid := []struct {
+		name       string
+		stallAfter time.Duration
+		heartbeat  time.Duration
+		want       string
+	}{
+		{"卡死阈值为负", -1, 0, "不能为负"},
+		{"卡死阈值过小", 10 * time.Millisecond, 0, "必须 ≥"},
+		{"心跳间隔过小", 5 * time.Second, 5 * time.Millisecond, "必须 ≥"},
+	}
+	for _, c := range invalid {
+		err := validateWatchdogFlags(c.stallAfter, c.heartbeat)
+		if err == nil {
+			t.Fatalf("%s: 期望报错，却通过", c.name)
+		}
+		if !strings.Contains(err.Error(), c.want) {
+			t.Fatalf("%s: 错误 %q 不含 %q", c.name, err.Error(), c.want)
+		}
+	}
 }

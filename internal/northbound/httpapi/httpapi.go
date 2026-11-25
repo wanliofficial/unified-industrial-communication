@@ -191,6 +191,20 @@ type Health struct {
 	Problems      []Problem     `json:"problems,omitempty"`
 	Version       string        `json:"version,omitempty"`
 	ConfigVersion string        `json:"configVersion,omitempty"`
+	// Scheduler 是采集中枢的活性。它回答一个 /healthz 无法回答的问题：
+	// 进程活着、HTTP 在响应，但调度器是否还在转？卡死时这里为 stalled，
+	// 并会在 Problems 里出现一条 state=stalled 的条目。
+	Scheduler SchedulerHealth `json:"scheduler"`
+}
+
+// SchedulerHealth 是采集调度中枢的活性快照。
+type SchedulerHealth struct {
+	// Verdict 取值 healthy | stalled | unknown。
+	Verdict string `json:"verdict"`
+	// AgeMs 是最近一次 tick 距今的毫秒数（unknown 时为 0）。
+	AgeMs int64 `json:"ageMs"`
+	// StallAfterMs 是判定卡死的阈值（毫秒），便于调用方理解 verdict。
+	StallAfterMs int64 `json:"stallAfterMs,omitempty"`
 }
 
 // Check 是就绪检查的一项。

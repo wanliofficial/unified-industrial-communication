@@ -63,6 +63,7 @@ import (
 	snmpdrv "uic/internal/driver/snmp"
 	toledodrv "uic/internal/driver/toledo"
 	"uic/internal/driver/virtual"
+	"uic/internal/heartbeat"
 	"uic/internal/history"
 	"uic/internal/instanceid"
 	"uic/internal/model"
@@ -71,6 +72,7 @@ import (
 	"uic/internal/outbox"
 	"uic/internal/scheduler"
 	slavemb "uic/internal/slave/modbus"
+	"uic/internal/watchdog"
 )
 
 // Options 是 runtime 的启动参数。
@@ -84,6 +86,14 @@ type Options struct {
 	Commit        string
 	BuildTime     string
 	MetricsPublic bool
+
+	// StallAfter 是「采集中枢多久没 tick 就判定卡死」的阈值；<=0 用默认 15s。
+	// 主要供测试注入较短阈值，生产用默认即可。
+	StallAfter time.Duration
+	// HeartbeatInterval 是心跳文件的写入间隔；<=0 用默认 5s，<0 表示禁用。
+	// 心跳文件写 <DataDir>/heartbeat.json，供不访问 HTTP 的外部 supervisor 判断
+	// 「进程活着但采集中枢卡死」。禁用只影响这一个外部信号，不影响 /healthz。
+	HeartbeatInterval time.Duration
 }
 
 // northboundSink 是 MQTT 北向的两种载荷格式共用的接口。
@@ -172,6 +182,14 @@ type Runtime struct {
 	// staged 是灰度发布的编排状态（见 staged.go）。用独立锁：灰度会调用
 	// ApplyConfig（内部走 cfg.Apply 与 reload 的锁），塞进同一把锁会成环。
 	staged stagedState
+
+	// 采集中枢活性的看门狗状态。
+	//
+	// schedStalled 只用于「刚转 stalled / 刚恢复」的边沿去重（指标与日志各记一次），
+	// 不是 Health() 的读缓存：Health() 每次都按实时的 LastTick 重新判定，避免
+	// 「看门狗还没跑到、健康检查就先看到旧结论」的时序问题。
+	schedStalled  atomic.Bool
+	heartbeatWarn atomic.Bool // 心跳文件写入是否已告警过（避免反复刷日志）
 }
 
 type idemEntry struct {
@@ -371,6 +389,8 @@ func (r *Runtime) declareMetrics() {
 	d("uic_collect_avg_ms", "gauge", "设备平均采集耗时")
 	d("uic_device_state", "gauge", "设备运行态（1 表示当前态）")
 	d("uic_scheduler_skipped_total", "counter", "因设备在飞而跳过的轮次")
+	d("uic_scheduler_stalled_total", "counter", "采集调度卡死次数（进程活着但 tick 停摆）")
+	d("uic_scheduler_tick_age_seconds", "gauge", "采集调度最近一次 tick 距今的秒数")
 	d("uic_driver_connect_total", "counter", "驱动建链次数与结果")
 	d("uic_write_total", "counter", "写入次数与结果")
 	d("uic_outbox_pending", "gauge", "Outbox 待投递条数")
@@ -489,6 +509,8 @@ func (r *Runtime) Start(ctx context.Context) {
 	}
 	r.wg.Add(1)
 	go r.watchdog(r.ctx)
+	r.wg.Add(1)
+	go r.heartbeatLoop(r.ctx)
 	r.ready.Store(true)
 	r.log.Info("runtime_started",
 		"config", r.cfg.Path(), "version", r.cfg.Version(),
@@ -607,7 +629,145 @@ func (r *Runtime) watchdog(ctx context.Context) {
 			r.markStale(now)
 			// 灰度观察窗口结束后的健康判定：没人来推进时也要能自动回滚。
 			r.checkStagedHealth(ctx, now)
+			// 采集中枢活性：检测「进程活着但调度器 tick 停摆」。
+			r.checkSchedulerLiveness(now)
 		}
+	}
+}
+
+// heartbeatLoop 独立负责心跳文件，不共用 watchdog 的 1s ticker。
+//
+// 两条信号必须解耦：
+//   - 看门狗 tick 负责「判断是否卡死」，固定 1s 就够；
+//   - 心跳文件负责「对外声明我还活着」，间隔是用户可配的。
+//
+// 早先把两者放在同一个 1s ticker 上，结果是 HeartbeatInterval 小于 1s 时被
+// 静默吞掉（永远不会按配置的频率写）——这是「配置被静默忽略」类缺陷，必须
+// 让心跳自己按配置的节奏走。
+func (r *Runtime) heartbeatLoop(ctx context.Context) {
+	defer r.wg.Done()
+	interval := r.opt.HeartbeatInterval
+	if interval < 0 {
+		return // 显式禁用：不生成心跳文件
+	}
+	if interval == 0 {
+		interval = heartbeatDefault
+	}
+	t := time.NewTicker(interval)
+	defer t.Stop()
+	// 启动即写一次：外部 supervisor 在进程刚起来时就能看到第一份心跳，不必
+	// 等一个完整间隔。
+	r.writeHeartbeat(time.Now())
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case now := <-t.C:
+			r.writeHeartbeat(now)
+		}
+	}
+}
+
+// checkSchedulerLiveness 用 watchdog 的纯判定逻辑检查调度器 tick 活性，并在状态
+// 迁移时记指标、写日志、更新供 Health() 读取的原子标记。
+//
+// 为什么单独做而不并进 Health()：Health() 是被动查询，只在有人调用时才算；一个
+// 「没人看的健康检查」无法主动发现卡死。看门狗是主动的，每秒都会判定一次，因此
+// 转为 stalled 的那一刻就能立刻记指标/日志，而不是等到下一次有人 curl。
+func (r *Runtime) checkSchedulerLiveness(now time.Time) {
+	last, ok := r.sched.LastTick()
+	st := watchdog.Evaluate(now, last, ok, watchdog.Options{StallAfter: r.stallAfter()})
+	was := r.schedStalled.Load()
+	stalled := st.Verdict == watchdog.VerdictStalled
+	switch {
+	case stalled && !was:
+		r.schedStalled.Store(true)
+		r.metrics.Inc("uic_scheduler_stalled_total", nil)
+		r.log.Error("scheduler_stalled", "age", st.Age.String(), "stallAfter", st.StallAfter.String(),
+			"detail", "采集调度 tick 停摆：进程仍在响应 HTTP，但设备已不再被调度")
+	case !stalled && was:
+		r.schedStalled.Store(false)
+		r.log.Warn("scheduler_recovered", "age", st.Age.String())
+	}
+	// 用指标暴露「多久没 tick」，便于做趋势告警（而不只是二值卡死）。
+	r.metrics.Set("uic_scheduler_tick_age_seconds", st.Age.Seconds(), nil)
+}
+
+// heartbeatDefault 是心跳文件的默认写入间隔。导出给 cmd/uic 引用：CLI 校验
+// 上下界必须与运行时默认值同源，否则两处各写一份 5s 迟早漂移。
+const heartbeatDefault = 5 * time.Second
+
+// 心跳默认写入间隔。与 -heartbeat-interval 的 0 语义对应。
+const DefaultHeartbeatInterval = heartbeatDefault
+
+// DefaultStallAfter 是「多久没 tick 判卡死」的默认阈值。导出给 cmd/uic 校验
+// 文案引用，避免 CLI 文档与运行时各写一份 15s 而漂移。
+const DefaultStallAfter = watchdog.DefaultStallAfter
+
+// 看门狗阈值与心跳间隔的下限。CLI 校验引用同一处，保证「命令行文档说的」与
+// 「运行时实际用的」是同一份事实。
+const (
+	// MinStallAfter 是允许的最小卡死阈值：调度器默认每 50ms tick 一次，低于
+	// 若干 tick 周期只会让正常的调度抖动被误报成卡死。
+	MinStallAfter = 500 * time.Millisecond
+	// MinHeartbeatEvery 是允许的最小心跳间隔：心跳是写盘操作，过密无收益。
+	MinHeartbeatEvery = 100 * time.Millisecond
+)
+
+// stallAfter 返回生效的卡死阈值。
+func (r *Runtime) stallAfter() time.Duration {
+	if r.opt.StallAfter > 0 {
+		return r.opt.StallAfter
+	}
+	return watchdog.DefaultStallAfter
+}
+
+// writeHeartbeat 写一次心跳文件。禁用与间隔判断由 heartbeatLoop 负责——这里
+// 只做「组装并落盘」，保持单一职责。
+func (r *Runtime) writeHeartbeat(now time.Time) {
+	snap := r.heartbeatSnapshot(now)
+	if err := heartbeat.Write(r.dataDir, snap); err != nil {
+		// 只在首次失败时告警，避免高频刷屏；恢复后重置标记。
+		if r.heartbeatWarn.CompareAndSwap(false, true) {
+			r.log.Warn("heartbeat_write_failed", "err", err.Error(), "path", heartbeat.Path(r.dataDir))
+		}
+	} else {
+		r.heartbeatWarn.Store(false)
+	}
+}
+
+// heartbeatSnapshot 组装心跳内容。与 Health() 同源：都读 scheduler 的实时状态。
+func (r *Runtime) heartbeatSnapshot(now time.Time) heartbeat.Snapshot {
+	last, ok := r.sched.LastTick()
+	st := watchdog.Evaluate(now, last, ok, watchdog.Options{StallAfter: r.stallAfter()})
+	var devs heartbeat.Devices
+	for _, s := range r.sched.Status() {
+		devs.Total++
+		switch s.RuntimeState {
+		case scheduler.StateCollecting:
+			devs.Collecting++
+		case scheduler.StateFaulted:
+			devs.Faulted++
+		case scheduler.StateDisabled:
+			devs.Disabled++
+		case scheduler.StateDegraded:
+			devs.Degraded++
+		}
+	}
+	return heartbeat.Snapshot{
+		TS:            now.Unix(),
+		TSMs:          now.UnixMilli(),
+		TSAt:          now.UTC().Format(time.RFC3339Nano),
+		PID:           os.Getpid(),
+		InstanceID:    r.instanceID,
+		Version:       r.version.Version,
+		UptimeSeconds: int64(now.Sub(r.startedAt).Seconds()),
+		Scheduler: heartbeat.Scheduler{
+			Verdict:      string(st.Verdict),
+			AgeMs:        st.Age.Milliseconds(),
+			StallAfterMs: st.StallAfter.Milliseconds(),
+		},
+		Devices: devs,
 	}
 }
 
@@ -895,7 +1055,11 @@ func (r *Runtime) deviceConfig(id string) (model.Device, model.Channel, bool) {
 // ---------------------------------------------------------------------------
 
 // Health 聚合设备状态、点位质量与队列水位。
-func (r *Runtime) Health() httpapi.Health {
+func (r *Runtime) Health() httpapi.Health { return r.healthAt(time.Now()) }
+
+// healthAt 是 Health 的可注入时钟形式：看门狗类测试需要一个「未来时刻」来
+// 观察 stalled 判定，而不必真的等 15 秒或冻结真实协程。
+func (r *Runtime) healthAt(now time.Time) httpapi.Health {
 	sts := r.sched.Status()
 	h := httpapi.Health{
 		UptimeSeconds: int64(time.Since(r.startedAt).Seconds()),
@@ -923,6 +1087,25 @@ func (r *Runtime) Health() httpapi.Health {
 		}
 	}
 	h.Points = r.pointCounts("")
+	// 采集中枢活性：即使设备全都在 collecting，若 tick 停摆，所有设备都会
+	// 在「下一个周期」不再更新——但它们的 runtimeState 仍是 collecting（没有
+	// 新的失败可触发迁移）。因此必须单独判定 tick 活性，否则「全都正常」的假象
+	// 会一直挂着。
+	{
+		last, ok := r.sched.LastTick()
+		st := watchdog.Evaluate(now, last, ok, watchdog.Options{StallAfter: r.stallAfter()})
+		h.Scheduler = httpapi.SchedulerHealth{
+			Verdict:      string(st.Verdict),
+			AgeMs:        st.Age.Milliseconds(),
+			StallAfterMs: st.StallAfter.Milliseconds(),
+		}
+		if st.Verdict == watchdog.VerdictStalled {
+			h.Problems = append(h.Problems, httpapi.Problem{
+				State:  "stalled",
+				Reason: st.Detail,
+			})
+		}
+	}
 	if st, ok := r.HistoryStats(); ok {
 		h.History = httpapi.HistoryHealth{
 			Enabled: true, Records: st.Appended, Bytes: st.Bytes, MaxBytes: st.MaxBytes,
@@ -952,6 +1135,10 @@ func (r *Runtime) Health() httpapi.Health {
 	}
 	h.Status = "ok"
 	switch {
+	case h.Scheduler.Verdict == string(watchdog.VerdictStalled):
+		// 采集中枢卡死是最高级别的故障：设备态可能仍显示 collecting，
+		// 但实际已不再被调度。放在最前面，避免被 devices/points 的「看似正常」掩盖。
+		h.Status = "stalled"
 	case h.Devices.Total == 0:
 		h.Status = "empty"
 	case h.Devices.Faulted > 0:
