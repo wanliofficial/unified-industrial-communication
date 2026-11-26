@@ -29,8 +29,10 @@ import (
 // plain、application/json 还是 application/octet-stream。带 `-selector`
 // 时只发送该字段的子树（PUT 是替换资源，不做隐藏的读-改-写）。
 //
-// 边界与驱动一致：明文 UDP、GET/PUT/POST、Block2 接收、资源发现；不做
-// DTLS、不做 Observe 订阅、不做 Block1 分块发送。
+// 边界与驱动一致：明文 UDP、GET/PUT/POST、Block2 接收、资源发现、以及
+// Observe 订阅（RFC 7641：配置 Channel.Subscribe=true 后驱动内部订阅推送，
+// 本命令的 -probe/-discover 仍是单次事务，不建立长订阅）；不做 DTLS、
+// 不做 Block1 分块发送。
 func coapreadCmd(args []string) {
 	fs := flag.NewFlagSet("coapread", flag.ExitOnError)
 	addr := fs.String("addr", "127.0.0.1:5683", "服务端地址 host[:port]，端口默认 5683")

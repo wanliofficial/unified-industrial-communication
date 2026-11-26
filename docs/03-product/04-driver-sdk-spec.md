@@ -4806,7 +4806,7 @@ curl -s -X POST -H 'Authorization: Bearer dev-token-0123456789' \
 | `sim/dnp3` | 静态编码 → 主站解析的往返自洽（16 个对象逐一比对），专门抓「编码少一个字节 / 解析多读一个字节」的错位；冻结计数器组 21 与组 20 同索引不同值、类 3 事件走组 23 |
 | `cmd/uic` | `-probe`/`-index`/`-raw`/`-json`、`-binary`/`-analog` 解析与错误写法、`-master`/`-unit` 范围与相同地址拒绝、行显示 |
 
-### 3.10.15 CoAP（UDP 资源模型：GET/PUT/POST + 分块接收 + 资源发现，端口 5683）
+### 3.10.15 CoAP（UDP 资源模型：GET/PUT/POST + 分块接收 + 资源发现 + Observe，端口 5683）
 
 CoAP 与前面所有协议都不同：它没有「寄存器地址」，也没有「对象索引」，它的数据模型
 是 **URI 资源**。一个点位就是一个路径（`/sensors/temp`），或者一个路径加一个字段
@@ -4825,13 +4825,16 @@ CoAP 与前面所有协议都不同：它没有「寄存器地址」，也没有
 | UDP 明文 CoAP | DTLS（加密传输） | DTLS 需要证书/预共享密钥、握手状态机与重放窗口，是一个独立子系统；本平台的安全边界放在北向与网络分段，而不是在每个南向驱动里各做一套 |
 | GET / PUT / POST | DELETE、FETCH、iPATCH | 网关的语义是「采集 + 下发」，删除资源与部分更新属于配置工具的动作，不该由采集进程发起 |
 | Block2 分块**接收** | Block1 分块**发送** | 读取大 JSON 文档是常态；写入超过单包大小的资源需要服务端配合的分块确认，现场极少见，做半套比不做更危险 |
-| `/.well-known/core` 资源发现 | Observe 订阅 | 订阅要长期维护观察关系、通知序号与重连后的重新注册；用周期 GET 已能满足采集，订阅留给后续独立实现 |
+| `/.well-known/core` 资源发现 | 组播发现 | 组播发现需要网络侧配合与去重策略；本平台面向点对点采集 |
+| Observe 订阅（RFC 7641，`Channel.Subscribe=true`） | 分块通知（Block2 + Observe） | 长期维护观察关系、通知序号与重连后重新注册已实现；分块通知需多次往返拼包、期间还可能有更新通知到达，会让「最新值表」语义变复杂，此时放弃推送值退回 GET |
 | Content-Format：text/plain、application/json、application/octet-stream | CBOR、SenML 等其它格式 | 前三种覆盖了现场绝大多数设备；其它格式先明确报「不支持」，不猜结构 |
 | 单播 | 组播发现、CoAP over TCP | 组播发现需要网络侧配合与去重策略；本平台面向点对点采集 |
 
-能力声明必须与实现一致：`Subscribe` 与 `Browse` 都声明为不支持。把 Observe 标成
-「支持」而实际只做一次性 GET，会让上层以为推送可用，然后在「为什么值不更新」上
-浪费一整天。
+能力声明必须与实现一致：`Read`、`Write`、`Subscribe`（Observe）、`Discovery` 都声明为
+`supported`，`Browse`、`MultiRead`、`BitAccess` 声明为不支持。`Subscribe` 与 MQTT/OPC UA
+同口径——指「协议是推送型、由驱动内部订阅、上层仍是 `Read` 拉取契约」，而不是驱动对外
+提供推送回调（见 §5.2 脚注 ¹ ⁴）。它需要通道上显式打开 `subscribe`：订阅与轮询的失败
+模式、带宽特征完全不同，自动切换会让同一份配置在两种行为之间漂移。
 
 #### 3.10.15.2 报文头只有四个字节，但有两套标识
 
@@ -5045,7 +5048,7 @@ JSON 写入的语义必须说清楚：**PUT 是替换整个资源，不是合并
 
 #### 3.10.15.10 读：逐点串行，链路失败后短路
 
-`Read` 对每个点位发一次 GET，串行执行。CoAP 没有「批量读」的标准手段：
+未开启订阅时，`Read` 对每个点位发一次 GET，串行执行。CoAP 没有「批量读」的标准手段：
 
 - 每个资源一个 URI，没有「读一段地址」的请求；
 - 即使多个点位指向同一个路径，驱动也不做响应缓存（见 3.10.15.5）。
@@ -5054,6 +5057,10 @@ JSON 写入的语义必须说清楚：**PUT 是替换整个资源，不是合并
 并发读需要额外的配对表与锁；而现场单设备的点位通常只有几十个，一次往返 10ms
 量级，串行的总时长仍在采集周期内。并发读的测试只验证「多个 goroutine 调用 `Read`
 不会数据竞争」，内部仍然由一把锁排队。
+
+开启订阅（`Channel.Subscribe=true`）时，`Read` 先查 Observe 的最新值表（见
+3.10.15.15）：命中且未过期就直接用推送值、不发 GET；未命中（还没收到通知、链路
+静默超过保鲜期、点位改配成别的类型）才退回一次真实 GET。绝不拿陈旧推送冒充实时。
 
 链路级失败（超时、断开）后，**剩余点位直接标同一个错误并结束**，不再逐个等超时，
 并以该错误返回。这一条在多点位设备上非常关键：否则一个掉线的设备会让一轮采集变成
@@ -5101,7 +5108,7 @@ CoAP 端点。只认 2.xx 会让大量不实现发现的老设备永远显示「
 | 不做 | 理由 |
 |---|---|
 | DTLS | 证书/密钥管理 + 握手状态机 + 防重放窗口，独立子系统 |
-| Observe 订阅 | 需要长期维护观察关系、通知序号与重连后重新注册 |
+| 分块通知（Block2 + Observe） | 一次通知要多次往返才拼完、期间还可能有更新的通知到达，会让「最新值表」语义变复杂；此时放弃该点位推送值、退回 GET |
 | Block1 分块发送 | 需要服务端配合的逐块确认；现场写入极少超过单包，半套实现比不做更危险 |
 | CBOR / SenML | 结构复杂，先明确报「不支持」，不猜 |
 | DELETE / FETCH / iPATCH | 配置工具动作，不属于采集进程 |
@@ -5109,14 +5116,62 @@ CoAP 端点。只认 2.xx 会让大量不实现发现的老设备永远显示「
 | 响应缓存 | 引入「两份数据谁更新」的问题，多一次往返可接受 |
 | JSON 读-改-写 | 隐藏的读会带来更复杂的失败模式，且掩盖「整文档替换」语义 |
 
-#### 3.10.15.14 位置与自检
+#### 3.10.15.14 Observe 订阅（RFC 7641）
+
+CoAP 的 Observe 让客户端「登记」对一个资源变化的关注：一次 `GET + Observe:0`，
+服务端在资源变化时主动推送带 Observe 序号的通知，省掉周期 GET。它正好补上「周期
+轮询采不到亚秒变化、而设备又支持推送」的场景。
+
+**独立套接字。** 订阅走自己的 UDP 套接字，不与主链路 `roundTrip` 共用。主链路是
+严格请求/响应的同步事务，一条报文要么是对某次 GET 的应答、要么是无关杂包（回 RST）；
+Observe 是长期、单向、由对端驱动的推送流，时序（重注册、保鲜、乱序丢弃）完全不同。
+混在一条链路上，会让「一次读的超时」与「一条推送的到达」互相干扰。这与 OPC UA
+「主连接取数、订阅连接推送」同构。
+
+**注册与确认。** 对每个去重后的资源路径发一次 `CON GET + Observe:0`���同路径多点位
+只观察一次，各点位共享这条观察）。服务端回 `2.05` 且带 Observe 选项即为确认，驱动
+把载荷解码后放进最新值表。注册用指数退避重发，连续失败到上限后停止，该点位退回
+真实 GET（记 `coap.observe.register_failed`），而不是让整个订阅崩掉。`Open` 阶段
+若订阅完全建不起来，会让 `Open` 失败——与 OPC UA 一致，不悄悄退化成轮询。
+
+**新鲜度（RFC 7641 §3.4）。** 这是 Observe 最容易写错的地方。通知携带 24 位 Observe
+序号 `V`，客户端必须按原算法判定「新通知是否该覆盖本地值」：
+
+1. 序号判新且按 `2²³` 模跨过 24 位回绕：`V1<V2 且 V2−V1<2²³`，或 `V1>V2 且 V1−V2>2²³`；
+2. 序号判旧/相等时，看时间窗：距上次接受 `<128s` 视为乱序/重复，丢弃；
+3. 超过 `128s` 说明重排窗口已过（或设备序号被重置），以到达顺序接受。
+
+把简单的 `next>prev` 当判据，会在序号每 `2²⁴` 次回绕一次时永久停在旧值上。算法
+集中实现为纯函数 `ObserveFresh(prev, next, prevAt, now)`，用表驱动测试钉住「单调递增、
+窗口内重复、窗口内乱序、`0xFFFFFF→0` 回绕、跨回绕、前跳过大、窗口过期」七类。
+
+**保鲜与退回 GET。** 每条推送沉淀到最新值表时记下到达时刻与通知声明的 Max-Age。
+`Read` 命中表的条件是「订阅已确认 + 值在保鲜期内 + 类型一致」。任一不成立（包括从未
+收到通知、链路静默、点位改配成别的类型、值解码出错）就退回一次真实 GET——绝不拿陈旧
+推送冒充实时。这是这类实现最危险的失效模式，测试对「链路静默后 Read 必须真读」有
+专门用例（把值的到达时间改成 10 分钟前，再验证 `Read` 拿到服务端的新值）。
+
+**通知类型。** 通知可能是 CON（必须回空 ACK）或 NON。本驱动对自带观察套接字上收到的
+任何「同 Token 的 2.05」都按通知处理；对不属于任何观察关系的 CON 回 RST（让对端停止）。
+关闭时对每个已确认观察发一次 `GET + Observe:1` 注销，再关套接字。
+
+**分块通知（边界）。** 带 Block2 的通知一次要多次往返才拼完，期间还可能有更新的通知
+到达；此时该条通知被跳过、该点位退回真实 GET。这是诚实的降级，而不是把半条通知
+当成完整值。
+
+**诊断埋点。** `coap.observe.registered`（注册成功）、`coap.observe.notification`
+（接受一条通知）、`coap.observe.stale_dropped`（丢弃乱序/重复）、
+`coap.observe.register_failed`（退避耗尽）、`coap.observe.interval`（相邻两次推送的
+间隔秒数，观察推送频率是否异常）。
+
+#### 3.10.15.15 位置与自检
 
 | 内容 | 路径 |
 |---|---|
-| 编解码 | `internal/codec/coap`（`Encode`/`Decode`、选项 delta/length、`EncodeUint`/`DecodeUint`、`EncodeBlock`/`DecodeBlock`、`SplitURI`、`ParseLinkFormat`） |
-| 主站驱动 | `internal/driver/coap`（`Meta`/`Open`/`Probe`/`Read`/`Write`/`Discover`；内部 `roundTrip`/`get`/`decodeValue`/`encodeWritePayload`/`jsonWritePayload`/`pathOptions`；诊断 `BadDatagrams`） |
+| 编解码 | `internal/codec/coap`（`Encode`/`Decode`、选项 delta/length、`EncodeUint`/`DecodeUint`、`EncodeBlock`/`DecodeBlock`、`SplitURI`、`ParseLinkFormat`；Observe：`ObserveFresh`/`Message.Observe`/`Message.MaxAge`/`ObserveRegister`/`ObserveCancel`/`ObserveSeqMask`） |
+| 主站驱动 | `internal/driver/coap`（`Meta`/`Open`/`Probe`/`Read`/`Write`/`Discover`；内部 `roundTrip`/`get`/`decodeValue`/`encodeWritePayload`/`jsonWritePayload`/`pathOptions`；Observe：`observeState`/`observePoints`/`establish`/`pump`/`handleMessage`/`lookup`/`close`；诊断 `BadDatagrams`） |
 | 共享解码 | `internal/codec/textval`（文本/JSON 标量 → 平台值；MQTT 与 CoAP 共用） |
-| 内置服务端 | `internal/sim/coap`（`NewServer`/`NewServerWithOptions`/`Addr`/`SetValue`/`Value`/`Resources`/`Requests`/`Writes`/`BlockGets`/`BadPackets`/`SeparateAcked`/`Close`） |
+| 内置服务端 | `internal/sim/coap`（`NewServer`/`NewServerWithOptions`/`Addr`/`SetValue`/`Value`/`Resources`/`Requests`/`Writes`/`BlockGets`/`BadPackets`/`SeparateAcked`/`Close`；Observe：`Observers`/`Notifications`，`SetValue` 触发推送） |
 | CLI | `uic coapread`（`-addr`/`-path`/`-selector`/`-type`/`-timeout`/`-block`/`-probe`/`-discover`/`-write`/`-payload`/`-method`/`-content-format`/`-json`/`-raw`） |
 | 示例 | `examples/coap.json`（3 台设备 12 点位，REST 8099，服务端 5683） |
 
@@ -5188,10 +5243,10 @@ uncertain，等下一轮采集确认）；加 `"confirm":true` 时会立刻回�
 
 | 层 | 用例 |
 |---|---|
-| `codec/coap` | 头字段与 TKL 边界、Token 8 字节、选项 delta/length 的 0..12/13/14 扩展与两种同时扩展、重复 Uri-Path（delta=0）、`15` 保留值拒绝、uint 编解码边界、Block2 `NUM/M/SZX` 往返与非法 SZX、URI 拆分（有无 scheme/端口/查询）、link-format 解析（带引号属性、空清单、缺 `>`） |
+| `codec/coap` | 头字段与 TKL 边界、Token 8 字节、选项 delta/length 的 0..12/13/14 扩展与两种同时扩展、重复 Uri-Path（delta=0）、`15` 保留值拒绝、uint 编解码边界、Block2 `NUM/M/SZX` 往返与非法 SZX、URI 拆分（有无 scheme/端口/查询）、link-format 解析（带引号属性、空清单、缺 `>`）、**`ObserveFresh` 七类新鲜度判定（单调/W 内重复/W 内乱序/`0xFFFFFF→0` 回绕/跨回绕/前跳过大/窗口过期）、Observe 选项 24 位往返与 0 的零长度编码、`MaxAge` 缺省 60s** |
 | `codec/textval` | 文本/JSON 标量 → bool/各宽度整数/浮点/字符串/bytes、`on/off`、科学计数法、越界（含 `int64`/`uint64` 边界、`NaN`/`±Inf`）、写路径越界与小数拒绝、`uint64` 不带符号回绕、超 2^53 的整数推断保持文本、`a.b` 与 `a[0]` selector、非整数方括号按字段名处理、整文档紧凑化 |
-| `driver/coap` | 真实 UDP 回环：纯文本/布尔/JSON selector/整文档/octets 读、Block2 3000 字节重组、服务端不认 Block2 时降级、分离响应 + 回 ACK、RST 分类、`4.04` 地址错误不计熔断、**部分失败语义（混合成功与失败时 `err==nil`、全失败才返回错误）**、PUT/POST/JSON 子树/octets 写入与回读、数组下标拒绝、只读资源拒绝、越界值在发报文前拒绝（text/json 两条路径）、`uint64` 边界回读、`Probe`/`Discover`、超时重传次数（`maxRetransmit` 0/2）、ctx 取消零发送、坏包跳过、无关 CON 回 RST、读错误后重连、`Close` 幂等、并发 Read、配置校验表、标签默认值与别名 |
-| `sim/coap` | CON/NON 响应类型与 MID 规则、同 MID 去重（写不重复执行）、Block2 多块与越界 `4.02`、`4.04`/`4.05`、Block1 `4.02`、空载荷 `4.00`、发现清单自洽（自动续块、不列自己、`rt`/`ct` 正确）、分离响应 + ACK、RST、畸形计数、块大小参数与非法回落 |
+| `driver/coap` | 真实 UDP 回环：纯文本/布尔/JSON selector/整文档/octets 读、Block2 3000 字节重组、服务端不认 Block2 时降级、分离响应 + 回 ACK、RST 分类、`4.04` 地址错误不计熔断、**部分失败语义（混合成功与失败时 `err==nil`、全失败才返回错误）**、PUT/POST/JSON 子树/octets 写入与回读、数组下标拒绝、只读资源拒绝、越界值在发报文前拒绝（text/json 两条路径）、`uint64` 边界回读、`Probe`/`Discover`、超时重传次数（`maxRetransmit` 0/2）、ctx 取消零发送、坏包跳过、无关 CON 回 RST、读错误后重连、`Close` 幂等、并发 Read、配置校验表、标签默认值与别名；**Observe：首读退回真读、推送回流到 Read 且不再真读、乱序通知被丢弃、链路静默后退回真读、`Channel.Subscribe=false` 全走真读、关闭时注销观察** |
+| `sim/coap` | CON/NON 响应类型与 MID 规则、同 MID 去重（写不重复执行）、Block2 多块与越界 `4.02`、`4.04`/`4.05`、Block1 `4.02`、空载荷 `4.00`、发现清单自洽（自动续块、不列自己、`rt`/`ct` 正确）、分离响应 + ACK、RST、畸形计数、块大小参数与非法回落；**Observe：注册回带当前序号、`SetValue` 推送递增序号通知、`Observe:1` 注销、观察者计数** |
 | `cmd/uic` | `-discover`/`-probe`/读/写/`-json`/`-raw` 的显示、`-type` 与 `-block` 校验、`-content-format` 归一化、文本值解析 |
 
 ### 3.10.16 SECS/GEM（HSMS/TCP + SECS-II：SVID/ECID 对象寻址，端口 5000）

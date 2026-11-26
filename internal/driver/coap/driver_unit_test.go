@@ -36,8 +36,10 @@ func TestMeta(t *testing.T) {
 	if m.Capabilities.Read != driver.CapSupported || m.Capabilities.Write != driver.CapSupported {
 		t.Fatalf("read/write must be supported: %+v", m.Capabilities)
 	}
-	if m.Capabilities.Subscribe != driver.CapUnsupported {
-		t.Fatal("Observe is out of scope; Subscribe must be unsupported")
+	// Observe（RFC 7641）已实现：Subscribe=true 时驱动内部订阅推送、Read 优先
+	// 用推送值。能力位必须是 supported，否则配置层不会暴露订阅开关。
+	if m.Capabilities.Subscribe != driver.CapSupported {
+		t.Fatal("Observe is implemented; Subscribe must be supported")
 	}
 	if m.Capabilities.Discovery != driver.CapSupported {
 		t.Fatal("resource discovery is implemented")

@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"strings"
 	"testing"
+	"time"
 )
 
 // TestGoldenGet 用一条真实抓包里的报文钉住头部布局。
@@ -526,4 +527,89 @@ func mustHex(t *testing.T, s string) []byte {
 		t.Fatalf("bad hex %q: %v", s, err)
 	}
 	return b
+}
+
+// ObserveFresh 是 RFC 7641 §3.4 的核心。它必须同时处理「单调递增」「乱序」
+// 「24 位回绕」与「重排窗口过期」四类，漏掉任一条现场都会看到值莫名回退。
+func TestObserveFresh(t *testing.T) {
+	base := time.Unix(1_700_000_000, 0)
+	cases := []struct {
+		name   string
+		prev   uint32
+		next   uint32
+		gap    time.Duration
+		fresh  bool
+		reason string
+	}{
+		{"单调递增", 5, 6, time.Second, true, "序号更新"},
+		{"相等即重复", 6, 6, time.Second, false, "窗口内重复丢弃"},
+		{"窗口内倒退即乱序", 7, 6, time.Second, false, "窗口内乱序丢弃"},
+		{"24 位回绕 FFFFFF→0", ObserveSeqMask, 0, time.Second, true, "V1>V2 且差>2^23"},
+		{"回绕段 F00000→100000", 0xF00000, 0x100000, time.Second, true, "跨 2^24 回绕"},
+		{"前跳≥2^23 视为旧", 0, 0x900000, time.Second, false, "窗口内前跳过大判旧"},
+		{"相等但窗口过期", 6, 6, 200 * time.Second, true, "重排窗口已过"},
+		{"倒退但窗口过期", 7, 6, 200 * time.Second, true, "重排窗口已过"},
+		{"序号按 24 位掩码", 0x1000005, 0x1000006, time.Second, true, "高位被掩掉后等价 5→6"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := ObserveFresh(c.prev, c.next, base, base.Add(c.gap))
+			if got != c.fresh {
+				t.Fatalf("ObserveFresh(%#x,%#x,+%s)=%v, want %v (%s)",
+					c.prev, c.next, c.gap, got, c.fresh, c.reason)
+			}
+		})
+	}
+}
+
+// 时间倒退（时钟回拨）且序号更新时仍应接受——时间只用于乱序保护。
+func TestObserveFreshAcceptsNewerDespiteClockBackwards(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	if !ObserveFresh(5, 6, now, now.Add(-time.Hour)) {
+		t.Fatal("序号更新时应接受，即使时钟回拨")
+	}
+}
+
+// Observe 选项的读写与 Max-Age 缺省值。
+func TestObserveOptionAndMaxAge(t *testing.T) {
+	var m Message
+	if _, ok := m.Observe(); ok {
+		t.Fatal("没有 Observe 选项时不应报告存在")
+	}
+	m.SetUintOption(OptObserve, 0) // 注册值 0 → 零长度
+	if v, ok := m.Observe(); !ok || v != 0 {
+		t.Fatalf("Observe() = (%d,%v), want (0,true)", v, ok)
+	}
+	if v, _ := m.Observe(); v != 0 {
+		t.Fatalf("Observe()=%d, want 0", v)
+	}
+	if got := m.MaxAge(); got != 60*time.Second {
+		t.Fatalf("缺省 Max-Age=%s, want 60s", got)
+	}
+	m.SetUintOption(OptMaxAge, 120)
+	if got := m.MaxAge(); got != 120*time.Second {
+		t.Fatalf("Max-Age=%s, want 120s", got)
+	}
+}
+
+// Observe 选项值必须按 24 位序号编解码往返，且 0 编码成零长度。
+func TestObserveSeqRoundTrip(t *testing.T) {
+	if b := EncodeUint(ObserveRegister); len(b) != 0 {
+		t.Fatalf("Observe:0 应编码为零长度, got %x", b)
+	}
+	for _, seq := range []uint32{1, 255, 256, 0xFFFFFF} {
+		msg := Message{Type: TypeNonConfirmable, Code: CodeContent, MID: 1}
+		msg.SetUintOption(OptObserve, seq)
+		raw, err := Encode(msg)
+		if err != nil {
+			t.Fatalf("encode seq %d: %v", seq, err)
+		}
+		back, err := Decode(raw)
+		if err != nil {
+			t.Fatalf("decode seq %d: %v", seq, err)
+		}
+		if v, ok := back.Observe(); !ok || v != seq {
+			t.Fatalf("seq %#x round-trip = (%#x,%v)", seq, v, ok)
+		}
+	}
 }

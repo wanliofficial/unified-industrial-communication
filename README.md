@@ -603,8 +603,16 @@ CoAP 的数据模型是 **URI 资源**，不是寄存器：点位用 `kind=symbo
 写入用 PUT（默认）或 POST：PUT 是**替换整个资源**，带 `selector` 时只发
 `{selector: value}` 这棵子树；驱动刻意不做隐藏的读-改-写，数组下标写入直接拒绝
 （否则会把其余元素抹成 null）。载荷格式由 `contentFormat` 选 text/json/octets，
-`text` 与 `octets` 的宽度规则与读取一致。不做 DTLS、不做 Observe 订阅、不做 Block1
-分块发送——能力声明里 `Subscribe` 是 `unsupported`，不把「一次性 GET」伪装成推送。
+`text` 与 `octets` 的宽度规则与读取一致。不做 DTLS、不做 Block1 分块发送。
+
+**Observe 订阅**（RFC 7641）：通道打开 `subscribe: true` 时，驱动用一条独立 UDP
+套接字对每个资源发 `GET + Observe:0` 登记关注，把设备推送的通知沉淀进一张最新值表；
+`Read` 在「订阅已确认 + 值未过保鲜期 + 类型一致」时直接用推送值、不再发 GET，否则
+退回一次真实 GET（绝不拿陈旧推送冒充实时）。通知的 24 位序号按 RFC 7641 §3.4 判新鲜
+（含 `2²⁴` 回绕与 128s 重排窗口），乱序/重复被丢弃；链路静默后自动退回轮询，重启
+重连后自动重注册。分块通知（Block2 + Observe）不支持，此时该点位退回 GET。能力声明
+`Subscribe` 是 `supported`——与 MQTT/OPC UA 同口径，指驱动内部订阅、上层仍是 `Read`
+拉取契约。
 
 KNXnet/IP 隧道主站 + 内置网关（楼宇自控，UDP 3671）：
 
@@ -1441,10 +1449,10 @@ make sbom     # 从产物内嵌 buildinfo 生成 CycloneDX SBOM（零第三方�
 | `internal/codec/dnp3` | DNP3 纯函数编解码（链路帧与 CRC / 流式收帧 / 传输分片重组 / 应用层请求响应 / 对象解析（含组 21/23 冻结计数器）/ 请求头 / CROB 与组 41 构造） |
 | `internal/driver/dnp3` | DNP3 主站（复位链路 + TEST_LINK、类 0/1/2/3 轮询、未请求响应、应用层确认、CROB 与模拟量直接控制、旁路表） |
 | `internal/sim/dnp3` | DNP3 内置从站（链路 ACK / 类 0 静态快照 / 三类事件队列与 inflight / 冻结计数器组 21/23 / CROB 与组 41 直接控制回显） |
-| `internal/codec/coap` | CoAP 纯函数编解码（4 字节头 / 选项 delta-len 扩展 / uint 与 Block 编解码 / URI 拆分 / link-format 解析） |
+| `internal/codec/coap` | CoAP 纯函数编解码（4 字节头 / 选项 delta-len 扩展 / uint 与 Block 编解码 / URI 拆分 / link-format 解析 / Observe 新鲜度判定） |
 | `internal/codec/textval` | 文本/JSON 标量 → 平台值（MQTT 与 CoAP 共用的类型规则；selector 取字段） |
-| `internal/driver/coap` | CoAP 主站（GET/PUT/POST、Block2 续读与降级、分离响应、指数重传、资源发现、坏包跳过） |
-| `internal/sim/coap` | CoAP 内置服务端（CON/NON / MID 去重 / Block2 / 分离响应 / RST / link-format 发现） |
+| `internal/driver/coap` | CoAP 主站（GET/PUT/POST、Block2 续读与降级、分离响应、指数重传、资源发现、坏包跳过、Observe 订阅与退回 GET） |
+| `internal/sim/coap` | CoAP 内置服务端（CON/NON / MID 去重 / Block2 / 分离响应 / RST / link-format 发现 / Observe 推送） |
 | `internal/codec/knx` | KNXnet/IP 纯函数编解码（组地址 4/4/8 与物理地址 4/4/8 / DPT 切片表与编解码 / cEMI `L_Data.req/ind/con` / 信封与全部服务报文 / HPAI） |
 | `internal/driver/knx` | KNXnet/IP 隧道主站（建隧道/心跳/断链重建、8 位序号与重传、组地址读写、`L_Data.con` 短窗口确认、源地址三级优先） |
 | `internal/sim/knx` | KNXnet/IP 内置网关（隧道分配与回收、序号严格校验与 8 位回绕、组地址对象表、`L_Data.con`、四种故障注入） |

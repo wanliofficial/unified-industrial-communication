@@ -16,10 +16,19 @@
 //     GET。不处理它，稍大的 JSON 资源会被静默截断成非法 JSON。
 //
 // 能力边界：只做明文 UDP、GET/PUT/POST、text/plain 与 application/json 载荷、
-// Block2 接收、`/.well-known/core` 资源发现。**不做 DTLS**（证书与握手是独立
-// 子系统）、**不做 Observe 订阅**（设备主动推与调度式采集的语义冲突，混进来
-// 会让超时/重连/死区三套逻辑互相干扰）、**不做 Block1 分块发送**（写载荷大
+// Block2 接收、`/.well-known/core` 资源发现，以及 **Observe 订阅**（RFC 7641：
+// 设备主动推送变化，Read 在订阅健康时用推送值、否则退回 GET）。
+//
+// **不做 DTLS**（证书与握手是独立子系统）、**不做 Block1 分块发送**（写载荷大
 // 到需要分块时，正确做法通常是改设备模型，而不是在网关里拼半个事务）。
+//
+// Observe 为什么用独立套接字：主链路是严格请求/响应的同步事务，一条报文要么
+// 是对某次 GET 的应答、要么是无关杂包（当前一律回 RST）。Observe 是长期、
+// 单向、由对端驱动的推送流，时序（重注册、保鲜、乱序丢弃）完全不同；混在
+// 一条链路上会让「一次读的超时」与「一条推送的到达」互相干扰。因此订阅走
+// 自己的 UDP 套接字，Read 优先读它沉淀的最新值表、过期或缺失时退回真实 GET
+// （与 OPC UA 的「主连接取数、订阅连接推送」同构）。带 Block2 的通知会让
+// 「最新值表」语义变复杂，此时放弃该点位推送、退回 GET——诚实的降级。
 package coap
 
 import (
@@ -110,9 +119,14 @@ func (d *Driver) Meta() driver.Meta {
 		Capabilities: driver.Capabilities{
 			Read:  driver.CapSupported,
 			Write: driver.CapSupported,
-			// Observe 不在范围内：底层可以把 2.05 通知当成一次读，
-			// 但「订阅」需要长期维护观察关系与序号，本驱动刻意不做。
-			Subscribe: driver.CapUnsupported,
+			// Observe（RFC 7641）：Channel.Subscribe=true 时，用独立套接字维持
+			// 观察关系、把设备推送的通知沉淀进最新值表，Read 在订阅健康时
+			// 用推送值、否则退回真实 GET。与 OPC UA 同口径——「订阅」指驱动
+			// 内部订阅推送，不是对外回调。
+			// 边界：明文 UDP、非分块通知。带 Block2 的通知会让「最新值表」
+			// 语义变复杂（一次通知要多次往返才拼完，期间还可能有更新的通知
+			// 到达），此时放弃该点位的推送值、退回真实 GET；DTLS 同样不在范围。
+			Subscribe: driver.CapSupported,
 			// `/.well-known/core` 是标准发现入口，已实现。
 			Discovery:   driver.CapSupported,
 			Browse:      driver.CapUnsupported,
@@ -156,7 +170,7 @@ func (d *Driver) Meta() driver.Meta {
 			{Name: "address.length", Label: "最大字节数", Type: "int", Scope: "point",
 				Help: "bytes/string 的接收上限；0 表示不限制"},
 		},
-		Description: "CoAP 主站：资源 GET/PUT/POST、Block2 分块接收、资源发现（UDP 5683）",
+		Description: "CoAP 主站：资源 GET/PUT/POST、Block2 分块接收、资源发现（UDP 5683）、Observe 订阅（RFC 7641 推送）",
 	}
 }
 
@@ -210,6 +224,32 @@ func (d *Driver) Open(ctx context.Context, cfg driver.OpenConfig) (driver.Conn, 
 			fmt.Sprintf("connect %s failed", addr), true, err)
 	}
 	c.link = link
+
+	// Subscribe=true：建立 Observe 订阅（独立套接字）。与 OPC UA 同构——
+	// 订阅建不起来就让 Open 失败，不悄悄退化成轮询：那会让「配置写着订阅、
+	// 实际在轮询」永远没人发现。没有启用/可规划的点位时退回纯轮询。
+	if cfg.Channel.Subscribe {
+		obsPoints, err := observePoints(cfg, c.byID)
+		if err != nil {
+			_ = c.Close()
+			return nil, driver.E(driver.ErrAddress, "open", cfg.Device.ID, err.Error(), false, err)
+		}
+		if len(obsPoints) > 0 {
+			obs := newObserveState(cfg.Device.ID,
+				func(ctx context.Context) (obsLink, error) {
+					return c.dial(ctx, addr, c.timeout)
+				},
+				obsPoints, cfg.Metrics)
+			if err := obs.establish(ctx); err != nil {
+				_ = c.Close()
+				return nil, err
+			}
+			subCtx, cancel := context.WithCancel(context.Background())
+			c.obs = obs
+			c.subCancel = cancel
+			obs.start(subCtx)
+		}
+	}
 	return c, nil
 }
 
@@ -372,6 +412,12 @@ type conn struct {
 	points []pointPlan
 	byID   map[string]pointPlan
 
+	// obs 是 Observe 订阅状态（Channel.Subscribe=true 时建立）。为 nil 表示
+	// 未订阅，Read 一律走真实 GET。它与主链路 c.link 用不同套接字：观察是
+	// 长期单向推送流，与主链路的同步请求/响应时序互不干扰。
+	obs       *observeState
+	subCancel context.CancelFunc
+
 	// badDatagrams 记录解析失败的报文数，供 CLI/诊断观察。它不影响
 	// 事务：UDP 上收到别人的包或被截断的包都不该让当前请求失败。
 	badDatagrams uint64
@@ -384,6 +430,14 @@ func (c *conn) Close() error {
 		return nil
 	}
 	c.closed = true
+	// 先停 Observe 泵（它会向对端注销观察、关自己的套接字），再关主链路。
+	// 顺序无关紧要——两者用不同套接字——但先停泵避免在关主链路时 pump 还在写。
+	if c.subCancel != nil {
+		c.subCancel()
+	}
+	if c.obs != nil {
+		c.obs.close()
+	}
 	link := c.link
 	c.link = nil
 	if link != nil {
@@ -620,6 +674,18 @@ func (c *conn) Read(ctx context.Context, spans []driver.ReadSpan) ([]driver.RawS
 				if firstErr == nil {
 					firstErr = e
 				}
+				continue
+			}
+		}
+		// 订阅健康时优先用推送值：它在「订阅确认 + 未过保鲜期 + 类型一致」时
+		// 替代真实 GET（与 OPC UA 同口径）。任一条件不成立（含从未收到通知、
+		// 链路静默、点位改配）就退回一次真实 GET——绝不拿陈旧值冒充实时。
+		if c.obs != nil {
+			if sv, ok := c.obs.lookup(ref.ID, plan.typ); ok {
+				if sv.Err == nil {
+					goodSamples++
+				}
+				out = append(out, sv)
 				continue
 			}
 		}

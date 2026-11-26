@@ -4,10 +4,13 @@
 // NON 响应、重复 MID 去重、Block2 分块、`/.well-known/core` 资源发现，以及
 // 一条用于验证「分离响应」的路径（先回空 ACK，再用新的 MID 发响应）。
 //
+// **Observe**（RFC 7641）：服务端按 GET 请求里的 Observe 选项维护观察关系，
+// 资源内容变化（SetValue）时向观察者主动推送带递增序号的通知。用于验证
+// 客户端的注册、新鲜度判定、ACK CON 通知与退回 GET 的降级路径。
+//
 // 刻意不做：
 //
 //   - **DTLS**：内置服务端只讲明文 UDP，与驱动一致。
-//   - **Observe**：资源发现里不会出现 `obs`，避免驱动误以为可以订阅。
 //   - **Block1**：收到带 Block1 的写请求直接回 4.02；驱动也不发。
 //
 // 去重缓存的语义与真实服务端一致：同一个客户端用同一个 MID 重复发 CON，
@@ -21,6 +24,7 @@ import (
 	"net"
 	"sort"
 	"sync"
+	"time"
 
 	coapcodec "uic/internal/codec/coap"
 )
@@ -51,6 +55,14 @@ type resource struct {
 	reset    bool // 直接回 RST
 }
 
+// observer 是一个已注册观察关系的客户端（RFC 7641）。
+type observer struct {
+	peer   *net.UDPAddr
+	token  []byte
+	seq    uint32 // 最近一次通知的 Observe 序号
+	maxAge time.Duration
+}
+
 // Server 是内置 CoAP 服务端。
 type Server struct {
 	conn      *net.UDPConn
@@ -61,6 +73,11 @@ type Server struct {
 	resources map[string]*resource
 	order     []string
 
+	// observers 按资源路径索引观察者，供 SetValue 推送通知。token 区分同一
+	// 客户端对同一资源的多次观察（重新注册会替换旧的）。
+	observers  map[string][]*observer
+	nextObsSeq uint32
+
 	dedup      map[dedupKey]cachedResponse
 	dedupOrder []dedupKey
 	nextMID    uint16
@@ -70,6 +87,9 @@ type Server struct {
 	blockGets  int
 	badPackets int
 	separateOK bool
+
+	// notify 统计主动推送的通知数（测试/诊断用）。
+	notify int
 }
 
 type dedupKey struct {
@@ -108,6 +128,7 @@ func NewServerWithOptions(addr string, opt Options) (*Server, error) {
 		blockSize: blockSize,
 		noBlock2:  opt.DisableBlock2,
 		resources: map[string]*resource{},
+		observers: map[string][]*observer{},
 		dedup:     map[dedupKey]cachedResponse{},
 		nextMID:   0x8000,
 	}
@@ -167,16 +188,71 @@ func (s *Server) SeparateAcked() bool {
 }
 
 // SetValue 直接改写某个资源的内容（测试夹具用）。
+//
+// 若该资源有观察者，改动后会向每个观察者推送一条通知（带递增 Observe 序号、
+// 资源当前的 Content-Format 与内容）。推送在释放锁之后进行，避免持锁做 I/O。
 func (s *Server) SetValue(path string, body string) bool {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	r, ok := s.resources[path]
 	if !ok {
+		s.mu.Unlock()
 		return false
 	}
 	r.body = []byte(body)
 	r.onGet = nil
+	obs := append([]*observer(nil), s.observers[path]...)
+	format := r.format
+	s.mu.Unlock()
+
+	for _, o := range obs {
+		s.pushNotify(path, o, format, []byte(body))
+	}
 	return true
+}
+
+// pushNotify 向单个观察者推送一条通知（NON，避免与服务端对 CON 的 ACK 状态
+// 机纠缠；RFC 7641 允许通知用 NON）。序号每资源递增。
+func (s *Server) pushNotify(path string, o *observer, format uint16, body []byte) {
+	s.mu.Lock()
+	s.nextObsSeq++
+	seq := s.nextObsSeq & coapcodec.ObserveSeqMask
+	mid := s.nextMID
+	s.nextMID++
+	if s.nextMID == 0 {
+		s.nextMID = 1
+	}
+	s.notify++
+	s.mu.Unlock()
+
+	msg := coapcodec.Message{
+		Type: coapcodec.TypeNonConfirmable, Code: coapcodec.CodeContent,
+		MID: mid, Token: append([]byte(nil), o.token...),
+		Options: []coapcodec.Option{
+			{Number: coapcodec.OptObserve, Value: coapcodec.EncodeUint(seq)},
+			{Number: coapcodec.OptContentFormat, Value: coapcodec.EncodeUint(uint32(format))},
+			{Number: coapcodec.OptMaxAge, Value: coapcodec.EncodeUint(uint32(o.maxAge / time.Second))},
+		},
+		Payload: append([]byte(nil), body...),
+	}
+	b, err := coapcodec.Encode(msg)
+	if err != nil {
+		return
+	}
+	_, _ = s.conn.WriteToUDP(b, o.peer)
+}
+
+// Notifications 返回主动推送的通知数。
+func (s *Server) Notifications() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.notify
+}
+
+// Observers 返回某资源的观察者数量。
+func (s *Server) Observers(path string) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.observers[path])
 }
 
 // Value 返回某个资源当前的内容。
@@ -341,7 +417,7 @@ func (s *Server) handle(dg []byte, from *net.UDPAddr) {
 		}
 	}
 
-	out := s.build(msg)
+	out := s.build(msg, from)
 	if out.reset {
 		b, err := coapcodec.Encode(coapcodec.Message{
 			Type: coapcodec.TypeReset, Code: coapcodec.CodeEmpty, MID: msg.MID,
@@ -412,7 +488,7 @@ type outcome struct {
 	payload  []byte
 }
 
-func (s *Server) build(msg coapcodec.Message) outcome {
+func (s *Server) build(msg coapcodec.Message, from *net.UDPAddr) outcome {
 	path := msg.Path()
 
 	s.mu.Lock()
@@ -442,6 +518,21 @@ func (s *Server) build(msg coapcodec.Message) outcome {
 			body = r.onGet()
 		}
 		out := s.buildContent(r, msg, body)
+		// Observe：按 GET 里的 Observe 选项注册（值=0）、注销（值=1）。注册时
+		// 在首条响应里带上当前序号，之后 SetValue 推送递增序号。
+		if ov, has := msg.UintOption(coapcodec.OptObserve); has {
+			switch ov & coapcodec.ObserveSeqMask {
+			case coapcodec.ObserveRegister:
+				if out.code == coapcodec.CodeContent {
+					seq := s.registerObserver(path, from, msg.Token)
+					out.options = append(out.options, coapcodec.Option{
+						Number: coapcodec.OptObserve, Value: coapcodec.EncodeUint(seq),
+					})
+				}
+			case coapcodec.ObserveCancel:
+				s.deregisterObserver(path, from, msg.Token)
+			}
+		}
 		// 分离响应是资源属性：只有 `/separate` 会先回空 ACK。漏掉这一行，
 		// 客户端就只能看到一条搭载响应，分离路径完全测不到。
 		out.separate = r.separate
@@ -545,4 +636,58 @@ func (s *Server) cacheResponse(key dedupKey, c cachedResponse) {
 		}
 	}
 	s.dedup[key] = c
+}
+
+// registerObserver 登记一个观察者并返回当前 Observe 序号。同 peer+token 重复
+// 注册会替换旧的（客户端重注册是常态）。调用方持有 s.mu。
+func (s *Server) registerObserver(path string, from *net.UDPAddr, token []byte) uint32 {
+	peer := from.String()
+	list := s.observers[path]
+	for _, o := range list {
+		if o.peer.String() == peer && bytesEqual(o.token, token) {
+			// 重复注册：保留序号继续递增，刷新 maxAge。
+			return o.seq
+		}
+	}
+	s.nextObsSeq++
+	seq := s.nextObsSeq & coapcodec.ObserveSeqMask
+	o := &observer{
+		peer:   from,
+		token:  append([]byte(nil), token...),
+		seq:    seq,
+		maxAge: 60 * time.Second,
+	}
+	s.observers[path] = append(list, o)
+	return seq
+}
+
+// deregisterObserver 移除某个观察者。调用方持有 s.mu。
+func (s *Server) deregisterObserver(path string, from *net.UDPAddr, token []byte) {
+	peer := from.String()
+	list := s.observers[path]
+	out := list[:0]
+	for _, o := range list {
+		if o.peer.String() == peer && bytesEqual(o.token, token) {
+			continue
+		}
+		out = append(out, o)
+	}
+	if len(out) == 0 {
+		delete(s.observers, path)
+	} else {
+		s.observers[path] = out
+	}
+}
+
+// bytesEqual 比较两个切片。
+func bytesEqual(a, b []byte) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }

@@ -699,8 +699,10 @@ type Channel struct {
 	Rack int `json:"rack,omitempty"`
 	Slot int `json:"slot,omitempty"`
 
-	// Subscribe 是 OPC UA 的取数方式开关（其他协议忽略）：true 表示
-	// 让服务端建立订阅、主动推送变化；false（默认）表示每轮用 Read 轮询。
+	// Subscribe 是推送型协议的取数方式开关：OPC UA、MQTT、IEC 104、CoAP
+	// 的 Observe 用它决定「驱动内部订阅、Read 优先用推送值」；其余协议忽略。
+	// true 表示让服务端/设备建立订阅、主动推送变化；false（默认）表示每轮
+	// 用 Read 轮询。CoAP 还需服务端支持 Observe（RFC 7641），不支持时退回 GET。
 	//
 	// 为什么是一个显式开关而不是「自动挑最好的」：两者的失败模式、
 	// 带宽特征与服务端负载完全不同。自动切换会让同一份配置在两种

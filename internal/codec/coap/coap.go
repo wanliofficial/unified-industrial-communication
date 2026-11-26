@@ -24,6 +24,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // Version1 是当前唯一的 CoAP 版本。
@@ -362,6 +363,62 @@ func DecodeUint(b []byte) uint32 {
 		v = v<<8 | uint32(c)
 	}
 	return v
+}
+
+// ---------------------------------------------------------------------------
+// Observe（RFC 7641）
+// ---------------------------------------------------------------------------
+
+const (
+	// ObserveRegister 是注册观察时的 Observe 选项值（GET + Observe:0）。
+	ObserveRegister uint32 = 0
+	// ObserveCancel 是取消观察的 Observe 选项值（GET + Observe:1）。
+	ObserveCancel uint32 = 1
+	// ObserveSeqMask 是 Observe 序号的有效位宽：24 位（RFC 7641 §2）。
+	ObserveSeqMask uint32 = 1<<24 - 1
+)
+
+// reorderWindow 是 RFC 7641 §3.4 重排/回绕判定的时间窗：128 秒。
+const reorderWindow = 128 * time.Second
+
+// ObserveFresh 判定一条新通知是否「新鲜」——即它应当覆盖本地已接受的值。
+//
+// 这是 RFC 7641 §3.4 的原算法，三条分支缺一不可，抄漏任何一条都会让「设备
+// 重启把序号归零」「多包乱序」这类现场问题变成『值莫名其妙退回去』：
+//
+//  1. 序号判新，且必须按 2^23 的模跨过 24 位回绕：
+//     V1<V2 且 V2-V1<2^23，或 V1>V2 且 V1-V2>2^23（回绕后 V2 反而变小）。
+//  2. 序号判旧/相等时，看时间窗：now-prevAt < 128s 视为乱序/重复，丢弃。
+//  3. 超过 128s 说明重排窗口已过（或设备序号被重置），以到达顺序为准接受。
+//
+// 第 1 项命中时直接接受，不受时间影响：时间只在「序号看起来更旧」时用来
+// 分辨『真旧』与『回绕后被误判为旧』。把简单的 next>prev 当成判据，会在
+// 序号每 2^24 次回绕一次时永久停滞在旧值上。
+func ObserveFresh(prev, next uint32, prevAt, now time.Time) bool {
+	prev &= ObserveSeqMask
+	next &= ObserveSeqMask
+	seqNewer := (prev < next && next-prev < 1<<23) || (prev > next && prev-next > 1<<23)
+	if seqNewer {
+		return true
+	}
+	return now.Sub(prevAt) >= reorderWindow
+}
+
+// Observe 读取 Observe 选项的 24 位序号；没有该选项时返回 false。
+func (m Message) Observe() (uint32, bool) {
+	v, ok := m.UintOption(OptObserve)
+	if !ok {
+		return 0, false
+	}
+	return v & ObserveSeqMask, true
+}
+
+// MaxAge 返回 Max-Age 选项换算出的时长；缺省按 RFC 7252 §5.10.5 为 60 秒。
+func (m Message) MaxAge() time.Duration {
+	if v, ok := m.UintOption(OptMaxAge); ok {
+		return time.Duration(v) * time.Second
+	}
+	return 60 * time.Second
 }
 
 // maxOptionValue 是选项长度编码能表达的上限（14 + 65535）。
