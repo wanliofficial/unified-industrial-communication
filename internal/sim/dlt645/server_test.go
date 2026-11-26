@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"sync"
 	"testing"
 	"time"
 
@@ -305,6 +306,117 @@ func TestSimReadAddress(t *testing.T) {
 	}
 	if !bytes.Equal(fr.Data, []byte{0x42, 0, 0, 0, 0, 0}) {
 		t.Fatalf("addr data = % X", fr.Data)
+	}
+}
+
+// TestSimShortAddressRepliesActualAddress 钉住标准 §5.2.2：缩位寻址（高位
+// 补 AA 通配）时，从站应答的地址域必须返回**实际通信地址**，不能原样回显
+// 请求里的 AA。正常应答与异常应答都要遵守——主站靠地址域确认「应答我的
+// 是点名的哪块表」，回显通配符会让「别的表应答」永远无法被检出。
+func TestSimShortAddressRepliesActualAddress(t *testing.T) {
+	srv, err := NewServer("127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = srv.Close() }()
+	c, done := dialSim(t, srv)
+	defer done()
+
+	// 缩位写 "42"：线上地址域为 AA AA AA AA 00 42。
+	short := simAddr(t, "42")
+
+	for _, tc := range []struct {
+		name string
+		di   string
+		exc  bool
+	}{
+		{name: "正常应答", di: "02010100"},
+		{name: "异常应答", di: "0400040A", exc: true},
+	} {
+		req, err := dlt.ReadRequest(short, mustDI(t, tc.di))
+		if err != nil {
+			t.Fatal(err)
+		}
+		fr, ok := roundTrip(t, c, req)
+		if !ok {
+			t.Fatalf("%s: no reply", tc.name)
+		}
+		if fr.IsError() != tc.exc {
+			t.Fatalf("%s: IsError = %v, want %v", tc.name, fr.IsError(), tc.exc)
+		}
+		if got := fr.AddrString(); got != "000000000042" {
+			t.Fatalf("%s: 应答地址 = %s，必须回实际地址 000000000042（不能回显 AA）", tc.name, got)
+		}
+	}
+}
+
+// TestSimAddressAccessIsLocked 钉住「读地址必须加锁」。写通信地址（0x14 +
+// DI 04000401）会在运行期改 s.addr；Address()/handle() 若直接读 s.addr，
+// -race 下就是数据竞争，且可能读到一个撕开的地址。
+func TestSimAddressAccessIsLocked(t *testing.T) {
+	srv := newServer()
+	short := simAddr(t, "42")
+	req, err := dlt.ReadRequest(short, mustDI(t, "02010100"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	fr, _, err := dlt.Parse(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 2000; i++ {
+			_ = srv.Address()
+			_, _ = srv.handle(fr)
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 2000; i++ {
+			srv.mu.Lock()
+			srv.addr[0] = byte(i % 256)
+			srv.mu.Unlock()
+		}
+	}()
+	wg.Wait()
+}
+
+// TestSimBroadcastReadIsSilent 钉住标准：广播地址（全 99）只对广播校时/广播
+// 冻结有效，其余命令必须静默。若读/写也应答，总线上所有表会同时抢答，主站
+// 收到的是若干帧交叠后的噪声。
+func TestSimBroadcastReadIsSilent(t *testing.T) {
+	srv, err := NewServer("127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = srv.Close() }()
+	c, done := dialSim(t, srv)
+	defer done()
+
+	before := srv.Value("04000101")
+
+	read, err := dlt.ReadRequest(dlt.Broadcast(), mustDI(t, "02010100"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fr, ok := roundTrip(t, c, read); ok {
+		t.Fatalf("广播读不应答，实际回了 ctrl=%#x addr=%s", fr.Ctrl, fr.AddrString())
+	}
+
+	write, err := dlt.WriteRequest(dlt.Broadcast(), mustDI(t, "04000101"), 0x02,
+		[3]byte{}, [4]byte{}, []byte{0x56, 0x34, 0x12, 0x07, 0x11, 0x26})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fr, ok := roundTrip(t, c, write); ok {
+		t.Fatalf("广播写不应答，实际回了 ctrl=%#x", fr.Ctrl)
+	}
+	if after := srv.Value("04000101"); !bytes.Equal(after, before) {
+		t.Fatalf("广播写不应落盘：% X -> % X", before, after)
 	}
 }
 

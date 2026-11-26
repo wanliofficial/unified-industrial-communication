@@ -196,7 +196,19 @@ func (s *Server) Addr() string {
 }
 
 // Address 返回通信地址文本。
-func (s *Server) Address() string { return dlt.FormatAddr(s.addr) }
+func (s *Server) Address() string { return dlt.FormatAddr(s.actualAddr()) }
+
+// actualAddr 返回从站当前的实际通信地址。
+//
+// 必须持锁读取：写通信地址（0x14 + DI 04000401/04000102）会在运行期改
+// s.addr，而 Address()/应答组帧可能在另一条 TCP 连接上同时发生。用一口
+// 未加锁的 s.addr 读会让 -race 报错，也会让「刚改完地址」的应答带上一个
+// 撕开的地址。
+func (s *Server) actualAddr() [dlt.AddrLen]byte {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.addr
+}
 
 // SetValue 直接设置数据项（未加 0x33 的真值，低字节在前）。
 func (s *Server) SetValue(di string, raw []byte) error {
@@ -344,9 +356,21 @@ func (s *Server) handle(fr dlt.Frame) ([]byte, bool) {
 	s.requests++
 	s.mu.Unlock()
 
-	// 广播地址只对特定的两类命令有效。
+	// 广播地址（全 99）只对「广播校时」与「广播冻结」有效，且从站不应答。
+	// 其余命令（读/读后续/读地址/写/拉合闸）发到广播地址是无效的：必须保持
+	// 静默，否则总线上所有表会同时抢答，听起来像一串永远对不齐的乱码。
 	broadcast := fr.Addr == dlt.Broadcast()
-	if !broadcast && !dlt.MatchAddr(s.addr, fr.Addr) {
+	my := s.actualAddr()
+	if broadcast {
+		switch fr.Ctrl {
+		case dlt.CtrlBroadcastTime:
+			s.handleBroadcastTime(fr)
+		case dlt.CtrlFreeze:
+			// 本从站不维护冻结状态；标准要求执行但不应答。
+		}
+		return nil, true
+	}
+	if !dlt.MatchAddr(my, fr.Addr) {
 		// 总线上不是我的事：保持静默。替别人的地址应答是串扰。
 		return nil, true
 	}
@@ -356,20 +380,13 @@ func (s *Server) handle(fr dlt.Frame) ([]byte, bool) {
 	case dlt.CtrlReadNext:
 		return s.handleReadNext(fr)
 	case dlt.CtrlReadAddr:
-		if broadcast {
-			return nil, true
-		}
 		// 应答的地址域必须是**实际地址**，不能原样回显请求里的全 AA：
 		// 主站靠它确认「应答我的是我点名的那块表」。
-		return s.build(s.addr, dlt.CtrlReadAddr|dlt.BitReply, s.addr[:])
+		return s.build(my, dlt.CtrlReadAddr|dlt.BitReply, my[:])
 	case dlt.CtrlWrite:
 		return s.handleWrite(fr)
 	case dlt.CtrlFreeze:
-		// 广播冻结：执行但不应答。
-		if broadcast {
-			return nil, true
-		}
-		return s.build(fr.Addr, dlt.CtrlFreeze|dlt.BitReply, nil)
+		return s.build(my, dlt.CtrlFreeze|dlt.BitReply, nil)
 	case dlt.CtrlBroadcastTime:
 		s.handleBroadcastTime(fr)
 		return nil, true
@@ -415,13 +432,16 @@ func (s *Server) handleRead(fr dlt.Frame) ([]byte, bool) {
 		raw = tb[:]
 	}
 	ctrl := byte(dlt.CtrlRead | dlt.BitReply)
+	// 应答地址必须是**实际地址**：缩位读（高位 AA 通配）时不能原样回显
+	// 请求地址，标准 §5.2.2 要求从站应答帧返回真实通信地址。
+	addr := s.actualAddr()
 	// 超过单帧容量才拆帧。块大小固定为 followChunk：读后续应答还要多带
 	// 一个帧序号字节，所以它比 MaxData-4 少 1，这样两种帧都在 L≤200 内。
 	if len(raw) > followChunk {
 		ctrl |= dlt.BitFollow
-		return s.buildWith(fr.Addr, ctrl, di, raw[:followChunk], 0)
+		return s.buildWith(addr, ctrl, di, raw[:followChunk], 0)
 	}
-	return s.buildWith(fr.Addr, ctrl, di, raw, 0)
+	return s.buildWith(addr, ctrl, di, raw, 0)
 }
 
 func (s *Server) handleReadNext(fr dlt.Frame) ([]byte, bool) {
@@ -452,7 +472,7 @@ func (s *Server) handleReadNext(fr dlt.Frame) ([]byte, bool) {
 		rest = rest[:followChunk]
 		ctrl |= dlt.BitFollow
 	}
-	return s.buildWith(fr.Addr, ctrl, di, rest, seq)
+	return s.buildWith(s.actualAddr(), ctrl, di, rest, seq)
 }
 
 func (s *Server) handleWrite(fr dlt.Frame) ([]byte, bool) {
@@ -485,7 +505,7 @@ func (s *Server) handleWrite(fr dlt.Frame) ([]byte, bool) {
 		s.mu.Unlock()
 		return s.exception(fr, dlt.CtrlWrite, dlt.ErrOther), false
 	}
-	replyAddr := fr.Addr
+	replyAddr := s.addr
 	if len(payload) > 0 {
 		v.Raw = append([]byte(nil), payload...)
 		// 写时钟同时推进内部时钟：读路径是从 s.clock 生成时间的，
@@ -541,7 +561,7 @@ func (s *Server) handleRelay(fr dlt.Frame) ([]byte, bool) {
 	s.relay = action
 	s.relayAt = time.Now()
 	s.mu.Unlock()
-	return s.build(fr.Addr, dlt.CtrlRelay|dlt.BitReply, nil)
+	return s.build(s.actualAddr(), dlt.CtrlRelay|dlt.BitReply, nil)
 }
 
 // ---------------------------------------------------------------------------
@@ -568,8 +588,10 @@ func (s *Server) buildWith(addr [dlt.AddrLen]byte, ctrl byte, di dlt.DI, data []
 	return s.build(addr, ctrl, out)
 }
 
-func (s *Server) exception(fr dlt.Frame, ctrl, code byte) []byte {
-	out, _ := dlt.Build(fr.Addr, ctrl|dlt.BitReply|dlt.BitError, []byte{code})
+// exception 组异常应答。地址域同样用**实际地址**：缩位请求的异常应答也
+// 必须让主站能确认是哪块表拒绝的。fr 只用于调用处保持对称，不再回显。
+func (s *Server) exception(_ dlt.Frame, ctrl, code byte) []byte {
+	out, _ := dlt.Build(s.actualAddr(), ctrl|dlt.BitReply|dlt.BitError, []byte{code})
 	return out
 }
 

@@ -764,7 +764,15 @@ func fromDateCompact(v float64) (time.Time, error) {
 	}
 	// 年取 0：EncodeDate 只用月/日/时/分，用一个具体年份只会让调用方
 	// 误以为这个数据项里真的有年。
-	return time.Date(0, time.Month(mon), day, hour, min, 0, 0, time.Local), nil
+	t := time.Date(0, time.Month(mon), day, hour, min, 0, 0, time.Local)
+	// 字段都合法但日期不存在（2 月 30 日、4 月 31 日）时 time.Date 会静默
+	// 归一化到下个月。反向比对拒绝——否则「把结算日写成 2 月 30 日」会变成
+	// 3 月 1/2 日，而且不报错，表会在错误的日子结算。与 fromCompact 对
+	// 14 位完整时间的处置保持一致。
+	if int(t.Month()) != mon || t.Day() != day {
+		return time.Time{}, fmt.Errorf("%02d-%02d 不存在", mon, day)
+	}
+	return t, nil
 }
 
 // fromCompact 把 Decode 输出的 YYYYMMDDhhmmss 还原成时间。

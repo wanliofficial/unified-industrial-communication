@@ -144,6 +144,44 @@ func TestReadEnergyVoltageCurrent(t *testing.T) {
 	}
 }
 
+// TestReadShortAddress 缩位地址（高位补 AA）端到端：从站应答必须带实际地
+// 址（标准 §5.2.2），主站按「请求里的 AA 是通配」匹配，不能把实际地址误判成
+// 「另一块表在应答」。
+func TestReadShortAddress(t *testing.T) {
+	srv := startSim(t)
+	dev := model.Device{
+		ID: "meter", ChannelID: "ch", Enabled: true,
+		Interval: model.Duration(time.Second),
+		Timeout:  model.Duration(2 * time.Second),
+		Labels:   map[string]string{"address": "42"},
+		Points: []model.Point{{
+			ID: "v", Enabled: true, DataType: model.TypeFloat64,
+			Address: model.Address{Kind: model.AddressRegister, Area: "02010100", Bit: -1},
+		}},
+	}
+	c, err := New().Open(context.Background(), driver.OpenConfig{
+		Channel: model.Channel{ID: "ch", Protocol: "dlt645",
+			Transport: model.Transport{Kind: "tcp", Address: srv.Addr()},
+			Timeout:   model.Duration(2 * time.Second)},
+		Device: dev,
+	})
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer func() { _ = c.Close() }()
+
+	got, err := c.Read(context.Background(), points("02010100"))
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if len(got) != 1 || got[0].Err != nil {
+		t.Fatalf("sample = %+v", got)
+	}
+	if got[0].Value.Num != 220.0 {
+		t.Fatalf("voltage = %v", got[0].Value.Num)
+	}
+}
+
 func TestReadDemandTimestamp(t *testing.T) {
 	srv := startSim(t)
 	c := openConn(t, srv.Addr())
@@ -764,6 +802,8 @@ func TestWriteTimeRejectsInvalidDate(t *testing.T) {
 		{"04000101", 20261307120000}, // 13 月
 		{"04000101", 20260230120000}, // 2 月 30 日
 		{"04000B01", 13320000},       // 月=13 的结算日
+		{"04000B01", 2301200},        // 2 月 30 日 12:00（MMDDhhmm）
+		{"04000B01", 4310000},        // 4 月 31 日 00:00（4 月只有 30 天）
 		{"04000B01", 42},             // 既不是 MMDDhhmm 也不是完整时间
 	} {
 		res, werr := c.Write(context.Background(), []driver.WriteRequest{{
