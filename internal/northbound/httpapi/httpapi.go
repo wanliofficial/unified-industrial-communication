@@ -196,6 +196,10 @@ type Health struct {
 	// 进程活着、HTTP 在响应，但调度器是否还在转？卡死时这里为 stalled，
 	// 并会在 Problems 里出现一条 state=stalled 的条目。
 	Scheduler SchedulerHealth `json:"scheduler"`
+	// Clock 是系统时钟相对单调钟的监测。它不参与 status 判定（见 ClockHealth），
+	// 但让「数据时间戳是否可信」成为一个可被监控抓取、可被告警判定的状态，而不
+	// 是只能事后翻日志的猜测。
+	Clock ClockHealth `json:"clock"`
 }
 
 // SchedulerHealth 是采集调度中枢的活性快照。
@@ -206,6 +210,64 @@ type SchedulerHealth struct {
 	AgeMs int64 `json:"ageMs"`
 	// StallAfterMs 是判定卡死的阈值（毫秒），便于调用方理解 verdict。
 	StallAfterMs int64 `json:"stallAfterMs,omitempty"`
+}
+
+// ClockHealth 是系统时钟相对单调钟的监测快照。
+//
+// 它回答的不是「现在几点」——那只能跟外部时间源比——而是「这个进程的墙钟是否还
+// 是当初那个墙钟」。样本采集时刻、Outbox 的 TTL、历史保留窗口都取自 time.Now()，
+// 而 time.Now() 会被 NTP 步进、容器迁移、人工改时、虚拟机快照恢复改变。墙钟一旦
+// 分叉，这些逻辑不会报错，只会安静地算错：向前跳变让 TTL 提前到期、把一批还没送
+// 出去的数据丢掉；向后跳变让样本时间戳倒流，按时间去重的消费方漏数。因此「时钟
+// 是不是可信」必须是一个可判定的健康状态，而不是只能事后翻日志的猜测。
+//
+// 它不参与 Health.Status：时钟被拨过是事实，不是故障。一台网关完全可以在时钟
+// 跳变 8 小时后照常采集、照常投递——数据里带着跳变事实，而不是网关本身坏了。判它
+// 坏的是接在下游的告警，不是 /health 的 status。这也是把跳变从 Problems 里排除的
+// 原因：把事实写进故障列表，运维迟早学会忽略那一行。
+type ClockHealth struct {
+	// Verdict 取值 unknown | ok | drifted | jumped。
+	//
+	//   - unknown：还没采到样，无从判断。
+	//   - ok：没见过跳变，累计偏移也在阈值以内。
+	//   - drifted：没见过跳变，但墙钟已相对单调钟累计偏移超过阈值——长时间不对时
+	//     或 NTP 缓慢调谐的累积。
+	//   - jumped：至少发生过一次跳变。累计事实，不会自行恢复：曾经被拨过就是发生
+	//     过，把它忘掉才是隐瞒。
+	Verdict string `json:"verdict"`
+	// OffsetSeconds 是累计偏移（墙钟相对单调钟），正数表示墙钟跑得快、回拨为负。
+	OffsetSeconds float64 `json:"offsetSeconds"`
+	// Jumps 是按方向拆分的跳变次数。
+	Jumps ClockJumpCounts `json:"jumps"`
+	// LastJump 是最近一次跳变；nil 表示从未发生。
+	LastJump *ClockJump `json:"lastJump,omitempty"`
+	// AgeMs 是最近一次采样距今的毫秒数（unknown 时为 0）。它不是「时间准不准」，
+	// 而是「采样协程是不是还活着」——采样挂在 runtime 已有的 1s watchdog tick 上，
+	// 进程还在但那条 tick 停摆时，这个值会一直涨，verdict 却冻在最后一次采样上。
+	// 夹到非负：health 可能在采样之后、下一次 tick 之前被调用，用 now 减一个
+	// 未来时刻的采样会得到负数，那没有意义。
+	AgeMs int64 `json:"ageMs"`
+	// StepThresholdMs 是判定跳变所用的阈值（毫秒），便于调用方理解 verdict。
+	StepThresholdMs int64 `json:"stepThresholdMs"`
+}
+
+// ClockJumpCounts 是跳变次数的按方向拆分。
+type ClockJumpCounts struct {
+	// Forward 是墙钟向前跳（time.Date 往后拨）的次数。
+	Forward uint64 `json:"forward"`
+	// Backward 是墙钟回拨（time.Date 往前拨）的次数。
+	Backward uint64 `json:"backward"`
+}
+
+// ClockJump 是一次被判定为跳变的记录。
+type ClockJump struct {
+	// At 是检测到跳变时读到的墙钟时刻，也就是跳变**之后**的值。向后跳变时它会早
+	// 于真正的检测时刻——这不是笔误，而是「此刻墙上钟显示几点」的忠实记录。
+	At string `json:"at"`
+	// Seconds 是有符号幅度（秒）：正数=墙钟向前跳，负数=回拨。
+	Seconds float64 `json:"seconds"`
+	// Direction 取值 forward | backward。
+	Direction string `json:"direction"`
 }
 
 // Check 是就绪检查的一项。

@@ -32,6 +32,7 @@ import (
 	"uic/internal/audit"
 	"uic/internal/auth"
 	"uic/internal/cache"
+	"uic/internal/clockmon"
 	"uic/internal/config"
 	"uic/internal/driver"
 	adsdrv "uic/internal/driver/ads"
@@ -94,6 +95,14 @@ type Options struct {
 	// 心跳文件写 <DataDir>/heartbeat.json，供不访问 HTTP 的外部 supervisor 判断
 	// 「进程活着但采集中枢卡死」。禁用只影响这一个外部信号，不影响 /healthz。
 	HeartbeatInterval time.Duration
+
+	// ClockSource 是系统时钟的采样源。为 nil 时用 clockmon.SystemSource()。
+	//
+	// 它是测试注入缝而不是配置项：时钟跳变检测不需要「用户可调的阈值」——阈值
+	// 取 1s 是一个有依据的常量（见 internal/clockmon），配置化只会带来「运维
+	// 随手调成 0 从而每分钟报一次跳变」的风险。但「墙钟被拨了 1.5 秒」这种场景
+	// 无法靠等待真实系统时间变化来测试，因此必须允许替换采样源。
+	ClockSource func() clockmon.Reading
 }
 
 // northboundSink 是 MQTT 北向的两种载荷格式共用的接口。
@@ -195,6 +204,13 @@ type Runtime struct {
 	// 「看门狗还没跑到、健康检查就先看到旧结论」的时序问题。
 	schedStalled  atomic.Bool
 	heartbeatWarn atomic.Bool // 心跳文件写入是否已告警过（避免反复刷日志）
+
+	// clock 监测墙钟相对单调钟的跳变（docs/03-product/05-northbound-api-spec.md
+	// §2.4 的 clock 健康块）。clockRead 是采样源：默认 SystemSource 的闭包，
+	// 测试注入一个「叠加了固定偏移的真实源」。两者都由 New 一次性确定，之后不再
+	// 改动——采样源不是配置，改了也没有语义。
+	clock     *clockmon.Monitor
+	clockRead func() clockmon.Reading
 }
 
 type idemEntry struct {
@@ -296,6 +312,17 @@ func New(opt Options) (*Runtime, error) {
 		startedAt:  time.Now(),
 	}
 	r.declareMetrics()
+
+	// 时钟监测必须在 openSinks 之前构造：sink 的启动路径里可能已经读过一次
+	// Health（例如 MQTT 的 retained 状态），那时 clock 不能是 nil。
+	clockRead := opt.ClockSource
+	if clockRead == nil {
+		clockRead = clockmon.SystemSource()
+	}
+	// 阈值不暴露成配置：1s 的依据写在 clockmon.DefaultStepThreshold。暴露它等于
+	// 邀请运维把它调小，然后开始忽略 uic_clock_jumps_total——那比不报更糟。
+	r.clock = clockmon.New(clockmon.DefaultStepThreshold, r.onClockJump)
+	r.clockRead = clockRead
 	// 窗口聚合的数据源必须在 openAlarms 之前就位（报警是第二步，历史是
 	// 第三步）。适配器内部按需读取 r.hist，因此这里构造时历史还没打开也
 	// 不会让它永久不可用。
@@ -401,6 +428,9 @@ func (r *Runtime) declareMetrics() {
 	d("uic_outbox_pending", "gauge", "Outbox 待投递条数")
 	d("uic_outbox_pending_bytes", "gauge", "Outbox 待投递字节数")
 	d("uic_outbox_dropped_total", "counter", "Outbox 丢弃条数")
+	d("uic_clock_jumps_total", "counter", "墙钟相对单调钟的跳变次数（按方向：forward/backward）")
+	d("uic_clock_offset_seconds", "gauge", "墙钟相对单调钟的累计偏移（秒）")
+	d("uic_clock_last_jump_seconds", "gauge", "最近一次时钟跳变的幅度（秒，有符号）")
 	d("uic_http_requests_total", "counter", "HTTP 请求数")
 	d("uic_http_request_duration_seconds", "histogram", "HTTP 请求耗时")
 	d("uic_stale_total", "counter", "点位被判定为 stale 的次数")
@@ -516,6 +546,11 @@ func (r *Runtime) Start(ctx context.Context) {
 	go r.watchdog(r.ctx)
 	r.wg.Add(1)
 	go r.heartbeatLoop(r.ctx)
+	// 播种一次时钟：不播种的话，启动后头一分钟 health 的 clock.verdict 恒为
+	// unknown——watchdog 的 1s tick 也要等一秒才第一次跑。这跟 scheduler 活性
+	// 看门狗「先种一次 LastTick 再开看门狗」是同一个道理：活性信号不能有空窗，
+	// 否则启动瞬间的 health 全是 unknown，接进告警系统会先产生一波假阳性。
+	r.sampleClock()
 	r.ready.Store(true)
 	r.log.Info("runtime_started",
 		"config", r.cfg.Path(), "version", r.cfg.Version(),
@@ -636,8 +671,27 @@ func (r *Runtime) watchdog(ctx context.Context) {
 			r.checkStagedHealth(ctx, now)
 			// 采集中枢活性：检测「进程活着但调度器 tick 停摆」。
 			r.checkSchedulerLiveness(now)
+			// 系统时钟跳变：墙钟相对单调钟的一次性步进（见 internal/clockmon）。
+			r.sampleClock()
 		}
 	}
+}
+
+// sampleClock 采一次系统时钟，喂给 clockmon.Monitor。
+//
+// 挂在 watchdog 已有的 1s tick 上，不另起协程：时钟监测本来就是「每秒看一眼墙
+// 钟有没有动」，而 watchdog 的 tick 已经保证每秒跑一次（它的语义就是靠这个
+// tick 维持的）。另起一个每秒 ticker 只会得到两个需要互相同步的定时器，没有
+// 任何额外信息。
+//
+// 跳变告警与计数（日志 + 指标）在 Monitor 内部按「锁外回调」执行，所以这里
+// 不用加锁、也不用再记一次数。若未来需要在这里加处理，注意它跑在 watchdog 的
+// 采样协程上——必须足够快，不能阻塞 tick。
+func (r *Runtime) sampleClock() {
+	if r.clock == nil {
+		return
+	}
+	_, _ = r.clock.Sample(r.clockRead())
 }
 
 // heartbeatLoop 独立负责心跳文件，不共用 watchdog 的 1s ticker。
@@ -1133,6 +1187,46 @@ func (r *Runtime) healthAt(now time.Time) httpapi.Health {
 			})
 		}
 	}
+	// 时钟监测块（见 clockmon 包注释）。它不参与 status 判定：时钟被拨过是事实，
+	// 不是故障——一台网关完全可以在时钟跳变 8 小时后照常采集、照常投递。判它坏的
+	// 是接在下游的告警，不是 /health 的 status。这也是把跳变从 Problems 里排除
+	// 的原因：把事实写进故障列表，运维迟早学会忽略那一行。
+	//
+	// 不管有没有采到样，verdict 与 stepThresholdMs 都填上：还没采样时 verdict 是
+	// "unknown"（契约里的合法枚举），而不是空字符串——空字符串不是四个合法取值之
+	// 一，会让按枚举校验的消费方直接判坏。age 用 SampledAt 与 health 自己的 now
+	// 参数算，而不是 time.Since：healthAt 是 Health 的可注入时钟形式，看门狗类测试
+	// 需要一个「未来时刻」来观察判定，而不必真的等一秒。
+	{
+		s := r.clock.Snapshot()
+		h.Clock = httpapi.ClockHealth{
+			Verdict:       string(s.Verdict()), // Samples==0 时即 "unknown"
+			OffsetSeconds: s.Offset.Seconds(),
+			Jumps: httpapi.ClockJumpCounts{
+				Forward:  s.Forward,
+				Backward: s.Backward,
+			},
+			StepThresholdMs: s.Threshold.Milliseconds(),
+		}
+		if s.LastJump != nil {
+			lj := *s.LastJump
+			h.Clock.LastJump = &httpapi.ClockJump{
+				At:        lj.At.UTC().Format(time.RFC3339),
+				Seconds:   lj.Seconds(),
+				Direction: lj.Direction(),
+			}
+		}
+		// AgeMs 回答「采样协程是不是还活着」，不是「时间准不准」：采样挂在
+		// watchdog 的 1s tick 上，进程还在但那条 tick 停摆时，这个值会一直涨，
+		// verdict 却冻在最后一次采样上。健康检查可能在采样之后、下一次 tick 之前
+		// 被调用，用 now 减一个未来时刻的采样会得到负数——那没有意义，夹到 0。
+		// 尚未采样时 SampledAt 是零值，now.Sub 会是一个天文数字，因此必须跳过。
+		if s.Samples > 0 {
+			if age := now.Sub(s.SampledAt); age > 0 {
+				h.Clock.AgeMs = age.Milliseconds()
+			}
+		}
+	}
 	if st, ok := r.HistoryStats(); ok {
 		h.History = httpapi.HistoryHealth{
 			Enabled: true, Records: st.Appended, Bytes: st.Bytes, MaxBytes: st.MaxBytes,
@@ -1260,8 +1354,46 @@ func (r *Runtime) Ready() httpapi.Ready {
 // Version 返回构建信息。
 func (r *Runtime) Version() httpapi.VersionInfo { return r.version }
 
+// onClockJump 是时钟跳变被检测到时的副作用：日志一次 + 计数一次。
+//
+// 它跑在 watchdog 的采样协程上（也就是 Monitor.Sample 的解锁回调路径），所以
+// 必须足够快：一条 Warn 是亚毫秒级的，不构成风险；它不会也不该阻塞去查 NTP。
+// 跳变本身由外部 NTP 客户端去处理，runtime 的职责只是「让它可见」。
+//
+// 计数器按 dir 打标签而不是只用一个总计数器：向前跳变（时钟被往前拨，样本时
+// 戳会倒退/重复）与向后跳变（TTL 提前到期、数据被提前丢弃）的后果是反的，运维
+// 要能一眼看出是哪一类。标签值来自 clockmon.Direction() 的固定两个取值，基数
+// 有界，不会造成指标标签爆炸。
+func (r *Runtime) onClockJump(j clockmon.Jump) {
+	r.log.Warn("clock_jump",
+		"direction", j.Direction(), "seconds", j.Seconds(), "at", j.At.UTC())
+	r.metrics.Inc("uic_clock_jumps_total", obs.Labels{"dir": j.Direction()})
+	//「最近一次跳变幅度」是状态：用 gauge 存有符号值，便于做趋势与「最后一次跳
+	// 了多久」的直接查询；计数器只回答「跳了几次」，回答不了「跳了多大」。
+	r.metrics.Set("uic_clock_last_jump_seconds", j.Seconds(), nil)
+}
+
+// refreshClockGauges 把时钟 gauge 刷成当前快照的值。
+//
+// 为什么在抓取时刷：offset 与 last-jump 都是「状态」而不是「事件」，事件有
+// counter，状态有 gauge。但 runtime 没有独立协程去维护这两个 gauge（时钟已经
+// 由 watchdog 的 tick 采样了，再起一个协程纯属浪费），所以在唯一会读它们的
+// 时刻——Prometheus 抓取——顺手算一次。这是幂等的：同一次抓取内写两次同值，
+// 结果一样；跳过它，gauge 就会永远停在进程启动时的 0。
+func (r *Runtime) refreshClockGauges() {
+	if r.clock == nil {
+		return
+	}
+	s := r.clock.Snapshot()
+	if s.Samples == 0 {
+		return
+	}
+	r.metrics.Set("uic_clock_offset_seconds", s.Offset.Seconds(), nil)
+}
+
 // Metrics 返回 Prometheus 文本。
 func (r *Runtime) Metrics() string {
+	r.refreshClockGauges()
 	var b strings.Builder
 	if err := r.metrics.WriteText(&b); err != nil {
 		return ""
