@@ -79,6 +79,7 @@ cmd/uic
        ├→ internal/outbox      （持久队列）
        ├→ internal/northbound  （http / sse / mqtt / opcua）
        │    └→ internal/i18n  （错误消息中/英渲染，纯函数）
+       ├→ internal/clockmon    （墙钟/单调钟跳变判定，纯函数）
        └→ internal/obs         （指标 + 日志）
 
 internal/driver/modbus  ──→ internal/codec/modbus（纯函数）
@@ -375,7 +376,7 @@ uic_<subsystem>_<name>{<labels>}
 |---|---|---|
 | `/healthz` | 进程存活（无条件 200，不检查依赖） | 进程应被重启 |
 | `/readyz` | 依赖就绪（配置已加载、存储可写、至少一个驱动可用） | 不应接收流量 |
-| `/api/v1/health` | 业务聚合（每设备状态、成功率、队列水位、采集中枢活性） | 需要人看 |
+| `/api/v1/health` | 业务聚合（每设备状态、成功率、队列水位、采集中枢活性、时钟可信度） | 需要人看 |
 
 **采集中枢活性与进程级看门狗**。上面三个端点回答的都是「进程/依赖/设备」层面的
 状态，缺一条：**进程活着、端口通、设备态还显示 collecting，但调度器 tick 已经
@@ -394,6 +395,20 @@ uic_<subsystem>_<name>{<labels>}
 - `/healthz` 与 `/readyz` 的契约刻意**不变**：存活探针不应因业务卡死而重启进程
   （重启会丢缓存与在飞写），就绪探针也不该把「卡死」当「未就绪」——否则 k8s 会把
   Pod 摘出流量，外部就再也看不到卡死信号。
+
+**系统时钟跳变**。与采集中枢活性并列的另一类静默失效：进程照常采集、照常投递，
+但 `time.Now()` 的墙钟分量被 NTP 步进/人工改时/快照恢复拨动，而单调分量照常前进。
+两者的分叉不会让任何一行代码报错，只会让 Outbox 的 TTL、历史保留窗口、样本时间戳
+**安静地算错**（向前跳让 TTL 提前到期丢数据，向后跳让时间戳倒流）。因此：
+
+- `internal/clockmon` 是**纯判定**（无协程、无 I/O）：比较「墙钟流逝」与「单调流逝」
+  的差，超过阈值（默认 1s）判为跳变；`Snapshot().Verdict()` 四态 `unknown/ok/
+  drifted/jumped`，`jumped` 累计粘滞、不自行恢复（事件发生过就是发生过）。
+- 运行时**不另起协程**：采样挂在已有的 1s watchdog tick 上，`Start` 时先播种一次。
+- 跳变写 `clock` 健康块（`verdict/offsetSeconds/jumps/lastJump/ageMs/stepThresholdMs`）
+  与指标 `uic_clock_jumps_total{dir}`/`uic_clock_offset_seconds`/`uic_clock_last_jump_seconds`。
+- **不参与 `status` 判定，不进 `problems`**：时钟被拨过是事实不是故障，判它坏的是
+  下游告警，不是网关自己。`clock.ageMs` 顺带暴露「采样协程是否还活着」。
 
 ---
 

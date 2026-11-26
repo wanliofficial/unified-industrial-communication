@@ -185,7 +185,7 @@ curl -N localhost:8080/api/v1/stream?points=virtual-01/sine
 | 灰度 | 配置分批下发、观察窗口、自动暂停 |
 | 数据 | 数据契约 v2（双发过渡）、Sparkplug B 的 DataSet/模板（按客户现场需要） |
 | 运维 | 远程日志拉取、离线升级包、看门狗自愈策略 |
-| 国际化 | 中/英双语（北向 API 错误消息已落地，见 `05-northbound-api-spec.md` §2.3.1）、时区、单位制 |
+| 国际化 | 中/英双语（北向 API 错误消息已落地，见 `05-northbound-api-spec.md` §2.3.1）、**系统时钟跳变检测已落地**（`internal/clockmon` + `/api/v1/health` 的 `clock` 块 + 3 个指标，见 `05-northbound-api-spec.md` §2.4 与 `02-architecture.md` §健康）、时区、单位制 |
 | 合规 | SBOM、签名发布、等保对照表 |
 
 ### 5.3 出口标准

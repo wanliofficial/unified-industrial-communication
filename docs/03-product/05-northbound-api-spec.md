@@ -288,6 +288,10 @@ Authorization: Bearer <token>
   "points":  { "total": 1200, "good": 1180, "stale": 12, "bad": 8 },
   "outbox":  { "pending": 42, "droppedLastHour": 0 },
   "scheduler": { "verdict": "healthy", "ageMs": 37, "stallAfterMs": 15000 },
+  "clock": {
+    "verdict": "ok", "offsetSeconds": 0.000123, "jumps": { "forward": 0, "backward": 0 },
+    "ageMs": 1000, "stepThresholdMs": 1000
+  },
   "problems": [
     { "device": "plc-07", "state": "faulted", "reason": "timeout", "since": "2026-11-04T07:10:00Z" }
   ]
@@ -325,6 +329,54 @@ Authorization: Bearer <token>
 `/healthz` 与 `/readyz` 的既有契约不变：`/healthz` 仍无条件 200（存活探针不应因
 业务卡死而重启进程），`/readyz` 仍只检查配置/存储/驱动。卡死信号只经
 `/api/v1/health`、指标、日志与心跳文件对外。
+
+#### `clock` 块：系统时钟跳变监测
+
+样本采集时刻、Outbox 的 TTL、历史保留窗口、报警去抖、审计时间戳——这些逻辑几乎
+全部取自 `time.Now()`。而 `time.Now()` 返回的时刻里有**两个分量**：墙钟（wall，
+真实世界的日期时间，会被 NTP 步进、容器迁移、人工 `date -s`、虚拟机快照恢复改变）
+与单调钟（monotonic，进程内的流逝时间，只会前进）。一旦两者分叉，上面那些逻辑
+不会报错，只会**安静地算错**：
+
+- 墙钟向前跳：Outbox 的 TTL 提前到期，一批还没送出去的数据被当成过期丢掉；
+- 墙钟向后跳：样本时间戳倒流，按时间去重/排序的消费方出现错乱、漏数。
+
+因此「墙钟还是不是当初那个墙钟」必须是一个可判定的健康状态，而不是只能事后翻
+日志的猜测。`clock` 块由 runtime 每秒采样一次（挂在已有的 watchdog tick 上，不另
+起协程）给出：
+
+| 字段 | 含义 |
+|---|---|
+| `verdict` | 四态：`unknown`（还没采到样）/`ok`（无跳变、累计偏移在阈值内）/`drifted`（无跳变但累计偏移超阈值）/`jumped`（至少发生过一次跳变） |
+| `offsetSeconds` | 累计偏移（秒），墙钟相对单调钟，正数=跑得快、回拨为负 |
+| `jumps` | 按方向拆分的跳变次数：`forward`（向前）/`backward`（回拨） |
+| `lastJump` | 最近一次跳变：`{at, seconds, direction}`；从未发生缺省 |
+| `ageMs` | 最近一次采样距今毫秒数（`unknown` 为 0）。回答「采样协程是否还活着」，非「时间准不准」 |
+| `stepThresholdMs` | 判定跳变的阈值（毫秒），默认 1000 |
+
+- **阈值取 1s，不暴露成配置**：NTP 正常工作时小于 1s 的偏差是缓慢调谐（slew）掉
+  的，不是步进；而 1s 以上的步进足以让按秒看趋势的数据出问题。暴露阈值只会带来
+  「运维随手调小、每分钟报一次跳变、然后开始忽略这个指标」的风险——那比不报更糟。
+- **优先级** `unknown > jumped > drifted > ok`：`jumped` 是累计事实，**不会自行恢复
+  成 `ok`**——曾经被拨过就是发生过，把它忘掉才是隐瞒。判跳变要不要告警，看计数与
+  `lastJump`，不要指望 `verdict` 自己恢复。
+- `ageMs` 夹到非负：health 可能在采样之后、下一次 tick 之前被调用，用 `now` 减一个
+  未来时刻的采样会得到负数，那没有意义。采样挂在 watchdog 的 1s tick 上，进程还在
+  但那条 tick 停摆时 `ageMs` 会一直涨、`verdict` 却冻在最后一次采样上——这个字段
+  就是用来发现「采样协程卡住」的。
+- `drifted` 与 `jumped` 的区别：`drifted` 是长期累计的缓慢偏移（晶振漂移、长时间
+  不对时），从没有单次步进；`jumped` 至少有一次瞬时跳变。前者是趋势问题，后者是
+  事件。
+
+**`clock` 不参与 `status` 判定。** 时钟被拨过是事实，不是故障：一台网关完全可以在
+时钟跳变 8 小时后照常采集、照常投递——数据里带着跳变事实，而不是网关本身坏了。判
+它坏的是接在下游的告警（例如 `rate(uic_clock_jumps_total[5m]) > 0`），不是 `/health`
+的 `status`。这也是把跳变从 `problems` 里排除的原因：把事实写进故障列表，运维
+迟早学会忽略那一行。
+
+该信号同时写入指标 `uic_clock_jumps_total`（counter，按 `dir` 标签分 forward/backward）、
+`uic_clock_offset_seconds`（gauge，累计偏移）、`uic_clock_last_jump_seconds`（gauge，
+最近一次跳变幅度，有符号），并写 `clock_jump` 日志（含方向、幅度与跳变后的墙钟时刻）。
 
 #### 心跳文件：给不访问 HTTP 的 supervisor
 
