@@ -21,6 +21,7 @@ using Uic.Driver.Mqtt;
 using Uic.Driver.Virtual;
 using Uic.Engine;
 using Uic.Northbound;
+using Uic.Northbound.Security;
 using Uic.Obs;
 using Uic.Runtime;
 
@@ -88,6 +89,8 @@ internal static class ContractTests
         tests.Add(new TestCase("contract/auth_login_forces_password_change", AuthLoginForcesPasswordChange));
         tests.Add(new TestCase("contract/auth_roles_are_enforced", AuthRolesAreEnforced));
         tests.Add(new TestCase("contract/auth_users_require_manage", AuthUsersRequireManage));
+        tests.Add(new TestCase("contract/auth_change_password_rejects_wrong_current",
+            AuthChangePasswordRejectsWrongCurrent));
         tests.Add(new TestCase("contract/user_last_admin_is_protected", UserLastAdminIsProtected));
         tests.Add(new TestCase("contract/user_cannot_delete_self_is_protected",
             UserCannotDeleteSelfIsProtected));
@@ -2758,6 +2761,61 @@ internal static class ContractTests
                 await host.Client.SendAsync(GetWith("/api/v1/auth/me", newToken), t.Ct));
             t.Equal("session", me.RootElement.GetProperty("kind").GetString(),
                 "a logged-in user is a session, not the static token");
+        });
+    }
+
+    /// <summary>
+    /// 改密时当前口令不对 → 400 且 code 点名 auth.invalid_password；并核对被拒后口令未变。
+    /// 错误表 northbound-api.md 的 400 行明列 auth.invalid_password，此前零断言。
+    /// 当前口令校验在写入/吊销会话之前（RestApi.Auth.cs 的 CheckPassword 先于
+    /// ValidatePassword 与 SetPassword），所以被拒的改密不该留下任何副作用——
+    /// 旧口令仍能登录、错误尝试里那个新口令永远登不进。用「错误当前口令 + 一个
+    /// 合法的强新口令」构造，把拒绝原因唯一地钉在「当前口令不对」上，
+    /// 不与弱口令（auth.weak_password）、坏请求（request.invalid）混淆。
+    /// </summary>
+    private static Task AuthChangePasswordRejectsWrongCurrent(TestContext t)
+    {
+        return RunAsync(async () =>
+        {
+            await using var host = await Host.StartAsync(t);
+
+            // 建账号并完成首次改密，拿到一个干净会话（mustChangePassword=false）。
+            // SignInAsAsync 会把初始口令改成「<初始>-changed」，那才是当前真实口令。
+            const string realPassword = "initial-secret-123-changed";
+            var token = await SignInAsAsync(t, host, "changer", Roles.Operator, "initial-secret-123");
+
+            var wrong = JsonSerializer.Serialize(new
+            {
+                currentPassword = "not-the-real-password",
+                newPassword = "next-password-456"
+            });
+            var rejected = await host.Client.SendAsync(
+                PostWith("/api/v1/auth/password", wrong, token), t.Ct);
+            t.Equal(HttpStatusCode.BadRequest, rejected.StatusCode,
+                "a wrong current password is rejected");
+
+            using (var error = await ReadJsonAsync(t, rejected))
+            {
+                t.Equal("auth.invalid_password",
+                    error.RootElement.GetProperty("error").GetProperty("code").GetString(),
+                    "the code names the current-password problem, not a generic bad request");
+            }
+
+            // 原子性：被拒的改密不该动口令——真实口令仍能登录。
+            var stillWorks = await host.Client.SendAsync(
+                PostWith("/api/v1/auth/login",
+                    JsonSerializer.Serialize(new { username = "changer", password = realPassword }), null),
+                t.Ct);
+            t.Equal(HttpStatusCode.OK, stillWorks.StatusCode,
+                "the real password still works after a rejected change");
+
+            // 错误尝试里那个「新」口令从未生效。
+            var wrongNew = await host.Client.SendAsync(
+                PostWith("/api/v1/auth/login",
+                    JsonSerializer.Serialize(new { username = "changer", password = "next-password-456" }), null),
+                t.Ct);
+            t.Equal(HttpStatusCode.Unauthorized, wrongNew.StatusCode,
+                "the attempted new password was never applied");
         });
     }
 

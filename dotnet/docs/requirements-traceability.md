@@ -12,8 +12,19 @@ PRD 中 M 级的采集协议已全部落地，FR-CFG-01 的四类寻址模型也
 COV/分段/多属性读仍不做，见 [protocol-status.md](protocol-status.md) §4.1）。非 M 级验收里的 12 类故障注入同样全部有了
 可自动跑的用例（见 §7）。
 
-当前测试基线：**443 条**（带 `--opcua` 全量；本轮**加强既有用例** `auth_users_require_manage`、未新增用例，条数不变。全量实测数字以
-[testing.md](testing.md) 最新一轮为准）。本轮给停用账号登录的拒绝补上 code 断言——`auth.user_disabled` 此前**零断言**：`auth_users_require_manage`
+当前测试基线：**444 条**（带 `--opcua` 全量；本轮**新增 1 条**契约用例。全量实测数字以
+[testing.md](testing.md) 最新一轮为准）。本轮补上错误表 400 行 `auth.invalid_password` 的覆盖——这个码此前**零断言**：
+`contract/auth_change_password_rejects_wrong_current` 拿一个干净会话（建账号→首次改密后 mustChangePassword=false 的会话），
+用**错误的当前口令** + 一个**合法的强新口令**改密 → 400 + `error.code == auth.invalid_password`；并核对被拒后的原子性——
+真实口令仍能登录（`SignInAsAsync` 会把初始口令改成 `<初始>-changed`，这里用那个真值）、错误尝试里的新口令永远登不进。
+当前口令校验在 `ValidatePassword`/`SetPassword`/会话吊销之前，所以被拒的改密不留任何副作用；用「合法的新口令」而不是弱口令，
+把拒绝原因唯一钉在「当前口令错」上，不与 `auth.weak_password`（口令太弱）、`request.invalid`（坏请求）混淆——运维改密时
+输错当前口令，要能一眼看到是「口令不对」而不是别的 400。非空验证：把 `RestApi.Auth.cs` 的抛点 code 由 `auth.invalid_password`
+改成 `auth.invalid_password_perturbed` → 实测 FAIL `expected <auth.invalid_password>, got <auth.invalid_password_perturbed>`；
+恢复后源码与 HEAD 字节一致、用例 PASS（13.4 s）。验证期间工作站长期被他人进程占满（`mount.ntfs` 60% CPU、多个 java/beam），
+一度连 `health_and_version_are_public` 都超 runner 的 180 s 硬超时；后来用后台监视器等真正的低负载窗口才跑成。第一版用例
+误把初始口令当成「真实口令」导致原子性断言假失败（`SignInAsAsync` 其实会把口令改成 `<初始>-changed`），已修正为用真值。
+上一轮（443 条、加强既有用例不增条）给停用账号登录的拒绝补上 code 断言——`auth.user_disabled` 此前**零断言**：`auth_users_require_manage`
 早已测到「停用账号登录返回 403」，但只断言了 HTTP 状态码、没点名 `error.code`。403 也能是别的码（越权、未改临时口令），状态码对了 code
 却漂移也没人发现；而「停用」是管理员主动做的决定，与「口令错」（用户自己输错）、「越权」（权限不足）的处置方向完全不同，运维要从
 code 一眼分清。加强后断言 `error.code == auth.user_disabled`。非空验证：把 `AuthService` 的停用抛点 code 由 `auth.user_disabled` 改成
