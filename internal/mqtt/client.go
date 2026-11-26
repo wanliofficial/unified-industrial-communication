@@ -346,25 +346,23 @@ func (c *Client) Publish(ctx context.Context, m Message) error {
 	}
 
 	var pid uint16
-	if m.QoS > 0 {
-		pid = c.allocPID()
-	}
-	pkt, err := PublishPacket(m, pid)
-	if err != nil {
-		return err
-	}
-
 	var ackCh chan error
 	if m.QoS > 0 {
 		ackCh = make(chan error, 1)
-		c.pendingMu.Lock()
-		c.pending[pid] = ackCh
-		c.pendingMu.Unlock()
+		// 选一个当前没有在飞的 packet id。直接用 allocPID 的单调计数器一旦
+		// 回绕到某个仍在 pending 的 pid，新的 ackCh 会覆盖旧的——旧发布者永远
+		// 收不到自己的 PUBACK，要白等满 AckTimeout 才报错，被 Outbox 误判为
+		// 投递失败而重发（at-least-once 下不算丢数据，但是虚假失败 + 无谓重发）。
+		pid = c.allocFreePID(ackCh)
 		defer func() {
 			c.pendingMu.Lock()
 			delete(c.pending, pid)
 			c.pendingMu.Unlock()
 		}()
+	}
+	pkt, err := PublishPacket(m, pid)
+	if err != nil {
+		return err
 	}
 
 	c.mu.Lock()
@@ -546,6 +544,26 @@ func (c *Client) allocPID() uint16 {
 		v := c.nextPID.Add(1)
 		if pid := uint16(v); pid != 0 {
 			return pid
+		}
+	}
+}
+
+// allocFreePID 返回当前不在 pending 里的 packet id，并把 ackCh 登记进去。
+//
+// 与 allocPID 的差别：allocPID 是纯单调计数器，回绕时会撞上某个仍在 pending 的
+// 老发布者，导致「新 ackCh 覆盖旧的」。这里在 pendingMu 下选一个确实空闲的 id，
+// 消除那条竞态。pending 里在飞的数量远小于 65536，循环通常一两步就命中；只有在
+// 全部 id 都占满时才会一直转（那等于已经积压了 6.5 万条未确认的 QoS1 发布）。
+func (c *Client) allocFreePID(ackCh chan error) uint16 {
+	c.pendingMu.Lock()
+	defer c.pendingMu.Unlock()
+	for {
+		v := c.nextPID.Add(1)
+		if pid := uint16(v); pid != 0 {
+			if _, busy := c.pending[pid]; !busy {
+				c.pending[pid] = ackCh
+				return pid
+			}
 		}
 	}
 }

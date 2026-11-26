@@ -1381,6 +1381,7 @@ QoS 取 1：控制命令不能是 fire-and-forget。
 | `TestConcurrentPingBothWakeOnOnePingresp` | 一次 PINGRESP 只唤醒一个等待者，另一个健康链路上误报超时 | `pingFlight.done` 改成容量 1 的 channel（单播语义） |
 | `TestConcurrentPingDuringDeadLinkBothFail` | 死链路上并发 Ping 误报成功（历史 `299f82d`） | `pingFlight` 退回 `close()`-only 语义 |
 | `TestParsePublishRejectsProtocolViolations` | QoS=3 / 空主题 / 主题含通配符被当成普通消息 | 三处守卫前置 `false &&` |
+| `TestAllocFreePIDSkipsInFlight` | QoS1 发布的 packet id 用单调计数器，回绕时撞上仍在 `pending` 的老发布者：新 `ackCh` 覆盖旧的，旧发布者永远收不到自己的 PUBACK，白等满 `AckTimeout` 误报「投递失败」，被 Outbox 重发（at-least-once 下不丢数据，但属虚假失败 + 无谓重发）。低频下要 6.5 万条在飞才触发，高吞吐北向通路才暴露 | `allocFreePID` 退回 `allocPID` + 无条件 `pending[pid]=ackCh` |
 
 测试用两种对端：`internal/sim/mqtt`（行为完整的 Broker）与 `scriptedBroker`（按
 规范允许、但内置 Broker 不刻意构造的顺序发报文，例如 SUBACK 之前先发保留消息）。
