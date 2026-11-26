@@ -91,6 +91,8 @@ internal static class ContractTests
         tests.Add(new TestCase("contract/user_last_admin_is_protected", UserLastAdminIsProtected));
         tests.Add(new TestCase("contract/user_cannot_delete_self_is_protected",
             UserCannotDeleteSelfIsProtected));
+        tests.Add(new TestCase("contract/user_create_rejects_duplicate_and_unknown_role",
+            UserCreateRejectsDuplicateAndUnknownRole));
         tests.Add(new TestCase("contract/auth_login_is_rate_limited", AuthLoginIsRateLimited));
         tests.Add(new TestCase("contract/auth_logout_revokes_session", AuthLogoutRevokesSession));
         tests.Add(new TestCase("contract/rate_limit_returns_429_with_the_shared_code", RateLimitReturns429));
@@ -2983,6 +2985,74 @@ internal static class ContractTests
                 .Single(u => u.GetProperty("id").GetString() == "admin");
             t.Equal(true, admin.GetProperty("enabled").GetBoolean(), "admin is still enabled");
             t.Equal("admin", admin.GetProperty("role").GetString(), "admin is still an administrator");
+        });
+    }
+
+    /// <summary>
+    /// 建账号时的两种拒绝，此前都零断言：错误表 409 行的 <c>user.exists</c>（账号重名）
+    /// 与 400 行的 <c>user.invalid_role</c>（角色名未知）。
+    ///
+    /// 两件事必须能从 code 分清：重名是「这个名字占了」（409，换个名字即可），角色错是
+    /// 「你写的角色根本不存在」（400，改参数）。都混成 400 或 500，前端就没法给出正确的提示。
+    /// 角色校验发生在写入之前，所以被拒后不应留下半个账号——这里连列表一起复核。
+    ///
+    /// <c>user.invalid_role</c> 在 <c>UserStore</c> 有两个抛点（<c>Create</c> 与 <c>Update</c>），
+    /// 两条独立路径都钉住：只钉 Create 的话，改角色那条路的校验被删掉也没人发现。
+    /// </summary>
+    private static Task UserCreateRejectsDuplicateAndUnknownRole(TestContext t)
+    {
+        return RunAsync(async () =>
+        {
+            await using var host = await Host.StartAsync(t);
+
+            // 角色名未知：400 user.invalid_role，且不留下账号。
+            var badRole = await host.Client.SendAsync(
+                PostWith("/api/v1/users", """{"id":"nobody","role":"root"}""", Token), t.Ct);
+            t.Equal(HttpStatusCode.BadRequest, badRole.StatusCode,
+                "an unknown role is a 400, not a 500 or a silent default");
+            using (var envelope = await ReadJsonAsync(t, badRole))
+                t.Equal("user.invalid_role",
+                    envelope.RootElement.GetProperty("error").GetProperty("code").GetString(),
+                    "the code names the role problem");
+
+            using (var afterBadRole = await ReadJsonAsync(t,
+                       await host.Client.SendAsync(GetWith("/api/v1/users", Token), t.Ct)))
+                t.Ok(!afterBadRole.RootElement.GetRawText().Contains("nobody", StringComparison.Ordinal),
+                    "a rejected create leaves no half-made account behind");
+
+            // 重名：先建一个，再用同一个 id 建一次 → 409 user.exists。
+            var create = await host.Client.SendAsync(
+                PostWith("/api/v1/users", """{"id":"dup","role":"viewer"}""", Token), t.Ct);
+            t.Equal(HttpStatusCode.OK, create.StatusCode, "the first account is created");
+
+            var duplicate = await host.Client.SendAsync(
+                PostWith("/api/v1/users", """{"id":"dup","role":"viewer"}""", Token), t.Ct);
+            t.Equal(HttpStatusCode.Conflict, duplicate.StatusCode,
+                "a duplicate id is a 409, not a second account with the same name");
+            using (var envelope = await ReadJsonAsync(t, duplicate))
+                t.Equal("user.exists",
+                    envelope.RootElement.GetProperty("error").GetProperty("code").GetString(),
+                    "the code says the name is taken, not that the request was malformed");
+
+            // Update 路径的角色校验：PUT 一个存在的账号、给个不存在的角色 → 400 user.invalid_role，
+            // 且角色没被改（校验在写入之前）。
+            var badUpdate = await host.Client.SendAsync(
+                PutWith("/api/v1/users/dup", """{"role":"root"}""", Token), t.Ct);
+            t.Equal(HttpStatusCode.BadRequest, badUpdate.StatusCode,
+                "an unknown role on update is a 400 too");
+            using (var envelope = await ReadJsonAsync(t, badUpdate))
+                t.Equal("user.invalid_role",
+                    envelope.RootElement.GetProperty("error").GetProperty("code").GetString(),
+                    "update reports the same role code as create");
+
+            using (var afterBadUpdate = await ReadJsonAsync(t,
+                       await host.Client.SendAsync(GetWith("/api/v1/users", Token), t.Ct)))
+            {
+                var dup = afterBadUpdate.RootElement.GetProperty("items").EnumerateArray()
+                    .Single(u => u.GetProperty("id").GetString() == "dup");
+                t.Equal("viewer", dup.GetProperty("role").GetString(),
+                    "the rejected update did not change the role");
+            }
         });
     }
 

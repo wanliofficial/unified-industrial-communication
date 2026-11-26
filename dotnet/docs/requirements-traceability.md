@@ -12,8 +12,27 @@ PRD 中 M 级的采集协议已全部落地，FR-CFG-01 的四类寻址模型也
 COV/分段/多属性读仍不做，见 [protocol-status.md](protocol-status.md) §4.1）。非 M 级验收里的 12 类故障注入同样全部有了
 可自动跑的用例（见 §7）。
 
-当前测试基线：**442 条**（带 `--opcua` 全量；本轮**新增 1 条**契约用例。全量实测数字以
-[testing.md](testing.md) 最新一轮为准）。本轮补上错误表 409 行里此前零断言的 `user.cannot_delete_self` ——
+当前测试基线：**443 条**（带 `--opcua` 全量；本轮**新增 1 条**契约用例。全量实测数字以
+[testing.md](testing.md) 最新一轮为准）。本轮补上错误表 400 行 `user.invalid_role` 与 409 行
+`user.exists` 的覆盖——这两个码此前**零断言**：
+`contract/user_create_rejects_duplicate_and_unknown_role` 钉住四件事——
+（1）建账号给不存在的角色 → 400 `user.invalid_role`（`UserStore.Create` 抛点）；
+（2）重名创建 → 409 `user.exists`；
+（3）PUT 给不存在的角色 → 400 `user.invalid_role`（`UserStore.Update` 抛点，**与 Create 是两条独立
+抛点**，只钉一条则另一条校验被删也没人发现）；
+（4）两条原子性复核——被拒的创建不留半拉账号、被拒的更新不改原角色（角色校验在写入之前）。
+两条 code 让调用方一眼分清「名字占了」（换名即可）与「角色根本不存在」（改参数），不会混成一个
+通用 400/500。非空验证（TUnit 首断言即停，故三轮独立扰动各自精确命中，全部运行期实测）：
+（1）`Create` 角色码 `user.invalid_role` 改成 `user.invalid_role_create` → 实测 FAIL
+`expected <user.invalid_role>, got <user.invalid_role_create>`；
+（2）`user.exists` 改成 `user.exists_conflict` → 实测 FAIL
+`expected <user.exists>, got <user.exists_conflict>`；
+（3）`Update` 角色码改成 `user.invalid_role_update` → 直接调用 `UserStore.Update` 的独立白盒探针
+实测：扰动态抛 `status=400 code=user.invalid_role_update`（断言 `user.invalid_role` 即 FAIL）、
+恢复态抛 `status=400 code=user.invalid_role`（PASS）——用探针是因为那段时间工作站内存/swap 抖动
+（load 20–60、swap 打满）导致测试宿主启动超 180s 硬超时，而探针只启一次 runtime、不经 Kestrel。
+三轮各自恢复后源码与 HEAD 字节一致，干净态用例 PASS（38.4 s）。
+上一轮（442 条、新增 1 条）补上错误表 409 行里此前零断言的 `user.cannot_delete_self` ——
 不能删除自己的账号。它和上一轮的 `user.last_admin` 不同：判的是**身份**（`principal.Id == id`），
 不是角色。静态 API Token 的身份是 `api-token`（不是任何用户），所以上一轮恰好绕开了它；要真正落到这条，
 `contract/user_cannot_delete_self_is_protected` 必须**以 admin 本人登录**（首次开机口令带
