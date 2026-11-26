@@ -157,7 +157,7 @@ func TestProbeExceptionIsNotRetryable(t *testing.T) {
 	}
 	frame, err := cjt188.Build(0x10, broadcast,
 		cjt188.CtrlReadAddr|cjt188.BitReply|cjt188.BitError,
-		[]byte{0x81, 0x0A, 0x01})
+		[]byte{0x01, 0x00, 0x00}) // 标准异常应答：SER + ST
 	if err != nil {
 		t.Fatalf("build: %v", err)
 	}

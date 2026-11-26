@@ -531,13 +531,19 @@ func (s *Server) replyWire(addr cj.Addr, ctrl byte, diWire [2]byte, ser byte, pa
 	return fr
 }
 
-// exception 组异常应答：控制码 = 请求 + 0x80 + 0x40，数据域 = DI + SER。
+// exception 组异常应答：控制码 = 请求 + 0x80 + 0x40，数据域 = SER + 状态 ST(2)。
+//
+// 2004 版的异常应答数据域是 **SER + ST**（L=03），不是「DI + SER」：
+// 标准 §8.1.3 的帧格式为 `CTR_2 L SER 状态ST`，汇中水表写时间失败的现场
+// 抓包 `C4 03 02 00 00` 也是这个布局。SER 回显请求数据域的第 3 字节；
+// ST 这里固定 0（188 没有定义异常错误码）。
 func (s *Server) exception(fr cj.Frame) []byte {
-	var data []byte
+	var ser byte
 	if len(fr.Data) >= 3 {
-		data = append(data, fr.Data[0], fr.Data[1], fr.Data[2])
+		ser = fr.Data[2]
 	}
-	out, err := cj.Build(s.mtype, fr.Addr, fr.Ctrl|cj.BitReply|cj.BitError, data)
+	out, err := cj.Build(s.mtype, fr.Addr, fr.Ctrl|cj.BitReply|cj.BitError,
+		[]byte{ser, 0x00, 0x00})
 	if err != nil {
 		return nil
 	}

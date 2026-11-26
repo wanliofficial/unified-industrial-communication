@@ -293,7 +293,9 @@ func TestReadAddr(t *testing.T) {
 
 func TestParseErrorReply(t *testing.T) {
 	addr := mustAddr(t, "00000805000001")
-	resp, _ := Build(0x10, addr, CtrlRead|BitReply|BitError, []byte{0x90, 0x1F, 0x07})
+	// 2004 版异常应答的数据域是 SER + 状态 ST(2)。用汇中水表「写时间失败」
+	// 的现场抓包 `C4 03 02 00 00` 做金帧：SER=0x02、ST=0x0000。
+	resp, _ := Build(0x10, addr, CtrlWrite|BitReply|BitError, []byte{0x02, 0x00, 0x00})
 	fr, _, err := Parse(resp)
 	if err != nil {
 		t.Fatal(err)
@@ -302,8 +304,21 @@ func TestParseErrorReply(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if er.DI != DIReadData || er.SER != 0x07 {
+	if er.SER != 0x02 || er.ST != 0x0000 {
 		t.Fatalf("error reply = %+v", er)
+	}
+	// 状态字低字节先传：04 08 → ST=0x0804。
+	resp2, _ := Build(0x10, addr, CtrlRead|BitReply|BitError, []byte{0x07, 0x04, 0x08})
+	fr2, _, err := Parse(resp2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	er2, err := ParseErrorReply(fr2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if er2.SER != 0x07 || er2.ST != 0x0804 {
+		t.Fatalf("error reply = %+v", er2)
 	}
 	if _, err := ParseReply(fr); err == nil {
 		t.Fatal("ParseReply must reject exception frames")

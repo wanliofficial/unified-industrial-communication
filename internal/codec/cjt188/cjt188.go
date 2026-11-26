@@ -378,11 +378,22 @@ func ParseReadReply(fr Frame, want DI, ser byte) (Reply, error) {
 
 // ErrorReply 是从站异常应答里能确定的内容。
 //
-// 标准写的是数据域 = DI0 DI1 SER（L=03）；部分设备只回 SER（L=01）。
-// 两种都接受，其余长度按协议错误处理。
+// 2004 版异常应答的数据域是 **SER + 状态 ST（2 字节）**，不是「DI + SER」：
+//
+//	68H T A0..A6 CTR_2 03H SER ST0 ST1 CS 16H
+//
+// 标准 §8.1.3（读）与 §8.2.x（写）都写作 `CTR_2 L SER 状态ST`；现场抓包也
+// 印证——汇中水表「写时间失败」的应答是 `C4 03 02 00 00`，数据域 `02 00 00`
+// 即 SER=0x02、ST=0x0000。把这里当成 DI0 DI1 SER 会把 SER 读成 DI 高字节、
+// 把 ST 高字节读成 SER，诊断文本整段错位。
+//
+// 少数厂商只回 1 字节 SER（L=01），同样接受；其 ST 视为 0。其余长度按协议
+// 错误处理。
 type ErrorReply struct {
-	DI  DI
 	SER byte
+	// ST 是 2 字节状态字（低字节先传）：第一字节定义见表 14，第二字节由
+	// 厂商定义。L=01 的厂商变体没有状态字，ST 为 0。
+	ST uint16
 }
 
 // Exception 是从站异常应答（控制码 D6=1）对应的错误。
@@ -392,16 +403,16 @@ type ErrorReply struct {
 // 不该重连、不该熔断；后者才需要看帧边界是否还可信。
 type Exception struct {
 	Ctrl byte
-	DI   DI
 	SER  byte
+	ST   uint16
 }
 
 // Error 输出便于对照请求的错误文本。
 //
-// 188 的异常应答没有错误码，因此文案只能说清「哪条命令被拒」——把 DI 与 SER
-// 都带上，现场才查得到是点表里的哪一行。
+// 188 的异常应答没有错误码，因此文案只能说清「哪条命令被拒」——把 SER 与
+// 状态字 ST 都带上，现场才查得到是点表里的哪一行。
 func (e *Exception) Error() string {
-	return fmt.Sprintf("cjt188: 从站拒绝执行（控制码 %02X，DI %s，SER %d）", e.Ctrl, e.DI, e.SER)
+	return fmt.Sprintf("cjt188: 从站拒绝执行（控制码 %02X，SER %d，状态 ST 0x%04X）", e.Ctrl, e.SER, e.ST)
 }
 
 // ParseErrorReply 解析异常应答（0xC1 / 0xC4 …）。
@@ -411,11 +422,12 @@ func ParseErrorReply(fr Frame) (ErrorReply, error) {
 	}
 	switch len(fr.Data) {
 	case 3:
-		return ErrorReply{DI: DI{Hi: fr.Data[0], Lo: fr.Data[1]}, SER: fr.Data[2]}, nil // 大端
+		// 数值低字节先传：ST0 是低字节、ST1 是高字节。
+		return ErrorReply{SER: fr.Data[0], ST: uint16(fr.Data[1]) | uint16(fr.Data[2])<<8}, nil
 	case 1:
 		return ErrorReply{SER: fr.Data[0]}, nil
 	default:
-		return ErrorReply{}, fmt.Errorf("cjt188: 异常应答数据域 %d 字节，无法解释", len(fr.Data))
+		return ErrorReply{}, fmt.Errorf("cjt188: 异常应答数据域 %d 字节，无法解释（标准为 SER+ST 共 3 字节）", len(fr.Data))
 	}
 }
 
@@ -430,8 +442,8 @@ func ExceptionOf(fr Frame) error {
 	}
 	ex := &Exception{Ctrl: fr.Ctrl}
 	if er, err := ParseErrorReply(fr); err == nil {
-		ex.DI = er.DI
 		ex.SER = er.SER
+		ex.ST = er.ST
 	}
 	return ex
 }

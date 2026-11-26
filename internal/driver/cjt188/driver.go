@@ -613,7 +613,8 @@ func (c *conn) writeAddr(ctx context.Context, req driver.WriteRequest) error {
 	return nil
 }
 
-// checkWriteAck 校验写应答：控制码必须是「请求 + 0x80」，DI 与 SER 回显一致。
+// checkWriteAck 校验写应答：正常应答的控制码必须是「请求 + 0x80」且 DI 与 SER
+// 回显一致；异常应答的数据域则是 SER + 状态 ST(2)，不带错误码。
 func (c *conn) checkWriteAck(fr cjt188.Frame, ctrl byte, want cjt188.DI, ser byte, what string) error {
 	if fr.IsError() {
 		// 写被拒同样按点级处理（ErrPermission 更贴切：这是「表不允许这次写」，
@@ -623,7 +624,7 @@ func (c *conn) checkWriteAck(fr cjt188.Frame, ctrl byte, want cjt188.DI, ser byt
 			return driver.E(driver.ErrProtocol, "write", c.devID, err.Error(), false, err)
 		}
 		return driver.E(driver.ErrPermission, "write", c.devID,
-			fmt.Sprintf("%s被拒绝（DI %s，SER %d）", what, er.DI, er.SER), false, nil)
+			fmt.Sprintf("%s被拒绝（SER %d，状态 ST 0x%04X）", what, er.SER, er.ST), false, nil)
 	}
 	if fr.Ctrl != ctrl {
 		return driver.E(driver.ErrProtocol, "write", c.devID,
@@ -762,7 +763,7 @@ func (c *conn) checkAddr(fr cjt188.Frame, op string) error {
 
 // classify 把编解码层/异常应答映射为驱动错误分类。
 //
-// CJ/T 188 的异常应答**不带错误码**：数据域只有 DI + SER，主站只能从「是哪条
+// CJ/T 188 的异常应答**不带错误码**：数据域只有 SER + 状态 ST(2)，主站只能从「是哪条
 // 命令、什么参数」推断原因。因此这里的分类必须保守地按「点级」处理：
 //
 //   - 异常应答（控制码 D6=1）说明表收到了请求但拒绝执行。最典型的来源是点表

@@ -362,8 +362,9 @@ func TestSimWithoutValueReturnsException(t *testing.T) {
 	if !fr.IsError() || fr.Ctrl != cj.CtrlRead|cj.BitReply|cj.BitError {
 		t.Fatalf("ctrl = %02X, want exception", fr.Ctrl)
 	}
-	if len(fr.Data) < 3 || fr.Data[0] != di.Bytes()[0] || fr.Data[1] != di.Bytes()[1] || fr.Data[2] != 0x02 {
-		t.Fatalf("exception echo = %X", fr.Data)
+	// 2004 标准：异常应答数据域 = SER + 状态 ST(2)，SER 回显请求。
+	if len(fr.Data) != 3 || fr.Data[0] != 0x02 || fr.Data[1] != 0x00 || fr.Data[2] != 0x00 {
+		t.Fatalf("exception data = %X, want SER(02) ST(00 00)", fr.Data)
 	}
 
 	// 同一块表的其它 DI 仍然正常：异常是点级事实，不是表级故障。
