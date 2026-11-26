@@ -12,9 +12,14 @@ PRD 中 M 级的采集协议已全部落地，FR-CFG-01 的四类寻址模型也
 COV/分段/多属性读仍不做，见 [protocol-status.md](protocol-status.md) §4.1）。非 M 级验收里的 12 类故障注入同样全部有了
 可自动跑的用例（见 §7）。
 
-当前测试基线：**443 条**（带 `--opcua` 全量；本轮**新增 1 条**契约用例。全量实测数字以
-[testing.md](testing.md) 最新一轮为准）。本轮补上错误表 400 行 `user.invalid_role` 与 409 行
-`user.exists` 的覆盖——这两个码此前**零断言**：
+当前测试基线：**443 条**（带 `--opcua` 全量；本轮**加强既有用例** `auth_users_require_manage`、未新增用例，条数不变。全量实测数字以
+[testing.md](testing.md) 最新一轮为准）。本轮给停用账号登录的拒绝补上 code 断言——`auth.user_disabled` 此前**零断言**：`auth_users_require_manage`
+早已测到「停用账号登录返回 403」，但只断言了 HTTP 状态码、没点名 `error.code`。403 也能是别的码（越权、未改临时口令），状态码对了 code
+却漂移也没人发现；而「停用」是管理员主动做的决定，与「口令错」（用户自己输错）、「越权」（权限不足）的处置方向完全不同，运维要从
+code 一眼分清。加强后断言 `error.code == auth.user_disabled`。非空验证：把 `AuthService` 的停用抛点 code 由 `auth.user_disabled` 改成
+`auth.account_disabled` → 实测 FAIL `expected <auth.user_disabled>, got <auth.account_disabled>`；恢复后源码与 HEAD 字节一致、用例 PASS
+（49.8 s）。
+上一轮（443 条、新增 1 条）补上错误表 400 行 `user.invalid_role` 与 409 行 `user.exists` 的覆盖——这两个码此前**零断言**：
 `contract/user_create_rejects_duplicate_and_unknown_role` 钉住四件事——
 （1）建账号给不存在的角色 → 400 `user.invalid_role`（`UserStore.Create` 抛点）；
 （2）重名创建 → 409 `user.exists`；

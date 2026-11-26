@@ -2870,6 +2870,13 @@ internal static class ContractTests
                 t.Ct);
             t.Equal(HttpStatusCode.Forbidden, disabledLogin.StatusCode,
                 "a disabled account cannot log in");
+            // 状态码是 403 还不够：403 也能是别的码（越权、未改临时口令……）。运维要从 code
+            // 一眼分清「这个账号被停用了」而不是「口令不对」或「没权限」——停用是管理员
+            // 主动做的决定，口令错是用户自己输错，两者的处置方向完全不同。
+            using (var envelope = await ReadJsonAsync(t, disabledLogin))
+                t.Equal("auth.user_disabled",
+                    envelope.RootElement.GetProperty("error").GetProperty("code").GetString(),
+                    "the code names the disabled state, not a generic forbidden");
 
             var remove = await host.Client.SendAsync(
                 DeleteWith("/api/v1/users/operator1", Token), t.Ct);
