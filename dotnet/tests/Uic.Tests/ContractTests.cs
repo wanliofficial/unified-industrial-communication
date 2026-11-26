@@ -91,6 +91,8 @@ internal static class ContractTests
         tests.Add(new TestCase("contract/auth_users_require_manage", AuthUsersRequireManage));
         tests.Add(new TestCase("contract/auth_change_password_rejects_wrong_current",
             AuthChangePasswordRejectsWrongCurrent));
+        tests.Add(new TestCase("contract/auth_change_password_rejects_api_token",
+            AuthChangePasswordRejectsApiToken));
         tests.Add(new TestCase("contract/user_last_admin_is_protected", UserLastAdminIsProtected));
         tests.Add(new TestCase("contract/user_cannot_delete_self_is_protected",
             UserCannotDeleteSelfIsProtected));
@@ -2820,6 +2822,41 @@ internal static class ContractTests
                 t.Ct);
             t.Equal(HttpStatusCode.Unauthorized, wrongNew.StatusCode,
                 "the attempted new password was never applied");
+        });
+    }
+
+    /// <summary>
+    /// 静态 API Token 不是账号，没有口令可改——POST /api/v1/auth/password 必须
+    /// 返回 400 + code == auth.not_a_user，而不是默默忽略或报别的错。
+    /// 错误表 northbound-api.md 的 400 行明列这个码，但此前零断言：API Token
+    /// 带 Roles.Admin + Permissions.All，能过所有权限门，若这个守卫被删，改密
+    /// 会一路走到「当前口令错」的 400 auth.invalid_password——管理员会以为是自己
+    /// 口令记错了，实际是这个身份根本没有口令可改。分支在读取请求体之前，
+    /// 所以即便传一份合法请求体也先命中 auth.not_a_user。用一个与真实账号都无关
+    /// 的静态令牌打，code 一眼能分清「你根本不是账号」与「凭据错」。
+    /// </summary>
+    private static Task AuthChangePasswordRejectsApiToken(TestContext t)
+    {
+        return RunAsync(async () =>
+        {
+            await using var host = await Host.StartAsync(t);
+
+            var body = JsonSerializer.Serialize(new
+            {
+                currentPassword = "whatever-current",
+                newPassword = "next-password-456"
+            });
+            var rejected = await host.Client.SendAsync(
+                PostWith("/api/v1/auth/password", body, Token), t.Ct);
+            t.Equal(HttpStatusCode.BadRequest, rejected.StatusCode,
+                "the static API token has no password to change");
+
+            using (var error = await ReadJsonAsync(t, rejected))
+            {
+                t.Equal("auth.not_a_user",
+                    error.RootElement.GetProperty("error").GetProperty("code").GetString(),
+                    "the code says this identity is not a user account, not a password mistake");
+            }
         });
     }
 

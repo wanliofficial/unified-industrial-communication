@@ -12,8 +12,22 @@ PRD 中 M 级的采集协议已全部落地，FR-CFG-01 的四类寻址模型也
 COV/分段/多属性读仍不做，见 [protocol-status.md](protocol-status.md) §4.1）。非 M 级验收里的 12 类故障注入同样全部有了
 可自动跑的用例（见 §7）。
 
-当前测试基线：**446 条**（带 `--opcua` 全量；本轮**新增 1 条**契约用例。全量实测数字以
-[testing.md](testing.md) 最新一轮为准）。本轮钉住登录凭据错误 `auth.invalid_credentials` 的「不做账号枚举」不变量：
+当前测试基线：**447 条**（带 `--opcua` 全量；本轮**新增 1 条**契约用例。全量实测数字以
+[testing.md](testing.md) 最新一轮为准）。本轮钉住静态 API Token 改密被拒的 `auth.not_a_user`：
+错误表 `northbound-api.md` 的 400 行明列这个码，但此前**零断言**——`RestApi.Auth.cs` 的
+`POST /api/v1/auth/password` 在读完鉴权、读请求体**之前**就判 `principal.IsApiToken`，直接返回
+400 `auth.not_a_user`（「静态 API Token 不是账号，没有口令可改」）。这个守卫不能删：静态 API Token
+带 `Roles.Admin` + `Permissions.All`，能过所有权限门，若守卫被删，改密会一路走到
+`CheckPassword(principal.Id, ...)` 的「当前口令错」400 `auth.invalid_password`——管理员会以为是自己
+口令记错了，实际是这个身份根本没有口令可改，处置方向完全不同。新增
+`contract/auth_change_password_rejects_api_token`：用静态令牌（`contract-token`，身份 `api-token`）
+打 `POST /api/v1/auth/password`（带一份合法请求体，因为守卫在解析请求体之前）→ 400 +
+`error.code == auth.not_a_user`，明确点名「这个身份不是账号」而不是「凭据错」。非空验证：把抛点 code
+由 `auth.not_a_user` 改成 `auth.not_a_user_x` → 实测 FAIL `the code says this identity is not a user
+account, not a password mistake: expected <auth.not_a_user>, got <auth.not_a_user_x>`；恢复后源码与 HEAD
+字节一致、用例 PASS（10.0 s 与 4.8 s）。验证受工作站他人进程占满影响（load 常 6-8、`mount.ntfs`
+持续高占用），靠后台监视器等低负载窗口跑成。
+上一轮（446 条、新增 1 条）钉住登录凭据错误 `auth.invalid_credentials` 的「不做账号枚举」不变量：
 错误表 `northbound-api.md` 的 401 行明列这个码，但既有 `contract/auth_login_is_rate_limited` 只断言「错口令 = 401」这个
 **状态码**、从没点名 `error.code`；更要紧的是，「口令错」与「用户不存在」必须给出**完全相同**的 code 与 message——否则
 错误信息本身就变成了一个账号枚举接口（攻击者拿一个用户名试一次，凭返回 code 就能判断账号是否存在），这条安全约束
