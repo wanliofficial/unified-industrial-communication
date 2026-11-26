@@ -145,9 +145,19 @@ HTTP POST /points/{d}/{p}/write
 cache 变更事件
   ├→ SSE Hub：按订阅过滤 → 每客户端有界缓冲 → 慢客户端丢弃最旧
   ├→ Outbox：写入 WAL → 投递 worker → 成功后删除
+  │     └→ 契约双发期：每条传输注册两条 lane（`<t>` v1 / `<t>#v2`），
+  │        独立确认位点；publish 读原子 contractVersion 决定是否喂 v2 lane
   ├→ OPC UA：更新节点值 + 触发 DataChange 通知（直接订阅 cache，不经过 Outbox）
   └→ 指标：计数/延迟
 ```
+
+**数据契约版本化（`internal/northbound/contract`）**：一条变化事件在进入 Outbox
+前先编成 v1 载荷；若当时 `contractVersion=2`，再编一份 v2 载荷。两份载荷分别
+入 v1 lane 与 v2 lane——这是两条 **独立的持久分区**，各有自己的确认位点与重试，
+所以 v2 的消费方坏掉不会把 v1 的位点卡住。`contractVersion` 是运行期的原子值：
+`reload` 只翻转它，不重建 sink、不重启采集，从而满足「同一份数据能以两种 Topic
+结构并发出队、切换不需重启采集」的验收标准。完整的载荷/主题示例见
+`05-northbound-api-spec.md` §3.4 与 §6。
 
 ---
 

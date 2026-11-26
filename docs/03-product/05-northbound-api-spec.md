@@ -185,11 +185,25 @@ Authorization: Bearer <token>
 
 | 字段 | 位置 | 当前值 |
 |---|---|---|
-| `schemaVersion` | 配置 | 1 |
+| `schemaVersion` | 配置 / v1 载荷 | 1 |
 | `apiVersion` | `/api/v1` | 1 |
 | `payloadVersion` | MQTT 消息属性（可选） | 1 |
+| `contractVersion` | 北向配置 / v2 载荷 | 2 |
 
-**演进规则**：新增字段向后兼容（消费者忽略未知字段）；删除/改名字段必须升 `/v2` 并提供双发过渡期（≥ 6 个月）。
+**演进规则**：新增字段向后兼容（消费者忽略未知字段）；删除/改名字段必须升主版本并提供双发过渡期（≥ 6 个月）。
+
+**双发过渡期（`northbound.contractVersion=2`）**：同一份采集数据同时以旧契约 v1 与新契约 v2 两份载荷输出，落到两条独立的 Outbox 分区（lane）：`<transport>`（v1）与 `<transport>#v2`（v2）。两条 lane 各有独立的确认位点与重试队列——v2 的消费方坏掉不会拖累 v1 的确认。切换契约版本是**运行期热切**：`contractVersion` 由一个原子值承载，reload 只翻转「是否往 v2 lane 入队」，不重建 sink、不重启采集。
+
+| `contractVersion` | 行为 |
+|---|---|
+| `0`（未配置）/ `1` | 只发 v1（存量部署默认，线上流量零变化） |
+| `2` | 双发：v1 lane + v2 lane 同时出队 |
+
+约束：
+
+- `contractVersion=2` 与 `mqtt.format=sparkplug-b` 互斥——Sparkplug B 自带契约与主题生成，不参与 JSON v2 双发。
+- `mqtt.topicV2` 仅在 `contractVersion=2` 且 `mqtt.format=json` 时生效；缺省派生为 `mqtt.topic + "/v2"`，显式配置必须自带 `{device}` 与 `{point}` 占位符。
+- v1/v2 载荷字段形态不同：v1 扁平（`device`/`point` 在顶层 + `schemaVersion`），v2 嵌套（外层 `contractVersion`，样本收进 `sample` 并用驼峰 `deviceId`/`pointId`/`deviceTime`/`collectedAt`）。契约的字节形态与 lane 命名规则集中在 `internal/northbound/contract`。
 
 ---
 
@@ -1339,6 +1353,11 @@ ID 里混进 `/`，消息会静默跑到别人的主题上（甚至被别人的 
 覆盖；模板必须同时包含 `{device}` 与 `{point}`，否则配置校验直接拒绝（所有
 点位挤到一个主题上等于没有主题路由）。
 
+**契约 v2 双发期**：`northbound.contractVersion=2` 时另有一条 v2 lane 发到
+`northbound.mqtt.topicV2`（缺省 `uic/{site}/{device}/{point}/value/v2`）。两条
+lane 共用同一个 Broker 连接与凭据，各发各的主题；v1 主题在双发期**不变**，
+老消费方无需改动。
+
 ### 6.2 消息体
 
 与 REST 的 Sample 完全一致（同一契约），额外增加：
@@ -1365,6 +1384,29 @@ ID 里混进 `/`，消息会静默跑到别人的主题上（甚至被别人的 
 { "schemaVersion": 1, "online": true,  "startedAt": "2026-11-04T10:15:20Z" }
 { "schemaVersion": 1, "online": false }
 ```
+
+**v2 载荷（双发期）**：与 v1 结构有意不同，消费方可从载荷本身认出属于哪一版。
+
+```json
+{
+  "contractVersion": 2,
+  "sample": {
+    "deviceId": "plc-01",
+    "pointId": "speed",
+    "value": { "type": "float32", "num": 1450 },
+    "quality": "good",
+    "deviceTime": "2026-11-04T10:15:20.123Z",
+    "collectedAt": "2026-11-04T10:15:20.456Z",
+    "seq": 42,
+    "unit": "rpm"
+  }
+}
+```
+
+v1（扁平，`device`/`point` 在顶层 + `schemaVersion`）与 v2（外层
+`contractVersion`，样本收进 `sample`、字段改驼峰）在同一条采集事件上并发出队，
+互不影响。设备状态、`$birth`/`$death`、报警等控制面消息仍只有 v1 形态——
+它们描述的是「当前事实」而非数据契约，不参与版本化。
 
 ### 6.3 QoS 与保留
 
@@ -1788,7 +1830,7 @@ NCMD 重生、断线后重发 BIRTH、停机 NDEATH 与 DISCONNECT、异常断�
 开启后，每条通过死区过滤的变化事件会追加到 `<dir>/journal.ndjson`，一行一条：
 
 ```json
-{"schemaVersion":1,"deviceId":"plc-01","pointId":"temp","value":{"type":"float32","num":23.5},"quality":"good","collectedAt":"2026-11-04T10:15:23.605Z","seq":42}
+{"schemaVersion":1,"device":"plc-01","point":"temp","value":{"type":"float32","num":23.5},"quality":"good","collectedAt":"2026-11-04T10:15:23.605Z","seq":42}
 ```
 
 | 规则 | 说明 |
@@ -1798,6 +1840,10 @@ NCMD 重生、断线后重发 BIRTH、停机 NDEATH 与 DISCONNECT、异常断�
 | 上限 | 受 `outboxMaxBytes` / `outboxMaxRecords` / `outboxTtl` 约束 |
 | 文件生命周期 | 只追加、不删除；轮转与清理交给外部（logrotate / 运维脚本） |
 | 语义 | at-least-once；崩溃后可能重复一行，消费方按 `device+point+seq` 去重 |
+
+**双发期（`contractVersion=2`）**：`journal` 与 `journal#v2` 两条 lane 写同一个
+文件，v1 行带 `schemaVersion`、v2 行带 `contractVersion`，读方按版本字段过滤。
+两条 lane 的 `write` 对同一个 `*os.File` 加锁串行化，避免两批字节插花。
 
 **它不是北向协议**。定位是：断网留痕、开发联调时无需架 Broker 即可验证整条链路、CI 里可直接断言落盘内容。默认关闭，因为它是磁盘写入路径，不该在为「只是想采个数」的部署里默默产生 I/O。
 
