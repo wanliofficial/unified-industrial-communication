@@ -26,6 +26,7 @@ import (
 	"uic/internal/cache"
 	"uic/internal/config"
 	"uic/internal/history"
+	"uic/internal/i18n"
 	"uic/internal/model"
 	"uic/internal/obs"
 	"uic/internal/rbac"
@@ -303,18 +304,48 @@ type WriteResult struct {
 }
 
 // APIError 是带 HTTP 状态与错误码的领域错误。Backend 用它表达可预期的失败。
+//
+// Code 是对外契约（稳定、机器可读、不随语言变化）；Message 是源语言（英语）
+// 渲染结果，供审计日志与进程内调用方使用。给人看的响应正文由 Localized 按
+// 请求语言重新渲染。
 type APIError struct {
 	Status  int            `json:"-"`
 	Code    string         `json:"code"`
 	Message string         `json:"message"`
 	Details map[string]any `json:"details,omitempty"`
+
+	// format/args 是构造时的源语言模板与参数。保留它们（而不是保留已渲染的
+	// 字符串）是 i18n 的前提：从成品句子里反推模板是不可靠的。
+	format string
+	args   []any
 }
 
 func (e *APIError) Error() string { return e.Code + ": " + e.Message }
 
+// Localized 返回该错误在 l 语言下的消息文本。
+//
+// 没有对应翻译——或者这个错误不是经由 Errf 构造（没有模板）——时回退 Message，
+// 也就是源语言渲染结果。因此最坏情况与未引入 i18n 之前逐字节相同：i18n 只会
+// 让消息更贴近调用方语言，不会让任何一条消息变得更糟。
+func (e *APIError) Localized(l i18n.Locale) string {
+	if e == nil {
+		return ""
+	}
+	if e.format == "" {
+		return e.Message
+	}
+	return i18n.Translate(l, e.format, e.args...)
+}
+
 // Errf 构造一个 APIError。
 func Errf(status int, code, format string, args ...any) *APIError {
-	return &APIError{Status: status, Code: code, Message: fmt.Sprintf(format, args...)}
+	return &APIError{
+		Status:  status,
+		Code:    code,
+		Message: fmt.Sprintf(format, args...),
+		format:  format,
+		args:    append([]any(nil), args...),
+	}
 }
 
 // StagedPolicy 是灰度发布的推进策略。
@@ -889,27 +920,54 @@ type errorDetail struct {
 	Details   map[string]any `json:"details,omitempty"`
 }
 
+var (
+	// 信封层的兜底错误。做成 Errf 的结果而不是 fail 里的字面量，是为了让它们
+	// 与所有领域错误走同一条「模板 → 渲染」路径；否则这三条消息会成为 i18n
+	// 覆盖率检查的盲区。
+	errCanceled = Errf(499, "request.canceled", "request canceled")
+	errTimeout  = Errf(http.StatusGatewayTimeout, "request.timeout", "request timed out")
+	errInternal = Errf(http.StatusInternalServerError, "internal.error", "internal error")
+)
+
 func (s *Server) fail(w http.ResponseWriter, r *http.Request, err error) {
-	code := http.StatusInternalServerError
-	apiCode := "internal.error"
-	msg := "internal error"
-	var details map[string]any
 	var ae *APIError
-	if errors.As(err, &ae) {
-		code = ae.Status
-		apiCode = ae.Code
-		msg = ae.Message
-		details = ae.Details
-	} else if errors.Is(err, context.Canceled) {
-		code, apiCode, msg = 499, "request.canceled", "request canceled"
-	} else if errors.Is(err, context.DeadlineExceeded) {
-		code, apiCode, msg = http.StatusGatewayTimeout, "request.timeout", "request timed out"
-	} else {
+	switch {
+	case errors.As(err, &ae):
+	case errors.Is(err, context.Canceled):
+		ae = errCanceled
+	case errors.Is(err, context.DeadlineExceeded):
+		ae = errTimeout
+	default:
 		s.log.Error("http_error", "path", r.URL.Path, "error", err)
+		ae = errInternal
 	}
-	writeJSON(w, code, errorEnvelope{Error: errorDetail{
-		Code: apiCode, Message: msg, RequestID: requestID(r), Details: details,
+	format, args := ae.format, ae.args
+	if format == "" {
+		// 手工构造的 APIError（不经 Errf）没有模板：原文即消息。
+		format = ae.Message
+	}
+	loc := negotiateLocale(r)
+	// 告诉调用方这段文案是什么语言，也让中间缓存知道：同一个 URL 的响应会
+	// 随 Accept-Language 变化，不能把中文错误缓存下来回给英文客户端。
+	w.Header().Set("Content-Language", loc.Tag())
+	w.Header().Add("Vary", "Accept-Language")
+	writeJSON(w, ae.Status, errorEnvelope{Error: errorDetail{
+		Code: ae.Code, Message: i18n.Translate(loc, format, args...), RequestID: requestID(r), Details: ae.Details,
 	}})
+}
+
+// localeParam 是显式指定响应语言的查询参数名。
+const localeParam = "lang"
+
+// negotiateLocale 解析本次请求希望使用的错误消息语言。
+//
+// 顺序是「显式查询参数 > Accept-Language > 默认英语」，理由见 internal/i18n
+// 的包注释：中文是「声明了才给」，默认保持英语以免升级改变既有客户端的字节。
+func negotiateLocale(r *http.Request) i18n.Locale {
+	if r == nil || r.URL == nil {
+		return i18n.Default
+	}
+	return i18n.Negotiate(r.URL.Query().Get(localeParam), r.Header.Get("Accept-Language"))
 }
 
 func writeJSON(w http.ResponseWriter, code int, v any) {
