@@ -7116,6 +7116,12 @@ error 位表示总线级问题——总线忙、冲突、链路发送失败。�
 该点。只要还有一个组地址读成功，`Read` 就返回 `nil`——否则点表里一个写错的组地址
 会让整台网关每周期重建隧道（重新申请通道号、重置 8 位序号）。
 
+等待总线应答（`awaitValue`）时，若底层套接字报**非超时**错误（典型是已连接 UDP
+套接字上的 `ECONNREFUSED`：对端端口关闭/主机不可达），`readFrame` 会把整条链路
+置空（`dropLink`）。清理读截止时间必须持有链路的**局部引用**，不能再用已经置空的
+`c.link`——否则会对 nil 接口调用方法而 panic。这类错误按 `ErrDisconnected` 返回，
+与 `disconnect` 里的同一处修正同源；驱动在任何情况下都不允许 panic。
+
 #### 3.10.20.11 自检与内置网关
 
 `uic knxread` 不依赖点表，回答「这条隧道建得起来吗、这个组地址现在是什么值」：
@@ -7176,7 +7182,7 @@ uic knxread -list
 | 层 | 用例 |
 |---|---|
 | `codec/knx` | 组地址 4/4/8 与物理地址 4/4/8 的往返与越界；DPT 解析与规范化（`9.1` ≡ `9.001`）、`Accepts` 的位宽/类型校验、`Encode`/`Decode` 各 Kind（Bool 接受 on/off/1/0 且拒绝其它数值、Unsigned/Signed/Float16/Float32/Scaled）；cEMI 的黄金字节（1 位 2 字节 TPDU 长度 = 1、2 字节 = 3）；`ParseLData` 跳过附加信息段；**1 位 APCI 归一化回归**；`DecodeGroupValue` 拒绝位宽不符与 `GroupValueRead`；KNXnet/IP 信封往返、HPAI 编解码、全部服务报文的 Parse/Build 对称、`ParseDisconnectResponse` |
-| `driver/knx` | `Meta`（能力/地址类型/`address.dpt` 必填）；`Open` 补默认端口、保留显式端口、拒绝非 UDP、九类非法 settings（心跳过长/为零/不可解析、ack 过短/超过设备超时、重传过多/不可解析、源地址非法/为 0）；缺 DPT 与 DPT-类型不符都在 `Open` 拒；`planPoint` 拒绝 selector/index/length/组地址语法错/DPT 语法错；`Probe` 建隧道且**不读组地址**；1 位/2 字节/4 字节/百分比读；未知组地址超时（`ErrTimeout` + `QualityTimeout`）；错误 DPT 读按 `ErrAddress`；首个链路错误后**中止剩余点位**（不逐个等超时）；**部分失败语义（好点 + 坏地址时 `err==nil`、全失败才返回错误）**；写开关并回读、写浮点、写未知地址成功、con 报错报 `ErrProtocol`；丢 2 个 ACK 后重传成功且序号仍同步；序号错乱后重建隧道并恢复；隧道被网关回收后心跳发现并重连；网关不回 con 时写仍成功；槽位满判可重试、释放后可连；`Close` 归还槽位；源地址三级优先 |
+| `driver/knx` | `Meta`（能力/地址类型/`address.dpt` 必填）；`Open` 补默认端口、保留显式端口、拒绝非 UDP、九类非法 settings（心跳过长/为零/不可解析、ack 过短/超过设备超时、重传过多/不可解析、源地址非法/为 0）；缺 DPT 与 DPT-类型不符都在 `Open` 拒；`planPoint` 拒绝 selector/index/length/组地址语法错/DPT 语法错；`Probe` 建隧道且**不读组地址**；1 位/2 字节/4 字节/百分比读；未知组地址超时（`ErrTimeout` + `QualityTimeout`）；错误 DPT 读按 `ErrAddress`；首个链路错误后**中止剩余点位**（不逐个等超时）；**部分失败语义（好点 + 坏地址时 `err==nil`、全失败才返回错误）**；写开关并回读、写浮点、写未知地址成功、con 报错报 `ErrProtocol`；丢 2 个 ACK 后重传成功且序号仍同步；序号错乱后重建隧道并恢复；隧道被网关回收后心跳发现并重连；网关不回 con 时写仍成功；槽位满判可重试、释放后可连；`Close` 归还槽位；源地址三级优先；**等待总线应答时底层非超时读错误按 `ErrDisconnected` 返回且不 panic（`c.link` 已被 dropLink 置空）** |
 | `sim/knx` | 手写最小客户端（**不复用驱动**）：建连分配通道与 CRD、槽位满拒绝、非隧道 CRI 拒绝且不占槽位、DISCONNECT 释放槽位、未知通道拒绝、通道状态存活与回收；序号严格校验（拒绝后不推进期望值）、重传只重发 ACK 不重复执行、8 位回绕后「新帧 vs 重传」边界、未知通道拒绝、畸形数据报计数；读返回存储载荷（含 `L_Data.con` 正常）、未知组地址只有 ACK + con、写 1 位/2 字节落地、写未知地址被转发但不落地、`FailNextConfirms` 只影响一条、`DisableConfirm` 抑制 con；`DropNextACKs` 后重传、`FailNextSequence` 只失败一次；对象表覆盖与**宽度与 DPT 一致**（`4/1/1` 必须 4 字节）、`SetValue`/`SetNumber` 越界拒绝、`SetPayload` 拒绝非法组地址、每秒自增、`Close` 幂等 |
 | `pointtable` | `PolicyFor("knx")` 是 `WidthNone + AllowSymbol + AllowDPT` 且不泄漏 DI/length 标志；正向（`@9.001`、`@9.1` 规范化）× 往返（`Canonical()` 能重新解析成同一地址且保留 DPT）；反向（缺 DPT、DPT 语法、主组/中间组越界、符号地址带 selector） |
 

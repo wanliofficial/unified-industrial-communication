@@ -955,10 +955,18 @@ func (c *conn) awaitValue(ctx context.Context, op string, window time.Duration, 
 	if d := time.Now().Add(window); d.Before(deadline) {
 		deadline = d
 	}
-	if err := c.link.SetDeadline(deadline); err != nil {
+	// 必须持有局部引用：循环里的 readFrame 在非超时读错误时会 dropLink()，
+	// 把 c.link 置空。若 defer 里仍用 c.link，就会对 nil 接口调用方法而
+	// panic——这与 disconnect 里同源（那里已经因此改用局部 link）。驱动
+	// 在任何情况下都不许 panic，链路错误只能作为 error 返回。
+	link := c.link
+	if link == nil {
+		return driver.E(driver.ErrDisconnected, op, c.devID, "link is down", true, nil)
+	}
+	if err := link.SetDeadline(deadline); err != nil {
 		return c.linkError(op, "set udp deadline", err)
 	}
-	defer func() { _ = c.link.SetDeadline(time.Time{}) }()
+	defer func() { _ = link.SetDeadline(time.Time{}) }()
 
 	for {
 		// 先消化 inbox。
