@@ -3,17 +3,18 @@ package runtime
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
 	"path/filepath"
 	"sort"
+	"sync"
 	"time"
 
 	"uic/internal/config"
 	"uic/internal/model"
+	"uic/internal/northbound/contract"
 	"uic/internal/obs"
 	"uic/internal/outbox"
 )
@@ -31,6 +32,9 @@ type deliverFunc func(ctx context.Context, recs []outbox.Record) (int, error)
 // （不写盘、不占内存），这是一个显式选择，而不是静默降级。
 func (r *Runtime) openSinks(f *config.File) error {
 	sinks := map[string]deliverFunc{}
+	// 契约版本是运行期热切的状态：这里种下初值，之后由 reload 跟随配置更新。
+	// 即使没有任何 sink（outbox 关闭）也种，保证 publish 读到的值一致。
+	r.contractVersion.Store(int64(f.Northbound.EffectiveContractVersion()))
 
 	if f.Northbound.Webhook.Enabled {
 		if f.Northbound.Webhook.URL == "" {
@@ -40,16 +44,21 @@ func (r *Runtime) openSinks(f *config.File) error {
 			if timeout <= 0 {
 				timeout = 5 * time.Second
 			}
-			sinks["webhook"] = (&webhookSink{
+			wh := &webhookSink{
 				url:     f.Northbound.Webhook.URL,
 				headers: f.Northbound.Webhook.Headers,
 				limit:   f.Northbound.Webhook.Batch,
 				client:  &http.Client{Timeout: timeout},
-			}).deliver
+			}
+			sinks["webhook"] = wh.deliverV1
+			// 双发：v2 lane 用 contractVersion 信封，与 v1 共享 client/url 但
+			// 各自独立确认。webhook 没有「主题」，差异全在载荷信封上。
+			sinks["webhook"+contract.LaneSuffixV2] = wh.deliverV2
 		}
 	}
 	if f.Northbound.MQTT.Enabled {
 		var sink northboundSink
+		var mjson *mqttSink
 		var err error
 		// 默认 clientID/nodeId 带上实例身份：同站点多实例部署时，若都退回
 		// 「uic-<site>」会连同一 Broker 会话互相顶掉（静默断流）。用户显式
@@ -74,7 +83,8 @@ func (r *Runtime) openSinks(f *config.File) error {
 			if mq.ClientID == "" {
 				mq.ClientID = r.defaultClientID(f.Site)
 			}
-			sink, err = newMQTTSink(mq, f.Site, mq.ClientID)
+			mjson, err = newMQTTSink(mq, f.Site, mq.ClientID)
+			sink = mjson
 		}
 		if err != nil {
 			return fmt.Errorf("runtime: mqtt: %w", err)
@@ -82,6 +92,12 @@ func (r *Runtime) openSinks(f *config.File) error {
 		sink.setMetrics(r.metrics)
 		r.mqttSink = sink
 		sinks["mqtt"] = sink.deliver
+		// json 双发：为 v2 lane 再注册一条，用 v2 主题模板。Sparkplug 自带
+		// 契约、不在这里开 v2 lane。两条 lane 共享同一 Broker 连接与凭据，
+		// 但各自独立确认——v2 消费方拖慢只拖累 mqtt#v2 的积压。
+		if mjson != nil {
+			sinks["mqtt"+contract.LaneSuffixV2] = mjson.deliverV2
+		}
 	}
 	if f.Storage.Journal {
 		path := filepath.Join(r.dataDir, "journal.ndjson")
@@ -91,7 +107,11 @@ func (r *Runtime) openSinks(f *config.File) error {
 		}
 		r.journalSink = &journalSink{f: fh}
 		r.journal = fh
+		// 两条 lane 写同一个文件：v1 行带 schemaVersion、v2 行带 contractVersion，
+		// 读方按版本字段过滤。deliver 内部对同一 *os.File 加锁串行化，两个
+		// dispatchLoop 并发写也不会让一行的字节插到另一行中间。
 		sinks["journal"] = r.journalSink.deliver
+		sinks["journal"+contract.LaneSuffixV2] = r.journalSink.deliver
 	}
 
 	if len(sinks) == 0 {
@@ -141,18 +161,43 @@ func (r *Runtime) instanceShort() string {
 }
 
 // publish 把一次变化事件写入所有已启用的 sink。
+//
+// 双发过渡期（contractVersion==2）：同一条采样同时编成 v1 与 v2 两份载荷，
+// 分别入 v1 lane 与 v2 lane。两条 lane 有各自独立的 outbox 分区与确认位点，
+// 互不影响。contractVersion 是原子值：运行期由 reload 热切，切换只改变
+// 「要不要往 v2 lane 入队」，不重建协程、不重启采集。
 func (r *Runtime) publish(s model.Sample) {
 	if r.box == nil || len(r.sinkNames) == 0 {
 		return
 	}
-	payload, err := json.Marshal(eventPayload{SchemaVersion: 1, Sample: s})
+	v1, err := contract.EncodeV1(s)
 	if err != nil {
-		r.log.Error("outbox_marshal_failed", "device", s.DeviceID, "point", s.PointID, "error", errText(err))
+		r.log.Error("outbox_marshal_failed", "version", contract.Version1, "device", s.DeviceID, "point", s.PointID, "error", errText(err))
 		return
+	}
+	dual := r.contractVersion.Load() >= int64(contract.Version2)
+	var v2 []byte
+	if dual {
+		v2, err = contract.EncodeV2(s)
+		if err != nil {
+			r.log.Error("outbox_marshal_failed", "version", contract.Version2, "device", s.DeviceID, "point", s.PointID, "error", errText(err))
+			return
+		}
 	}
 	now := time.Now()
 	for _, sink := range r.sinkNames {
-		if _, err := r.box.Enqueue(sink, s.Key(), payload, now); err != nil {
+		if contract.IsV2Lane(sink) {
+			// v1-only 模式：v2 lane 空转（不占位点、不重试）。切到 v2 时
+			// 下一条采样就会开始入队，不需要重建 lane。
+			if !dual {
+				continue
+			}
+			if _, err := r.box.Enqueue(sink, s.Key(), v2, now); err != nil {
+				r.log.Error("outbox_enqueue_failed", "sink", sink, "error", errText(err))
+			}
+			continue
+		}
+		if _, err := r.box.Enqueue(sink, s.Key(), v1, now); err != nil {
 			r.log.Error("outbox_enqueue_failed", "sink", sink, "error", errText(err))
 		}
 	}
@@ -256,11 +301,17 @@ func (r *Runtime) refreshQueueMetrics() {
 
 // journalSink 把每条变化追加为一行 JSON。它是「断网留痕」的最低成本实现，
 // 也让 Outbox 在没有 MQTT/Webhook 的开发环境里可被观察。
+//
+// 双发过渡期会有两个 dispatchLoop（journal 与 journal#v2）并发写同一个
+// *os.File。mu 把「整批拼好 + 一次 Write」串行化，避免两批的字节插花。
 type journalSink struct {
-	f *os.File
+	mu sync.Mutex
+	f  *os.File
 }
 
 func (j *journalSink) deliver(_ context.Context, recs []outbox.Record) (int, error) {
+	j.mu.Lock()
+	defer j.mu.Unlock()
 	if j.f == nil {
 		return 0, fmt.Errorf("journal: closed")
 	}
@@ -276,6 +327,8 @@ func (j *journalSink) deliver(_ context.Context, recs []outbox.Record) (int, err
 }
 
 func (j *journalSink) close() error {
+	j.mu.Lock()
+	defer j.mu.Unlock()
 	if j.f == nil {
 		return nil
 	}
@@ -288,6 +341,9 @@ func (j *journalSink) close() error {
 }
 
 // webhookSink 把样本批量 POST 到用户端点。
+//
+// 双发过渡期：v1 lane 与 v2 lane 共用同一个 url/headers/client，但各自拼
+// 不同的信封（schemaVersion 1 vs contractVersion 2）。两条 lane 独立确认。
 type webhookSink struct {
 	url     string
 	headers map[string]string
@@ -295,12 +351,22 @@ type webhookSink struct {
 	limit   int
 }
 
-func (w *webhookSink) deliver(ctx context.Context, recs []outbox.Record) (int, error) {
+// deliverV1 发送 v1 信封：{"schemaVersion":1,"items":[...]}。
+func (w *webhookSink) deliverV1(ctx context.Context, recs []outbox.Record) (int, error) {
+	return w.postItems(ctx, recs, `{"schemaVersion":1,"items":[`)
+}
+
+// deliverV2 发送 v2 信封：{"contractVersion":2,"items":[...]}。
+func (w *webhookSink) deliverV2(ctx context.Context, recs []outbox.Record) (int, error) {
+	return w.postItems(ctx, recs, `{"contractVersion":2,"items":[`)
+}
+
+func (w *webhookSink) postItems(ctx context.Context, recs []outbox.Record, open string) (int, error) {
 	if w.limit > 0 && len(recs) > w.limit {
 		recs = recs[:w.limit]
 	}
 	var body bytes.Buffer
-	body.WriteString(`{"schemaVersion":1,"items":[`)
+	body.WriteString(open)
 	for i, rec := range recs {
 		if i > 0 {
 			body.WriteByte(',')

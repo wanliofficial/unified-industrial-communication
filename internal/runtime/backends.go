@@ -349,14 +349,6 @@ func (r *Runtime) command(ctx context.Context, action string, params map[string]
 			return nil, httpapi.Errf(http.StatusBadRequest, "request.confirm_required",
 				"outbox.drop discards data; pass confirm: true to proceed")
 		}
-		sink, err := strParam(params, "sink")
-		if err != nil {
-			if len(r.sinkNames) == 1 {
-				sink = r.sinkNames[0]
-			} else {
-				return nil, err
-			}
-		}
 		before := time.Now()
 		if v, ok := params["before"].(string); ok && v != "" {
 			t, perr := time.Parse(time.RFC3339, v)
@@ -365,9 +357,23 @@ func (r *Runtime) command(ctx context.Context, action string, params map[string]
 			}
 			before = t
 		}
-		n := r.box.DropBefore(sink, before)
+		// 显式指定 sink：只丢那一条 lane。未指定：丢所有 lane（含 v2 lane）——
+		// 双发后每个传输都有两条 lane，运维说「清队列」时指的就是全部，不该
+		// 因为 lane 数变多就被迫补一个 sink 参数。返回按 lane 拆分的明细。
+		if sink, err := strParam(params, "sink"); err == nil {
+			n := r.box.DropBefore(sink, before)
+			r.wakeUp()
+			return map[string]any{"sink": sink, "dropped": n, "before": before.UTC()}, nil
+		}
+		dropped := make(map[string]int64, len(r.sinkNames))
+		var total int64
+		for _, name := range r.sinkNames {
+			n := r.box.DropBefore(name, before)
+			dropped[name] = n
+			total += n
+		}
 		r.wakeUp()
-		return map[string]any{"sink": sink, "dropped": n, "before": before.UTC()}, nil
+		return map[string]any{"sinks": dropped, "dropped": total, "before": before.UTC()}, nil
 
 	case "config.rollback":
 		if !confirmed(params) {

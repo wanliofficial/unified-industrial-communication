@@ -81,6 +81,25 @@ type Northbound struct {
 	MQTT    MQTT    `json:"mqtt,omitempty"`
 	OPCUA   OPCUA   `json:"opcua,omitempty"`
 	Webhook Webhook `json:"webhook,omitempty"`
+
+	// ContractVersion 选择北向数据契约：0（未配置，按 1）/ 1 为现状（只发 v1），
+	// 2 为双发过渡（同一份采集数据同时以 v1 与新契约 v2 输出）。它是运行期
+	// 可热切的——改这个值不需要重启采集。契约的字节形态与 v2 lane 命名规则
+	// 集中在 internal/northbound/contract。
+	ContractVersion int `json:"contractVersion,omitempty"`
+}
+
+// EffectiveContractVersion 返回生效的契约版本（缺省视为 1）。
+//
+// 刻意不复用 Normalize 去把字段写成 1：ContractVersion 是 omitempty 的，
+// 若 Normalize 无条件把 0 写成 1，会让所有存量配置的规范化内容哈希凭空
+// 漂移（Canonical 是整个 File 进哈希）。这里只在读取时把「未配置（<=0）」
+// 解释为 1，字段本身保持 0，存量配置的哈希不受影响。
+func (n Northbound) EffectiveContractVersion() int {
+	if n.ContractVersion < 1 {
+		return 1
+	}
+	return n.ContractVersion
 }
 
 // MQTT 北向的载荷格式。
@@ -99,6 +118,12 @@ type MQTT struct {
 	Broker   string `json:"broker,omitempty"`
 	ClientID string `json:"clientId,omitempty"`
 	Topic    string `json:"topic,omitempty"`
+
+	// TopicV2 是双发过渡期（northbound.contractVersion=2）v2 lane 使用的主题
+	// 模板，仅 json 格式生效。缺省（空）在 Normalize 里派生为 Topic + "/v2"，
+	// 让两条 lane 天然落到不同主题；显式配置则必须自带 {device}/{point}。
+	// 用 omitempty 且只在 cv==2 时填充，避免 cv==1 的存量配置哈希漂移。
+	TopicV2 string `json:"topicV2,omitempty"`
 
 	// Format 决定载荷与主题的生成方式：json（默认）或 sparkplug-b。
 	// 两者共用 Broker 连接、凭据与 Outbox，但生命周期完全不同——所以
@@ -329,6 +354,13 @@ func (f *File) Normalize() {
 		}
 	} else if mq.Topic == "" {
 		mq.Topic = "uic/{site}/{device}/{point}/value"
+	}
+	// 双发过渡期：cv==2 且 json 格式时，给 v2 lane 一个默认主题模板（在 v1 的
+	// Topic 后追加 /v2），让两条 lane 落到不同主题、消费方能各取所需。只在
+	// cv==2 且用户没填时补——cv 为 0/1 时不碰这个字段，存量配置的内容哈希保持
+	// 不变；cv==2 时这是有意的规范化（该配置本就打算双发，主题默认值稳定）。
+	if f.Northbound.EffectiveContractVersion() == 2 && mq.Format != MQTTFormatSparkplugB && mq.TopicV2 == "" {
+		mq.TopicV2 = mq.Topic + "/v2"
 	}
 	if f.Northbound.Webhook.Timeout <= 0 {
 		f.Northbound.Webhook.Timeout = model.Duration(5 * time.Second)
@@ -867,6 +899,12 @@ func (f *File) validateSlaves() error {
 // 这些是静态错误：配了 mqtt.enabled 却没有 broker，永远不可能投递成功。
 // 让它在启动前失败，比让设备采集正常、数据默默发不出去要好得多。
 func (f *File) validateNorthbound() error {
+	// 契约版本：0（未配置，按 1）、1、2 合法；其余显式拒绝。0 必须放行——
+	// 它是 omitempty 的「未配置」态，不能因为规范化不写字段就把它当非法值。
+	cv := f.Northbound.ContractVersion
+	if cv != 0 && cv != 1 && cv != 2 {
+		return fmt.Errorf("northbound.contractVersion %d: only 0 (default), 1 and 2 are supported", cv)
+	}
 	m := f.Northbound.MQTT
 	if m.Enabled {
 		if m.Broker == "" {
@@ -882,11 +920,28 @@ func (f *File) validateNorthbound() error {
 			if !strings.Contains(m.Topic, "{device}") || !strings.Contains(m.Topic, "{point}") {
 				return fmt.Errorf("northbound.mqtt.topic %q must contain {device} and {point}", m.Topic)
 			}
+			// TopicV2 只有在双发（cv==2）时才有意义；但只要用户填了就必须是
+			// 合法模板，否则双发时 v2 lane 会发到错误主题。空串由 Normalize
+			// 在 cv==2 时派生，cv==1 时保持空（不参与投递）。
+			if strings.TrimSpace(m.TopicV2) != "" &&
+				(!strings.Contains(m.TopicV2, "{device}") || !strings.Contains(m.TopicV2, "{point}")) {
+				return fmt.Errorf("northbound.mqtt.topicV2 %q must contain {device} and {point}", m.TopicV2)
+			}
 		case MQTTFormatSparkplugB:
 			// 主题是协议契约的一部分，不能让模板覆盖：一个「自定义了
 			// topic」的 Sparkplug 配置在本地看着配好了，对端却永远收不到。
 			if strings.TrimSpace(m.Topic) != "" {
 				return errors.New("northbound.mqtt.topic must be empty when format is sparkplug-b: Sparkplug derives topics from groupId/nodeId/device")
+			}
+			// Sparkplug 有自己的契约与主题生成，不参与 json v2 双发。cv==2
+			// 与 sparkplug-b 同时出现是一种自相矛盾的配置，必须显式拒绝。
+			if cv == 2 {
+				return errors.New("northbound.contractVersion 2 (dual-send) is not supported with format sparkplug-b: Sparkplug B carries its own contract")
+			}
+			// TopicV2 在 sparkplug 下没有任何消费方，留着是「配了但静默忽略」
+			// 的隐患，与 topic 同样直接拒绝。
+			if strings.TrimSpace(m.TopicV2) != "" {
+				return errors.New("northbound.mqtt.topicV2 must be empty when format is sparkplug-b: Sparkplug derives topics from groupId/nodeId/device")
 			}
 			if m.Retain {
 				return errors.New("northbound.mqtt.retain must be false when format is sparkplug-b: every edge-node message is non-retained (only a Host Application's STATE topic is retained)")

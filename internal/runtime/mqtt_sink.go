@@ -25,11 +25,15 @@ import (
 // 就永久丢了——对一个「断网不丢数据」的产品来说这是不可接受的。
 type mqttSink struct {
 	client *mqtt.Client
-	// topicTemplate 形如 uic/{site}/{device}/{point}/value。
+	// topicTemplate 形如 uic/{site}/{device}/{point}/value（v1 lane 用）。
 	topicTemplate string
-	site          string
-	qos           byte
-	retain        bool
+	// topicTemplateV2 是双发过渡期 v2 lane 用的主题模板，缺省在 newMQTTSink
+	// 里派生为 topicTemplate + "/v2"。两条 lane 落到不同主题，消费方才能
+	// 各取所需。
+	topicTemplateV2 string
+	site            string
+	qos             byte
+	retain          bool
 
 	// 设备状态的最后已知值。Broker 重启会丢掉 retained 消息，重连后要
 	// 靠这份缓存把当前状态补发回去，否则消费方会一直看到旧状态。
@@ -87,6 +91,16 @@ func newMQTTSink(cfg config.MQTT, site, gatewayID string) (*mqttSink, error) {
 	if !strings.Contains(tmpl, "{device}") || !strings.Contains(tmpl, "{point}") {
 		return nil, fmt.Errorf("northbound.mqtt.topic %q must contain {device} and {point}", tmpl)
 	}
+	// v2 lane 的主题模板：缺省在 v1 主题后追加 /v2。无论当前是否已切到 v2，
+	// 这里都备好模板——两条 lane 在 openSinks 时就建好，运行期改 contractVersion
+	// 只翻转「发不发 v2」，不需要重建 sink。
+	tmplV2 := cfg.TopicV2
+	if tmplV2 == "" {
+		tmplV2 = tmpl + "/v2"
+	}
+	if !strings.Contains(tmplV2, "{device}") || !strings.Contains(tmplV2, "{point}") {
+		return nil, fmt.Errorf("northbound.mqtt.topicV2 %q must contain {device} and {point}", tmplV2)
+	}
 
 	clientID := cfg.ClientID
 	if clientID == "" {
@@ -95,14 +109,15 @@ func newMQTTSink(cfg config.MQTT, site, gatewayID string) (*mqttSink, error) {
 		clientID = gatewayID
 	}
 	s := &mqttSink{
-		topicTemplate: tmpl,
-		site:          site,
-		qos:           byte(cfg.EffectiveQoS()),
-		retain:        cfg.Retain,
-		states:        map[string]sinkState{},
-		stateCleared:  map[string]bool{},
-		alarmStates:   map[string]alarm.Status{},
-		alarmCleared:  map[string]bool{},
+		topicTemplate:   tmpl,
+		topicTemplateV2: tmplV2,
+		site:            site,
+		qos:             byte(cfg.EffectiveQoS()),
+		retain:          cfg.Retain,
+		states:          map[string]sinkState{},
+		stateCleared:    map[string]bool{},
+		alarmStates:     map[string]alarm.Status{},
+		alarmCleared:    map[string]bool{},
 	}
 	s.client = mqtt.New(mqtt.Options{
 		Addr:      cfg.Broker,
@@ -144,6 +159,16 @@ func (m *mqttSink) topicFor(device, point string) string {
 	return r.Replace(m.topicTemplate)
 }
 
+// topicForV2 用 v2 主题模板渲染主题（双发过渡期 v2 lane 用）。
+func (m *mqttSink) topicForV2(device, point string) string {
+	r := strings.NewReplacer(
+		"{site}", sanitizeTopicLevel(m.site),
+		"{device}", sanitizeTopicLevel(device),
+		"{point}", sanitizeTopicLevel(point),
+	)
+	return r.Replace(m.topicTemplateV2)
+}
+
 // sanitizeTopicLevel 清掉 MQTT 主题层级分隔符与通配符。
 //
 // 设备 ID 来自配置文件，理论上受 idRe 约束；但这里是最后一道闸门：
@@ -162,7 +187,7 @@ func sanitizeTopicLevel(s string) string {
 	}, s)
 }
 
-// deliver 实现 deliverFunc 契约。
+// deliver 实现 deliverFunc 契约（v1 lane）。
 //
 // 逐条发布而不是把整批塞进一条消息：北向契约是「一条 Sample 一条消息」，
 // 这样消费方可以按主题路由，也便于 Broker 做 ACL 与限流。
@@ -170,10 +195,20 @@ func sanitizeTopicLevel(s string) string {
 // 前缀语义：一旦某条失败就停止，返回已成功的条数。Outbox 只会推进到
 // 最后一个成功的位点，因此失败之后的消息会在下一轮重发，不会跳号。
 func (m *mqttSink) deliver(ctx context.Context, recs []outbox.Record) (int, error) {
+	return m.deliverOn(ctx, recs, m.topicFor)
+}
+
+// deliverV2 实现 deliverFunc 契约（v2 lane）：与 deliver 逻辑一致，只是
+// 主题来自 v2 模板、载荷是 contract v2 字节。两条 lane 各自独立确认。
+func (m *mqttSink) deliverV2(ctx context.Context, recs []outbox.Record) (int, error) {
+	return m.deliverOn(ctx, recs, m.topicForV2)
+}
+
+func (m *mqttSink) deliverOn(ctx context.Context, recs []outbox.Record, topicFor func(device, point string) string) (int, error) {
 	done := 0
 	for _, rec := range recs {
 		device, point := splitKey(rec.Key)
-		topic := m.topicFor(device, point)
+		topic := topicFor(device, point)
 		msg := mqtt.Message{
 			Topic:   topic,
 			Payload: rec.Data,

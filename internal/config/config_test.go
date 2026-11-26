@@ -645,6 +645,147 @@ func TestMQTTQoSTriState(t *testing.T) {
 	}
 }
 
+// 契约版本：0（未配置）按 1、1、2 合法，其余显式拒绝；2 与 sparkplug-b 互斥；
+// TopicV2 作为模板必须自带占位符。这些都是「配了就永远不可能投递成功」或
+// 「自相矛盾」的静态错误，必须在装配期暴露。
+func TestValidateContractVersion(t *testing.T) {
+	registerDrivers(t)
+	cases := []struct {
+		name string
+		mod  func(*File)
+		want string
+	}{
+		{"cv3 rejected", func(f *File) { f.Northbound.ContractVersion = 3 }, "contractVersion"},
+		{"cv negative rejected", func(f *File) { f.Northbound.ContractVersion = -1 }, "contractVersion"},
+		{"cv2 with sparkplug rejected", func(f *File) {
+			f.Northbound.MQTT = MQTT{Enabled: true, Broker: "broker:1883", Format: MQTTFormatSparkplugB}
+			f.Northbound.ContractVersion = 2
+		}, "sparkplug"},
+		{"topicV2 missing placeholder", func(f *File) {
+			f.Northbound.MQTT = MQTT{Enabled: true, Broker: "broker:1883", TopicV2: "static/v2"}
+			f.Northbound.ContractVersion = 2
+		}, "topicV2"},
+		{"topicV2 with sparkplug rejected", func(f *File) {
+			f.Northbound.MQTT = MQTT{Enabled: true, Broker: "broker:1883", Format: MQTTFormatSparkplugB, TopicV2: "x/{device}/{point}"}
+			f.Northbound.ContractVersion = 1
+		}, "topicV2"},
+	}
+	for _, c := range cases {
+		f := baseFile()
+		c.mod(f)
+		err := f.Validate()
+		if err == nil {
+			t.Fatalf("%s: expected error", c.name)
+		}
+		if !strings.Contains(err.Error(), c.want) {
+			t.Fatalf("%s: err = %v, want mention of %q", c.name, err, c.want)
+		}
+	}
+}
+
+// 0/1/2 都是合法契约版本：0（未配置）与 1 等价，2 是双发过渡。
+func TestValidateContractVersionAccepts(t *testing.T) {
+	registerDrivers(t)
+	for _, cv := range []int{0, 1, 2} {
+		f := baseFile()
+		f.Northbound.ContractVersion = cv
+		if cv == 2 {
+			f.Northbound.MQTT = MQTT{Enabled: true, Broker: "broker:1883"}
+		}
+		if err := f.Validate(); err != nil {
+			t.Fatalf("cv=%d must be accepted: %v", cv, err)
+		}
+	}
+}
+
+// EffectiveContractVersion 把未配置（<=0）解释为 1，且读取时不写字段——
+// 否则存量配置的规范化内容哈希会漂移。
+func TestEffectiveContractVersion(t *testing.T) {
+	for _, tc := range []struct {
+		in, want int
+	}{
+		{0, 1}, {-5, 1}, {1, 1}, {2, 2},
+	} {
+		nb := Northbound{ContractVersion: tc.in}
+		if got := nb.EffectiveContractVersion(); got != tc.want {
+			t.Fatalf("EffectiveContractVersion(%d) = %d, want %d", tc.in, got, tc.want)
+		}
+	}
+}
+
+// Normalize 只在 cv==2 且 json 时派生 TopicV2 = Topic + "/v2"；cv 为 0/1
+// 时绝不碰这个字段（存量配置哈希不漂移）。
+func TestNormalizeDerivesTopicV2(t *testing.T) {
+	registerDrivers(t)
+
+	// cv==2：派生默认 v2 主题。
+	f := baseFile()
+	f.Northbound.ContractVersion = 2
+	f.Northbound.MQTT = MQTT{Enabled: true, Broker: "broker:1883"}
+	f.Validate()
+	if got := f.Northbound.MQTT.TopicV2; got != "uic/{site}/{device}/{point}/value/v2" {
+		t.Fatalf("cv=2 derived topicV2 = %q", got)
+	}
+
+	// cv==2 且用户显式填了 topicV2：保留，不覆盖。
+	f = baseFile()
+	f.Northbound.ContractVersion = 2
+	f.Northbound.MQTT = MQTT{Enabled: true, Broker: "broker:1883", TopicV2: "custom/{device}/{point}"}
+	f.Validate()
+	if got := f.Northbound.MQTT.TopicV2; got != "custom/{device}/{point}" {
+		t.Fatalf("explicit topicV2 was overwritten: %q", got)
+	}
+
+	// cv==0/1：绝不派生，保持空串（哈希不漂移）。
+	for _, cv := range []int{0, 1} {
+		f = baseFile()
+		f.Northbound.ContractVersion = cv
+		f.Northbound.MQTT = MQTT{Enabled: true, Broker: "broker:1883"}
+		f.Validate()
+		if got := f.Northbound.MQTT.TopicV2; got != "" {
+			t.Fatalf("cv=%d must not derive topicV2, got %q", cv, got)
+		}
+	}
+}
+
+// 契约版本字段必须是 omitempty + 条件规范化：未配置（cv==0）时规范化结果里
+// 既不该出现 contractVersion 也不该出现 topicV2——这正是「存量配置升级到本版本
+// 后内容哈希不变」的保证。cv==2 则两者都该出现，且 topicV2 取派生默认值。
+func TestCanonicalContractFieldsGating(t *testing.T) {
+	registerDrivers(t)
+
+	// cv 未配置：规范化后两个字段都不出现在 canonical JSON 里。
+	base := baseFile()
+	base.Northbound.MQTT = MQTT{Enabled: true, Broker: "broker:1883"}
+	base.Validate()
+	cb, err := base.Canonical()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(cb), "contractVersion") {
+		t.Fatalf("unset contractVersion must be omitted from canonical: %s", cb)
+	}
+	if strings.Contains(string(cb), "topicV2") {
+		t.Fatalf("topicV2 must be omitted when cv!=2: %s", cb)
+	}
+
+	// cv==2：两个字段都出现，且 topicV2 为派生默认值。
+	dual := baseFile()
+	dual.Northbound.MQTT = MQTT{Enabled: true, Broker: "broker:1883"}
+	dual.Northbound.ContractVersion = 2
+	dual.Validate()
+	cd, err := dual.Canonical()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(cd), "\"contractVersion\": 2") {
+		t.Fatalf("cv=2 must surface contractVersion: %s", cd)
+	}
+	if !strings.Contains(string(cd), "\"topicV2\": \"uic/{site}/{device}/{point}/value/v2\"") {
+		t.Fatalf("cv=2 must surface derived topicV2: %s", cd)
+	}
+}
+
 // 从站映射的校验必须落到点位元数据上：宽度来自类型，可写性来自点位，
 // 这两件事分开定义迟早会出现「从站说可写、点位说只读」的矛盾配置。
 func TestValidateSlaveMappings(t *testing.T) {

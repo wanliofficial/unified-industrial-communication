@@ -171,6 +171,11 @@ type Runtime struct {
 	ready    atomic.Bool
 	stopping atomic.Bool
 
+	// contractVersion 是当前生效的北向契约版本（1 或 2）。publish 在不同
+	// goroutine 里读它，reload 在热更新时写它——用原子值避免数据竞争，也让
+	// 「改 contractVersion 不需要重启采集」成为可能。初值在 openSinks 种下。
+	contractVersion atomic.Int64
+
 	ctx    context.Context
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
@@ -828,10 +833,7 @@ func (r *Runtime) ApplyConfig(ctx context.Context, raw json.RawMessage, source s
 			"cannot parse config: %v", err)
 	}
 	before := r.cfg.Current()
-	beforeNB, _ := json.Marshal(struct {
-		N config.Northbound `json:"n"`
-		S config.Storage    `json:"s"`
-	}{before.Northbound, before.Storage})
+	beforeNB := northboundRestartFingerprint(before.Northbound, before.Storage)
 
 	res, err := r.cfg.Apply(&f, source)
 	if err != nil {
@@ -851,10 +853,7 @@ func (r *Runtime) ApplyConfig(ctx context.Context, raw json.RawMessage, source s
 	r.auditConfigChange(ctx, "config.apply", res.Version, source, "ok", "", "")
 
 	after := r.cfg.Current()
-	afterNB, _ := json.Marshal(struct {
-		N config.Northbound `json:"n"`
-		S config.Storage    `json:"s"`
-	}{after.Northbound, after.Storage})
+	afterNB := northboundRestartFingerprint(after.Northbound, after.Storage)
 	if string(beforeNB) != string(afterNB) {
 		r.log.Warn("northbound_config_changed", "detail", "MQTT/Webhook 参数变更需重启进程生效；OPC UA 北向已热重建")
 	}
@@ -866,6 +865,26 @@ func (r *Runtime) ApplyConfig(ctx context.Context, raw json.RawMessage, source s
 			"detail", "storage.history 的 dir/maxBytes/segmentBytes/maxAge 变更需重启进程生效；minInterval/heartbeat/deadband 已即时生效")
 	}
 	return res, nil
+}
+
+// northboundRestartFingerprint 计算「MQTT/Webhook 参数变更需重启进程生效」
+// 这条警告所依据的指纹。它在内容哈希之外再做两处归一化：
+//
+//   - 排除 ContractVersion：契约版本是运行期热切的（reload 里原子 Store），
+//     改它不该谎报「需重启」。两条 lane 在 openSinks 时就已建好。
+//   - 归一化 TopicV2 的派生默认值（Topic + "/v2"）：cv 从 1 切到 2 时
+//     config.Normalize 才把这个字段填出来——这是切契约的副产物，不是运维
+//     改了主题模板。而显式配置的 TopicV2（!= 派生值）仍需重启才生效，故保留。
+func northboundRestartFingerprint(nb config.Northbound, st config.Storage) []byte {
+	nb.ContractVersion = 0
+	if nb.MQTT.TopicV2 == nb.MQTT.Topic+"/v2" {
+		nb.MQTT.TopicV2 = ""
+	}
+	b, _ := json.Marshal(struct {
+		N config.Northbound `json:"n"`
+		S config.Storage    `json:"s"`
+	}{nb, st})
+	return b
 }
 
 // Rollback 回滚到指定版本并热更新。
@@ -900,6 +919,14 @@ func (r *Runtime) reload(before *config.File) []string {
 	defer r.reloadMu.Unlock()
 
 	after := r.cfg.Current()
+	// 契约版本热切：改 contractVersion 不需要重启进程，也不需要重建 sink /
+	// 协程——两条 lane 早已注册，这里只翻转 publish 是否往 v2 lane 入队。
+	// 放在最前：即便后面的设备重建有失败，契约版本仍是配置里最新的意图。
+	prevContract := r.contractVersion.Swap(int64(after.Northbound.EffectiveContractVersion()))
+	if cur := r.contractVersion.Load(); prevContract != cur {
+		r.log.Info("northbound_contract_version_changed", "from", prevContract, "to", cur,
+			"detail", "v1/v2 双发目标已热切，无需重启采集")
+	}
 	if err := r.buildAuth(after); err != nil {
 		// 不回滚整次 Apply（配置已落盘，业务面要继续服务），但凭据必须
 		// 换成新表：保留旧表等于「配置说删了、进程还说在」。
