@@ -78,6 +78,7 @@ cmd/uic
        ├→ internal/cache       （快照 + 订阅）
        ├→ internal/outbox      （持久队列）
        ├→ internal/northbound  （http / sse / mqtt / opcua）
+       │    └→ internal/i18n  （错误消息中/英渲染，纯函数）
        └→ internal/obs         （指标 + 日志）
 
 internal/driver/modbus  ──→ internal/codec/modbus（纯函数）
