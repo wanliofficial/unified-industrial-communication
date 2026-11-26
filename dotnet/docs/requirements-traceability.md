@@ -12,8 +12,23 @@ PRD 中 M 级的采集协议已全部落地，FR-CFG-01 的四类寻址模型也
 COV/分段/多属性读仍不做，见 [protocol-status.md](protocol-status.md) §4.1）。非 M 级验收里的 12 类故障注入同样全部有了
 可自动跑的用例（见 §7）。
 
-当前测试基线：**445 条**（带 `--opcua` 全量；本轮**新增 1 条**契约用例。全量实测数字以
-[testing.md](testing.md) 最新一轮为准）。本轮补上一个**错误表漏列**的码——`user.invalid_id`：`northbound-api.md`
+当前测试基线：**446 条**（带 `--opcua` 全量；本轮**新增 1 条**契约用例。全量实测数字以
+[testing.md](testing.md) 最新一轮为准）。本轮钉住登录凭据错误 `auth.invalid_credentials` 的「不做账号枚举」不变量：
+错误表 `northbound-api.md` 的 401 行明列这个码，但既有 `contract/auth_login_is_rate_limited` 只断言「错口令 = 401」这个
+**状态码**、从没点名 `error.code`；更要紧的是，「口令错」与「用户不存在」必须给出**完全相同**的 code 与 message——否则
+错误信息本身就变成了一个账号枚举接口（攻击者拿一个用户名试一次，凭返回 code 就能判断账号是否存在），这条安全约束
+此前**零断言**。`AuthService` 的 switch 里 `Disabled → 403 auth.user_disabled`、`Ok → 成功`、`default`（同时兜住
+`NoSuchUser` 与 `BadPassword`）→ 401 `auth.invalid_credentials`。新增 `contract/auth_invalid_credentials_does_not_distinguish`：
+用「已知 admin 配错口令」与「不存在的用户名」各打一次登录，断言两次都是 401 + `error.code == auth.invalid_credentials`
+（逐字相同），且 message 也逐字相同；两次失败远低于每分钟 5 次的锁定阈值（`MaxFailures = 5` / `FailureWindow = 1 min`），
+不会触发 429。非空验证（两条断言各自独立扰动，全部运行期实测）：（1）把 default 分支的 code 改成 `auth.invalid_credentials_x`
+→ 实测 FAIL `a wrong password names auth.invalid_credentials: expected <auth.invalid_credentials>, got <auth.invalid_credentials_x>`
+（错口令断言）；（2）为 `LoginCheck.NoSuchUser` 加一个独立 case 抛 `auth.no_such_user`（**模拟枚举泄露**：错口令仍走 default
+的 `auth.invalid_credentials`，未知用户走新 code）→ 实测 FAIL `an unknown user names the same code — otherwise login enumerates
+accounts: expected <auth.invalid_credentials>, got <auth.no_such_user>`（同 code 断言；错口令断言此时仍过，证明两条失败被
+分别覆盖）。两处各自恢复后源码与 HEAD 字节一致、用例 PASS（5.2 s 与 4.9 s）。验证受工作站他人进程占满影响（load 常 7-10、
+`mount.ntfs` 持续高占用），靠后台监视器等低负载窗口跑成。
+上一轮（445 条、新增 1 条）补上一个**错误表漏列**的码——`user.invalid_id`：`northbound-api.md`
 的 400 行此前只列了 `auth.weak_password` / `auth.invalid_password` / `user.invalid_role`，代码里 `UserStore.ValidateId`
 与 REST 层明明会抛 `user.invalid_id`，却从没写进错误表、也没有任何用例断言——调用方按错误表写判断会漏掉这条。本轮两件事一起做：
 （1）把 `user.invalid_id` 补进错误表 400 行（id 为空、超过 64 字符、或含字母/数字/`.`/`_`/`-` 之外的字符）；

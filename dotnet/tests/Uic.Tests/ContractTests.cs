@@ -99,6 +99,8 @@ internal static class ContractTests
         tests.Add(new TestCase("contract/user_create_rejects_invalid_id",
             UserCreateRejectsInvalidId));
         tests.Add(new TestCase("contract/auth_login_is_rate_limited", AuthLoginIsRateLimited));
+        tests.Add(new TestCase("contract/auth_invalid_credentials_does_not_distinguish",
+            AuthInvalidCredentialsDoesNotDistinguish));
         tests.Add(new TestCase("contract/auth_logout_revokes_session", AuthLogoutRevokesSession));
         tests.Add(new TestCase("contract/rate_limit_returns_429_with_the_shared_code", RateLimitReturns429));
         tests.Add(new TestCase("contract/metrics_report_live_sse_connections", MetricsReportLiveSseConnections));
@@ -3217,6 +3219,56 @@ internal static class ContractTests
             using var body = await ReadJsonAsync(t, locked);
             t.Equal("request.rate_limited", body.RootElement.GetProperty("error")
                 .GetProperty("code").GetString(), "the error code is the contract's rate-limit code");
+        });
+    }
+
+    /// <summary>
+    /// 登录凭据错误是 401 auth.invalid_credentials，且「口令错」与「用户不存在」
+    /// 必须给出**同一个** code 与 message——错误表 northbound-api.md 的 401 行明列
+    /// 这个 code，但此前只测了「错口令 = 401」状态码、没点名 code；更重要的是
+    /// 「不区分是哪一个错」这条安全约束（否则错误信息本身会变成一个账号枚举接口）
+    /// 没有任何断言。AuthService 的 switch：Disabled → 403 auth.user_disabled、
+    /// Ok → 成功、default（包含 NoSuchUser 与 BadPassword 两种）→ 401
+    /// auth.invalid_credentials；这里用「已知 admin 配错口令」与「不存在的用户名」
+    /// 各打一次，断言同一个 code、同一句 message。两次失败远低于每分钟 5 次的锁定阈值。
+    /// </summary>
+    private static Task AuthInvalidCredentialsDoesNotDistinguish(TestContext t)
+    {
+        return RunAsync(async () =>
+        {
+            await using var host = await Host.StartAsync(t);
+
+            var wrongPassword = await host.Client.SendAsync(
+                PostWith("/api/v1/auth/login",
+                    JsonSerializer.Serialize(new { username = "admin", password = "definitely-wrong-1" }), null),
+                t.Ct);
+            t.Equal(HttpStatusCode.Unauthorized, wrongPassword.StatusCode,
+                "a wrong password is a 401");
+
+            string wrongMessage;
+            using (var error = await ReadJsonAsync(t, wrongPassword))
+            {
+                var body = error.RootElement.GetProperty("error");
+                t.Equal("auth.invalid_credentials", body.GetProperty("code").GetString(),
+                    "a wrong password names auth.invalid_credentials");
+                wrongMessage = body.GetProperty("message").GetString()!;
+            }
+
+            var unknownUser = await host.Client.SendAsync(
+                PostWith("/api/v1/auth/login",
+                    JsonSerializer.Serialize(new { username = "ghost-user-absent", password = "whatever-1" }), null),
+                t.Ct);
+            t.Equal(HttpStatusCode.Unauthorized, unknownUser.StatusCode,
+                "an unknown user is a 401 too");
+
+            using (var error = await ReadJsonAsync(t, unknownUser))
+            {
+                var body = error.RootElement.GetProperty("error");
+                t.Equal("auth.invalid_credentials", body.GetProperty("code").GetString(),
+                    "an unknown user names the same code — otherwise login enumerates accounts");
+                t.Equal(wrongMessage, body.GetProperty("message").GetString(),
+                    "the message is identical too — an enumeration oracle would leak account existence");
+            }
         });
     }
 
