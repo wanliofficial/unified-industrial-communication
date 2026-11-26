@@ -1,4 +1,4 @@
-// Command uic 是单一可执行入口：run（默认）/ sim / mbread / mcread / finsread / hostlinkread / enipread / bacread / iec104read / iec101read / dnp3read / coapread / knxread / uaread / s7blocks / s7upload / instantiate / import / token / version。
+// Command uic 是单一可执行入口：run（默认）/ sim / mbread / mcread / finsread / hostlinkread / enipread / bacread / iec104read / iec101read / dnp3read / coapread / knxread / uaread / s7blocks / s7upload / instantiate / import / token / makepkg / upgrade / version。
 //
 //	uic -config config.json            # 前台运行
 //	uic run -config config.json        # 同上
@@ -39,6 +39,8 @@
 //	uic s7blocks -addr 127.0.0.1:15102   # S7 块目录（-type db / -num 1 可细看）
 //	uic s7upload -addr 127.0.0.1:15102 -type db -num 1 -out db1.bin  # 块上传备份
 //	uic token -name ops -role operator   # 生成用户凭据（明文 + tokenSha256）
+//	uic makepkg -out dist/uic.pkg -binary dist/uic-linux-amd64 -version 1.5.0 -privkey <hex>   # 构建离线升级包（含 ed25519 签名）
+//	uic upgrade -pkg dist/uic.pkg -pubkey <hex> -yes   # 校验并原子安装升级包
 //
 // 关闭顺序遵循 docs/03-product/02-architecture.md §11.2：
 // 停止接收流量 → 停调度 → 排空 Outbox → 关连接，总预算 10 秒。
@@ -170,6 +172,8 @@ var commands = map[string]func([]string){
 	"instantiate":   instantiateCmd,
 	"import":        importCmd,
 	"token":         tokenCmd,
+	"makepkg":       pkgCmd,
+	"upgrade":       upgradeCmd,
 }
 
 func usage() {
