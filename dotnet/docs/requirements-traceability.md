@@ -12,8 +12,20 @@ PRD 中 M 级的采集协议已全部落地，FR-CFG-01 的四类寻址模型也
 COV/分段/多属性读仍不做，见 [protocol-status.md](protocol-status.md) §4.1）。非 M 级验收里的 12 类故障注入同样全部有了
 可自动跑的用例（见 §7）。
 
-当前测试基线：**444 条**（带 `--opcua` 全量；本轮**新增 1 条**契约用例。全量实测数字以
-[testing.md](testing.md) 最新一轮为准）。本轮补上错误表 400 行 `auth.invalid_password` 的覆盖——这个码此前**零断言**：
+当前测试基线：**445 条**（带 `--opcua` 全量；本轮**新增 1 条**契约用例。全量实测数字以
+[testing.md](testing.md) 最新一轮为准）。本轮补上一个**错误表漏列**的码——`user.invalid_id`：`northbound-api.md`
+的 400 行此前只列了 `auth.weak_password` / `auth.invalid_password` / `user.invalid_role`，代码里 `UserStore.ValidateId`
+与 REST 层明明会抛 `user.invalid_id`，却从没写进错误表、也没有任何用例断言——调用方按错误表写判断会漏掉这条。本轮两件事一起做：
+（1）把 `user.invalid_id` 补进错误表 400 行（id 为空、超过 64 字符、或含字母/数字/`.`/`_`/`-` 之外的字符）；
+（2）新增 `contract/user_create_rejects_invalid_id` 钉三种非法 id——空白（REST 层先拦，"'id' is required"）、含非法字符
+（`ValidateId` 字符集检查）、超过 64 字符（`ValidateId` 长度检查），都必须是 400 + `error.code == user.invalid_id`；不传口令
+（服务端生成合法临时口令），把拒绝原因唯一钉在 id 上，不让 `auth.weak_password` 抢在前面；另核对三次被拒都没留下半拉账号、
+admin 仍在。非空验证（三处抛点各自独立扰动，全部运行期实测）：（1）REST 层空白抛点 code 改成 `user.invalid_id_rest` →
+实测 FAIL `expected <user.invalid_id>, got <user.invalid_id_rest>`（空白断言）；（2）`ValidateId` 字符集抛点改成
+`user.invalid_id_chars` → 实测 FAIL `got <user.invalid_id_chars>`（非法字符断言，空白断言仍过）；（3）`ValidateId` 长度抛点
+改成 `user.invalid_id_len` → 实测 FAIL `got <user.invalid_id_len>`（超长断言）。三处各自恢复后源码与 HEAD 字节一致、用例
+PASS（31.1 s 与 4.6 s）。验证全程受工作站他人进程占满影响（load 常 10-36），靠后台监视器等低负载窗口才逐个跑成。
+上一轮（444 条、新增 1 条）补上错误表 400 行 `auth.invalid_password` 的覆盖——这个码此前**零断言**：
 `contract/auth_change_password_rejects_wrong_current` 拿一个干净会话（建账号→首次改密后 mustChangePassword=false 的会话），
 用**错误的当前口令** + 一个**合法的强新口令**改密 → 400 + `error.code == auth.invalid_password`；并核对被拒后的原子性——
 真实口令仍能登录（`SignInAsAsync` 会把初始口令改成 `<初始>-changed`，这里用那个真值）、错误尝试里的新口令永远登不进。

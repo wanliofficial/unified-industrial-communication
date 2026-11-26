@@ -169,6 +169,7 @@ MQTT 的 TLS 是独立开关（`northbound.mqtt.tls`），语义见
 | 400 | `request.invalid` / `request.invalid_parameter` / `request.missing_parameter` | 请求体或参数不合法 |
 | 400 | `request.confirm_required` | 破坏性操作缺少 `confirm: true` |
 | 400 | `auth.weak_password` / `auth.invalid_password` / `user.invalid_role` | 新口令不合规、当前口令不对、角色名未知 |
+| 400 | `user.invalid_id` | 新建账号时 `id` 为空、超过 64 字符、或含字母/数字/`.`/`_`/`-` 之外的字符 |
 | 401 | `auth.unauthorized` | 缺少、错误或已过期的令牌 |
 | 401 | `auth.invalid_credentials` | 登录时用户名或口令不对（不区分是哪一个错） |
 | 403 | `auth.forbidden` / `auth.password_change_required` | 权限不足 / 尚未改掉一次性口令 |

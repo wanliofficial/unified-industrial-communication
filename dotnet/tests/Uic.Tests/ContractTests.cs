@@ -96,6 +96,8 @@ internal static class ContractTests
             UserCannotDeleteSelfIsProtected));
         tests.Add(new TestCase("contract/user_create_rejects_duplicate_and_unknown_role",
             UserCreateRejectsDuplicateAndUnknownRole));
+        tests.Add(new TestCase("contract/user_create_rejects_invalid_id",
+            UserCreateRejectsInvalidId));
         tests.Add(new TestCase("contract/auth_login_is_rate_limited", AuthLoginIsRateLimited));
         tests.Add(new TestCase("contract/auth_logout_revokes_session", AuthLogoutRevokesSession));
         tests.Add(new TestCase("contract/rate_limit_returns_429_with_the_shared_code", RateLimitReturns429));
@@ -2816,6 +2818,72 @@ internal static class ContractTests
                 t.Ct);
             t.Equal(HttpStatusCode.Unauthorized, wrongNew.StatusCode,
                 "the attempted new password was never applied");
+        });
+    }
+
+    /// <summary>
+    /// 新建账号时 id 非法 → 400 且 code 点名 user.invalid_id。
+    /// 错误表 northbound-api.md 的 400 行此前没列这个码（本轮补上），
+    /// 代码里两条独立抛点也零断言。id 的三条非法形态分别钉住：
+    /// 空白 → REST 层直接拦（"'id' is required"，在生成口令之前）；
+    /// 含非法字符 / 超过 64 字符 → UserStore.ValidateId 的字符集与长度检查。
+    /// 三处产生同一个 code。不传口令（服务端生成合法临时口令），
+    /// 把拒绝原因唯一钉在 id 上，不让 auth.weak_password 抢在前面。
+    /// </summary>
+    private static Task UserCreateRejectsInvalidId(TestContext t)
+    {
+        return RunAsync(async () =>
+        {
+            await using var host = await Host.StartAsync(t);
+
+            var tooLong = new string('a', 65);
+
+            // (1) 空白 id：REST 层直接拦（在生成口令之前）。
+            var blank = JsonSerializer.Serialize(new { id = "   ", role = "viewer" });
+            var blankResp = await host.Client.SendAsync(PostWith("/api/v1/users", blank, Token), t.Ct);
+            t.Equal(HttpStatusCode.BadRequest, blankResp.StatusCode, "a blank id is rejected");
+            using (var error = await ReadJsonAsync(t, blankResp))
+            {
+                t.Equal("user.invalid_id",
+                    error.RootElement.GetProperty("error").GetProperty("code").GetString(),
+                    "a blank id names user.invalid_id");
+            }
+
+            // (2) 含非法字符（空格、斜杠）：UserStore.ValidateId 的字符集检查。
+            var badChars = JsonSerializer.Serialize(new { id = "bad id/slash", role = "viewer" });
+            var badResp = await host.Client.SendAsync(PostWith("/api/v1/users", badChars, Token), t.Ct);
+            t.Equal(HttpStatusCode.BadRequest, badResp.StatusCode,
+                "an id with illegal characters is rejected");
+            using (var error = await ReadJsonAsync(t, badResp))
+            {
+                t.Equal("user.invalid_id",
+                    error.RootElement.GetProperty("error").GetProperty("code").GetString(),
+                    "an illegal-character id names user.invalid_id");
+            }
+
+            // (3) 超过 64 字符：UserStore.ValidateId 的长度检查。
+            var longId = JsonSerializer.Serialize(new { id = tooLong, role = "viewer" });
+            var longResp = await host.Client.SendAsync(PostWith("/api/v1/users", longId, Token), t.Ct);
+            t.Equal(HttpStatusCode.BadRequest, longResp.StatusCode, "an over-long id is rejected");
+            using (var error = await ReadJsonAsync(t, longResp))
+            {
+                t.Equal("user.invalid_id",
+                    error.RootElement.GetProperty("error").GetProperty("code").GetString(),
+                    "an over-long id names user.invalid_id");
+            }
+
+            // 原子性：三次被拒都没留下半拉账号，admin 仍在。
+            var list = await host.Client.SendAsync(GetWith("/api/v1/users", Token), t.Ct);
+            t.Equal(HttpStatusCode.OK, list.StatusCode, "the user list is readable");
+            using (var document = await ReadJsonAsync(t, list))
+            {
+                var ids = document.RootElement.GetProperty("items").EnumerateArray()
+                    .Select(u => u.GetProperty("id").GetString())
+                    .ToHashSet(StringComparer.Ordinal);
+                t.Ok(!ids.Contains("   ") && !ids.Contains("bad id/slash") && !ids.Contains(tooLong),
+                    "no half-created account from a rejected id");
+                t.Ok(ids.Contains("admin"), "the seeded admin is still there");
+            }
         });
     }
 
