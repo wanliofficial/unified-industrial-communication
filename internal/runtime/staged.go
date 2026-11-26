@@ -30,12 +30,29 @@ import (
 // 关键安全点：每批只改动该批设备。其余设备保持当前生效配置，连接与死区状态
 // 不受影响（reload 按指纹只重建变化的设备，这是天然的批隔离）。
 
+// batchBaseline 是一台设备在被本灰度批次下发时刻的累计读统计快照。
+// 观察窗口的失败率必须按「本次下发之后新采上来的样本」来算，而不是设备
+// 全生命周期的累计失败/总数：后者会把设备几周历史故障期的失败数一直
+// 带进新批次的判定里——一台历史上就 flaky 的设备，新配置再健康也会在
+// 第一批就被自动回滚；反过来，长期干净的设备即便新批次把链路打挂，也
+// 会被巨大的历史分母稀释、迟迟不触发回滚。两者都让「失败率超阈值自动
+// 回滚」要么永远误伤、要么形同虚设。以基线做差，得到的才是「这批新配置
+// 造成的失败率」。
+type batchBaseline struct {
+	total, failed uint64
+}
+
 // stagedRollout 是一次灰度发布的内部状态。对外只暴露 httpapi.StagedStatus，
 // 目标完整配置与批次计划留在进程内，避免把整份配置随每个状态查询回吐一遍。
 type stagedRollout struct {
 	status httpapi.StagedStatus
 	target config.File
 	plan   config.StagedPlan
+
+	// baseline 记录每台已下发设备在被下发时刻的累计读统计。失败率按
+	// 增量（当前累计 - 基线）计算，使健康判定只反映本批次观察窗口内的
+	// 表现，不掺杂设备全生命周期历史。
+	baseline map[string]batchBaseline
 }
 
 // stagedState 是进程内的灰度编排状态。用独立锁而不是 r.mu：灰度操作会调用
@@ -113,8 +130,9 @@ func (r *Runtime) BeginStaged(ctx context.Context, raw json.RawMessage, source s
 			StartedAt:      now.UTC(),
 			UpdatedAt:      now.UTC(),
 		},
-		target: target,
-		plan:   plan,
+		target:   target,
+		plan:     plan,
+		baseline: make(map[string]batchBaseline),
 	}
 	r.staged.cur = ro
 	r.metrics.Inc("uic_config_staged_total", obs.Labels{"status": "started"})
@@ -214,7 +232,7 @@ func (r *Runtime) stagedViewLocked(ro *stagedRollout, now time.Time) httpapi.Sta
 		out.Batches = [][]string{}
 	}
 	out.Observing = ro.observingFor(now) > 0
-	out.FailureRate = r.failureRateLocked(appliedDeviceIDs(ro))
+	out.FailureRate = r.failureRateLocked(ro, appliedDeviceIDs(ro))
 	return out
 }
 
@@ -239,29 +257,71 @@ func appliedDeviceIDs(ro *stagedRollout) []string {
 	return ids
 }
 
-// failureRateLocked 计算给定设备的采集失败率。total 为 0（还没采过）时返回 0：
-// 「还没开始采」不是「采得很好」，但也不该被当成故障去回滚一个刚下发的批次。
-func (r *Runtime) failureRateLocked(ids []string) float64 {
+// readCountersLocked 读取一台设备的累计读统计快照。设备不存在（尚未注册
+// 或刚被删除）时返回零值——调用方据此把它的增量视为 0。
+func (r *Runtime) readCountersLocked(id string) batchBaseline {
+	st, ok := r.sched.StatusOf(id)
+	if !ok {
+		return batchBaseline{}
+	}
+	return batchBaseline{total: st.Stats.ReadsTotal, failed: st.Stats.ReadsFailed}
+}
+
+// failureRateLocked 计算给定设备「观察窗口内」的采集失败率：以每台设备被
+// 本批次下发时刻的累计读统计为基线，只统计基线之后新采上来的样本。
+//
+// total 为 0（窗口内还没采过）时返回 0：「还没开始采」不是「采得很好」，但
+// 也不该被当成故障去回滚一个刚下发的批次。
+//
+// healthFn 是测试接缝：注入时直接返回窗口内的 (failed, total)，跳过基线
+// 增量计算（测试用假时钟/假统计驱动，不需要真实调度器读数）。
+func (r *Runtime) failureRateLocked(ro *stagedRollout, ids []string) float64 {
 	if len(ids) == 0 {
 		return 0
 	}
-	var failed, total uint64
 	if r.staged.healthFn != nil {
-		failed, total = r.staged.healthFn(ids)
-	} else {
-		for _, id := range ids {
-			st, ok := r.sched.StatusOf(id)
-			if !ok {
-				continue
-			}
-			failed += st.Stats.ReadsFailed
-			total += st.Stats.ReadsTotal
-		}
+		failed, total := r.staged.healthFn(ids)
+		return ratio(failed, total)
 	}
+	pairs := make([]counterPair, 0, len(ids))
+	for _, id := range ids {
+		pairs = append(pairs, counterPair{cur: r.readCountersLocked(id), base: ro.baseline[id]})
+	}
+	return windowedFailureRate(pairs)
+}
+
+// counterPair 是一台设备的「当前累计」与「下发时刻基线」。
+type counterPair struct{ cur, base batchBaseline }
+
+// windowedFailureRate 把所有设备「观察窗口内」的增量聚合成一个失败率纯函数。
+// total 为 0（窗口内还没采过）时返回 0。
+func windowedFailureRate(pairs []counterPair) float64 {
+	var failed, total uint64
+	for _, p := range pairs {
+		df, dt := windowDelta(p.cur, p.base)
+		failed += df
+		total += dt
+	}
+	return ratio(failed, total)
+}
+
+func ratio(failed, total uint64) float64 {
 	if total == 0 {
 		return 0
 	}
 	return float64(failed) / float64(total)
+}
+
+// windowDelta 用当前累计减基线得到窗口内的增量，并防御计数器回退（重启、
+// 设备重建会归位累计值）导致的无符号下溢。
+func windowDelta(cur, base batchBaseline) (failed, total uint64) {
+	if cur.total >= base.total {
+		total = cur.total - base.total
+	}
+	if cur.failed >= base.failed {
+		failed = cur.failed - base.failed
+	}
+	return failed, total
 }
 
 // abortIfUnhealthyLocked 在观察窗口结束后检查失败率，超阈值则自动回滚。
@@ -271,7 +331,7 @@ func (r *Runtime) abortIfUnhealthyLocked(ctx context.Context, ro *stagedRollout,
 	if max <= 0 || ro.status.ObserveUntil.IsZero() || now.Before(ro.status.ObserveUntil) {
 		return nil
 	}
-	rate := r.failureRateLocked(appliedDeviceIDs(ro))
+	rate := r.failureRateLocked(ro, appliedDeviceIDs(ro))
 	if rate <= max {
 		return nil
 	}
@@ -303,7 +363,7 @@ func (r *Runtime) checkStagedHealth(ctx context.Context, now time.Time) {
 		r.staged.mu.Unlock()
 		return
 	}
-	rate := r.failureRateLocked(appliedDeviceIDs(ro))
+	rate := r.failureRateLocked(ro, appliedDeviceIDs(ro))
 	if rate <= max {
 		ro.status.Observing = false
 		r.staged.mu.Unlock()
@@ -353,6 +413,15 @@ func (r *Runtime) applyStagedBatchLocked(ctx context.Context, ro *stagedRollout,
 	}
 	if _, err := r.ApplyConfig(ctx, raw, stagedSource(source, idx)); err != nil {
 		return err
+	}
+	// 基线必须在 ApplyConfig 之后取：ApplyConfig 会立刻重启该批设备的采集并
+	// 产生新样本。取此刻的累计值作基线，观察窗口的失败率就只统计「本批次
+	// 下发之后」的样本，不被设备全生命周期的历史故障污染。
+	if ro.baseline == nil {
+		ro.baseline = make(map[string]batchBaseline)
+	}
+	for _, id := range ro.plan.BatchIDs(idx) {
+		ro.baseline[id] = r.readCountersLocked(id)
 	}
 	now := r.stagedNowLocked()
 	ro.status.NextBatch = idx + 1

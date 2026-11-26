@@ -485,3 +485,73 @@ func TestStagedWatchdogAutoAborts(t *testing.T) {
 		t.Fatalf("看门狗未标记终止：%+v", s)
 	}
 }
+
+// 失败率必须只统计「观察窗口内」（基线之后）的样本，而不是设备全生命周期的
+// 累计值。这是自动回滚正确性的核心：历史 flaky 的设备新配置健康时不该被误伤，
+// 历史干净的设备新批次打挂时也不该被巨大分母稀释。
+func TestWindowedFailureRateIgnoresLifetimeHistory(t *testing.T) {
+	cases := []struct {
+		name string
+		pair counterPair
+		want float64
+	}{
+		{
+			// 设备历史上 1000 次里失败 900（90%），但窗口内新采 100 次全好。
+			// 全生命周期口径会得到 ~92%（误伤），窗口口径必须是 0%。
+			name: "历史 flaky、窗口健康 → 0",
+			pair: counterPair{
+				base: batchBaseline{total: 1000, failed: 900},
+				cur:  batchBaseline{total: 1100, failed: 900},
+			},
+			want: 0,
+		},
+		{
+			// 设备历史干净（10000 次全好），但新批次窗口内 100 次失败 60。
+			// 全生命周期口径只有 ~0.6%（漏报），窗口口径必须是 60%。
+			name: "历史干净、窗口打挂 → 0.6",
+			pair: counterPair{
+				base: batchBaseline{total: 10000, failed: 0},
+				cur:  batchBaseline{total: 10100, failed: 60},
+			},
+			want: 0.6,
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := windowedFailureRate([]counterPair{c.pair})
+			if diff := got - c.want; diff > 1e-9 || diff < -1e-9 {
+				t.Fatalf("windowedFailureRate = %v, want %v", got, c.want)
+			}
+		})
+	}
+}
+
+// 窗口内还没采到样本时不能算出「0% 失败」然后当成健康放行——但也不该
+// 当成故障回滚刚下发的批次。约定是返回 0（由调用方结合 total 判断）。
+func TestWindowedFailureRateEmptyWindow(t *testing.T) {
+	got := windowedFailureRate([]counterPair{{
+		base: batchBaseline{total: 500, failed: 250},
+		cur:  batchBaseline{total: 500, failed: 250}, // 窗口内无新增
+	}})
+	if got != 0 {
+		t.Fatalf("窗口内无样本时失败率 = %v, want 0", got)
+	}
+}
+
+// 计数器回退（设备重启把累计值归位）不能让无符号减法下溢成一个天文数字，
+// 否则一次重启就会被误判成「100% 失败」而回滚。
+func TestWindowDeltaGuardsCounterReset(t *testing.T) {
+	failed, total := windowDelta(
+		batchBaseline{total: 10, failed: 3}, // 重启后归位
+		batchBaseline{total: 1000, failed: 900},
+	)
+	if failed != 0 || total != 0 {
+		t.Fatalf("计数器回退时增量 = (%d,%d), want (0,0)", failed, total)
+	}
+	if r := windowedFailureRate([]counterPair{{
+		base: batchBaseline{total: 1000, failed: 900},
+		cur:  batchBaseline{total: 10, failed: 3},
+	}}); r != 0 {
+		t.Fatalf("重启后失败率 = %v, want 0（不因下溢误判）", r)
+	}
+}

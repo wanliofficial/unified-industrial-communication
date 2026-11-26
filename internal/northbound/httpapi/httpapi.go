@@ -324,7 +324,9 @@ type StagedPolicy struct {
 	// Observe 是每批下发后的观察窗口：窗口内拒绝推进下一批。
 	Observe model.Duration `json:"observe,omitempty"`
 	// MaxFailureRate 是观察窗口结束时「已下发设备」的采集失败率上限（0~1）。
-	// 超过则以 baseVersion 自动回滚并终止灰度；0 表示不做健康检查。
+	// 失败率按窗口内的增量计算（以每批下发时刻的累计读统计为基线，只统计
+	// 基线之后的新样本），而非设备全生命周期的累计值。超过则以 baseVersion
+	// 自动回滚并终止灰度；0 表示不做健康检查。
 	MaxFailureRate float64 `json:"maxFailureRate,omitempty"`
 }
 
