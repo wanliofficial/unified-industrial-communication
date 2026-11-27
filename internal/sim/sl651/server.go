@@ -62,6 +62,9 @@ type Server struct {
 	badFunc bool
 	// truncate 非 0 时把应答正文截断成这么多字节（验证长度/短帧处理）。
 	truncate int
+	// multiPacket 为真时把应答封装成 M3 多包帧（SYN 起始 + 包信息），
+	// 用于验证驱动对「不做跨包重组」的显式拒绝。
+	multiPacket bool
 	// delay 是应答前的人为延迟（验证超时分类）。
 	delay time.Duration
 	// dropOnQuery 为真时收到下行查询后立即断开、不回应（模拟终端掉线/停电）。
@@ -298,6 +301,14 @@ func (s *Server) SetTruncate(n int) {
 	s.mu.Unlock()
 }
 
+// SetMultiPacket 让从站把应答封装成 M3 多包帧（SYN 起始、ETB 结束、
+// 正文前 3 字节为包信息）。驱动明确不做跨包重组，应报 ErrUnsupported。
+func (s *Server) SetMultiPacket(on bool) {
+	s.mu.Lock()
+	s.multiPacket = on
+	s.mu.Unlock()
+}
+
 // SetDropOnQuery 让从站收到下行查询后立即断开、不回应（模拟终端掉线）。
 func (s *Server) SetDropOnQuery(on bool) {
 	s.mu.Lock()
@@ -495,6 +506,7 @@ func (s *Server) reply(req *sl651codec.Frame, center int, only []byte) ([]byte, 
 	station := s.station
 	badCRC, badFunc := s.badCRC, s.badFunc
 	truncate := s.truncate
+	multiPacket := s.multiPacket
 	now := s.clock()
 	obsOffset := s.obsOffset
 	s.serial++
@@ -539,6 +551,12 @@ func (s *Server) reply(req *sl651codec.Frame, center int, only []byte) ([]byte, 
 			return nil, false, err
 		}
 	}
+	if multiPacket {
+		raw, err = toMultiPacket(raw)
+		if err != nil {
+			return nil, false, err
+		}
+	}
 	if badCRC && len(raw) >= 2 {
 		raw[len(raw)-1] ^= 0xFF
 	}
@@ -571,6 +589,36 @@ func retruncate(raw []byte, n int) ([]byte, error) {
 	out = append(out, sl651codec.STX)
 	out = append(out, body...)
 	out = append(out, sl651codec.ETX)
+	return sl651codec.AppendCRC(out), nil
+}
+
+// toMultiPacket 把一帧普通上行报文改造成 M3 多包帧：报文起始符位置换成
+// SYN，正文前加 3 字节包信息（包总数 + 本包序号），结束符换成 ETB。
+//
+// 包信息这里写成「共 2 包、本包序号 1」（12 位+12 位），提示终端确实把应答
+// 拆成了多个包，驱动明确不做跨包重组、应报 ErrUnsupported。
+func toMultiPacket(raw []byte) ([]byte, error) {
+	f, err := sl651codec.Parse(raw)
+	if err != nil {
+		return nil, err
+	}
+	// 包信息：包总数 2（0x002）、本包序号 1（0x001）→ 0x002001。
+	packetInfo := []byte{0x00, 0x20, 0x01}
+	fullBody := make([]byte, 0, len(packetInfo)+len(f.Body))
+	fullBody = append(fullBody, packetInfo...)
+	fullBody = append(fullBody, f.Body...)
+
+	out := make([]byte, 0, len(raw)+len(packetInfo))
+	out = append(out, sl651codec.Start, sl651codec.Start)
+	out = append(out, byte(f.Center&0xFF))
+	out = append(out, f.Station[:]...)
+	out = append(out, f.Password[:]...)
+	out = append(out, f.Func)
+	rawLen := sl651codec.DirUp | (len(fullBody) & sl651codec.MaxLen)
+	out = append(out, byte(rawLen>>8), byte(rawLen&0xFF))
+	out = append(out, sl651codec.Syn)
+	out = append(out, fullBody...)
+	out = append(out, sl651codec.ETB)
 	return sl651codec.AppendCRC(out), nil
 }
 

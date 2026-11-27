@@ -561,6 +561,13 @@ func (c *conn) exchange(ctx context.Context, req []byte, op string,
 		//
 		// 校验和错是瞬态干扰（可重试）；功能码不对说明终端在正常应答，
 		// 只是我们理解错了，重试没用，直接报协议错误。
+		//
+		// 编解码层的 ErrUnsupported（如 M3 多包帧）不是链路故障也不是协议错，
+		// 而是「本驱动明确不做的能力边界」：映射成 ErrUnsupported，才不会让
+		// 一台正常终端因为送了一帧多包应答被当成坏设备熔断/重连。
+		if errors.Is(err, sl651codec.ErrUnsupported) {
+			return nil, driver.E(driver.ErrUnsupported, op, c.devID, err.Error(), false, err)
+		}
 		if errors.Is(err, sl651codec.ErrBadFrame) {
 			return nil, driver.E(driver.ErrProtocol, op, c.devID,
 				"应答帧结构错误（长度/CRC/结束符）", true, err)

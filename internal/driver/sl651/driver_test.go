@@ -379,6 +379,36 @@ func TestBadReportIsNotRetried(t *testing.T) {
 	}
 }
 
+// TestMultiPacketIsUnsupported M3 多包应答：驱动明确不做跨包重组，必须报
+// ErrUnsupported（能力边界，不是链路故障），且不重发、不熔断。
+//
+// 旧实现没有在 ParseReport 里拦住 M3 帧：会把正文前 3 字节包信息当成流水号/
+// 发报时间去解，要么报误导性的「地址标识错」，要么在字节凑巧对齐时解出一份
+// 看着合理却是错的数据。而驱动文档明确承诺「包总数 > 1 报 ErrUnsupported」。
+func TestMultiPacketIsUnsupported(t *testing.T) {
+	srv := startSim(t)
+	srv.SetMultiPacket(true)
+	c := openConn(t, srv, "retries=2,gap=1ms")
+
+	_, err := c.Read(context.Background(), spans(pt("z", "Z")))
+	if err == nil {
+		t.Fatal("M3 多包应答应报错")
+	}
+	if k := driver.KindOf(err); k != driver.ErrUnsupported {
+		t.Fatalf("错误分类 = %v，应为 ErrUnsupported", k)
+	}
+	if driver.IsRetryable(err) {
+		t.Fatal("M3 多包应标为不可重发")
+	}
+	if driver.IsLinkFailure(err) {
+		t.Fatal("M3 多包是能力边界，不应算链路故障")
+	}
+	// retries=2 时若误重发会发 3 次；正确行为是只发 1 次。
+	if got := srv.QueryCount(sl651codec.FuncQueryAll); got != 1 {
+		t.Fatalf("M3 多包不应重发（只发 1 次 37H），实际 %d 次", got)
+	}
+}
+
 // TestSilentStationTimesOut 静默终端：报超时并按 qualityOf 映射质量。
 func TestSilentStationTimesOut(t *testing.T) {
 	srv := startSim(t)

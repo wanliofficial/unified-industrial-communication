@@ -71,6 +71,15 @@ func ParseReport(f *Frame) (*Report, error) {
 	if f.Dir != DirUp {
 		return nil, fmt.Errorf("%w: not an uplink frame (dir=0x%04X)", ErrBadReport, f.Dir)
 	}
+	// M3 多包帧（报文起始符位置是 SYN）的正文前 3 字节是包信息（包总数 + 本包
+	// 序号），真正的报文体从第 4 字节起；本包不做跨包重组，也无法把它当单帧报文
+	// 解析（parseHead 会把包信息当成流水号/发报时间，要么报误导性的「地址标识
+	// 错」，要么在字节凑巧对齐时解出一份看着合理却是错的数据）。按包注释与
+	// 驱动契约的约定，显式拒绝，让运维去查为什么终端把应答拆成了多包。
+	if f.IsM3 {
+		return nil, fmt.Errorf("%w: M3 多包帧（包总数 %d）未做跨包重组，无法解析单包",
+			ErrUnsupported, m3TotalPackets(f.Packets))
+	}
 
 	switch f.Func {
 	case FuncLink:
@@ -83,6 +92,16 @@ func ParseReport(f *Frame) (*Report, error) {
 	default:
 		return nil, fmt.Errorf("%w: func 0x%02X", ErrUnsupported, f.Func)
 	}
+}
+
+// m3TotalPackets 从 M3 的 3 字节包信息里取「包总数」。
+//
+// 编码是「高 12 位包总数、低 12 位本包序号」（见 Frame.Packets 注释），即
+// 一个 24 位大端整数，高半是总数、低半是本包序号。本函数只取总数用于错误
+// 提示，不参与重组。
+func m3TotalPackets(p [3]byte) int {
+	v := int(p[0])<<16 | int(p[1])<<8 | int(p[2])
+	return v >> 12
 }
 
 // reportHead 是标准报文体的前 23 字节固定部分。

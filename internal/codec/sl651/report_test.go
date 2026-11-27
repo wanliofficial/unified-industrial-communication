@@ -488,3 +488,33 @@ func TestBCDLoose(t *testing.T) {
 		t.Fatalf("pow10 wrong")
 	}
 }
+
+// ParseReport：M3 多包帧（SYN 起始）必须显式拒绝，而不是把正文前 3 字节
+// 的包信息当流水号/发报时间硬解。否则要么报误导性的「地址标识错」，要么在
+// 字节凑巧对齐时解出一份看着合理却是错的数据。
+func TestParseReportRejectsM3(t *testing.T) {
+	b := testBuilder()
+	// M3 包信息 3 字节：高 12 位包总数、低 12 位本包序号。
+	// 0x002001 → 包总数 = 0x002001>>12 = 2，本包序号 = 1。
+	raw, err := b.frame(FuncTimed, DirUp, ETB, []byte{0x00, 0x20, 0x01, 0xAA, 0xBB})
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw[offSTX] = Syn // STX → SYN：M3 多包
+	raw = AppendCRC(raw[:len(raw)-2])
+
+	f, err := Parse(raw)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if !f.IsM3 {
+		t.Fatal("IsM3 = false")
+	}
+	if got := m3TotalPackets(f.Packets); got != 2 {
+		t.Fatalf("m3TotalPackets = %d，应为 2", got)
+	}
+	_, err = ParseReport(f)
+	if !errors.Is(err, ErrUnsupported) {
+		t.Fatalf("ParseReport(M3) = %v，应为 ErrUnsupported", err)
+	}
+}
