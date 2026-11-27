@@ -8284,23 +8284,31 @@ DIF 的低 4 位不是字节数，而是一个长度**编码**：
 | `00` / `08` | 无数据域 | 选择项 / 保留 |
 | `0F` | 厂商特定 | 按原始字节暴露 |
 
-LVAR 同时编码**长度与形态**（EN 13757-3 §6.5）：
+LVAR 同时编码**长度与形态**（EN 13757-3:2018/2025 §6.3.3 Table 5）：
 
 | LVAR | 形态 | 数据域字节数 |
 |---|---|---|
-| `00h..BFh` | ASCII 文本 | = LVAR |
-| `C0h..CFh` | **正 BCD 数**（`(LVAR-C0h)*2` 位十进制） | = LVAR−C0h |
-| `D0h..DFh` | **负 BCD 数** | = LVAR−D0h |
-| `E0h..EFh` | **二进制整数**（小端） | = LVAR−E0h |
-| `F0h..FAh` | 浮点（标准标 "to be defined"） | = LVAR−F0h |
-| `FBh..FFh` | 保留 | — |
+| `00h..BFh` | 8 位文本（ISO/IEC 8859-1） | = LVAR（0..191） |
+| `C0h..C9h` | **正 BCD 数**（`(LVAR-C0h)*2` 位十进制，0..18 位） | = LVAR−C0h |
+| `D0h..D9h` | **负 BCD 数**（0..18 位） | = LVAR−D0h |
+| `E0h..EFh` | **二进制数**（小端，0..15 字节） | = LVAR−E0h |
+| `F0h..F4h` | **二进制数** | = `4*(LVAR-ECh)` → 16/20/24/28/32 |
+| `F5h` / `F6h` | **二进制数** | 48 / 64 |
+| 其余（`CA..CF`、`DA..DF`、`F7..FF`） | 保留 | — |
 
-驱动按这张表把变长记录分派：`≤BFh` 作文本、`C/D` 段解成有符号 BCD 数（**符号由 C/D 段给出**，与固定宽度 BCD 用末字节 `Fh` 半字节表示符号是两套约定，不能混用）、`E` 段作整数（宽度装不进 `int64` 时退回原始字节，不静默截断）、`F` 段因语义未定按原始字节暴露。`Raw` 一律含 LVAR 首字节，供 `r:` 原始导出。
+驱动按这张表把变长记录分派：`≤BFh` 作文本、`C/D` 段解成有符号 BCD 数（**符号由 C/D 段给出**，与固定宽度 BCD 用末字节 `Fh` 半字节表示符号是两套约定，不能混用；18 位仍在 `int64` 内，不能按 8 字节截断）、`E` 段作整数（5/7/9..15 字节装不进 `int64` 时退回原始字节，不静默截断）、`F` 段是 16..64 字节的宽二进制数，必然超出 `int64`，按原始字节暴露。`Raw` 一律含 LVAR 首字节，供 `r:` 原始导出。
 
-> 早先实现把 `C/D/E` 段一律当 `KindBinary`（原始字节），且 `F` 段用自造的
-> `(LVAR-0xEC)*4`（`F0h→16`、`F4h→32`）加 `F5h=48`/`F6h=64` 长度表——与标准完全不符。
-> 后果：可变长 BCD 计数器（大电量值常用）被静默降级成字节、4 字节浮点记录因声明 32
-> 字节而整帧解析失败。已修正并加 `TestVariableLengthRecords` 锁四段分派与帧推进。
+> **F 段不是浮点。** 1990 年代的 M-Bus 文档写过 `F0h..FAh` 是 `(LVAR-F0h)` 字节的浮点
+> "to be defined"，标准化后的 2018/2025 版已改成 `4*(LVAR-ECh)` / 48 / 64 的二进制数。
+> 按旧文档解会把 `F4h`（32 字节）只吃 4 字节、后面整条记录错位，还会把保留编码
+> `F7h..FAh` 当成合法长度；反过来，把标准表当成"自造"改回旧文档，会让合法的宽记录
+> 整帧解析失败。这类表必须以标准原文为准，不能靠记忆或旧文档推断。
+
+> 历史缺陷（两轮）：第一版把 `C/D/E` 段一律当 `KindBinary`（原始字节），可变长 BCD
+> 计数器被静默降级；第二版又按旧文档把 `F` 段改成 `LVAR-F0h` 字节。现在
+> `TestLVARLengthTable` 逐编码钉住上表（含保留段拒绝），`TestVariableLengthRecords`
+> 钉住形态分派、`F4h` 必须整段吃满 32 字节、数据不足要报 `ErrFrame`、宽记录后的
+> 定长记录不误读。
 
 `2Fh` 是按 16 字节对齐时的**填充**而不是记录——把它当记录会
 读出一条长度 0、量名乱码的假记录，后面整段记录随之错位；字节流里出现 `2Fh` 必须
@@ -8358,6 +8366,12 @@ FCB，表现为问答完全对不上；`SND_NKE` 是唯一能把它拉回已知�
 「永远说要更多」的从站会把一次事务挂死。所有分段的记录在拼接后重新编号（`reindex`），
 `r:<n>` 才能对整张表连续寻址。
 
+多段读取的终止条件有**两个**（EN 13757-3 §6.5）：下一段应答不再含 `DIF=1Fh`，
+或者**从站只回单字符 `E5`**（收到请求、没有更多数据）。`E5` 没有 C/CI 字段，
+不能走 `ParseResponse`，但它不是帧错误：驱动把它当作正常终止，保留已经收到的
+全部记录。若整轮的第一条 `REQ_UD2` 就只回 `E5`，则归**点级 `ErrAddress`**
+（从站健康、只是没有数据；先查点表或读表列表选择），不触发熔断/重连。
+
 #### 3.10.25.6 错误分类：把「没字节」与「有字节不成帧」分开
 
 `Probe` 用 `SND_NKE` 的**单字节应答**（`E5`）。它不依赖任何数据结构，因此能把两类
@@ -8369,6 +8383,7 @@ FCB，表现为问答完全对不上；`SND_NKE` 是唯一能把它拉回已知�
 | 有字节回来，但一帧都没成 | 波特率/校验位配错（标准 2400 8E1）、终端电阻缺失、多台表同时应答 | `ErrProtocol` + 排查提示 |
 | 帧成了但校验和错 | 总线上有干扰，通常是瞬态 | `ErrProtocol`（可重试） |
 | 帧成了但 C/CI 不对 | 从站在正常应答，只是我们理解错了 | `ErrProtocol`（**不**重试） |
+| 对 `REQ_UD2` 只回单字符 `E5` | 从站健康，但没有数据可给（点表/读表列表选择） | `ErrAddress`（点级，不熔断重连） |
 | 串口读/写本身失败 | 转换器掉线、fd 被关 | `ErrDisconnected` |
 
 第二行是这个驱动最值得讲的一处。`Reader` 会跳过坏帧继续扫描，所以它最终报出来的
@@ -8499,9 +8514,9 @@ VIF 换算）三个注入点，测试只打开自己关心的那一个。
 
 | 层 | 用例 |
 |---|---|
-| `codec/mbus` | 金帧逐字节（SND_NKE / 短帧 / 长帧 / 控制帧）与校验和范围（**不覆盖** L 与起止符）；双 `L` 不等、结束符错、截断 → `ErrIncomplete` vs `ErrFrame` 的区分；`FDh` 次级地址被拒；`E5` 与长帧粘包时先切 `E5`；`BadFrames` 只数内容不对的帧、重同步不计数；VIF 全表与幂次（含相邻编码 10 倍关系、厂商特定 7Fh/FFh、自定义 7Ch、主 VIFE 表 7Dh）；BCD 正负号与非法数字；REAL 不乘 Scale；**LVAR 全编码表（`C/D` 段到 `CF/DF`、`E0..EF` 二进制整数、`F0..FA` 浮点按 LVAR−F0、`FB..FF` 保留）与变长记录形态分派（正/负 BCD→数值、浮点按原始字节暴露、多记录帧推进）**；Type G/F/I 日期时间与无效位、2 月 30 日拒绝；`2Fh` 填充跳过；`DIF=1Fh` 后续标志；固定结构 16 字节布局与 `type` 字节（含 J 族 `0x0B..0x13` 单调 1e3..1e11）；`q:`/`r:` 选择与失败时报候选；编码↔解码互逆 |
-| `driver/mbus` | 真实 TCP 回环读写；`MultiRead` 一条事务覆盖多点；FCB 跨轮翻转、同轮回放（访问号不变的端到端验证）；读取失败后 `SND_NKE` 复位再试；同 FCB 重放不累加访问号；坏帧 → `ErrProtocol` 且文案含波特率提示；完全无应答 → `ErrTimeout`；校验和错**重发到上限**（每轮 `retries+1` 次）与 C/CI 错**不重发**（每轮 1 次）成对断言，后者同时断言 `IsRetryable(err)==false`；状态字应用错误 → uncertain；`Write` 逐项 `ErrUnsupported`；`max-follow` 上限；`q:volume@1` / `q:power-max` / `r:0` 寻址；后续报文记录重新编号；地址 251/253/255 在 `Open` 被拒 |
-| `sim/mbus` | 默认 8 条记录可被 `RecordNames`→`FindRecord` 直接吃回去；同 FCB 重放不改访问号；访问号自增；地址不符静默；坏校验只改校验和；`SetBadCI` 换 CI 后重算校验和（帧完好、语义不支持）；`Reads` 与 `ReqCount` 在重发时分离；`SetStatusError`；`SetSilent`；`DIF=1Fh` 后续报文；`SetValue`/`Value` 与 VIF 换算一致 |
+| `codec/mbus` | 金帧逐字节（SND_NKE / 短帧 / 长帧 / 控制帧）与校验和范围（**不覆盖** L 与起止符）；双 `L` 不等、结束符错、截断 → `ErrIncomplete` vs `ErrFrame` 的区分；`FDh` 次级地址被拒；`E5` 与长帧粘包时先切 `E5`；`BadFrames` 只数内容不对的帧、重同步不计数；VIF 全表与幂次（含相邻编码 10 倍关系、厂商特定 7Fh/FFh、自定义 7Ch、主 VIFE 表 7Dh）；BCD 正负号与非法数字；REAL 不乘 Scale；**LVAR 全编码表（`C0..C9`/`D0..D9` 到 18 位、`E0..EF`、`F0..F4`=`4*(LVAR-EC)`、`F5`=48、`F6`=64，`CA..CF`/`DA..DF`/`F7..FF` 保留必须拒绝）与变长记录形态分派（正/负 BCD→数值、18 位 BCD 不截断、`F4` 整段吃满 32 字节、数据不足报 `ErrFrame`、宽记录后的定长记录不误读、多记录帧推进）**；Type G/F/I 日期时间与无效位、2 月 30 日拒绝；`2Fh` 填充跳过；`DIF=1Fh` 后续标志；固定结构 16 字节布局与 `type` 字节（含 J 族 `0x0B..0x13` 单调 1e3..1e11）；`q:`/`r:` 选择与失败时报候选；编码↔解码互逆 |
+| `driver/mbus` | 真实 TCP 回环读写；`MultiRead` 一条事务覆盖多点；FCB 跨轮翻转、同轮回放（访问号不变的端到端验证）；读取失败后 `SND_NKE` 复位再试；同 FCB 重放不累加访问号；坏帧 → `ErrProtocol` 且文案含波特率提示；完全无应答 → `ErrTimeout`；校验和错**重发到上限**（每轮 `retries+1` 次）与 C/CI 错**不重发**（每轮 1 次）成对断言，后者同时断言 `IsRetryable(err)==false`；状态字应用错误 → uncertain；`Write` 逐项 `ErrUnsupported`；`max-follow` 上限；**多段读取以 `E5` 正常终止时保留已收记录（`TestMoreRecordsThenAckIsSuccess`）**；**首条 `REQ_UD2` 只回 `E5` → 点级 `ErrAddress`、`IsLinkFailure==false`（`TestAckOnlyIsAddressNotLinkFailure`）**；`q:volume@1` / `q:power-max` / `r:0` 寻址；后续报文记录重新编号；地址 251/253/255 在 `Open` 被拒 |
+| `sim/mbus` | 默认 8 条记录可被 `RecordNames`→`FindRecord` 直接吃回去；同 FCB 重放不改访问号；访问号自增；地址不符静默；坏校验只改校验和；`SetBadCI` 换 CI 后重算校验和（帧完好、语义不支持）；`Reads` 与 `ReqCount` 在重发时分离；`SetStatusError`；`SetSilent`；`DIF=1Fh` 后续报文；`WithMoreRecordsThenAck`（首段 `1Fh`、次段仅 `E5`）；`WithAckOnly`（一律 `E5`）；`SetValue`/`Value` 与 VIF 换算一致 |
 | `pointtable` | `mbus` 走 `WidthNone + AllowSymbol`；`q:`/`r:` 两种记录寻址都解析成 symbol 且 `Canonical` 往返一致（`r:` 靠策略里的 `SymbolPrefixes` 先一步排除寄存器识别——`r` 同时是 Mewtocol 的接点区名，不排除会被判成「不接受寄存器地址」）；漏写 `q:` 前缀按物理量名处理；`coil:`/`holding:`/`dt:`/`dm:` 与 selector 在导入期拒绝；`length` 列在导入期拒绝；`q:energy` 不被 modbus/s7/iec104/mewtocol/fins 收下，而 `r:16.3` 在 mewtocol 下仍是寄存器位地址 |
 | `cmd/uic` | `parsePrimaryAddr`（253/255 的拒绝文案）、`parseScanRange`、`mbusRefs` 列拆分、`rowOf` 可粘贴地址 |
 

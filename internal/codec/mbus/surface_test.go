@@ -1,6 +1,7 @@
 package mbus
 
 import (
+	"bytes"
 	"encoding/hex"
 	"errors"
 	"math"
@@ -302,25 +303,32 @@ func TestStatusText(t *testing.T) {
 }
 
 func TestLVARLengthTable(t *testing.T) {
-	// LVAR 同时编码长度与形态（EN 13757-3 §6.5）：
-	//   ≤BFh     ASCII，长度即字节数
-	//   C0..CF   正 BCD，字节数 = LVAR-C0（(LVAR-C0)*2 位十进制）
-	//   D0..DF   负 BCD，字节数 = LVAR-D0
-	//   E0..EF   二进制整数，字节数 = LVAR-E0
-	//   F0..FA   浮点，字节数 = LVAR-F0（to be defined）
-	//   FB..FF   保留
+	// LVAR 同时编码长度与形态（EN 13757-3:2018/2025 §6.3.3 Table 5）：
+	//   ≤BFh     ISO/IEC 8859-1 文本，长度即字节数
+	//   C0..C9   正 BCD，字节数 = LVAR-C0（(LVAR-C0)*2 位十进制，0..18 位）
+	//   D0..D9   负 BCD，字节数 = LVAR-D0
+	//   E0..EF   二进制数，字节数 = LVAR-E0（0..15 字节）
+	//   F0..F4   二进制数，字节数 = 4*(LVAR-EC)（16/20/24/28/32 字节）
+	//   F5/F6    48 / 64 字节
+	//   其余     保留
+	//
+	// F 段不是浮点：1990 年代文档里的「F0..FA = (LVAR-F0) 字节浮点」早已被
+	// 标准化改写；按旧文档解会把 F4 的 32 字节读成 4 字节、整帧错位。
 	cases := []struct {
 		lvar byte
 		n    int
 		ok   bool
 	}{
 		{0x00, 0, true}, {0x05, 5, true}, {0xBF, 191, true},
-		{0xC0, 0, true}, {0xC9, 9, true}, {0xCF, 15, true},
-		{0xD0, 0, true}, {0xD9, 9, true}, {0xDF, 15, true},
+		{0xC0, 0, true}, {0xC9, 9, true},
+		{0xD0, 0, true}, {0xD9, 9, true},
 		{0xE0, 0, true}, {0xE2, 2, true}, {0xEF, 15, true},
-		{0xF0, 0, true}, {0xF4, 4, true}, {0xFA, 10, true},
-		// FB..FF 是保留编码，不是合法 LVAR。
-		{0xFB, 0, false}, {0xFF, 0, false},
+		{0xF0, 16, true}, {0xF1, 20, true}, {0xF2, 24, true}, {0xF3, 28, true}, {0xF4, 32, true},
+		{0xF5, 48, true}, {0xF6, 64, true},
+		// CA..CF、DA..DF、F7..FF 是保留编码，不是合法 LVAR。
+		{0xCA, 0, false}, {0xCF, 0, false},
+		{0xDA, 0, false}, {0xDF, 0, false},
+		{0xF7, 0, false}, {0xFA, 0, false}, {0xFB, 0, false}, {0xFF, 0, false},
 	}
 	for _, c := range cases {
 		n, ok := lvarLen(c.lvar)
@@ -330,15 +338,17 @@ func TestLVARLengthTable(t *testing.T) {
 	}
 }
 
-// TestVariableLengthRecords 锁 LVAR 的形态分派（EN 13757-3 §6.5）：
-//   - C0..CF 正 BCD、D0..DF 负 BCD → 数值（不是原始字节）；
-//   - E0..EF 二进制整数 → 数值；
-//   - F0..FA 浮点 → 长度按 LVAR-F0，帧能正确推进（不再因自造长度整帧失败）。
+// TestVariableLengthRecords 锁 LVAR 的形态分派与长度（EN 13757-3:2018/2025 Table 5）：
+//   - C0..C9 正 BCD、D0..D9 负 BCD → 数值（不是原始字节）；
+//   - E0..EF 二进制数 → 数值；
+//   - F0..F6 宽二进制数 → 按声明的 16..64 字节整段吃掉，原始字节暴露。
 //
-// 早先实现把 C/D/E 段一律当 KindBinary，且 F 段用自造的 (LVAR-0xEC)*4 长度，
-// 于是可变长 BCD 计数器被静默降级成字节、4 字节浮点记录被当 32 字节而解析失败。
+// 早期实现把 C/D/E 段一律当 KindBinary；之后又按 1990 年代旧文档把 F 段当成
+// `LVAR-F0` 字节浮点，于是 F4（标准 32 字节）只吃 4 字节、后面整帧错位。
 func TestVariableLengthRecords(t *testing.T) {
 	// VIF=00h：Energy 10^0 Wh（scale=1），便于直接看整数值。
+	f0Payload := bytes.Repeat([]byte{0xAB}, 16)
+	f4Payload := bytes.Repeat([]byte{0xCD}, 32)
 	cases := []struct {
 		name    string
 		raw     []byte
@@ -348,12 +358,17 @@ func TestVariableLengthRecords(t *testing.T) {
 	}{
 		// 正 BCD：LVAR=C2 → 2 字节，34 12（低字节在前）= 1234。
 		{"positive-bcd", []byte{0x0D, 0x00, 0xC2, 0x34, 0x12}, KindNumeric, 1234, 5},
+		// 18 位 BCD（LVAR=C9，9 字节）仍在 int64 内，必须解成数值而不是原始字节。
+		{"positive-bcd-18-digit", concat([]byte{0x0D, 0x00, 0xC9}, bytes.Repeat([]byte{0x99}, 9)),
+			KindNumeric, 999999999999999999, 12},
 		// 负 BCD：LVAR=D2 → 量级 1234，取负 = -1234。
 		{"negative-bcd", []byte{0x0D, 0x00, 0xD2, 0x34, 0x12}, KindNumeric, -1234, 5},
 		// 二进制整数：LVAR=E2 → 2 字节小端 34 12 = 0x1234 = 4660。
 		{"binary-int", []byte{0x0D, 0x00, 0xE2, 0x34, 0x12}, KindNumeric, 4660, 5},
-		// 浮点（to be defined）：LVAR=F4 → 4 字节，按原始字节暴露，长度正确。
-		{"float-keep-bytes", []byte{0x0D, 0x00, 0xF4, 0x00, 0x00, 0x80, 0x3F}, KindBinary, 0, 7},
+		// 宽二进制：LVAR=F0 → 16 字节，超出 int64，按原始字节暴露。
+		{"wide-binary-16", concat([]byte{0x0D, 0x00, 0xF0}, f0Payload), KindBinary, 0, 19},
+		// LVAR=F4 → 32 字节。旧表按 4 字节推进，这里锁住整段消耗 35。
+		{"wide-binary-32", concat([]byte{0x0D, 0x00, 0xF4}, f4Payload), KindBinary, 0, 35},
 		// D 段但数据末字节高半字节是 F：不是纯数字 BCD。变长的符号由 D 段
 		// 给出，数据必须是纯数字；若误用固定宽度 BCD 的符号位逻辑会「负负
 		// 得正」得到一个正数。这里必须退回原始字节，不得静默出数。
@@ -381,6 +396,18 @@ func TestVariableLengthRecords(t *testing.T) {
 		})
 	}
 
+	// 保留编码必须拒绝，不能当成某个小长度继续解析。
+	for _, lvar := range []byte{0xCA, 0xDA, 0xF7, 0xFB} {
+		if _, _, err := parseRecord([]byte{0x0D, 0x00, lvar, 0x00, 0x00}, 0); !errors.Is(err, ErrFrame) {
+			t.Errorf("LVAR %02X 应报 ErrFrame，得到 %v", lvar, err)
+		}
+	}
+
+	// 声明 32 字节但只剩 4 字节：必须报帧错，不能按 4 字节「成功」解析。
+	if _, _, err := parseRecord([]byte{0x0D, 0x00, 0xF4, 0x00, 0x00, 0x80, 0x3F}, 0); !errors.Is(err, ErrFrame) {
+		t.Errorf("F4 声明 32 字节但数据不足应报 ErrFrame，得到 %v", err)
+	}
+
 	// 多记录帧：变长 BCD 记录后紧跟一条定长整数记录，验证帧推进正确。
 	// 记录 1：DIF=0Dh VIF=00h LVAR=C2 34 12（正 BCD 1234，消耗 5 字节）。
 	// 记录 2：DIF=02h(16 位整数) VIF=00h 数据 0E 00 = 14。
@@ -399,6 +426,31 @@ func TestVariableLengthRecords(t *testing.T) {
 	if r2.Kind != KindNumeric || r2.RawInt != 14 {
 		t.Errorf("记录 2：kind=%v raw=%d，应为 number/14", r2.Kind, r2.RawInt)
 	}
+
+	// 宽二进制记录后紧跟定长记录：F4 必须整段 32 字节吃掉，第 2 条才不误读。
+	wide := concat([]byte{0x0D, 0x00, 0xF4}, f4Payload, []byte{0x02, 0x00, 0x0E, 0x00})
+	w1, wn, err := parseRecord(wide, 0)
+	if err != nil {
+		t.Fatalf("宽记录解析失败：%v", err)
+	}
+	if wn != 35 || w1.Kind != KindBinary {
+		t.Fatalf("宽记录：n=%d kind=%v，应为 35/binary", wn, w1.Kind)
+	}
+	w2, _, err := parseRecord(wide[wn:], 0)
+	if err != nil {
+		t.Fatalf("宽记录后的定长记录解析失败：%v", err)
+	}
+	if w2.Kind != KindNumeric || w2.RawInt != 14 {
+		t.Errorf("宽记录后的定长记录：kind=%v raw=%d，应为 number/14", w2.Kind, w2.RawInt)
+	}
+}
+
+func concat(parts ...[]byte) []byte {
+	var out []byte
+	for _, p := range parts {
+		out = append(out, p...)
+	}
+	return out
 }
 
 func TestFixedUnitTable(t *testing.T) {

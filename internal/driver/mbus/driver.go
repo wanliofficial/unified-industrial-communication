@@ -386,7 +386,7 @@ func (c *conn) Read(ctx context.Context, spans []driver.ReadSpan) ([]driver.RawS
 
 // readTable 发 REQ_UD2 并解析应答，必要时跟随后续报文。
 func (c *conn) readTable(ctx context.Context, op string) (mbuscodec.Response, error) {
-	resp, err := c.readOnce(ctx, op)
+	resp, noData, err := c.readOnce(ctx, op)
 	if err != nil {
 		// 失败后复位从站的 FCB 状态再试一次。
 		//
@@ -395,11 +395,18 @@ func (c *conn) readTable(ctx context.Context, op string) (mbuscodec.Response, er
 		// 没反应，或收到上一次的应答）。SND_NKE 是唯一能把它拉回已知状态
 		// 的帧。
 		if nerr := c.sendNKE(ctx, op); nerr == nil {
-			resp, err = c.readOnce(ctx, op)
+			resp, noData, err = c.readOnce(ctx, op)
 		}
 		if err != nil {
 			return mbuscodec.Response{}, err
 		}
+	}
+	// E5 是"收到请求但没有数据"（EN 13757-3 §6.5/§6.6）。作为第一次应答
+	// 说明从站没有可读数据，不再是帧错误，也不是链路故障：归点级 address，
+	// 让运维先查点表/读表列表，而不是让整台健康设备被熔断重连。
+	if noData {
+		return resp, driver.E(driver.ErrAddress, op, c.devID,
+			"从站对 REQ_UD2 仅回 E5：已收到请求但没有数据可读（检查点表或读表列表选择）", false, nil)
 	}
 	// CI=70h（通用错误）/ 71h（告警状态）应答没有记录：错误码说明的是从站
 	// 的整体状态（CI 不支持、缓冲溢出…），不是哪个点配错了。在这里上抛，
@@ -419,9 +426,15 @@ func (c *conn) readTable(ctx context.Context, op string) (mbuscodec.Response, er
 			return resp, driver.E(driver.ErrProtocol, op, c.devID,
 				fmt.Sprintf("后续报文超过 %d 段仍未结束", c.opt.MaxFollow), true, nil)
 		}
-		more, err := c.readOnce(ctx, op)
+		more, noData, err := c.readOnce(ctx, op)
 		if err != nil {
 			return resp, err
+		}
+		if noData {
+			// 多段读取的合法终止条件之一：从站只回 E5（EN 13757-3 §6.5）。
+			// 这不是失败——已收记录就是完整的表，丢掉会让整轮采集全灭。
+			resp.MoreRecordsFollow = false
+			break
 		}
 		resp.Records = append(resp.Records, reindex(more.Records, len(resp.Records))...)
 		resp.MoreRecordsFollow = more.MoreRecordsFollow
@@ -430,23 +443,32 @@ func (c *conn) readTable(ctx context.Context, op string) (mbuscodec.Response, er
 }
 
 // readOnce 发一次 REQ_UD2 并解析一帧应答。
-func (c *conn) readOnce(ctx context.Context, op string) (mbuscodec.Response, error) {
+//
+// noData 为真表示从站只回了单字符 E5（收到请求但没有数据）。E5 没有 C/CI
+// 字段，不是数据应答，不能交给 ParseResponse；但它是多段读取的正常终止符，
+// 所以必须作为「已成功收到、只是无数据」返回，而不是帧错误。
+func (c *conn) readOnce(ctx context.Context, op string) (mbuscodec.Response, bool, error) {
 	req := mbuscodec.BuildShort(mbuscodec.ReqUD2Control(c.fcb), c.addr)
 	var out mbuscodec.Response
+	var ack bool
 	_, err := c.transact(ctx, op, req, func(fr mbuscodec.Frame) error {
-		resp, perr := mbuscodec.ParseResponse(fr)
+		if fr.Type == mbuscodec.FrameAck {
+			ack = true
+			return nil
+		}
+		parsed, perr := mbuscodec.ParseResponse(fr)
 		if perr != nil {
 			return perr
 		}
-		out = resp
+		out = parsed
 		return nil
 	})
 	if err != nil {
-		return mbuscodec.Response{}, err
+		return mbuscodec.Response{}, false, err
 	}
 	// 成功一次就翻转 FCB：下一次是新请求。
 	c.fcb = !c.fcb
-	return out, nil
+	return out, ack, nil
 }
 
 // transact 是唯一的事务入口：排空 → 设截止时间 → 发送 → 收帧 → 校验。

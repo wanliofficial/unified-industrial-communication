@@ -100,12 +100,16 @@ func decodeBCD(b []byte) (int64, bool) {
 // decodeBCDDigits 解**纯数字 BCD**：每字节两位十进制、低位在前，但不接受
 // 末字节高半字节的 Fh 符号位。
 //
-// 用于变长记录（LVAR = C0h..DFh）：那里符号由 LVAR 的 C/D 段给出，数据字节
+// 用于变长记录（LVAR = C0h..D9h）：那里符号由 LVAR 的 C/D 段给出，数据字节
 // 必须是纯数字。若复用 decodeBCD，一条末字节高半字节为 F 的畸形记录会被它
 // 当成负号，再被 D 段取负，负负得正、静默得出一个"看起来合理"的正数。
 // 这里遇到任何非十进制半字节都返回 ok=false，交由调用方按原始字节暴露。
+//
+// 上限 9 字节（18 位十进制）：EN 13757-3 Table 5 的 BCD 段到 C9h/D9h 为止，
+// 18 位最大 999999999999999999 仍在 int64 内，不能按 8 字节截断——那会把
+// 合法的 18 位记录降级成原始字节。
 func decodeBCDDigits(b []byte) (int64, bool) {
-	if len(b) == 0 || len(b) > 8 {
+	if len(b) == 0 || len(b) > 9 {
 		return 0, false
 	}
 	var v int64

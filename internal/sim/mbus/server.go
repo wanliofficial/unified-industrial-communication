@@ -39,6 +39,14 @@ type Server struct {
 	records []mb.RecordSpec
 	// moreRecords 为真时在报文末尾追加 DIF=1Fh 标记"还有后续"。
 	moreRecords bool
+	// moreThenAck 为真时：第一段声明"还有后续"，第二段只回 E5。
+	//
+	// 这是标准允许的多段读取终止方式之一（EN 13757-3 §6.5：「直到应答仅为
+	// E5 或不再有 DIF=1Fh」）。主站若把 E5 当帧错误，整轮采集会全灭。
+	moreThenAck  bool
+	moreDeclared int
+	// ackOnly 为真时对所有 REQ_UD2 只回 E5（收到请求但无数据）。
+	ackOnly bool
 
 	// fcbSeen/fcbValue 实现 FCB 回放语义。
 	fcbSeen  bool
@@ -119,6 +127,19 @@ func WithRecords(specs ...mb.RecordSpec) Option {
 // 它只用于测试驱动的跟读逻辑：真实表只有在整表放不进一帧时才这样做。
 func WithMoreRecords(on bool) Option {
 	return func(s *Server) { s.moreRecords = on }
+}
+
+// WithMoreRecordsThenAck 让第一段声明"还有后续"，跟随请求只回 E5。
+//
+// 标准允许从站用单字符 E5 结束多段读取（此时没有更多数据），驱动必须把它
+// 当成正常终止而不是帧错误。
+func WithMoreRecordsThenAck() Option {
+	return func(s *Server) { s.moreThenAck = true }
+}
+
+// WithAckOnly 让从站对所有 REQ_UD2 只回 E5（收到请求但没有数据）。
+func WithAckOnly() Option {
+	return func(s *Server) { s.ackOnly = true }
 }
 
 // NewServer 创建并启动 TCP 从站；addr 为 "127.0.0.1:0" 时自动分配端口。
@@ -462,6 +483,8 @@ func (s *Server) handleNKE() ([]byte, bool) {
 	// SND_NKE 的语义就是"把 FCB 状态清零"。
 	s.fcbSeen = false
 	s.lastReply = nil
+	// 多段序列也从第一段重新开始。
+	s.moreDeclared = 0
 	return mb.BuildAck(), false
 }
 
@@ -490,11 +513,28 @@ func (s *Server) handleREQ(fr mb.Frame) ([]byte, bool) {
 		return frame, false
 	}
 
+	if s.ackOnly {
+		// 收到请求但没有数据：只回单字符 E5（不是错误帧）。
+		// 仍写入 lastReply，保证同一 FCB 的重传回放的是这条 E5。
+		s.lastReply = append([]byte(nil), mb.BuildAck()...)
+		return mb.BuildAck(), false
+	}
+
+	if s.moreThenAck && s.moreDeclared > 0 {
+		// 后续段没有更多记录：标准允许只回 E5（收到请求、无数据）。
+		// 仍写入 lastReply，保证同一 FCB 的重传回放的是这条 E5。
+		s.lastReply = append([]byte(nil), mb.BuildAck()...)
+		return mb.BuildAck(), false
+	}
+
 	data, err := s.buildData()
 	if err != nil {
 		// 组帧失败说明记录表配置有误（例如数据域超过单帧上限）。
 		// 沉默比回一个错的帧更安全：主站会超时并报告链路问题。
 		return nil, true
+	}
+	if s.moreThenAck {
+		s.moreDeclared++
 	}
 	frame := mb.BuildLong(mb.CtrlRSPUD, s.addr, mb.CIVariableData, data)
 	if s.badCI != 0 {
@@ -526,7 +566,7 @@ func (s *Server) buildData() ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	if s.moreRecords {
+	if s.moreRecords || s.moreThenAck {
 		// DIF=1Fh（更多记录跟随）+ 两个厂商字节。真实表会在这里放
 		// 厂商特定数据；这里放可预测的常量，方便测试断言。
 		data = append(data, 0x1F, 0xAA, 0xBB)

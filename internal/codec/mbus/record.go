@@ -325,10 +325,10 @@ func parseRecord(b []byte, index int) (Record, int, error) {
 		payload := append([]byte(nil), b[i+1:i+1+n]...)
 		rec.Raw = append([]byte(nil), b[i:i+1+n]...)
 		i += 1 + n
-		// LVAR 的形态决定数据怎么解释（EN 13757-3 §6.5）：
+		// LVAR 的形态决定数据怎么解释（EN 13757-3:2018/2025 Table 5）：
 		//   ≤BFh    ASCII 文本
-		//   C0..CF  正 BCD 数   D0..DF  负 BCD 数
-		//   E0..EF  二进制整数  F0..FA  浮点（to be defined，按原始字节暴露）
+		//   C0..C9  正 BCD 数   D0..D9  负 BCD 数
+		//   E0..EF  二进制数    F0..F6  16..64 字节二进制数（超出 int64，按原始字节暴露）
 		rec.Kind, rec.Num, rec.RawInt, rec.Text = decodeVariableValue(rec, lvar, payload)
 		return rec, i, nil
 	}
@@ -365,31 +365,37 @@ func difDataLen(field byte) (int, error) {
 	return 0, fmt.Errorf("%w: DIF 长度编码 %X 无效", ErrFrame, field)
 }
 
-// lvarLen 解 LVAR 的长度编码（EN 13757-3 §6.5，Table 5 之后的 LVAR 表）。
+// lvarLen 解 LVAR 的长度编码（EN 13757-3:2018/2025 §6.3.3 Table 5）。
 //
-//	00h..BFh : ASCII 字符串，长度 = LVAR 字节
-//	C0h..CFh : 正 BCD 数，(LVAR-C0h)*2 位十进制 → 字节数 = LVAR-C0h
-//	D0h..DFh : 负 BCD 数，(LVAR-D0h)*2 位十进制 → 字节数 = LVAR-D0h
-//	E0h..EFh : 二进制数，字节数 = LVAR-E0h
-//	F0h..FAh : 浮点数，字节数 = LVAR-F0h（标准标注 "to be defined"）
-//	FBh..FFh : 保留
+//	00h..BFh : 8 位文本（ISO/IEC 8859-1），长度 = LVAR 字节
+//	C0h..C9h : 正 BCD 数，(LVAR-C0h)*2 位十进制 → 字节数 = LVAR-C0h
+//	D0h..D9h : 负 BCD 数，(LVAR-D0h)*2 位十进制 → 字节数 = LVAR-D0h
+//	E0h..EFh : 二进制数，字节数 = LVAR-E0h（0..15 字节）
+//	F0h..F4h : 二进制数，字节数 = 4*(LVAR-ECh)（16/20/24/28/32 字节）
+//	F5h      : 二进制数，48 字节
+//	F6h      : 二进制数，64 字节
+//	其余     : 保留
 //
-// 关键修正：早先实现把 C/D 段截断在 C9/D9、并自造了 F0..F6 的
-// `(LVAR-0xEC)*4 / 48 / 64` 长度表——后者与标准完全不符（标准 F 段是
-// LVAR-F0 字节的浮点数）。截断 + 自造长度会让合法的可变长 BCD/浮点记录
-// 要么被当原始字节、要么因声明长度错误而整帧解析失败。
+// 注意 F 段不是「浮点」：2018/2025 版把它们统称 Binary number，只是宽度
+// 超过 int64。早期 1990 年代文档写过 F0..FA 是 (LVAR-F0) 字节的浮点
+// "to be defined"，但标准化后已改成 4 的倍数 / 48 / 64；按旧文档解会让
+// 合法的 16..64 字节记录被截断、把保留编码 F7h..FAh 当合法长度。
 func lvarLen(lvar byte) (int, bool) {
 	switch {
 	case lvar <= 0xBF:
 		return int(lvar), true
-	case lvar >= 0xC0 && lvar <= 0xCF:
+	case lvar >= 0xC0 && lvar <= 0xC9:
 		return int(lvar - 0xC0), true
-	case lvar >= 0xD0 && lvar <= 0xDF:
+	case lvar >= 0xD0 && lvar <= 0xD9:
 		return int(lvar - 0xD0), true
 	case lvar >= 0xE0 && lvar <= 0xEF:
 		return int(lvar - 0xE0), true
-	case lvar >= 0xF0 && lvar <= 0xFA:
-		return int(lvar - 0xF0), true
+	case lvar >= 0xF0 && lvar <= 0xF4:
+		return 4 * int(lvar-0xEC), true
+	case lvar == 0xF5:
+		return 48, true
+	case lvar == 0xF6:
+		return 64, true
 	}
 	return 0, false
 }
@@ -443,9 +449,9 @@ func decodeRecordValue(rec Record) (Kind, float64, int64, string) {
 
 // decodeVariableValue 按 LVAR 的形态解释变长记录的数据域（payload 已去掉 LVAR 字节）。
 //
-// EN 13757-3 §6.5 用 LVAR 同时编码长度与形态：≤BFh 是 ASCII 文本，C/D 段是
-// 正/负 BCD 数，E 段是二进制整数，F 段是浮点（"to be defined"）。早先实现只
-// 认 ≤BFh 为文本、其余一律当原始字节，于是可变长 BCD 计数器被静默降级成字节。
+// EN 13757-3:2018/2025 §6.3.3 用 LVAR 同时编码长度与形态：≤BFh 是 8 位文本，
+// C/D 段是正/负 BCD 数，E 段是 0..15 字节二进制数，F 段是 16/20/24/28/32/48/64
+// 字节二进制数。后两段的宽度超过 int64，按原始字节暴露、不静默截断。
 //
 // 符号约定与固定宽度 BCD 不同：固定宽度（DIF 1001..1110）的符号在末字节高半
 // 字节的 Fh；变长的符号由 C/D 段给出，数据字节本身必须是纯数字。因此这里用
@@ -455,13 +461,13 @@ func decodeVariableValue(rec Record, lvar byte, payload []byte) (Kind, float64, 
 	switch {
 	case lvar <= 0xBF:
 		return KindText, 0, 0, strings.TrimRight(string(payload), "\x00")
-	case lvar >= 0xC0 && lvar <= 0xCF:
+	case lvar >= 0xC0 && lvar <= 0xC9:
 		v, ok := decodeBCDDigits(payload)
 		if !ok {
 			return KindBinary, 0, 0, ""
 		}
 		return KindNumeric, float64(v) * rec.Scale, v, ""
-	case lvar >= 0xD0 && lvar <= 0xDF:
+	case lvar >= 0xD0 && lvar <= 0xD9:
 		v, ok := decodeBCDDigits(payload)
 		if !ok {
 			return KindBinary, 0, 0, ""
@@ -474,7 +480,7 @@ func decodeVariableValue(rec Record, lvar byte, payload []byte) (Kind, float64, 
 			return KindBinary, 0, 0, ""
 		}
 		return KindNumeric, float64(v) * rec.Scale, v, ""
-	default: // 0xF0..0xFA 浮点，"to be defined"：保持原始字节
+	default: // 0xF0..0xF6：16..64 字节二进制数，必然超出 int64，保持原始字节
 		return KindBinary, 0, 0, ""
 	}
 }

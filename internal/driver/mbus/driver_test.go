@@ -429,6 +429,36 @@ func TestMoreRecordsFollow(t *testing.T) {
 	}
 }
 
+func TestMoreRecordsThenAckIsSuccess(t *testing.T) {
+	// EN 13757-3 §6.5：多段读取可以「直到应答仅为 E5」。E5 没有 C/CI，
+	// 不是数据应答；把它当帧错误会让已收到的整表记录全部丢弃。
+	srv := startSim(t, mbsim.WithMoreRecordsThenAck())
+	c := openConn(t, srv, "")
+	if v := readOne(t, c, "energy"); v != 12345678 {
+		t.Fatalf("energy = %g，应为 12345678（不应因 E5 终止而丢记录）", v)
+	}
+	if got := srv.Reads(); got != 1 {
+		t.Fatalf("数据段应答次数 = %d，应为 1", got)
+	}
+}
+
+func TestAckOnlyIsAddressNotLinkFailure(t *testing.T) {
+	// 第一次 REQ_UD2 就只回 E5：从站没问题，只是没有数据。这是点级
+	// address 错（先查点表/读表列表），不是协议错、更不能触发熔断重连。
+	srv := startSim(t, mbsim.WithAckOnly())
+	c := openConn(t, srv, "")
+	out, err := c.Read(context.Background(), spans(q("e", "energy")))
+	if driver.KindOf(err) != driver.ErrAddress {
+		t.Fatalf("错误分类 = %v，应为 ErrAddress", driver.KindOf(err))
+	}
+	if driver.IsLinkFailure(err) {
+		t.Fatal("E5 无数据不应算链路故障")
+	}
+	if len(out) != 1 || out[0].Quality != model.QualityAddressError {
+		t.Fatalf("样本 = %+v，应为 1 条 address_error", out)
+	}
+}
+
 func TestHistoricalStorage(t *testing.T) {
 	// 造一台带历史记录的表：当前值 storage=0，上期 storage=1。
 	srv := startSim(t, mbsim.WithRecords(
