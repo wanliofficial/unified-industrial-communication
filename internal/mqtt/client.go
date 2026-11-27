@@ -569,12 +569,25 @@ func (c *Client) allocFreePID(ackCh chan error) uint16 {
 }
 
 // dropConn 关闭当前连接并清空状态，使下一次 Publish 重新建链。
+//
+// 只对**当前**连接生效：旧连接的读/保活 goroutine 可能在重连成功之后才
+// 醒来（保活超时先 dropConn(A) → 驱动重连到 B → 旧 readLoop(A) 读到 EOF
+// 再 dropConn(A) 一次）。此时 A 早已不是 c.conn，若仍无条件把 state 打成
+// 未连接、失败在飞发布、结束 PING，就会误杀健康的新连接 B——表现为刚恢复
+// 的链路立刻被判死、正在等 PUBACK 的发布全部失败。因此所有副作用都收在
+// 「conn 仍是当前连接」的守卫内；不是当前连接就只关掉这条死 socket。
 func (c *Client) dropConn(conn net.Conn) {
 	c.mu.Lock()
-	if c.conn == conn {
+	current := c.conn == conn
+	if current {
 		c.conn = nil
 	}
 	c.mu.Unlock()
+	if !current {
+		// 不是当前连接：只回收这条已经失效的 socket，不碰全局状态。
+		_ = conn.Close()
+		return
+	}
 	if c.state.Load() != 3 {
 		c.state.Store(0)
 		c.reconnect.Add(1)

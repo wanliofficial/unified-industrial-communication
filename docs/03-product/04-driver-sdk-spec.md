@@ -1368,6 +1368,7 @@ QoS 取 1：控制命令不能是 fire-and-forget。
 | 订阅窗口里分发 PUBLISH **不得再取连接锁** | `Connect` 永久卡死（`Close`/下一次 `Publish` 也一起卡在同一把锁上）；只能在「Broker 在 SUBACK 之前发了一条 QoS1 保留消息」时触发，实验室几乎撞不到 | `dispatchPublish(conn, pkt)` 由调用方把连接传进来。`Connect` 在订阅期间持有连接锁，读循环本来就知道自己读的是哪条连接，再加锁只会引入自锁。规范允许 Broker 在 SUBACK 前后任一顺序发保留消息，其他发布者也随时可能推来消息 |
 | 每条报文写**自带写超时，写完清除** | ① 不清除：`net.Conn` 的写超时是粘性的，`Publish` 设的 `now + AckTimeout` 过期后，保活 PINGREQ、入站 QoS1 的 PUBACK、DISCONNECT 全部立刻 `i/o timeout`——发布间隔大于 `AckTimeout` 的连接会被自己判死、周期性重连；② 不设置：对端停止读取时 `Write` 永久阻塞，`Ping`/保活走不到自己的超时判断，链路状态被冻结 | 所有写走 `writePacket`：在 `writeMu` 内置 `SetWriteDeadline`、写、清成零值。设置与清除都在锁内，并发写各自设自己的上界，不会把对方的截止时间清掉 |
 | 入站 PUBLISH 的协议违约**必须断开** | QoS=3、空主题、主题带 `+`/`#` 的消息被当成普通消息投给点位：QoS3 不回 PUBACK（Broker 无限重投），空主题无处可投，带通配符的主题在消费方看来像一个订阅——错误被藏进「收到了但语义不对」 | `ParsePublish` 按 §3.3.1.2 / §3.3.2 / §4.7.3 拒绝；`readLoop` 与订阅窗口都把它当建链/链路失败处理（规范要求关闭网络连接）。载荷解不出（`OnMessage` 内部）仍是「保留旧值 + 计数」，两者不是一回事 |
+| 旧连接的 `dropConn` **只能关它自己那条死 socket**，不得改动当前连接的状态 | 旧连接的读/保活 goroutine 可能在重连成功之后才醒来（保活对 A 判死 → 驱动重连到 B → 旧 `readLoop(A)` 读到 EOF 再 `dropConn(A)` 一次）。此时 `A` 早已不是当前连接，若仍无条件把 `state` 打成未连接、失败在飞 PUBACK、结束 PING，就会**误杀刚恢复的 B**：链路刚重建就被判死、正在等确认的发布全部失败、Outbox 无谓重发 | `dropConn` 先用 `c.conn == conn` 判定「这是不是当前连接」，**确认是当前连接才**执行清零状态 / 计一次重连 / 失败在飞发布 / 结束 PING；不是当前连接就只 `conn.Close()` 回收这条死 socket 并返回 |
 
 #### 3.10.6.2 回归测试矩阵（客户端状态机）
 
@@ -1382,6 +1383,7 @@ QoS 取 1：控制命令不能是 fire-and-forget。
 | `TestConcurrentPingDuringDeadLinkBothFail` | 死链路上并发 Ping 误报成功（历史 `299f82d`） | `pingFlight` 退回 `close()`-only 语义 |
 | `TestParsePublishRejectsProtocolViolations` | QoS=3 / 空主题 / 主题含通配符被当成普通消息 | 三处守卫前置 `false &&` |
 | `TestAllocFreePIDSkipsInFlight` | QoS1 发布的 packet id 用单调计数器，回绕时撞上仍在 `pending` 的老发布者：新 `ackCh` 覆盖旧的，旧发布者永远收不到自己的 PUBACK，白等满 `AckTimeout` 误报「投递失败」，被 Outbox 重发（at-least-once 下不丢数据，但属虚假失败 + 无谓重发）。低频下要 6.5 万条在飞才触发，高吞吐北向通路才暴露 | `allocFreePID` 退回 `allocPID` + 无条件 `pending[pid]=ackCh` |
+| `TestDropConnOfStaleConnectionLeavesCurrentIntact` | 旧连接的 `dropConn` 在重连成功之后才执行，把**新连接**的 `state` 打成未连接、失败新连接的在飞 PUBACK、误伤新连接的 PING（`c.conn == conn` 的守卫只包住了 `c.conn = nil`，其余副作用无条件执行） | 去掉 `if !current { conn.Close(); return }` 早返回 |
 
 测试用两种对端：`internal/sim/mqtt`（行为完整的 Broker）与 `scriptedBroker`（按
 规范允许、但内置 Broker 不刻意构造的顺序发报文，例如 SUBACK 之前先发保留消息）。
