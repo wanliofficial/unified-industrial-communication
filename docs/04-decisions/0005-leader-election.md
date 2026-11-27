@@ -1,191 +1,191 @@
-# ADR-0005｜多实例 leader 选举：同主机 flock 强一致选主，跨主机交给中心聚合器，不引入 raft
+# ADR-0005｜多实例 leader 选举：引入第三方 raft 做全状态机复制，推翻 ADR-0004 零依赖约束
 
 - **状态**：提议（Proposed）— 待批准
 - **决策日期**：多实例协调收尾阶段
 - **决策者**：架构组
-- **影响范围**：`internal/leader`（新包）、`internal/runtime`（采集/投递/写操作的 leader 闸）、`internal/northbound/httpapi`（`/api/v1/leader` 块与 409 语义）、`go.mod`（依赖面保持为零）
-- **相关文档**：ADR-0001（零第三方依赖、零 CGO）、ADR-0004（不引入任何第三方库，连 `go.sum`/`vendor` 都不生成）、`docs/03-product/07-roadmap.md` §5.2（「多实例协调」与「中心聚合器」两条独立路线图项）、`docs/03-product/02-architecture.md` §3（模块图与部署形态）
+- **影响范围**：`go.mod`/`go.sum`/`vendor/`（依赖面由「按构造为零」变为「有限第三方集」）、`internal/consensus`（新包，raft 集成与复制状态机）、`internal/runtime`（采集/投递/写操作的 leader 闸与提交入口）、`internal/northbound/httpapi`（`/api/v1/leader` 块、409 语义、提交式配置/控制端点）、`docs/04-decisions/0004`（其零依赖硬约束被本决策正式修订）
+- **相关文档**：ADR-0001（语言选型：单二进制、可交叉编译、零 CGO —— 本决策不推翻它，只重新评估依赖面）、ADR-0004（工具链与依赖安全：零第三方依赖 —— **本决策正式修订它**）、`internal/config`（已有版本化配置存储：`Canonical()` 哈希、`Version()`、快照、回滚、staged —— 复制状态机的天然日志）、`internal/instanceid`（实例身份）、`docs/03-product/07-roadmap.md` §5.2（「多实例协调」路线图项）
 
 ---
 
 ## 1. 决策摘要
 
-四句话：
+五句话：
 
-1. **同主机多实例（多容器 / 多进程 / 双机热备同盘）：用 `flock` 在 `<dataDir>/leader.lock` 上做内核强一致选主。** 持锁者即 leader，崩溃时内核自动释放、无脑裂、无心跳、零新依赖。
-2. **跨主机协调不在边缘做，交给「中心聚合器」这条独立路线图项。** 边缘软选主（MQTT retained + 租约）存在**脑裂窗口**，对采集是「重复但幂等」可接受，对**写操作不安全**——而我们的语义要求「写操作须 leader」。用软状态去守一个强一致要求，是把安全边界建立在时序假设上。
-3. **明确拒绝 raft（第三方与自研两条路都不走）。** 第三方 raft 违反 ADR-0004 的零依赖硬约束；自研 raft 是把「零依赖工业网关」的可靠性押在手写的共识算法上。更根本的是：**我们只需要「谁是主」，不需要「复制状态机」**——用 raft 解 leader 选举是拿大炮打蚊子，且引入了它全部的复杂度却没有它的收益。
-4. **非 leader 实例的行为**：仍可服务 `/health`、`/version`、`/metrics` 等**只读**端点；**不采集、不投递**；**写操作（配置变更 / 点位写 / 控制命令 / 报警确认）返回 `409 not_leader`**，并带 `leader.instanceId` 供运维定位真主。
+1. **引入第三方 raft 库（候选首选 `hashicorp/raft`，备选 `etcd/raft`、`dragonboat`）组建多实例集群，用 raft 的「唯一 leader + 日志复制」同时解决 leader 选举与强一致状态同步。** 不再用同主机 flock，也不再把跨主机协调推给中心聚合器。
+2. **复制的是「控制面状态」，不是「采集数据」。** 采集数据继续走 Outbox（at-least-once 已落地）；raft 复制的是**配置、点位/控制命令、报警确认、成员变更**这些必须由集群一致裁决的状态 —— 即「全状态机复制」，复制集是 runtime 的写状态，不是时序样本。
+3. **本决策正式推翻 ADR-0004 的「零第三方依赖」硬约束，但守住 ADR-0004 的「安全纪律」。** 依赖面不再按构造为空，改为「**有限、可枚举、可审计**」：固定一组 raft 及其传递依赖，进入 `go.mod` `require` 与 `vendor/`，纳入 `make sbom` 与 CI 漏洞扫描。ADR-0004 §6.3 的反顾触发器「零依赖约束被推翻」被本决策触发。
+4. **非 leader 实例仍服务只读端点（`/health`、`/version`、`/metrics`、查询类），但所有写操作（点位写、控制命令、配置应用/回滚、报警确认）改为「提交到 raft 日志」：leader 序列化 → 多数派复制 → 提交后各副本按序 apply。** 副本 apply 失败即判副本不健康、停止服务写（fail-closed）。脑裂由 raft 多数派从根上消除。
+5. **单实例部署（集群规模为 1）退化为「永远是 leader」，行为与今天完全一致，且 `raft` 以单节点集群运行、零外部依赖。** 只有显式配置 `cluster.peers`（≥3 节点）时才启用多副本。这是「raft 引入不破坏单实例」的关键保障。
 
 一句话理由：
 
-> 真实的多实例重复采集发生在**同一台主机**（一台工业机跑两个容器、灰度期新旧进程并存），而这件事 `flock` 能用内核保证做到无脑裂、零依赖。跨主机的强一致协调属于「中心聚合器」的职责，不该塞进边缘网关——那会让每一台边缘设备都背上一套分布式共识的运维成本，只为解决一个绝大多数现场并不存在的问题。
+> 当产品明确要求跨主机、强一致、抗脑裂的协调时，flock（同主机）与软选主（脑裂窗口）都不再够用；raft 是这一需求下被充分验证的答案。它的代价是推翻零依赖约束，但零依赖是这个产品的**差异化支点之一而非目的本身**——用「有限、可审计、vendored 的第三方依赖」换「真正的分布式强一致」，在已确认的产品方向下是值得的、且可控的。
 
 ---
 
-## 2. 背景：需求给出的硬约束与现状
+## 2. 背景：需求、约束与现状（代码复核）
 
-### 2.1 为什么需要 leader 选举（问题陈述）
+### 2.1 为什么需要跨主机强一致（问题陈述）
 
-同站点跑两个 UIC 实例是常见部署：
+ADR-0005 的前一版（flock 路线）把跨主机协调判为 out of scope，理由是「真实重复采集发生在同主机」。**用户明确不认同这一判断，要求边缘网关自身具备跨主机、强一致、抗脑裂的协调能力。** 因此问题重述为：
 
-| 场景 | 现状 | 后果 |
+| 场景 | 无跨主机强一致的后果 |
+|---|---|
+| 两台网关配了同一组设备做双活/热备 | 两台都采集、都投递，且无任何机制裁决「谁该写」 |
+| 运维对某实例下发配置变更 / 点位写 / 控制命令 | 该操作只作用于被命中的那一台，集群状态出现分歧 |
+| 网络分区下两侧各有一台自认为 leader | 两侧都接受写，分区愈合后状态冲突、无冲突检测 |
+| 一台网关重启接管 | 新 leader 不知道旧 leader 已下发的配置/未确认报警 |
+
+flock 与 MQTT 软选主都无法覆盖后三者——这正是「分布式强一致」的领地，也是 raft 的正当场景。
+
+### 2.2 被本决策触碰的硬约束（必须正面处理，不能绕过）
+
+| 约束 | 来源 | 本决策如何处置 |
 |---|---|---|
-| 一台主机多容器（旧版/新版并存灰度） | 两实例各自采集、各自投递 | 同一设备被采两遍、同一数据被投两遍 |
-| 双机热备（同盘或共享数据目录） | 两实例都以为自己该干活 | 主备同时写、写冲突、数据重复 |
-| 运维误起两个进程（systemd 配错） | 无任何拦截 | 静默重复，日志里一片正常 |
+| 零第三方依赖、连 `go.sum`/`vendor` 都不生成 | ADR-0004 §1 | **正式推翻。** 改为「有限可枚举依赖 + vendor 固化 + SBOM/CI 审计」 |
+| 单二进制 ≤40 MB、三平台交叉编译 | ADR-0001 C1/C2 | 重新评估：raft + 依赖计入体积预算，逐平台验交叉编译（见 §6） |
+| 零 CGO | ADR-0001 C7 | 候选库须满足 `CGO_ENABLED=0` 可构建（`hashicorp/raft` 满足；`dragonboat` 的存储层需核对） |
+| 依赖面按构造为空（`go list -m all` 只返回 `uic`） | ADR-0004 §2.1 | **作废**，改为「`go list -m all` 返回固定有限集」 |
 
-`instanceid`（已落地）解决了「同站点多实例 MQTT clientID / Sparkplug nodeId 互相顶掉」的**身份消歧**问题——但那只是让两个实例**不互相踢下线**，**没有解决「两个都在采集投递」**。后者才是 leader 选举要回答的：**同一时刻，谁有资格采集与写入？**
-
-### 2.2 硬约束（不可协商）
-
-这三条来自已接受的 ADR，是本决策的边界：
-
-| # | 约束 | 来源 |
-|---|---|---|
-| E1 | **零第三方依赖**：不引入任何第三方库，不生成 `go.sum` / `vendor/` | ADR-0004 §1 |
-| E2 | **零 CGO、单二进制 ≤40 MB、三平台交叉编译** | ADR-0001 C1/C2/C7 |
-| E3 | **依赖面按构造为空**：`go list -m all` 只返回 `uic` 自身 | ADR-0004 §2.1 |
-
-任何「引入 X 库」的方案，都要先回答「X 是否推翻了 E1」，而不是「X 好不好用」。
+> 纪律要求：推翻一条已接受的 ADR，必须**显式、可追溯**——本 ADR 即那份记录，ADR-0004 状态由「Accepted」改为「Superseded（部分，见 ADR-0005）」。
 
 ### 2.3 现状（代码复核）
 
-- `internal/instanceid` 已落地：持久化稳定身份到 `<dataDir>/instance.id`，派生 MQTT clientID / Sparkplug nodeId，暴露到 `GET /api/v1/version` 与诊断包 `manifest.json`。**这是「不冲突」，不是「不重复」。**
-- `grep -rniE "leader|election|lease|quorum|raft" internal/` 的命中**全部在协议编解码层**（IEC 61850 的 `leader` 是 MMS 关联里的角色、KNX 的 `leader` 是总线主站、ADS 的 `leader` 是符号名），**没有任何跨实例协调代码**。leader 选举是真正的空白。
-- `docs/03-product/07-roadmap.md` §5.2 把「多实例协调」放在**架构**类、「中心聚合器」放在**集中管理**类——两条独立路线图项。本 ADR 只裁「多实例协调」里的边缘 leader 选举，不碰中心聚合器。
+- `go.mod` 仅两行（`module uic` + `go 1.26.10`），无 `require`、无 `go.sum`、无 `vendor/`、源码零第三方 import —— **零依赖现状 100% 确认**，本决策将改变它。
+- **配置已是天然的复制日志**：`internal/config.Manager` 用 `File.Canonical()` 算稳定哈希 → `VersionOf(canonical)` 作版本号 → 快照落盘 + 回滚 + staged 计划（`BeginStaged`/`AdvanceStaged`/`AbortStaged`）。raft 复制的「配置条目」可以直接是「配置版本 + canonical 内容」，apply 即 `Manager.Apply`。**这是把 raft 接入现有系统的最小切口。**
+- **写面已成形**：`httpapi.Backend` 接口的写类方法 = `Write` / `Command` / `ApplyConfig` / `Rollback` / `BeginStaged` / `AdvanceStaged` / `AbortStaged` / `AckAlarms`。leader 闸与「提交到 raft 日志」只需包裹这一组方法。
+- **采集/投递入口**：`runtime.Start` → `dispatchLoop`。leader 闸可在此拦截：非 leader 不产生采集请求、不进 Outbox（比「采了再丢」正确）。
+- **身份已就位**：`instanceid.Load` 提供稳定 `instanceId`，raft 的 `ServerID` 直接复用它，`/api/v1/leader` 的 `instanceId` 与 `/version`、诊断包一致。
+- `grep -rniE "leader|raft|quorum" internal/` 的命中仍全部在协议编解码层（IEC 61850/KNX/ADS 的设备角色），**跨实例协调层是空白**。
 
 ---
 
 ## 3. 候选方案
 
-### 3.1 方案 A：第三方 raft（`hashicorp/raft` / `go.etcd.io/raft` / `lni/dragonboat`）
+### 3.1 `hashicorp/raft`（**首选**）
 
-**做法**：引入成熟 raft 实现，多实例组成集群选主。
+**做法**：引入 `github.com/hashicorp/raft`，配 `raft-boltdb`（或自研快照存储）作 `StableStore`/`LogStore`，自写 `Transport`（复用现有 TCP/HTTP 能力）。
 
-**为什么被拒**：
+**为什么首选**：
 
-1. **直接推翻 ADR-0004 的 E1。** `hashicorp/raft` 的传递依赖至少包括 `armon/go-metrics`、`hashicorp/go-hclog`、`hashicorp/go-msgpack`、`hashicorp/go-sockaddr`、`mitchellh/mapstructure`，配 `raft-boltdb` 还要 `go.etcd.io/bbolt`——**8~10 个直接/传递第三方模块**。`go.etcd.io/raft` 稍小但仍需自备 WAL 与 transport，实际落地通常连 `etcd/server`（体量巨大）。`dragonboat` 更重（自带存储、需要 cgo 可选、交叉编译矩阵复杂）。这不是「加一个库」，是**把零依赖这个产品差异化支点拆掉**（ADR-0001 把「单二进制、可交叉编译、可无头运行」列为第一支点，权重 20）。
-2. **体积与交叉编译代价**：raft + 其存储 + msgpack 会把二进制从「≤15MB 级」推向需要重新评估 40MB 上限的程度，且 `bbolt` 的 `mmap` 在 Windows/ARM 上有额外注意事项——每一平台都要重新验。
-3. **它解决的是「复制状态机」，我们只需要「选主」。** raft 的价值在于「在不可靠网络上复制一份一致的日志」；我们没有任何需要复制的状态——采集数据走 Outbox（at-least-once 已落地）、配置走版本管理（已落地）、报警走引擎（已落地）。**用 raft 只为选一个主，是拿它 90% 的复杂度换 10% 的收益**，而且这 10%（强一致选主）在同主机场景下 `flock` 免费提供。
+1. **纯 Go、零 CGO、社区最成熟** —— 满足 ADR-0001 C7；被 Consul/Nomad/Vault 生产验证，选举、日志复制、快照、成员变更（joint consensus）路径久经考验。
+2. **API 边界清晰**：你提供一个实现 `fsm.FSM` 接口的状态机（`Apply`/`Snapshot`/`Restore`），raft 只负责「把日志一致地喂给每个副本的 FSM」——这正好对应本决策的「全状态机复制」。
+3. **体积/依赖可控**：核心库 + boltdb + 少量传递依赖（go-msgpack 等），vendor 后可枚举；二进制增量在可接受范围（需 §6 实测确认，不臆断）。
 
-### 3.2 方案 B：自研 raft
+**代价**：传递依赖约 6~10 个模块（`go-hclog`、`go-metrics`、`go-msgpack`、`raft-boltdb`→`bbolt` 等）；boltdb 的 `mmap` 在 Windows/ARM 需验交叉编译；这些都要进 SBOM。
 
-**做法**：标准库手写一个 raft（选举超时、日志复制、快照、成员变更）。
+### 3.2 `go.etcd.io/raft`（备选）
 
-**为什么被拒**：
+**做法**：仅引入共识核心 `go.etcd.io/raft`（不含 etcd 服务器），自备 `WAL`、`Transport`、`Ready` 处理循环。
 
-1. **正确性风险不可接受。** raft 的 bug 是分布式系统里最隐蔽的一类：多数情况下能跑，只在网络分区、时钟漂移、成员变更的罕见交错下丢数据或双主。MIT 6.824 的参考实现要 2000~4000 行才勉强正确，而工业网关没有分布式测试集群去兜底这些路径。
-2. **违反「慢工出细活」的收益比。** 把有限精力投在「手写共识算法」上，远不如投在协议编解码的现场正确性（那里一个字节错就是全站数据错）。自研 raft 是**看起来硬核、实则把风险后置**的选择。
-3. **它仍然解决不了我们不需要解决的问题**（见 3.1 第 3 点）。
+**权衡**：核心库依赖更少、更「纯共识」，但它**只给你共识算法，存储/传输/快照全要自研**——集成代码量大、正确性责任落在自己写的 `Ready` 处理循环上。适合「要共识但不要 boltdb」的团队，对我们是「省了依赖、费了工」。
 
-### 3.3 方案 C：`flock` 同主机强一致选主（**推荐**）
+### 3.3 `lni/dragonboat`（备选）
 
-**做法**：
+**做法**：引入 `dragonboat`，它把 raft + 多 raft 组 + 状态机快照打包好。
 
-- 启动时 `open(<dataDir>/leader.lock, O_CREAT|O_RDWR|O_CLOEXEC, 0644)`，对 fd 调 `syscall.Flock(fd, LOCK_EX|LOCK_NB)`。
-- 抢到 → 本实例为 `leader`；`EWOULDBLOCK` → 本实例为 `standby`。
-- `standby` 每 5s（可配）重试抢锁；leader 进程崩溃/被杀时内核随 fd 关闭**自动释放锁**，`standby` 下一轮接管。
-- 无心跳、无租约、无脑裂——**flock 是内核状态，进程死了就是死了，不存在「另一个进程以为它还活着」**。
+**权衡**：功能最全（多 raft 组、多线程），但体量大、存储层历史上与 CGO/平台耦合更紧、交叉编译矩阵复杂。对我们「单 raft 组、单状态机」的需求是**过度**，且最可能触碰 ADR-0001 交叉编译/零 CGO 约束。
 
-**为什么这是对的选择**：
+### 3.4 候选对比
 
-1. **零新依赖**：`syscall.Flock` 是标准库，`O_CLOEXEC` 是 `os` 默认行为，不碰 E1/E2/E3 任何一条。
-2. **强一致、无脑裂**：内核保证同一时刻只有一个 fd 持有排他锁。这是**比 raft 更强**的保证（raft 只给线性一致性，且要多数派；flock 给的是「这台机器上唯一」）。
-3. **精准命中真实问题**：见 §2.1，真实重复采集就发生在**同主机**。flock 把这类问题 100% 解决。
-4. **崩溃自愈**：fd 关闭即释放，无需实现「租约过期判定」这类容易写错的逻辑。
-5. **可测试**：`flock` 可以用「同一测试进程里开两个 fd 模拟两个实例」来单测，不依赖真实多进程。
+| 维度 | hashicorp/raft（首选） | etcd/raft 核心 | dragonboat |
+|---|---|---|---|
+| 纯 Go / 零 CGO | ✅ | ✅ | ⚠️ 需核对 |
+| 生产验证度 | 高（Consul/Vault） | 中（库本身） | 中 |
+| 需自研量 | 低（FSM + Transport） | **高**（WAL/Ready/Transport 全自研） | 低 |
+| 传递依赖数 | 6~10 | 少 | 多 |
+| 体积/交叉编译代价 | 中 | 中 | **高** |
+| 单状态机契合度 | ✅ | ✅ | 过度（多 raft 组） |
 
-**边界（必须写进文档与配置校验）**：
+**决策**：选 `hashicorp/raft`。理由：生产验证度最高、需自研量最低、API 与「FSM 状态机复制」天然对应，代价（依赖数/体积）在可接受且可审计范围。
 
-- `<dataDir>` 必须是**本地文件系统**。NFS 上 `flock` 的语义因实现而异（部分 NFS 服务端会把 flock 退化为 `fcntl` 记录锁，跨客户端不可靠）。启动时若检测到 dataDir 在 NFS/CIFS 上，应**告警并降级为「不做跨实例保证」**，而不是假装选主成功——**静默的假 leader 比没有 leader 更危险**。
-- flock 是「打开文件描述符」级别的：同一进程 `fork` 出的子进程会继承 fd。Go 的 `os.OpenFile` 默认 `O_CLOEXEC`，但若未来某处 `exec` 子进程，必须确保 fd 不被继承（`O_CLOEXEC` 已覆盖）。
+### 3.5 前一版 flock 路线（保留作对照，已被用户否决）
 
-### 3.4 方案 D：`flock` + MQTT 跨主机软选主（**不推荐，但列出来说明为什么不**）
-
-**做法**：同主机用 flock，跨主机用 MQTT retained 主题 + 租约（`{instanceId, tsMs, ttlMs}`）软选主。
-
-**为什么不推荐**：
-
-1. **脑裂窗口对写操作不安全。** MQTT 是软状态：两个实例同时认为自己是 leader 的窗口 = 租约 TTL（默认秒级）。对**采集**，这窗口的后果是「重复但幂等」——Outbox 去重、契约 v2 双发都已保证重复不丢不坏。但对**写操作**（点位写、控制命令、配置变更），脑裂窗口内两个实例都能写，**后写的覆盖先写的，且没有任何冲突检测**。而我们的语义要求「写操作须 leader」——用一个允许脑裂的机制去守一个不容脑裂的要求，是自相矛盾。
-2. **跨主机重复采集在真实拓扑里几乎不存在。** 工业现场的正常形态是「每台网关负责一组设备」，不同网关管不同设备，天然不重复。会重复的情况是「两台网关配了同一组设备做冗余」，那是**热备**，应该由**中心聚合器**统一裁决（它能看到全部站点、能做配置下发与去重），而不是让每台边缘网关各自跑一套软选主。
-3. **它把分布式系统的运维成本摊到每台边缘设备上。** MQTT 软选主要运维 broker 的 retained 语义、租约 TTL、时钟同步（租约靠 `tsMs` 判断过期，而**时钟跳变恰好是 G10 要监测的问题**）——每台边缘盒子都要正确配置这些，只为解决一个绝大多数现场不发生的问题。
-
-**结论**：跨主机协调留给中心聚合器（独立路线图项）。边缘只做同主机 flock。这不是「偷懒」，是**把强一致需求交给能提供强一致的层**（同主机交给内核，跨主机交给中心）。
-
-### 3.5 方案 E：不做，只暴露身份
-
-**做法**：只把 `instanceId` 暴露到 `/api/v1/version`（已落地），不选主。
-
-**为什么被拒**：这正是 `instanceid` 已落地但问题仍在的原因（§2.3）——它让实例**可区分**，但**不阻止两个实例都干活**。运维仍会看到重复采集。不做等于把问题留给现场。
-
-### 3.6 方案对比
-
-| 维度 | A 第三方 raft | B 自研 raft | **C flock（推荐）** | D flock+MQTT | E 不做 |
-|---|---|---|---|---|---|
-| 零第三方依赖（E1） | ❌ 8~10 模块 | ✅ | ✅ | ✅ | ✅ |
-| 零 CGO / 交叉编译（E2） | ⚠️ bbolt mmap | ✅ | ✅ | ✅ | ✅ |
-| 同主机强一致 | ✅ | ⚠️ 需正确 | ✅ 内核保证 | ✅ | ❌ |
-| 跨主机强一致 | ✅ | ⚠️ | ❌ 明确 out of scope | ❌ 软状态 | ❌ |
-| 写操作安全 | ✅ | ⚠️ | ✅（同主机） | ❌ 脑裂窗口 | ❌ |
-| 实现复杂度 | 中（集成） | **极高** | **低** | 中 | 无 |
-| 解决真实问题 | 过度 | 过度 | **精准** | 过度 | 不解决 |
+前一版 ADR 结论「flock 同主机 + 跨主机交给中心聚合器 + 不引入 raft」被用户明确否决（「就是要 raft / 分布式强一致」）。归档于此仅为保留决策演进痕迹：flock 的「内核强一致」在同主机场景仍成立，但它**结构上无法覆盖跨主机**，故不满足产品方向。raft 取代它作为统一方案。
 
 ---
 
-## 4. 设计要点（方案 C 的具体契约）
+## 4. 设计要点（raft 路线的具体契约）
 
-### 4.1 纯包 `internal/leader`
+### 4.1 复制什么：控制面状态机（「全状态机复制」的边界）
 
-判定与 I/O 分离，沿用本仓「纯判定可单测」的一贯做法（见 `watchdog` / `clockmon` / `heartbeat`）：
+复制集 = runtime 的**写状态**，即任何「必须全集群一致的裁决」。明确划界：
 
-- **`Election` 接口**：`Acquire() (bool, error)` / `Release() error` / `IsLeader() bool`。
-- **`FileElection`**：基于 `flock` 的实现。`Acquire` 用 `LOCK_EX|LOCK_NB`；返回 `false, nil` 表示「别人持有」（正常 standby），返回 `true, nil` 表示「本实例成为 leader」，返回 `err` 表示「无法判定」（如 dataDir 不可写）——**无法判定必须 fail-closed**（当作非 leader，并告警），绝不 fail-open（当作 leader 去采集）。
-- **文件系统类型探测**：`<dataDir>` 在 NFS/CIFS 上时，`FileElection` 应返回一个明确的 `ErrUnsupportedFS`，由 runtime 决定「降级为单实例假设 + 告警」还是「拒绝启动」。默认**告警后按单实例运行**（工业现场 NFS 是少数，且拒绝启动会误伤），但告警必须显式（`leader_unsupported_fs`），不能静默。
+| 复制（进 raft 日志，全副本 apply） | 不复制（留在本地，不进共识） |
+|---|---|
+| 配置应用 / 回滚（`config.Version` + canonical） | 采集样本（时序数据，走 Outbox at-least-once） |
+| 点位写命令（`Write` 的意图与幂等结果） | 北向投递结果（Outbox/SSE/MQTT 各自本地） |
+| 控制命令（`Command`：重启设备、模式切换等） | 历史/缓存（本地有界存储） |
+| 报警确认（`AckAlarms`） | 指标、日志、心跳（本地观测） |
+| 集群成员变更（增删节点） | 只读查询结果（`/health` 等） |
 
-### 4.2 runtime 接线
+**理由**：样本是高频、幂等可重放、可丢可重的，共识它毫无收益且会拖垮吞吐；控制面状态是低频、必须一致、分歧即事故的——**共识它收益最大**。「全状态机复制」指的就是这一控制面状态机的完整复制，不是把一切塞进共识。
 
-- 启动时构造 `leader.Election`，`Acquire` 一次确定初始角色；`standby` 起一个 5s ticker 重试（**独立协程，但只有一个 ticker**，不挂 watchdog——watchdog 的语义是采集中枢活性，leader 重试是另一件事；混在一起会让「leader 重试」污染 watchdog 的 tick 语义）。
-- **采集与投递的闸**：collector 的调度入口在 `!IsLeader()` 时直接跳过（不产生请求、不产生 Outbox 记录）。这比「采了再丢弃」正确——后者会浪费协议往返、污染成功率的统计。
-- **写操作的闸**：`POST /api/v1/points/*/write`、`POST /api/v1/config/*`、`POST /api/v1/commands`、`POST /api/v1/alarms/*/ack` 在 `!IsLeader()` 时返回 `409 Conflict`，body 为 `{"error":"not_leader","leader":{"instanceId":"..."},"message":"..."}`。**读操作（GET）不受影响**——运维要能看到 standby 的健康与配置。
-- **角色变化的下游通知**：`leader → standby`（锁丢失，理论上只在异常时）与 `standby → leader`（抢到锁）都必须写日志（`leader_acquired` / `leader_lost`）并推进指标（`uic_leader_is_leader` gauge、`uic_leader_changes_total{to}` counter）。
+### 4.2 纯包 `internal/consensus`
 
-### 4.3 契约暴露
+沿用本仓「纯判定可单测」的一贯做法，把 raft 与 runtime 解耦：
 
-- **`GET /api/v1/leader`**：`{"instanceId":"...","role":"leader|standby","since":"RFC3339","lockPath":"<dataDir>/leader.lock"}`。无锁配置时 `role` 恒为 `leader`（单实例默认），`since` 为进程启动时刻。
-- **`/api/v1/health`** 加 `leader` 块（`role` / `instanceId` / `changes`）。**不参与 `status` 判定**——standby 不是故障，是正常角色（与 `clock` 块的「事实非故障」同理）。
-- **指标**：`uic_leader_is_leader`（gauge，1/0）、`uic_leader_changes_total{to="leader|standby"}`（counter）、`uic_leader_acquire_errors_total`（counter）。
+- **`Consensus` 接口**：`Propose(cmd Command) error` / `Apply() <-chan Command` / `IsLeader() bool` / `LeaderID() string` / `AddPeer`/`RemovePeer` / `Shutdown()`。
+- **`RaftConsensus`**：`hashicorp/raft` 的薄封装。实现 `raft.FSM` 接口（`Apply`/`Snapshot`/`Restore`）把日志命令桥接到内部 apply 通道。
+- **`StateMachine`（runtime 提供）**：实现 raft FSM 的 `Apply`，按序把每条命令应用到本地 `config.Manager` / 报警 / 命令处理器。apply 失败 → 副本标记不健康、拒绝后续写（fail-closed）。
+- **存储后端**：`LogStore`/`StableStore` 用 `raft-boltdb`，快照存 `<dataDir>/raft/`（与配置快照分离）。
 
-### 4.4 与 `instanceid` 的关系
+### 4.3 写操作的「提交式」语义（替代前一版的 409）
 
-leader 的 `instanceId` **直接复用 `instanceid.Load`** 的结果，不另造身份。这样 `/api/v1/leader` 的 `instanceId` 与 `/api/v1/version`、诊断包 `manifest.json` 里的完全一致——运维凭一个 ID 就能在三个地方对上同一台实例。
+- **leader 收到写请求**（`Write`/`Command`/`ApplyConfig`/`Rollback`/`AckAlarms`/staged）：
+  1. 序列化为 `Command`，`Propose` 到 raft；
+  2. 等待多数派复制并 commit（带超时）；
+  3. 本副本 FSM `Apply` 后返回结果给调用方。
+- **非 leader 收到写请求**：返回 `409 Conflict` + `{"error":"not_leader","leader":{"instanceId":"...","api":"..."}}`，**并附 leader 的网络地址**（若集群内可达），让客户端重定向——比单纯拒绝更有用，且不改变「写必须 leader」的强一致语义。
+- **超时未提交**：返回 `504`/明确错误，不静默吞掉（静默忽略写请求是缺陷）。**fail-closed**：无法确认提交成功的写，绝不当作成功。
 
-### 4.5 配置
+### 4.4 采集与投递的 leader 闸
+
+- `runtime.Start` 的 `dispatchLoop` 前置 `IsLeader()` 判定：非 leader 不产生采集请求、不写 Outbox。leader 切换时，新 leader 自然接管采集，旧 leader 停采——**重复采集由 raft 唯一 leader 从根上消除**，不再依赖「配置相同就不冲突」的假设。
+- leader 切换有过渡窗口（旧 leader 未察觉已失主）：用「提交式写 + Outbox 幂等去重」兜底，窗口内的重复不丢不坏。
+
+### 4.5 故障转移与成员变更
+
+- **故障转移**：raft 内建。leader 失联，剩余多数派在 election timeout 内重新选主（默认百毫秒~秒级）。单节点集群无此需求（永远是 leader）。
+- **成员变更**：增删节点走 raft 的 joint consensus（`AddPeer`/`RemovePeer` 经日志复制），避免变更期脑裂。规模固定为 3 时成员变更极少用，但接口要留。
+- **持久化**：raft 的 `CurrentTerm`/`VotedFor`/日志落盘，重启恢复——**重启不破坏多数派、不会双主**。
+
+### 4.6 契约暴露
+
+- **`GET /api/v1/leader`**：`{"instanceId":"...","role":"leader|follower|candidate","term":N,"leaderId":"...","peers":[...],"commitIndex":N,"since":"RFC3339"}`。`/health` 加 `leader` 块（`role`/`term`/`peers`/`commitIndex`），**不参与 status 判定**（无 leader 是正常角色，集群可能正在选主）。
+- **指标**：`uic_leader_role{role="leader|follower|candidate"}`（gauge）、`uic_raft_term`（gauge）、`uic_raft_commit_index`（gauge）、`uic_raft_proposals_total{result="committed|rejected|timeout"}`、`uic_raft_membership_changes_total`。
+
+### 4.7 配置
 
 ```json
-"leader": {
-  "enabled": true,          // 默认 false（单实例行为不变）
-  "lockFile": "leader.lock", // 相对 dataDir
-  "retryInterval": "5s"
+"cluster": {
+  "enabled": false,
+  "nodeId": "",                  // 缺省复用 instanceid
+  "dataDir": "raft",             // 相对 dataDir
+  "listen": "0.0.0.0:7000",      // raft Transport
+  "peers": [                      // >=3 才启用多副本；<=1 或空 = 单节点 always-leader
+    {"id":"uic-<site>-<a>","addr":"10.0.0.1:7000"},
+    {"id":"uic-<site>-<b>","addr":"10.0.0.2:7000"},
+    {"id":"uic-<site>-<c>","addr":"10.0.0.3:7000"}
+  ]
 }
 ```
 
-- **默认 `enabled: false`**：单实例部署（绝大多数）不受影响，行为与今天完全一致。
-- `enabled: true` 时才抢锁；`lockFile` 必须落在 dataDir 内（防止误配到系统目录）。
-- 配置进 `Canonical()` 哈希，版本化与回滚天然支持。
+- **默认 `enabled: false`**：退化为单节点 always-leader，零外部依赖、行为与今天一致。
+- `peers` 含本节点自身 `nodeId`；`peers` 数量 < 3 时拒绝启用多副本（2 节点无多数派意义），fail-fast 配置报错。
+- 进 `Canonical()` 哈希，版本化与回滚天然支持。
 
 ---
 
 ## 5. 与参考方案的差异
 
-| 维度 | 参考实现常见做法（raft/etcd/zk） | 本决策 |
+| 维度 | 常见 raft 集成 | 本决策 |
 |---|---|---|
-| 选主机制 | 分布式共识（多数派） | 同主机内核 flock（单机唯一） |
-| 跨主机 | 一并解决 | **明确 out of scope，交给中心聚合器** |
-| 依赖 | 引入共识库 | 零依赖（标准库 `syscall`） |
-| 心跳/租约 | 需要（判定存活） | 不需要（fd 关闭即释放） |
-| 脑裂 | 靠多数派避免 | 同主机不存在脑裂；跨主机不做 |
-| 运维成本 | 每台边缘设备都要正确配置 | 一个配置文件项，默认关闭 |
+| 复制内容 | 常复制全量状态 | **只复制控制面状态机**，样本走 Outbox |
+| 单实例兼容 | 多数需额外开关 | **单节点 raft 集群天然 always-leader**，默认关闭 |
+| 依赖 | 引入即无约束 | **有限可枚举 + vendor + SBOM/CI 审计**（守住 ADR-0004 纪律） |
+| 非 leader 写 | 直接拒绝 | 409 + leader 地址，支持重定向 |
 
 ---
 
@@ -193,53 +193,58 @@ leader 的 `instanceId` **直接复用 `instanceid.Load`** 的结果，不另造
 
 ### 6.1 正面
 
-- **精准解决同主机重复采集**（§2.1 全部三种场景），且是内核强一致，比任何软选主都可靠。
-- **零新依赖**，ADR-0004 的 E1/E2/E3 一条不破，`make sbom` 依然「依赖面如实为零」。
-- **默认关闭**，单实例行为零变化，无回归风险。
-- **写操作安全**：同主机内 flock 保证唯一 leader，写操作 409 语义清晰。
-- **可测试**：flock 可在一个测试进程里用两个 fd 模拟，不依赖真实多进程；跨进程行为可用 `go test` 起子进程验（`os/exec`）。
+- **真正的跨主机强一致、抗脑裂**：raft 多数派 + 持久化，从根上消除双主，覆盖双活/热备/分区/接管全场景。
+- **控制面状态全副本一致**：配置、命令、报警确认、成员变更全集群按序 apply。
+- **写操作语义清晰**：提交式写，未确认即明确报错（fail-closed），无静默吞请求。
+- **单实例零影响**：默认关闭、单节点 always-leader，绝大多数部署行为不变。
 
 ### 6.2 负面与缓解
 
 | 负面 | 缓解 |
 |---|---|
-| 跨主机重复采集未解决 | 文档明确「跨主机协调交给中心聚合器」，并在 `05-northbound-api-spec` 的 leader 小节写清边界；真需要时按 §7 重新评估 |
-| NFS 上 flock 不可靠 | 启动探测文件系统类型，NFS/CIFS 告警 `leader_unsupported_fs`，按单实例运行（显式告警，不静默） |
-| 同主机 flock 只能防「同一 dataDir」 | 文档要求：做 leader 选举的多实例必须共享同一个 dataDir；不同 dataDir 视为不同实例（各自无条件 leader）——这是正确语义 |
-| standby 不采集，设备在 standby 侧显示「无数据」 | 这是 leader 语义的必然：standby 本来就不该有数据。`/api/v1/leader` 明确标注 `role: standby`，运维不会误判 |
+| 推翻零依赖约束（产品差异化支点之一） | 依赖有限可枚举、vendor 固化、纳入 SBOM/CI；ADR-0004 正式改为 Superseded（部分）并留痕 |
+| 二进制体积上升、可能逼近 40 MB | §6 实测：引入前后体积对比，写进 ADR；若逼近上限，评估裁剪（如去掉 go-metrics 的 expvar 依赖） |
+| 传递依赖的安全面扩大 | 沿用 ADR-0004 工具链：OSV/`govulncheck` 扫描，CI 接入；定期复核 |
+| 交叉编译矩阵（尤其 boltdb mmap 在 Windows/ARM） | 三平台 `make` 交叉编译验收纳入 CI；不满足则换纯 mmap 替代存储 |
+| 运维需理解 raft（分区、多数派、选主） | `/api/v1/leader` + 指标暴露 term/commitIndex；文档给出「3 节点部署」「故障切换」runbook |
+| 单组 raft 的写吞吐上限 | 控制面写本就低频；样本不入共识，吞吐不受 raft 限制 |
 
 ### 6.3 退出条件 / revisit 触发器
 
-出现以下任一情况时，重新评估本决策（**届时另开 ADR**，不在本 ADR 上打补丁）：
+出现以下任一情况，重评本决策（另开 ADR）：
 
-1. **现场出现「两台及以上跨主机网关必须对同一批设备做去重」的真实需求**——先评估「中心聚合器」能否满足；若必须边缘强一致，再评估 raft（此时应连同「是否值得推翻 ADR-0004」一起决策）。
-2. **本仓需要跨主机复制「状态」而非仅选主**（例如配置必须在多实例间强一致同步）——那是 raft/etcd 的正当场景，但仍应优先考虑中心聚合器架构。
-3. **NFS/CIFS 成为主流部署载体**（当前判断是少数）——flock 的降级告警会频繁出现，需重新设计跨主机方案。
-4. **ADR-0004 的零依赖约束被推翻**（例如产品战略转向「允许 vendor 依赖」）——届时 raft 的集成成本大幅下降，可重新评估。
+1. **`hashicorp/raft` 体积/依赖超出可接受**，或交叉编译/零 CGO 无法满足 → 评估 `etcd/raft` 核心（少依赖、多自研）或重新设计状态机边界。
+2. **出现「需要多 raft 组 / 数据平面也要共识」的需求** → 评估 `dragonboat`（多 raft 组）。
+3. **中心聚合器这条独立路线图项成熟**，且能提供更低成本的跨主机协调 → 评估是否让边缘退回「raft 选主 + 中心下发」混合。
+4. **零依赖被重新确立为不可让渡的产品红线**（战略回退）→ 本决策整体作废，回到「同主机 flock + 跨主机不强一致」的降级方案。
 
 ---
 
 ## 7. 验证（变异测试计划）
 
-沿用本仓「先编译通过、再让测试变红」的硬标准，预计 20+ 变异体：
+沿用本仓「先编译通过、再让测试变红」的硬标准。引入 raft 后，用「内存 FSM + 模拟 Transport / 多 in-proc 节点」做确定性测试（不依赖真实网络分区），预计 20+ 变异体：
 
 | 类别 | 变异体（必须变红） |
 |---|---|
-| flock 判定 | `LOCK_NB` 改成阻塞 `LOCK_EX`（死锁/挂起）；`EWOULDBLOCK` 当成错误而非「别人持有」；抢锁成功返回 `false`；抢锁失败返回 `true`（fail-open） |
-| 角色 | `IsLeader` 恒 `true`；`IsLeader` 恒 `false`；角色变化不写日志；角色变化不推进指标 |
-| runtime 闸 | 非 leader 仍采集；非 leader 仍投递；非 leader 写操作返回 200；非 leader 读操作被拒（读必须放行） |
-| 释放 | `Release` 不关 fd；崩溃后不释放（用子进程验证）；`Release` 后仍报 leader |
-| 文件系统 | NFS 探测恒成功；NFS 不告警；`lockFile` 允许逃出 dataDir |
-| 契约 | `/api/v1/leader` 缺 `role`；`instanceId` 与 `/version` 不一致；`health.leader` 参与 status 判定（standby 被误判故障） |
-| 配置 | `enabled` 默认 `true`（改变单实例行为）；`retryInterval<=0` 不回退默认 |
+| leader 闸 | 非 leader 仍 Propose 写；非 leader 仍采集；写失败返回 200 而非 504/409 |
+| 提交语义 | 未多数派复制就返回成功；提交超时不报错（静默吞）；Propose 不等 commit |
+| FSM apply | apply 命令顺序错乱（乱序 apply）；apply 失败仍判副本健康；apply panic 不恢复 |
+| 快照/恢复 | Snapshot 不含未 apply 的已提交日志；Restore 不重置状态；快照后丢失已提交条目 |
+| 成员变更 | 变更不经日志复制即生效；变更期允许双主；AddPeer 不校验多数派 |
+| 故障转移 | 选主不靠多数派（单节点也能选）；leader 失联后不重选；term 不回退 |
+| fail-closed | 无法判 leader 时默认当 leader 采写（fail-open）；集群未成共识仍接受写 |
+| 契约 | `/api/v1/leader` 缺 `term`/`commitIndex`；非 leader 409 不带 leader 地址；health.leader 参与 status 判定 |
+| 单实例兼容 | `enabled:false` 时行为变化；单节点集群仍走选主（应为 always-leader）；`peers<3` 未 fail-fast |
+| 依赖/构建 | 未 vendor（依赖不可复现构建）；`go list -m all` 含意外模块；体积超预算未告警 |
 
 ---
 
 ## 8. 关键结论
 
-1. **leader 选举要回答的是「谁有资格采集与写入」，而真实问题只发生在同主机**——`flock` 用内核强一致解决它，零依赖、无脑裂、崩溃自愈。
-2. **跨主机协调属于「中心聚合器」**，不该让每台边缘网关背分布式共识。这是职责划分，不是能力缺失。
-3. **raft 被明确拒绝**：第三方违反 ADR-0004，自研高风险，且它解决的是我们不需要的「复制状态机」。若未来真的有跨主机强一致需求，**另开 ADR** 重新评估，而不是在本功能里顺带引入。
-4. **默认关闭、写操作 409、读操作放行、不参与 status**——四条语义边界确保单实例零变化、运维可观测、故障可定位。
+1. **用户要的是跨主机、强一致、抗脑裂的协调，flock 结构上做不到、软选主不安全，raft 是这一需求的标准答案。**
+2. **引入第三方 raft（首选 `hashicorp/raft`）正式推翻 ADR-0004 的零依赖约束**——但零依赖是手段不是目的；本决策用「有限可枚举 + vendor + SBOM/CI 审计」守住 ADR-0004 真正的安全纪律。
+3. **复制的是控制面状态机（配置/命令/报警确认/成员变更），不是采集数据**——样本继续走 Outbox 不丢不坏；「全状态机复制」指控制面状态机的完整复制。
+4. **单实例默认关闭、单节点 always-leader**，绝大多数部署零影响；`peers>=3` 才启用多副本，`peers<3` fail-fast。
+5. **提交式写 + fail-closed + 非 leader 409 带重定向地址**，是 raft 路线下保证「写强一致、绝不静默吞请求」的四条语义边界。
 
-> 一句话收尾：**把强一致需求交给能提供强一致的层**——同主机交给内核（flock），跨主机交给中心聚合器。边缘网关的职责是采集与投递，不是共识。
+> 一句话收尾：**当产品方向是分布式强一致时，零依赖必须让位——但让位不等于放任，用可审计的有限依赖把 raft 接进来，用单一共识层把控制面复制成一致状态机。**

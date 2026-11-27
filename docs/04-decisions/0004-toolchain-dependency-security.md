@@ -1,6 +1,6 @@
 # ADR-0004｜工具链与依赖安全：零第三方依赖 + 暂不升级 Go 工具链堵一个不可达的 stdlib advisory
 
-- **状态**：已决定（Accepted）
+- **状态**：已决定（Accepted）——**依赖安全部分由 [ADR-0005](0005-leader-election.md) 修订（Superseded in part）：零第三方依赖约束被推翻，改为「有限可枚举 + vendor + SBOM/CI 审计」。本文件其余结论（暂不升级工具链堵不可达 advisory、OSV 扫描方法）不受影响，继续有效。**
 - **决策日期**：静态安全收尾时
 - **决策者**：架构组
 - **影响范围**：`go.mod`（`go` directive 固定 1.26.10）、构建/CI 环境的 `GOSUMDB`、`internal/northbound/httpapi`（`MaxBytesReader` 两处使用点）
