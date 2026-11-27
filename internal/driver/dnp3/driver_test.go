@@ -918,3 +918,40 @@ func TestIINRestartTriggersIntegrityPoll(t *testing.T) {
 	h.srv.SetIIN(0)
 	_ = c
 }
+
+// sendApp 会在两个 goroutine 上被调用：后台轮询（request 持 cmu）与
+// readLoop（带 CON 的事件响应、未请求响应的应用层确认）。transport 序号
+// tseq 的分配与多帧发送必须是原子的：否则 -race 会报数据竞争，且两条应用
+// 报文的分片可能交错，从站的重组器会把第二条的 FIR 当成新消息、丢掉第一条。
+//
+// Conn 的公开方法有 cmu 串行化，但 readLoop 的确认路径不持 cmu（持了会与
+// 「请求等响应」互相卡住），所以这里直接并发调用 sendApp 验证它自身的
+// 串行化。未修复时 `-race` 必须报 tseq 竞争。
+func TestSendAppSerializesTransportSequence(t *testing.T) {
+	server, client := net.Pipe()
+	defer server.Close()
+	defer client.Close()
+	go func() {
+		buf := make([]byte, 4096)
+		for {
+			if _, err := server.Read(buf); err != nil {
+				return
+			}
+		}
+	}()
+
+	c := &conn{devID: "dnp3-seq", dest: 1, src: 1024, timeout: time.Second, link: client}
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 32; j++ {
+				if err := c.sendApp([]byte{0x01, 0x02}); err != nil {
+					return
+				}
+			}
+		}()
+	}
+	wg.Wait()
+}

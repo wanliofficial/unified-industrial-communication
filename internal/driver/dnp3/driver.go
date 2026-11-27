@@ -420,8 +420,12 @@ type conn struct {
 	dropped  uint64
 	lastIIN  uint16
 
-	wmu  sync.Mutex // 串行化「写一整条链路帧」
-	cmu  sync.Mutex // 串行化应用事务（一问一答）
+	wmu sync.Mutex // 串行化「写一整条链路帧」
+	cmu sync.Mutex // 串行化应用事务（一问一答）
+	// tmu 串行化「一条应用报文的 transport 分片」以及 tseq 的分配。
+	// 不能复用 cmu：readLoop 里的应用层确认不持 cmu（持了会与「请求等
+	// 响应」互相卡住），必须有一个独立的锁保证两条应用报文的片段不交错。
+	tmu  sync.Mutex
 	tseq uint8
 	aseq uint8
 
@@ -705,6 +709,12 @@ func (c *conn) request(ctx context.Context, fn byte, objects []byte) (dnp3codec.
 }
 
 func (c *conn) sendApp(payload []byte) error {
+	// 应用报文可能在两个 goroutine 上同时发：后台轮询（request 持 cmu）
+	// 与 readLoop（带 CON 的响应、未请求响应要回应用层确认）。transport
+	// 序号必须一次分配、整条报文一次写完：交错会让从站的重组器把第二条
+	// 的 FIR 当成新消息，丢掉第一条；并发读写 tseq 本身也是数据竞争。
+	c.tmu.Lock()
+	defer c.tmu.Unlock()
 	chunks := dnp3codec.EncodeTransport(payload, c.tseq)
 	c.tseq = (c.tseq + uint8(len(chunks))) & 0x3F
 	for _, ch := range chunks {
