@@ -1,6 +1,7 @@
 package opcua
 
 import (
+	"bytes"
 	"encoding/binary"
 	"math"
 	"testing"
@@ -235,7 +236,18 @@ func TestPublishResponseRoundTrip(t *testing.T) {
 
 func TestStatusChangeNotificationRoundTrip(t *testing.T) {
 	in := StatusChangeNotification{Status: StatusBadTimeout}
-	msg, err := DecodeStatusChangeNotification(in.Encode())
+	raw := in.Encode()
+
+	// 线上布局：Status(4, 小端) + diagnosticInfo 编码掩码(1, 空=0x00) = 5 字节。
+	// diagnosticInfo 是 DiagnosticInfo 而非 ExtensionObject——把空值编码成
+	// NullNodeID(2)+编码字节(1) 的 3 字节会让整条通知多出 2 字节，真实客户端
+	// 会判畸形。这里钉死精确字节，防止回归。
+	want := []byte{0x00, 0x00, 0x0A, 0x80, 0x00}
+	if !bytes.Equal(raw, want) {
+		t.Fatalf("StatusChangeNotification.Encode = % x, want % x", raw, want)
+	}
+
+	msg, err := DecodeStatusChangeNotification(raw)
 	if err != nil {
 		t.Fatalf("decode: %v", err)
 	}

@@ -608,7 +608,12 @@ type StatusChangeNotification struct {
 func (n StatusChangeNotification) Encode() []byte {
 	e := &encoder{}
 	e.U32(uint32(n.Status))
-	ExtensionObject{}.Encode(e) // diagnosticInfo：空
+	// diagnosticInfo 是 DiagnosticInfo，不是 ExtensionObject：空值在线上是
+	// **1 字节编码掩码 0x00**，而不是 NullNodeID(2) + 编码字节(1) 的 3 字节。
+	// 早先这里误写成 ExtensionObject{}.Encode——编码出 7 字节、解码只吃 5 字节，
+	// 余下的 2 字节会让真实客户端把整条通知判成畸形。与 ResponseHeader 的
+	// serviceDiagnostics 用 e.Byte(0) 是同一处语义。
+	e.Byte(0) // diagnosticInfo：空
 	return e.Bytes()
 }
 
