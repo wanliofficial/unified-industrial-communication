@@ -4658,16 +4658,26 @@ CROB 还带 count、on-time、off-time，本实现固定 count=1、时间为 0�
 映射到变体 1 的 `uint32`/`uint64` 点位，超过 `int32` 上界的值只能拒绝：组 41 没有无
 符号变体是协议本身的限制，需要靠点表评审改类型，而不是让驱动悄悄发一个负数。
 
+组 41 的每个对象是「值 + 1 字节 `CommandStatus`」，**状态字节在请求里也存在**（值为
+0），从站在 DirectOperate 响应里把结果填进去。因此对象宽度是 5/3/5/9 字节
+（v1/v2/v3/v4），不是 4/2/4/8。此前 codec 的构造与解析都按「只有值」处理、模拟从站
+也按同样的错误布局回显：自环回一直绿着，但与真实从站对接时，从站会多读 1 字节并把
+后续对象头读歪。现在构造时写入 0 状态、解析时暴露 `CmdStatus`，并加了金字节回归
+`TestAnalogOutputObjectCarriesCommandStatus`（去掉状态字节必须变红）。
+
 两条写路径都等从站的应用响应，并检查两件事：
 
 1. **IIN**：`功能不支持` / `对象未知` / `参数错误` / `已在执行` 任一置位即失败；
-2. **回显状态**：CROB 的响应必须带回显对象，`status != 0` 即失败，错误信息里带状态码
-   （`timeout` / `no-select` / `format-error` / `not-supported` / `already-active` /
-   `hardware-error` / `local-control` / `too-many-ops` / `not-authorized`）。
+2. **回显状态**：响应必须带回显的命令对象。CROB 的对象内 `status != 0` 即失败，组 41
+   的对象末尾 `CommandStatus != 0` 即失败；错误信息里带状态码（`timeout` / `no-select` /
+   `format-error` / `not-supported` / `already-active` / `hardware-error` /
+   `local-control` / `too-many-ops` / `not-authorized`）。空回显或回显解析失败同样判
+   `protocol` 错误——「不知道从站是否接受」不能当成「已接受」。
 
 只写 socket 不检查回显，会把「从站拒绝」当成「写入成功」。这类错误在有硬件联调时
 通常能被现场发现（因为设备没动），但在纯软件测试里会一直绿着——所以从站对不存在的
-索引故意返回 `not-supported`，驱动测试 `TestWriteUnknownOutputRejected` 断言它必须报错，
+索引故意返回 `not-supported`，驱动测试 `TestWriteUnknownOutputRejected`（CROB）与
+`TestWriteAnalogUnknownOutputRejected`（组 41）分别断言它必须报错，
 且错误分类是 `protocol` 而不是 `unknown`。
 
 写成功后驱动把「刚写下去的值」填进本地表并标 `good`：从站已经回显成功，这个值就是
@@ -4686,6 +4696,7 @@ read-back 确认读到 uncertain → 上层显示「写入未确认」，与事�
 | 链路层二级帧回 `NOT_SUPPORTED` | `unsupported` | 否 |
 | IIN 置位（功能不支持、对象未知、参数错误、已在执行） | `protocol` | 是（换参数后） |
 | CROB 回显非零状态 | `protocol` | 是（看状态码） |
+| 组 41 回显非零 `CommandStatus` / 回显缺失或解析失败 | `protocol` | 是（看状态码） |
 | 模拟量输出值无法装进选定线格式（越界、带小数、`NaN`/`±Inf`） | `unsupported`（**发报文前**拒绝） | 否 |
 | 配置错误（地址区未知、类型不匹配、轮询参数非法、主从地址相同） | `unsupported` / `address` | 否 |
 | 未知 `area`、`kind != register` | `address` | 否 |
@@ -4806,7 +4817,7 @@ curl -s -X POST -H 'Authorization: Bearer dev-token-0123456789' \
 
 | 层 | 用例 |
 |---|---|
-| `codec/dnp3` | CRC 已知答案与分块、链路帧编解码与流式收帧（粘包/半包/坏 CRC 恢复）、传输分片与重组、应用请求/响应（有无 IIN）、8/16 位起止与全部对象、计数限定词、索引前缀、静态位图（1 位/点与双点 2 位/点）、变体 2 无位图、计数器/模拟量交错、带时标事件（22v5/v6 双对象不错位）、**冻结计数器组 21/23（21v1/v2 带品质、21v5/v6 带品质+绝对时标、21v9/v10 无品质、23v5 双对象不错位、delta 变体 3/4/7/8/11/12 显式拒绝）**、请求头解析、CROB 与组 41 构造、未知组报错 |
+| `codec/dnp3` | CRC 已知答案与分块、链路帧编解码与流式收帧（粘包/半包/坏 CRC 恢复）、传输分片与重组、应用请求/响应（有无 IIN）、8/16 位起止与全部对象、计数限定词、索引前缀、静态位图（1 位/点与双点 2 位/点）、变体 2 无位图、计数器/模拟量交错、带时标事件（22v5/v6 双对象不错位）、**冻结计数器组 21/23（21v1/v2 带品质、21v5/v6 带品质+绝对时标、21v9/v10 无品质、23v5 双对象不错位、delta 变体 3/4/7/8/11/12 显式拒绝）**、请求头解析、CROB 与组 41 构造（**组 41 对象含「值 + 1 字节 CommandStatus」，宽度 5/3/5/9**）、未知组报错、组 41 金字节与状态回显 |
 | `driver/dnp3` | 真实 TCP 回环：复位 + 总召唤 + 静态值、双点中间态 uncertain、事件轮询与主站应用层确认（inflight 清零）、质量映射三态、CROB 写/读回、模拟量写、模拟量写越界/带小数/`NaN` 在发报文前拒绝（设备零写入）、合法边界值与浮点写仍成功、只读区拒绝、未知输出索引被从站拒绝、`Probe`、`Close` 后读失败、配置校验（地址范围/主从相同/轮询参数/传输/区/类型）、无 ACK 超时有限、并发 Read 与后台轮询（`-race`）；**错误分类不被洗白（写失败保 `disconnected`）**、**链路复位被 `NACK` 时 `Open` 失败且原因可见**、**链路断开后 `Read` 的旧值降级为 `stale` 而非 `good`** |
 | `sim/dnp3` | 静态编码 → 主站解析的往返自洽（16 个对象逐一比对），专门抓「编码少一个字节 / 解析多读一个字节」的错位；冻结计数器组 21 与组 20 同索引不同值、类 3 事件走组 23 |
 | `cmd/uic` | `-probe`/`-index`/`-raw`/`-json`、`-binary`/`-analog` 解析与错误写法、`-master`/`-unit` 范围与相同地址拒绝、行显示 |

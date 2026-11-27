@@ -489,10 +489,15 @@ type Object struct {
 	Flags     byte
 	HasFlags  bool
 	Value     any
-	When      time.Time
-	HasTime   bool
-	Relative  uint16
-	HasRel    bool
+	// CmdStatus 是命令对象（组 41 模拟量输出块）回显末尾的 1 字节
+	// CommandStatus。请求里该字节恒为 0，从站在响应中填结果。
+	// CROB（组 12）的状态内嵌在 CROB 值里，不走这两个字段。
+	CmdStatus    byte
+	HasCmdStatus bool
+	When         time.Time
+	HasTime      bool
+	Relative     uint16
+	HasRel       bool
 }
 
 // Header 是只解到对象头与范围的请求头，供从站解析 READ 用。
@@ -844,6 +849,10 @@ type numericSpec struct {
 	flags bool
 	kind  byte // i=int32 I=int16 u=uint32 U=uint16 f=float32 d=float64 c=CROB
 	time  bool
+	// cmdStatus 表示对象值后面还有 1 字节 CommandStatus（组 41 模拟量
+	// 输出块）。这个字节**在请求里也存在**（值为 0），不是只在响应里追加：
+	// 漏掉它会让真实从站把对象体读歪，或把值后的下一字节当成对象头。
+	cmdStatus bool
 }
 
 func numericSpecOf(g, v byte) (numericSpec, bool) {
@@ -968,13 +977,13 @@ func numericSpecOf(g, v byte) (numericSpec, bool) {
 	case GroupAnalogOutputBlock:
 		switch v {
 		case 1:
-			return numericSpec{size: 4, kind: 'i'}, true
+			return numericSpec{size: 5, kind: 'i', cmdStatus: true}, true
 		case 2:
-			return numericSpec{size: 2, kind: 'I'}, true
+			return numericSpec{size: 3, kind: 'I', cmdStatus: true}, true
 		case 3:
-			return numericSpec{size: 4, kind: 'f'}, true
+			return numericSpec{size: 5, kind: 'f', cmdStatus: true}, true
 		case 4:
-			return numericSpec{size: 8, kind: 'd'}, true
+			return numericSpec{size: 9, kind: 'd', cmdStatus: true}, true
 		}
 	case GroupCROB:
 		if v == 1 {
@@ -1062,6 +1071,10 @@ func readNumeric(p []byte, pos *int, spec numericSpec, g, v byte, idx uint32) (O
 	if spec.time {
 		o.When = decodeTime48(b[off+valueWidth(spec.kind):])
 		o.HasTime = true
+	}
+	if spec.cmdStatus {
+		o.CmdStatus = b[off+valueWidth(spec.kind)]
+		o.HasCmdStatus = true
 	}
 	return o, nil
 }
@@ -1196,6 +1209,11 @@ func CROBObjects(index uint32, code, count byte, onTime, offTime uint32) ([]byte
 // AnalogOutputObjects 生成一个模拟量输出（组 41）的对象区。
 //
 // variation 必须是 1..4，分别对应 int32 / int16 / float32 / float64。
+//
+// 组 41 的每个对象是「值 + 1 字节 CommandStatus」。状态字节在**请求里也
+// 存在**，恒为 0；从站在 DirectOperate 响应中把结果填进去。早先这里只写
+// 值、不写状态字节：真实从站按标准多读 1 字节，会把后面的对象头读歪；
+// 而模拟从站也按同样的错误布局回显，自环回因此一直绿着。
 func AnalogOutputObjects(index uint32, variation byte, value float64) ([]byte, error) {
 	if variation < 1 || variation > 4 {
 		return nil, fmt.Errorf("dnp3: analog output variation %d out of range", variation)
@@ -1216,6 +1234,7 @@ func AnalogOutputObjects(index uint32, variation byte, value float64) ([]byte, e
 	case 4:
 		out = binary.LittleEndian.AppendUint64(out, math.Float64bits(value))
 	}
+	out = append(out, 0) // CommandStatus：请求里恒为 0，从站回显时填结果
 	return out, nil
 }
 

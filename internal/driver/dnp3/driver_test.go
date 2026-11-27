@@ -442,12 +442,14 @@ func TestWriteAnalogAcceptsRepresentable(t *testing.T) {
 		{model.TypeFloat32, 0.5},
 		{model.TypeFloat64, 12.5},
 	}
-	for i, tc := range cases {
-		idx := uint32(100 + i)
+	for _, tc := range cases {
+		// 用模拟从站真实存在的索引（AnalogOutput[0]）。写成任意索引
+		// 会在「未知索引回 not-supported」的修复后正确地失败——这不是
+		// 本用例要测的语义。
 		res, err := c.Write(context.Background(), []driver.WriteRequest{{
 			PointID:  "ao-ok",
 			DataType: tc.dt,
-			Address:  model.Address{Kind: model.AddressRegister, Area: AreaAnalogOutput, Offset: int(idx), Bit: -1},
+			Address:  model.Address{Kind: model.AddressRegister, Area: AreaAnalogOutput, Offset: 0, Bit: -1},
 			Value:    model.NumValue(tc.dt, tc.val),
 		}})
 		if err != nil {
@@ -456,6 +458,29 @@ func TestWriteAnalogAcceptsRepresentable(t *testing.T) {
 		if len(res) != 1 || !res[0].OK {
 			t.Fatalf("%v: result = %+v", tc, res)
 		}
+	}
+}
+
+// 模拟量输出与 CROB 一样，从站可以在回显里用 CommandStatus 拒绝命令。
+// 此前驱动完全不看组 41 的回显，未知索引会被静默当成写入成功；现在必须
+// 按 protocol 错误上报，并保留状态码，方便现场区分「越界」与「未授权」。
+func TestWriteAnalogUnknownOutputRejected(t *testing.T) {
+	h := newHarness(t)
+	c := h.open()
+
+	_, err := c.Write(context.Background(), []driver.WriteRequest{{
+		PointID: "ao9", DataType: model.TypeFloat64,
+		Address: model.Address{Kind: model.AddressRegister, Area: AreaAnalogOutput, Offset: 9, Bit: -1},
+		Value:   model.NumValue(model.TypeFloat64, 1),
+	}})
+	if err == nil {
+		t.Fatal("write to unknown analog output index succeeded")
+	}
+	if driver.KindOf(err) != driver.ErrProtocol {
+		t.Fatalf("kind = %s, want protocol", driver.KindOf(err))
+	}
+	if !strings.Contains(err.Error(), "status") {
+		t.Fatalf("error = %v", err)
 	}
 }
 

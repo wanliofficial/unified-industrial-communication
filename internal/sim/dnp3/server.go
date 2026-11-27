@@ -902,11 +902,15 @@ func (st *station) handleDirectOperate(m dnp3codec.AppMessage) {
 			if variation < 1 || variation > 4 {
 				variation = 1
 			}
-			st.srv.applyAnalog(o.Index, n)
+			status := st.srv.applyAnalog(o.Index, n)
 			raw, err := dnp3codec.AnalogOutputObjects(o.Index, variation, n)
 			if err != nil {
 				continue
 			}
+			// 组 41 的对象末尾是 1 字节 CommandStatus：构造时写 0，
+			// 这里用实际执行结果覆盖。漏掉这个字节会让主站解析错位，
+			// 也会让「从站拒绝」被主站当成成功。
+			raw[len(raw)-1] = status
 			echo = append(echo, raw...)
 		}
 	}
@@ -948,12 +952,16 @@ func (s *Server) applyCROB(index uint32, c dnp3codec.CROB) byte {
 	return CROBSuccess
 }
 
-func (s *Server) applyAnalog(index uint32, v float64) {
+// applyAnalog 应用模拟量输出并返回 CommandStatus。未知索引回
+// not-supported，与 CROB 的行为一致：主站必须能从回显里看到「拒绝」，
+// 而不是被一个静默忽略的写操作骗成成功。
+func (s *Server) applyAnalog(index uint32, v float64) byte {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	p := s.points[AnalogOutput][index]
 	if p == nil {
-		return
+		return CROBNotSupported
 	}
 	p.Num = v
+	return CROBSuccess
 }

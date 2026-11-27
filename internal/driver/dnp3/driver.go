@@ -1057,13 +1057,8 @@ func (c *conn) writeOne(ctx context.Context, req driver.WriteRequest) (driver.Wr
 		if msg := iinError(resp.IIN); msg != "" {
 			return fail(driver.ErrProtocol, msg)
 		}
-		if objs, perr := dnp3codec.ParseObjects(resp.Objects); perr == nil {
-			for _, o := range objs {
-				if c, ok := o.Value.(dnp3codec.CROB); ok && !c.Success() {
-					return fail(driver.ErrProtocol,
-						fmt.Sprintf("outstation rejected CROB at index %d: status 0x%02X", o.Index, c.Status))
-				}
-			}
+		if msg := commandEchoError(req.PointID, dnp3codec.GroupCROB, resp.Objects); msg != "" {
+			return fail(driver.ErrProtocol, msg)
 		}
 		c.storeWritten(req.PointID, req.DataType, model.BoolValue(v))
 		return driver.WriteResult{PointID: req.PointID, OK: true, Quality: model.QualityGood}, nil
@@ -1111,6 +1106,9 @@ func (c *conn) writeOne(ctx context.Context, req driver.WriteRequest) (driver.Wr
 		if msg := iinError(resp.IIN); msg != "" {
 			return fail(driver.ErrProtocol, msg)
 		}
+		if msg := commandEchoError(req.PointID, dnp3codec.GroupAnalogOutputBlock, resp.Objects); msg != "" {
+			return fail(driver.ErrProtocol, msg)
+		}
 		c.storeWritten(req.PointID, req.DataType, model.NumValue(req.DataType, n))
 		return driver.WriteResult{PointID: req.PointID, OK: true, Quality: model.QualityGood}, nil
 
@@ -1138,6 +1136,50 @@ func iinError(iin uint16) string {
 		return ""
 	}
 	return "outstation IIN: " + strings.Join(msgs, ", ")
+}
+
+// commandEchoError 检查 DirectOperate 响应里回显的命令对象。
+//
+// group 是本次下发的对象组（CROB=12 或模拟量块=41）。DNP3 要求从站把
+// 命令对象原样回显，并在每个对象上写 CommandStatus。空回显或解析失败都
+// 不能当成成功：那等于「只写了 socket，没确认从站接受」。此前模拟量路径
+// 完全不看回显，而 CROB 路径在解析失败时静默跳过检查——两种都会把从站的
+// 拒绝报成写入成功。
+//
+// CROB 的状态内嵌在 CROB 值里；组 41 的状态是值末尾独立的 1 字节。
+func commandEchoError(pointID string, group byte, raw []byte) string {
+	objs, err := dnp3codec.ParseObjects(raw)
+	if err != nil {
+		return fmt.Sprintf("point %q: malformed command echo: %v", pointID, err)
+	}
+	seen := 0
+	for _, o := range objs {
+		if o.Group != group {
+			continue
+		}
+		seen++
+		switch group {
+		case dnp3codec.GroupCROB:
+			c, ok := o.Value.(dnp3codec.CROB)
+			if !ok {
+				continue
+			}
+			if !c.Success() {
+				return fmt.Sprintf("outstation rejected CROB at index %d: status 0x%02X", o.Index, c.Status)
+			}
+		case dnp3codec.GroupAnalogOutputBlock:
+			if !o.HasCmdStatus {
+				return fmt.Sprintf("point %q: analog output echo at index %d has no command status", pointID, o.Index)
+			}
+			if o.CmdStatus != 0 {
+				return fmt.Sprintf("outstation rejected analog output at index %d: status 0x%02X", o.Index, o.CmdStatus)
+			}
+		}
+	}
+	if seen == 0 {
+		return fmt.Sprintf("point %q: outstation response did not echo the command object", pointID)
+	}
+	return ""
 }
 
 func (c *conn) storeWritten(id string, dt model.DataType, v model.Value) {

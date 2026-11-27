@@ -559,8 +559,9 @@ DNP3 是三层协议：链路层（`05 64` 起始、每 16 字节一块 CRC、�
 （组 21/23）与 `counter`（组 20/22）是两个独立的对象组**：同一个索引在两组里分别是
 结算周期冻结值与瞬时值，各自寻址，不能互相顶替；冻结计数器只读。双点量按 bool 映射时：1（分）→
 false、2（合）→ true、0/3（中间态/不确定）→ false + uncertain，绝不把「未知」显示成
-「已关闭」。写二进制输出用 CROB（组 12，锁存开/关），写模拟量输出用组 41；两者都等
-从站的应用响应并检查回显状态，**只写 socket 不检查回显会把拒绝当成成功**。不做选择-
+「已关闭」。写二进制输出用 CROB（组 12，锁存开/关），写模拟量输出用组 41（每个对象是
+「值 + 1 字节 CommandStatus」，请求里状态恒为 0）；两者都等从站的应用响应并检查回显
+状态，**只写 socket 不检查回显会把拒绝当成成功**。不做选择-
 执行（SBO）两段式、不做安全认证、不做文件传输、不做时间同步写路径、不做串口。
 
 `dnp3read` 同样不依赖点表：驱动旁路表按「区 + 索引」记录设备实际送过的每个对象
@@ -1454,9 +1455,9 @@ make sbom     # 从产物内嵌 buildinfo 生成 CycloneDX SBOM（零第三方�
 | `internal/codec/iec101` | IEC 60870-5-101 纯函数帧层（FT1.2 固定帧 / 可变帧 / 单字节帧、控制域 FCB/FCV/ACD/DFC、校验和、流式收帧 `Reader`） |
 | `internal/driver/iec101` | IEC 101 非平衡轮询主站（复位链路、第 1/2 级轮询、站总召唤 + 电能量召唤、FCB 原帧重传、命令两段确认、双承载、旁路表） |
 | `internal/sim/iec101` | IEC 101 内置从站（FT1.2 over TCP 透传、FCB 去重、ACD、两级队列、召唤快照与终止、命令两段确认） |
-| `internal/codec/dnp3` | DNP3 纯函数编解码（链路帧与 CRC / 流式收帧 / 传输分片重组 / 应用层请求响应 / 对象解析（含组 21/23 冻结计数器）/ 请求头 / CROB 与组 41 构造） |
-| `internal/driver/dnp3` | DNP3 主站（复位链路 + TEST_LINK、类 0/1/2/3 轮询、未请求响应、应用层确认、CROB 与模拟量直接控制、旁路表） |
-| `internal/sim/dnp3` | DNP3 内置从站（链路 ACK / 类 0 静态快照 / 三类事件队列与 inflight / 冻结计数器组 21/23 / CROB 与组 41 直接控制回显） |
+| `internal/codec/dnp3` | DNP3 纯函数编解码（链路帧与 CRC / 流式收帧 / 传输分片重组 / 应用层请求响应 / 对象解析（含组 21/23 冻结计数器）/ 请求头 / CROB 与组 41 构造（组 41 对象 = 值 + 1 字节 CommandStatus，宽度 5/3/5/9）） |
+| `internal/driver/dnp3` | DNP3 主站（复位链路 + TEST_LINK、类 0/1/2/3 轮询、未请求响应、应用层确认、CROB 与模拟量直接控制、回显状态校验、旁路表） |
+| `internal/sim/dnp3` | DNP3 内置从站（链路 ACK / 类 0 静态快照 / 三类事件队列与 inflight / 冻结计数器组 21/23 / CROB 与组 41 直接控制回显（含 CommandStatus，未知索引回 not-supported）） |
 | `internal/codec/coap` | CoAP 纯函数编解码（4 字节头 / 选项 delta-len 扩展 / uint 与 Block 编解码 / URI 拆分 / link-format 解析 / Observe 新鲜度判定） |
 | `internal/codec/textval` | 文本/JSON 标量 → 平台值（MQTT 与 CoAP 共用的类型规则；selector 取字段） |
 | `internal/driver/coap` | CoAP 主站（GET/PUT/POST、Block2 续读与降级、分离响应、指数重传、资源发现、坏包跳过、Observe 订阅与退回 GET） |

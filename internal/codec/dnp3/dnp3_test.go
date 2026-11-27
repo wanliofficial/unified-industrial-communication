@@ -569,8 +569,40 @@ func TestControlObjectsRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(objs) != 1 || objs[0].Value != 12.5 {
+	if len(objs) != 1 || objs[0].Value != 12.5 || !objs[0].HasCmdStatus || objs[0].CmdStatus != 0 {
 		t.Fatalf("analog output = %+v", objs)
+	}
+}
+
+// 组 41 的每个对象是「值 + 1 字节 CommandStatus」，状态字节在请求里也
+// 存在（值为 0）。漏掉它会让真实从站多读 1 字节、把对象体读歪；而自环回
+// （主站与内置从站共用同一份错误布局）不会暴露这个问题。这里钉死金字节。
+func TestAnalogOutputObjectCarriesCommandStatus(t *testing.T) {
+	raw, err := AnalogOutputObjects(7, 1, 12)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 头（组 41 / 变体 1 / QualIndex8 / count=1）+ 索引 + int32 值 + 状态。
+	want := []byte{GroupAnalogOutputBlock, 1, QualIndex8, 1, 7, 12, 0, 0, 0, 0}
+	if !bytes.Equal(raw, want) {
+		t.Fatalf("AnalogOutputObjects = % X, want % X", raw, want)
+	}
+	objs, err := ParseObjects(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(objs) != 1 || !objs[0].HasCmdStatus || objs[0].CmdStatus != 0 {
+		t.Fatalf("analog output = %+v", objs)
+	}
+
+	// 从站拒绝：状态字节非零必须原样暴露，驱动才能按 protocol 错误上报。
+	raw[len(raw)-1] = 4
+	objs, err = ParseObjects(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(objs) != 1 || !objs[0].HasCmdStatus || objs[0].CmdStatus != 4 {
+		t.Fatalf("rejected analog output = %+v", objs)
 	}
 }
 
