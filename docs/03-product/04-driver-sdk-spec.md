@@ -8737,6 +8737,13 @@ A-XDR（IEC 61334-6）里 `Data` CHOICE 的 octet-string 是 `IMPLICIT OCTET STR
 分钟**，`0x8000` 表示未指定（不能用 0 代替，0 意味着 UTC）。`date`（5 字节）是
 `年(2) 月 日 星期`，`time`（4 字节）是 `时 分 秒 百分秒`。
 
+**「未指定」的哨兵是逐字段定的，年不是按字节判。** 年字段是 2 字节大端，只有整段
+`0xFFFF` 才表示"未指定"（IEC 62056-6-2 §4.1.6.1）；月、日、时、分、秒各 1 字节，
+各自 `0xFF` 才是未指定。把年按"任一字节为 `0xFF`"判会误杀合法年份——例如
+2047 = `0x07FF`，低字节恰是 `0xFF`，会被当成未指定而拒掉。`DateTime()` 因此只认
+整段 `0xFFFF`；而时/分/秒的 `0xFF` 落入范围检查（`> 23`/`> 59`）被拒，绝不交给
+`time.Date` 去把 255 时静默归一化成"下一天 15 点"这种看着合理、其实全错的时间点。
+
 #### 3.10.26.5 OBIS 与 `SplitRef`：唯一地址切分点
 
 点表地址（`kind=symbol`，`AddressPolicy{Width: WidthNone, AllowSymbol: true}`）是
@@ -8967,7 +8974,7 @@ octet-string 四种值形态。
 
 | 层 | 用例 |
 |---|---|
-| `codec/dlms` | `SNRM` 金帧 `7E A0 07 03 21 93 0F 01 7E`；`FCS(A0 07 03 21 93) == 0F 01` 与 `GoodFCS` 的固定余数 `0xF0B8`；长度字段跨两字节与 bit11 分段位；info 与 FCS 里出现 `0x7E` 时仍按长度定界（FCS `7E 64` 的回归）；截断 → `ErrIncomplete`、指针前移 1 字节重同步；1/2/4 字节地址域（含 `48 68 FE FF`）；LLC `E6 E6 00` vs `E6 E7 00`；I/RR/RNR/U 帧控制域与 `NS`/`NR` 回绕；AARQ/AARE 逐字节向量与拒绝诊断；conformance 位值与 `5F 1F 04 00` 编码；A-XDR 全标签（含 `0x07`/`0x0E` 空号必须报错）；**字符串/位串长度语义（`0x80..0xFF` 是合法长度 128..255 不拒绝、超额长度主张在递归里报 `ErrAXDR` 帧串位）**；`date_time` 12 字节布局（星期位置、`0x8000` 时区）与 `date`/`time`；`data-access-result` 只认 2 字节形态（用 `hardware-fault(1)` 锁「前两字节相同」的陷阱）；Get-Response 三分支（normal / datablock / list）；OBIS 十进制六段与 `.`/`-`/`:`/空格分隔；`SplitRef` 对 `1-0:1-8-0-255:3:2` 的切点；`ApplyScaler` 单次乘除（`50.01` 精确）；`UnitName`/`ClassName` 全扫 |
+| `codec/dlms` | `SNRM` 金帧 `7E A0 07 03 21 93 0F 01 7E`；`FCS(A0 07 03 21 93) == 0F 01` 与 `GoodFCS` 的固定余数 `0xF0B8`；长度字段跨两字节与 bit11 分段位；info 与 FCS 里出现 `0x7E` 时仍按长度定界（FCS `7E 64` 的回归）；截断 → `ErrIncomplete`、指针前移 1 字节重同步；1/2/4 字节地址域（含 `48 68 FE FF`）；LLC `E6 E6 00` vs `E6 E7 00`；I/RR/RNR/U 帧控制域与 `NS`/`NR` 回绕；AARQ/AARE 逐字节向量与拒绝诊断；conformance 位值与 `5F 1F 04 00` 编码；A-XDR 全标签（含 `0x07`/`0x0E` 空号必须报错）；**字符串/位串长度语义（`0x80..0xFF` 是合法长度 128..255 不拒绝、超额长度主张在递归里报 `ErrAXDR` 帧串位）**；`date_time` 12 字节布局（星期位置、`0x8000` 时区、**年 `0xFFFF` 才是未指定——2047=`0x07FF` 必须能解、时/分/秒 `0xFF` 不归一化**）与 `date`/`time`；`data-access-result` 只认 2 字节形态（用 `hardware-fault(1)` 锁「前两字节相同」的陷阱）；Get-Response 三分支（normal / datablock / list）；OBIS 十进制六段与 `.`/`-`/`:`/空格分隔；`SplitRef` 对 `1-0:1-8-0-255:3:2` 的切点；`ApplyScaler` 单次乘除（`50.01` 精确）；`UnitName`/`ClassName` 全扫 |
 | `driver/dlms` | 真实 TCP 回环：SNRM→AARQ→逐点 GET→DISC；`Probe` 复用已建关联；拒绝关联 → `ErrProtocol`；静默 → `ErrTimeout`；坏校验 → `ErrProtocol` 且文案含「坏帧」与波特率提示；**DM（断开模式）→ `ErrProtocol` 且 `IsRetryable==false`，`retries=2` 下 Get 只发 1 次**（与坏校验「重发到上限」构成成对断言）；`linkErr` 缓存后第二轮不再发包且立即返回；object-undefined → `ErrAddress`；类号不一致 → `ErrAddress`；分块 → `ErrUnsupported` 且提示调大 `max-pdu`；scaler 五个点逐位精确（`50.01`/`0.985`/`220.1`/`5.12`/`345.6`）；**Register 缺 attribute 3 时该点判坏（不报 raw good 静默回绕），补上后同一连接回到正确缩放（不永久毒化）**；`Scan` 条数等于内置表条数且带 scaler_unit 文本；`Association` 采用服务端较小的 max-PDU；`Write`/`MultiRead`/`Browse` 逐项 `ErrUnsupported`；`parseOptions` 越界全忽略；`addressOf` 的 `labels.address` 优先级与 `addr-size=3` 拒绝；空 span 返回 `(nil, nil)`；关闭后所有入口 → `ErrDisconnected` |
 | `sim/dlms` | 默认对象表覆盖 40+ 项且 `examples/dlms.json` 能全部读到；AARQ 接受/拒绝两分支；未建关联读 → `read-write-denied`；对象未定义 / 类号不一致两种结果码；地址与客户端地址过滤静默；`SetSilent`/`SetBadChecksum`/`SetRejectAssociation`/`SetReplyDM`；`SetReplyDM` 下 Get 计数仍加一（证明请求确实到达，用于断言是否重发）；`SetValue`/`Value` 的坏定位报错；`AddObject` 链路上途补属性（供测试「缺 scaler_unit 判坏→补上后同一连接恢复正确缩放」）；TCP `acceptLoop`→`serveConn`→`tcpStream` 真实 socket 路径；`Close` 幂等且能清理连接；`isClosed` 对 `net.ErrClosed`/`io.EOF`/超时的分类 |
 | `pointtable` | `dlms` 走 `WidthNone + AllowSymbol`；`1.0.1.8.0.255`、`:3`、`:3:2` 与连字符写法 `0-0-42-0-0-255:1:2` 都解析成 symbol 且 `Canonical` 往返一致；寄存器/对象/计算地址在导入期拒绝；`length` 列在导入期拒绝 |

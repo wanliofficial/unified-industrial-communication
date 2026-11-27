@@ -305,12 +305,33 @@ func TestAXDRDateTimeLayout(t *testing.T) {
 		t.Error("时区未指定不应导致整条时钟解不出来")
 	}
 
-	// 年/月/日任一为 0xFF（未指定）就构不成时间点。
-	for _, i := range []int{0, 1, 2, 3} {
+	// 年字段"未指定"的哨兵是整段 0xFFFF，而不是任一字节 0xFF——按字节判会把
+	// 2047(0x07FF) 这类低字节恰为 0xFF 的合法年份误拒。
+	badYear := append([]byte(nil), raw...)
+	badYear[0], badYear[1] = 0xFF, 0xFF
+	if _, ok := (Value{Tag: TagDateTime, Raw: badYear}).DateTime(); ok {
+		t.Error("年 0xFFFF（未指定）不应解出时间")
+	}
+	// 年 2047 = 0x07FF：低字节是 0xFF，但它是合法年份，必须能解出。
+	if t2047, ok := (Value{Tag: TagDateTime, Raw: []byte{
+		0x07, 0xFF, 0x0B, 0x0D, 0x05, 0x08, 0x1E, 0x00, 0x00, 0x00, 0x00, 0x00,
+	}}).DateTime(); !ok || t2047.Year() != 2047 {
+		t.Errorf("年 2047(0x07FF) 应能解出，得到 ok=%v year=%d", ok, t2047.Year())
+	}
+	// 月/日任一为 0xFF（未指定）就构不成时间点。
+	for _, i := range []int{2, 3} {
 		bad := append([]byte(nil), raw...)
 		bad[i] = 0xFF
 		if _, ok := (Value{Tag: TagDateTime, Raw: bad}).DateTime(); ok {
 			t.Errorf("第 %d 字节为 0xFF 时不应解出时间", i+1)
+		}
+	}
+	// 时/分/秒为 0xFF（未指定）也不能静默归一化成一个错的时间点。
+	for _, i := range []int{5, 6, 7} {
+		bad := append([]byte(nil), raw...)
+		bad[i] = 0xFF
+		if _, ok := (Value{Tag: TagDateTime, Raw: bad}).DateTime(); ok {
+			t.Errorf("时间字节第 %d 位为 0xFF 时不应解出时间", i+1)
 		}
 	}
 	// 月份越界必须判失败，不能"宽容地"返回 13 月。

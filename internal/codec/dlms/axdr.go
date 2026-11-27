@@ -289,7 +289,10 @@ func (v Value) DateTime() (time.Time, bool) {
 			return time.Time{}, false
 		}
 		b := v.Raw
-		if b[0] == 0xFF || b[1] == 0xFF || b[2] == 0xFF || b[3] == 0xFF {
+		// 年字段是 2 字节大端，**只有整段 0xFFFF 才是"未指定"**（IEC 62056-6-2
+		// §4.1.6.1）。按单字节 0xFF 判会把 2047(0x07FF) 这类低字节恰为 0xFF
+		// 的合法年份误当成未指定而拒掉；月、日各自 1 字节，0xFF 才是未指定。
+		if (b[0] == 0xFF && b[1] == 0xFF) || b[2] == 0xFF || b[3] == 0xFF {
 			return time.Time{}, false // 年/月/日未指定，构不成时间点
 		}
 		year := int(binary.BigEndian.Uint16(b[0:2]))
@@ -298,7 +301,14 @@ func (v Value) DateTime() (time.Time, bool) {
 		hour := int(b[5])
 		min := int(b[6])
 		sec := int(b[7])
-		if year < 1 || month < 1 || month > 12 || day < 1 || day > 31 {
+		// 时/分/秒子字段为 0xFF 表示"未指定"。若不在下面的范围检查里拦住，
+		// time.Date 会把 255 时/分/秒静默归一化到下一天，报出一个看似合理却
+		// 错的时间点——比明确失败更危险（现场会把错的时钟当成对的）。
+		if year < 1 || year > 9999 || month < 1 || month > 12 || day < 1 || day > 31 {
+			return time.Time{}, false
+		}
+		// 0xFF(255) 也落在这里被拒（>23/>59），与"未指定"同归失败。
+		if hour > 23 || min > 59 || sec > 59 {
 			return time.Time{}, false
 		}
 		loc := time.UTC
@@ -312,13 +322,14 @@ func (v Value) DateTime() (time.Time, bool) {
 			return time.Time{}, false
 		}
 		b := v.Raw
-		if b[0] == 0xFF || b[1] == 0xFF || b[2] == 0xFF || b[3] == 0xFF {
+		// 同 date_time：年 2 字节只有整段 0xFFFF 才是未指定，月/日各 1 字节。
+		if (b[0] == 0xFF && b[1] == 0xFF) || b[2] == 0xFF || b[3] == 0xFF {
 			return time.Time{}, false
 		}
 		year := int(binary.BigEndian.Uint16(b[0:2]))
 		month := int(b[2])
 		day := int(b[3])
-		if month < 1 || month > 12 || day < 1 || day > 31 {
+		if year < 1 || year > 9999 || month < 1 || month > 12 || day < 1 || day > 31 {
 			return time.Time{}, false
 		}
 		return time.Date(year, time.Month(month), day, 0, 0, 0, 0, time.UTC), true
