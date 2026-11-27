@@ -114,6 +114,14 @@ func newSubState(deviceID string, points []subPoint, pubEvery, sampling time.Dur
 // subscribe=true，实际却在轮询，是那种「跑起来一切正常、三个月后有人
 // 问为什么数据延迟变了」的问题。要轮询就把这个开关关掉。
 func (s *subState) establish(ctx context.Context) error {
+	// establish 的语义是「用一条新连接替换当前连接」，因此必须先释放上一条。
+	// 重连循环（run）在 publishUntilError 出错后直接进来，而上一条连接并
+	// 不保证已经关闭：错误可能来自「订阅状态为 Bad」或一条解不开的通知，
+	// 此时 socket 与会话都还活着。不先关掉就覆盖 s.conn，等于每次重连都泄漏
+	// 一条 TCP fd 和一个服务端会话——表现是「跑几天后 fd 用尽 / 服务端会话
+	// 暴涨」。首次 establish 时 s.conn 为 nil，closeCurrent 是空操作。
+	s.closeCurrent()
+
 	c, err := s.open(ctx)
 	if err != nil {
 		return err

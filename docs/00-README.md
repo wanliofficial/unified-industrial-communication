@@ -1556,7 +1556,7 @@ obs  ← 所有包（不依赖任何内部包）
 | `internal/transport` | 字节流抽象 + TCP + 串口（termios） | 写满、读满或超时、关闭幂等；协议层 deadline 不得被兜底值覆盖 | 80.3% |
 | `internal/driver/modbus` | Modbus TCP + RTU + ASCII 主站 | 事务号递增；异常码分类（05 Acknowledge / 06 Busy 归可重试的临时故障，与 04 设备故障同档；01/02/03/08 不可重试）；部分失败不吞好样本；同串口事务串行；分帧类型参与端口冲突判定；写路径数值越界/带小数/float32 溢出在发报文前拒绝（`codec/value.Encode` 收口范围校验，归 `ErrAddress` 不计熔断，旧实现 `40000` 写 int16 静默变 `-25536`） | 82.7% |
 | `internal/driver/s7` | S7（S7comm）主站；块服务走独立一次性 `Session` | COTP/Setup 握手不可省；按协商 PDU 与 20 项上限切块；逐项返回码映射质量码；顶层 ACK 错误直接判协议错；块上传以 `param[1]` 判最后一片，失败也补 End 释放 PLC 会话 | 78.1% |
-| `internal/driver/opcua` | OPC UA 二进制主站（None/None + 匿名）；可选订阅推送 | 三层状态（TCP/通道/会话）分开判断；按 RequestId 过滤迟到响应；节点越界判坏不截断；订阅走独立第二条连接，Read 优先本地表、失效即回退真读 | 76% |
+| `internal/driver/opcua` | OPC UA 二进制主站（None/None + 匿名）；可选订阅推送 | 三层状态（TCP/通道/会话）分开判断；按 RequestId 过滤迟到响应；节点越界判坏不截断；订阅走独立第二条连接，Read 优先本地表、失效即回退真读；重连先关旧连接（不泄漏 fd/会话） | 76% |
 | `internal/driver/mqtt` | MQTT 南向（订阅取数）：把推送型协议适配成拉取契约 | `Read` 无网络交互，只读本地最新值表；质量码只反映新鲜度（good/stale/bad 三档）；一条消息都没有不算断链，安静到一个窗口且 PING 失败才判链；客户端 `Ping` 的等待者用 `chan error` 携带结论——链路在 PINGREQ 在飞期间断开时，并发的 Ping 也必须报失败而非误报成功 | 77.4% |
 | `internal/driver/computed` | 计算点：表达式驱动，无物理链路 | 同设备依赖在一次 `Read` 内按拓扑序闭合；输入不可用则不计算、质量取最差并指名输入；整数越界判坏不截断；窗口聚合的数据来自只读 `OpenConfig.History`，缺失时显式失败；求值失败的错误归 `ErrProtocol` 而非 `ErrInternal`（计算点无物理链路，bad 永远来自表达式/输入，不是内部 bug） | 92.7% |
 | `internal/driver/virtual` | 虚拟设备（波形 + 故障注入） | 故障按「第 n 次请求」精确注入一次；Probe/Read/Write 三个入口共享同一请求序列，`disconnect` 也遵守 `faultAt`（`faultAt<=0` 时从不断连，`>0` 时第 n 次请求起断），避免 `disconnect+faultAt>0` 成为永远建不起链、跑不到恢复的死配置 | 98.6% |
@@ -1829,7 +1829,7 @@ OPC UA 服务端（同一份点位表的另一个出口）：
 | MQTT 南向不支持项 | ❌ | 点位的 `path` 只能是具体主题（禁止 `+` / `#` 通配符，否则一个点位对应 N 个主题、值无法归属）；不做持久会话 / ACL / TLS / WebSocket / QoS2；不做二进制载荷解码 |
 | MQTT 内置 Broker | ✅ | `uic sim -protocol mqtt`：CONNECT/SUBSCRIBE/PUBLISH/PING 全套、retained 内存表、每秒发布演示点位并回显 setpoint 写入；同时是集成测试的对端（全项目唯一一份 Broker 实现） |
 | OPC UA 主站 | ✅ | UACP HEL/ACK + OPN 安全通道 + CreateSession/ActivateSession 会话三层；批量读（≤100 节点/请求）、写、Browse、GetEndpoints；SecurityPolicy=None / SecurityMode=None / 匿名；NodeId 支持 `ns=2;s=` / `ns=2;i=` / `i=` / 裸字符串；TokenId 寿命 3/4 时自动 OPN 续订；数值越界判坏不截断 |
-| OPC UA 订阅 | ✅ | 通道级 `subscribe` 开关（默认关闭 = 每轮 Read 轮询）；CreateSubscription + CreateMonitoredItems + Publish 长轮询 + 逐条确认；走**独立第二条连接**（Publish 不阻塞读写）；`QueueSize=1` + `DiscardOldest` 只保留最新值；监视项建立后立刻收到一次初始样本；建订阅失败让 `Open` 失败（不静默退化成轮询）；运行期断开自动重建并暂时回退真读 |
+| OPC UA 订阅 | ✅ | 通道级 `subscribe` 开关（默认关闭 = 每轮 Read 轮询）；CreateSubscription + CreateMonitoredItems + Publish 长轮询 + 逐条确认；走**独立第二条连接**（Publish 不阻塞读写）；`QueueSize=1` + `DiscardOldest` 只保留最新值；监视项建立后立刻收到一次初始样本；建订阅失败让 `Open` 失败（不静默退化成轮询）；运行期断开自动重建（**先关旧连接再拨新连接**，不泄漏 fd/服务端会话）并暂时回退真读 |
 | OPC UA 订阅的边界 | ⚠️ | 不做同一连接上的多请求复用（那需要一套完整的多路复用器）；不实现 Republish 补取（跳号时靠下一条通知）；采样周期只发配置值，不做服务端采样率协商；`publishingInterval` / `samplingInterval` 必须配合 `subscribe=true` |
 | OPC UA 历史 / 方法 / 事件 / 证书 | ❌ | 证书体系是另一套运维域；方法与事件需要完整地址空间与权限模型；历史由自建有界采样日志承担（ADR-0002） |
 | OPC UA 服务端（内置演示） | ✅ | `uic sim -protocol opcua`：Root/Objects/Server/ServerStatus/CurrentTime + ns=2 Plant.{Counter,Temperature,Running,Label,Setpoint}；只读节点写入回 `BadNotWritable`；未知节点回 `BadNodeIdUnknown`；未实现的服务（方法调用/历史读取）回 `BadServiceUnsupported`；订阅按值变化推送，空闲按 KeepAlive 周期发空通知 |

@@ -1171,7 +1171,7 @@ OPC UA 的 `Read` 是**逐项**返回 `DataValue.Status` 的：一个节点不�
 | 批量读（≤100 节点/请求） | ✅ | 按服务端的 OperationLimits 保守取值 |
 | 写（单点/批量） | ✅ | 逐项状态码回传 |
 | Browse / GetEndpoints | ✅ | 驱动层提供，供后续「点位浏览」界面用 |
-| 订阅（CreateSubscription / MonitoredItems / Publish） | ✅ | 通道级 `subscribe` 开关（默认 false = 轮询）；订阅走独立第二条连接，Publish 长轮询不阻塞 Read/Write；每个带序列号的通知都在下一次 Publish 中确认；`QueueSize=1 + DiscardOldest` 只保留最新值；断开自动重建，期间 Read 回退真读 |
+| 订阅（CreateSubscription / MonitoredItems / Publish） | ✅ | 通道级 `subscribe` 开关（默认 false = 轮询）；订阅走独立第二条连接，Publish 长轮询不阻塞 Read/Write；每个带序列号的通知都在下一次 Publish 中确认；`QueueSize=1 + DiscardOldest` 只保留最新值；断开自动重建且**重建前先关闭旧连接**（不泄漏 fd/会话），期间 Read 回退真读 |
 | 历史读取（HistoryRead） | ❌ | 属 Wave 2 历史库范畴 |
 | 方法调用 / 事件 / 别名 | ❌ | — |
 | 证书 / 信任列表 / 签名校验 | ❌ | 属于另一套运维体系，混进来会让「连不上」的原因不可判定 |
@@ -1185,6 +1185,12 @@ OPC UA 的 `Read` 是**逐项**返回 `DataValue.Status` 的：一个节点不�
 > 2. **推送值只在「订阅健康 + 未超保鲜期 + 类型一致」时才替代真实读**。
 >    其余情况一律回退 `Read`——拿最后一次成功的读数冒充当前值，是这类
 >    实现最危险的失效模式。
+> 3. **重连必须先关旧连接、再拨新连接**。发布循环出错不一定意味着 socket
+>    已经死了：订阅状态被服务端置 Bad、或一条通知解不开时，连接本身仍然
+>    活着。若直接新建连接并覆盖 `s.conn`，旧连接从不 `Close`——每次重连
+>    泄漏一条 TCP fd 和一个服务端会话，跑几天后表现为「fd 用尽 / 服务端
+>    会话暴涨」。`establish` 进入时先 `closeCurrent()`（删订阅 + 关会话），
+>    首次建立时它是空操作。
 
 #### 3.9.8 内置服务端（`internal/opcuaserver`）
 

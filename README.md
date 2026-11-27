@@ -1508,7 +1508,7 @@ make sbom     # 从产物内嵌 buildinfo 生成 CycloneDX SBOM（零第三方�
 | `internal/codec/opcua` | OPC UA 纯函数编解码（UACP、安全报文、NodeId、Variant、九类服务） |
 | `internal/driver/modbus` | Modbus TCP + RTU + ASCII 主站 |
 | `internal/driver/s7` | S7（S7comm）主站；块服务走独立一次性 `Session`（目录 / 属性 / 上传） |
-| `internal/driver/opcua` | OPC UA 主站（None/None + 匿名，三层状态机）；可选订阅推送（独立第二条连接） |
+| `internal/driver/opcua` | OPC UA 主站（None/None + 匿名，三层状态机）；可选订阅推送（独立第二条连接，重连先关旧连接） |
 | `internal/driver/mqtt` | MQTT 南向（订阅取数）：推送适配成拉取，三档新鲜度质量码 |
 | `internal/driver/computed` | 计算点：表达式驱动，同设备依赖在一次 Read 内按拓扑序闭合 |
 | `internal/driver/virtual` | 虚拟设备（波形 + 故障注入） |
