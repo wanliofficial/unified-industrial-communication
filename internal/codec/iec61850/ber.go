@@ -238,6 +238,13 @@ func decodeUnsigned(b []byte) (uint64, error) {
 	if len(b) > 8 {
 		return 0, fmt.Errorf("iec61850: unsigned of %d octets is out of range", len(b))
 	}
+	// 前导 0xFF 是有符号 -1 的编码：当成无符号读会把 -1 读成 2^64-1。
+	// MMS 里 Unsigned 字段按 BER 也是非负的，出现前导 0xFF 是对端发了负数，
+	// 静默接受会得到一个荒谬的大数（如把 MaxPDUSize 读成 1.8e19），不如
+	// 就地报错，让问题停在产生它的那一帧。单字节 0xFF 同样是 -1，一并拒绝。
+	if b[0] == 0xFF {
+		return 0, fmt.Errorf("iec61850: unsigned with leading 0xFF (negative encoding): % x", b)
+	}
 	var v uint64
 	for _, c := range b {
 		v = v<<8 | uint64(c)

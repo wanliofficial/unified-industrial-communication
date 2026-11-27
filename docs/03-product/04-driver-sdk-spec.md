@@ -7569,7 +7569,7 @@ uic iec61850read -list
 
 | 层 | 用例 |
 |---|---|
-| `codec/iec61850` | BER 整数最短补码与无符号符号位、不定长拒绝、长形式长度、位串/浮点往返；TPKT 往返与版本校验；COTP CR 形状、CC/DT 往返、TPDU size 码；**会话层 `0xFF` 扩展长度**、CN/AC 形状、DT 固定四字节头、FIN/AB；表示层 CP/CPA 形状与上下文编号；ACSE AARQ/AARE 往返、带认证、拒绝、固定 PDU（RLRQ/RLRE/ABRT）；MMS Initiate 形状与响应往返；对象名两种形态；读/写/getNameList 请求形状与响应往返、**写请求变量数与数据数不等时拒绝**、读响应部分失败；类型规格与数据值往返；`Data.ToValue` 拒绝结构体、`ValueFromData` 类型放宽、位串取值；连接 PDU 全链、连接响应全链、拒绝解析、`WrapData`/`UnwrapData`、错误上下文拒绝、释放 PDU；对象引用解析（显式 FC / 默认 FC / 六类语法错）、`String`、`SplitMMSName`、`DataSetName`；**服务端侧构造与解析往返**（`BuildReadResponse`/`ParseReadResponse`、`BuildWriteResponse`/`ParseWriteResponse`、四个请求解析、`MMSServiceTag`、`ConfirmedResponse` 对称、错误服务标签拒绝、坏值降级为 `object-invalidated`） |
+| `codec/iec61850` | BER 整数最短补码与无符号符号位、**无符号拒绝前导 `0xFF`（负编码，避免把 -1 读成 `2^64-1`）**、不定长拒绝、长形式长度、位串/浮点往返；TPKT 往返与版本校验；COTP CR 形状、CC/DT 往返、TPDU size 码；**会话层 `0xFF` 扩展长度**、CN/AC 形状、DT 固定四字节头、FIN/AB；表示层 CP/CPA 形状与上下文编号；ACSE AARQ/AARE 往返、带认证、拒绝、固定 PDU（RLRQ/RLRE/ABRT）；MMS Initiate 形状与响应往返；对象名两种形态；读/写/getNameList 请求形状与响应往返、**写请求变量数与数据数不等时拒绝**、读响应部分失败；类型规格与数据值往返；`Data.ToValue` 拒绝结构体、`ValueFromData` 类型放宽、位串取值；连接 PDU 全链、连接响应全链、拒绝解析、`WrapData`/`UnwrapData`、错误上下文拒绝、释放 PDU；对象引用解析（显式 FC / 默认 FC / 六类语法错）、`String`、`SplitMMSName`、`DataSetName`；**服务端侧构造与解析往返**（`BuildReadResponse`/`ParseReadResponse`、`BuildWriteResponse`/`ParseWriteResponse`、四个请求解析、`MMSServiceTag`、`ConfirmedResponse` 对称、错误服务标签拒绝、坏值降级为 `object-invalidated`） |
 | `driver/iec61850` | `Meta`（能力/地址种类/`defaultFC` 与 `probeObject` 字段）；`Open` 拒绝非 TCP 与非法对象引用；`Probe` 建立关联；bool/int/float 三类读；`defaultFC` 补齐；对象不存在 → `address`；写后读回；写不存在对象 → `address`；关联被拒 → `protocol` 且 `assocCount==0`；读超时 → `timeout`；`Browse` 全量枚举且不产生读请求；`Browse` 未知域返回空列表；**部分失败语义（好点 + 坏对象引用时 `err==nil`、全失败才返回错误）** |
 | `sim/iec61850` | 手写最小客户端（**不复用驱动**）：默认对象表每个值都能被 `ToValue` 读懂、名字有序、`Set`/`Get`；真实 TCP 上的多对象读、未知对象逐项 `object-non-existent`、写落地、写未知对象失败；**getNameList 分页**（每页 3 项 + continueAfter 驱动读完，且只回项名）；关联被拒；`DropReads` 超时后恢复投递仍能读；有序释放回 RLRE |
 | `pointtable` | `PolicyFor("iec61850")` 是 `WidthNone + AllowSymbol` 且不泄漏 length/DPT/selector 标志；正向（显式 FC、默认 FC 补齐）× 反向（缺 LD、非标准 FC、带 length） |
@@ -7590,7 +7590,7 @@ uic iec61850read -list
 
 | 文件 | 内容 |
 |---|---|
-| `internal/codec/iec61850/ber.go` | BER 基础（TLV、长度、整数最短补码、无符号符号位、位串、浮点、时间） |
+| `internal/codec/iec61850/ber.go` | BER 基础（TLV、长度、整数最短补码、无符号符号位、拒绝负编码前导 `0xFF`、位串、浮点、时间） |
 | `internal/codec/iec61850/tpkt.go` | TPKT 组帧/解析/长度预读（版本 3） |
 | `internal/codec/iec61850/cotp.go` | COTP CR/CC/DT/DR、TPDU size 码、`DefaultCOTPOptions`、`BuildCOTPData`/`ParseCOTPData` |
 | `internal/codec/iec61850/session.go` | 会话层：**独立的 LI 解析**（`0xFF` + 恰好两字节）、CN/AC/DT/FIN/DN/AB/RF、`ParseSPDU`、SPDU 常量 |

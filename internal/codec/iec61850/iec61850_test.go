@@ -80,6 +80,34 @@ func TestEncodeUnsignedKeepsSignBitClear(t *testing.T) {
 	}
 }
 
+func TestDecodeUnsignedRejectsLeadingFF(t *testing.T) {
+	// 前导 0xFF 是 -1 的 BER 编码：按无符号读会把 -1 读成 2^64-1。
+	// decodeUnsigned 的文档承诺拒绝它，否则对端发一个负数进 Unsigned 字段
+	// （或把 MaxPDUSize 编成 0xFF..FF）会被静默接受成一个荒谬的大数。
+	for _, b := range [][]byte{
+		{0xFF},
+		{0xFF, 0xFF},
+		{0xFF, 0x01},
+		{0x80, 0xFF, 0xFF}, // 前导 0x80 合法，但第二位起全 1 不该整体触发
+	} {
+		// 只有首字节是 0xFF 才拒绝；0x80 开头是合法补零。
+		if b[0] == 0x80 {
+			if _, err := decodeUnsigned(b); err != nil {
+				t.Errorf("decodeUnsigned(% x) should accept a 0x80-prefixed value, got %v", b, err)
+			}
+			continue
+		}
+		if _, err := decodeUnsigned(b); err == nil {
+			t.Errorf("decodeUnsigned(% x) should reject a leading 0xFF", b)
+		}
+	}
+	// 单字节 0xFF（无补零、就是 255）也要拒绝：它同样是负数编码。
+	// 对照：单字节 0x7F 是合法的 127。
+	if v, err := decodeUnsigned([]byte{0x7F}); err != nil || v != 127 {
+		t.Errorf("decodeUnsigned(7f) = %d, %v; want 127, nil", v, err)
+	}
+}
+
 func TestParseElementRejectsIndefiniteLength(t *testing.T) {
 	// 不定长（0x80）在 IEC 61850 里不使用。接受它意味着「扫描找结束标记」，
 	// 在长度写错时会把整条流读歪，因此明确拒绝。
