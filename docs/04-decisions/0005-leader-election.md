@@ -65,15 +65,15 @@ flock 与 MQTT 软选主都无法覆盖后三者——这正是「分布式强�
 
 ### 3.1 `hashicorp/raft`（**首选**）
 
-**做法**：引入 `github.com/hashicorp/raft`，配 `raft-boltdb`（或自研快照存储）作 `StableStore`/`LogStore`，自写 `Transport`（复用现有 TCP/HTTP 能力）。
+**做法**：引入 `github.com/hashicorp/raft`；存储用 **自写的 bbolt-only `LogStore`/`StableStore`**（只依赖 `go.etcd.io/bbolt`，不用 raft-boltdb 以避开其遗留 `boltdb/bolt` 双份兼容层）+ raft 内置 `FileSnapshotStore` 落快照；节点间用 raft 内置 TCP transport。
 
 **为什么首选**：
 
 1. **纯 Go、零 CGO、社区最成熟** —— 满足 ADR-0001 C7；被 Consul/Nomad/Vault 生产验证，选举、日志复制、快照、成员变更（joint consensus）路径久经考验。
 2. **API 边界清晰**：你提供一个实现 `fsm.FSM` 接口的状态机（`Apply`/`Snapshot`/`Restore`），raft 只负责「把日志一致地喂给每个副本的 FSM」——这正好对应本决策的「全状态机复制」。
-3. **体积/依赖可控**：核心库 + boltdb + 少量传递依赖（go-msgpack 等），vendor 后可枚举；二进制增量在可接受范围（需 §6 实测确认，不臆断）。
+3. **体积/依赖可控**：核心库 + 少量传递依赖（go-msgpack 等），vendor 后可枚举；二进制增量在可接受范围——**实测：`cmd/uic` 引入 raft+bbolt 前后 21.0 MB → 21.7 MB，增量约 728 KB**。
 
-**代价**：传递依赖约 6~10 个模块（`go-hclog`、`go-metrics`、`go-msgpack`、`raft-boltdb`→`bbolt` 等）；boltdb 的 `mmap` 在 Windows/ARM 需验交叉编译；这些都要进 SBOM。
+**代价**：传递依赖约 6~10 个模块（`go-hclog`、`go-metrics`、`go-msgpack`、`bbolt` 等）；bbolt 的 `mmap` 在 Windows/ARM 需验交叉编译；这些都要进 SBOM。**实测 11 个模块、三平台交叉编译全过（见 §6.2）。**
 
 ### 3.2 `go.etcd.io/raft`（备选）
 
@@ -202,10 +202,10 @@ flock 与 MQTT 软选主都无法覆盖后三者——这正是「分布式强�
 
 | 负面 | 缓解 |
 |---|---|
-| 推翻零依赖约束（产品差异化支点之一） | 依赖有限可枚举、vendor 固化、纳入 SBOM/CI；ADR-0004 正式改为 Superseded（部分）并留痕 |
-| 二进制体积上升、可能逼近 40 MB | §6 实测：引入前后体积对比，写进 ADR；若逼近上限，评估裁剪（如去掉 go-metrics 的 expvar 依赖） |
+| 推翻零依赖约束（产品差异化支点之一） | 依赖有限可枚举、vendor 固化、纳入 SBOM/CI；ADR-0004 正式改为 Superseded（部分）并留痕。**实测依赖面：`go.mod` 固定 11 个模块（2 直连 `hashicorp/raft` + `bbolt`，9 传递），`go.sum` 46 行** |
+| 二进制体积上升、可能逼近 40 MB | **实测：引入前后 `cmd/uic` 21.0 MB → 21.7 MB（+728 KB），三平台 linux/amd64 21 MB、linux/arm64 20 MB、windows/amd64 22 MB，均在 40 MB 内** |
 | 传递依赖的安全面扩大 | 沿用 ADR-0004 工具链：OSV/`govulncheck` 扫描，CI 接入；定期复核 |
-| 交叉编译矩阵（尤其 boltdb mmap 在 Windows/ARM） | 三平台 `make` 交叉编译验收纳入 CI；不满足则换纯 mmap 替代存储 |
+| 交叉编译矩阵（尤其 boltdb mmap 在 Windows/ARM） | **实测三平台（linux/amd64、linux/arm64、windows/amd64）`CGO_ENABLED=0` 交叉编译全部成功，bbolt 的 mmap 未破坏 Windows/ARM 构建**；纳入 CI |
 | 运维需理解 raft（分区、多数派、选主） | `/api/v1/leader` + 指标暴露 term/commitIndex；文档给出「3 节点部署」「故障切换」runbook |
 | 单组 raft 的写吞吐上限 | 控制面写本就低频；样本不入共识，吞吐不受 raft 限制 |
 
