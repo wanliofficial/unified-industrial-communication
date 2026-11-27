@@ -12,8 +12,19 @@ PRD 中 M 级的采集协议已全部落地，FR-CFG-01 的四类寻址模型也
 COV/分段/多属性读仍不做，见 [protocol-status.md](protocol-status.md) §4.1）。非 M 级验收里的 12 类故障注入同样全部有了
 可自动跑的用例（见 §7）。
 
-当前测试基线：**447 条**（带 `--opcua` 全量；本轮**新增 1 条**契约用例。全量实测数字以
-[testing.md](testing.md) 最新一轮为准）。本轮钉住静态 API Token 改密被拒的 `auth.not_a_user`：
+当前测试基线：**447 条**（带 `--opcua` 全量；本轮**不新增用例**，只加强既有 `contract/auth_roles_are_enforced`
+的断言。全量实测数字以 [testing.md](testing.md) 最新一轮为准）。本轮钉住越权/权限拒绝的 `auth.forbidden`：
+错误表 `northbound-api.md` 的 403 行明列这个码，但 `auth_roles_are_enforced` 此前只断言了 4 处 403 的
+**状态码**、从没点名 `error.code`——403 也可能是 `auth.password_change_required`（未改临时口令）或别的码，
+运维要看 code 分清「权限不够」还是「得先改密」。本轮在既有 4 条 403 上各补一句 `error.code == auth.forbidden`，
+覆盖两个**独立抛点**：通用权限中间件（`RestApi.cs`——端点用 `RequirePermissionAttribute` 声明权限，viewer 写点位、
+apply 配置、读审计都走这里，缺权限或端点没声明权限都抛 `auth.forbidden`）与命令按动作查表（`RestApi.Config.cs`——
+`/api/v1/commands` 的权限取决于 action，路由层只能标 `system.read` 下限，`driver.restart` 需要更高权限，由这张表抛
+同一种 403）。两处各自可能被删，故分别点名。非空验证（两处独立扰动，全部运行期实测）：（1）把中间件 `RestApi.cs`
+的 code 改成 `auth.forbidden_mw` → 实测 FAIL（第一条 code 断言「a point-write denial names auth.forbidden」命中）；
+（2）把命令表 `RestApi.Config.cs` 的 code 改成 `auth.forbidden_cmd`（中间件不动）→ 前三条断言仍过、只有命令那条
+「a command denial names auth.forbidden」FAIL，证明是**另一个**抛点。两处各自恢复后源码与 HEAD 字节一致、用例 PASS。
+上一轮（447 条、新增 1 条）钉住静态 API Token 改密被拒的 `auth.not_a_user`：
 错误表 `northbound-api.md` 的 400 行明列这个码，但此前**零断言**——`RestApi.Auth.cs` 的
 `POST /api/v1/auth/password` 在读完鉴权、读请求体**之前**就判 `principal.IsApiToken`，直接返回
 400 `auth.not_a_user`（「静态 API Token 不是账号，没有口令可改」）。这个守卫不能删：静态 API Token

@@ -2945,19 +2945,35 @@ internal static class ContractTests
                 PostWith("/api/v1/points/v1/temp/write",
                     """{"value":{"type":"float64","num":10},"confirm":true}""", viewer), t.Ct);
             t.Equal(HttpStatusCode.Forbidden, write.StatusCode, "a viewer cannot write points");
+            using (var error = await ReadJsonAsync(t, write))
+                t.Equal("auth.forbidden",
+                    error.RootElement.GetProperty("error").GetProperty("code").GetString(),
+                    "a point-write denial names auth.forbidden (middleware permission gate)");
 
             var apply = await host.Client.SendAsync(
                 PostWith("/api/v1/config/apply", """{"json":"{}"}""", viewer), t.Ct);
             t.Equal(HttpStatusCode.Forbidden, apply.StatusCode, "a viewer cannot apply configuration");
+            using (var error = await ReadJsonAsync(t, apply))
+                t.Equal("auth.forbidden",
+                    error.RootElement.GetProperty("error").GetProperty("code").GetString(),
+                    "a config-apply denial names auth.forbidden");
 
             var command = await host.Client.SendAsync(
                 PostWith("/api/v1/commands",
                     """{"action":"driver.restart","params":{"device":"v1"}}""", viewer), t.Ct);
             t.Equal(HttpStatusCode.Forbidden, command.StatusCode,
                 "a viewer cannot restart a driver even though the route is readable");
+            using (var error = await ReadJsonAsync(t, command))
+                t.Equal("auth.forbidden",
+                    error.RootElement.GetProperty("error").GetProperty("code").GetString(),
+                    "a command denial names auth.forbidden (per-action permission table, a separate throw site)");
 
             var audit = await host.Client.SendAsync(GetWith("/api/v1/audit", viewer), t.Ct);
             t.Equal(HttpStatusCode.Forbidden, audit.StatusCode, "a viewer cannot read the audit log");
+            using (var error = await ReadJsonAsync(t, audit))
+                t.Equal("auth.forbidden",
+                    error.RootElement.GetProperty("error").GetProperty("code").GetString(),
+                    "an audit-read denial names auth.forbidden");
 
             var auditorAudit = await host.Client.SendAsync(GetWith("/api/v1/audit", auditor), t.Ct);
             t.Equal(HttpStatusCode.OK, auditorAudit.StatusCode, "an auditor can read the audit log");
