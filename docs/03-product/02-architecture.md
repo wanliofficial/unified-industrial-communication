@@ -535,6 +535,7 @@ Close 会漏——每加一个子系统就多一条 return 路径，而「进程
 | `0002-history-storage.md` | 历史存储（自建有界采样日志） | Accepted |
 | `0003-auth-rbac-audit.md` | 认证 / 授权 / 审计 | Accepted |
 | `0004-toolchain-dependency-security.md` | 工具链与依赖安全（零第三方依赖 + 暂不升级堵不可达 advisory） | Accepted |
+| `0005-leader-election.md` | 多实例 leader 选举（同主机 flock 强一致，跨主机交给中心聚合器，不引入 raft） | Proposed |
 | —（本文档承担） | 四类寻址统一模型 | 见 `03-domain-model.md` |
 | —（本文档承担） | 驱动三层分离 | 见 `04-driver-sdk-spec.md` |
 | —（本文档承担） | 北向四通道 | 见 `05-northbound-api-spec.md` |
