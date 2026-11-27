@@ -857,6 +857,39 @@ func TestSendFrameWrites(t *testing.T) {
 	}
 }
 
+// 接收循环与确认循环/命令下发并发访问共享状态时，-race 必须干净。
+// recvSeq/pendingAck/ackSince 由 readLoop 更新、由 keeper（确认）与 sendASDU
+// （命令）读取，全部走原子量；这里让两条路径同时高频跑，逼出任何遗漏的
+// 非原子访问或丢失更新。
+func TestConcurrentReceiveAndAck(t *testing.T) {
+	hh := newH(t)
+	hh.srv.SetAutoIncrement(true)
+	c := hh.open()
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		// 模拟从站持续突发上送：反复写 IOA 触发上送。
+		for i := 0; i < 200; i++ {
+			_ = hh.srv.SetValue(1001, sim.Info{Kind: sim.KindFloat, Num: float64(i)})
+			time.Sleep(2 * time.Millisecond)
+		}
+	}()
+
+	// 同时持续下发命令，迫使 sendASDU 与 keeper 的确认路径并发跑。
+	deadline := time.Now().Add(700 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		_, _ = c.Write(context.Background(), []driver.WriteRequest{{
+			PointID: "cmd", DataType: model.TypeBool,
+			Address: model.Address{Kind: model.AddressRegister, Area: AreaSingleCommand, Offset: 4001, Bit: -1},
+			Value:   model.BoolValue(time.Now().UnixNano()%2 == 0),
+		}})
+		time.Sleep(5 * time.Millisecond)
+	}
+	wg.Wait()
+}
+
 // 累计量的 IV 位必须一路走到点位质量：设备说「这个读数无效」，驱动不能
 // 把它的值当 good 报上去（电能量结算按增量计费，一个假增量就是一笔错账）。
 // 这条覆盖 codec → 驱动缓存 → Read 的整条链路，而不只是 codec 的单元。
