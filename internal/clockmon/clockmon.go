@@ -179,10 +179,11 @@ func (m *Monitor) Sample(r Reading) (jump Jump, ok bool) {
 	m.last = r
 	m.samples++
 	fn := m.onJump
+	m.mu.Unlock()
+	// 回调必须在锁外执行：它可能调用 Snapshot，持锁回调会自锁。
 	if ok && fn != nil {
 		fn(jump)
 	}
-	m.mu.Unlock()
 	return jump, ok
 }
 
