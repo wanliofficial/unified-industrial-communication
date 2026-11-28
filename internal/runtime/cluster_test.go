@@ -628,18 +628,27 @@ func TestSingleNodeRaftEndToEnd(t *testing.T) {
 		}
 	}, nil)
 
-	// 单节点引导后应立即成为 leader（always-leader）。
-	deadline := time.Now().Add(15 * time.Second)
+	// 单节点引导后应立即成为 leader（always-leader）。但不能一看到
+	// Role==leader 就停：raft 完成选举（follower/term=1 → leader/term=2）后，
+	// bootstrap 配置日志条目还需一次 commit 传播才把 CommitIndex 从 0 推进。
+	// 若在此处立即读 /api/v1/leader 可能拿到 CommitIndex==0（选举已完成但首条
+	// 配置尚未 commit）。因此等待条件必须含 CommitIndex>0——这正是后续
+	// /api/v1/config/apply 链路真实依赖的前置。窗口给到 30s：高负载下选举 +
+	// 首次 commit 传播会被放大（与 consensus 包 failover 测试同源问题）。
+	deadline := time.Now().Add(30 * time.Second)
 	var info httpapi.LeaderInfo
 	for time.Now().Before(deadline) {
 		info = h.rt.Leader()
-		if info.Role == string(consensus.RoleLeader) {
+		if info.Role == string(consensus.RoleLeader) && info.CommitIndex > 0 {
 			break
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
 	if info.Role != string(consensus.RoleLeader) {
 		t.Fatalf("single node never became leader: %+v", info)
+	}
+	if info.CommitIndex == 0 {
+		t.Fatalf("leader but bootstrap config never committed: %+v", info)
 	}
 	if !info.Enabled {
 		t.Fatal("LeaderInfo.Enabled should be true with cluster enabled")
