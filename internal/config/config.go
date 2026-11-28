@@ -647,6 +647,9 @@ func (f *File) validateCluster() error {
 		// 单节点集群：Bootstrap 由 runtime 置 true，本节点恒为 leader。
 		return nil
 	}
+	if len(f.Slaves) > 0 {
+		return errors.New("cluster: slaves are not supported with multi-node clusters (replicated config causes all instances to bind the same TCP listen / open the same serial port, so the second instance aborts at startup; use single-node mode or remove slaves)")
+	}
 	ids := make(map[string]bool, len(c.Peers))
 	addrs := make(map[string]bool, len(c.Peers))
 	self := false

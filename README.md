@@ -1533,7 +1533,7 @@ make sbom     # 从产物内嵌 buildinfo 生成 CycloneDX SBOM（零第三方�
 | `internal/sparkplug` | Sparkplug B 生命周期状态机（主题 / BIRTH 与 DEATH / 节点级序号与回绕 / bdSeq / Rebirth 命令 / 指标映射） |
 | `internal/mqtt` | 自写 MQTT 3.1.1 客户端（北向发布 + 南向订阅共用；QoS0/1、retained、LWT、PING 往返探测·单飞广播、连接代数 `Epoch`、每报文写超时、旧连接 `dropConn` 不误杀新连接、优雅 `Disconnect` 可重连且抑制遗嘱） |
 | `internal/mqtt/mqtttest` | 测试封装：`internal/sim/mqtt` 的 `*testing.T` 生命周期 + 等待断言 |
-| `internal/runtime` | 唯一编排层 + 看门狗 + 后端实现（含各 sink 装配）；集群角色闸：采集 / Outbox / 站点级 MQTT 控制面（`$birth`/`$state`/`$death`/`$alarm`）只由 leader 产生 |
+| `internal/runtime` | 唯一编排层 + 看门狗 + 后端实现（含各 sink 装配）；集群角色闸：采集 / Outbox / 站点级 MQTT 控制面（`$birth`/`$state`/`$death`/`$alarm`）只由 leader 产生；多节点集群配置期拒绝内置南向从站（复制配置必然 bind 冲突，见 ADR-0005 §4.4） |
 
 ## 许可
 

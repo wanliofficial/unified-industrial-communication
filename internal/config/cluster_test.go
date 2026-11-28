@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"uic/internal/model"
 )
 
 // TestClusterValidation 覆盖 cluster 块的全部配置期不变量。
@@ -291,4 +293,95 @@ func TestVersionStableAcrossNodes(t *testing.T) {
 	if a.Version() == "" {
 		t.Fatal("empty version")
 	}
+}
+
+// TestClusterRejectsSlaves 验证多节点集群不允许内置从站。
+//
+// 从站监听地址（TCP listen 或串口路径）是复制配置的一部分：多节点共用同一
+// 份配置意味着第二个实例启动时 net.Listen 必然地址冲突，openSlaves 是硬启
+// 动步骤，冲突会导致该实例直接 abort；即使串口可用，降主副本仍会以 disabled
+// 点位回主站。因此配置期必须拦截。
+func TestClusterRejectsSlaves(t *testing.T) {
+	registerDrivers(t)
+
+	multiCluster := func(slaves ...model.Slave) *File {
+		f := baseFile()
+		f.Cluster = &Cluster{
+			Enabled: true, NodeID: "node-a", Listen: "10.0.0.1:7000",
+			Peers: []Peer{
+				{ID: "node-a", Addr: "10.0.0.1:7000"},
+				{ID: "node-b", Addr: "10.0.0.2:7000"},
+				{ID: "node-c", Addr: "10.0.0.3:7000"},
+			},
+		}
+		f.Slaves = slaves
+		return f
+	}
+	tcpSlave := func(listen string) model.Slave {
+		return model.Slave{
+			ID:     "tcp-" + strings.ReplaceAll(listen, ":", "_"),
+			Listen: listen,
+			Units: []model.SlaveUnit{{
+				UnitID: 1,
+				Mappings: []model.SlaveMapping{
+					{Point: "dev1/p1", Area: model.MappingHolding, Offset: 0},
+				},
+			}},
+		}
+	}
+	serialSlave := func(port string) model.Slave {
+		return model.Slave{
+			ID:     "serial0",
+			Serial: &model.SlaveSerial{Port: port, Framing: "rtu", Baud: 19200},
+			Units: []model.SlaveUnit{{
+				UnitID: 1,
+				Mappings: []model.SlaveMapping{
+					{Point: "dev1/p1", Area: model.MappingHolding, Offset: 0},
+				},
+			}},
+		}
+	}
+
+	t.Run("multi-node rejects TCP slave", func(t *testing.T) {
+		f := multiCluster(tcpSlave("127.0.0.1:15020"))
+		if err := f.Validate(); err == nil {
+			t.Fatal("expected validation error when multi-node cluster has TCP slave")
+		} else if !strings.Contains(err.Error(), "slaves are not supported") {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	})
+
+	t.Run("multi-node rejects serial slave", func(t *testing.T) {
+		f := multiCluster(serialSlave("/dev/ttyUSB0"))
+		if err := f.Validate(); err == nil {
+			t.Fatal("expected validation error when multi-node cluster has serial slave")
+		} else if !strings.Contains(err.Error(), "slaves are not supported") {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	})
+
+	t.Run("multi-node without slaves is accepted", func(t *testing.T) {
+		f := multiCluster()
+		if err := f.Validate(); err != nil {
+			t.Fatalf("multi-node cluster without slaves should be accepted: %v", err)
+		}
+	})
+
+	t.Run("single-node cluster allows TCP slave", func(t *testing.T) {
+		f := baseFile()
+		f.Cluster = &Cluster{Enabled: true, NodeID: "node-a", Listen: "10.0.0.1:7000"}
+		f.Slaves = []model.Slave{tcpSlave("127.0.0.1:15020")}
+		if err := f.Validate(); err != nil {
+			t.Fatalf("single-node cluster with TCP slave should be accepted: %v", err)
+		}
+	})
+
+	t.Run("disabled cluster ignores the guard", func(t *testing.T) {
+		f := baseFile()
+		f.Cluster = &Cluster{Enabled: false, NodeID: "node-a", Listen: "10.0.0.1:7000", Peers: []Peer{{ID: "node-a", Addr: "10.0.0.1:7000"}}}
+		f.Slaves = []model.Slave{tcpSlave("127.0.0.1:15020")}
+		if err := f.Validate(); err != nil {
+			t.Fatalf("disabled cluster with slave should be accepted: %v", err)
+		}
+	})
 }

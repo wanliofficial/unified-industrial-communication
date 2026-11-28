@@ -784,6 +784,9 @@ uic s7upload ... -out -                                  # 输出到标准输出
    一条永远起不来的配置。
 8. `serial.port` 不得与任何 `channels[].transport.port`（串口主站）或其他从站重复。
    半双工总线上两个角色会互相抢答。串口端点上出现 `maxConnections` 同样是配置错误。
+9. 多节点集群（`cluster.peers` 非空）**不允许配置任何从站**：从站监听地址属于复制
+   配置，第二个实例启动时 `net.Listen` 必然地址冲突（串口同理，独占打开），直接
+   abort。配置期 fail-fast 拦截。单节点集群不受影响。见 ADR-0005 §4.4。
 
 宽度来自 `Point.RegisterWidth()`：`bool`/`uint16` 为 1，`float32` 为 2，`float64` 为 4，
 `string`/`bytes` 的 `address.length` 是**寄存器个数**而不是字符数。这条规则单独抽成
