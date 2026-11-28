@@ -9966,10 +9966,10 @@ type OpError struct {
 | `cjt188`（户用计量仪表 188-2004） | supported | supported | unsupported | unsupported | unsupported | unsupported ⁸ | unsupported |
 | `snmp`（v1/v2c 对象读写） | supported | supported | unsupported | unsupported | unsupported | supported ⁹ | unsupported |
 | `ads`（AMS/TCP 符号读写） | supported | supported | unsupported | unsupported | unsupported | unsupported ¹⁰ | unsupported |
-| `opcua` | supported | supported | supported ⁴ | unsupported | experimental | supported | unsupported |
+| `opcua` | supported | supported | supported ⁴ | unsupported | unsupported ¹¹ | supported | unsupported |
 | `mqtt`（南向订阅） | supported | supported | supported ¹ | unsupported | unsupported | supported ² | unsupported |
 | `computed`（计算点） | supported | unsupported ³ | unsupported | unsupported | unsupported | supported | unsupported |
-| `virtual` | supported | supported | supported | supported | unsupported | supported | supported |
+| `virtual` | supported | supported | unsupported ¹² | unsupported ¹² | unsupported | supported | supported |
 
 > ¹ `mqtt` 的 `Subscribe` 指「协议是推送型、由驱动内部订阅」，**不是**驱动对外提供推送回调：
 > 上层拿到的仍然是 `Read` 拉取契约，推送在同包内被消化成最新值表（见 §3.10.1）。
@@ -10010,6 +10010,17 @@ type OpError struct {
 > ¹⁰ ADS 的 `MultiRead` 声明 `unsupported` 是**主动放弃**：`ReadWrite` 可以带多个
 > 句柄，但一次失败无法逐点归因；逐点事务换来「哪个变量、哪一类错误」。这与 645/188
 > 的「协议只能一次一个 DI」不同（见 §3.10.13.1）。
+>
+> ¹¹ OPC UA 的 `Discovery` 声明 `unsupported` 而非本表早先写的 `experimental`：
+> 驱动没有 `GetEndpoints`/`FindServers` 客户端（端点信息只在 `CreateSession`
+> 响应里捎带解析 `PolicyID`），运行时与北向 API 都没有发现入口。声明 `experimental`
+> 会让配置界面出现一个永远点不动的按钮——能力位是「实际存在的行为」的声明，
+> 不是配置意图，不确定时不虚标（见 §5.1「禁止在不确定时声明 supported」）。
+>
+> ¹² virtual（内存模拟设备）的 `Subscribe`/`Browse` 声明 `unsupported` 而非本表
+> 早先写的 `supported`：驱动的 `Conn` 契约只有 `Probe`/`Read`/`Write`/`Close`，
+> 没有任何订阅/浏览代码路径。虚标 `supported` 会经 `driver.List()` 暴露给
+> API/UI，让配置界面出现两个永远点不动的按钮。同样的「按实际行为声明」原则。
 
 ---
 
