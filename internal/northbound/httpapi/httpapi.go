@@ -504,6 +504,9 @@ type Backend interface {
 	Write(ctx context.Context, device string, items []WriteItem) ([]WriteResult, error)
 
 	Config() (json.RawMessage, error)
+	// Describe 返回站点侧配置的只读描述（配置哈希/站点/影响面计数），供中心
+	// 管理平面做配置下发的比对与预览决策。不含配置正文。
+	Describe() config.DescribeInfo
 	ValidateConfig(raw json.RawMessage) error
 	ApplyConfig(ctx context.Context, raw json.RawMessage, source string) (config.ApplyResult, error)
 	ConfigVersions() []config.VersionInfo
@@ -789,6 +792,10 @@ func (s *Server) routes() {
 	route("POST /api/v1/points/{device}/write", rbac.PermWrite, s.writeBatch)
 
 	route("GET /api/v1/config", rbac.PermConfigRead, s.configGet)
+	// describe 是站点侧只读镜像：中心管理平面拉取它以做配置下发的比对
+	// （configVersion 哈希比对决定是否下发）与影响面预览。与 GET /config
+	// 的分工：/config 给正文（脱敏），/config/describe 给决策所需的最小描述。
+	route("GET /api/v1/config/describe", rbac.PermConfigRead, s.configDescribe)
 	route("POST /api/v1/config/validate", rbac.PermConfigWrite, s.configValidate)
 	route("POST /api/v1/config/apply", rbac.PermConfigWrite, s.configApply)
 	route("GET /api/v1/config/versions", rbac.PermConfigRead, s.configVersions)
@@ -1469,6 +1476,28 @@ func (s *Server) configGet(w http.ResponseWriter, _ *http.Request) error {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(raw)
+	return nil
+}
+
+// configDescribe 返回站点侧配置的只读描述：进程契约版本（apiVersion/schema/
+// instanceId）+ 配置版本哈希 + 站点 + 影响面计数。
+//
+// 这是中心管理平面「配置下发」的站点侧前置：中心拉 describe 后，用
+// configVersion 与本地目标配置哈希比对——相同则跳过该站点（零流量下发），
+// 不同才拉取 /config 正文并走灰度。它只读、不触发任何重建，operator 即可查。
+func (s *Server) configDescribe(w http.ResponseWriter, _ *http.Request) error {
+	d := s.be.Describe()
+	v := s.be.Version()
+	writeOK(w, map[string]any{
+		"configVersion": d.ConfigVersion,
+		"site":          d.Site,
+		"devices":       d.Devices,
+		"points":        d.Points,
+		"channels":      d.Channels,
+		"apiVersion":    v.APIVer,
+		"schemaVersion": v.Schema,
+		"instanceId":    v.InstanceID,
+	})
 	return nil
 }
 

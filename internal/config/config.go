@@ -1511,6 +1511,43 @@ func (m *Manager) VersionConfig(version string) (*File, error) {
 	return f, err
 }
 
+// DescribeInfo 是站点侧配置的只读描述，供中心管理平面做「配置下发」决策。
+//
+// 它刻意不含配置正文——正文走 GET /config（脱敏后的完整 canonical JSON）。
+// 这里只给中心「比对与预览」所需的最小集合：当前配置哈希（中心与目标哈希
+// 比对，相同则跳过下发）、站点与实例身份、契约版本、以及本次下发的影响面
+// 统计（设备/点位/通道数，中心据此预估 500 台设备批量下发的规模与分组）。
+type DescribeInfo struct {
+	// ConfigVersion 是当前生效配置的版本哈希（sha256 前缀形式）。它是
+	// VersionOf(Canonical()) 的结果，排除 cluster 块：中心下发的配置面向全
+	// 集群共享内容，与节点的本地集群身份无关，比对哈希时也必须排除它。
+	ConfigVersion string `json:"configVersion"`
+	// Site 是站点标识。
+	Site string `json:"site"`
+	// Devices/Points/Channels 是配置影响面计数（下发会重建的设备规模）。
+	Devices  int `json:"devices"`
+	Points   int `json:"points"`
+	Channels int `json:"channels"`
+}
+
+// Describe 返回当前生效配置的只读描述。
+func (m *Manager) Describe() DescribeInfo {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	f := m.current
+	points := 0
+	for i := range f.Devices {
+		points += len(f.Devices[i].Points)
+	}
+	return DescribeInfo{
+		ConfigVersion: m.version,
+		Site:          f.Site,
+		Devices:       len(f.Devices),
+		Points:        points,
+		Channels:      len(f.Channels),
+	}
+}
+
 // Diff 计算两个版本的差异；from/to 为空时表示当前版本。
 func (m *Manager) Diff(from, to string) (Diff, error) {
 	m.mu.Lock()

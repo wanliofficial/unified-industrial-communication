@@ -32,6 +32,11 @@ func (r *Runtime) Config() (json.RawMessage, error) {
 	return redactJSON(canonical)
 }
 
+// Describe 返回站点侧配置的只读描述，供中心管理平面做配置下发决策。
+func (r *Runtime) Describe() config.DescribeInfo {
+	return r.cfg.Describe()
+}
+
 // ValidateConfig 只校验，不应用。
 func (r *Runtime) ValidateConfig(raw json.RawMessage) error {
 	filled, err := r.fillRedacted(raw)

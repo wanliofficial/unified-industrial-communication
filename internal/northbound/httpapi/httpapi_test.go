@@ -36,6 +36,7 @@ type fakeBackend struct {
 	writeFn func(ctx context.Context, device string, items []WriteItem) ([]WriteResult, error)
 
 	cfg       json.RawMessage
+	describe  config.DescribeInfo
 	versions  []config.VersionInfo
 	configs   map[string]json.RawMessage
 	diff      config.Diff
@@ -135,6 +136,7 @@ func (f *fakeBackend) Write(ctx context.Context, device string, items []WriteIte
 }
 
 func (f *fakeBackend) Config() (json.RawMessage, error) { return f.cfg, nil }
+func (f *fakeBackend) Describe() config.DescribeInfo    { return f.describe }
 func (f *fakeBackend) ValidateConfig(raw json.RawMessage) error {
 	var v any
 	if err := json.Unmarshal(raw, &v); err != nil {
@@ -623,6 +625,51 @@ func TestConfigEndpoints(t *testing.T) {
 	s.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/api/v1/config/rollback", strings.NewReader(`{}`)))
 	if rec.Code != 400 {
 		t.Fatalf("rollback without version = %d", rec.Code)
+	}
+}
+
+// TestConfigDescribe 验证站点侧只读镜像端点：它合并进程契约版本（apiVersion/
+// schema/instanceId，来自 Version()）与配置描述（configVersion/site/影响面
+// 计数，来自 Describe()），供中心管理平面做配置下发的版本协商与影响面预览。
+// 这是中心拉取的唯一入口：configVersion 与本地目标哈希比对，相同则跳过下发。
+func TestConfigDescribe(t *testing.T) {
+	s, be := newServer(t, Options{})
+	be.describe = config.DescribeInfo{
+		ConfigVersion: "sha256:abc123",
+		Site:          "plant-01",
+		Devices:       12,
+		Points:        340,
+		Channels:      3,
+	}
+	be.version = VersionInfo{InstanceID: "uic-xxxx", Schema: 1, APIVer: 1}
+
+	rec := httptest.NewRecorder()
+	s.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/v1/config/describe", nil))
+	if rec.Code != 200 {
+		t.Fatalf("describe = %d %s", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	for _, want := range []string{
+		`"configVersion":"sha256:abc123"`,
+		`"site":"plant-01"`,
+		`"devices":12`,
+		`"points":340`,
+		`"channels":3`,
+		`"apiVersion":1`,
+		`"schemaVersion":1`,
+		`"instanceId":"uic-xxxx"`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("describe body %s missing %s", body, want)
+		}
+	}
+
+	// 只读端点：任何角色只要有 config.read 即可查（operator 也行）。
+	be.describe = config.DescribeInfo{Site: "plant-01"}
+	rec = httptest.NewRecorder()
+	s.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/v1/config/describe", nil))
+	if rec.Code != 200 {
+		t.Fatalf("describe as operator = %d", rec.Code)
 	}
 }
 

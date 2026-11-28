@@ -1514,3 +1514,45 @@ func TestSparkplugDefaults(t *testing.T) {
 		t.Fatalf("json defaults = %+v", g.Northbound.MQTT)
 	}
 }
+
+// TestDescribe 守护站点侧只读描述：影响面计数（设备/点位/通道）、站点、以及
+// 配置版本哈希必须等于 VersionOf(Canonical())——后者是中心做「配置下发」
+// 版本协商的比对基准，若它漂移，中心会对所有站点误判「需要下发」。
+func TestDescribe(t *testing.T) {
+	m, _ := openManager(t)
+
+	d := m.Describe()
+	if d.Site != "plant-01" {
+		t.Fatalf("site = %q, want plant-01", d.Site)
+	}
+	if d.Devices != 1 || d.Points != 1 || d.Channels != 1 {
+		t.Fatalf("counts = dev %d/pt %d/ch %d, want 1/1/1", d.Devices, d.Points, d.Channels)
+	}
+
+	// 配置版本哈希必须等于当前配置 canonical 的 VersionOf。
+	cur := m.Current()
+	canonical, err := cur.Canonical()
+	if err != nil {
+		t.Fatalf("canonical: %v", err)
+	}
+	if want := VersionOf(canonical); d.ConfigVersion != want {
+		t.Fatalf("configVersion = %q, want %q", d.ConfigVersion, want)
+	}
+
+	// 点位数跨设备累加：baseFile 加一台 3 点的设备后应为 4。
+	cur.Devices = append(cur.Devices, model.Device{
+		ID: "dev2", ChannelID: "ch1", Interval: model.Duration(1e9), Enabled: true,
+		Points: []model.Point{
+			{ID: "q1", DataType: model.TypeFloat32, Enabled: true,
+				Address: model.Address{Kind: model.AddressRegister, Area: "holding", Offset: 10, Length: 2, Bit: -1}},
+			{ID: "q2", DataType: model.TypeFloat32, Enabled: true,
+				Address: model.Address{Kind: model.AddressRegister, Area: "holding", Offset: 20, Length: 2, Bit: -1}},
+			{ID: "q3", DataType: model.TypeFloat32, Enabled: true,
+				Address: model.Address{Kind: model.AddressRegister, Area: "holding", Offset: 30, Length: 2, Bit: -1}},
+		},
+	})
+	d2 := m.Describe()
+	if d2.Devices != 2 || d2.Points != 4 {
+		t.Fatalf("after add: counts = dev %d/pt %d, want 2/4", d2.Devices, d2.Points)
+	}
+}
