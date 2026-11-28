@@ -49,12 +49,14 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"log/slog"
 	"math"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -100,6 +102,7 @@ import (
 	sl651sim "uic/internal/sim/sl651"
 	snmpsim "uic/internal/sim/snmp"
 	toledosim "uic/internal/sim/toledo"
+	"uic/internal/tlscert"
 )
 
 // 构建期注入：-ldflags "-X main.version=... -X main.commit=..."
@@ -390,17 +393,38 @@ func runCmd(args []string) {
 
 	errCh := make(chan error, 1)
 	go func() {
-		if cfg.Server.TLS.Enabled && cfg.Server.TLS.CertFile != "" && cfg.Server.TLS.KeyFile != "" {
-			log.Info("http_listening", "addr", srv.Addr, "tls", true)
+		// TLS 装配 fail-closed：配置校验（config.validateServerTLS）已保证
+		// enabled=true 时要么有 certFile/keyFile、要么开了 auto，因此这里
+		// 走到明文只可能是 enabled=false（明确的明文选择）。历史上 enabled
+		// 却缺证书时会打 WARN 然后**回退明文继续服务**——那是最危险的静默
+		// 降级（运维以为加密、实际明文，鉴权 Token 可被窃听），现已改为配置期
+		// 拒绝，启动期不再有「enabled 但没证书」这个分支。
+		switch {
+		case cfg.Server.TLS.Enabled && cfg.Server.TLS.CertFile != "" && cfg.Server.TLS.KeyFile != "":
+			log.Info("http_listening", "addr", srv.Addr, "tls", true, "source", "certFile")
 			errCh <- srv.ListenAndServeTLS(cfg.Server.TLS.CertFile, cfg.Server.TLS.KeyFile)
-			return
+		case cfg.Server.TLS.Enabled && cfg.Server.TLS.Auto:
+			// 自动生成自签证书：免证书分发、开箱即用地拿到传输加密。它不提供
+			// 来源可信（无 CA 链），生产环境要来源可信请改用 certFile/keyFile。
+			host, _, _ := net.SplitHostPort(srv.Addr)
+			if host == "" || host == "0.0.0.0" || host == "::" {
+				host, _ = os.Hostname() // 通配地址无法写进证书 SAN，用主机名兜底
+			}
+			pair, err := tlscert.Generate(host, 0)
+			if err != nil {
+				errCh <- err
+				return
+			}
+			srv.TLSConfig = &tls.Config{Certificates: []tls.Certificate{pair}}
+			log.Info("http_listening", "addr", srv.Addr, "tls", true, "source", "auto",
+				"fingerprint", tlscert.Fingerprint(pair))
+			errCh <- srv.ListenAndServeTLS("", "")
+		default:
+			// enabled=false：明确的明文选择（纯内网联调）。配置校验已拦掉
+			// 「enabled 但无证书无 auto」，所以这里一定是未启用 TLS。
+			log.Info("http_listening", "addr", srv.Addr, "tls", false)
+			errCh <- srv.ListenAndServe()
 		}
-		if cfg.Server.TLS.Enabled {
-			log.Warn("tls_enabled_without_certificate",
-				"detail", "TLS 已开启但未配置 certFile/keyFile，回退到明文 HTTP")
-		}
-		log.Info("http_listening", "addr", srv.Addr, "tls", false)
-		errCh <- srv.ListenAndServe()
 	}()
 
 	// 认证状态按「凭据表」报告，而不是按单个 Token 字段：多用户配置下

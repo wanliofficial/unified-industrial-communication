@@ -531,6 +531,9 @@ func (f *File) Validate() error {
 // Apply，运行中的进程就会带着半套身份继续服务，而被删掉的那个用户直到
 // 下次重启才发现自己的 Token 还能用。宁可在写入时就拒绝。
 func (f *File) validateServer() error {
+	if err := f.validateServerTLS(); err != nil {
+		return err
+	}
 	seenUser := map[string]bool{}
 	seenToken := map[string]bool{}
 	if t := strings.TrimSpace(f.Server.Token); t != "" {
@@ -575,6 +578,46 @@ func (f *File) validateServer() error {
 		}
 	}
 	return nil
+}
+
+// validateServerTLS 在配置期校验 TLS 配置，fail-closed。
+//
+// 这是等保 2.0 安全通信「传输保密性」与本项目 NFR §8「不支持的组合应在配置期
+// 失败、而非运行期静默降级」两条要求的收口：历史上 server.tls.enabled=true 却
+// 没配证书时，进程会打一条 WARN 然后**回退明文 HTTP 继续服务**——运维以为开了
+// 加密，实际鉴权 Token 等敏感数据可被同网窃听，这是最危险的一种「兼容」。现在
+// 配置期直接拒绝这种状态，让它在 `uic -check` 或启动加载配置时就暴露。
+//
+// 三种合法形态：
+//   - enabled=false：明文（明确的、允许的选择，例如纯内网联调）。
+//   - enabled=true + certFile/keyFile：用 CA 签发证书（来源可信，生产推荐）。
+//   - enabled=true + auto：启动时生成自签证书（传输加密、免证书分发，联调/边缘
+//     开箱即用；不提供来源可信，详见 internal/tlscert 包注释）。
+//
+// 非法形态（配置期拒绝）：
+//   - enabled=true 但既无 certFile/keyFile 也无 auto（旧的静默降级，现 fail-closed）。
+//   - certFile/keyFile 只给其一（半配证书必然加载失败，提前拦下给出清晰报错）。
+func (f *File) validateServerTLS() error {
+	t := f.Server.TLS
+	if !t.Enabled {
+		return nil
+	}
+	hasCert := t.CertFile != ""
+	hasKey := t.KeyFile != ""
+	if hasCert != hasKey {
+		// 半配：只给证书没给私钥，或反之。tls.LoadX509KeyPair 必然失败，
+		// 提前在配置期指出，比运行期 ListenAndServeTLS 报错更可操作。
+		return errors.New("server.tls: certFile and keyFile must be configured together")
+	}
+	if hasCert {
+		return nil // 证书文件形态，校验通过。
+	}
+	if t.Auto {
+		return nil // 自签形态，校验通过。
+	}
+	// enabled 但既无证书文件也无 auto：过去会静默降级明文，现在配置期拒绝。
+	return errors.New("server.tls: enabled but no certFile/keyFile and auto=false; " +
+		"refusing to fall back to plaintext HTTP (configure certFile/keyFile or set auto=true)")
 }
 
 // validateCluster 校验跨实例协调配置。

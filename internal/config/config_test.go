@@ -92,8 +92,62 @@ func TestValidateRejects(t *testing.T) {
 		"schema mismatch":   func(f *File) { f.SchemaVersion = 99 },
 		"bad point id":      func(f *File) { f.Devices[0].Points[0].ID = "Bad ID" },
 		"bit on non-bool":   func(f *File) { f.Devices[0].Points[0].Address.Bit = 3 },
+		// TLS fail-closed：enabled 却无证书文件也无 auto（旧的静默降级，现配置期拒绝）。
+		"tls enabled no cert": func(f *File) {
+			f.Server.TLS = TLS{Enabled: true}
+		},
+		// TLS：certFile/keyFile 必须成对，半配（只给证书）在配置期拒绝。
+		"tls cert without key": func(f *File) {
+			f.Server.TLS = TLS{Enabled: true, CertFile: "cert.pem"}
+		},
 	}
 	for name, mut := range cases {
+		f := baseFile()
+		mut(f)
+		if err := f.Validate(); err == nil {
+			t.Fatalf("%s: expected validation error", name)
+		}
+	}
+}
+
+// 空通道列表不能 panic（Normalize 曾经直接取 Channels[0]）。
+// TestValidateServerTLS 守护 TLS 配置校验的三种合法形态都通过、两种非法形态被拒。
+// 这是等保「传输保密性」与 NFR「配置期失败而非静默降级」的收口：过去 enabled
+// 无证书会静默降级明文，现在配置期直接拒绝。
+func TestValidateServerTLS(t *testing.T) {
+	registerDrivers(t)
+
+	ok := map[string]func(*File){
+		"disabled (明文)": func(f *File) {
+			f.Server.TLS = TLS{Enabled: false}
+		},
+		"cert+key 成对": func(f *File) {
+			f.Server.TLS = TLS{Enabled: true, CertFile: "c.pem", KeyFile: "k.pem"}
+		},
+		"auto 自签": func(f *File) {
+			f.Server.TLS = TLS{Enabled: true, Auto: true}
+		},
+	}
+	for name, mut := range ok {
+		f := baseFile()
+		mut(f)
+		if err := f.Validate(); err != nil {
+			t.Fatalf("%s: expected valid, got %v", name, err)
+		}
+	}
+
+	bad := map[string]func(*File){
+		"enabled 无证书无 auto（旧的静默降级）": func(f *File) {
+			f.Server.TLS = TLS{Enabled: true}
+		},
+		"cert 有 key 无（半配）": func(f *File) {
+			f.Server.TLS = TLS{Enabled: true, CertFile: "c.pem"}
+		},
+		"key 有 cert 无（半配）": func(f *File) {
+			f.Server.TLS = TLS{Enabled: true, KeyFile: "k.pem"}
+		},
+	}
+	for name, mut := range bad {
 		f := baseFile()
 		mut(f)
 		if err := f.Validate(); err == nil {
@@ -113,7 +167,6 @@ func TestValidateEmptyChannelsDoesNotPanic(t *testing.T) {
 	}
 }
 
-// 设备没配 timeout 时必须继承「它自己所属 channel」的超时，而不是 Channels[0]。
 // 多通道、各通道超时不同的配置里，挂在慢通道上的设备若被第一个（可能很快）
 // 通道的超时提前掐断，会表现为「明明配了 30s 却 3s 就超时」，且没有任何报错。
 func TestDeviceTimeoutInheritsOwnChannel(t *testing.T) {

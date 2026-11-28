@@ -27,7 +27,7 @@
 |---|---|---|---|
 | a) 对登录用户进行身份标识和鉴别，标识唯一，鉴别有难度 | ✓ | `internal/auth/auth.go` `Store.Authenticate`；`internal/auth/token.go` | Token 明文不落盘：配置可只存 `tokenSha256`（不可逆），比对时先对入参做 SHA-256 再比（`auth.go:225`）。多用户各自唯一标识（用户名进 `Principal`，用于审计）。「有难度」靠 Token 自身熵（≥16 字符、禁弱口令表，见下）。 |
 | b) 登录失败处理：失败次数限制、结束会话、超时自动退出 | ✗ | — | **缺口**：当前无登录失败计数与锁定，也无基于闲置的超时退出（会话层）。边缘网关多为服务间长连接、人工交互式登录少，风险低于典型业务系统，但等保三级要求此子项，需部署方在接入层补齐或在后续版本实现。 |
-| c) 远程管理防鉴别信息被窃听 | ◐ | `cmd/uic/main.go:393` `ListenAndServeTLS`；`internal/model` `Server.TLS` | 配齐 `server.tls`（enabled + certFile + keyFile）即强制 TLS，传输加密防窃听。**但** TLS 开启而缺证书时会打 `tls_enabled_without_certificate` WARN 并**回退明文 HTTP**（`main.go:398`）——见 §2 风险 R-1。 |
+| c) 远程管理防鉴别信息被窃听 | ✓ | `cmd/uic/main.go:393` `ListenAndServeTLS`；`internal/model` `Server.TLS`；`internal/tlscert` | 配齐 `server.tls`（enabled + certFile + keyFile）即强制 TLS，传输加密防窃听；或 `auto:true` 启动时生成自签证书（免证书分发、开箱即用，不提供来源可信）。**fail-closed**（已修复 R-1）：`enabled` 却既无证书文件也无 `auto` 时，配置期（`config.validateServerTLS`）直接拒绝，**不再静默回退明文 HTTP**。 |
 | d) 口令复杂度与定期更换 | ◐ | `internal/auth/auth.go` `ValidateToken` | 已有：≥16 字符、≤512、禁空白、禁已知弱口令占位符（`weakTokens`）。**缺**：「定期更换」无强制机制（配置项可手工换，无到期强制）。 |
 
 ### 1.2 访问控制（控制点 8.1.4）
@@ -99,7 +99,7 @@
 
 | 编号 | 缺口 | 对应控制点 | 风险 | 处置建议 |
 |---|---|---|---|---|
-| **R-1** | TLS 开启但缺证书时**静默回退明文 HTTP**（`main.go:398`，打 WARN 后继续明文） | 安全通信 / 数据保密性 (传输) | 高：运维以为开了 TLS，实际明文，鉴别信息可被窃听。违背 NFR §8「不支持的组合应在配置期失败，而非运行期静默降级」原则 | 短期：部署验收须核对启动日志 `tls=true`。建议改为「TLS 开启即强制要求证书，缺失则启动失败」（fail-closed）。 |
+| **R-1** ✅已修复 | ~~TLS 开启但缺证书时静默回退明文 HTTP~~：已改为 fail-closed——`enabled` 无证书文件且无 `auto` 时配置期（`config.validateServerTLS`）直接拒绝，不再静默降级；同时实现 `server.tls.auto` 自动生成自签证书（`internal/tlscert`，纯标准库），免证书分发即可拿到传输加密 | 安全通信 / 数据保密性 (传输) | ~~高~~ 已消除 | 已落地并测试守护（`tlscert.TestGenerateProducesUsableCert` 证书可用、config `TestValidateServerTLS` 三合法两非法形态）。自签不提供来源可信，生产仍建议 CA 证书。 |
 | **R-2** | 配置内**链路凭据明文存储**（MQTT/OPC UA 用户名口令，`model.go:893`） | 数据保密性 (存储) / 剩余信息保护 | 中：拿到配置文件即拿到凭据。等保三级要求重要数据存储保密性 | 短期：配置文件 0o600 + 纳入版本快照脱敏。建议：引入信封加密（KEK 来自环境/外部 KMS）或对接密钥管理。 |
 | **R-3** | **无登录失败锁定 / 无会话超时退出**（`auth.go` 仅做成功比对） | 身份鉴别 b) / 入侵防范 c) | 中：无法防在线口令爆破。三级明确要求 | 边缘场景可评估在接入层（反代/WAF）实现；或后续版本内置失败计数 + 锁定窗口。 |
 | **R-4** | **无口令到期强制更换** | 身份鉴别 d) | 低 | 配置项可手工轮换；建议纳入运维制度。 |

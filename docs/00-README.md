@@ -1851,7 +1851,7 @@ OPC UA 服务端（同一份点位表的另一个出口）：
 | 认证的边界 | ⚠️ | 不做会话/口令/过期/自助轮换（见 ADR-0003）；不做账户锁定与失败次数限制；未配置凭据时进入 open 模式并告警，不生成默认口令 |
 | 审计 | ✅ | 写入/命令/报警确认/配置变更/越权尝试逐条落盘（写入按点位逐项）；NDJSON 分段 + SHA-256 哈希链（`seq`/`prev`/`hash`）；`/audit` 倒序游标查询、`/audit/verify` 指认第一条不一致记录、`/audit/stats` 水位；默认开启，写失败只计数不阻断业务 |
 | 审计的边界 | ⚠️ | 不加密（能读文件即可看内容，但不含凭据）；哈希链不能自证「从第一段开始整体重写」（需外部锚点，Wave 2）；`dir`/`maxBytes`/`segmentBytes`/`maxAge` 改动需重启，其余即时生效 |
-| TLS | ✅ | `server.tls.enabled` + `certFile`/`keyFile`；开启但缺证书时回退明文并打 WARN（自签证书自动生成仍属 Wave 2） |
+| TLS | ✅ | `server.tls.enabled` + `certFile`/`keyFile`（CA 签发，来源可信）；或 `auto:true` 启动时生成自签证书（免证书分发、传输加密，详见 `internal/tlscert`）。**fail-closed**：`enabled` 却既无证书文件也无 `auto` 时配置期直接拒绝（`config.validateServerTLS`），不再静默回退明文——这是等保 2.0 安全通信与 NFR §8 红线的要求 |
 | `uic token` | ✅ | 生成 ≥16 字符 base64url Token + `tokenSha256` + 可直接粘贴的 `server.users` 片段（`-count` / `-json`） |
 | `uic -check` | ✅ | 纯校验，不写快照/状态文件（可在 CI 里安全运行） |
 
