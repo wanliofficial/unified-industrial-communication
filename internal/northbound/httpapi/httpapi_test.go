@@ -1512,3 +1512,44 @@ func TestLeaderEndpoint(t *testing.T) {
 		t.Fatalf("status = %q, want ok", hb.Status)
 	}
 }
+
+// TestHealthzTimestampIsUTC 守护对外时间戳统一 UTC 的契约（规范 §4.8.5：
+// 「所有对外时间戳都是 UTC」）。
+//
+// 注入一个 +08:00 时区的固定时刻，验证 /healthz 的 ts 字段仍是 UTC——
+// 即偏移为 0、且与「同一时刻用 UTC 表示」数值相等。这条守护不依赖任何运行时
+// 配置：时区不是可配置项，是契约，靠测试钉死「无论本机时区如何，对外都是 UTC」。
+// 与 audit 包的 TestRecordTimesAreUTC 同源，覆盖北向 HTTP 这条对外链路。
+func TestHealthzTimestampIsUTC(t *testing.T) {
+	moment := time.Date(2026, 3, 1, 12, 0, 0, 0, time.FixedZone("CST", 8*3600))
+	s, _ := newServer(t, Options{Now: func() time.Time { return moment }})
+
+	rec := httptest.NewRecorder()
+	s.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/healthz", nil))
+	if rec.Code != 200 {
+		t.Fatalf("code = %d body = %s", rec.Code, rec.Body.String())
+	}
+
+	var env struct {
+		Status string `json:"status"`
+		TS     string `json:"ts"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &env); err != nil {
+		t.Fatalf("unmarshal: %v (body=%s)", err, rec.Body.String())
+	}
+	// 响应里的 ts 必须带 Z（UTC）后缀，不能带 +08:00。
+	if !strings.HasSuffix(env.TS, "Z") {
+		t.Fatalf("ts = %q, want UTC 'Z' suffix", env.TS)
+	}
+	parsed, err := time.Parse(time.RFC3339, env.TS)
+	if err != nil {
+		t.Fatalf("parse ts %q: %v", env.TS, err)
+	}
+	if _, offset := parsed.Zone(); offset != 0 {
+		t.Fatalf("ts offset = %d, want 0 (UTC)", offset)
+	}
+	// 与注入时刻必须是同一绝对时刻（时区只是表示，时刻不变）。
+	if !parsed.Equal(moment) {
+		t.Fatalf("ts = %s, want same instant as %s", parsed, moment)
+	}
+}

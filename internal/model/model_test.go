@@ -824,3 +824,92 @@ func TestSlaveSerialEndpoint(t *testing.T) {
 		t.Fatalf("defaults = %+v", n)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// 单位与量纲
+// ---------------------------------------------------------------------------
+
+func TestDimensionOf(t *testing.T) {
+	cases := []struct {
+		symbol string
+		want   Dimension
+		known  bool
+	}{
+		// 温度三种写法都映射到同一个热力学温度量纲。
+		{"degC", dimTemperature, true},
+		{"℃", dimTemperature, true},
+		{"°C", dimTemperature, true},
+		{"K", dimTemperature, true},
+		// 功率 / 能量 / 频率是不同量纲。
+		{"W", dimPower, true},
+		{"Wh", dimEnergy, true},
+		{"Hz", dimFrequency, true},
+		// 无量纲。
+		{"%", dimNone, true},
+		// 体积流量两种写法量纲相同。
+		{"m3/h", Dimension{L: 3, T: -1}, true},
+		{"m³/h", Dimension{L: 3, T: -1}, true},
+		// 未知单位。
+		{"widgets", Dimension{}, false},
+		{"", Dimension{}, false},
+	}
+	for _, c := range cases {
+		got, ok := DimensionOf(c.symbol)
+		if ok != c.known {
+			t.Fatalf("DimensionOf(%q) known = %v, want %v", c.symbol, ok, c.known)
+		}
+		if got != c.want {
+			t.Fatalf("DimensionOf(%q) = %+v, want %+v", c.symbol, got, c.want)
+		}
+	}
+}
+
+func TestPointUnitValidation(t *testing.T) {
+	// 已知单位 + 数值点位：合法。
+	p := validPoint()
+	p.Unit = "degC"
+	if err := p.Validate(); err != nil {
+		t.Fatalf("known unit on numeric point: %v", err)
+	}
+
+	cases := map[string]func(*Point){
+		// 未知单位 fail-closed。
+		"unknown unit":    func(p *Point) { p.Unit = "widgets" },
+		"misspelled unit": func(p *Point) { p.Unit = "celsius" },
+		"unit on bool":    func(p *Point) { p.Unit = "kg"; p.DataType = TypeBool; p.Address.Bit = 0 },
+		"unit on string":  func(p *Point) { p.Unit = "kg"; p.DataType = TypeString; p.Address.Length = 4 },
+		"unit on bytes":   func(p *Point) { p.Unit = "kg"; p.DataType = TypeBytes; p.Address.Length = 4 },
+	}
+	for name, mut := range cases {
+		q := validPoint()
+		mut(&q)
+		if err := q.Validate(); err == nil {
+			t.Fatalf("%s: expected error", name)
+		}
+	}
+
+	// 数值点位 + 空单位：合法（单位可选）。
+	q := validPoint()
+	q.Unit = ""
+	if err := q.Validate(); err != nil {
+		t.Fatalf("numeric point without unit: %v", err)
+	}
+}
+
+// TestUnitTableCoversExampleUnits 守护受控词表与 examples 的契约：
+// examples/ 下出现过的每个工程单位都必须能被识别，否则存量配置会被新校验
+// 误伤。新增 examples 单位时若忘了登记，这里直接变红。
+func TestUnitTableCoversExampleUnits(t *testing.T) {
+	examples := []string{
+		"degC", "℃", "°C", "K", "V", "kV", "A", "mA", "Hz", "rpm",
+		"m", "mm", "km", "kg", "g", "t", "s", "min", "h",
+		"Pa", "kPa", "MPa", "bar", "J", "Wh", "kWh", "varh", "W", "kW",
+		"m3", "m³", "m3/h", "m³/h", "m3/s", "m3/min", "m/s", "km/h",
+		"%", "%RH", "ppm", "B", "ticks", "次/min", "元", "元/kWh",
+	}
+	for _, u := range examples {
+		if _, ok := DimensionOf(u); !ok {
+			t.Fatalf("unit %q is used in examples but missing from the controlled table", u)
+		}
+	}
+}

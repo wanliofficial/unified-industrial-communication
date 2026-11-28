@@ -529,6 +529,156 @@ func (q Quality) IsUsable() bool {
 }
 
 // ---------------------------------------------------------------------------
+// 单位与量纲
+// ---------------------------------------------------------------------------
+
+// Dimension 是一个物理量的量纲，用七个 SI 基本量纲的指数表示。
+//
+// 为什么用指数向量而不是字符串标签：量纲要能比较「是不是同一种物理量」，
+// 指数向量可以直接判等，也能为后续「跨点位运算结果量纲推断」打底。当前阶段
+// 只用它做两件事——配置期受控词表校验、以及把已知单位的量纲暴露给上游，
+// 不做任何单位换算（见 Point.Validate 的单位注释）。
+//
+// 七个分量对应 SI 七个基本量纲：
+//
+//	L 长度、M 质量、T 时间、I 电流、Θ 热力学温度、N 物质的量、J 发光强度
+type Dimension struct {
+	L, M, T, I, Th, N, J int
+}
+
+// 几个常用量纲，避免到处写字面量。
+var (
+	dimNone        = Dimension{}                         // 无量纲
+	dimTemperature = Dimension{Th: 1}                    // 温度（热力学温标之差/间隔）
+	dimLength      = Dimension{L: 1}                     // 长度
+	dimMass        = Dimension{M: 1}                     // 质量
+	dimTime        = Dimension{T: 1}                     // 时间
+	dimCurrent     = Dimension{I: 1}                     // 电流
+	dimVoltage     = Dimension{M: 1, L: 2, T: -3, I: -1} // 电压（= 电功率 / 电流）
+	dimFrequency   = Dimension{T: -1}                    // 频率
+	dimVelocity    = Dimension{L: 1, T: -1}              // 速度
+	dimPressure    = Dimension{M: 1, L: -1, T: -2}       // 压力/压强
+	dimEnergy      = Dimension{M: 1, L: 2, T: -2}        // 能量
+	dimPower       = Dimension{M: 1, L: 2, T: -3}        // 功率
+)
+
+// unitEntry 把一个工程单位字符串映射到它的量纲。
+//
+// 这是受控词表：平台只承认表里的单位。新增单位在这里登记一次，配置校验、
+// 文档、测试共用同一张表，避免「同一个温度三种写法、没人说得清哪个对」。
+type unitEntry struct {
+	symbol string
+	dim    Dimension
+}
+
+// unitTable 是全部受承认的工程单位。
+//
+// 收录范围取自 examples 与各协议驱动实际产出的单位，外加一批常见工程单位
+// 备用。注意同一物理量在这里只保留一种「规范写法」，其它写法要么登记为别名
+// 指向同一量纲（degC/℃/°C 都映射到 dimTemperature）、要么不收（由用户改配置）。
+var unitTable = []unitEntry{
+	// 温度：三种常见写法都收，统一映射到热力学温度量纲。
+	{"degC", dimTemperature},
+	{"℃", dimTemperature},
+	{"°C", dimTemperature},
+	{"K", Dimension{Th: 1}},
+
+	// 长度 / 距离
+	{"m", dimLength},
+	{"mm", Dimension{L: 1}},
+	{"km", Dimension{L: 1}},
+
+	// 质量
+	{"kg", dimMass},
+	{"g", dimMass},
+	{"t", dimMass},
+
+	// 时间
+	{"s", dimTime},
+	{"min", dimTime},
+	{"h", dimTime},
+
+	// 电流
+	{"A", dimCurrent},
+	{"mA", dimCurrent},
+
+	// 电压：电流量纲之外的另一电气量纲（功率 = 电压 × 电流）。
+	{"V", dimVoltage},
+	{"kV", dimVoltage},
+	{"mV", dimVoltage},
+
+	// 货币 / 电价：无 SI 量纲，按无量纲收录。复合电价（元/kWh）作为整体
+	// 也收录，避免误伤存量配置。
+	{"元", dimNone},
+	{"元/kWh", dimNone},
+
+	// 频率
+	{"Hz", dimFrequency},
+
+	// 转速（工程习惯：revolution/minute，按时间量纲处理）
+	{"rpm", dimTime},
+
+	// 速度
+	{"m/s", dimVelocity},
+	{"km/h", dimVelocity},
+
+	// 压力 / 压强
+	{"Pa", dimPressure},
+	{"kPa", dimPressure},
+	{"MPa", dimPressure},
+	{"bar", dimPressure},
+
+	// 能量 / 电能
+	{"J", dimEnergy},
+	{"Wh", dimEnergy},
+	{"kWh", dimEnergy},
+	{"varh", dimEnergy},
+
+	// 功率
+	{"W", dimPower},
+	{"kW", dimPower},
+
+	// 体积流量（m³ 的两种写法都收）
+	{"m3", Dimension{L: 3}},
+	{"m³", Dimension{L: 3}},
+	{"m3/h", Dimension{L: 3, T: -1}},
+	{"m³/h", Dimension{L: 3, T: -1}},
+	{"m3/s", Dimension{L: 3, T: -1}},
+	{"m3/min", Dimension{L: 3, T: -1}},
+
+	// 无量纲 / 比率
+	{"%", dimNone},
+	{"%RH", dimNone},
+	{"ppm", dimNone},
+
+	// 计数 / 杂项单位：协议里出现但无 SI 量纲，按无量纲收录以免误伤存量配置。
+	{"B", dimNone},
+	{"ticks", dimNone},
+	{"次/min", dimNone},
+}
+
+// unitIndex 按 symbol 索引单位，供 O(1) 查量纲。
+var unitIndex = func() map[string]Dimension {
+	m := make(map[string]Dimension, len(unitTable))
+	for _, e := range unitTable {
+		// 先登记者胜：重复定义以第一个为准，避免别名把规范写法覆盖掉。
+		if _, ok := m[e.symbol]; !ok {
+			m[e.symbol] = e.dim
+		}
+	}
+	return m
+}()
+
+// DimensionOf 返回单位 symbol 的量纲，以及它是否是受控词表里的已知单位。
+//
+// 未知单位返回 (Dimension{}, false)，由调用方决定怎么处理——配置加载期走
+// fail-closed（拒绝），运行期上报则原样透传（见 Point 的单位注释）。
+func DimensionOf(symbol string) (Dimension, bool) {
+	d, ok := unitIndex[symbol]
+	return d, ok
+}
+
+// ---------------------------------------------------------------------------
 // 点位
 // ---------------------------------------------------------------------------
 
@@ -601,6 +751,25 @@ func (p Point) Validate() error {
 	}
 	if p.Address.Kind == AddressRegister && p.Address.Bit >= 0 && p.DataType != TypeBool {
 		return fmt.Errorf("point %q: address.bit >= 0 requires bool dataType", p.ID)
+	}
+	// 单位受控词表校验：只对数值点位生效。字符串/布尔点位带单位是配置错误
+	// （驱动不会产出、下游也没法解释），数值点位的单位必须是受控词表里的
+	// 已知写法——否则同一个温度会出现 degC/℃/°C 三种没人说得清对错的写法。
+	//
+	// 为什么 fail-closed 而不是放行未知单位：单位会原样进北向契约（Sample.Unit
+	// → contract / SparkPlug），一个拼错的单位一旦上线，下游消费者的量纲假设
+	// 就静默错掉，事后排查极难。配置期一次报错，远比上线后静默污染便宜。
+	//
+	// 注意平台只登记单位、不做任何单位换算：数值的 scale/bias 在采集管线里
+	// 处理，单位字符串按原样上报。量纲（Dimension）在这里的作用是把「已知单位」
+	// 结构化，供配置校验与后续维度一致性使用，不参与数值变换。
+	if p.Unit != "" {
+		if !p.DataType.IsNumeric() {
+			return fmt.Errorf("point %q: unit %q is only valid for numeric points", p.ID, p.Unit)
+		}
+		if _, ok := DimensionOf(p.Unit); !ok {
+			return fmt.Errorf("point %q: unknown unit %q (not in the controlled unit table)", p.ID, p.Unit)
+		}
 	}
 	if p.Address.Kind == AddressComputed {
 		// 计算点是纯函数的结果，没有可以写回去的地址。允许它 writable 会
