@@ -624,7 +624,26 @@ func (r *Runtime) applyRole(leader bool, now time.Time) {
 		}
 	}
 	r.setRoleSince(now)
-	r.setCollectionActive(leader)
+	// 顺序很关键：
+	//   - 升主：先恢复采集（状态迁移落到本地快照）再把 sink 置活，republish
+	//     补发的是「刚恢复的」状态，而不是待命时的 disabled；
+	//   - 降主：先把 sink 置死（优雅断开、不再发布），再停采集——否则停采产生
+	//     的一串 disabled 会被当作站点级最终事实发到 Broker。
+	if leader {
+		r.setCollectionActive(true)
+		r.setMqttSinkActive(true)
+	} else {
+		r.setMqttSinkActive(false)
+		r.setCollectionActive(false)
+	}
+}
+
+// setMqttSinkActive 把「站点级北向控制面发布权」交给/收回 leader。
+// 未配置 MQTT 时为 no-op；Sparkplug 的 setActive 也是 no-op（节点身份带实例）。
+func (r *Runtime) setMqttSinkActive(active bool) {
+	if r.mqttSink != nil {
+		r.mqttSink.setActive(active)
+	}
 }
 
 // setCollectionActive 把本机设备切到「采集/待命」。

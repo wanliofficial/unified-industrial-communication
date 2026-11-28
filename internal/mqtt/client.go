@@ -507,6 +507,44 @@ func (c *Client) Close() error {
 	return conn.Close()
 }
 
+// Disconnect 优雅断开当前连接，但保留客户端可再次建链（与 Close 的终态不同）。
+//
+// 为什么需要它：集群多实例部署时，站点级 json MQTT 控制面（$birth/$state/
+// $death）只能由 leader 发布。副本降主时必须停掉这条北向会话，而且**必须发
+// DISCONNECT**：若直接掐掉 TCP，Broker 会替它广播遗嘱（$death retained），
+// 而站点里还有别的实例在服务，那条「整站离线」会误导所有消费方。
+//
+// 断开后 conn 置空、state 复位为 idle；下一次 Publish/Connect 会自动重连并
+// 重新登记遗嘱。在飞的 QoS1 与保活等待显式失败，避免它们白等满 AckTimeout。
+func (c *Client) Disconnect(ctx context.Context) error {
+	if c.state.Load() == 3 {
+		return errors.New("mqtt: client closed")
+	}
+	c.mu.Lock()
+	conn := c.conn
+	c.conn = nil
+	if conn != nil {
+		c.state.Store(0)
+	}
+	c.mu.Unlock()
+	if conn == nil {
+		return nil
+	}
+	deadline := time.Now().Add(c.opt.AckTimeout)
+	if ctx != nil {
+		if d, ok := ctx.Deadline(); ok && d.Before(deadline) {
+			deadline = d
+		}
+	}
+	_ = c.writePacket(conn, deadline, DisconnectPacket())
+	_ = conn.Close()
+	c.failPending(errors.New("mqtt: disconnected"))
+	c.pingMu.Lock()
+	c.finishPingLocked(errPingConnLost)
+	c.pingMu.Unlock()
+	return nil
+}
+
 // Stats 返回投递统计，供指标与诊断使用。
 type Stats struct {
 	Sent      uint64

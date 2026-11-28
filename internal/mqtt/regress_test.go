@@ -294,3 +294,41 @@ func TestParsePublishRejectsProtocolViolations(t *testing.T) {
 		}
 	}
 }
+
+// 回归：Disconnect 必须优雅断开（发 DISCONNECT，Broker 不代发遗嘱），且断开后
+// 客户端仍可再次建链。集群里非 leader 副本降主时靠它停掉站点级北向会话——若
+// 直接掐 TCP，Broker 会广播 $death retained，把「整站离线」误报给所有消费方。
+func TestDisconnectSuppressesWillAndAllowsReconnect(t *testing.T) {
+	b := mqtttest.New(t, nil)
+	c := newClient(b, func(o *mqtt.Options) {
+		o.Will = func() *mqtt.Will {
+			return &mqtt.Will{Topic: "uic/site/$death", Payload: []byte(`{"online":false}`), QoS: 1, Retain: true}
+		}
+	})
+	defer c.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := c.Publish(ctx, mqtt.Message{Topic: "uic/site/d/p", Payload: []byte("1")}); err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+	if err := c.Disconnect(ctx); err != nil {
+		t.Fatalf("disconnect: %v", err)
+	}
+	b.WaitDisconnects(t, 1)
+	if wills := b.Wills(); len(wills) != 0 {
+		t.Fatalf("graceful Disconnect must not trigger the will, got %d: %+v", len(wills), wills)
+	}
+
+	// 断开可重连：下一次 Publish 自动建链并送达。
+	if err := c.Publish(ctx, mqtt.Message{Topic: "uic/site/d/p", Payload: []byte("2")}); err != nil {
+		t.Fatalf("publish after disconnect: %v", err)
+	}
+	msgs := b.WaitMessages(t, 2)
+	if string(msgs[len(msgs)-1].Payload) != "2" {
+		t.Fatalf("second publish payload = %q, want 2", msgs[len(msgs)-1].Payload)
+	}
+	if wills := b.Wills(); len(wills) != 0 {
+		t.Fatalf("reconnect must not trigger the will, got %d", len(wills))
+	}
+}

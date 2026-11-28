@@ -143,6 +143,7 @@ flock 与 MQTT 软选主都无法覆盖后三者——这正是「分布式强�
 ### 4.4 采集与投递的 leader 闸
 
 - `runtime.Start` 的 `dispatchLoop` 前置 `IsLeader()` 判定：非 leader 不产生采集请求、不写 Outbox。leader 切换时，新 leader 自然接管采集，旧 leader 停采——**重复采集由 raft 唯一 leader 从根上消除**，不再依赖「配置相同就不冲突」的假设。
+- **站点级北向控制面同样只有 leader 发布**：json 北向的 `$birth`/`$state`/`$death`/`$alarm` 是站点级主题（不含实例身份），多实例同时发布会互相覆盖 retained——follower 把设备写成 `disabled`、停机补发 `$death`，会让消费方以为设备被停用、整个网关离线。因此非 leader **不连 Broker、不发布这些主题**（只维护本地快照）；升主时补发 `$birth` 与当前状态/报警，降主时**优雅 DISCONNECT**（绝不发 `$death`，否则站点里还有实例在服务）。Sparkplug 的节点身份（`nodeId`）已带实例短码，事件只描述本节点，不需要这道闸。
 - leader 切换有过渡窗口（旧 leader 未察觉已失主）：用「提交式写 + Outbox 幂等去重」兜底，窗口内的重复不丢不坏。
 
 ### 4.5 故障转移与成员变更
@@ -226,7 +227,7 @@ flock 与 MQTT 软选主都无法覆盖后三者——这正是「分布式强�
 
 | 类别 | 变异体（必须变红） |
 |---|---|
-| leader 闸 | 非 leader 仍 Propose 写；非 leader 仍采集；写失败返回 200 而非 504/409 |
+| leader 闸 | 非 leader 仍 Propose 写；非 leader 仍采集；非 leader 仍发布站点级 `$birth`/`$state`/`$death`；降主补发 `$death`（误报整站离线）；写失败返回 200 而非 504/409 |
 | 提交语义 | 未多数派复制就返回成功；提交超时不报错（静默吞）；Propose 不等 commit |
 | FSM apply | apply 命令顺序错乱（乱序 apply）；apply 失败仍判副本健康；apply panic 不恢复 |
 | 快照/恢复 | Snapshot 不含未 apply 的已提交日志；Restore 不重置状态；快照后丢失已提交条目 |

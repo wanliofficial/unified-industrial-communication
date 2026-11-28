@@ -131,6 +131,8 @@ type northboundSink interface {
 	onAlarmEvent(ev alarm.Event)
 	seedAlarms(statuses []alarm.Status)
 	setMetrics(m *obs.Metrics)
+	// setActive 随集群角色切换北向控制面的发布权（仅站点级主题需要）。
+	setActive(active bool)
 	close() error
 }
 
@@ -560,6 +562,10 @@ func (r *Runtime) Start(ctx context.Context) {
 		return
 	}
 	r.ctx, r.cancel = context.WithCancel(ctx)
+	// 集群下北向站点级控制面只由 leader 发布。必须在启动调度器**之前**按当前
+	// 角色初始化发布权：sched.Start 会立刻触发首条状态迁移，若等到 clusterLoop
+	// 的首次 applyRole 才置位，follower 会在启动窗口里短暂发布 $state。
+	r.setMqttSinkActive(r.isLeader())
 	r.sched.Start(r.ctx)
 	if r.alarms != nil {
 		r.alarms.Start(r.ctx)

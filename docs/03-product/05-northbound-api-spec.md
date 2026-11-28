@@ -449,6 +449,15 @@ Authorization: Bearer <token>
 污染版本列表与回滚历史）。用户显式配置了 `clientId`/`nodeId` 时以其为准，实例
 短码只在默认值这一层兜底。
 
+**集群（多实例选主）下的北向发布权**：json MQTT 的 `$birth`/`$state`/`$death`/
+`$alarm` 是**站点级**主题（`uic/{site}/...`，不含实例身份）。同站点多实例若都发布，
+retained 会互相覆盖——follower 会把设备写成 `disabled`，停机补发的 `$death` 更会
+让消费方以为整个网关离线。因此启用集群（`cluster.enabled`）后这些主题**只由
+leader 发布**：非 leader 不连 Broker、不发这些消息（本地仍维护状态快照）；
+升主时补发 `$birth` 与当前设备/报警状态，降主时优雅 `DISCONNECT` 且**不发
+`$death`**。`value` 采样本就走 leader-only 的 Outbox，语义一致。Sparkplug 不受
+影响：其 `nodeId` 默认已带实例短码，各实例是独立节点，只描述本节点。
+
 ### 4.2 设备与点位
 
 | 方法 | 路径 | 说明 |

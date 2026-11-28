@@ -366,6 +366,12 @@ func (s *sparkplugSink) forgetDevice(device string) {
 func (s *sparkplugSink) onAlarmEvent(alarm.Event)           {}
 func (s *sparkplugSink) seedAlarms(statuses []alarm.Status) {}
 
+// setActive 是集群角色切换的钩子。Sparkplug 的节点身份（nodeId）已带实例
+// 短码：每个实例是独立节点，follower 发布的 NBIRTH/DBIRTH/DDEATH 只描述
+// 「本节点」，不会覆盖 leader 的站点级事实，因此这里不需要抑制。json 北向
+// 必须闸，正因为它的事件主题（$birth/$state/$death）不含实例身份。
+func (s *sparkplugSink) setActive(bool) {}
+
 // handleCommand 解析 NCMD/DCMD 的 Rebirth。
 //
 // 它在 MQTT 读循环里同步执行，必须立刻返回：真正的发布放到 goroutine，

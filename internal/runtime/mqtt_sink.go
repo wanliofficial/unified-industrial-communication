@@ -71,6 +71,19 @@ type mqttSink struct {
 
 	published atomic.Uint64
 	failed    atomic.Uint64
+
+	// active 表示本实例当前是否为**站点级北向控制面**的发布者。未启用集群
+	// （consensus==nil）时恒为 true，行为与单实例完全一致；集群下由角色循环
+	// 跟随 leader 切换。
+	//
+	// 为什么必须闸：json 北向的 $birth/$state/$death 是站点级主题（不含实例
+	// 身份）。同站点多实例同时发布，retained 会互相覆盖——follower 把设备写成
+	// disabled、停机补发 $death 让消费方以为整站离线。ADR-0005 §4.4 要求
+	// 非 leader 不采集、不写 Outbox，这条直接发布路径需要同一道闸。
+	active atomic.Bool
+	// closing 在 close() 期间置位：压掉「补发死亡消息时顺带重连触发的
+	// republish」，否则停机瞬间会先发一条 birth 再发 death。
+	closing atomic.Bool
 }
 
 type sinkState struct {
@@ -119,6 +132,9 @@ func newMQTTSink(cfg config.MQTT, site, gatewayID string) (*mqttSink, error) {
 		alarmStates:     map[string]alarm.Status{},
 		alarmCleared:    map[string]bool{},
 	}
+	// 未启用集群时 sink 永远是「活跃发布者」；启用集群时 runtime 会在角色
+	// 循环里按 leader 切换。默认 true 保证单实例行为不受影响。
+	s.active.Store(true)
 	s.client = mqtt.New(mqtt.Options{
 		Addr:      cfg.Broker,
 		ClientID:  clientID,
@@ -310,6 +326,10 @@ func (m *mqttSink) publishState(ctx context.Context, device string, st sinkState
 // 设备被删除时这是让消费方不再看见它的唯一方式——只删本地快照，Broker 上
 // 那条旧状态会一直挂着。
 func (m *mqttSink) publishStateID(ctx context.Context, device string, payload []byte) error {
+	if !m.active.Load() {
+		// 非 leader：只更新本地快照，不碰 Broker。升主后 republish 会补发。
+		return nil
+	}
 	topic := fmt.Sprintf("uic/%s/%s/$state", sanitizeTopicLevel(m.site), sanitizeTopicLevel(device))
 	return m.client.Publish(ctx, mqtt.Message{
 		Topic: topic, Payload: payload, QoS: m.qos, Retain: true,
@@ -318,6 +338,9 @@ func (m *mqttSink) publishStateID(ctx context.Context, device string, payload []
 
 // republish 在（重）连成功后补发 birth 与已知设备状态。
 func (m *mqttSink) republish(ctx context.Context) {
+	if m.closing.Load() || !m.active.Load() {
+		return
+	}
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 
@@ -376,12 +399,41 @@ func (m *mqttSink) count(result string) {
 	}
 }
 
+// setActive 切换「本实例是否为站点级北向控制面的发布者」（集群角色驱动）。
+//
+// 未启用集群时不会被调用，active 初始为 true；启用集群后由 runtime.applyRole
+// 在角色边沿调用。
+func (m *mqttSink) setActive(on bool) {
+	if m.active.Swap(on) == on {
+		return
+	}
+	if on {
+		// 升主：重新建链并补发 birth/设备状态/报警。异步执行，避免阻塞角色
+		// 循环；republish 内部自带超时。
+		go m.republish(context.Background())
+		return
+	}
+	// 降主：优雅断开当前会话。必须发 DISCONNECT——直接掐 TCP 会让 Broker 代发
+	// 遗嘱（$death retained），而站点里还有别的实例在服务，那会误报整站离线。
+	// 本地快照保留，升主时由 republish 补发。
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	_ = m.client.Disconnect(ctx)
+}
+
 // close 先补发一条 retained 的 $death，再断开连接。
 //
 // 正常停机时 Broker 不会触发 LWT（因为我们发了 DISCONNECT），而 $birth 是
 // retained 的：不补这一条，消费方会一直看到 online=true，直到有人手动清理
 // retained。运维视角下「网关已经停了但监控说在线」比没有状态更糟。
 func (m *mqttSink) close() error {
+	m.closing.Store(true)
+	// 只有 leader 才补发站点级 $death：follower 停机时站点里还有别的实例在
+	// 服务，补发 $death 会让消费方以为整个网关离线。active 是 sink 本地的
+	// 「最后已知角色」，不受 Stop 里 consensus 先于 sink 关闭的时序影响。
+	if !m.active.Load() {
+		return m.client.Close()
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	payload, _ := json.Marshal(map[string]any{"schemaVersion": 1, "online": false})
@@ -501,6 +553,9 @@ func (m *mqttSink) publishAlarm(ctx context.Context, st alarm.Status, remove boo
 // MQTT 规范里「零长度 retained 载荷」就是删除该主题的 retained 消息。
 // 这是唯一能让已删规则从消费方视野里彻底消失的方式。
 func (m *mqttSink) publishAlarmID(ctx context.Context, id string, payload []byte) error {
+	if !m.active.Load() {
+		return nil
+	}
 	if err := m.client.Publish(ctx, mqtt.Message{
 		Topic: m.alarmTopic(id), Payload: payload, QoS: m.qos, Retain: true,
 	}); err != nil {
