@@ -9854,6 +9854,14 @@ comm_error」）。衡器写进去的、驱动解出来的共用同一套格式�
 会让操作员按一个错的数字决策。四舍五入而不是向下取整，是因为配置声明的是整数
 类型，用户要的是**最近的**整数。
 
+64 位上界要按**开区间**判：`MaxInt64` / `MaxUint64` 无法精确表示为 `float64`
+（分别进位成 `2^63` / `2^64`），所以上界必须写成 `r < 2^63` / `r < 2^64`。若用
+`r > float64(MaxInt64)` 这种闭区间写法，恰为 `2^63` 的结果会通过校验，随后被下游
+`codec/value` 与 sparkplug 的 `int64(v.Num)` 静默裁剪成 `MinInt64`——一个看起来
+完全正常的负数被写进寄存器/上报出去。这与 §3.9.9 对同一取舍边界的处理一致
+（`Value.String` 亦已用严格 `< 2^63` 回避同款问题）；回归见
+`internal/driver/computed/regress_test.go` 的 `TestInt64BoundaryIsBadNotWrapped`。
+
 #### 3.11.9 只读注入：`OpenConfig.Lookup`
 
 驱动需要读别的点位，但**不能**持有 cache：

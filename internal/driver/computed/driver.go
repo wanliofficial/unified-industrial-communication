@@ -425,9 +425,23 @@ func encode(dt model.DataType, v float64) (model.Value, error) {
 	case model.TypeUint32:
 		return intValue(dt, v, 0, math.MaxUint32)
 	case model.TypeInt64:
-		return intValue(dt, v, math.MinInt64, math.MaxInt64)
+		// MaxInt64 无法精确表示为 float64（会进位到 2^63），因此不能用
+		// 「r > float64(MaxInt64)」做上界——恰为 2^63 的输入会通过检查，
+		// 随后被下游的 int64(v.Num) 裁剪成 MinInt64，得到一个完全错误的数。
+		// 改用严格小于 2^63 判定（MinInt64 = -2^63 本身合法）。这与
+		// model.Value.String 对同一取舍边界的处理一致。
+		r := math.Round(v)
+		if r < -9223372036854775808.0 || r >= 9223372036854775808.0 {
+			return model.Value{}, fmt.Errorf("%v out of range for %s", v, dt)
+		}
+		return model.NumValue(dt, r), nil
 	case model.TypeUint64:
-		return intValue(dt, v, 0, math.MaxUint64)
+		// 同上：MaxUint64 会进位到 2^64，上界必须严格。
+		r := math.Round(v)
+		if r < 0 || r >= 18446744073709551616.0 {
+			return model.Value{}, fmt.Errorf("%v out of range for %s", v, dt)
+		}
+		return model.NumValue(dt, r), nil
 	case model.TypeFloat32:
 		f := float32(v)
 		if math.IsInf(float64(f), 0) {

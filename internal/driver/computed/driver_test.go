@@ -295,6 +295,12 @@ func TestEncode(t *testing.T) {
 		{dt: model.TypeUint16, v: 70000, bad: true}, // 越界判坏，不截断
 		{dt: model.TypeUint16, v: -1, bad: true},
 		{dt: model.TypeInt32, v: 2147483648, bad: true},
+		// 64 位上界是 float64 的取舍边界：MaxInt64/MaxUint64 无法精确表示，
+		// 会进位到 2^63/2^64。恰为该值的输入必须判坏，否则下游 int64(v.Num)
+		// 会把它裁剪成 MinInt64（见回归用例与 Value.String 的同款严判）。
+		{dt: model.TypeInt64, v: 9223372036854775808, bad: true},                   // 2^63
+		{dt: model.TypeUint64, v: 18446744073709551616, bad: true},                 // 2^64
+		{dt: model.TypeInt64, v: -9223372036854775808, want: -9223372036854775808}, // MinInt64 合法
 		{dt: model.TypeBool, v: 0, isB: true, wantB: false},
 		{dt: model.TypeBool, v: 0.1, isB: true, wantB: true},
 	}
