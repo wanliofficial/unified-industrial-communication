@@ -28,6 +28,7 @@ import (
 	"uic/internal/alarm"
 	"uic/internal/auth"
 	"uic/internal/calc"
+	"uic/internal/config/envelope"
 	"uic/internal/driver"
 	"uic/internal/model"
 	"uic/internal/mqtt"
@@ -1304,6 +1305,93 @@ type Manager struct {
 	raw     []byte
 	version string
 	state   State
+	// kek 是配置信封加密的密钥（AES-256）。nil 表示未启用加密（敏感字段
+	// 明文落盘，向后兼容存量配置）。由 SetKEK 注入，来源见 cmd/uic/main.go
+	// （环境变量 UIC_CONFIG_KEK 或派生自 server.token）。
+	kek []byte
+}
+
+// SetKEK 注入信封加密密钥。传入 nil 或长度非 32 字节的密钥会禁用加密（敏感
+// 字段回退明文，向后兼容）。调用后下一次 Apply/loadVersion 即生效。
+//
+// 副作用：注入 KEK 后，若 current 配置里的通道凭据是密文（enc:v1: 前缀），
+// 立即解密还原成明文——因为 Open 在 KEK 注入前完成，启动时 current 里的密文
+// 还没解开。这样驱动从 Current() 拿到的密码是明文，能直接用于 CONNECT。
+func (m *Manager) SetKEK(kek []byte) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if len(kek) == envelope.KEKSize {
+		m.kek = make([]byte, envelope.KEKSize)
+		copy(m.kek, kek)
+		// 注入后立即解密 current（Open 时 KEK 未注入，密文还没解开）。
+		if m.current != nil {
+			_ = m.decryptChannelSecretsLocked(m.current)
+		}
+	} else {
+		m.kek = nil
+	}
+}
+
+// encryptChannelSecrets 在 Apply 写盘前调用：遍历配置里的通道凭据（MQTT/
+// OPC UA 的 Password），用 KEK 加密成 enc:v1: 前缀的密文。未注入 KEK 时
+// 跳过（明文落盘，向后兼容）。空串与非密文都加密（非密文包括明文存量配置，
+// 首次 Apply 时自动加密迁移）。
+func (m *Manager) encryptChannelSecrets(f *File) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.encryptChannelSecretsLocked(f)
+}
+
+// encryptChannelSecretsLocked 是 encryptChannelSecrets 的内部版本，假设调用方
+// 已持有 m.mu（Apply 在持锁状态下调用它）。
+func (m *Manager) encryptChannelSecretsLocked(f *File) error {
+	kek := m.kek
+	if kek == nil {
+		return nil // 未启用加密，明文落盘
+	}
+	for i := range f.Channels {
+		pw := f.Channels[i].Password
+		if pw == "" {
+			continue
+		}
+		encrypted, err := envelope.Encrypt(kek, pw)
+		if err != nil {
+			return fmt.Errorf("config: encrypt channel %q password: %w", f.Channels[i].ID, err)
+		}
+		f.Channels[i].Password = encrypted
+	}
+	return nil
+}
+
+// decryptChannelSecrets 在 loadVersion/Current 读盘后调用：遍历配置里的通道
+// 凭据，解密 enc:v1: 前缀的密文还原成明文。未注入 KEK 时跳过（原样返回，
+// 向后兼容）。解密失败（篡改/KEK 不匹配）返回 error，调用方 fail-closed，
+// 绝不放行「当作空密码继续用」。
+func (m *Manager) decryptChannelSecrets(f *File) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.decryptChannelSecretsLocked(f)
+}
+
+// decryptChannelSecretsLocked 是 decryptChannelSecrets 的内部版本，假设调用方
+// 已持有 m.mu（避免 SetKEK 持锁时重入死锁）。
+func (m *Manager) decryptChannelSecretsLocked(f *File) error {
+	kek := m.kek
+	if kek == nil {
+		return nil // 未注入 KEK，原样返回（明文配置）
+	}
+	for i := range f.Channels {
+		pw := f.Channels[i].Password
+		if pw == "" {
+			continue
+		}
+		decrypted, err := envelope.Decrypt(kek, pw)
+		if err != nil {
+			return fmt.Errorf("config: decrypt channel %q password: %w", f.Channels[i].ID, err)
+		}
+		f.Channels[i].Password = decrypted
+	}
+	return nil
 }
 
 // Open 加载配置并初始化版本目录。dataDir 为空时使用配置文件所在目录。
@@ -1424,6 +1512,21 @@ func (m *Manager) Apply(f *File, source string) (ApplyResult, error) {
 	if err != nil {
 		return ApplyResult{}, err
 	}
+	// 信封加密：写盘前把通道凭据（MQTT/OPC UA 密码）加密成 enc:v1: 密文。
+	// canonical 已在上面用明文算好，version 哈希不受加密影响；落盘与快照用
+	// 加密后的 full，运行时从快照解密还原明文给驱动使用。未注入 KEK 时
+	// 跳过（明文落盘，向后兼容）。
+	encryptFull := full
+	if m.kek != nil {
+		encF := DeepCopy(f)
+		if err := m.encryptChannelSecrets(encF); err != nil {
+			return ApplyResult{}, err
+		}
+		encryptFull, err = encF.MarshalFull()
+		if err != nil {
+			return ApplyResult{}, err
+		}
+	}
 	version := VersionOf(canonical)
 
 	m.mu.Lock()
@@ -1444,12 +1547,12 @@ func (m *Manager) Apply(f *File, source string) (ApplyResult, error) {
 	if err := m.writeSnapshot(prevVersion, prevRaw); err != nil {
 		return ApplyResult{}, fmt.Errorf("config: backup: %w", err)
 	}
-	// 2. 原子写入新配置（完整内容，含本地 cluster 块）。
-	if err := atomicWrite(m.path, full); err != nil {
+	// 2. 原子写入新配置（完整内容，含本地 cluster 块，通道凭据已加密）。
+	if err := atomicWrite(m.path, encryptFull); err != nil {
 		return ApplyResult{}, fmt.Errorf("config: write: %w", err)
 	}
-	// 3. 写新版本快照。
-	if err := m.writeSnapshot(version, full); err != nil {
+	// 3. 写新版本快照（也用加密后的内容，与落盘一致；回滚读快照后解密）。
+	if err := m.writeSnapshot(version, encryptFull); err != nil {
 		_ = atomicWrite(m.path, prevRaw)
 		return ApplyResult{}, fmt.Errorf("config: snapshot: %w", err)
 	}
@@ -1473,7 +1576,7 @@ func (m *Manager) Apply(f *File, source string) (ApplyResult, error) {
 	}
 
 	m.current = f
-	m.raw = full
+	m.raw = encryptFull // 内存 raw 与落盘一致（加密后），供下次 Apply 备份与回滚恢复
 	m.version = version
 	_ = m.prune(50)
 
@@ -1631,6 +1734,11 @@ func (m *Manager) loadVersion(version string) (*File, []byte, error) {
 	}
 	var f File
 	if err := json.Unmarshal(raw, &f); err != nil {
+		return nil, nil, fmt.Errorf("config: version %s: %w", version, err)
+	}
+	// 信封解密：快照里的通道凭据是加密的（enc:v1: 前缀），读盘后解密还原成
+	// 明文给调用方（Rollback 用）。未注入 KEK 时跳过（原样返回，明文配置）。
+	if err := m.decryptChannelSecrets(&f); err != nil {
 		return nil, nil, fmt.Errorf("config: version %s: %w", version, err)
 	}
 	if VersionOf(raw) != version {

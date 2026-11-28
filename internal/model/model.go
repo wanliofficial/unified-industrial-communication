@@ -890,9 +890,11 @@ type Channel struct {
 	// OPC UA 用户名认证）。放在通道而不是设备上：凭据属于 Broker/服务端，
 	// 同一通道下的多台设备共用一份。
 	//
-	// 明文存在配置文件里是当前版本的真实状态：加密存储需要密钥管理，
-	// 属于另一件事。文档里明确要求配置文件权限 0600，并在启动日志里
-	// 只打印「是否配置了凭据」，不打印值。
+	// 写盘时 Password 经信封加密（enc:v1: 前缀密文，见 internal/config/envelope），
+	// 读盘后解密还原明文给驱动；配置文件里不再出现明文口令。KEK 来自环境变量
+	// UIC_CONFIG_KEK 或派生自 server.token（见 cmd/uic/main.go injectConfigKEK）。
+	// 未注入 KEK 时明文落盘（向后兼容存量配置）。文件权限要求 0600，
+	// 启动日志只打印「是否配置了凭据」，不打印值。
 	Username string `json:"username,omitempty"`
 	Password string `json:"password,omitempty"`
 }

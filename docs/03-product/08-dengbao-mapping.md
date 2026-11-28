@@ -63,8 +63,8 @@
 
 | 等保要求（第三级） | 状态 | 实现与出处 | 说明 |
 |---|---|---|---|
-| a) 重要业务数据传输保密性 | ◐ | `cmd/uic/main.go:393` TLS；`internal/outbox`/`internal/northbound` 出站 | 北向 API 支持 TLS（见 1.1 c）。**南向/北向协议传输**（MQTT/OPC UA 等）的保密性由各协议自身承载：MQTT 支持 TLS（凭据在 CONNECT，见 `model.go:889` 注释「明文存在配置文件是当前版本的真实状态」）；OPC UA 本驱动走 None/None（无安全策略，见驱动 Meta `Name`）。**配置内凭据当前明文存储**（`model.go:893` 注释明确），加密存储需密钥管理——见 §2 风险 R-2。 |
-| b) 重要数据存储保密性 | ✗ | — | **缺口**：配置文件中的链路凭据（MQTT/OPC UA 用户名口令）当前**明文存储**（`model.go:889-895` 注释：加密存储需要密钥管理，未做）。等保三级要求重要数据存储保密性，此为明确缺口，已在 §2 风险 R-2 记录。 |
+| a) 重要业务数据传输保密性 | ◐ | `cmd/uic/main.go:393` TLS；`internal/outbox`/`internal/northbound` 出站 | 北向 API 支持 TLS（见 1.1 c）。**南向/北向协议传输**（MQTT/OPC UA 等）的保密性由各协议自身承载：MQTT 支持 TLS（凭据在 CONNECT，见 `model.go:889` 注释）；OPC UA 本驱动走 None/None（无安全策略，见驱动 Meta `Name`）。配置文件里的凭据已加密存储（见 1.5 b），即使配置文件泄露凭据也不直接可读。 |
+| b) 重要数据存储保密性 | ✓ | `internal/config/envelope`（AES-256-GCM 信封加密）；`internal/config` `encryptChannelSecrets`/`decryptChannelSecrets` | **已修复 R-2**：配置内链路凭据（MQTT/OPC UA 用户名口令）写盘前用信封加密（`enc:v1:` 前缀密文），读盘后解密还原明文给驱动。KEK 来源：环境变量 `UIC_CONFIG_KEK`（推荐，专用密钥）或派生自 `server.token`（回退）。未注入 KEK 时明文落盘（向后兼容存量配置）；KEK 不匹配/密文被篡改时 fail-closed（解密失败拒绝加载）。存储格式 `enc:v1:base64(nonce‖ciphertext+tag)`，纯标准库 `crypto/aes`+`crypto/cipher`，符合 ADR-0001 零第三方依赖。 |
 
 ### 1.6 数据备份恢复（控制点 8.1.4）
 
@@ -72,7 +72,7 @@
 |---|---|---|---|
 | a) 提供本地数据备份与恢复 | ✓ | `internal/config` 版本快照（`VersionConfig`/`Rollback`）；`internal/history` NDJSON 分段 | 配置有版本快照 + 一键回滚（`Rollback`，每次回滚产生新版本）；采集历史以 NDJSON 分段落盘 + 保留策略。 |
 | b) 提供异地实时备份（关键数据） | ◐ | `internal/outbox`；`internal/northbound` MQTT/Sparkplug | 关键数据经 MQTT（QoS1，retained 状态）/ Sparkplug B 实时外发到 Broker，可异地消费——「异地」由 Broker 部署位置决定，软件提供实时外发通道。**但**这是「实时外发」而非「定时备份到异地容灾系统」，后者属运维域。 |
-| c) 剩余信息保护：释放前清除敏感信息 | ◐ | `internal/runtime/backends.go` `redactedValue`（`***`）；`internal/upgrade` 密钥不落盘 | `GET /config` 返回脱敏（凭据替换为 `***`，`backends.go:134`）；枚举用户绝不回显 Token/哈希（`TestUsersNeverExposeTokens`）；升级私钥经 `-privkey` 传入不落盘。**缺**：内存/临时文件中敏感信息的「用后清零」无显式保证；配置内明文口令在「剩余信息」视角下仍属暴露面（与 1.5 b 同源，R-2）。 |
+| c) 剩余信息保护：释放前清除敏感信息 | ◐ | `internal/runtime/backends.go` `redactedValue`（`***`）；`internal/upgrade` 密钥不落盘；`internal/config/envelope` 凭据加密 | `GET /config` 返回脱敏（凭据替换为 `***`，`backends.go:134`）；枚举用户绝不回显 Token/哈希（`TestUsersNeverExposeTokens`）；升级私钥经 `-privkey` 传入不落盘；配置文件里的链路凭据已加密存储（见 1.5 b）。**缺**：内存/临时文件中敏感信息的「用后清零」无显式保证。 |
 
 ### 1.7 入侵防范（控制点 8.1.4）
 
@@ -100,7 +100,7 @@
 | 编号 | 缺口 | 对应控制点 | 风险 | 处置建议 |
 |---|---|---|---|---|
 | **R-1** ✅已修复 | ~~TLS 开启但缺证书时静默回退明文 HTTP~~：已改为 fail-closed——`enabled` 无证书文件且无 `auto` 时配置期（`config.validateServerTLS`）直接拒绝，不再静默降级；同时实现 `server.tls.auto` 自动生成自签证书（`internal/tlscert`，纯标准库），免证书分发即可拿到传输加密 | 安全通信 / 数据保密性 (传输) | ~~高~~ 已消除 | 已落地并测试守护（`tlscert.TestGenerateProducesUsableCert` 证书可用、config `TestValidateServerTLS` 三合法两非法形态）。自签不提供来源可信，生产仍建议 CA 证书。 |
-| **R-2** | 配置内**链路凭据明文存储**（MQTT/OPC UA 用户名口令，`model.go:893`） | 数据保密性 (存储) / 剩余信息保护 | 中：拿到配置文件即拿到凭据。等保三级要求重要数据存储保密性 | 短期：配置文件 0o600 + 纳入版本快照脱敏。建议：引入信封加密（KEK 来自环境/外部 KMS）或对接密钥管理。 |
+| **R-2** ✅已修复 | ~~配置内链路凭据明文存储~~：已改为信封加密——`internal/config/envelope`（AES-256-GCM）+ `config.encryptChannelSecrets`/`decryptChannelSecrets`，写盘加密、读盘解密，KEK 来自 `UIC_CONFIG_KEK` 环境变量或派生自 `server.token`；未注入 KEK 时明文落盘（向后兼容），KEK 不匹配/篡改时 fail-closed | 数据保密性 (存储) / 剩余信息保护 | ~~中~~ 已消除 | 已落地并测试守护（`envelope.TestRoundTrip`/`TestTamperDetection`/`TestWrongKEK`、`config.TestConfigEnvelopeEncryption` 端到端）。3 个变异体验证。自签证书不提供来源可信，生产仍建议专用 KEK（环境变量）+ 定期轮换。 |
 | **R-3** | **无登录失败锁定 / 无会话超时退出**（`auth.go` 仅做成功比对） | 身份鉴别 b) / 入侵防范 c) | 中：无法防在线口令爆破。三级明确要求 | 边缘场景可评估在接入层（反代/WAF）实现；或后续版本内置失败计数 + 锁定窗口。 |
 | **R-4** | **无口令到期强制更换** | 身份鉴别 d) | 低 | 配置项可手工轮换；建议纳入运维制度。 |
 | **R-5** | **依赖与工具链漏洞面按构造为零，但工具链自身仅 1 条已知 advisory**（ADR-0004：GO-2026-6859，1.26.11 修复） | 安全审计 / 入侵防范 | 低：advisory 在固定 1.26.10 上「已知但接受」，bump 受 GOSUMDB=off 阻断 | 维持 ADR-0004 决策；升 1.26.11 需同时启用 sumdb 或 vendor 工具链。 |

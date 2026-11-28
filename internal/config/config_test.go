@@ -1,6 +1,7 @@
 package config
 
 import (
+	"bytes"
 	"encoding/json"
 	"math"
 	"os"
@@ -10,9 +11,11 @@ import (
 	"time"
 
 	"uic/internal/alarm"
+	"uic/internal/config/envelope"
 	"uic/internal/driver"
 	"uic/internal/driver/computed"
 	"uic/internal/driver/modbus"
+	"uic/internal/driver/mqtt"
 	"uic/internal/driver/virtual"
 	"uic/internal/model"
 )
@@ -21,7 +24,7 @@ func registerDrivers(t *testing.T) {
 	t.Helper()
 	// 逐个检查而不是「virtual 在就整体跳过」：后者会让后加进列表的驱动
 	// 在同一个测试进程里永远注册不上（前面的用例已经注册过 virtual）。
-	for _, d := range []driver.Driver{virtual.New(), modbus.New(), modbus.NewRTU(), computed.New()} {
+	for _, d := range []driver.Driver{virtual.New(), modbus.New(), modbus.NewRTU(), computed.New(), mqtt.New()} {
 		if _, ok := driver.Get(d.Meta().ID); ok {
 			continue
 		}
@@ -1607,5 +1610,90 @@ func TestDescribe(t *testing.T) {
 	d2 := m.Describe()
 	if d2.Devices != 2 || d2.Points != 4 {
 		t.Fatalf("after add: counts = dev %d/pt %d, want 2/4", d2.Devices, d2.Points)
+	}
+}
+
+// TestConfigEnvelopeEncryption 守护 R-2（南向链路凭据信封加密）的端到端：
+// Apply 含密码的配置后，落盘文件里是密文（enc:v1: 前缀）；新 Manager Open
+// 同一文件 + SetKEK 后，Current() 里是明文（驱动能直接用）；KEK 不匹配时
+// 解密失败（fail-closed）；未注入 KEK 时明文落盘（向后兼容）。
+func TestConfigEnvelopeEncryption(t *testing.T) {
+	registerDrivers(t)
+	kek := envelope.DeriveKEK("test-token-123456")
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.json")
+
+	// 构造含密码的配置：ch1 加一个 MQTT 通道，Password 是明文。
+	f := baseFile()
+	f.Channels = append(f.Channels, model.Channel{
+		ID: "mqtt-ch", Protocol: "mqtt",
+		Transport: model.Transport{Kind: "tcp", Address: "broker:1883"},
+		Password:  "super-secret-pw",
+	})
+	f.Server.Token = "test-token-123456"
+	if err := f.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	raw, _ := f.Canonical()
+	if err := os.WriteFile(path, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// 第一次 Open + SetKEK + Apply：先 Apply 一次触发落盘（首次 Open 时
+	// 配置文件已是该 canonical，version 相同会幂等返回不落盘；改一个无关
+	// 字段让 version 前进，强制走落盘路径，密码才会被加密写进快照）。
+	m1, err := Open(path, dir)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	m1.SetKEK(kek)
+	// 改一个无关字段（storage.dir）让 version 前进，触发落盘。
+	f2 := DeepCopy(f)
+	f2.Storage.Dir = "./data-v2"
+	if _, err := m1.Apply(f2, "api"); err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	// 当前版本快照文件里密码必须是密文（不是明文）。
+	snapPath := filepath.Join(dir, "snapshots", "v-"+strings.TrimPrefix(m1.Version(), "sha256:")+".json")
+	snapRaw, err := os.ReadFile(snapPath)
+	if err != nil {
+		t.Fatalf("read snapshot %s: %v", snapPath, err)
+	}
+	if bytes.Contains(snapRaw, []byte("super-secret-pw")) {
+		t.Fatal("明文密码泄露到快照文件")
+	}
+	if !bytes.Contains(snapRaw, []byte("enc:v1:")) {
+		t.Fatal("快照文件没有密文（enc:v1: 前缀）")
+	}
+
+	// 第二次 Open 同一文件 + 同一 KEK：Current() 里密码必须是明文（驱动能用）。
+	m2, err := Open(path, dir)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	m2.SetKEK(kek)
+	if got := m2.Current().Channels[1].Password; got != "super-secret-pw" {
+		t.Fatalf("Current().Password = %q, want 明文 super-secret-pw", got)
+	}
+
+	// 第三次 Open + 错误 KEK：解密必须失败（fail-closed，不能拿到空密码继续用）。
+	m3, err := Open(path, dir)
+	if err != nil {
+		t.Fatalf("reopen2: %v", err)
+	}
+	m3.SetKEK(envelope.DeriveKEK("wrong-token"))
+	if _, err := m3.VersionConfig(m3.Version()); err == nil {
+		t.Fatal("错误 KEK 解密应失败（fail-closed）")
+	}
+
+	// 第四次 Open + 不注入 KEK：原样返回（密文字段保持 enc:v1: 前缀，驱动连不上
+	// 但配置能加载，向后兼容存量未加密配置）。
+	m4, err := Open(path, dir)
+	if err != nil {
+		t.Fatalf("reopen3: %v", err)
+	}
+	// 不调用 SetKEK，KEK 为 nil。
+	if got := m4.Current().Channels[1].Password; !envelope.IsCiphertext(got) {
+		t.Fatalf("无 KEK 时 Current().Password = %q, 期望保持密文（向后兼容）", got)
 	}
 }

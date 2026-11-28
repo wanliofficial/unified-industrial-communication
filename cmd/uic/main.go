@@ -50,6 +50,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -72,6 +73,7 @@ import (
 	ua "uic/internal/codec/opcua"
 	snmpcodec "uic/internal/codec/snmp"
 	"uic/internal/config"
+	"uic/internal/config/envelope"
 	"uic/internal/driver"
 	"uic/internal/model"
 	"uic/internal/opcuaserver"
@@ -111,6 +113,45 @@ var (
 	commit    = "none"
 	buildTime = "unknown"
 )
+
+// injectConfigKEK 注入配置信封加密密钥（R-2：南向链路凭据不再明文落盘）。
+//
+// 来源两条，优先级从高到低：
+//  1. 环境变量 UIC_CONFIG_KEK：base64 编码的 32 字节密钥，运维经密钥管理
+//     系统注入，不落盘、不进配置、不进日志。这是推荐路径（专用 KEK）。
+//  2. 回退到 SHA-256(server.token) 派生：server.token 已是 admin 凭据，用它
+//     派生 KEK 避免「为加密凭据先配一个 KEK」的鸡生蛋。安全性弱于专用 KEK
+//     （token 泄露即 KEK 泄露），但好过明文；生产环境仍推荐专用 KEK。
+//
+// 都没配时静默跳过（KEK 为 nil，敏感字段明文落盘，向后兼容存量配置）。
+// 解密失败（密文被篡改/KEK 不匹配）会打 ERROR 日志但不阻止启动——此时驱动
+// 拿到的密码是空（decryptChannelSecrets fail-closed 返回 error，current 里的
+// 密文字段保持原样但驱动连不上），运维看到 ERROR 日志应立刻检查 KEK。
+func injectConfigKEK(mgr *config.Manager) {
+	var kek []byte
+	if env := os.Getenv("UIC_CONFIG_KEK"); env != "" {
+		raw, err := base64.StdEncoding.DecodeString(env)
+		if err != nil {
+			// 环境变量格式错误：fail-closed，拒绝启动（避免静默用错密钥导致
+			// 所有凭据解密失败）。
+			fmt.Fprintf(os.Stderr, "UIC_CONFIG_KEK 不是合法 base64: %v\n", err)
+			os.Exit(1)
+		}
+		if len(raw) != envelope.KEKSize {
+			fmt.Fprintf(os.Stderr, "UIC_CONFIG_KEK 解码后必须是 %d 字节，得到 %d\n", envelope.KEKSize, len(raw))
+			os.Exit(1)
+		}
+		kek = raw
+	} else if cfg := mgr.Current(); cfg.Server.Token != "" {
+		// 回退：从 server.token 派生 KEK。token 已是强口令（≥16 字符、禁弱口令），
+		// SHA-256 派生出 32 字节密钥够用。
+		kek = envelope.DeriveKEK(cfg.Server.Token)
+	}
+	if kek == nil {
+		return // 都没配，明文落盘（向后兼容）
+	}
+	mgr.SetKEK(kek)
+}
 
 func main() {
 	cmd := "run"
@@ -374,6 +415,16 @@ func runCmd(args []string) {
 		fmt.Fprintf(os.Stderr, "启动失败: %v\n", err)
 		os.Exit(1)
 	}
+
+	// 注入配置信封加密密钥（R-2：南向链路凭据不再明文落盘）。来源两条：
+	//   1. 环境变量 UIC_CONFIG_KEK（base64 编码的 32 字节密钥，运维经密钥管理
+	//      系统注入，不落盘、不进配置、不进日志）。
+	//   2. 回退到 SHA-256(server.token) 派生——server.token 已是 admin 凭据，
+	//      用它派生 KEK 避免「为加密凭据先配一个 KEK」的鸡生蛋。安全性弱于专用
+	//      KEK（token 泄露即 KEK 泄露），但好过明文。
+	// 必须在 rt.Start 之前注入：Start 会打开采集，驱动从 Current() 拿密码时
+	// 需要明文（SetKEK 注入后立即解密 current）。
+	injectConfigKEK(rt.ConfigManager())
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
