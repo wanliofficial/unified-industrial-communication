@@ -51,6 +51,10 @@ type Server struct {
 	// Users 是多身份凭据表。存在时 server.token 仍被接受（映射为名为
 	// "api" 的 admin 凭据），这样老配置升级后不会突然变成「无凭据」。
 	Users []User `json:"users,omitempty"`
+	// Auth 是北向认证策略（R-3：登录失败锁定 + 会话闲置超时）。未配置时
+	// 使用等保基线默认值（5 次失败锁定 15 分钟 / 全局熔断 20 次/5 分钟 /
+	// 闲置超时 30 分钟）并启用策略。
+	Auth *AuthPolicy `json:"auth,omitempty"`
 }
 
 // User 是一条北向凭据。
@@ -67,6 +71,32 @@ type User struct {
 	Role        string `json:"role"`
 	Token       string `json:"token,omitempty"`
 	TokenSha256 string `json:"tokenSha256,omitempty"`
+}
+
+// AuthPolicy 是北向认证策略的配置（R-3 等保身份鉴别 b：登录失败限制、
+// 会话超时自动退出）。零值字段使用等保基线默认值，见 auth.NewPolicy。
+//
+// 字段与 internal/auth.AuthPolicy 一一对应（这里是 JSON 形态，auth 包里是
+// time.Duration 形态——序列化需要字符串/整数形式，运行时需要时长）。
+type AuthPolicy struct {
+	// TrustedProxies 是可信代理 IP/CIDR 列表（如 ["10.0.0.0/8"]）。仅当请求
+	// 直接来自这些地址时，才信任 X-Forwarded-For 里的真实客户端 IP；其余请求
+	// 一律用 RemoteAddr。反代部署时必须配置，否则锁定按反代 IP 计数（一次
+	// 失败全体用户被锁）。
+	TrustedProxies []string `json:"trustedProxies,omitempty"`
+	// MaxAuthFailures 是单个 IP 连续认证失败多少次后锁定。默认 5。
+	MaxAuthFailures int `json:"maxAuthFailures,omitempty"`
+	// LockoutDuration 是单 IP 锁定时长，如 "15m"。默认 15 分钟。
+	LockoutDuration string `json:"lockoutDuration,omitempty"`
+	// GlobalMaxFailures 是全局窗口内失败多少次触发全局熔断（防分布式绕过
+	// 单 IP 限制）。默认 20。
+	GlobalMaxFailures int `json:"globalMaxFailures,omitempty"`
+	// GlobalFailureWindow 是全局熔断的计数窗口，如 "5m"。默认 5 分钟。
+	GlobalFailureWindow string `json:"globalFailureWindow,omitempty"`
+	// GlobalLockoutDuration 是全局熔断持续时长，如 "15m"。默认 15 分钟。
+	GlobalLockoutDuration string `json:"globalLockoutDuration,omitempty"`
+	// IdleTimeout 是会话闲置超时，如 "30m"。默认 30 分钟。
+	IdleTimeout string `json:"idleTimeout,omitempty"`
 }
 
 // TLS 是 API 的 TLS 配置。默认关闭；生产要求开启。

@@ -32,6 +32,7 @@ var zhCatalog = map[string]string{
 	"at most 100 writes per request":                     "单个请求最多 100 条写入",
 	"audit storage is closed":                            "审计存储已关闭",
 	"audit storage is not enabled in this configuration": "当前配置未启用审计存储",
+	"authentication attempts exhausted; retry later":     "认证尝试次数已用尽；请稍后再试",
 	"before must be RFC3339: %v":                         "before 必须是 RFC3339 时间: %v",
 	"body ids/all are not allowed on a single-alarm ack": "单条报警确认的请求体不允许携带 ids/all",
 	"body point %q does not match path %q":               "请求体中的点位 %q 与路径中的 %q 不一致",

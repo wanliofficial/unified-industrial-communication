@@ -7,12 +7,14 @@ package httpapi
 
 import (
 	"context"
+	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"sort"
 	"strconv"
@@ -47,6 +49,9 @@ type Options struct {
 	// 类型是接口而不是 *auth.Store：runtime 需要在配置热更新后整体替换凭据表，
 	// 而 HTTP 层在启动时就拿到了它。见 auth.Reloadable 的注释。
 	Auth Credentials
+	// Policy 是认证安全策略（R-3：登录失败锁定 + 全局熔断 + 会话闲置超时）。
+	// 为 nil 时不启用（旧部署或最小部署）。
+	Policy *auth.Policy
 	// Audit 接收认证/授权/写入记录。为 nil 时不记录（测试环境）。
 	Audit Auditor
 }
@@ -585,8 +590,25 @@ func ActorFrom(ctx context.Context) (Actor, bool) {
 // 因为前者会被扫描器无限产生。
 func (s *Server) guard(perm rbac.Permission, next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		// R-3：认证策略前置检查（per-IP 锁定 / 全局熔断）。锁定拒绝进审计，
+		// 因为扫描器会无限触发；开放模式（无凭据）不接 policy。
+		if s.opt.Policy != nil && !s.opt.Auth.Open() {
+			ip := s.clientIP(r)
+			if ok, _ := s.opt.Policy.Allow(ip); !ok {
+				s.auditDenied(r, Actor{}, "auth.locked", http.StatusTooManyRequests,
+					"authentication attempts exhausted", perm)
+				s.fail(w, r, Errf(http.StatusTooManyRequests, "auth.locked",
+					"authentication attempts exhausted; retry later"))
+				return
+			}
+		}
 		actor, ok := s.authenticate(r)
 		if !ok {
+			// 认证失败后记录（触发 per-IP 计数与全局熔断）。whoami 绕过 guard，
+			// 因此不进入这里——whoami 的认证失败不计入锁定（诊断端点需要可读）。
+			if s.opt.Policy != nil && !s.opt.Auth.Open() {
+				s.opt.Policy.RecordFailure(s.clientIP(r))
+			}
 			s.auditDenied(r, actor, "auth.unauthorized", http.StatusUnauthorized,
 				"missing or invalid bearer token", perm)
 			w.Header().Set("WWW-Authenticate", `Bearer realm="uic"`)
@@ -624,6 +646,10 @@ func (s *Server) guardReadPublic(next http.HandlerFunc) http.HandlerFunc {
 // 关键细节：opt.Auth 为 nil 只发生在调用方没接多身份凭据表时（例如旧测试
 // 直接构造 Server）。此时如果 opt.Token 也是空，历史上是**完全开放**而不是
 // 拒绝，runtime 依赖这个语义启动无认证的最小部署，因此这里保持放行。
+//
+// R-3 会话闲置超时：Token 有效且 policy 已配置时，检查该 Token 的会话是否
+// 因长期闲置被服务端关闭——超时则拒绝（提示需轮换 Token）。认证成功后立即
+// 刷新 lastSeen 并重置该 IP 的失败计数（这是「成功认证重置锁定」的唯一入口）。
 func (s *Server) authenticate(r *http.Request) (Actor, bool) {
 	if s.opt.Auth == nil {
 		if s.opt.Token == "" {
@@ -648,11 +674,34 @@ func (s *Server) authenticate(r *http.Request) (Actor, bool) {
 	if !strings.HasPrefix(raw, "Bearer ") {
 		return Actor{}, false
 	}
-	p, ok := s.opt.Auth.Authenticate(strings.TrimSpace(raw[len("Bearer "):]))
+	token := strings.TrimSpace(raw[len("Bearer "):])
+	p, ok := s.opt.Auth.Authenticate(token)
 	if !ok {
 		return Actor{}, false
 	}
+	// R-3：会话闲置超时检查与保活。sum 是 Token 哈希（不落明文），与凭据表
+	// 的存储方式一致——内存里留哈希不留 Token 原文。
+	if s.opt.Policy != nil {
+		sum := sha256.Sum256([]byte(token))
+		if !s.opt.Policy.SessionAlive(sum) {
+			return Actor{}, false
+		}
+		s.opt.Policy.RecordSuccess(s.clientIP(r), sum)
+	}
 	return Actor{User: p.User, Role: p.Role}, true
+}
+
+// clientIP 提取真实客户端 IP。policy 已配置时用它（支持可信代理 XFF）；
+// 否则直接用 RemoteAddr 去端口。
+func (s *Server) clientIP(r *http.Request) string {
+	if s.opt.Policy != nil {
+		return s.opt.Policy.SourceIP(r)
+	}
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return r.RemoteAddr
+	}
+	return host
 }
 
 func (s *Server) auditDenied(r *http.Request, a Actor, code string, status int, msg string, perm rbac.Permission) {
@@ -941,25 +990,39 @@ func metricPath(p string) string {
 	return p
 }
 
+// authorized 是 ServeHTTP 入口的轻量放行判定：它回答「这个请求是否可能
+// 携带有效凭据、值得进 mux 交给 guard 做真正的认证与授权」。
+//
+// 历史实现只认单凭据 legacy token（ConstantTimeCompare(opt.Token)），这与
+// 后来的多身份凭据表（opt.Auth）和认证安全策略（opt.Policy）分裂成两处认证：
+// 错 token 在 ServeHTTP 这一层就被 401 拦掉，根本到不了 guard，于是 per-IP
+// 失败计数与全局熔断永远收不到事件（等保 R-3 失效）。
+//
+// 这里改为与 guard 的 authenticate 同源：
+//   - 开放模式（无 token 且无多身份凭据表，或凭据表为空）：一律放行，让
+//     guard/authenticate 决定语义；
+//   - 探针端点（/healthz、/readyz、/version）与 whoami（/api/v1/auth/me，
+//     诊断「认证模式」的端点，必须匿名可读）放行；
+//   - 其余必须有 Bearer 凭据，但有效性校验留给 guard——此处只做「像不像认证
+//     请求」的粗判，避免双重认证再次割裂 policy 的失败计数。
 func (s *Server) authorized(r *http.Request) bool {
-	if s.opt.Token == "" {
+	// 开放模式：无凭据部署，任何请求都放行（guard 内 authenticate 同样放行）。
+	if s.openMode() {
 		return true
 	}
 	switch r.URL.Path {
-	case "/healthz", "/readyz", "/api/v1/version":
+	case "/healthz", "/readyz", "/api/v1/version", "/api/v1/auth/me":
 		return true
 	case "/api/v1/metrics":
 		if s.opt.MetricsPublic {
 			return true
 		}
 	}
+	// 非开放模式：请求必须带 Bearer 前缀才往下走。具体 token 是否有效不在这里
+	// 判定——交给 guard 的 authenticate，确保每一次认证失败都流经 policy 计数。
 	auth := r.Header.Get("Authorization")
 	const prefix = "Bearer "
-	if len(auth) <= len(prefix) || !strings.EqualFold(auth[:len(prefix)], prefix) {
-		return false
-	}
-	got := strings.TrimSpace(auth[len(prefix):])
-	return subtle.ConstantTimeCompare([]byte(got), []byte(s.opt.Token)) == 1
+	return len(auth) > len(prefix) && strings.EqualFold(auth[:len(prefix)], prefix)
 }
 
 type ctxKeyRequestID struct{}

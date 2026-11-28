@@ -15,11 +15,13 @@ import (
 
 	"uic/internal/alarm"
 	"uic/internal/audit"
+	"uic/internal/auth"
 	"uic/internal/cache"
 	"uic/internal/config"
 	"uic/internal/history"
 	"uic/internal/model"
 	"uic/internal/obs"
+	"uic/internal/rbac"
 )
 
 // fakeBackend 实现全部 Backend 能力，只用内存数据，便于测接口契约。
@@ -1598,5 +1600,212 @@ func TestHealthzTimestampIsUTC(t *testing.T) {
 	// 与注入时刻必须是同一绝对时刻（时区只是表示，时刻不变）。
 	if !parsed.Equal(moment) {
 		t.Fatalf("ts = %s, want same instant as %s", parsed, moment)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// R-3 认证安全策略集成测试
+// ---------------------------------------------------------------------------
+
+// newPolicyServer 构造带认证 + 策略的 HTTP server。token 是 Bearer Token，
+// policyThresholds 为 nil 时使用默认阈值（等保基线）。
+func newPolicyServer(t *testing.T, token string, policyThresholds *auth.AuthPolicy) (*Server, *auth.Policy) {
+	t.Helper()
+	p := auth.NewPolicy(policyThresholds, nil)
+	// 注入真实时钟（测试里用短超时 + time.Sleep 控制时间）。
+	var st *auth.Reloadable
+	if token != "" {
+		users := []auth.User{{Name: "t", Role: rbac.RoleAdmin, Token: token}}
+		store, err := auth.NewStore(users, "")
+		if err != nil {
+			t.Fatalf("NewStore: %v", err)
+		}
+		st = auth.NewReloadable(store)
+	} else {
+		st = auth.NewReloadable(nil)
+	}
+	s, _ := newServer(t, Options{
+		Token:  token,
+		Auth:   st,
+		Policy: p,
+	})
+	return s, p
+}
+
+func doGet(t *testing.T, s *Server, token, remote string) *httptest.ResponseRecorder {
+	t.Helper()
+	r := httptest.NewRequest(http.MethodGet, "/api/v1/health", nil)
+	if token != "" {
+		r.Header.Set("Authorization", "Bearer "+token)
+	}
+	r.RemoteAddr = remote
+	rec := httptest.NewRecorder()
+	s.ServeHTTP(rec, r)
+	return rec
+}
+
+// TestPolicyIPLockout 守护 per-IP 失败锁定：5 次失败后该 IP 被 429 拒绝；
+// 成功认证后计数器重置；锁定过期后解锁。
+func TestPolicyIPLockout(t *testing.T) {
+	token := "token-for-lockout-test-1234"
+	pcfg := &auth.AuthPolicy{
+		MaxAuthFailures: 3,
+		LockoutDuration: 300 * time.Millisecond,
+	}
+	s, _ := newPolicyServer(t, token, pcfg)
+	ip := "192.0.2.1:1234"
+
+	// 前 3 次失败，均 401。
+	for i := 0; i < 3; i++ {
+		rec := doGet(t, s, "wrong-"+token, ip)
+		if rec.Code != http.StatusUnauthorized {
+			t.Fatalf("attempt %d: want 401, got %d", i, rec.Code)
+		}
+	}
+	// 第 4 次尝试被锁，429。
+	rec := doGet(t, s, "wrong-"+token, ip)
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("after lockout: want 429, got %d\nbody=%s", rec.Code, rec.Body.String())
+	}
+	// 带正确 Token 也照样被锁（IP 级别锁定不认 Token）。
+	rec = doGet(t, s, token, ip)
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("locked IP with good token: want 429, got %d", rec.Code)
+	}
+	// 锁定过期后恢复。
+	time.Sleep(350 * time.Millisecond)
+	rec = doGet(t, s, token, ip)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("after lockout expiry: want 200, got %d\nbody=%s", rec.Code, rec.Body.String())
+	}
+	// 成功后失败计数器重置：再错 3 次才会再次锁。
+	for i := 0; i < 3; i++ {
+		rec = doGet(t, s, "wrong-"+token, ip)
+		if rec.Code != http.StatusUnauthorized {
+			t.Fatalf("after reset attempt %d: want 401, got %d", i, rec.Code)
+		}
+	}
+	rec = doGet(t, s, "wrong-"+token, ip)
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("after reset lockout: want 429, got %d", rec.Code)
+	}
+}
+
+// TestPolicyGlobalCircuitBreaker 守护全局熔断：不同 IP 累计失败达到阈值后
+// 所有请求被 429 拒绝；窗口过期后恢复。
+func TestPolicyGlobalCircuitBreaker(t *testing.T) {
+	token := "token-for-global-test-1234"
+	pcfg := &auth.AuthPolicy{
+		GlobalMaxFailures:     3,
+		GlobalFailureWindow:   500 * time.Millisecond,
+		GlobalLockoutDuration: 1 * time.Second,
+	}
+	s, _ := newPolicyServer(t, token, pcfg)
+
+	// 3 个不同 IP 各失败 1 次，累计 3 次触发全局熔断。
+	for _, ip := range []string{"192.0.2.1", "192.0.2.2", "192.0.2.3"} {
+		rec := doGet(t, s, "wrong", ip+":1234")
+		if rec.Code != http.StatusUnauthorized {
+			t.Fatalf("ip %s: want 401, got %d", ip, rec.Code)
+		}
+	}
+	// 第 4 个 IP（甚至正确 Token）被全局熔断拒绝。
+	rec := doGet(t, s, token, "192.0.2.4:1234")
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("global circuit: want 429, got %d", rec.Code)
+	}
+	// 熔断过期后恢复。
+	time.Sleep(1100 * time.Millisecond)
+	rec = doGet(t, s, token, "192.0.2.4:1234")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("after global expiry: want 200, got %d", rec.Code)
+	}
+}
+
+// TestPolicySessionExpiry 守护会话闲置超时：Token 首次认证成功后 31 分钟（超时
+// 30 分钟）再次使用被 401 拒绝（需轮换 Token）。
+func TestPolicySessionExpiry(t *testing.T) {
+	token := "token-for-session-test-1234"
+	pcfg := &auth.AuthPolicy{
+		IdleTimeout: 30 * time.Millisecond, // 测试用极短超时
+	}
+	s, _ := newPolicyServer(t, token, pcfg)
+
+	// 首次认证成功。
+	rec := doGet(t, s, token, "192.0.2.1:1234")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("first auth: want 200, got %d", rec.Code)
+	}
+	// 在窗口内（10ms 后）仍然有效。
+	time.Sleep(10 * time.Millisecond)
+	rec = doGet(t, s, token, "192.0.2.1:1234")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("within window: want 200, got %d", rec.Code)
+	}
+	// 超时后（35ms）被拒。
+	time.Sleep(30 * time.Millisecond)
+	rec = doGet(t, s, token, "192.0.2.1:1234")
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("after idle timeout: want 401, got %d\nbody=%s", rec.Code, rec.Body.String())
+	}
+	// 错误 Token 也不应通过（不是「会话超时导致误放」）。
+	rec = doGet(t, s, "wrong-token", "192.0.2.1:1234")
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("wrong token after expiry: want 401, got %d", rec.Code)
+	}
+}
+
+// TestPolicyTrustedProxyXFF 守护可信代理 IP 提取：请求来自可信代理时，XFF
+// 最右侧非可信跳作为锁定对象；不可信代理的 XFF 被忽略。
+func TestPolicyTrustedProxyXFF(t *testing.T) {
+	token := "token-for-xff-test-1234"
+	pcfg := &auth.AuthPolicy{
+		TrustedProxies:    []string{"10.0.0.0/24"},
+		MaxAuthFailures:   2,
+		LockoutDuration:   5 * time.Second,
+		IdleTimeout:       1 * time.Minute,
+		GlobalMaxFailures: 10,
+	}
+	s, _ := newPolicyServer(t, token, pcfg)
+
+	// 请求来自 10.0.0.5（可信代理），XFF 真实客户端 192.0.2.99。
+	r := httptest.NewRequest(http.MethodGet, "/api/v1/health", nil)
+	r.Header.Set("Authorization", "Bearer wrong-token")
+	r.Header.Set("X-Forwarded-For", "192.0.2.99, 10.0.0.5")
+	r.RemoteAddr = "10.0.0.5:8080"
+	rec := httptest.NewRecorder()
+	s.ServeHTTP(rec, r)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("first failure via XFF: want 401, got %d", rec.Code)
+	}
+	// 真实客户端 IP 192.0.2.99 失败 2 次后被锁。
+	r2 := httptest.NewRequest(http.MethodGet, "/api/v1/health", nil)
+	r2.Header.Set("Authorization", "Bearer wrong-token")
+	r2.Header.Set("X-Forwarded-For", "192.0.2.99, 10.0.0.5")
+	r2.RemoteAddr = "10.0.0.5:8080"
+	rec2 := httptest.NewRecorder()
+	s.ServeHTTP(rec2, r2)
+	if rec2.Code != http.StatusUnauthorized {
+		t.Fatalf("second failure: want 401, got %d", rec2.Code)
+	}
+	// 第三次：真实客户端 192.0.2.99 被锁 429。
+	r3 := httptest.NewRequest(http.MethodGet, "/api/v1/health", nil)
+	r3.Header.Set("Authorization", "Bearer wrong-token")
+	r3.Header.Set("X-Forwarded-For", "192.0.2.99, 10.0.0.5")
+	r3.RemoteAddr = "10.0.0.5:8080"
+	rec3 := httptest.NewRecorder()
+	s.ServeHTTP(rec3, r3)
+	if rec3.Code != http.StatusTooManyRequests {
+		t.Fatalf("real client locked: want 429, got %d", rec3.Code)
+	}
+	// 不可信代理 203.0.113.1 的 XFF 被忽略，按 RemoteAddr 锁定（203.0.113.1 还未失败过）。
+	r4 := httptest.NewRequest(http.MethodGet, "/api/v1/health", nil)
+	r4.Header.Set("Authorization", "Bearer wrong-token")
+	r4.Header.Set("X-Forwarded-For", "192.0.2.99") // 不可信代理，忽略
+	r4.RemoteAddr = "203.0.113.1:1234"
+	rec4 := httptest.NewRecorder()
+	s.ServeHTTP(rec4, r4)
+	if rec4.Code != http.StatusUnauthorized {
+		t.Fatalf("untrusted proxy: want 401, got %d", rec4.Code)
 	}
 }

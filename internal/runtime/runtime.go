@@ -402,12 +402,41 @@ func New(opt Options) (*Runtime, error) {
 		}
 	}
 
+	// 认证安全策略（R-3）：从 config.AuthPolicy（字符串形式的时长）转换成
+	// auth.AuthPolicy（time.Duration）。trustedProxies 空表示不信任任何转发。
+	var ap *auth.AuthPolicy
+	if f.Server.Auth != nil {
+		parseDur := func(s string, def time.Duration) time.Duration {
+			if s == "" {
+				return def
+			}
+			if d, err := time.ParseDuration(s); err == nil && d > 0 {
+				return d
+			}
+			return def
+		}
+		def := auth.DefaultPolicy
+		ap = &auth.AuthPolicy{
+			TrustedProxies:        f.Server.Auth.TrustedProxies,
+			MaxAuthFailures:       f.Server.Auth.MaxAuthFailures,
+			LockoutDuration:       parseDur(f.Server.Auth.LockoutDuration, def.LockoutDuration),
+			GlobalMaxFailures:     f.Server.Auth.GlobalMaxFailures,
+			GlobalFailureWindow:   parseDur(f.Server.Auth.GlobalFailureWindow, def.GlobalFailureWindow),
+			GlobalLockoutDuration: parseDur(f.Server.Auth.GlobalLockoutDuration, def.GlobalLockoutDuration),
+			IdleTimeout:           parseDur(f.Server.Auth.IdleTimeout, def.IdleTimeout),
+		}
+	}
+	var trustedProxies []string
+	if ap != nil {
+		trustedProxies = ap.TrustedProxies
+	}
 	r.api = httpapi.New(httpapi.Options{
 		Token:         firstNonEmpty(opt.Token, f.Server.Token),
 		BasePath:      f.Server.BasePath,
 		MetricsPublic: opt.MetricsPublic,
 		Auth:          r.auth,
 		Audit:         r,
+		Policy:        auth.NewPolicy(ap, trustedProxies),
 	}, r, logger)
 
 	return r, nil

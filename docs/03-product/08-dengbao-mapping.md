@@ -26,7 +26,7 @@
 | 等保要求（第三级） | 状态 | 实现与出处 | 说明 |
 |---|---|---|---|
 | a) 对登录用户进行身份标识和鉴别，标识唯一，鉴别有难度 | ✓ | `internal/auth/auth.go` `Store.Authenticate`；`internal/auth/token.go` | Token 明文不落盘：配置可只存 `tokenSha256`（不可逆），比对时先对入参做 SHA-256 再比（`auth.go:225`）。多用户各自唯一标识（用户名进 `Principal`，用于审计）。「有难度」靠 Token 自身熵（≥16 字符、禁弱口令表，见下）。 |
-| b) 登录失败处理：失败次数限制、结束会话、超时自动退出 | ✗ | — | **缺口**：当前无登录失败计数与锁定，也无基于闲置的超时退出（会话层）。边缘网关多为服务间长连接、人工交互式登录少，风险低于典型业务系统，但等保三级要求此子项，需部署方在接入层补齐或在后续版本实现。 |
+| b) 登录失败处理：失败次数限制、结束会话、超时自动退出 | ✓ | `internal/auth/policy.go` `Policy`；`internal/northbound/httpapi/httpapi.go` `guard`/`authenticate`/`authorized`；`internal/config` `AuthPolicy` | 三条等保子项全部落地（已修复 R-3）：**失败次数限制 + 锁定**——`Policy.RecordFailure` 维护 per-IP 失败计数，达 `maxAuthFailures`（默认 5）即锁定 `lockoutDuration`（默认 15 分钟），锁定期间 `Policy.Allow` 返回 429；**防分布式绕过**——另有全局熔断 `globalMaxFailures`（默认 20）/`globalFailureWindow`（默认 5 分钟），窗口内累计失败触发全站拒绝 `globalLockoutDuration`；**超时自动退出**——`Policy.SessionAlive` 按 Token 的 sha256 记录最后成功时间，闲置超 `idleTimeout`（默认 30 分钟）即拒绝并要求轮换。**可信代理白名单**：`trustedProxies` 控制 XFF 提取真实 IP（反代部署必配，否则按反代 IP 计数致全体被锁）。全部阈值/时长经 `server.auth` 配置，零值回退等保基线默认。 |
 | c) 远程管理防鉴别信息被窃听 | ✓ | `cmd/uic/main.go:393` `ListenAndServeTLS`；`internal/model` `Server.TLS`；`internal/tlscert` | 配齐 `server.tls`（enabled + certFile + keyFile）即强制 TLS，传输加密防窃听；或 `auto:true` 启动时生成自签证书（免证书分发、开箱即用，不提供来源可信）。**fail-closed**（已修复 R-1）：`enabled` 却既无证书文件也无 `auto` 时，配置期（`config.validateServerTLS`）直接拒绝，**不再静默回退明文 HTTP**。 |
 | d) 口令复杂度与定期更换 | ◐ | `internal/auth/auth.go` `ValidateToken` | 已有：≥16 字符、≤512、禁空白、禁已知弱口令占位符（`weakTokens`）。**缺**：「定期更换」无强制机制（配置项可手工换，无到期强制）。 |
 
@@ -79,8 +79,8 @@
 | 等保要求（第三级） | 状态 | 实现与出处 | 说明 |
 |---|---|---|---|
 | a) 遵循最小安装，仅开放必要服务/端口 | ✓ | `cmd/uic/main.go` listener；`internal/northbound/httpapi` 路由 | 单一 HTTP 端口，仅注册北向 API 路由（`route(...)`）；采集/北向外向按需启用，无多余守护端口。 |
-| b) 最小授权，及时关闭不需要的会话 | ◐ | `internal/rbac`；`internal/auth` Open 模式 | 最小授权已落地（1.2）。**「关闭不需要的会话」**：HTTP 服务设 `ReadHeaderTimeout`/`IdleTimeout`/`MaxHeaderBytes`（`main.go:385`），但无主动会话超时登出（与 1.1 b 同源缺口）。 |
-| c) 限制远程管理端口、防暴力破解 | ✗ | — | **缺口**：无登录失败锁定/限速（与 1.1 b 同源）。等保三级「入侵防范」要求限制登录失败次数、终端锁死，当前未实现。 |
+| b) 最小授权，及时关闭不需要的会话 | ◐ | `internal/rbac`；`internal/auth` Open 模式；`internal/auth/policy.go` `SessionAlive` | 最小授权已落地（1.2）。**「关闭不需要的会话」**：HTTP 服务设 `ReadHeaderTimeout`/`IdleTimeout`/`MaxHeaderBytes`（`main.go:385`），**会话闲置超时已落地（已修复 R-3）**——`Policy.SessionAlive` 对每个 Token 记录最后成功时间，闲置超 `idleTimeout`（默认 30 分钟）即拒绝并要求轮换，超时阈值经 `server.auth.idleTimeout` 配置。 |
+| c) 限制远程管理端口、防暴力破解 | ✓ | `internal/auth/policy.go` `Policy.Allow`/`RecordFailure`；`internal/northbound/httpapi/httpapi.go` `guard` | 已修复 R-3。**登录失败锁定**：`Policy.RecordFailure` 累计 per-IP 失败，达 `maxAuthFailures`（默认 5）锁定 `lockoutDuration`（默认 15 分钟），锁定期间 `guard` 前置 `Policy.Allow` 直接 429（不进认证、不污染审计）；**全局熔断**防分布式绕过（窗口内累计 `globalMaxFailures` 触发全站拒绝）；**可信代理白名单**防反代部署下按反代 IP 误锁。全部可经 `server.auth` 配置。 |
 | d) 安装必要运行补丁/安全加固 | ✗ | — | 缺口：补丁/加固属运维域，软件不内置。 |
 | e) 主机入侵防范（防恶意代码） | ✗ | — | 不在本软件范围（依赖部署主机）。 |
 
@@ -101,7 +101,7 @@
 |---|---|---|---|---|
 | **R-1** ✅已修复 | ~~TLS 开启但缺证书时静默回退明文 HTTP~~：已改为 fail-closed——`enabled` 无证书文件且无 `auto` 时配置期（`config.validateServerTLS`）直接拒绝，不再静默降级；同时实现 `server.tls.auto` 自动生成自签证书（`internal/tlscert`，纯标准库），免证书分发即可拿到传输加密 | 安全通信 / 数据保密性 (传输) | ~~高~~ 已消除 | 已落地并测试守护（`tlscert.TestGenerateProducesUsableCert` 证书可用、config `TestValidateServerTLS` 三合法两非法形态）。自签不提供来源可信，生产仍建议 CA 证书。 |
 | **R-2** ✅已修复 | ~~配置内链路凭据明文存储~~：已改为信封加密——`internal/config/envelope`（AES-256-GCM）+ `config.encryptChannelSecrets`/`decryptChannelSecrets`，写盘加密、读盘解密，KEK 来自 `UIC_CONFIG_KEK` 环境变量或派生自 `server.token`；未注入 KEK 时明文落盘（向后兼容），KEK 不匹配/篡改时 fail-closed | 数据保密性 (存储) / 剩余信息保护 | ~~中~~ 已消除 | 已落地并测试守护（`envelope.TestRoundTrip`/`TestTamperDetection`/`TestWrongKEK`、`config.TestConfigEnvelopeEncryption` 端到端）。3 个变异体验证。自签证书不提供来源可信，生产仍建议专用 KEK（环境变量）+ 定期轮换。 |
-| **R-3** | **无登录失败锁定 / 无会话超时退出**（`auth.go` 仅做成功比对） | 身份鉴别 b) / 入侵防范 c) | 中：无法防在线口令爆破。三级明确要求 | 边缘场景可评估在接入层（反代/WAF）实现；或后续版本内置失败计数 + 锁定窗口。 |
+| **R-3** ✅已修复 | ~~无登录失败锁定 / 无会话超时退出~~：已落地 `internal/auth/policy.go`——per-IP 失败锁定（`maxAuthFailures` 默认 5 次/`lockoutDuration` 默认 15 分钟）+ 全局熔断防分布式绕过（`globalMaxFailures` 默认 20/`globalFailureWindow` 默认 5 分钟）+ 会话闲置超时（`idleTimeout` 默认 30 分钟，`SessionAlive` 按 Token sha256 记最后成功时间）+ 可信代理白名单（XFF 防误锁）。全部经 `server.auth` 配置，零值回退等保基线。同时修复 `ServeHTTP.authorized` 单凭据前置认证与 `guard` 双重认证割裂（错 token 在入口即被拦、policy 收不到失败事件）的设计缺陷 | 身份鉴别 b) / 入侵防范 c) | ~~中~~ 已消除 | 已落地并测试守护（`auth` 14 单测 + `httpapi` 4 集成测试：IP 锁定、全局熔断、会话超时、可信代理 XFF）。3 个变异体验证（RecordFailure 不计数、SessionAlive 超时放行、Allow 锁定失效，均先编译通过再变红）。 |
 | **R-4** | **无口令到期强制更换** | 身份鉴别 d) | 低 | 配置项可手工轮换；建议纳入运维制度。 |
 | **R-5** | **依赖与工具链漏洞面按构造为零，但工具链自身仅 1 条已知 advisory**（ADR-0004：GO-2026-6859，1.26.11 修复） | 安全审计 / 入侵防范 | 低：advisory 在固定 1.26.10 上「已知但接受」，bump 受 GOSUMDB=off 阻断 | 维持 ADR-0004 决策；升 1.26.11 需同时启用 sumdb 或 vendor 工具链。 |
 
@@ -125,7 +125,8 @@
 
 本表的每一条「✓ / ◐」都对应**可运行、可复核**的代码与测试：
 
-- 身份鉴别：`internal/auth` `auth_test.go`（Open 模式、sha256-only 凭据不接受明文、用户枚举不泄露 Token、弱口令拒绝）。
+- 身份鉴别：`internal/auth` `auth_test.go`（Open 模式、sha256-only 凭据不接受明文、用户枚举不泄露 Token、弱口令拒绝）+ `policy_test.go`（per-IP 锁定与解锁、全局熔断与窗口重置、会话闲置超时、可信代理 XFF 提取、默认阈值）+ `internal/northbound/httpapi/httpapi_test.go` 集成测试（IP 锁定、全局熔断、会话超时、可信代理 XFF 端到端）。
+- 认证策略配置：`internal/config`（`AuthPolicy` 字符串时长 ↔ `auth.AuthPolicy` 时长转换，见 `runtime.go` `buildAuth` 后的转换闭包）。
 - 访问控制：`internal/rbac/rbac_test.go`（未知角色拒绝、危险命令归 `command.danger`）。
 - 安全审计：`internal/audit/audit_test.go`（哈希链成立、篡改被抓、删除被抓、重启续链、0o600 权限、淘汰后可校验）。
 - 数据完整性：配置 `VersionOf` 快照哈希、升级包逐文件 SHA-256（`upgrade_test.go`、`cmd/uic/pkg_test.go` `TestUpgradeTamperedRejected`）。
