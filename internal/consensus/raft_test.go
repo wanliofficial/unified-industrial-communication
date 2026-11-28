@@ -131,8 +131,10 @@ func TestFailoverAfterLeaderShutdown(t *testing.T) {
 	if err := tc.node(first).Shutdown(); err != nil {
 		t.Fatalf("shutdown leader: %v", err)
 	}
-	// 剩余多数派应在 election timeout 内选出新 leader。
-	deadline := time.Now().Add(15 * time.Second)
+	// 剩余多数派应在 election timeout 内选出新 leader。deadline 放宽到 30s：
+	// 200ms 选举超时在正常负载下 1-2s 完成，但整包与机器高负载下调度会被放大，
+	// 15s 偶发不够（放宽窗口不改语义，只消除瞬态超时）。
+	deadline := time.Now().Add(30 * time.Second)
 	var second string
 	for time.Now().Before(deadline) {
 		for id, c := range tc.nodes {
@@ -215,7 +217,11 @@ func TestTermAdvancesAfterFailover(t *testing.T) {
 	if err := tc.node(first).Shutdown(); err != nil {
 		t.Fatalf("shutdown: %v", err)
 	}
-	deadline := time.Now().Add(15 * time.Second)
+	// 放宽到 30s：200ms 选举超时在正常负载下 1-2s 内即可 failover，但当整包与
+	// 其它 raft 集成测试并发、或机器正跑 `go test ./...`（高 CPU 负载 + GC）时，
+	// 心跳/选举的 goroutine 调度会被放大，15s 偶发不够（曾观察到一次 no new
+	// leader 超时）。这是放宽窗口、不改语义；term 前进的断言本身不受影响。
+	deadline := time.Now().Add(30 * time.Second)
 	var second string
 	for time.Now().Before(deadline) {
 		for id, c := range tc.nodes {
