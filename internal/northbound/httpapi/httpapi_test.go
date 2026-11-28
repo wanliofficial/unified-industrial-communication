@@ -27,6 +27,7 @@ type fakeBackend struct {
 	health  Health
 	ready   Ready
 	version VersionInfo
+	leader  LeaderInfo
 	metrics string
 	logs    []obs.Entry
 
@@ -78,6 +79,7 @@ type fakeBackend struct {
 func (f *fakeBackend) Health() Health       { return f.health }
 func (f *fakeBackend) Ready() Ready         { return f.ready }
 func (f *fakeBackend) Version() VersionInfo { return f.version }
+func (f *fakeBackend) Leader() LeaderInfo   { return f.leader }
 func (f *fakeBackend) Metrics() string      { return f.metrics }
 func (f *fakeBackend) Logs(device, level string, limit int) []obs.Entry {
 	return f.logs
@@ -1435,5 +1437,78 @@ func TestHealthSerializesScheduler(t *testing.T) {
 	s.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/v1/health", nil))
 	if !strings.Contains(rec.Body.String(), `"scheduler":{"verdict":""`) {
 		t.Fatalf("body = %s", rec.Body.String())
+	}
+}
+
+// TestLeaderEndpoint 验证 GET /api/v1/leader 的契约：它是「写之前先问路」的
+// 端点，因此必须低门槛可读，且字段完整（角色、leader 地址、复制水位）。
+func TestLeaderEndpoint(t *testing.T) {
+	s, be := newServer(t, Options{Token: "secret", MetricsPublic: false})
+	be.leader = LeaderInfo{
+		Enabled:     true,
+		Role:        "follower",
+		InstanceID:  "node-a",
+		Term:        7,
+		LeaderID:    "node-b",
+		LeaderAddr:  "10.0.0.2:7000",
+		CommitIndex: 123,
+		Healthy:     true,
+		Peers: []PeerInfo{
+			{ID: "node-a", Addr: "10.0.0.1:7000", Voter: true},
+			{ID: "node-b", Addr: "10.0.0.2:7000", Voter: true},
+		},
+	}
+
+	// 未认证：与 /api/v1/health 同一档（需要读权限的凭据），避免把集群拓扑
+	// 完全公开；但也不要求更高权限——运维与负载均衡都要能读它。
+	rec := httptest.NewRecorder()
+	s.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/v1/leader", nil))
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthenticated = %d, want 401", rec.Code)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/leader", nil)
+	req.Header.Set("Authorization", "Bearer secret")
+	rec = httptest.NewRecorder()
+	s.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code = %d (%s)", rec.Code, rec.Body)
+	}
+	var got LeaderInfo
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode: %v (%s)", err, rec.Body)
+	}
+	if got.Role != "follower" || got.LeaderID != "node-b" || got.CommitIndex != 123 || !got.Healthy {
+		t.Fatalf("leader = %+v", got)
+	}
+	if len(got.Peers) != 2 || got.Peers[1].Addr != "10.0.0.2:7000" {
+		t.Fatalf("peers = %+v", got.Peers)
+	}
+
+	// /health 里也带同一份视图：一次抓取就能判断「本副本是不是 leader」，
+	// 不必再打一个端点。
+	be.health = Health{Status: "ok", Leader: be.leader}
+	rec = httptest.NewRecorder()
+	s.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/v1/health", nil))
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("health unauthenticated = %d", rec.Code)
+	}
+	req = httptest.NewRequest(http.MethodGet, "/api/v1/health", nil)
+	req.Header.Set("Authorization", "Bearer secret")
+	rec = httptest.NewRecorder()
+	s.ServeHTTP(rec, req)
+	var hb struct {
+		Status string     `json:"status"`
+		Leader LeaderInfo `json:"leader"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &hb); err != nil {
+		t.Fatal(err)
+	}
+	if hb.Leader.LeaderID != "node-b" || hb.Status != "ok" {
+		t.Fatalf("health leader = %+v status=%q", hb.Leader, hb.Status)
+	}
+	// follower 角色不得把整体健康判成故障。
+	if hb.Status != "ok" {
+		t.Fatalf("status = %q, want ok", hb.Status)
 	}
 }

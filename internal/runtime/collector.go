@@ -140,6 +140,13 @@ func (c *collector) Collect(ctx context.Context, lease *scheduler.Lease) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
+	// leader 闸：非 leader 副本不产生采集请求。正常路径下设备已被
+	// clusterLoop 停用、根本不会被调度；这里是「角色刚切换、调度器已派发」
+	// 的窗口兜底——返回 nil 而不是错误，避免把一次正常的停采记成设备故障。
+	if !c.rt.isLeader() {
+		return nil
+	}
+
 	if err := c.ensure(ctx, lease.Generation); err != nil {
 		c.rt.metrics.Inc("uic_driver_connect_total", obs.Labels{
 			"device": c.dev.ID, "protocol": c.ch.Protocol, "status": "error",
@@ -193,6 +200,9 @@ func (c *collector) Collect(ctx context.Context, lease *scheduler.Lease) error {
 func (c *collector) Probe(ctx context.Context, lease *scheduler.Lease) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if !c.rt.isLeader() {
+		return nil
+	}
 	if err := c.ensure(ctx, lease.Generation); err != nil {
 		c.markUnavailable(lease, err)
 		return err

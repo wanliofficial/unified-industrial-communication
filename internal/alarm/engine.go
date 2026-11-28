@@ -1141,6 +1141,30 @@ func (e *Engine) Get(id string) (Status, bool) {
 	return st.snapshot(), true
 }
 
+// SetStateForTest 是测试专用入口：直接塞一条 active 报警状态（绕过采集时序）。
+//
+// 报警引擎的 Ingest/Sweep 路径要产生一条 active 报警，需要先有样本、再满足
+// 阈值、再等 onDelay——这让「只验证确认账本守卫逻辑」的用例既慢又脆。测试
+// 只需要一条已知 Since 的 active 状态，直接用这个入口把状态塞进去即可。
+//
+// 仅测试代码可用：名字里带 Test 后缀，生产代码不会调用它。
+func (e *Engine) SetStateForTest(id string, since time.Time) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if _, ok := e.states[id]; !ok {
+		return
+	}
+	st := e.states[id]
+	st.state = StateActive
+	st.since = since
+	st.acked = false
+	st.ackAt = time.Time{}
+	st.ackBy = ""
+	st.known = true
+	st.reason = "test-injected"
+	st.updatedAt = since
+}
+
 // Counts 返回状态汇总。
 func (e *Engine) Counts() Counts {
 	e.mu.Lock()

@@ -178,6 +178,35 @@ type HistoryHealth struct {
 	Errors  uint64     `json:"writeErrors,omitempty"`
 }
 
+// LeaderInfo 是跨实例协调的角色视图（GET /api/v1/leader 与 /health 的 leader 块）。
+//
+// 它回答「本副本在集群里是谁、当前 leader 是谁、复制到哪了」。Enabled=false
+// 表示 cluster 未启用（单实例部署）：此时本进程按 always-leader 运行，行为与
+// 引入 raft 之前一致。Role 取值 leader|follower|candidate|unknown，始终可判定；
+// 集群正在选主时是 candidate/unknown，这是正常角色，不是故障——因此它不参与
+// /health 的 status 判定。
+type LeaderInfo struct {
+	Enabled     bool       `json:"enabled"`
+	Role        string     `json:"role"`
+	InstanceID  string     `json:"instanceId,omitempty"`
+	Term        uint64     `json:"term"`
+	LeaderID    string     `json:"leaderId,omitempty"`
+	LeaderAddr  string     `json:"leaderAddr,omitempty"`
+	Peers       []PeerInfo `json:"peers,omitempty"`
+	CommitIndex uint64     `json:"commitIndex"`
+	Healthy     bool       `json:"healthy"`
+	// Healthy 表示本副本的状态机与日志一致。false 时本副本拒绝写（fail-closed）。
+	// Since 是本副本进入当前角色（或进程启动）的时间，便于判断「刚切主」。
+	Since time.Time `json:"since,omitempty"`
+}
+
+// PeerInfo 是一个集群成员。
+type PeerInfo struct {
+	ID    string `json:"id"`
+	Addr  string `json:"addr"`
+	Voter bool   `json:"voter"`
+}
+
 // Health 是业务健康聚合。
 type Health struct {
 	Status        string       `json:"status"`
@@ -200,6 +229,10 @@ type Health struct {
 	// 但让「数据时间戳是否可信」成为一个可被监控抓取、可被告警判定的状态，而不
 	// 是只能事后翻日志的猜测。
 	Clock ClockHealth `json:"clock"`
+	// Leader 是跨实例协调的角色与复制水位。同样不参与 status 判定：
+	// follower/candidate 是合法角色，把「我不是 leader」判成故障会让每个
+	// 副本的 health 都变成噪声，告警系统很快学会忽略它。
+	Leader LeaderInfo `json:"leader"`
 }
 
 // SchedulerHealth 是采集调度中枢的活性快照。
@@ -457,6 +490,8 @@ type Backend interface {
 	Health() Health
 	Ready() Ready
 	Version() VersionInfo
+	// Leader 返回本副本的集群角色视图（cluster 未启用时 enabled=false）。
+	Leader() LeaderInfo
 	Metrics() string
 	Logs(device, level string, limit int) []obs.Entry
 
@@ -740,6 +775,7 @@ func (s *Server) routes() {
 	public("GET /readyz", s.readyz)
 	public("GET /api/v1/version", s.version)
 	s.mux.HandleFunc("GET /api/v1/health", s.guardReadPublic(h(s.health)))
+	s.mux.HandleFunc("GET /api/v1/leader", s.guardReadPublic(h(s.leader)))
 	s.mux.HandleFunc("GET /api/v1/metrics", s.guardReadPublic(h(s.metrics)))
 	public("GET /api/v1/auth/me", s.whoami)
 
@@ -1073,6 +1109,13 @@ func (s *Server) readyz(w http.ResponseWriter, _ *http.Request) error {
 
 func (s *Server) health(w http.ResponseWriter, _ *http.Request) error {
 	writeOK(w, s.be.Health())
+	return nil
+}
+
+// leader 返回本副本的集群角色视图。非 leader 的写请求会拿到 409 + leader
+// 地址，客户端可据此重定向；这个端点让客户端在发起写之前就能先问路。
+func (s *Server) leader(w http.ResponseWriter, _ *http.Request) error {
+	writeOK(w, s.be.Leader())
 	return nil
 }
 

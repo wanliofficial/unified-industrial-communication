@@ -3,6 +3,8 @@ package consensus
 import (
 	"context"
 	"errors"
+	"io"
+	"strings"
 	"testing"
 	"time"
 )
@@ -171,10 +173,35 @@ func TestApplyFailureMarksReplicaUnhealthy(t *testing.T) {
 	if c.fsm.IsHealthy() {
 		t.Error("FSM should be unhealthy after apply failure")
 	}
-	// 恢复后应重新可用。
+	// 分歧是粘性的：applier 恢复正常也不再接受写。副本已经无法保证它与
+	// 日志一致，只能靠快照恢复追平（见 TestRestoreReenablesPropose），
+	// 否则「一次失败后悄悄恢复」会把分歧留在状态里。
 	tc.applier(leader).clearFail()
+	if _, err := c.Propose(context.Background(), Command{Kind: KindCommand}); !errors.Is(err, ErrUnhealthy) {
+		t.Fatalf("Propose after transient recovery = %v, want ErrUnhealthy", err)
+	}
+}
+
+// TestRestoreReenablesPropose 验证快照恢复是分歧副本唯一的复位路径。
+func TestRestoreReenablesPropose(t *testing.T) {
+	tc := newTestCluster(t, 1)
+	defer tc.Close()
+	leader := tc.waitLeader(t, 5*time.Second)
+	c := tc.node(leader)
+
+	tc.applier(leader).setFail(errors.New("apply boom"))
+	if _, err := c.Propose(context.Background(), Command{Kind: KindCommand}); err == nil {
+		t.Fatal("Propose should surface apply error")
+	}
+	tc.applier(leader).clearFail()
+	if err := c.fsm.Restore(io.NopCloser(strings.NewReader(""))); err != nil {
+		t.Fatalf("Restore: %v", err)
+	}
+	if !c.Healthy() {
+		t.Fatal("Consensus should be healthy after a successful Restore")
+	}
 	if _, err := c.Propose(context.Background(), Command{Kind: KindCommand}); err != nil {
-		t.Fatalf("Propose after recovery: %v", err)
+		t.Fatalf("Propose after restore: %v", err)
 	}
 }
 

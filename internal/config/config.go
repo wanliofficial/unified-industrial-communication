@@ -235,13 +235,53 @@ type Logging struct {
 	File   string `json:"file,omitempty"`
 }
 
+// Cluster 是跨实例协调（raft）配置。
+//
+// 默认关闭：单实例部署行为与引入 raft 之前完全一致（无 raft、无额外监听、
+// 无额外磁盘）。开启后本进程以 raft 集群成员身份运行：唯一 leader 采集与
+// 接受写，其余副本复制控制面状态机（配置/写记录/命令记录/报警确认）。
+//
+// Peers 描述的是**期望的集群成员表**（含本节点），供两件事使用：
+//   - 单节点/多节点判定（空或只含自身 = 单节点，Bootstrap 由 runtime 置 true）；
+//   - leader 对账：leader 启动后把表里尚未加入的节点经 raft 原生 AddServer
+//     加入。Bootstrap 只写「自身」一条初始配置，绝不在引导时把未启动的节点
+//     写进投票集——否则种子节点会因凑不齐多数派而永远选不出 leader。
+type Cluster struct {
+	Enabled bool `json:"enabled"`
+	// NodeID 是本节点在集群里的身份。空时复用 instanceid 的持久值；多节点
+	// 部署必须显式填写，否则各节点无法从 Peers 里认出「自己」。
+	NodeID string `json:"nodeId,omitempty"`
+	// DataDir 是 raft 日志/稳定存储/快照目录。相对路径基于 storage.dir 解析。
+	DataDir string `json:"dataDir,omitempty"`
+	// Listen 是 raft transport 的监听地址（host:port）。多节点必须可被对端
+	// 路由；单节点可用环回地址。
+	Listen string `json:"listen,omitempty"`
+	// Bootstrap 表示本节点是集群种子（唯一一台写入初始配置的节点）。
+	// 单节点部署由 runtime 自动置 true，无需配置；多节点必须恰好一台为 true。
+	Bootstrap bool   `json:"bootstrap,omitempty"`
+	Peers     []Peer `json:"peers,omitempty"`
+}
+
+// Peer 是一个集群成员：身份 + raft transport 地址。
+type Peer struct {
+	ID   string `json:"id"`
+	Addr string `json:"addr"`
+}
+
+// ClusterEnabled 报告集群协调是否启用。
+func (f *File) ClusterEnabled() bool { return f.Cluster != nil && f.Cluster.Enabled }
+
 // File 是一份完整配置。
 type File struct {
-	SchemaVersion int             `json:"schemaVersion"`
-	Site          string          `json:"site"`
-	Server        Server          `json:"server"`
-	Channels      []model.Channel `json:"channels"`
-	Devices       []model.Device  `json:"devices"`
+	SchemaVersion int    `json:"schemaVersion"`
+	Site          string `json:"site"`
+	Server        Server `json:"server"`
+	// Cluster 用指针 + omitempty：使「未启用」的存量配置规范化输出逐字节不变，
+	// 版本哈希不因升级而漂移（struct 的 omitempty 不会省略零值，会让所有存量
+	// 配置凭空多出一个 "cluster":{}）。
+	Cluster  *Cluster        `json:"cluster,omitempty"`
+	Channels []model.Channel `json:"channels"`
+	Devices  []model.Device  `json:"devices"`
 	// Slaves 把采集到的点位以 Modbus 从站形式暴露给外部主站。它不参与
 	// 采集调度，因此与 channels/devices 并列而不是挂在设备下。
 	Slaves []model.Slave `json:"slaves,omitempty"`
@@ -414,6 +454,9 @@ func (f *File) Validate() error {
 	if err := f.validateServer(); err != nil {
 		return err
 	}
+	if err := f.validateCluster(); err != nil {
+		return err
+	}
 	if len(f.Channels) == 0 {
 		return errors.New("channels: at least one channel required")
 	}
@@ -530,6 +573,76 @@ func (f *File) validateServer() error {
 		default:
 			return fmt.Errorf("server.users[%d] (%s): one of token or tokenSha256 is required", i, name)
 		}
+	}
+	return nil
+}
+
+// validateCluster 校验跨实例协调配置。
+//
+// 全部在配置期 fail-fast：一次集群配置错误（缺地址、两节点、端口冲突）如果
+// 拖到启动期才发现，表现会是一场「选不出 leader」的静默故障——所有写都 409/504，
+// 而日志里只有 raft 的连接失败，运维很难联想到是配置少写了一个字段。
+func (f *File) validateCluster() error {
+	if f.Cluster == nil || !f.Cluster.Enabled {
+		return nil
+	}
+	c := f.Cluster
+	if c.Listen == "" {
+		return errors.New("cluster.listen: required when cluster.enabled")
+	}
+	if _, port, err := net.SplitHostPort(c.Listen); err != nil {
+		return fmt.Errorf("cluster.listen %q: must be host:port: %v", c.Listen, err)
+	} else if port == "" || port == "0" {
+		// 端口 0 是随机分配：对端无法据此连进来，多节点必然失败。
+		return fmt.Errorf("cluster.listen %q: port must be a fixed non-zero port", c.Listen)
+	}
+	if strings.TrimSpace(c.DataDir) == "" {
+		c.DataDir = "raft"
+	}
+	if len(c.Peers) == 0 {
+		// 单节点集群：Bootstrap 由 runtime 置 true，本节点恒为 leader。
+		return nil
+	}
+	ids := make(map[string]bool, len(c.Peers))
+	addrs := make(map[string]bool, len(c.Peers))
+	self := false
+	for i, p := range c.Peers {
+		id := strings.TrimSpace(p.ID)
+		if id == "" {
+			return fmt.Errorf("cluster.peers[%d]: id is required", i)
+		}
+		if ids[id] {
+			return fmt.Errorf("cluster.peers[%d]: duplicate id %q", i, id)
+		}
+		ids[id] = true
+		addr := strings.TrimSpace(p.Addr)
+		if addr == "" {
+			return fmt.Errorf("cluster.peers[%d] (%s): addr is required", i, id)
+		}
+		if _, port, err := net.SplitHostPort(addr); err != nil || port == "" {
+			return fmt.Errorf("cluster.peers[%d] (%s): addr %q must be host:port", i, id, addr)
+		}
+		if addrs[addr] {
+			return fmt.Errorf("cluster.peers[%d] (%s): duplicate addr %q", i, id, addr)
+		}
+		addrs[addr] = true
+		if id == c.NodeID {
+			self = true
+			if addr != c.Listen {
+				return fmt.Errorf("cluster.peers[%d] (%s): addr %q must equal cluster.listen %q", i, id, addr, c.Listen)
+			}
+		}
+	}
+	if len(c.Peers) == 2 {
+		// 2 节点集群没有容错价值：任一节点故障就凑不齐多数派，反而比单节点
+		// 更不可用。要么单节点，要么 >=3。
+		return errors.New("cluster.peers: exactly 2 nodes has no fault tolerance; use 1 (single node) or >=3")
+	}
+	if c.NodeID == "" {
+		return errors.New("cluster.nodeId: required when cluster.peers is set (it must match this node's peers[].id)")
+	}
+	if !self {
+		return fmt.Errorf("cluster.peers: nodeId %q must appear in peers (include this node)", c.NodeID)
 	}
 	return nil
 }
@@ -1032,7 +1145,30 @@ func listenConflicts(a, b string) bool {
 }
 
 // Canonical 输出确定性 JSON，作为版本哈希的输入。
+//
+// cluster 块被**排除**在版本之外：它是节点本地启动参数（nodeId/listen/
+// dataDir/bootstrap），不属于集群共享配置。若纳入哈希：
+//   - 同一份逻辑配置在各节点会算出不同版本（nodeId 必然不同），
+//     「全集群同一个配置版本」这个可核对的契约就没了；
+//   - 节点身份会被写进版本号、快照文件名与 /api/v1/config 的对外响应。
+//
+// 排除它不会让存量配置哈希漂移：未启用集群时该字段本来就是 nil（omitempty）。
 func (f *File) Canonical() ([]byte, error) {
+	cp := *f
+	cp.Cluster = nil
+	b, err := json.MarshalIndent(&cp, "", "  ")
+	if err != nil {
+		return nil, err
+	}
+	return append(b, '\n'), nil
+}
+
+// MarshalFull 输出包含节点本地块的完整 JSON，用于落盘与版本快照。
+//
+// 与 Canonical 的分工：Canonical 是「全集群共享内容」的哈希输入；MarshalFull
+// 是「本节点完整配置」的持久化形式。写盘用后者，否则每次配置应用都会把本地
+// cluster 块从配置文件里抹掉（重启后集群身份丢失）。
+func (f *File) MarshalFull() ([]byte, error) {
 	b, err := json.MarshalIndent(f, "", "  ")
 	if err != nil {
 		return nil, err
@@ -1118,11 +1254,13 @@ type Manager struct {
 	statePath string
 	snapDir   string
 
-	mu        sync.Mutex
-	current   *File
-	canonical []byte
-	version   string
-	state     State
+	mu      sync.Mutex
+	current *File
+	// raw 是落盘原文（含节点本地 cluster 块）。回滚/失败恢复用的就是它，
+	// 不能用 Canonical()——后者刻意排除了 cluster 块。
+	raw     []byte
+	version string
+	state   State
 }
 
 // Open 加载配置并初始化版本目录。dataDir 为空时使用配置文件所在目录。
@@ -1142,6 +1280,10 @@ func Open(path, dataDir string) (*Manager, error) {
 	if err != nil {
 		return nil, err
 	}
+	full, err := f.MarshalFull()
+	if err != nil {
+		return nil, err
+	}
 	if dataDir == "" {
 		dataDir = filepath.Dir(path)
 	}
@@ -1150,7 +1292,7 @@ func Open(path, dataDir string) (*Manager, error) {
 		statePath: filepath.Join(dataDir, "config.state.json"),
 		snapDir:   filepath.Join(dataDir, "snapshots"),
 		current:   &f,
-		canonical: canonical,
+		raw:       full,
 		version:   VersionOf(canonical),
 	}
 	if err := os.MkdirAll(m.snapDir, 0o755); err != nil {
@@ -1160,7 +1302,7 @@ func Open(path, dataDir string) (*Manager, error) {
 		return nil, err
 	}
 	// 当前配置也必须有一份快照，否则回滚列表里看不到它。
-	if err := m.writeSnapshot(m.version, canonical); err != nil {
+	if err := m.writeSnapshot(m.version, full); err != nil {
 		return nil, err
 	}
 	m.state.CurrentVersion = m.version
@@ -1208,10 +1350,22 @@ func (m *Manager) Validate(f *File) error {
 }
 
 // Apply 校验并应用一份配置。相同内容不重复应用（幂等）。
+//
+// cluster 块是节点本地启动参数，**不从入参继承**：无论配置来自 API、回滚快照
+// 还是共识日志（可能带着另一个节点的 nodeId/listen），落盘与生效的都是本机
+// 原来的 cluster 块。集群拓扑只能改本地配置文件并重启，运行期 Apply 改不动它。
 func (m *Manager) Apply(f *File, source string) (ApplyResult, error) {
 	start := time.Now()
 	if source == "" {
 		source = "api"
+	}
+	m.mu.Lock()
+	localCluster := m.current.Cluster
+	m.mu.Unlock()
+	if localCluster != nil {
+		f = DeepCopy(f)
+		cp := *localCluster
+		f.Cluster = &cp
 	}
 	if err := f.Validate(); err != nil {
 		return ApplyResult{}, err
@@ -1220,6 +1374,10 @@ func (m *Manager) Apply(f *File, source string) (ApplyResult, error) {
 	// 取就拿到新值了。
 	beforeVersion, _ := m.currentVersion()
 	canonical, err := f.Canonical()
+	if err != nil {
+		return ApplyResult{}, err
+	}
+	full, err := f.MarshalFull()
 	if err != nil {
 		return ApplyResult{}, err
 	}
@@ -1236,20 +1394,20 @@ func (m *Manager) Apply(f *File, source string) (ApplyResult, error) {
 	}
 
 	prevVersion := m.version
-	prevCanonical := m.canonical
+	prevRaw := m.raw
 	summary := summarize(m.current, f)
 
 	// 1. 备份当前版本（快照本身即备份）。
-	if err := m.writeSnapshot(prevVersion, prevCanonical); err != nil {
+	if err := m.writeSnapshot(prevVersion, prevRaw); err != nil {
 		return ApplyResult{}, fmt.Errorf("config: backup: %w", err)
 	}
-	// 2. 原子写入新配置。
-	if err := atomicWrite(m.path, canonical); err != nil {
+	// 2. 原子写入新配置（完整内容，含本地 cluster 块）。
+	if err := atomicWrite(m.path, full); err != nil {
 		return ApplyResult{}, fmt.Errorf("config: write: %w", err)
 	}
 	// 3. 写新版本快照。
-	if err := m.writeSnapshot(version, canonical); err != nil {
-		_ = atomicWrite(m.path, prevCanonical)
+	if err := m.writeSnapshot(version, full); err != nil {
+		_ = atomicWrite(m.path, prevRaw)
 		return ApplyResult{}, fmt.Errorf("config: snapshot: %w", err)
 	}
 	// 4. 更新状态；失败则恢复原配置。
@@ -1267,12 +1425,12 @@ func (m *Manager) Apply(f *File, source string) (ApplyResult, error) {
 	m.state = next
 	if err := m.saveState(); err != nil {
 		m.state = prevState
-		_ = atomicWrite(m.path, prevCanonical)
+		_ = atomicWrite(m.path, prevRaw)
 		return ApplyResult{}, fmt.Errorf("config: state: %w", err)
 	}
 
 	m.current = f
-	m.canonical = canonical
+	m.raw = full
 	m.version = version
 	_ = m.prune(50)
 

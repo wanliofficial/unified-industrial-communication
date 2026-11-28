@@ -2,15 +2,18 @@ package runtime
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"uic/internal/alarm"
 	"uic/internal/audit"
 	"uic/internal/auth"
 	"uic/internal/config"
+	"uic/internal/consensus"
 	"uic/internal/northbound/httpapi"
 	"uic/internal/rbac"
 )
@@ -235,12 +238,30 @@ func (r *Runtime) AuditStats() (audit.Stats, bool) {
 // 埋点：命令、报警确认、配置
 // ---------------------------------------------------------------------------
 
+// localOnlyCommand 列出「只影响本副本、与集群状态无关」的命令。
+//
+// 默认（未列出的）一律 leader-only：新加一条命令若忘了分类，结果是「只想在
+// leader 上执行」而不是「在 follower 上也悄悄执行」——这是 fail-closed 的方向。
+// log.level 是唯一的本地命令：运维要调高某个 follower 的日志级别来排查它为
+// 什么没跟上，这时把他 409 掉毫无道理。
+func localOnlyCommand(action string) bool {
+	return action == "log.level"
+}
+
+// commandReplicatedByInner 报告该命令的业务动作本身已经提交过共识（由
+// Rollback / AckAlarms 内部完成），外层不再重复提交一条决策记录。
+func commandReplicatedByInner(action string) bool {
+	return action == "config.rollback" || action == "alarm.ack"
+}
+
 // Command 执行白名单命令并审计。
 //
 // 审计包在**外面**而不是每个 case 里：命令白名单会继续增加，逐个 case 写
 // 审计必然漏掉一两个，而漏掉的往往就是最危险的那个。
+//
+// 复制的是「决策记录」而不是命令本身：设备 I/O 副作用只在 leader 执行一次，
+// 其余副本 apply 到的只是一条可复盘的控制记录。否则一次重启会被执行 N 次。
 func (r *Runtime) Command(ctx context.Context, action string, params map[string]any) (any, error) {
-	out, err := r.command(ctx, action, params)
 	detail := map[string]string{}
 	// 只记录标量参数，并截断长度：params 里可能有表达式或大量点位 ID，
 	// 原样写进审计会让单条记录失控。
@@ -252,41 +273,76 @@ func (r *Runtime) Command(ctx context.Context, action string, params map[string]
 			detail["param."+k] = s
 		}
 	}
-	if err != nil {
-		code, msg := "command.failed", err.Error()
-		var ae *httpapi.APIError
-		if errors.As(err, &ae) {
-			code, msg = ae.Code, ae.Message
+
+	leaderOnly := !localOnlyCommand(action)
+	if leaderOnly && r.consensus != nil {
+		if err := r.requireLeader(); err != nil {
+			r.auditFrom(ctx, "command."+action, action, "error", errorCode(err), errorMessage(err), detail)
+			return nil, err
 		}
-		r.auditFrom(ctx, "command."+action, action, "error", code, msg, detail)
+	}
+
+	out, err := r.command(ctx, action, params)
+	if err != nil {
+		r.auditFrom(ctx, "command."+action, action, "error", errorCode(err), errorMessage(err), detail)
 		return out, err
 	}
 	r.auditFrom(ctx, "command."+action, action, "ok", "", "", detail)
+
+	// 复制决策记录：成功执行的命令才进日志。失败的命令已经由请求方看到
+	// 错误，把它写进共识只会让各副本多一份「这里失败过」的噪声。
+	if leaderOnly && r.consensus != nil && !commandReplicatedByInner(action) {
+		res, _ := json.Marshal(out)
+		payload := commandPayload{
+			Action: action, Params: params, Result: res,
+			At: time.Now().UTC(),
+		}
+		if _, perr := r.propose(ctx, consensus.KindCommand, payload); perr != nil {
+			return out, r.clusterWriteError(perr)
+		}
+	}
 	return out, nil
 }
 
 // AckAlarms 确认报警并审计。
 //
 // 确认本身不改设备，但它是「谁按下了确认」的唯一证据——事故复盘时这条记录
-// 比报警文本更重要。
+// 比报警文本更重要。它同时是必须复制的状态：新 leader 若不知道「这个发生
+// 实例已被确认」，会把整个故障重新播报一遍，运维会以为故障又来了。
 func (r *Runtime) AckAlarms(ctx context.Context, ids []string, all bool, by string) ([]alarm.Status, error) {
-	out, err := r.ackAlarms(ctx, ids, all, by)
 	target := strings.Join(ids, ",")
 	if all {
 		target = "*"
 	}
-	if err != nil {
-		code, msg := "alarm.ack_failed", err.Error()
-		var ae *httpapi.APIError
-		if errors.As(err, &ae) {
-			code, msg = ae.Code, ae.Message
+	if r.consensus != nil {
+		if err := r.requireLeader(); err != nil {
+			r.auditFrom(ctx, "alarm.ack", target, "error", errorCode(err), errorMessage(err), map[string]string{"by": by})
+			return nil, err
 		}
-		r.auditFrom(ctx, "alarm.ack", target, "error", code, msg, map[string]string{"by": by})
+	}
+	out, err := r.ackAlarms(ctx, ids, all, by)
+	if err != nil {
+		r.auditFrom(ctx, "alarm.ack", target, "error", errorCode(err), errorMessage(err), map[string]string{"by": by})
 		return out, err
 	}
 	r.auditFrom(ctx, "alarm.ack", target, "ok", "", "", map[string]string{
 		"by": by, "count": strconv.Itoa(len(out)),
 	})
+
+	// 记录实际被确认的 ID，而不是请求里的原始参数：all=true 时原始参数
+	// 没有具体 ID，账本里也就无从重放。
+	if r.consensus != nil && len(out) > 0 {
+		ackedIDs := make([]string, 0, len(out))
+		for _, st := range out {
+			ackedIDs = append(ackedIDs, st.ID)
+		}
+		payload := commandPayload{
+			IDs: ackedIDs, All: all, By: by, At: time.Now().UTC(),
+		}
+		if _, perr := r.propose(ctx, consensus.KindAckAlarms, payload); perr != nil {
+			return out, r.clusterWriteError(perr)
+		}
+	}
 	return out, nil
 }
 

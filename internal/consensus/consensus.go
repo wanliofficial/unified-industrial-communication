@@ -47,6 +47,10 @@ var ErrNotVoter = errors.New("consensus: not a voter")
 // ErrClosed 表示 Consensus 已关闭，不再接受 Propose。
 var ErrClosed = errors.New("consensus: closed")
 
+// ErrUnhealthy 表示本副本状态机已与日志分歧（apply/decode 失败过），不再接受
+// 会改变状态的写。这是 fail-closed：宁可拒绝，也不把另一个版本的状态写进去。
+var ErrUnhealthy = errors.New("consensus: state machine unhealthy")
+
 // Role 是本副本在集群里的实时角色。
 //
 // 取值与 raft 术语一致：leader 是唯一可提交写、可发起采集的副本；follower 复制

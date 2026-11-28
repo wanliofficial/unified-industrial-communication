@@ -170,6 +170,12 @@ func (r *Runtime) publish(s model.Sample) {
 	if r.box == nil || len(r.sinkNames) == 0 {
 		return
 	}
+	// leader 闸：非 leader 副本不写 Outbox。采集闸已经拦住了正常路径，这里是
+	// 「角色刚丢、样本已在飞」的兜底——宁可少一条投递（样本可重采），也不要
+	// 旧 leader 与新 leader 双份投递。
+	if !r.isLeader() {
+		return
+	}
 	v1, err := contract.EncodeV1(s)
 	if err != nil {
 		r.log.Error("outbox_marshal_failed", "version", contract.Version1, "device", s.DeviceID, "point", s.PointID, "error", errText(err))
@@ -234,6 +240,12 @@ func (r *Runtime) dispatchLoop(ctx context.Context, sink string, deliver deliver
 }
 
 // drain 按批投递：只有整批成功（或前缀成功）才推进确认位点。
+//
+// 这里**刻意不设 leader 闸**（而 publish 有）：Outbox 是节点本地存储，记录由
+// 采集它的那个节点独占——只有旧 leader 的队列里有那批样本。若它在丢主后停止
+// 投递，这些样本既不会被新 leader 采到，也不会被它自己送出，只能等它重新
+// 升主；在容量上限内还可能被保留策略挤掉，变成真正的数据丢失。让每个节点把
+// 「自己采集到的」记录送完，既满足 at-least-once，也不会产生跨节点重复投递。
 func (r *Runtime) drain(ctx context.Context, sink string, deliver deliverFunc) {
 	if r.box == nil {
 		return

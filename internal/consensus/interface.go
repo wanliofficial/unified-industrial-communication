@@ -13,7 +13,8 @@ import (
 // 只依赖「提交裁决 + 知道谁是 leader」，也让这个包可以用内存 transport 单测。
 //
 // 实现：单节点集群恒为 leader（always-leader）；多节点集群由 raft 选主，
-// 写经多数派复制。关闭（Enabled=false）时退化为单节点，零外部依赖。
+// 写经多数派复制。runtime 在 cluster 未启用时不构造 Consensus（哨兵为 nil），
+// 行为与引入 raft 之前完全一致。
 type Consensus interface {
 	// Propose 提交一条控制面命令，等多数派复制并 commit 后返回 apply 结果。
 	//
@@ -39,6 +40,12 @@ type Consensus interface {
 
 	// CommitIndex 返回已 commit 的日志索引（复制进度，供 /api/v1/leader 暴露）。
 	CommitIndex() uint64
+
+	// Healthy 报告本副本的状态机是否可服务。apply/decode 失败过（状态机
+	// 已与日志分歧）或已关闭时为 false；此时 Propose 一律返回 ErrUnhealthy。
+	//
+	// 这是 fail-closed 的读口：不能确认状态一致，就不接受会改变状态的写。
+	Healthy() bool
 
 	// Term 返回当前任期（供 /api/v1/leader 与指标暴露；term 变化即发生过选主）。
 	Term() uint64
@@ -86,8 +93,8 @@ type Options struct {
 	// Addr 是本节点 raft transport 地址（host:port）。单节点集群也需可路由形式，
 	// 但单机不回环，可用 "node-<id>" 占位。
 	Addr string
-	// Peers 是全部成员（含本节点）。空或仅 1 个成员 → 单节点 always-leader。
-	// >=3 才启用多副本；2 个或更少（且 >1）应被上层拒绝（无多数派意义）。
+	// Peers 是集群成员表（含本节点），供 Bootstrap 写初始配置与 runtime
+	// 对账成员。**不**用它推断是否单节点——是否引导由 Bootstrap 决定。
 	Peers []Server
 	// DataDir 是 raft 存储（日志/快照/稳定存储）的根目录。空用临时目录（测试）。
 	DataDir string
@@ -100,6 +107,9 @@ type Options struct {
 	// LogOutput 是 raft 自身日志（hclog）的去处。nil 时静默（测试/未配置）。
 	// runtime 接线时传真实 writer（如 os.Stderr 或 slog 适配）。
 	LogOutput io.Writer
+	// LogLevel 是 raft 自身日志级别（trace/debug/info/warn/error）。空用 raft
+	// 默认（debug，非常吵）；runtime 接线下传 "warn"。
+	LogLevel string
 	// TestBackend 注入 raft 底层（日志/稳定/快照存储 + transport）。
 	// 生产为 nil（由 RaftConsensus 按 DataDir 用 boltdb + TCP transport 自建）；
 	// 测试传入内存实现（同进程多节点、确定性、无网络）。见 backend_mem.go。
@@ -108,7 +118,8 @@ type Options struct {
 	// Bootstrap 控制本节点是否在启动时写入初始集群配置（BootstrapCluster）。
 	//
 	// 语义刻意显式、不做推断：
-	//   - 单节点部署（cluster 未启用）：必须为 true，启动即 always-leader。
+	//   - 单节点部署（cluster.enabled=true 且 peers 为空或只含自身）：runtime
+	//     置 true，启动即 always-leader。
 	//   - 多节点集群：**有且只有一台**（种子节点）为 true，且其 Peers 应只含
 	//     自身；其余节点为 false，由种子节点经 AddServer 逐个加入。
 	//

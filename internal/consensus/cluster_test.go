@@ -58,8 +58,8 @@ func (a *recordingApplier) ApplyCommand(cmd Command) (any, error) {
 	return fmt.Sprintf("applied:%s", cmd.Kind), nil
 }
 
-func (a *recordingApplier) Snapshot() (raft.FSMSnapshot, error)  { return &noopSnapshot{}, nil }
-func (a *recordingApplier) Restore(snapshot io.ReadCloser) error { return snapshot.Close() }
+func (a *recordingApplier) Snapshot() ([]byte, error) { return []byte("snap"), nil }
+func (a *recordingApplier) Restore(data []byte) error { return nil }
 
 func (a *recordingApplier) Applied() []Command {
 	a.mu.Lock()
@@ -78,12 +78,6 @@ func (a *recordingApplier) clearFail() {
 	a.failWith = nil
 	a.mu.Unlock()
 }
-
-// noopSnapshot 是测试用的空快照。
-type noopSnapshot struct{}
-
-func (noopSnapshot) Persist(sink raft.SnapshotSink) error { return sink.Close() }
-func (noopSnapshot) Release()                             {}
 
 // newTestCluster 构造 n 个节点的集群并全部启动并完成扩容。
 func newTestCluster(t *testing.T, n int) *testCluster {

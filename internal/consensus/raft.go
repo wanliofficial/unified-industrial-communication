@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -38,6 +39,14 @@ type raftConsensus struct {
 
 	done     chan struct{}
 	closeOne sync.Once
+}
+
+// New 构造并启动一个 Consensus（生产与测试共用的唯一入口）。
+//
+// applier 是状态机副作用实现（runtime 注入）；opts 见 Options。返回的
+// Consensus 已开始参与选主/复制：单节点 Bootstrap 集群立即成为 leader。
+func New(opts Options, applier Applier) (Consensus, error) {
+	return newRaftConsensus(opts, applier)
 }
 
 // newRaftConsensus 构造并启动一个 raftConsensus。
@@ -93,6 +102,16 @@ func newRaftConsensus(opts Options, applier Applier) (*raftConsensus, error) {
 		conf.LogOutput = opts.LogOutput
 	} else {
 		conf.LogOutput = io.Discard
+	}
+	if opts.LogLevel != "" {
+		// 非法级别会被 hclog 解释成 NoLevel（静默），这里先本地校验，让
+		// 配置错误在构造期暴露而不是「日志突然全没了」。
+		switch strings.ToLower(opts.LogLevel) {
+		case "trace", "debug", "info", "warn", "error":
+			conf.LogLevel = strings.ToLower(opts.LogLevel)
+		default:
+			return nil, fmt.Errorf("consensus: invalid LogLevel %q", opts.LogLevel)
+		}
 	}
 
 	// 解析底层存储与传输：测试注入内存，生产用 bbolt + TCP。
@@ -193,6 +212,11 @@ func (c *raftConsensus) Propose(ctx context.Context, cmd Command) (any, error) {
 	if !c.IsLeader() {
 		return nil, ErrNotLeader
 	}
+	// 状态机已分歧（apply 失败过）的副本不能再提交：它已经无法保证 apply
+	// 结果与集群一致，继续写只会扩大分歧。这是 fail-closed。
+	if !c.Healthy() {
+		return nil, ErrUnhealthy
+	}
 
 	future := c.r.ApplyLog(raft.Log{Data: encodeCommand(cmd)}, c.commitTimeout)
 	// ctx 取消也应当取消等待：用一个 goroutine 把 ctx.Done 转成 future 完成。
@@ -257,6 +281,17 @@ func (c *raftConsensus) refreshLeaderView() {
 
 // IsLeader 实现 Consensus。
 func (c *raftConsensus) IsLeader() bool { return c.Role() == RoleLeader }
+
+// Healthy 实现 Consensus：状态机无分歧且 raft 未关闭才算健康。
+func (c *raftConsensus) Healthy() bool {
+	if c.r == nil || c.fsm == nil {
+		return false
+	}
+	if c.r.State() == raft.Shutdown {
+		return false
+	}
+	return c.fsm.IsHealthy()
+}
 
 // LeaderID 实现 Consensus。
 func (c *raftConsensus) LeaderID() string {

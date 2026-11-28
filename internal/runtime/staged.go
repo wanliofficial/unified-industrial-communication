@@ -84,6 +84,9 @@ func (r *Runtime) stagedNowLocked() time.Time {
 // 下发后的状态。若目标与当前配置没有设备变更，直接收敛到目标并返回
 // completed=true。
 func (r *Runtime) BeginStaged(ctx context.Context, raw json.RawMessage, source string, policy httpapi.StagedPolicy) (httpapi.StagedStatus, error) {
+	if err := r.requireLeader(); err != nil {
+		return httpapi.StagedStatus{}, err
+	}
 	filled, err := r.fillRedacted(raw)
 	if err != nil {
 		return httpapi.StagedStatus{}, err
@@ -163,6 +166,9 @@ func (r *Runtime) BeginStaged(ctx context.Context, raw json.RawMessage, source s
 // 可审计的判定点；后台看门狗只负责「没人来推进时也要自动回滚」（见
 // checkStagedHealth）。
 func (r *Runtime) AdvanceStaged(ctx context.Context, source string) (httpapi.StagedStatus, error) {
+	if err := r.requireLeader(); err != nil {
+		return httpapi.StagedStatus{}, err
+	}
 	r.staged.mu.Lock()
 	defer r.staged.mu.Unlock()
 	ro := r.staged.cur
@@ -195,6 +201,9 @@ func (r *Runtime) AdvanceStaged(ctx context.Context, source string) (httpapi.Sta
 // AbortStaged 终止灰度并回滚到灰度前的版本（baseVersion）。已下发的批次会被
 // 撤销——这正是灰度存在的意义：影响面可收回。
 func (r *Runtime) AbortStaged(ctx context.Context, source string) (config.ApplyResult, error) {
+	if err := r.requireLeader(); err != nil {
+		return config.ApplyResult{}, err
+	}
 	r.staged.mu.Lock()
 	defer r.staged.mu.Unlock()
 	ro := r.staged.cur
@@ -352,6 +361,12 @@ func (r *Runtime) abortIfUnhealthyLocked(ctx context.Context, ro *stagedRollout,
 // 回滚在锁外执行（Rollback 会走 reload 与北向通知，可能耗时数秒）；回滚
 // 完成后再取锁更新状态，若其间灰度已被人工终止/替换则不再改状态。
 func (r *Runtime) checkStagedHealth(ctx context.Context, now time.Time) {
+	// 灰度计划与进度是 leader 本地状态；副本不该驱动它（也无法驱动：配置
+	// 变更要走共识，非 leader 会被 409）。丢主后由 applyRole 把本次灰度
+	// 就地标为中止，这里再兜一层，避免每秒刷一条自动回滚失败日志。
+	if !r.isLeader() {
+		return
+	}
 	r.staged.mu.Lock()
 	ro := r.staged.cur
 	if ro == nil || !ro.status.Active || ro.status.NextBatch == 0 {
@@ -395,6 +410,29 @@ func (r *Runtime) markAbortedLocked(ro *stagedRollout, reason string) {
 	ro.status.Aborted = true
 	ro.status.PausedReason = reason
 	ro.status.UpdatedAt = r.stagedNowLocked().UTC()
+}
+
+// abandonStagedOnDemotion 在丢失 leadership 时把本机的灰度计划就地终止。
+//
+// 灰度计划是 leader 本地状态（批次划分、观察窗口、失败率基线都无法跨节点
+// 复制：基线来自本机的采集统计）。升主的新副本看不到它，也不会替它推进；
+// 若旧 leader 保留这份状态，它下次升主时会对着已经变化的配置继续「下一批」，
+// 那等于用一个过期的计划去改生产环境。因此宁可显式中止，让运维在新 leader
+// 上重新发起。
+//
+// 不做回滚：非 leader 无法提交配置变更，且集群当前配置是最后一次成功提交的
+// 结果，本来就是一个一致的状态点。
+func (r *Runtime) abandonStagedOnDemotion() {
+	r.staged.mu.Lock()
+	defer r.staged.mu.Unlock()
+	ro := r.staged.cur
+	if ro == nil || !ro.status.Active {
+		return
+	}
+	r.markAbortedLocked(ro, "leadership lost: staged rollout state is leader-local; restart it on the new leader")
+	r.metrics.Inc("uic_config_staged_total", obs.Labels{"status": "abandoned_on_demotion"})
+	r.log.Warn("staged_abandoned_on_demotion",
+		"detail", "本机不再是 leader，灰度计划已中止；请在新 leader 上重新发起")
 }
 
 // applyStagedBatchLocked 下发第 idx 批：用当前生效配置作底、把第 0..idx 批的

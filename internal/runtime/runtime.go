@@ -34,6 +34,7 @@ import (
 	"uic/internal/cache"
 	"uic/internal/clockmon"
 	"uic/internal/config"
+	"uic/internal/consensus"
 	"uic/internal/driver"
 	adsdrv "uic/internal/driver/ads"
 	bacnetdrv "uic/internal/driver/bacnet"
@@ -103,6 +104,13 @@ type Options struct {
 	// 随手调成 0 从而每分钟报一次跳变」的风险。但「墙钟被拨了 1.5 秒」这种场景
 	// 无法靠等待真实系统时间变化来测试，因此必须允许替换采样源。
 	ClockSource func() clockmon.Reading
+
+	// Consensus 是测试注入缝：非 nil 时 runtime 直接使用它，不按配置构造 raft。
+	//
+	// 为什么要这个缝：leader 闸/409/停采/提交式写都可以用一个假 Consensus 确定
+	// 性验证（切角色、制造无多数派），不必在每个 runtime 测试里拉起真实集群。
+	// 真实集群路径由 consensus 包的集成测试 + runtime 的单节点端到端测试覆盖。
+	Consensus consensus.Consensus
 }
 
 // northboundSink 是 MQTT 北向的两种载荷格式共用的接口。
@@ -211,6 +219,28 @@ type Runtime struct {
 	// 改动——采样源不是配置，改了也没有语义。
 	clock     *clockmon.Monitor
 	clockRead func() clockmon.Reading
+
+	// 跨实例协调（见 cluster.go）。consensus 为 nil 表示 cluster 未启用：所有
+	// leader 闸恒为真，行为与引入 raft 之前逐字节一致。
+	consensus   consensus.Consensus
+	clusterCfg  *config.Cluster
+	nodeID      string
+	clusterAddr string
+
+	// cluMu 串行化共识 apply 与快照捕获：两者都在 raft 的协程上，但 Snapshot
+	// 可能与 Apply 并发（raft 会在继续 apply 的同时物化快照），需要一把锁把
+	// 「配置 + 幂等表 + 记录」钉在同一个 apply 位置上。
+	cluMu sync.Mutex
+	clu   clusterRecords
+
+	roleSinceMu sync.Mutex
+	roleSince   time.Time
+
+	// leaderActive/roleKnown 驱动「只在角色边沿改设备状态」的判定。设备被
+	// SetEnabled(true) 会把 nextDue 拉到当下，每个 tick 都调会把采集周期变成
+	// 500ms，所以必须做边沿检测。
+	leaderActive atomic.Bool
+	roleKnown    atomic.Bool
 }
 
 type idemEntry struct {
@@ -361,6 +391,7 @@ func New(opt Options) (*Runtime, error) {
 		r.openSlaves,
 		r.openOPCUA,
 		r.openSinks,
+		r.openConsensus,
 	}
 	for _, step := range steps {
 		if err := step(mgr.Current()); err != nil {
@@ -386,6 +417,9 @@ func New(opt Options) (*Runtime, error) {
 // 句柄与后台 goroutine** 的东西关掉。否则：测试里临时目录删不掉；生产里
 // 重启后旧进程还没退干净，新进程抢不到段文件锁。
 func (r *Runtime) abortStartup() {
+	// 先停 raft：它可能在 apply 配置（调用 reload），必须在其他子系统拆掉
+	// 之前停止，否则 apply 会对着已关闭的调度器/审计存储操作。
+	r.closeConsensus()
 	r.closeOPCUA()
 	r.closeSlaves()
 	if r.alarms != nil {
@@ -459,6 +493,11 @@ func (r *Runtime) declareMetrics() {
 	d("uic_audit_write_errors_total", "counter", "审计写入失败次数（不等于业务失败）")
 	d("uic_audit_last_seq", "gauge", "审计链最后一条记录的序号")
 	d("uic_audit_query_total", "counter", "审计查询次数")
+	d("uic_leader_role", "gauge", "本副本在 raft 集群里的角色（1 表示当前角色）")
+	d("uic_raft_term", "gauge", "raft 当前任期")
+	d("uic_raft_commit_index", "gauge", "raft 已提交日志索引")
+	d("uic_raft_proposals_total", "counter", "控制面命令提交结果（committed/rejected/timeout）")
+	d("uic_raft_membership_changes_total", "counter", "raft 成员变更次数（按 op）")
 }
 
 // build 按配置创建采集器并注册到调度器。
@@ -544,6 +583,10 @@ func (r *Runtime) Start(ctx context.Context) {
 	}
 	r.wg.Add(1)
 	go r.watchdog(r.ctx)
+	if r.consensus != nil {
+		r.wg.Add(1)
+		go r.clusterLoop(r.ctx)
+	}
 	r.wg.Add(1)
 	go r.heartbeatLoop(r.ctx)
 	// 播种一次时钟：不播种的话，启动后头一分钟 health 的 clock.verdict 恒为
@@ -584,6 +627,9 @@ func (r *Runtime) Stop(timeout time.Duration) error {
 	case <-time.After(timeout / 2):
 		r.log.Warn("runtime_stop_timeout", "stage", "workers")
 	}
+
+	// 采集/写协程已退出，再停 raft：apply 不会再调用 reload/审计。
+	r.closeConsensus()
 
 	r.closeSlaves()
 
@@ -870,7 +916,21 @@ func (r *Runtime) markStale(now time.Time) {
 // ---------------------------------------------------------------------------
 
 // ApplyConfig 校验并应用配置，返回需要重启的设备列表。
+//
+// 提交式语义（cluster 启用时）：leader 闸在最外层，然后本地做完整校验（填充
+// 脱敏占位符、解析、Validate、算 canonical 哈希），只有校验通过才把它作为 raft
+// 命令提交。这样一份笔误的配置得到的是 422 而不是「apply 失败→状态机判分歧→
+// 本副本停写」：校验是确定性的、每个副本都会做同样的判断，因此不需要靠共识
+// 去发现它。
+//
+// 闸门放在校验之前是为了让契约单一：非 leader 对任何写请求都回 409 + leader
+// 地址，调用方只需处理一种「换个节点重试」的情形，不必分辨这个 422 是不是
+// 因为自己问错了副本。
 func (r *Runtime) ApplyConfig(ctx context.Context, raw json.RawMessage, source string) (config.ApplyResult, error) {
+	if err := r.requireLeader(); err != nil {
+		r.auditConfigChange(ctx, "config.apply", "rejected", source, "error", errorCode(err), errorMessage(err))
+		return config.ApplyResult{}, err
+	}
 	filled, err := r.fillRedacted(raw)
 	if err != nil {
 		apiErr, _ := err.(*httpapi.APIError)
@@ -886,38 +946,50 @@ func (r *Runtime) ApplyConfig(ctx context.Context, raw json.RawMessage, source s
 		return config.ApplyResult{}, httpapi.Errf(http.StatusBadRequest, "config.invalid_json",
 			"cannot parse config: %v", err)
 	}
-	before := r.cfg.Current()
-	beforeNB := northboundRestartFingerprint(before.Northbound, before.Storage)
-
-	res, err := r.cfg.Apply(&f, source)
-	if err != nil {
-		r.metrics.Inc("uic_config_apply_total", obs.Labels{"status": "error"})
+	if err := f.Validate(); err != nil {
 		apiErr := httpapi.Errf(http.StatusUnprocessableEntity, "config.apply_failed", "%v", err)
 		r.auditConfigChange(ctx, "config.apply", "rejected", source, "error", apiErr.Code, apiErr.Message)
 		return config.ApplyResult{}, apiErr
 	}
+	canonical, err := f.Canonical()
+	if err != nil {
+		return config.ApplyResult{}, httpapi.Errf(http.StatusUnprocessableEntity, "config.apply_failed", "%v", err)
+	}
+
+	var res config.ApplyResult
+	if r.consensus == nil {
+		res, err = r.applyConfigCanonical(ctx, canonical, source)
+		if err != nil {
+			apiErr := httpapi.Errf(http.StatusUnprocessableEntity, "config.apply_failed", "%v", err)
+			r.metrics.Inc("uic_config_apply_total", obs.Labels{"status": "error"})
+			r.auditConfigChange(ctx, "config.apply", "rejected", source, "error", apiErr.Code, apiErr.Message)
+			return config.ApplyResult{}, apiErr
+		}
+	} else {
+		out, perr := r.propose(ctx, consensus.KindApplyConfig, commandPayload{
+			Source: source, Config: canonical, At: time.Now().UTC(),
+		})
+		if perr != nil {
+			apiErr := r.clusterWriteError(perr)
+			r.auditConfigChange(ctx, "config.apply", "rejected", source, "error", errorCode(apiErr), errorMessage(apiErr))
+			return config.ApplyResult{}, apiErr
+		}
+		got, ok := out.(config.ApplyResult)
+		if !ok {
+			return config.ApplyResult{}, httpapi.Errf(http.StatusInternalServerError, "internal.error",
+				"unexpected apply result type %T", out)
+		}
+		res = got
+	}
+
 	if !res.Applied {
 		// 内容哈希相同：没改任何东西。仍记一条——「谁在什么时候试图改配置」
 		// 本身就是审计要回答的问题，即使最终没有生效。
 		r.auditConfigChange(ctx, "config.apply", res.Version, source, "ok", "config.unchanged", "content hash unchanged")
 		return res, nil
 	}
-	res.Restarted = r.reload(before)
 	r.metrics.Inc("uic_config_apply_total", obs.Labels{"status": "ok"})
 	r.auditConfigChange(ctx, "config.apply", res.Version, source, "ok", "", "")
-
-	after := r.cfg.Current()
-	afterNB := northboundRestartFingerprint(after.Northbound, after.Storage)
-	if string(beforeNB) != string(afterNB) {
-		r.log.Warn("northbound_config_changed", "detail", "MQTT/Webhook 参数变更需重启进程生效；OPC UA 北向已热重建")
-	}
-	// 历史库的目录与保留策略在 Open 时就固定了。采样参数可以热改，
-	// 但这四项不能——必须明确告诉运维「改了但没生效」，否则他会盯着
-	// 一个没变的水位以为配置没生效。
-	if historyFingerprint(before.Storage.History) != historyFingerprint(after.Storage.History) {
-		r.log.Warn("history_config_changed",
-			"detail", "storage.history 的 dir/maxBytes/segmentBytes/maxAge 变更需重启进程生效；minInterval/heartbeat/deadband 已即时生效")
-	}
 	return res, nil
 }
 
@@ -942,27 +1014,51 @@ func northboundRestartFingerprint(nb config.Northbound, st config.Storage) []byt
 }
 
 // Rollback 回滚到指定版本并热更新。
+//
+// 与 ApplyConfig 同样的提交式语义：先在本地确认目标版本存在（这是确定性的
+// 检查，不该靠共识发现，否则「版本号写错」会被报成 503），再提交 raft 命令。
 func (r *Runtime) Rollback(ctx context.Context, version string) (config.ApplyResult, error) {
-	before := r.cfg.Current()
-	res, err := r.cfg.Rollback(version)
-	if err != nil {
-		var apiErr *httpapi.APIError
-		if errors.Is(err, config.ErrVersionNotFound) {
-			apiErr = httpapi.Errf(http.StatusNotFound, "config.version_not_found", "%v", err)
-		} else {
-			apiErr = httpapi.Errf(http.StatusUnprocessableEntity, "config.rollback_failed", "%v", err)
-		}
+	if err := r.requireLeader(); err != nil {
+		r.auditConfigChange(ctx, "config.rollback", version, "rollback", "error", errorCode(err), errorMessage(err))
+		return config.ApplyResult{}, err
+	}
+	// 目标版本必须存在：这是「调用方拿错版本号」，与集群无关。
+	if _, err := r.cfg.VersionConfig(version); err != nil {
+		apiErr := httpapi.Errf(http.StatusNotFound, "config.version_not_found", "%v", err)
 		r.auditConfigChange(ctx, "config.rollback", version, "rollback", "error", apiErr.Code, apiErr.Message)
 		return config.ApplyResult{}, apiErr
 	}
-	// 回滚同样重建凭据表：回滚最常见的用途就是「刚才那次变更引入了错误」，
-	// 而那次变更可能同时改掉了用户表。
-	if err := r.buildAuth(r.cfg.Current()); err != nil {
-		// 不回滚整次 Apply（配置已落盘，业务面要继续服务），但凭据必须
-		// 换成新表：保留旧表等于「配置说删了、进程还说在」。
-		r.log.Error("auth_reload_failed", "error", errText(err))
+
+	var res config.ApplyResult
+	var err error
+	if r.consensus == nil {
+		res, err = r.rollbackCanonical(ctx, version)
+		if err != nil {
+			var apiErr *httpapi.APIError
+			if errors.Is(err, config.ErrVersionNotFound) {
+				apiErr = httpapi.Errf(http.StatusNotFound, "config.version_not_found", "%v", err)
+			} else {
+				apiErr = httpapi.Errf(http.StatusUnprocessableEntity, "config.rollback_failed", "%v", err)
+			}
+			r.auditConfigChange(ctx, "config.rollback", version, "rollback", "error", apiErr.Code, apiErr.Message)
+			return config.ApplyResult{}, apiErr
+		}
+	} else {
+		out, perr := r.propose(ctx, consensus.KindRollbackConfig, commandPayload{
+			Version: version, Source: "rollback", At: time.Now().UTC(),
+		})
+		if perr != nil {
+			apiErr := r.clusterWriteError(perr)
+			r.auditConfigChange(ctx, "config.rollback", version, "rollback", "error", errorCode(apiErr), errorMessage(apiErr))
+			return config.ApplyResult{}, apiErr
+		}
+		got, ok := out.(config.ApplyResult)
+		if !ok {
+			return config.ApplyResult{}, httpapi.Errf(http.StatusInternalServerError, "internal.error",
+				"unexpected rollback result type %T", out)
+		}
+		res = got
 	}
-	res.Restarted = r.reload(before)
 	r.auditConfigChange(ctx, "config.rollback", res.Version, "rollback", "ok", "", "restored "+version)
 	return res, nil
 }
@@ -1147,6 +1243,7 @@ func (r *Runtime) healthAt(now time.Time) httpapi.Health {
 		Version:       r.version.Version,
 		ConfigVersion: r.cfg.Version(),
 		Alarms:        r.AlarmCounts(),
+		Leader:        r.Leader(),
 	}
 	for _, st := range sts {
 		h.Devices.Total++
@@ -1558,7 +1655,15 @@ func (r *Runtime) Point(device, point string) (model.Sample, bool) {
 }
 
 // Write 写入单点或批量。逐项返回结果：部分失败不返回 5xx。
+//
+// 提交式语义（cluster 启用时）：设备 I/O 只在 leader 执行一次（副本不会对着
+// 自己的设备再写一遍），执行结果随 raft 日志复制，供故障转移后按幂等键重放。
+// 若本地写完但无法提交，返回 504 并明确「可能已在本地执行」——静默当成功是
+// 缺陷：客户端会以为写没发生，而现场设备已经动了。
 func (r *Runtime) Write(ctx context.Context, device string, items []httpapi.WriteItem) ([]httpapi.WriteResult, error) {
+	if err := r.requireLeader(); err != nil {
+		return nil, err
+	}
 	dev, _, ok := r.deviceConfig(device)
 	if !ok {
 		return nil, httpapi.Errf(http.StatusNotFound, "device.not_found", "device %q not found", device)
@@ -1653,7 +1758,9 @@ func (r *Runtime) Write(ctx context.Context, device string, items []httpapi.Writ
 	}
 
 	if key := httpapi.IdempotencyKey(ctx); key != "" {
-		r.idemPut(device+"\x00"+key, results)
+		if r.consensus == nil {
+			r.idemPut(device+"\x00"+key, results)
+		}
 	}
 	// 逐项审计：一次批量写可能一半成功一半被拒绝，只记一条「写入了 3 个点」
 	// 无法回答事后最重要的问题——**到底哪个点没写进去**。
@@ -1673,6 +1780,16 @@ func (r *Runtime) Write(ctx context.Context, device string, items []httpapi.Writ
 		}
 		r.auditFrom(ctx, "point.write", device+"/"+it.Point, result, code, msg, detail)
 	}
+	// 最后提交写结果：审计先落，保证「本地确实执行过」这件事有留痕，即使
+	// 提交失败。幂等键缺失时不提交——没有可重放的结论，也没有必要让一次
+	// 不可去重的写进入共识日志。
+	if key := httpapi.IdempotencyKey(ctx); key != "" && r.consensus != nil {
+		if _, err := r.propose(ctx, consensus.KindWritePoints, commandPayload{
+			Device: device, IdemKey: key, Items: items, Results: results, At: time.Now().UTC(),
+		}); err != nil {
+			return results, r.clusterWriteError(err)
+		}
+	}
 	return results, nil
 }
 
@@ -1690,18 +1807,26 @@ func (r *Runtime) idemGet(key string) ([]httpapi.WriteResult, bool) {
 }
 
 func (r *Runtime) idemPut(key string, res []httpapi.WriteResult) {
+	r.idemPutAt(key, res, time.Now())
+}
+
+// idemPutAt 是幂等记录的「带时刻」写入：共识 apply 与快照恢复用 leader 决定
+// 该命令的时刻，而不是本副本 apply 的时刻——否则同一条日志在不同副本上会
+// 得到不同的过期结论（副本可能晚几秒才 apply）。
+func (r *Runtime) idemPutAt(key string, res []httpapi.WriteResult, at time.Time) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if len(r.idem) > 512 {
+		now := time.Now()
 		for k, e := range r.idem {
-			if time.Since(e.at) > 5*time.Minute {
+			if now.Sub(e.at) > 5*time.Minute {
 				delete(r.idem, k)
 			}
 		}
 	}
 	cp := make([]httpapi.WriteResult, len(res))
 	copy(cp, res)
-	r.idem[key] = idemEntry{at: time.Now(), results: cp}
+	r.idem[key] = idemEntry{at: at, results: cp}
 }
 
 // ---------------------------------------------------------------------------
@@ -1722,6 +1847,26 @@ func errText(err error) string {
 		return ""
 	}
 	return err.Error()
+}
+
+// errorCode/errorMessage 从错误里取审计用的稳定错误码与消息。
+//
+// 审计要记的是对外契约里的 code（machine-readable、不随语言变化），而不是
+// err.Error() 的拼接文本——后者会随包装层数变化，事后按 code 检索就失效了。
+func errorCode(err error) string {
+	var ae *httpapi.APIError
+	if errors.As(err, &ae) {
+		return ae.Code
+	}
+	return "internal.error"
+}
+
+func errorMessage(err error) string {
+	var ae *httpapi.APIError
+	if errors.As(err, &ae) {
+		return ae.Message
+	}
+	return errText(err)
 }
 
 func hashJSON(v any) string {

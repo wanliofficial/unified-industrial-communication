@@ -28,14 +28,13 @@ type Applier interface {
 	//     （fail-closed），绝不「失败也照常推进」。
 	ApplyCommand(cmd Command) (any, error)
 
-	// Snapshot 返回当前状态机的可持久化快照（实现 raft.FSMSnapshot）。
-	// raft 用它做日志压缩与新副本追赶。快照必须表达「截至某索引、已 apply
-	// 全部 ≤该索引日志」的完整状态。
-	Snapshot() (raft.FSMSnapshot, error)
+	// 快照用字节流表达（而不是直接暴露 raft.FSMSnapshot）：consensus 在自己的
+	// StateMachine 里把字节包成 raft 快照，runtime 因此不必 import raft 的类型。
+	Snapshot() ([]byte, error)
 
-	// Restore 从一个快照流恢复状态。raft 在新副本启动、或日志被压缩后追不上时
+	// Restore 从快照字节恢复状态。raft 在新副本启动、或日志被压缩后追不上时
 	// 调用。恢复后本副本状态必须与写下该快照的副本一致。
-	Restore(snapshot io.ReadCloser) error
+	Restore(data []byte) error
 }
 
 // StateMachine 是 raft.FSM 的实现：raft commit 一条日志就调用一次 Apply。
@@ -87,9 +86,13 @@ func (s *StateMachine) Apply(log *raft.Log) interface{} {
 	return res
 }
 
-// Snapshot 实现 raft.FSM。直接委托 Applier.Snapshot。
+// Snapshot 实现 raft.FSM。直接委托 Applier.Snapshot，把字节包成 raft 快照。
 func (s *StateMachine) Snapshot() (raft.FSMSnapshot, error) {
-	return s.applier.Snapshot()
+	data, err := s.applier.Snapshot()
+	if err != nil {
+		return nil, err
+	}
+	return &byteSnapshot{data: data}, nil
 }
 
 // Restore 实现 raft.FSM。从快照恢复状态机，委托 Applier.Restore。
@@ -97,13 +100,36 @@ func (s *StateMachine) Snapshot() (raft.FSMSnapshot, error) {
 // 恢复成功即清除旧的分歧标记——能从快照追平，说明状态已一致。
 func (s *StateMachine) Restore(snapshot io.ReadCloser) error {
 	defer snapshot.Close()
-	if err := s.applier.Restore(snapshot); err != nil {
+	data, err := io.ReadAll(snapshot)
+	if err != nil {
+		s.applyErr = err
+		return err
+	}
+	if err := s.applier.Restore(data); err != nil {
 		s.applyErr = err
 		return err
 	}
 	s.applyErr = nil
 	return nil
 }
+
+// byteSnapshot 把 []byte 适配成 raft.FSMSnapshot。
+//
+// 快照在 Snapshot() 返回时就已物化（Applier 负责给出某个一致点的完整字节），
+// Persist 只做一次写；Release 无需回收（字节由 GC 管理）。
+type byteSnapshot struct{ data []byte }
+
+// Persist 实现 raft.FSMSnapshot。
+func (b *byteSnapshot) Persist(sink raft.SnapshotSink) error {
+	if _, err := sink.Write(b.data); err != nil {
+		_ = sink.Cancel()
+		return err
+	}
+	return sink.Close()
+}
+
+// Release 实现 raft.FSMSnapshot。
+func (b *byteSnapshot) Release() {}
 
 // IsHealthy 报告状态机是否处于「可服务」状态。
 //
